@@ -1530,3 +1530,80 @@ def test_task_detail_prefers_verified_reviewer_findings_over_terminal_prose():
         "blocking_finding_count": 0,
     }
     assert "No code changes required" not in json.dumps(logs)
+
+
+def _write_protocol_alert_record(root: Path, *, count: int, reason: str) -> None:
+    alert_dir = root / ".aiworkhub" / "runtime"
+    alert_dir.mkdir(parents=True, exist_ok=True)
+    (alert_dir / "mcp_protocol_alerts.json").write_text(
+        json.dumps({
+            "schema_id": "aiworkhub.mcp_control_plane.protocol_alert.v1",
+            "count": count,
+            "latest": {
+                "method": "thread/resume",
+                "request_id": None,
+                "repo_identity": root.name,
+                "boundary": "app_server_mux_sideband",
+                "reason": reason,
+                "timestamp": NOW,
+            },
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_protocol_alert_telemetry_empty_without_repo_root():
+    telemetry = dashboard._protocol_alert_telemetry(None)
+    assert telemetry == {
+        "schema_id": "aiworkhub.mcp_control_plane.protocol_alert_telemetry.v1",
+        "alert_count": 0,
+        "latest_method": None,
+        "latest_boundary": None,
+        "latest_reason": None,
+        "latest_timestamp": None,
+    }
+
+
+def test_protocol_alert_telemetry_empty_when_no_durable_record_yet(tmp_path):
+    telemetry = dashboard._protocol_alert_telemetry(tmp_path)
+    assert telemetry["alert_count"] == 0
+    assert telemetry["latest_reason"] is None
+
+
+def test_protocol_alert_telemetry_defaults_safely_on_malformed_record(tmp_path):
+    alert_dir = tmp_path / ".aiworkhub" / "runtime"
+    alert_dir.mkdir(parents=True)
+    (alert_dir / "mcp_protocol_alerts.json").write_text("{not json", encoding="utf-8")
+
+    telemetry = dashboard._protocol_alert_telemetry(tmp_path)
+
+    assert telemetry["alert_count"] == 0
+    assert telemetry["latest_reason"] is None
+
+
+def test_protocol_alert_telemetry_reports_truthful_count_and_latest_reason(tmp_path):
+    _write_protocol_alert_record(tmp_path, count=4, reason="invalid_params:empty_string")
+
+    telemetry = dashboard._protocol_alert_telemetry(tmp_path)
+
+    assert telemetry["alert_count"] == 4
+    assert telemetry["latest_method"] == "thread/resume"
+    assert telemetry["latest_boundary"] == "app_server_mux_sideband"
+    assert telemetry["latest_reason"] == "invalid_params:empty_string"
+    assert telemetry["latest_timestamp"] == NOW
+
+
+def test_build_snapshot_includes_protocol_alert_telemetry_for_ready_repo(tmp_path):
+    root = _init_canonical_repo(tmp_path, "protocol-alert-repo")
+    provider = dashboard.DashboardProvider(repo_root=root)
+
+    snapshot = dashboard.build_snapshot(provider)
+    assert snapshot["protocol_alert_telemetry"]["alert_count"] == 0
+
+    _write_protocol_alert_record(root, count=2, reason="invalid_params:non_object:list")
+
+    snapshot = dashboard.build_snapshot(provider)
+    telemetry = snapshot["protocol_alert_telemetry"]
+    assert telemetry["alert_count"] == 2
+    assert telemetry["latest_reason"] == "invalid_params:non_object:list"
+    assert telemetry["latest_boundary"] == "app_server_mux_sideband"

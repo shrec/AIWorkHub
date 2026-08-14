@@ -1177,6 +1177,46 @@ def _project_context_telemetry(process_report: Mapping[str, Any]) -> dict[str, A
     }
 
 
+_PROTOCOL_ALERT_RELATIVE_PARTS = (".aiworkhub", "runtime", "mcp_protocol_alerts.json")
+
+
+def _protocol_alert_telemetry(repo_root: Path | None) -> dict[str, Any]:
+    """Truthful, bounded projection of the durable MCP protocol-alert record.
+
+    Only method/boundary/reason/timestamp metadata is ever read back here --
+    the durable record never stores raw params, credentials, prompts or
+    tokens, so nothing sensitive can leak through this telemetry.
+    """
+
+    empty = {
+        "schema_id": "aiworkhub.mcp_control_plane.protocol_alert_telemetry.v1",
+        "alert_count": 0,
+        "latest_method": None,
+        "latest_boundary": None,
+        "latest_reason": None,
+        "latest_timestamp": None,
+    }
+    if repo_root is None:
+        return empty
+    path = Path(repo_root).joinpath(*_PROTOCOL_ALERT_RELATIVE_PARTS)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return empty
+    if not isinstance(payload, Mapping):
+        return empty
+    latest = payload.get("latest")
+    latest = latest if isinstance(latest, Mapping) else {}
+    return {
+        "schema_id": "aiworkhub.mcp_control_plane.protocol_alert_telemetry.v1",
+        "alert_count": int(payload.get("count") or 0),
+        "latest_method": latest.get("method"),
+        "latest_boundary": latest.get("boundary"),
+        "latest_reason": latest.get("reason"),
+        "latest_timestamp": latest.get("timestamp"),
+    }
+
+
 class DashboardReadError(RuntimeError):
     """A bounded failure from an existing read-only provider."""
 
@@ -1910,6 +1950,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             "source_graph_index_health": {},
             "read_efficiency_telemetry": _read_efficiency_telemetry({}),
             "project_context_telemetry": _project_context_telemetry({}),
+            "protocol_alert_telemetry": _protocol_alert_telemetry(None),
             "kpi_analytics": dashboard_kpis.build_kpi_snapshot(
                 process_report={},
                 source_graph=_source_graph_telemetry({}),
@@ -2190,6 +2231,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
     )
     read_efficiency_telemetry = _read_efficiency_telemetry(process_report)
     project_context_telemetry = _project_context_telemetry(process_report)
+    protocol_alert_telemetry = _protocol_alert_telemetry(provider_root or _default_repo_root())
     cost_totals = _cost_totals(ledger)
     kpi_analytics = dashboard_kpis.build_kpi_snapshot(
         process_report=kpi_process_report,
@@ -2246,6 +2288,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "source_graph_index_health": dict(source_graph_index_health),
         "read_efficiency_telemetry": read_efficiency_telemetry,
         "project_context_telemetry": project_context_telemetry,
+        "protocol_alert_telemetry": protocol_alert_telemetry,
         "kpi_analytics": kpi_analytics,
         "callback_bridge_health": dict(callback_bridge_health),
         "task_plan": dict(task_plan_snapshot),

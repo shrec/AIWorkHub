@@ -190,6 +190,7 @@ def materialize_git_metrics(
     """Refresh bounded 90-day history during indexing, never during a query."""
 
     selected = files[: max(1, min(limit, 10000))]
+    selected_set = set(selected)
     if not selected:
         return {"available": True, "window": "90d", "files": []}
     if not (repo_root / ".git").exists():
@@ -244,7 +245,7 @@ def materialize_git_metrics(
         if len(parts) != 3:
             continue
         added, deleted, path = parts
-        if path not in selected:
+        if path not in selected_set:
             continue
         commits[path] += 1
         authors[path][current_author] += 1

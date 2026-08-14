@@ -12,12 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.56
+## What's new in 0.9.58
 
-- Source Graph refresh no longer aborts when a relative Python import has an
-  empty module component after exact symbol normalization.
-- Failed import disambiguation remains unresolved and fail-closed instead of
-  preventing a new canonical generation from being built.
+- Malformed empty-string/non-object MCP parameters are rejected before
+  dispatch with a bounded redacted protocol alert.
+- Valid empty-object calls and parallel healthy clients remain serviceable.
+- Repository-owned sideband sockets remain portable under long retained
+  workspace paths without falling back to global system temp directories.
 
 See the packaged **Changelog** for the complete release summary.
 

@@ -10,6 +10,7 @@ import threading
 import types
 import typing
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
@@ -175,13 +176,77 @@ except ModuleNotFoundError:
         text = json.dumps(result, ensure_ascii=False, default=str)
         return {"content": [{"type": "text", "text": text}], "structuredContent": structured}
 
+    _PROTOCOL_ALERT_RELATIVE_PARTS = (".aiworkhub", "runtime", "mcp_protocol_alerts.json")
+    _PROTOCOL_ALERT_SCHEMA_ID = "aiworkhub.mcp_control_plane.protocol_alert.v1"
+    _PROTOCOL_ALERT_FIELD_MAX_LEN = 200
+
+    def _protocol_alert_repo_root() -> Path | None:
+        raw = os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
+        if not raw:
+            return None
+        try:
+            root = Path(raw)
+            return root if root.is_dir() else None
+        except OSError:
+            return None
+
+    def _record_protocol_alert(*, method: Any, request_id: Any, reason: str) -> None:
+        repo_root = _protocol_alert_repo_root()
+        if repo_root is None:
+            return
+        try:
+            path = repo_root.joinpath(*_PROTOCOL_ALERT_RELATIVE_PARTS)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            count = 0
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                count = int(existing.get("count") or 0)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                count = 0
+            record = {
+                "schema_id": _PROTOCOL_ALERT_SCHEMA_ID,
+                "count": count + 1,
+                "latest": {
+                    "method": str(method)[:_PROTOCOL_ALERT_FIELD_MAX_LEN] if method is not None else None,
+                    "request_id": request_id
+                    if request_id is None or isinstance(request_id, (str, int, float, bool))
+                    else str(request_id)[:64],
+                    "repo_identity": repo_root.name[:_PROTOCOL_ALERT_FIELD_MAX_LEN],
+                    "boundary": "stdio_server",
+                    "reason": reason[:_PROTOCOL_ALERT_FIELD_MAX_LEN],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            }
+            tmp_path = path.with_name(path.name + ".tmp")
+            tmp_path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+            os.replace(tmp_path, path)
+        except OSError:
+            pass
+
+    def _validate_stdio_rpc_params(method: Any, params: Any, *, request_id: Any) -> dict[str, Any]:
+        """Fail closed on non-object params before any child/RPC dispatch."""
+
+        if params is None:
+            return {}
+        if isinstance(params, dict):
+            return params
+        reason = (
+            "invalid_params:empty_string"
+            if params == ""
+            else f"invalid_params:non_object:{type(params).__name__}"
+        )
+        _record_protocol_alert(method=method, request_id=request_id, reason=reason)
+        raise _StdioProtocolError(-32602, reason)
+
     def _stdio_dispatch(
         name: str,
         tools: dict[str, Any],
         method: Any,
         params: Any,
         instructions: str = "",
+        request_id: Any = None,
     ) -> Any:
+        params = _validate_stdio_rpc_params(method, params, request_id=request_id)
         if method == "initialize":
             result = {
                 "protocolVersion": _FALLBACK_PROTOCOL_VERSION,
@@ -258,9 +323,9 @@ except ModuleNotFoundError:
         def dispatch_request(message: dict[str, Any]) -> None:
             msg_id = message.get("id")
             method = message.get("method")
-            params = message.get("params") if message.get("params") is not None else {}
+            params = message.get("params")
             try:
-                result = _stdio_dispatch(name, tools, method, params, instructions)
+                result = _stdio_dispatch(name, tools, method, params, instructions, msg_id)
             except _StdioProtocolError as exc:
                 write({
                     "jsonrpc": "2.0", "id": msg_id,
@@ -336,8 +401,9 @@ except ModuleNotFoundError:
                             name,
                             tools,
                             message.get("method"),
-                            message.get("params") or {},
+                            message.get("params"),
                             instructions,
+                            None,
                         )
                     except Exception as exc:
                         _stdio_log(

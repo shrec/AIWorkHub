@@ -1,5 +1,29 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.58 — 2026-08-14
+
+### Fixed
+
+- Fail closed before dispatch when an MCP request carries empty-string or
+  non-object parameters, with a bounded redacted repository-local alert.
+- Preserve valid `{}` requests and keep parallel healthy clients serviceable
+  when one malformed request is rejected.
+- Use the repository-owned sideband endpoint through a short relative socket
+  name so long retained workspace paths do not exceed AF_UNIX limits.
+
+## 0.9.57 — 2026-08-14
+
+### Fixed
+
+- Publish fresh Source Graph generations with truthful refresh health and
+  generation metadata.
+- Reindex by content hash instead of trusting size/mtime hints, while using
+  bounded host-adaptive parallel hashing for unchanged files.
+- Keep scoped analytics, pagination and aggregate counts inside the requested
+  path boundary and resolve exact local JavaScript/TypeScript import bindings.
+- Use an O(1) membership hot path for bounded git metrics without changing
+  persisted or returned ordering.
+
 ## 0.9.56 — 2026-08-14
 
 ### Fixed

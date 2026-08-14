@@ -6,6 +6,53 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.58] - 2026-08-14
+
+### Fixed
+
+- Reject empty-string and non-object JSON-RPC parameters before child or
+  sideband dispatch with a stable, non-empty structured reason.
+- Record one bounded, redacted, repository-local protocol alert without raw
+  request parameters, credentials, prompts, tokens or external host paths.
+- Keep valid empty-object calls serviceable and isolate malformed requests so
+  concurrent valid MCP clients are not globally poisoned.
+- Bind app-server sideband sockets from a short CWD-relative name while
+  retaining the exact repository-owned endpoint, owner-only permissions,
+  per-repository isolation and cleanup on long retained workspace paths.
+
+### Validation
+
+- MCP stdio, app-server mux and dashboard protocol suite: 115 passed.
+- Changed-file Ruff and whitespace checks pass.
+
+## [0.9.57] - 2026-08-14
+
+### Fixed
+
+- Publish truthful Source Graph refresh lifecycle and generation metadata
+  without retaining a stale canonical generation after a successful build.
+- Make unchanged-file detection content-hash authoritative, including
+  same-size/same-mtime mutations, while preserving deterministic incremental
+  publication and bounded single-writer behavior.
+- Keep scoped analytics, pagination, coverage metadata and repository
+  aggregates within the exact requested path boundary.
+- Resolve exact same-repository JavaScript/TypeScript import bindings without
+  overstating ambiguous or external targets.
+- Replace repeated git-metrics list membership with an order-preserving set
+  hot path; the deterministic comparison receipt improves from 79,972 to 8.
+
+### Performance
+
+- Use host-adaptive parallel content hashing: 15 workers on a 16-CPU host in
+  the release canary, with 691 unchanged files reconciled in about 43 ms.
+- Reuse unchanged index-quality evidence instead of repeating graph-wide SQL
+  on a no-op refresh.
+
+### Validation
+
+- Combined Source Graph, daemon, MCP serialization and git-metrics suite:
+  213 passed; changed-file Ruff and whitespace checks pass.
+
 ## [0.9.56] - 2026-08-14
 
 ### Fixed

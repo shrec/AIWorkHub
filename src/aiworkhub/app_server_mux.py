@@ -107,6 +107,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -665,6 +666,39 @@ def sideband_uses_unix_socket() -> bool:
     return hasattr(socket, "AF_UNIX")
 
 
+# B203-rework: ``sockaddr_un.sun_path`` is a fixed ~108-byte buffer (104 on
+# BSD/macOS) checked against the LITERAL string handed to ``bind(2)``/
+# ``connect(2)`` -- not the resolved absolute path. A retained workspace or
+# checkout can sit deeper than that on its own, with no shorter writable
+# location available anywhere (this never relocates the endpoint to /tmp,
+# /var/tmp, /dev/shm, a machine-wide directory, or anything outside the
+# caller's own ``sideband_dir`` -- doing so would trade one hazard for an
+# unauthenticated, cross-repo-shared one). Binding/connecting with a plain
+# instance-id filename while the process CWD is the target directory keeps
+# the syscall string short while the file lands at the exact real path.
+_UNIX_SOCKET_CHDIR_LOCK = threading.Lock()
+
+
+def _bind_unix_socket_relative(srv: socket.socket, path: Path) -> None:
+    with _UNIX_SOCKET_CHDIR_LOCK:
+        previous_cwd = os.getcwd()
+        try:
+            os.chdir(path.parent)
+            srv.bind(path.name)
+        finally:
+            os.chdir(previous_cwd)
+
+
+def _connect_unix_socket_relative(sock: socket.socket, path: Path) -> None:
+    with _UNIX_SOCKET_CHDIR_LOCK:
+        previous_cwd = os.getcwd()
+        try:
+            os.chdir(path.parent)
+            sock.connect(path.name)
+        finally:
+            os.chdir(previous_cwd)
+
+
 def bind_sideband_listener(path: Path) -> socket.socket:
     """Bind one private local sideband listener on Unix or Windows.
 
@@ -677,7 +711,7 @@ def bind_sideband_listener(path: Path) -> socket.socket:
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         previous_umask = os.umask(0o177)
         try:
-            srv.bind(str(path))
+            _bind_unix_socket_relative(srv, path)
         except BaseException:
             srv.close()
             raise
@@ -711,7 +745,7 @@ def connect_sideband_socket(path: Path | str, *, timeout: float | None = None) -
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         if timeout is not None:
             sock.settimeout(timeout)
-        sock.connect(str(endpoint_path))
+        _connect_unix_socket_relative(sock, endpoint_path)
         return sock
 
     try:
@@ -1117,6 +1151,48 @@ def _dedup_key(child_epoch: str, method: str, params: dict[str, Any]) -> str:
         + json.dumps(params, ensure_ascii=False, sort_keys=True)
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+_PROTOCOL_ALERT_RELATIVE_PARTS = (".aiworkhub", "runtime", "mcp_protocol_alerts.json")
+_PROTOCOL_ALERT_SCHEMA_ID = "aiworkhub.mcp_control_plane.protocol_alert.v1"
+_PROTOCOL_ALERT_FIELD_MAX_LEN = 200
+
+
+def _record_protocol_alert(
+    repo_root: Path | None, *, method: Any, request_id: Any, repo_identity: str, reason: str
+) -> None:
+    """Best-effort, non-blocking durable record of a rejected sideband request."""
+
+    if repo_root is None:
+        return
+    try:
+        path = repo_root.joinpath(*_PROTOCOL_ALERT_RELATIVE_PARTS)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        count = 0
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            count = int(existing.get("count") or 0)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            count = 0
+        record = {
+            "schema_id": _PROTOCOL_ALERT_SCHEMA_ID,
+            "count": count + 1,
+            "latest": {
+                "method": str(method)[:_PROTOCOL_ALERT_FIELD_MAX_LEN] if method is not None else None,
+                "request_id": request_id
+                if request_id is None or isinstance(request_id, (str, int, float, bool))
+                else str(request_id)[:64],
+                "repo_identity": repo_identity[:_PROTOCOL_ALERT_FIELD_MAX_LEN],
+                "boundary": "app_server_mux_sideband",
+                "reason": reason[:_PROTOCOL_ALERT_FIELD_MAX_LEN],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except OSError:
+        pass
 
 
 def _project_sideband_response(method: str, response: dict[str, Any]) -> dict[str, Any]:
@@ -1660,7 +1736,19 @@ class AppServerMux:
         if method not in SIDEBAND_ALLOWED_METHODS:
             raise SidebandRejected(f"method not allowed: {method}")
         if not isinstance(params, dict):
-            raise SidebandRejected("params must be an object")
+            reason = (
+                "invalid_params:empty_string"
+                if params == ""
+                else f"invalid_params:non_object:{type(params).__name__}"
+            )
+            _record_protocol_alert(
+                self._repo_root,
+                method=method,
+                request_id=None,
+                repo_identity=self._repo_id or (self._repo_root.name if self._repo_root else "unknown"),
+                reason=reason,
+            )
+            raise SidebandRejected(reason)
         if not self._ready_event.is_set():
             raise SidebandNotReady("app_server_not_ready")
         if self._child is None or self._child.poll() is not None:
@@ -1866,6 +1954,18 @@ class AppServerMux:
                 self._send_json(conn, {"ok": False, "error": "method_not_allowed"})
                 return
             if not isinstance(params, dict):
+                reason = (
+                    "invalid_params:empty_string"
+                    if params == ""
+                    else f"invalid_params:non_object:{type(params).__name__}"
+                )
+                _record_protocol_alert(
+                    self._repo_root,
+                    method=method,
+                    request_id=None,
+                    repo_identity=self._repo_id or (self._repo_root.name if self._repo_root else "unknown"),
+                    reason=reason,
+                )
                 self._send_json(conn, {"ok": False, "error": "invalid_params"})
                 return
             try:

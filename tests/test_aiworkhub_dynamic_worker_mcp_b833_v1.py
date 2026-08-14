@@ -415,6 +415,130 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     }
 
 
+# ---------------------------------------------------------------------------
+# NF171: engine-authoritative analytics scope/cursor -- no wrapper-level
+# second filter or hidden cap on top of what analytics_query already decided
+# ---------------------------------------------------------------------------
+
+def _real_analytics_repo(tmp_path: Path, *, name: str = "analytics_repo") -> Path:
+    """A real, indexed repository (not the stubbed-engine ``_fake_repo``).
+
+    These tests assert that the MCP wrapper forwards ``target``/``cursor``
+    into the real ``analytics_query`` engine and does not re-derive scope on
+    top of its authoritative result, so they need genuine indexed rows.
+    """
+    repo = tmp_path / name
+    repo.mkdir(parents=True)
+    repository_state.bootstrap_repository(repo)
+    (repo / "pkg" / "in_scope").mkdir(parents=True)
+    (repo / "pkg" / "in_scope" / "mod.py").write_text(
+        "def alpha_symbol():\n    return 1\n\n\ndef beta_symbol():\n    return 2\n",
+        encoding="utf-8",
+    )
+    (repo / "pkg" / "other").mkdir(parents=True)
+    (repo / "pkg" / "other" / "mod.py").write_text(
+        "def gamma_symbol():\n    return 3\n", encoding="utf-8",
+    )
+    (repo / "pkg" / "many").mkdir(parents=True)
+    (repo / "pkg" / "many" / "mod.py").write_text(
+        "".join(f"def page_{i:02d}():\n    return {i}\n\n\n" for i in range(9)),
+        encoding="utf-8",
+    )
+    source_graph_mod.build_index(repo, incremental=True)
+    return repo
+
+
+def _analytics_ctx(repo: Path, *, targets: tuple[str, ...] = ()) -> w.WorkerToolContext:
+    return w.WorkerToolContext(
+        task_id="T-NF171", runner="r", topic="topic", request_id="req-nf171",
+        repo=repo, authority_repo=repo, source_graph_targets=targets,
+        session_topic="topic", audit_ledger_path=None, audit_hmac_key_path=None,
+    )
+
+
+def test_worker_source_graph_query_analytics_target_is_engine_authoritative(
+    tmp_path: Path,
+) -> None:
+    repo = _real_analytics_repo(tmp_path)
+    ctx = _analytics_ctx(repo)
+
+    result = w.source_graph_query(
+        ctx, mode="symbols", query="zzz_does_not_match_anything_zzz",
+        budget=10, target="pkg/in_scope",
+    )
+    assert result["ok"] is True
+    payload = json.loads(result["content"])
+    names = {row["name"] for row in payload["symbols"]}
+    assert names == {"alpha_symbol", "beta_symbol"}
+    assert "gamma_symbol" not in names
+    # The wrapper must not re-run its own generic path-prefix filter on top
+    # of the engine's already-scoped payload -- the engine's own coverage
+    # accounting is untouched evidence that no second filter pass ran.
+    assert payload["coverage"] == {
+        "scanned": 2, "eligible": 2, "eligible_capped": False,
+        "returned": 2, "requested_budget": 10, "effective_budget": 2,
+    }
+    assert payload["target"] == "pkg/in_scope"
+
+
+def test_worker_source_graph_query_analytics_scope_empty_stays_empty(
+    tmp_path: Path,
+) -> None:
+    repo = _real_analytics_repo(tmp_path)
+    ctx = _analytics_ctx(repo)
+
+    result = w.source_graph_query(
+        ctx, mode="symbols", query="zzz_does_not_match_anything_zzz",
+        budget=10, target="pkg/does_not_exist",
+    )
+    assert result["ok"] is True
+    payload = json.loads(result["content"])
+    assert payload.get("symbols") is None
+    assert payload["scope"] == "target_scope_empty"
+
+
+def test_worker_source_graph_query_cursor_rejected_for_non_analytic_mode(
+    tmp_path: Path,
+) -> None:
+    repo = _real_analytics_repo(tmp_path)
+    ctx = _analytics_ctx(repo)
+
+    result = w.source_graph_query(
+        ctx, mode="focus", query="alpha_symbol", cursor="0:deadbeefdeadbeef",
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "cursor_not_supported_for_mode"
+
+
+def test_worker_source_graph_query_analytics_cursor_roundtrip(tmp_path: Path) -> None:
+    # MIN_BUDGET floors every worker-requested budget at 8, so a corpus of
+    # exactly 2 rows (the ``pkg/in_scope`` fixture) can never force a second
+    # page through this wrapper -- 9 rows under ``pkg/many`` can.
+    repo = _real_analytics_repo(tmp_path)
+    ctx = _analytics_ctx(repo)
+
+    first = w.source_graph_query(
+        ctx, mode="symbols", query="zzz_does_not_match_anything_zzz",
+        budget=8, target="pkg/many",
+    )
+    assert first["ok"] is True
+    first_payload = json.loads(first["content"])
+    assert len(first_payload["symbols"]) == 8
+    next_cursor = first_payload["next_cursor"]
+    assert next_cursor is not None
+
+    second = w.source_graph_query(
+        ctx, mode="symbols", query="zzz_does_not_match_anything_zzz",
+        budget=8, target="pkg/many", cursor=next_cursor,
+    )
+    assert second["ok"] is True
+    second_payload = json.loads(second["content"])
+    assert len(second_payload["symbols"]) == 1
+    first_names = {row["name"] for row in first_payload["symbols"]}
+    assert second_payload["symbols"][0]["name"] not in first_names
+    assert second_payload["next_cursor"] is None
+
+
 def test_source_graph_cache_can_return_full_content_for_internal_evaluation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

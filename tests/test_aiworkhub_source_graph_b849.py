@@ -24,6 +24,7 @@ import json
 import sqlite3
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1398,7 +1399,27 @@ def test_multicore_extraction_is_bounded_and_merge_order_is_deterministic(
     for name in names:
         _write(repo / "pkg" / name, f"def {name[0]}():\n    return 1\n")
 
+    class _DeterministicProcessPoolExecutor:
+        """Drives the real process_pool success branch in-process so this
+        regression stays deterministic under sandboxes that deny process
+        creation, instead of silently falling back to one worker."""
+
+        def __init__(self, *, max_workers, mp_context=None):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def map(self, fn, iterable, chunksize=1):
+            return [fn(item) for item in iterable]
+
     monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "2")
+    monkeypatch.setattr(
+        sg.concurrent.futures, "ProcessPoolExecutor", _DeterministicProcessPoolExecutor
+    )
     original_write = sg._write_extraction
     write_order: list[str] = []
 
@@ -1726,6 +1747,339 @@ def test_source_graph_risk_views_are_explicit_nonblocking_candidates(tmp_path):
         for row in crash["analysis"]["findings"]
         for reason in row["reasons"]
     )
+
+
+# ---------------------------------------------------------------------------
+# NF171: engine-authoritative analytics scope, cursor pagination, coverage truth
+# ---------------------------------------------------------------------------
+
+_NO_MATCH_QUERY = "zzz_does_not_match_anything_zzz"
+
+
+def test_analytics_query_target_scope_filters_and_reports_coverage(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "in_scope" / "mod.py",
+        "def alpha_symbol():\n    return 1\n\n\ndef beta_symbol():\n    return 2\n",
+    )
+    _write(
+        repo / "pkg" / "other" / "mod.py",
+        "def gamma_symbol():\n    return 3\n",
+    )
+    sg.build_index(repo, incremental=True)
+
+    payload = sg.analytics_query(
+        repo, "symbols", _NO_MATCH_QUERY, budget=10, target="pkg/in_scope",
+    )
+    names = {row["name"] for row in payload["symbols"]}
+    assert names == {"alpha_symbol", "beta_symbol"}
+    assert payload["target"] == "pkg/in_scope"
+    assert payload["coverage"] == {
+        "scanned": 2, "eligible": 2, "eligible_capped": False,
+        "returned": 2, "requested_budget": 10, "effective_budget": 2,
+    }
+    assert payload["next_cursor"] is None
+    assert payload["truncated"] is False
+
+    unscoped = sg.analytics_query(repo, "symbols", _NO_MATCH_QUERY, budget=10)
+    unscoped_names = {row["name"] for row in unscoped["symbols"]}
+    assert unscoped_names >= {"alpha_symbol", "beta_symbol", "gamma_symbol"}
+
+
+def test_analytics_query_empty_scope_never_falls_back_to_repository_wide(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "mod.py", "def only_symbol():\n    return 1\n")
+    sg.build_index(repo, incremental=True)
+
+    payload = sg.analytics_query(
+        repo, "symbols", _NO_MATCH_QUERY, budget=10, target="pkg/does_not_exist",
+    )
+    assert payload.get("symbols") is None
+    assert payload["scope"] == "target_scope_empty"
+    assert payload["coverage"] == {
+        "scanned": 0, "eligible": 0, "eligible_capped": False,
+        "returned": 0, "requested_budget": 10, "effective_budget": 0,
+    }
+    assert payload["next_cursor"] is None
+
+
+def test_analytics_query_cursor_paginates_through_scoped_corpus(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "mod.py",
+        "def page_alpha():\n    return 1\n\n\n"
+        "def page_beta():\n    return 2\n\n\n"
+        "def page_gamma():\n    return 3\n",
+    )
+    sg.build_index(repo, incremental=True)
+
+    seen: list[str] = []
+    cursor = None
+    pages = 0
+    while True:
+        payload = sg.analytics_query(
+            repo, "symbols", _NO_MATCH_QUERY, budget=1, target="pkg", cursor=cursor,
+        )
+        assert len(payload["symbols"]) == 1
+        seen.append(payload["symbols"][0]["name"])
+        assert payload["coverage"]["requested_budget"] == 1
+        assert payload["coverage"]["effective_budget"] == 1
+        pages += 1
+        cursor = payload["next_cursor"]
+        if cursor is None:
+            assert payload["truncated"] is False
+            break
+        assert payload["truncated"] is True
+        assert pages < 10  # fail-fast guard against a pagination loop bug
+
+    assert pages == 3
+    assert seen == ["page_alpha", "page_beta", "page_gamma"]
+
+
+def test_analytics_query_rejects_stale_or_malformed_cursor(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "mod.py",
+        "def cursor_alpha():\n    return 1\n\n\ndef cursor_beta():\n    return 2\n",
+    )
+    sg.build_index(repo, incremental=True)
+
+    first = sg.analytics_query(repo, "symbols", _NO_MATCH_QUERY, budget=1)
+    valid_cursor = first["next_cursor"]
+    assert valid_cursor is not None
+
+    with pytest.raises(sg.SourceGraphError):
+        sg.analytics_query(repo, "symbols", "a_different_query", budget=1, cursor=valid_cursor)
+    with pytest.raises(sg.SourceGraphError):
+        sg.analytics_query(repo, "symbols", _NO_MATCH_QUERY, budget=2, cursor=valid_cursor)
+    with pytest.raises(sg.SourceGraphError):
+        sg.analytics_query(repo, "symbols", _NO_MATCH_QUERY, budget=1, cursor="not-a-cursor")
+    with pytest.raises(sg.SourceGraphError):
+        sg.analytics_query(repo, "symbols", _NO_MATCH_QUERY, budget=1, cursor="9999:deadbeefdeadbeef")
+
+
+def test_analytics_query_empty_repository_reports_zero_coverage(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    sg.build_index(repo, incremental=True)
+
+    payload = sg.analytics_query(repo, "symbols", _NO_MATCH_QUERY, budget=10)
+    assert payload["symbols"] == []
+    assert payload["coverage"] == {
+        "scanned": 0, "eligible": 0, "eligible_capped": False,
+        "returned": 0, "requested_budget": 10, "effective_budget": 0,
+    }
+    assert payload["next_cursor"] is None
+
+
+def _analytics_nested_repo_wide_counts(node):
+    """Every ``files``/``entities`` int counter anywhere in the payload."""
+
+    found = []
+    if isinstance(node, dict):
+        if isinstance(node.get("files"), int):
+            found.append(("files", node["files"]))
+        if isinstance(node.get("entities"), int):
+            found.append(("entities", node["entities"]))
+        for value in node.values():
+            found.extend(_analytics_nested_repo_wide_counts(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_analytics_nested_repo_wide_counts(item))
+    return found
+
+
+def test_analytics_query_stats_summary_gaps_never_leak_repository_wide_scope(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "inside" / "mod.py",
+        "def alpha_symbol():\n    return 1\n\n\ndef beta_symbol():\n    return 2\n",
+    )
+    _write(repo / "pkg" / "other" / "mod.py", "def gamma_symbol():\n    return 3\n")
+    sg.build_index(repo, incremental=True)
+
+    byte_cap = max(512, 1 * 768)
+    for mode in ("stats", "summarize", "gaps", "pipeline"):
+        payload = sg.analytics_query(
+            repo, mode, _NO_MATCH_QUERY, budget=1, target="pkg/inside",
+        )
+        # Byte cap: the fully assembled response -- content plus the
+        # coverage/cursor block itself -- must fit under the cap, not just
+        # the per-mode content that existed before coverage was attached.
+        assert len(json.dumps(payload).encode("utf-8")) <= byte_cap
+        assert payload["target"] == "pkg/inside"
+        # ``pkg/inside`` has exactly 2 scoped entities across 1 file; every
+        # ``files``/``entities`` counter anywhere in the nested payload
+        # (e.g. a per-mode "repository summary" object) must reflect that
+        # scope, never the repository-wide totals (2 files / 5 entities).
+        assert payload["coverage"]["scanned"] == 2
+        for label, value in _analytics_nested_repo_wide_counts(payload):
+            assert value <= 2, f"{mode}.{label} leaked repository-wide count: {value}"
+        # ``effective_budget`` must describe what this page actually
+        # delivered, not a generic corpus-page length independent of the
+        # mode's own (possibly zero) result.
+        assert payload["coverage"]["effective_budget"] == payload["coverage"]["returned"]
+
+    # ``pkg/inside`` owns exactly 1 file, 2 functions, 1 module entity and
+    # 2 "defines" edges. ``stats``/``summarize`` must report those *exact*
+    # scoped values -- not merely "no bigger than 2" -- for every aggregate
+    # a per-mode analytic nests (``files_by_language``, ``entities_by_kind``,
+    # ``edges``), never the repository-wide totals (2 files, 3 functions,
+    # 2 modules, 3 edges, ``files_by_language`` python=2).
+    expected_scoped_summary = {
+        "files": 1,
+        "entities": 2,
+        "entities_by_kind": {"function": 2, "module": 1},
+        "files_by_language": {"python": 1},
+        "edges": 2,
+    }
+    stats_payload = sg.analytics_query(
+        repo, "stats", _NO_MATCH_QUERY, budget=1, target="pkg/inside",
+    )
+    for key, expected in expected_scoped_summary.items():
+        assert stats_payload[key] == expected, f"stats.{key}"
+    summarize_payload = sg.analytics_query(
+        repo, "summarize", _NO_MATCH_QUERY, budget=1, target="pkg/inside",
+    )
+    for key, expected in expected_scoped_summary.items():
+        assert summarize_payload["repository"][key] == expected, f"summarize.repository.{key}"
+
+    # Scoping must never leak the other direction either: an unscoped call
+    # still sees the true repository-wide totals.
+    unscoped = sg.analytics_query(repo, "stats", _NO_MATCH_QUERY, budget=1)
+    assert unscoped["files"] == 2
+    assert unscoped["entities_by_kind"] == {"function": 3, "module": 2}
+    assert unscoped["files_by_language"] == {"python": 2}
+    assert unscoped["edges"] == 3
+
+
+def test_scoped_repo_aggregates_matches_owning_file_boundary(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "inside" / "mod.py",
+        "def alpha_symbol():\n    return 1\n\n\ndef beta_symbol():\n    return 2\n",
+    )
+    _write(repo / "pkg" / "other" / "mod.py", "def gamma_symbol():\n    return 3\n")
+    sg.build_index(repo, incremental=True)
+
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        aggregates = sg._scoped_repo_aggregates(conn, "pkg/inside")
+    finally:
+        conn.close()
+    assert aggregates == {
+        "files_by_language": {"python": 1},
+        "entities_by_kind": {"function": 2, "module": 1},
+        "edges": 2,
+    }
+
+
+def test_analytics_row_in_scope_keeps_out_of_scope_import_call_edges():
+    # A row owned by an in-scope file must stay in scope even when its
+    # target crosses outside that scope -- an in-scope file importing or
+    # calling an out-of-scope symbol is exactly the evidence a bounded
+    # scope query should surface for the file it owns, not evidence to
+    # silently drop because the *target* happens to live elsewhere.
+    owned_edge = {"file_path": "pkg/inside/mod.py", "dst_file_path": "pkg/other/mod.py"}
+    assert sg._analytics_row_in_scope(owned_edge, "pkg/inside") is True
+
+    # A row owned by an out-of-scope file must still be dropped, even when
+    # its target happens to land inside the scope.
+    foreign_edge = {"file_path": "pkg/other/mod.py", "dst_file_path": "pkg/inside/mod.py"}
+    assert sg._analytics_row_in_scope(foreign_edge, "pkg/inside") is False
+
+    src_field_variant = {
+        "src_file_path": "pkg/inside/mod.py", "dst_file": "pkg/other/mod.py",
+    }
+    assert sg._analytics_row_in_scope(src_field_variant, "pkg/inside") is True
+
+
+def test_analytics_query_never_pages_into_a_duplicate_result(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "inside" / "mod.py",
+        "def alpha_symbol():\n    return 1\n\n\ndef beta_symbol():\n    return 2\n",
+    )
+    _write(repo / "pkg" / "other" / "mod.py", "def gamma_symbol():\n    return 3\n")
+    sg.build_index(repo, incremental=True)
+
+    for mode in ("stats", "summarize", "gaps", "pipeline"):
+        payload = sg.analytics_query(
+            repo, mode, _NO_MATCH_QUERY, budget=1, target="pkg/inside",
+        )
+        cursor = payload["next_cursor"]
+        if cursor is None:
+            # No second page was offered at all -- the safest way to never
+            # repeat a result is to not paginate past it in the first place.
+            continue
+        payload2 = sg.analytics_query(
+            repo, mode, _NO_MATCH_QUERY, budget=1, target="pkg/inside", cursor=cursor,
+        )
+        content1 = {k: v for k, v in payload.items() if k not in ("cursor", "next_cursor")}
+        content2 = {k: v for k, v in payload2.items() if k not in ("cursor", "next_cursor")}
+        assert content1 != content2, f"{mode} page 2 repeated page 1 verbatim"
+
+
+def test_analytics_query_aggregate_modes_reject_a_forged_cursor(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "mod.py", "def only_symbol():\n    return 1\n")
+    sg.build_index(repo, incremental=True)
+
+    # ``stats``/``pipeline`` never mint a cursor of their own (see
+    # ``_ANALYTICS_RESULT_KEYS``); a nonzero-offset cursor forged with the
+    # engine's own encoder must still be rejected rather than silently
+    # accepted as a second, identical page.
+    for mode in ("stats", "pipeline"):
+        forged = sg._encode_analytics_cursor(
+            1, mode=mode, query=_NO_MATCH_QUERY, target="", budget=1,
+        )
+        with pytest.raises(sg.SourceGraphError):
+            sg.analytics_query(repo, mode, _NO_MATCH_QUERY, budget=1, cursor=forged)
+
+
+def test_javascript_same_file_import_bindings_resolve_deterministically(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "src" / "a" / "deep" / "target.js",
+        "function helper() {\n  return 1;\n}\n",
+    )
+    _write(
+        repo / "src" / "a" / "main.js",
+        "import { helper } from './deep/target';\n\n"
+        "function run() {\n  return helper();\n}\n",
+    )
+    _write(repo / "src" / "a" / "other.js", "function otherHelper() {\n  return 1;\n}\n")
+    _write(repo / "src" / "b" / "other.js", "function otherHelper() {\n  return 2;\n}\n")
+    _write(
+        repo / "src" / "a" / "main2.js",
+        "import { otherHelper } from './other';\n\n"
+        "function run2() {\n  return otherHelper();\n}\n",
+    )
+    _write(repo / "src" / "a" / "unpackaged.js", "import react from 'react';\n")
+    sg.build_index(repo, incremental=True)
+
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        unique_import = conn.execute(
+            "SELECT dst_qualname, evidence_label FROM edges WHERE kind='imports' "
+            "AND file_path='src/a/main.js' AND dst_name='./deep/target'"
+        ).fetchone()
+        assert unique_import["dst_qualname"] == "src/a/deep/target.js"
+        assert unique_import["evidence_label"] == sgast.EXTRACTED
+
+        ambiguous_import = conn.execute(
+            "SELECT dst_qualname, evidence_label FROM edges WHERE kind='imports' "
+            "AND file_path='src/a/main2.js' AND dst_name='./other'"
+        ).fetchone()
+        assert ambiguous_import["dst_qualname"] is None
+        assert ambiguous_import["evidence_label"] == sgast.AMBIGUOUS
+
+        package_import = conn.execute(
+            "SELECT dst_qualname, evidence_label FROM edges WHERE kind='imports' "
+            "AND file_path='src/a/unpackaged.js' AND dst_name='react'"
+        ).fetchone()
+        assert package_import["dst_qualname"] is None
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2308,3 +2662,483 @@ def test_rework_overlay_is_wired_into_production_source_graph_query(tmp_path):
 
     canonical = sg.body_query(authority, "later_rework_symbol", 16)
     assert canonical["matches"] == []
+
+
+# ---------------------------------------------------------------------------
+# NF149: multicore extraction -- bounded worker selection, ordered
+# single-writer merge, and a truthful sequential_fallback receipt when the
+# sandbox denies process creation.  Determinism must not depend on whether
+# the validation sandbox actually permits ``ProcessPoolExecutor`` to spawn
+# real OS processes, so every test below replaces
+# ``concurrent.futures.ProcessPoolExecutor`` with an in-process stand-in.
+# ---------------------------------------------------------------------------
+
+
+def test_extraction_worker_count_env_override_is_bounded_by_ceiling_and_candidates(
+    monkeypatch,
+):
+    monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "999")
+    assert (
+        sg._source_graph_extract_workers(50, sg.MIN_PARALLEL_EXTRACTION_BYTES)
+        == sg.MAX_SOURCE_GRAPH_EXTRACT_WORKERS
+    )
+
+    monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "4")
+    assert (
+        sg._source_graph_extract_workers(50, sg.MIN_PARALLEL_EXTRACTION_BYTES)
+        == 4
+    )
+
+    # The override can never exceed the candidate count either -- a small
+    # incremental refresh must not fan out more workers than files.
+    monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "4")
+    assert sg._source_graph_extract_workers(2, sg.MIN_PARALLEL_EXTRACTION_BYTES) == 2
+
+
+def test_multicore_extraction_bounded_workers_and_ordered_single_writer_merge(
+    tmp_path, monkeypatch,
+):
+    """Extraction width stays bounded and the SQLite merge preserves
+    ``Executor.map``'s submission order even when workers "complete" in a
+    scrambled order -- proven without depending on the sandbox's ability to
+    spawn real OS processes."""
+    repo = _new_repo(tmp_path, "multicore_ordered_merge")
+    names = [f"m{i:02d}" for i in range(10)]
+    for name in names:
+        _write(repo / "src" / f"{name}.py", f"def {name}():\n    return 1\n")
+
+    submitted_order = []
+
+    class _ScrambledCompletionPool:
+        def __init__(self, *, max_workers, mp_context=None):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def map(self, fn, iterable, chunksize=1):
+            items = list(iterable)
+            submitted_order.extend(item[2] for item in items)
+            # Compute out of submission order to prove the merge relies on
+            # ``Executor.map``'s order guarantee, not completion order.
+            computed = {item[2]: fn(item) for item in reversed(items)}
+            return [computed[item[2]] for item in items]
+
+    monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "4")
+    monkeypatch.setattr(sg.concurrent.futures, "ProcessPoolExecutor", _ScrambledCompletionPool)
+
+    write_order = []
+    real_write_extraction = sg._write_extraction
+
+    def _recording_write_extraction(conn, extraction, **kwargs):
+        write_order.append(extraction.file_path)
+        return real_write_extraction(conn, extraction, **kwargs)
+
+    monkeypatch.setattr(sg, "_write_extraction", _recording_write_extraction)
+
+    report = sg.build_index(repo)
+
+    assert report.errors == []
+    assert report.extraction_workers == 4
+    assert report.extraction_backend == "process_pool"
+    assert report.extraction_fallback_reason == ""
+    assert len(submitted_order) >= len(names)
+    assert write_order == submitted_order
+    expected_rel_paths = {f"src/{name}.py" for name in names}
+    assert expected_rel_paths.issubset(set(write_order))
+
+
+def test_multicore_extraction_denied_process_creation_yields_truthful_sequential_fallback(
+    tmp_path, monkeypatch,
+):
+    """A sandbox that denies process creation degrades to a truthful
+    sequential extraction, not a false build failure."""
+    repo = _new_repo(tmp_path, "multicore_denied_spawn")
+    names = [f"d{i:02d}" for i in range(10)]
+    for name in names:
+        _write(repo / "src" / f"{name}.py", f"def {name}():\n    return 1\n")
+
+    class _DeniedProcessCreationPool:
+        def __init__(self, *, max_workers, mp_context=None):
+            raise PermissionError("process creation denied by sandbox")
+
+    monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "4")
+    monkeypatch.setattr(sg.concurrent.futures, "ProcessPoolExecutor", _DeniedProcessCreationPool)
+
+    report = sg.build_index(repo)
+
+    assert report.errors == []
+    assert report.extraction_workers == 1
+    assert report.extraction_backend == "sequential_fallback"
+    assert report.extraction_fallback_reason == "PermissionError"
+    assert report.extraction_telemetry.get("selected_workers") == 1
+    assert report.extraction_telemetry.get("reason") == "fallback_PermissionError"
+
+    # The fallback still produced a complete, queryable generation -- the
+    # denied spawn degraded the extraction backend, not the product's truth.
+    for name in names:
+        assert sg.body_query(repo, name, 16)["matches"]
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00204: ``_index_quality_scorecard`` per-language aggregation must
+# never join ``files`` to both ``entities`` and ``edges`` in one statement
+# (that Cartesian product is what stalled a 691-file unchanged incremental
+# refresh for ~11 CPU-minutes) and the separate pre-aggregated queries it
+# replaced that join with must still add up to the same truth under
+# high-fanout data and across multiple files sharing one language.
+# ---------------------------------------------------------------------------
+
+
+def test_index_quality_scorecard_never_joins_entities_and_edges_in_one_statement(
+    tmp_path,
+):
+    """Query-plan regression: no captured statement may directly JOIN both
+    ``entities`` and ``edges`` to ``files`` -- that shape is exactly the
+    Cartesian fan-out this fix eliminated."""
+    repo = _new_repo(tmp_path, "quality_no_cartesian_join")
+    # A high-fanout file: several entities each with several outgoing edges,
+    # so a reintroduced files->entities->edges join would multiply rows.
+    lines = [f"def fn{i}():\n    return {i}\n" for i in range(6)]
+    lines.append(
+        "def caller():\n"
+        + "".join(f"    fn{i}()\n" for i in range(6))
+        + "    missing_one()\n    missing_two()\n"
+    )
+    _write(repo / "pkg" / "fanout.py", "".join(lines))
+    sg.build_index(repo, incremental=False)
+
+    db_path = sg.resolve_db_path(repo)
+    conn = sg.connect(db_path, read_only=True)
+    captured_sql: list[str] = []
+    conn.set_trace_callback(captured_sql.append)
+    try:
+        quality = sg._index_quality_scorecard(
+            conn, db_path, finished_at="2026-08-14T00:00:00+00:00", previous=None,
+        )
+    finally:
+        conn.set_trace_callback(None)
+        conn.close()
+
+    assert captured_sql, "expected the scorecard to execute at least one query"
+    for statement in captured_sql:
+        normalized = " ".join(statement.split()).lower()
+        if "join entities" in normalized and "join edges" in normalized:
+            pytest.fail(
+                "index quality scorecard rejoined files to both entities and "
+                f"edges in one statement: {statement}"
+            )
+
+    # Sanity: the high-fanout data was actually measured, not silently
+    # skipped by the rewritten aggregation.
+    assert quality["by_language"]["python"]["entities"] >= 7
+    assert quality["by_language"]["python"]["edges"] >= 8
+    assert quality["edges"]["resolved"] >= 6
+    assert quality["edges"]["unresolved"] >= 2
+
+
+def test_index_quality_scorecard_by_language_matches_naive_per_table_counts(
+    tmp_path,
+):
+    """Equivalence regression: the pre-aggregated by-language rollup must
+    still equal independently computed, single-table ground truth -- across
+    two files that share one language -- after replacing the joined query
+    with separate per-table aggregations."""
+    repo = _new_repo(tmp_path, "quality_equivalence")
+    _write(
+        repo / "pkg" / "a.py",
+        "def a_one():\n    return 1\n\ndef a_two():\n    return 2\n",
+    )
+    _write(
+        repo / "pkg" / "b.py",
+        "def b_caller():\n    a_one()\n    a_two()\n    ghost_call()\n",
+    )
+    sg.build_index(repo, incremental=False)
+
+    db_path = sg.resolve_db_path(repo)
+    conn = sg.connect(db_path, read_only=True)
+    try:
+        quality = sg._index_quality_scorecard(
+            conn, db_path, finished_at="2026-08-14T00:00:00+00:00", previous=None,
+        )
+        naive_files = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM files WHERE language='python'"
+            ).fetchone()[0]
+        )
+        naive_entities = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM entities en JOIN files f "
+                "ON f.file_path=en.file_path WHERE f.language='python'"
+            ).fetchone()[0]
+        )
+        naive_edges = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM edges e JOIN files f "
+                "ON f.file_path=e.file_path WHERE f.language='python'"
+            ).fetchone()[0]
+        )
+        naive_resolved = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM edges e JOIN files f "
+                "ON f.file_path=e.file_path WHERE f.language='python' "
+                "AND e.dst_qualname IS NOT NULL AND e.dst_qualname != '' "
+                "AND EXISTS (SELECT 1 FROM entities d WHERE d.qualname=e.dst_qualname)"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+
+    python_row = quality["by_language"]["python"]
+    assert python_row["files"] == naive_files == 2
+    assert python_row["entities"] == naive_entities
+    assert python_row["edges"] == naive_edges
+    assert python_row["resolved_edges"] == naive_resolved
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00205: hash-authoritative bounded incremental indexing.  size/mtime
+# are hints only -- content hashing (not the stat hint) decides changed vs.
+# unchanged, delete/rename truth and the single-writer atomic merge are
+# preserved, and a true no-op generation reuses its prior quality metrics
+# instead of re-running graph-wide SQL.
+# ---------------------------------------------------------------------------
+
+
+def test_same_size_same_mtime_content_mutation_is_reindexed_via_hash(tmp_path):
+    """A stat hint alone would call this file unchanged; content hashing
+    must catch the mutation and force reindexing anyway."""
+
+    repo = _new_repo(tmp_path, "same_size_same_mtime_mutation")
+    target = repo / "pkg" / "a.py"
+    _write(target, "def a():\n    return 1\n")
+    r1 = sg.build_index(repo, incremental=True)
+    assert r1.files_changed == 1
+    assert r1.hash_candidates == 0
+
+    new_content = "def a():\n    return 2\n"
+    assert len(new_content) == len(target.read_text(encoding="utf-8"))
+    target.write_text(new_content, encoding="utf-8")
+
+    # Recreate the exact "same size, same mtime" hint condition without
+    # depending on ``os.utime`` (unavailable/unpermitted under some
+    # sandboxes and coarse filesystem timestamp resolutions): pin the
+    # stored stat hint to the file's *current* on-disk stat directly, so
+    # only content hashing -- never the hint -- can catch the mutation.
+    current_stat = target.stat()
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE files SET file_size=?, mtime_ns=? WHERE file_path='pkg/a.py'",
+                (int(current_stat.st_size), int(current_stat.st_mtime_ns)),
+            )
+    finally:
+        conn.close()
+
+    r2 = sg.build_index(repo, incremental=True)
+    assert r2.hash_candidates == 1
+    assert r2.hash_mismatched == 1
+    assert r2.hash_reused == 0
+    assert r2.files_changed == 1
+    assert r2.files_unchanged == 0
+
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        row = conn.execute(
+            "SELECT source_hash FROM files WHERE file_path='pkg/a.py'"
+        ).fetchone()
+        assert row["source_hash"] == sgast.sha256_bytes(new_content.encode("utf-8"))
+    finally:
+        conn.close()
+
+
+def test_create_delete_rename_are_correct_under_hash_authoritative_reconciliation(
+    tmp_path,
+):
+    repo = _new_repo(tmp_path, "create_delete_rename_hash")
+    _write(repo / "pkg" / "keep.py", "def keep():\n    return 1\n")
+    _write(repo / "pkg" / "old.py", "def old():\n    return 2\n")
+    r1 = sg.build_index(repo, incremental=True)
+    assert r1.files_changed == 2
+
+    (repo / "pkg" / "old.py").rename(repo / "pkg" / "renamed.py")
+    _write(repo / "pkg" / "new.py", "def brand_new():\n    return 3\n")
+
+    r2 = sg.build_index(repo, incremental=True)
+    assert r2.files_removed == 1
+    assert r2.files_changed == 2
+    assert r2.files_unchanged == 1
+    # ``keep.py`` is the only file whose stat hint matched -- it must be
+    # reconciled through the hash phase, not skipped for free.
+    assert r2.hash_candidates == 1
+    assert r2.hash_reused == 1
+
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        old_context = sg.context(conn, "pkg/old.py")
+        assert old_context["found"] is False
+        assert old_context["entities"] == []
+        stale_rows = conn.execute(
+            "SELECT COUNT(*) FROM entities WHERE file_path='pkg/old.py'"
+        ).fetchone()[0]
+        assert stale_rows == 0
+        renamed_matches = sg.func(conn, "old")
+        assert len(renamed_matches) == 1
+        assert renamed_matches[0]["file_path"] == "pkg/renamed.py"
+        assert len(sg.func(conn, "brand_new")) == 1
+        assert len(sg.func(conn, "keep")) == 1
+    finally:
+        conn.close()
+
+
+def test_hash_phase_fail_closed_on_unstable_read_forces_extraction(
+    tmp_path, monkeypatch,
+):
+    """A file racing a concurrent writer must never be trusted as
+    unchanged by the fast hash path: an unstable stat straddle fails
+    closed to full re-extraction, which then correctly reconfirms the
+    file's true (unchanged) content instead of silently skipping it."""
+
+    repo = _new_repo(tmp_path, "concurrent_mutation")
+    target = repo / "pkg" / "a.py"
+    _write(target, "def a():\n    return 1\n")
+    r1 = sg.build_index(repo, incremental=True)
+    assert r1.files_changed == 1
+
+    real_stable_hash = sg._stable_content_hash
+
+    def unstable_for_target(path):
+        if path.name == "a.py":
+            return None
+        return real_stable_hash(path)
+
+    monkeypatch.setattr(sg, "_stable_content_hash", unstable_for_target)
+
+    original_extract = sgast.extract_file
+    extracted: list[str] = []
+
+    def counted_extract(repo_root, path, *, build_revision):
+        extracted.append(path.relative_to(repo_root).as_posix())
+        return original_extract(repo_root, path, build_revision=build_revision)
+
+    monkeypatch.setattr(sgast, "extract_file", counted_extract)
+
+    r2 = sg.build_index(repo, incremental=True)
+    assert r2.hash_candidates == 1
+    assert r2.hash_unstable == 1
+    assert r2.hash_mismatched == 0
+    # Fail closed: the unstable read forced a real re-extraction pass...
+    assert extracted == ["pkg/a.py"]
+    # ...which then correctly reconfirms the content is truly unchanged,
+    # rather than fabricating a false "changed" count.
+    assert r2.files_changed == 0
+    assert r2.files_unchanged == 1
+
+
+def test_hash_worker_count_env_override_is_bounded_by_ceiling_and_candidates(
+    monkeypatch,
+):
+    monkeypatch.setenv(sg.SOURCE_GRAPH_HASH_WORKERS_ENV, "999")
+    assert (
+        sg._source_graph_hash_workers(50, sg.MIN_PARALLEL_HASH_BYTES)
+        == sg.MAX_SOURCE_GRAPH_HASH_WORKERS
+    )
+
+    monkeypatch.setenv(sg.SOURCE_GRAPH_HASH_WORKERS_ENV, "4")
+    assert sg._source_graph_hash_workers(50, sg.MIN_PARALLEL_HASH_BYTES) == 4
+
+    # The override can never exceed the candidate count either.
+    monkeypatch.setenv(sg.SOURCE_GRAPH_HASH_WORKERS_ENV, "4")
+    assert sg._source_graph_hash_workers(2, sg.MIN_PARALLEL_HASH_BYTES) == 2
+
+
+def test_hash_worker_count_below_threshold_stays_serial(monkeypatch):
+    monkeypatch.delenv(sg.SOURCE_GRAPH_HASH_WORKERS_ENV, raising=False)
+    assert sg._source_graph_hash_workers(3, sg.MIN_PARALLEL_HASH_BYTES) == 1
+    assert sg._source_graph_hash_workers(50, 10) == 1
+
+
+def test_unchanged_refresh_uses_bounded_parallel_hash_workers(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "hash_bounded_parallel")
+    for i in range(12):
+        _write(
+            repo / "pkg" / f"m{i}.py",
+            f"def fn_{i}():\n    return {i}\n" * 50,
+        )
+    r1 = sg.build_index(repo, incremental=False)
+    assert r1.files_changed == 12
+
+    monkeypatch.setenv(sg.SOURCE_GRAPH_HASH_WORKERS_ENV, "3")
+    r2 = sg.build_index(repo, incremental=True)
+    assert r2.hash_candidates == 12
+    assert r2.hash_reused == 12
+    assert r2.hash_mismatched == 0
+    assert r2.hash_unstable == 0
+    assert r2.hash_workers == 3
+    assert r2.hash_backend == "thread_pool"
+    assert r2.hash_telemetry["reason"] == "env_override"
+    assert r2.files_changed == 0
+    assert r2.files_unchanged == 12
+
+
+def test_noop_refresh_reuses_quality_metrics_without_graph_wide_recompute(
+    tmp_path, monkeypatch,
+):
+    repo = _new_repo(tmp_path, "quality_reuse_equivalence")
+    _write(repo / "pkg" / "a.py", "def a():\n    return 1\n\ndef b():\n    a()\n")
+    r1 = sg.build_index(repo, incremental=True)
+    assert r1.quality_reused is False
+
+    calls: list[int] = []
+    original_scorecard = sg._index_quality_scorecard
+
+    def tracked_scorecard(*args, **kwargs):
+        calls.append(1)
+        return original_scorecard(*args, **kwargs)
+
+    monkeypatch.setattr(sg, "_index_quality_scorecard", tracked_scorecard)
+
+    r2 = sg.build_index(repo, incremental=True)
+    assert r2.files_changed == 0 and r2.files_removed == 0
+    assert r2.quality_reused is True
+    assert calls == []
+
+    # Metric equivalence: every measured field carries forward unchanged
+    # from the last real generation -- only the receipt timestamp advances.
+    assert r2.index_quality["edges"] == r1.index_quality["edges"]
+    assert r2.index_quality["by_language"] == r1.index_quality["by_language"]
+    assert r2.index_quality["artifacts"] == r1.index_quality["artifacts"]
+    assert r2.index_quality["finished_at"] == r2.finished_at
+    assert r2.index_quality["finished_at"] != r1.index_quality["finished_at"]
+
+
+def test_live_like_noop_refresh_stays_fast_with_hash_and_quality_reuse(tmp_path):
+    """A no-op refresh over a moderately sized index must reach a truthful
+    terminal report quickly: the hash phase only reads bytes and the
+    quality scorecard is reused rather than recomputed graph-wide."""
+
+    repo = _new_repo(tmp_path, "live_like_noop_latency")
+    for i in range(60):
+        callees = "".join(f"    fn_{j}_0()\n" for j in range(max(0, i - 1), i))
+        _write(
+            repo / f"mod_{i}.py",
+            f"def fn_{i}_0():\n    return {i}\n"
+            f"def fn_{i}_1():\n{callees}    missing_{i}()\n",
+        )
+    r1 = sg.build_index(repo, incremental=False)
+    assert r1.files_changed == 60
+
+    started = time.monotonic()
+    r2 = sg.build_index(repo, incremental=True)
+    elapsed = time.monotonic() - started
+
+    assert r2.files_changed == 0
+    assert r2.files_removed == 0
+    assert r2.hash_candidates == 60
+    assert r2.hash_reused == 60
+    assert r2.quality_reused is True
+    assert elapsed < 15.0, f"no-op refresh with hash reconciliation took {elapsed:.2f}s"

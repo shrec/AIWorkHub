@@ -1139,3 +1139,185 @@ def test_installer_never_touches_vscode_settings_or_sideband_dir(tmp_path, monke
 
 def _watched_paths() -> list[Path]:
     return [default_sideband_dir()]
+
+
+def test_dispatch_sideband_rejects_empty_string_params_before_child_write(tmp_path):
+    mux = _dispatch_only_mux(tmp_path)
+    written: list[bytes] = []
+    mux._write_to_child = lambda raw: written.append(raw)
+
+    with pytest.raises(app_server_mux.SidebandRejected) as exc_info:
+        mux.dispatch_sideband("thread/resume", "")
+
+    assert str(exc_info.value) == "invalid_params:empty_string"
+    assert written == []
+
+
+@pytest.mark.parametrize("bad_params", [[], 5, True, "not empty", 1.5])
+def test_dispatch_sideband_rejects_non_object_params_before_child_write(tmp_path, bad_params):
+    mux = _dispatch_only_mux(tmp_path)
+    written: list[bytes] = []
+    mux._write_to_child = lambda raw: written.append(raw)
+
+    with pytest.raises(app_server_mux.SidebandRejected) as exc_info:
+        mux.dispatch_sideband("thread/resume", bad_params)
+
+    assert str(exc_info.value) == f"invalid_params:non_object:{type(bad_params).__name__}"
+    assert written == []
+
+
+def test_dispatch_sideband_accepts_valid_object_params_and_reaches_child(tmp_path):
+    mux = _dispatch_only_mux(tmp_path)
+    written: list[dict] = []
+
+    def write(raw: bytes) -> None:
+        request = json.loads(raw)
+        written.append(request)
+        response = {"id": request["id"], "result": {"threadId": request["params"]["threadId"]}}
+        mux._route_child_message((json.dumps(response) + "\n").encode("utf-8"))
+
+    mux._write_to_child = write
+
+    result = mux.dispatch_sideband("thread/resume", {"threadId": "x"})
+
+    assert result["result"]["threadId"] == "x"
+    assert len(written) == 1
+
+
+def test_malformed_params_reject_independently_without_blocking_valid_clients(tmp_path):
+    """B: an empty-string/non-object params call must fail on its own lane --
+    it must never poison, retry, or block concurrent valid sideband callers."""
+
+    mux = _dispatch_only_mux(tmp_path)
+    written: list[dict] = []
+    write_lock = threading.Lock()
+
+    def write(raw: bytes) -> None:
+        with write_lock:
+            request = json.loads(raw)
+            written.append(request)
+        response = {"id": request["id"], "result": {"threadId": request["params"]["threadId"]}}
+        mux._route_child_message((json.dumps(response) + "\n").encode("utf-8"))
+
+    mux._write_to_child = write
+
+    results: dict[str, object] = {}
+    barrier = threading.Barrier(3)
+
+    def call_valid(name: str) -> None:
+        barrier.wait(timeout=5)
+        results[name] = mux.dispatch_sideband("thread/resume", {"threadId": name})
+
+    def call_invalid() -> None:
+        barrier.wait(timeout=5)
+        try:
+            mux.dispatch_sideband("thread/resume", "")
+        except app_server_mux.SidebandRejected as exc:
+            results["invalid"] = exc
+
+    threads = [
+        threading.Thread(target=call_valid, args=("a",)),
+        threading.Thread(target=call_valid, args=("b",)),
+        threading.Thread(target=call_invalid),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert results["a"]["result"]["threadId"] == "a"
+    assert results["b"]["result"]["threadId"] == "b"
+    assert isinstance(results["invalid"], app_server_mux.SidebandRejected)
+    assert len(written) == 2
+
+
+def test_dispatch_sideband_invalid_params_records_one_bounded_durable_alert(tmp_path):
+    mux = _dispatch_only_mux(tmp_path)
+    mux._repo_root = tmp_path
+    mux._repo_id = "test-repo"
+    alert_path = tmp_path / ".aiworkhub" / "runtime" / "mcp_protocol_alerts.json"
+
+    with pytest.raises(app_server_mux.SidebandRejected):
+        mux.dispatch_sideband("thread/resume", "")
+
+    payload = json.loads(alert_path.read_text(encoding="utf-8"))
+    assert payload["count"] == 1
+    latest = payload["latest"]
+    assert latest["method"] == "thread/resume"
+    assert latest["boundary"] == "app_server_mux_sideband"
+    assert latest["reason"] == "invalid_params:empty_string"
+    assert latest["repo_identity"] == "test-repo"
+    assert latest["request_id"] is None
+    assert isinstance(latest["timestamp"], str) and latest["timestamp"]
+    # Bounded/redacted: no raw "params" key and no raw rejected payload value
+    # (the empty string that was rejected) anywhere in the serialized record.
+    # The safe bounded reason string, which happens to contain the substring
+    # "params" inside "invalid_params", is explicitly allowed.
+    assert set(latest.keys()) == {
+        "method",
+        "request_id",
+        "boundary",
+        "reason",
+        "repo_identity",
+        "timestamp",
+    }
+    assert "params" not in payload
+    assert "" not in latest.values()
+
+    with pytest.raises(app_server_mux.SidebandRejected):
+        mux.dispatch_sideband("thread/resume", [1, 2])
+
+    payload = json.loads(alert_path.read_text(encoding="utf-8"))
+    assert payload["count"] == 2
+    assert payload["latest"]["reason"] == "invalid_params:non_object:list"
+
+
+def test_dispatch_sideband_invalid_params_skips_alert_without_repo_root(tmp_path):
+    mux = _dispatch_only_mux(tmp_path)
+    assert mux._repo_root is None
+
+    with pytest.raises(app_server_mux.SidebandRejected):
+        mux.dispatch_sideband("thread/resume", "")
+
+    assert not (tmp_path / ".aiworkhub").exists()
+
+
+def test_bind_and_connect_sideband_socket_survive_a_long_retained_workspace_path(tmp_path):
+    """Regression for NF-2026-00203 rework: a retained validation workspace
+    (this worktree) can itself already be deep enough that even a short
+    instance-id filename under it overflows AF_UNIX's ~108-byte
+    ``sun_path``. ``bind_sideband_listener``/``connect_sideband_socket``
+    must still succeed by binding/connecting with a CWD-relative filename
+    -- never by relocating the endpoint outside the caller's own
+    ``sideband_dir`` (no /tmp, /var/tmp, /dev/shm, or machine-wide
+    fallback)."""
+    if not app_server_mux.sideband_uses_unix_socket():
+        pytest.skip("AF_UNIX-specific regression")
+
+    deep = tmp_path
+    while len(str(deep)) < 200:
+        deep = deep / "nested_segment_to_force_a_long_retained_workspace_path"
+    deep.mkdir(parents=True, mode=0o700)
+    assert len(str(deep)) > 108
+
+    path = deep / "12345678.sock"
+    srv = app_server_mux.bind_sideband_listener(path)
+    srv.listen(1)
+    try:
+        assert path.exists()
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+        client = app_server_mux.connect_sideband_socket(path, timeout=5)
+        try:
+            conn, _ = srv.accept()
+            try:
+                client.sendall(b"ping")
+                assert conn.recv(4) == b"ping"
+            finally:
+                conn.close()
+        finally:
+            client.close()
+    finally:
+        srv.close()
+        with contextlib.suppress(FileNotFoundError, OSError):
+            os.unlink(path)

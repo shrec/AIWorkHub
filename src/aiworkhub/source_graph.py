@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import fnmatch
+import hashlib
 import json
 import multiprocessing
 import os
@@ -77,6 +78,7 @@ SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
 )
 
 MAX_BUDGET_ROWS = 200
+MAX_ANALYTICS_CORPUS_ROWS = 4000
 MAX_DEPTH = 6
 MAX_NEIGHBOR_RESULTS = 200
 MAX_COMPONENT_NODES = 500
@@ -88,6 +90,11 @@ DEFAULT_SOURCE_GRAPH_EXTRACT_WORKERS = 2
 MAX_SOURCE_GRAPH_EXTRACT_WORKERS = 8
 MIN_PARALLEL_EXTRACTION_FILES = 8
 MIN_PARALLEL_EXTRACTION_BYTES = 256 * 1024
+SOURCE_GRAPH_HASH_WORKERS_ENV = "AIWORKHUB_SOURCE_GRAPH_HASH_WORKERS"
+MAX_SOURCE_GRAPH_HASH_WORKERS = 16
+MIN_PARALLEL_HASH_FILES = 8
+MIN_PARALLEL_HASH_BYTES = 256 * 1024
+SOURCE_GRAPH_HASH_STABLE_READ_ATTEMPTS = 3
 _INDEXED_EXTENSION_SET = frozenset(
     suffix.casefold() for suffix in sglanguages.INDEXED_EXTENSIONS
 )
@@ -646,6 +653,15 @@ class BuildReport:
     extraction_fallback_reason: str = ""
     extraction_telemetry: dict[str, Any] = field(default_factory=dict)
     index_quality: dict[str, Any] = field(default_factory=dict)
+    hash_candidates: int = 0
+    hash_reused: int = 0
+    hash_mismatched: int = 0
+    hash_unstable: int = 0
+    hash_workers: int = 1
+    hash_seconds: float = 0.0
+    hash_backend: str = "sequential"
+    hash_telemetry: dict[str, Any] = field(default_factory=dict)
+    quality_reused: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -668,6 +684,15 @@ class BuildReport:
             "compaction_recommended": self.compaction_recommended,
             "compaction_deferred_reason": self.compaction_deferred_reason,
             "index_quality": self.index_quality,
+            "hash_candidates": self.hash_candidates,
+            "hash_reused": self.hash_reused,
+            "hash_mismatched": self.hash_mismatched,
+            "hash_unstable": self.hash_unstable,
+            "hash_workers": self.hash_workers,
+            "hash_seconds": self.hash_seconds,
+            "hash_backend": self.hash_backend,
+            "hash_telemetry": self.hash_telemetry,
+            "quality_reused": self.quality_reused,
         }
 
 
@@ -746,6 +771,120 @@ def _source_graph_extraction_telemetry(
     return selection.to_dict()
 
 
+def _source_graph_hash_workers(
+    candidate_count: int, candidate_bytes: int = 0,
+) -> int:
+    """Return a bounded content-hashing width for one repository build.
+
+    Mirrors ``_source_graph_extract_workers``: hashing only reads bytes and
+    computes a digest (no AST/lexical parse), so a thread pool -- not a
+    process pool -- is bounded by the same capacity-aware policy.
+    """
+
+    configured = os.environ.get(SOURCE_GRAPH_HASH_WORKERS_ENV, "").strip()
+    if configured:
+        try:
+            requested = int(configured)
+        except ValueError:
+            requested = 1
+        return min(
+            max(1, candidate_count),
+            max(1, min(requested, MAX_SOURCE_GRAPH_HASH_WORKERS)),
+        )
+    if (
+        candidate_count < MIN_PARALLEL_HASH_FILES
+        or candidate_bytes < MIN_PARALLEL_HASH_BYTES
+    ):
+        return 1
+    workers, _ = parallelism.compute_worker_count(
+        candidate_count=candidate_count,
+        reserve=1,
+        ceiling=MAX_SOURCE_GRAPH_HASH_WORKERS,
+        min_candidates=MIN_PARALLEL_HASH_FILES,
+    )
+    return workers
+
+
+def _source_graph_hash_telemetry(
+    workers: int,
+    candidate_count: int,
+    candidate_bytes: int = 0,
+) -> dict[str, Any]:
+    """Describe the exact hashing-width decision without fabricating it."""
+
+    capacity = parallelism.get_cpu_capacity()
+    configured = os.environ.get(SOURCE_GRAPH_HASH_WORKERS_ENV, "").strip()
+    if configured:
+        return parallelism.WorkerSelection(
+            available_cpus=capacity,
+            selected_workers=workers,
+            reserve=0,
+            ceiling=MAX_SOURCE_GRAPH_HASH_WORKERS,
+            nested=parallelism.pool_is_nested(),
+            reason="env_override",
+        ).to_dict()
+    if (
+        candidate_count < MIN_PARALLEL_HASH_FILES
+        or candidate_bytes < MIN_PARALLEL_HASH_BYTES
+    ):
+        return parallelism.WorkerSelection(
+            available_cpus=capacity,
+            selected_workers=workers,
+            reserve=1,
+            ceiling=MAX_SOURCE_GRAPH_HASH_WORKERS,
+            nested=parallelism.pool_is_nested(),
+            reason="below_threshold",
+        ).to_dict()
+    _, selection = parallelism.compute_worker_count(
+        candidate_count=candidate_count,
+        reserve=1,
+        ceiling=MAX_SOURCE_GRAPH_HASH_WORKERS,
+        min_candidates=MIN_PARALLEL_HASH_FILES,
+    )
+    return selection.to_dict()
+
+
+def _stable_content_hash(path: Path) -> tuple[str, int, int] | None:
+    """Read one file and hash it with a stable pre/post stat straddle.
+
+    Returns ``(sha256_hex, file_size, mtime_ns)`` only when the stat taken
+    immediately before the read matches the stat taken immediately after,
+    across up to ``SOURCE_GRAPH_HASH_STABLE_READ_ATTEMPTS`` tries. Returns
+    ``None`` (fail closed) when the file kept changing under a concurrent
+    writer or could not be read at all -- callers must never trust a torn
+    read's hash and must route the file to full extraction instead.
+    """
+
+    for _ in range(SOURCE_GRAPH_HASH_STABLE_READ_ATTEMPTS):
+        try:
+            before = path.stat()
+            raw = path.read_bytes()
+            after = path.stat()
+        except OSError:
+            continue
+        if before.st_size == after.st_size and before.st_mtime_ns == after.st_mtime_ns:
+            return sgast.sha256_bytes(raw), int(after.st_size), int(after.st_mtime_ns)
+    return None
+
+
+def _hash_source_graph_candidate(
+    candidate: tuple[str, str],
+) -> tuple[str, str | None, int, int]:
+    """Bounded thread-pool worker: stable content hash for one file.
+
+    Returns ``(rel, hash_or_None, file_size, mtime_ns)``. ``hash`` is
+    ``None`` when the stat-straddled read could not be proven stable, so
+    the caller must fail closed and route this file to full extraction.
+    """
+
+    path_str, rel = candidate
+    result = _stable_content_hash(Path(path_str))
+    if result is None:
+        return rel, None, -1, -1
+    content_hash, file_size, mtime_ns = result
+    return rel, content_hash, file_size, mtime_ns
+
+
 def _extract_source_graph_candidate(
     candidate: tuple[str, str, str, int, int, str],
 ) -> tuple[sgast.FileExtraction, str, int, int]:
@@ -800,20 +939,42 @@ def _index_quality_scorecard(
         "file_path LIKE 'build/%'"
     ).fetchone()[0])
 
-    language_rows = conn.execute(
-        "WITH resolved AS ("
-        " SELECT e.id, e.file_path FROM edges e WHERE e.dst_qualname IS NOT NULL "
-        " AND e.dst_qualname != '' AND EXISTS ("
-        "  SELECT 1 FROM entities d WHERE d.qualname=e.dst_qualname)"
-        ") "
-        "SELECT f.language, COUNT(DISTINCT f.file_path) AS files, "
-        "COUNT(DISTINCT en.id) AS entities, COUNT(DISTINCT e.id) AS edges, "
-        "COUNT(DISTINCT r.id) AS resolved_edges "
-        "FROM files f LEFT JOIN entities en ON en.file_path=f.file_path "
-        "LEFT JOIN edges e ON e.file_path=f.file_path "
-        "LEFT JOIN resolved r ON r.id=e.id "
-        "GROUP BY f.language ORDER BY f.language"
-    ).fetchall()
+    # Each metric is pre-aggregated against ``files`` on its own, single
+    # foreign key -- never joined to more than one fan-out table at a time.
+    # The prior single query joined files -> entities -> edges -> resolved
+    # in one statement, so SQLite's planner multiplied every file's entity
+    # rows by its edge rows before the four COUNT(DISTINCT) temp B-trees
+    # could collapse the product back down; on a high-fanout file that
+    # Cartesian intermediate made an unchanged incremental refresh scan
+    # the same cost as a full rebuild (see NF-2026-00204).
+    files_by_language: dict[str, int] = {
+        str(row["language"]): int(row["files"])
+        for row in conn.execute(
+            "SELECT language, COUNT(*) AS files FROM files GROUP BY language"
+        )
+    }
+    entities_by_language: dict[str, int] = {
+        str(row["language"]): int(row["entities"])
+        for row in conn.execute(
+            "SELECT f.language AS language, COUNT(*) AS entities "
+            "FROM entities en JOIN files f ON f.file_path=en.file_path "
+            "GROUP BY f.language"
+        )
+    }
+    edges_by_language: dict[str, dict[str, int]] = {
+        str(row["language"]): {
+            "edges": int(row["edges"] or 0),
+            "resolved_edges": int(row["resolved_edges"] or 0),
+        }
+        for row in conn.execute(
+            "SELECT f.language AS language, COUNT(*) AS edges, "
+            "SUM(CASE WHEN e.dst_qualname IS NOT NULL AND e.dst_qualname != '' "
+            "AND EXISTS (SELECT 1 FROM entities d WHERE d.qualname=e.dst_qualname) "
+            "THEN 1 ELSE 0 END) AS resolved_edges "
+            "FROM edges e JOIN files f ON f.file_path=e.file_path "
+            "GROUP BY f.language"
+        )
+    }
     span_rows = {
         str(row["language"]): int(row["indexed_span_lines"] or 0)
         for row in conn.execute(
@@ -825,13 +986,14 @@ def _index_quality_scorecard(
         )
     }
     by_language: dict[str, dict[str, Any]] = {}
-    for row in language_rows:
-        edges = int(row["edges"] or 0)
-        resolved = int(row["resolved_edges"] or 0)
-        entities = int(row["entities"] or 0)
-        span_lines = span_rows.get(str(row["language"]), 0)
-        by_language[str(row["language"])] = {
-            "files": int(row["files"] or 0),
+    for language in sorted(files_by_language):
+        edge_stats = edges_by_language.get(language, {})
+        edges = int(edge_stats.get("edges", 0) or 0)
+        resolved = int(edge_stats.get("resolved_edges", 0) or 0)
+        entities = int(entities_by_language.get(language, 0) or 0)
+        span_lines = span_rows.get(language, 0)
+        by_language[language] = {
+            "files": files_by_language[language],
             "entities": entities,
             "edges": edges,
             "resolved_edges": resolved,
@@ -1290,6 +1452,65 @@ def _import_target_matches_file(target: str, file_path: str) -> bool:
     )
 
 
+def _resolve_javascript_import_bindings(conn: sqlite3.Connection) -> int:
+    """Bind each JS/TS ``imports`` edge to the one indexed module it names.
+
+    Both the tree-sitter and lexical-fallback JS/TS extractors record the
+    observed import specifier string but never prove which indexed file it
+    names -- ``dst_qualname`` starts NULL for every ``imports`` edge
+    regardless of extractor. A specifier that matches exactly one indexed
+    JS/TS module in this repository is bound to that module's own qualname
+    (EXTRACTED: the specifier match is exact and unique). More than one
+    candidate module is recorded as AMBIGUOUS -- distinct from an edge that
+    was never examined -- so a caller can tell "the specifier does not name
+    one file" apart from "resolution was never attempted". Zero candidates
+    (an npm package, an unindexed extension, a path outside the repository)
+    are left untouched.
+    """
+
+    unresolved = conn.execute(
+        "SELECT e.id, e.dst_name FROM edges e "
+        "JOIN files f ON f.file_path=e.file_path "
+        "WHERE e.kind='imports' AND e.dst_qualname IS NULL "
+        "AND f.language IN ('javascript', 'typescript') "
+        "ORDER BY e.id"
+    ).fetchall()
+    if not unresolved:
+        return 0
+    modules = [
+        (str(row["file_path"]), str(row["qualname"]))
+        for row in conn.execute(
+            "SELECT en.file_path, en.qualname FROM entities en "
+            "JOIN files f ON f.file_path=en.file_path "
+            "WHERE en.kind='module' AND f.language IN ('javascript', 'typescript')"
+        )
+    ]
+    candidates_by_target: dict[str, list[tuple[str, str]]] = {}
+    resolved = 0
+    for edge in unresolved:
+        target = str(edge["dst_name"])
+        candidates = candidates_by_target.get(target)
+        if candidates is None:
+            candidates = [
+                (file_path, qualname) for file_path, qualname in modules
+                if _import_target_matches_file(target, file_path)
+            ]
+            candidates_by_target[target] = candidates
+        if len(candidates) == 1:
+            cur = conn.execute(
+                "UPDATE edges SET dst_qualname=?, evidence_label=? "
+                "WHERE id=? AND dst_qualname IS NULL",
+                (candidates[0][1], sgast.EXTRACTED, edge["id"]),
+            )
+            resolved += int(cur.rowcount or 0)
+        elif len(candidates) > 1:
+            conn.execute(
+                "UPDATE edges SET evidence_label=? WHERE id=?",
+                (sgast.AMBIGUOUS, edge["id"]),
+            )
+    return resolved
+
+
 def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, incremental: bool = True) -> BuildReport:
     repo_root = repo_root.resolve()
     resolved_db_path = db_path or resolve_db_path(repo_root)
@@ -1303,6 +1524,15 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
     extraction_backend = "sequential"
     extraction_fallback_reason = ""
     extraction_telemetry: dict[str, Any] = {}
+    hash_workers = 1
+    hash_seconds = 0.0
+    hash_backend = "sequential"
+    hash_telemetry: dict[str, Any] = {}
+    hash_candidates_seen = 0
+    hash_reused = 0
+    hash_mismatched = 0
+    hash_unstable = 0
+    quality_reused = False
     compaction_performed = False
     compaction_error = ""
     bytes_before_compaction = 0
@@ -1335,6 +1565,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             )
         pending_extractions: list[tuple[sgast.FileExtraction, int, int]] = []
         extraction_candidates: list[tuple[Path, str, int, int]] = []
+        hash_candidates: list[tuple[Path, str, int, int, str]] = []
         pending_stat_updates: list[tuple[int, int, str]] = []
         expected_extractors_by_suffix: dict[str, frozenset[str]] = {}
         for path in files_on_disk:
@@ -1360,9 +1591,60 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 and prior[2] == file_size and prior[3] == mtime_ns
                 and existing_extractors.get(rel, set()) == expected_extractors
             ):
-                unchanged += 1
+                # Size and mtime agree with the prior generation's hint,
+                # but a hint is not identity: a same-second content
+                # mutation can leave both unchanged. Content hashing --
+                # not the stat hint -- is authoritative, so this file still
+                # goes through a bounded stable-read hash before it can be
+                # trusted as unchanged.
+                hash_candidates.append((path, rel, file_size, mtime_ns, prior[0]))
                 continue
             extraction_candidates.append((path, rel, file_size, mtime_ns))
+
+        hash_candidate_bytes = sum(max(0, item[2]) for item in hash_candidates)
+        hash_workers = _source_graph_hash_workers(
+            len(hash_candidates), hash_candidate_bytes,
+        )
+        hash_telemetry = _source_graph_hash_telemetry(
+            hash_workers, len(hash_candidates), hash_candidate_bytes,
+        )
+        hash_candidates_seen = len(hash_candidates)
+        hash_started = time.monotonic()
+        if hash_candidates:
+            hash_inputs = [(str(path), rel) for path, rel, _, _, _ in hash_candidates]
+            if hash_workers > 1:
+                with parallelism.worker_pool_scope():
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=hash_workers,
+                    ) as executor:
+                        hash_results = list(
+                            executor.map(_hash_source_graph_candidate, hash_inputs)
+                        )
+                hash_backend = "thread_pool"
+            else:
+                hash_results = [
+                    _hash_source_graph_candidate(item) for item in hash_inputs
+                ]
+            hashed_by_rel = {
+                result_rel: content_hash
+                for result_rel, content_hash, _, _ in hash_results
+            }
+            for path, rel, file_size, mtime_ns, prior_hash in hash_candidates:
+                content_hash = hashed_by_rel.get(rel)
+                if content_hash is not None and content_hash == prior_hash:
+                    unchanged += 1
+                    hash_reused += 1
+                    continue
+                if content_hash is None:
+                    hash_unstable += 1
+                else:
+                    hash_mismatched += 1
+                # Hash mismatch (content mutated behind an unchanged stat
+                # hint) or an unstable straddled read (fail closed): both
+                # must go through full extraction, never be silently
+                # counted as unchanged.
+                extraction_candidates.append((path, rel, file_size, mtime_ns))
+        hash_seconds = max(0.0, time.monotonic() - hash_started)
 
         candidate_count = len(extraction_candidates)
         candidate_bytes = sum(
@@ -1474,6 +1756,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             if changed or removed:
                 _resolve_cpp_cross_file_edges(conn)
                 _resolve_python_imported_calls(conn, repo_root)
+                _resolve_javascript_import_bindings(conn)
             sginsights.materialize_git_metrics(
                 conn, repo_root, sorted(seen_rel), limit=10000,
             )
@@ -1514,12 +1797,25 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             )
         except (TypeError, json.JSONDecodeError):
             previous_quality = None
-        index_quality = _index_quality_scorecard(
-            conn,
-            resolved_db_path,
-            finished_at=finished_at,
-            previous=previous_quality if isinstance(previous_quality, dict) else None,
-        )
+        if (
+            changed == 0 and removed == 0
+            and isinstance(previous_quality, dict) and previous_quality
+        ):
+            # A true no-op generation -- nothing changed or removed, even
+            # after hash-authoritative reconciliation -- leaves the graph
+            # byte-for-byte identical to the prior generation. Re-running
+            # every graph-wide aggregation query would cost the same as a
+            # full rebuild for zero new truth; reuse the prior metrics
+            # verbatim and only align the receipt to this generation.
+            index_quality = {**previous_quality, "finished_at": finished_at}
+            quality_reused = True
+        else:
+            index_quality = _index_quality_scorecard(
+                conn,
+                resolved_db_path,
+                finished_at=finished_at,
+                previous=previous_quality if isinstance(previous_quality, dict) else None,
+            )
         with conn:
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('index_quality', ?) "
@@ -1560,6 +1856,15 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
         extraction_fallback_reason=extraction_fallback_reason,
         extraction_telemetry=extraction_telemetry,
         index_quality=index_quality,
+        hash_candidates=hash_candidates_seen,
+        hash_reused=hash_reused,
+        hash_mismatched=hash_mismatched,
+        hash_unstable=hash_unstable,
+        hash_workers=hash_workers,
+        hash_seconds=hash_seconds,
+        hash_backend=hash_backend,
+        hash_telemetry=hash_telemetry,
+        quality_reused=quality_reused,
     )
 
 
@@ -2237,6 +2542,9 @@ def _fit_payload_bytes(payload: dict[str, Any], byte_cap: int) -> dict[str, Any]
         "query_tokens_source",
         "candidate_files",
         "truncated",
+        "coverage",
+        "cursor",
+        "next_cursor",
     }
 
     def encoded_size() -> int:
@@ -2245,12 +2553,16 @@ def _fit_payload_bytes(payload: dict[str, Any], byte_cap: int) -> dict[str, Any]
     while encoded_size() > byte_cap:
         lists: list[tuple[int, list[Any]]] = []
         strings: list[tuple[int, dict[str, Any], str]] = []
+        removable: list[tuple[int, dict[str, Any], str]] = []
 
         def visit(value: Any) -> None:
             if isinstance(value, dict):
                 for key, item in value.items():
                     if key in protected_keys:
                         continue
+                    removable.append(
+                        (len(json.dumps(item, ensure_ascii=False)), value, key)
+                    )
                     if isinstance(item, str) and len(item) > 256:
                         strings.append((len(item), value, key))
                     else:
@@ -2271,6 +2583,17 @@ def _fit_payload_bytes(payload: dict[str, Any], byte_cap: int) -> dict[str, Any]
         if lists:
             _, target = max(lists, key=lambda item: item[0])
             del target[len(target) // 2:]
+            payload["truncated"] = True
+            continue
+        if removable:
+            # Nothing left is a compressible string or a shrinkable list --
+            # every remaining non-protected value is small fixed scaffolding
+            # (short strings, already-empty lists, small nested dicts). The
+            # byte cap is still a hard requirement, so drop whole fields,
+            # largest encoded size first, until the cap is met or only
+            # protected keys remain.
+            _, owner, key = max(removable, key=lambda item: item[0])
+            del owner[key]
             payload["truncated"] = True
             continue
         break
@@ -2466,31 +2789,391 @@ def impact(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
         conn.close()
 
 
+_ANALYTICS_RESULT_KEYS: dict[str, tuple[str, ...]] = {
+    "tags": ("symbols",),
+    "hotspots": ("ranked_symbols",),
+    "complexity": ("ranked_symbols",),
+    "bottlenecks": ("ranked_symbols",),
+    "coverage": ("related_tests",),
+    "testmap": ("related_tests",),
+    "auditmap": ("audit_queue",),
+    "churn": ("files",),
+    "ownership": ("files",),
+    "calls": ("outgoing_calls", "incoming_calls"),
+    "symbols": ("symbols",),
+    "reviewqueue": ("queue",),
+    "todo": ("todos",),
+    "leaks": ("analysis.findings",),
+    "nullrisks": ("analysis.findings",),
+    "rawptrs": ("analysis.findings",),
+    "casts": ("analysis.findings",),
+    "crashes": ("analysis.findings",),
+    "looprisks": ("analysis.findings",),
+    "deadmethods": ("analysis.findings",),
+    "duplicates": ("analysis.findings",),
+    "gaps": ("low_confidence_edges",),
+    "stats": (),
+    "summarize": ("files",),
+    "pipeline": (),
+}
+
+_ANALYTICS_ROW_OWNER_PATH_KEYS: tuple[str, ...] = (
+    "file_path", "file", "src_file_path", "src_file",
+)
+
+
+def _analytics_result_row_count(mode: str, payload: dict[str, Any]) -> int:
+    total = 0
+    for key_path in _ANALYTICS_RESULT_KEYS.get(mode, ()):
+        node: Any = payload
+        for part in key_path.split("."):
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(part)
+        if isinstance(node, list):
+            total += len(node)
+    return total
+
+
+def _normalize_analytics_target(target: str | None) -> str:
+    if target is None:
+        return ""
+    normalized = str(target).strip().replace("\\", "/").strip("/")
+    parts = Path(normalized).parts
+    if not normalized or "\x00" in normalized or Path(str(target)).is_absolute() or ".." in parts:
+        raise SourceGraphError("invalid_target")
+    return normalized
+
+
+def _path_in_analytics_scope(file_path: str, scope: str) -> bool:
+    normalized = str(file_path).replace("\\", "/")
+    return normalized == scope or normalized.startswith(f"{scope}/")
+
+
+def _analytics_scope_sql_predicate(scope: str) -> tuple[str, tuple[str, str]]:
+    """SQL ``WHERE`` fragment + params confining ``file_path`` to ``scope``."""
+
+    escaped = scope.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return (
+        "(file_path = ? OR file_path LIKE ? ESCAPE '\\')",
+        (scope, f"{escaped}/%"),
+    )
+
+
+def _scoped_entity_rows(
+    conn: sqlite3.Connection, scope: str, *, limit: int,
+) -> list[dict[str, Any]]:
+    """Bounded entity corpus for analytics, optionally confined to ``scope``."""
+
+    cap = max(1, limit)
+    # ``module``/``file`` rows are containers, never a renderable analytic
+    # subject for any mode -- excluding them keeps ``eligible``/``scanned``
+    # aligned with what a mode can actually return, instead of inflating
+    # coverage with rows no mode will ever emit.
+    select = (
+        "SELECT file_path, kind, name, qualname, line_start, line_end, signature, "
+        "evidence_label, confidence FROM entities WHERE kind NOT IN ('file', 'module') "
+    )
+    order_by = (
+        "ORDER BY CASE WHEN kind IN ('function','method') THEN 0 ELSE 1 END, "
+        "file_path, line_start, qualname LIMIT ?"
+    )
+    if scope:
+        predicate, params = _analytics_scope_sql_predicate(scope)
+        rows = conn.execute(
+            select + f"AND {predicate} " + order_by, (*params, cap),
+        ).fetchall()
+    else:
+        rows = conn.execute(select + order_by, (cap,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _scoped_repo_aggregates(conn: sqlite3.Connection, scope: str) -> dict[str, Any]:
+    """Truthful ``files_by_language``/``entities_by_kind``/``edges`` for ``scope``.
+
+    Computed directly against the same ``files``/``entities``/``edges``
+    tables a per-mode analytic's own (potentially repository-wide)
+    aggregation draws from, confined to ``scope`` by owning ``file_path`` --
+    the engine's own scope boundary, not a name-keyed patch applied after
+    the fact. Edge scope follows the *owning* file only (the file the edge
+    was recorded against), so an import/call edge owned by an in-scope file
+    is kept even when its target (``dst_name``/``dst_qualname``) lives
+    outside scope -- excluding it would understate what the in-scope file
+    actually does.
+    """
+
+    predicate, params = _analytics_scope_sql_predicate(scope)
+    files_by_language = dict(conn.execute(
+        f"SELECT language, COUNT(*) FROM files WHERE {predicate} GROUP BY language", params,
+    ).fetchall())
+    entities_by_kind = dict(conn.execute(
+        f"SELECT kind, COUNT(*) FROM entities WHERE {predicate} GROUP BY kind", params,
+    ).fetchall())
+    (edge_count,) = conn.execute(
+        f"SELECT COUNT(*) FROM edges WHERE {predicate}", params,
+    ).fetchone()
+    return {
+        "files_by_language": files_by_language,
+        "entities_by_kind": entities_by_kind,
+        "edges": edge_count,
+    }
+
+
+def _analytics_cursor_digest(mode: str, query: str, target: str, budget: int) -> str:
+    payload = f"{mode}\x1f{query}\x1f{target}\x1f{budget}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _encode_analytics_cursor(
+    offset: int, *, mode: str, query: str, target: str, budget: int,
+) -> str:
+    return f"{offset}:{_analytics_cursor_digest(mode, query, target, budget)}"
+
+
+def _decode_analytics_cursor(
+    cursor: str | None, *, mode: str, query: str, target: str, budget: int,
+) -> int:
+    if cursor is None:
+        return 0
+    raw = str(cursor).strip()
+    if not raw:
+        return 0
+    offset_text, separator, digest = raw.partition(":")
+    if not separator or not digest or not offset_text.isdigit():
+        raise SourceGraphError("invalid_cursor")
+    if digest != _analytics_cursor_digest(mode, query, target, budget):
+        raise SourceGraphError("invalid_cursor")
+    return int(offset_text)
+
+
+def _analytics_row_in_scope(row: Any, scope: str) -> bool:
+    """True when ``row`` belongs to ``scope`` by its *owning* file only.
+
+    Only the file that recorded/owns this row (``file_path``/``src_file*``)
+    decides scope. A row's *target* (``dst_file_path``/``dst_file``) is
+    never used to disqualify it: an import or call edge legitimately
+    points outside the scope it was recorded in (an in-scope file
+    importing/calling an out-of-scope symbol), and that must still surface
+    as scoped evidence for the file that owns it -- requiring the target to
+    also be in scope would silently drop real out-of-scope import/call
+    edges instead of reporting them.
+    """
+
+    if not isinstance(row, dict):
+        return True
+    found = [
+        str(row[key]) for key in _ANALYTICS_ROW_OWNER_PATH_KEYS
+        if isinstance(row.get(key), str) and row.get(key)
+    ]
+    if not found:
+        return True
+    return all(_path_in_analytics_scope(path, scope) for path in found)
+
+
+def _scrub_analytics_repo_wide_counts(
+    node: Any, corpus: list[dict[str, Any]], aggregates: dict[str, Any],
+) -> None:
+    """Recursively retarget any repo-wide analytic aggregate to scope.
+
+    A per-mode analytic frequently nests a repository-wide summary object
+    (e.g. ``{"repository": {"files": N, "entities": M, "edges": K,
+    "files_by_language": {...}, "entities_by_kind": {...}}}``) anywhere in
+    its payload, not just at the top level. Wherever a ``files``/``entities``
+    int counter, a ``files_by_language``/``entities_by_kind`` breakdown, or
+    an ``edges`` int total appears, by name, it is replaced with the
+    truthful value for the already-scoped ``corpus``/``aggregates`` -- the
+    engine's sole source of scope truth -- so nesting can never smuggle a
+    repository-wide number past the scope this call actually requested.
+    """
+
+    if isinstance(node, dict):
+        if isinstance(node.get("files"), int):
+            node["files"] = len({
+                str(row.get("file_path")) for row in corpus if row.get("file_path")
+            })
+        if isinstance(node.get("entities"), int):
+            node["entities"] = len(corpus)
+        if isinstance(node.get("files_by_language"), dict):
+            node["files_by_language"] = dict(aggregates["files_by_language"])
+        if isinstance(node.get("entities_by_kind"), dict):
+            node["entities_by_kind"] = dict(aggregates["entities_by_kind"])
+        if isinstance(node.get("edges"), int):
+            node["edges"] = aggregates["edges"]
+        for value in node.values():
+            _scrub_analytics_repo_wide_counts(value, corpus, aggregates)
+    elif isinstance(node, list):
+        for item in node:
+            _scrub_analytics_repo_wide_counts(item, corpus, aggregates)
+
+
+def _enforce_analytics_target_scope(
+    payload: dict[str, Any], mode: str, corpus: list[dict[str, Any]], scope: str,
+    conn: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Re-assert engine-owned scope over a per-mode analytic's own payload.
+
+    A per-mode analytic may compute some fields (e.g. repository-wide
+    aggregates or edge scans) without consulting the already-scoped
+    ``matches`` it was handed. This is the engine's last word: any
+    row-shaped list registered for this mode is filtered back down to
+    ``scope`` by owning file, and any nested repo-wide aggregate (counts,
+    ``files_by_language``, ``entities_by_kind``, ``edges``) is replaced with
+    the truthful value for the same scoped corpus/DB boundary every mode
+    shares, so a caller can never observe a wider scope than it explicitly
+    requested.
+    """
+
+    if not scope:
+        return payload
+    for key_path in _ANALYTICS_RESULT_KEYS.get(mode, ()):
+        parts = key_path.split(".")
+        node: Any = payload
+        for part in parts[:-1]:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(part)
+        if not isinstance(node, dict):
+            continue
+        last = parts[-1]
+        value = node.get(last)
+        if isinstance(value, list):
+            node[last] = [row for row in value if _analytics_row_in_scope(row, scope)]
+    _scrub_analytics_repo_wide_counts(payload, corpus, _scoped_repo_aggregates(conn, scope))
+    return payload
+
+
 def analytics_query(
     repo_root: Path,
     mode: str,
     query: str,
     budget: int = 64,
+    *,
+    target: str | None = None,
+    cursor: str | None = None,
 ) -> dict[str, Any]:
-    """Run one repository-neutral analytic mode over canonical graph rows."""
+    """Run one repository-neutral analytic mode over canonical graph rows.
+
+    ``target``, when given, is an exact bounded path/prefix scope enforced
+    inside the engine: every candidate row considered for this call is
+    already confined to that scope before the per-mode analytic ever runs,
+    and any row or nested count a per-mode analytic still reports outside
+    that scope is stripped or corrected back to scope afterward -- so no
+    downstream caller can widen it or observe a conflicting second filter.
+    ``cursor`` deterministically pages through that same scoped,
+    budget-bounded corpus, but only for a mode whose result is an actual
+    row list AND whose current page truthfully returned at least one row:
+    a mode that only ever produces one aggregate snapshot never mints or
+    accepts a cursor (a second page would just repeat the same snapshot),
+    and a page that returned nothing never advances into a further page
+    either (repeating that same empty result). A cursor is only valid for
+    the exact ``(mode, query, target, budget)`` tuple that minted it. The
+    returned ``coverage`` block reports how many rows were actually
+    scanned/eligible in scope, how many this page truthfully returned,
+    and the budget this call actually resolved to (``effective_budget``,
+    always equal to ``returned``) alongside what was asked for
+    (``requested_budget``).
+    """
 
     if mode not in sganalytics.ANALYTIC_MODES:
         raise SourceGraphError(f"invalid_analytic_mode:{mode}")
-    budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    requested_budget = int(budget)
+    budget = max(1, min(requested_budget, MAX_BUDGET_ROWS))
     byte_cap = max(512, budget * 768)
+    normalized_target = _normalize_analytics_target(target)
+    is_pageable_mode = bool(_ANALYTICS_RESULT_KEYS.get(mode))
     conn = connect(resolve_db_path(repo_root), read_only=True)
     try:
-        matches = find(conn, query, limit=budget)
-        payload = sganalytics.query(
-            conn,
-            repo_root,
-            mode=mode,
-            query_text=query,
-            matches=matches,
-            budget=budget,
+        offset = _decode_analytics_cursor(
+            cursor, mode=mode, query=query, target=normalized_target, budget=budget,
         )
-        payload["truncated"] = False
-        return _fit_payload_bytes(payload, byte_cap)
+        if offset and not is_pageable_mode:
+            # This mode never mints a cursor (its result is one aggregate
+            # snapshot, not a row page), so a nonzero offset can only come
+            # from a forged or stale cursor.
+            raise SourceGraphError("invalid_cursor")
+        corpus = find(conn, query, limit=MAX_ANALYTICS_CORPUS_ROWS)
+        if normalized_target:
+            corpus = [
+                row for row in corpus
+                if _path_in_analytics_scope(str(row.get("file_path") or ""), normalized_target)
+            ]
+        if not corpus:
+            corpus = _scoped_entity_rows(
+                conn, normalized_target, limit=MAX_ANALYTICS_CORPUS_ROWS,
+            )
+        scanned = len(corpus)
+        if offset and offset >= scanned:
+            raise SourceGraphError("invalid_cursor")
+        page = corpus[offset:offset + budget] if is_pageable_mode else corpus[:budget]
+        pending_next_offset = offset + len(page)
+        if normalized_target and not corpus:
+            # An explicit scope with zero eligible rows must stay empty --
+            # never let the per-mode analytic's own no-match fallback widen
+            # the response back out to a repository-wide default.
+            payload: dict[str, Any] = {
+                "mode": mode, "query": query, "budget": budget,
+                "scope": "target_scope_empty",
+            }
+        else:
+            payload = sganalytics.query(
+                conn, repo_root, mode=mode, query_text=query,
+                matches=page, budget=budget,
+            )
+            payload = _enforce_analytics_target_scope(payload, mode, corpus, normalized_target, conn)
+        payload["target"] = normalized_target or None
+        # Reserve room for the coverage/cursor block BEFORE fitting content
+        # to the byte cap, then fit the fully assembled payload (content
+        # plus coverage/cursor) to the cap again as a final guarantee --
+        # so the cap describes what is actually serialized on the wire,
+        # not just the content that existed before coverage/cursor were
+        # attached (coverage/cursor themselves stay protected from trim).
+        # ``returned``/``next_cursor`` are not known until the payload is
+        # assembled, so the reserve uses a same-shape placeholder cursor
+        # (an offset no smaller than any real one this call could mint).
+        placeholder_cursor = _encode_analytics_cursor(
+            scanned, mode=mode, query=query, target=normalized_target, budget=budget,
+        )
+        reserve_shell = {
+            "cursor": cursor,
+            "next_cursor": placeholder_cursor,
+            "coverage": {
+                "scanned": scanned,
+                "eligible": scanned,
+                "eligible_capped": scanned >= MAX_ANALYTICS_CORPUS_ROWS,
+                "returned": 0,
+                "requested_budget": requested_budget,
+                "effective_budget": 0,
+            },
+        }
+        reserve_bytes = len(json.dumps(reserve_shell, ensure_ascii=False).encode("utf-8"))
+        content_cap = max(256, byte_cap - reserve_bytes)
+        pre_fit_truncated = bool(payload.get("truncated"))
+        payload = _fit_payload_bytes(payload, content_cap)
+        byte_trimmed = bool(payload.get("truncated")) and not pre_fit_truncated
+        returned = _analytics_result_row_count(mode, payload)
+        next_cursor = (
+            _encode_analytics_cursor(
+                pending_next_offset, mode=mode, query=query,
+                target=normalized_target, budget=budget,
+            )
+            if is_pageable_mode and returned > 0 and pending_next_offset < scanned
+            else None
+        )
+        payload["cursor"] = cursor
+        payload["next_cursor"] = next_cursor
+        payload["coverage"] = {
+            "scanned": scanned,
+            "eligible": scanned,
+            "eligible_capped": scanned >= MAX_ANALYTICS_CORPUS_ROWS,
+            "returned": returned,
+            "requested_budget": requested_budget,
+            "effective_budget": returned,
+        }
+        payload["truncated"] = next_cursor is not None or byte_trimmed
+        payload = _fit_payload_bytes(payload, byte_cap)
+        return payload
     finally:
         conn.close()
 

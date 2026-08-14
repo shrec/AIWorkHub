@@ -94,6 +94,44 @@ def _registry_key(repo_root: Path | str) -> str:
     return str(Path(repo_root).resolve())
 
 
+def _repo_has_readable_generation(repo_root: Path | str) -> bool:
+    """True iff the canonical database already holds a committed generation.
+
+    Distinguishes a writer that yielded to another process's build lease
+    (STANDBY) with a usable prior generation from one where no generation
+    has ever been committed -- the former is not a refresh failure, the
+    latter genuinely is.
+    """
+    try:
+        db_path = source_graph.resolve_db_path(Path(repo_root).resolve())
+        if not db_path.exists():
+            return False
+        conn = source_graph.connect(db_path, read_only=True)
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'last_build'"
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return False
+        payload = json.loads(row["value"])
+        return bool(
+            payload.get("finished_at")
+            and payload.get("build_revision")
+            and int(payload.get("files_seen") or 0) > 0
+        )
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+        sqlite3.Error,
+        source_graph.SourceGraphError,
+    ):
+        return False
+
+
 class SourceGraphDaemon:
     """Owns exactly one background Source Graph indexing thread for one
     repository. Never constructed directly by callers outside this
@@ -231,6 +269,46 @@ class SourceGraphDaemon:
                     "state": "failed",
                     "error": persist_error,
                 }
+
+    def _reserve_refresh_job(self) -> tuple[dict[str, Any], bool]:
+        """Create (or coalesce into) one pending/active durable refresh job.
+
+        Shared by ``request_refresh()`` and ``refresh_now()`` so both entry
+        points expose the same job identity/coalescing contract.
+        """
+        with self._state_lock:
+            existing = self._pending_refresh_job or self._active_refresh_job
+            if existing is not None:
+                return dict(existing), True
+            job = {
+                "schema_id": "aiworkhub.source_graph.refresh_job.v1",
+                "job_id": uuid.uuid4().hex,
+                "repo_root": str(self.repo_root),
+                "state": "queued",
+                "requested_at": _utcnow(),
+                "started_at": "",
+                "finished_at": "",
+                "error": "",
+                "report": None,
+            }
+            self._pending_refresh_job = job
+            self._last_refresh_job = job
+            return job, False
+
+    def _refresh_terminal_state(self, status: str, error: str) -> tuple[str, str]:
+        """Map a post-build daemon status to a truthful refresh-job state.
+
+        STANDBY means this process yielded its build lease to another
+        writer, not that the refresh failed -- if the canonical database
+        already holds a readable prior generation, the refresh is truthfully
+        ``succeeded``. A STANDBY with no readable generation, or any other
+        non-ready status, remains truthfully ``failed``.
+        """
+        if status in {STATUS_READY, STATUS_EMPTY}:
+            return "succeeded", ""
+        if status == STATUS_STANDBY and _repo_has_readable_generation(self.repo_root):
+            return "succeeded", ""
+        return "failed", error or f"refresh_terminal_status:{status}"
 
     def _terminate_build_process(self) -> None:
         with self._process_lock:
@@ -619,43 +697,69 @@ class SourceGraphDaemon:
                 if kind != "success":
                     raise RuntimeError(str(outcome.get("error") or "index_build_failed"))
                 report = dict(outcome["report"])
-                # The query engine and MCP wrapper have different failure
-                # surfaces.  Exercise the exact shared manager/worker wrapper
-                # once per committed generation so health can distinguish an
-                # emission/index fault from a wrapper regression instead of
-                # discovering it after a worker wastes a follow-up call.
-                try:
-                    from . import worker_ai_tools_mcp
+                files_changed = int(report.get("files_changed") or 0)
+                files_removed = int(report.get("files_removed") or 0)
+                with self._state_lock:
+                    previous_report = self._last_report
+                previous_recommendation = (
+                    previous_report.get("recommendation_resolvability")
+                    if isinstance(previous_report, dict) else None
+                )
+                reuse_recommendation = bool(
+                    files_changed == 0 and files_removed == 0
+                    and isinstance(previous_recommendation, dict)
+                    and previous_recommendation.get("ok")
+                )
+                if reuse_recommendation:
+                    # A true no-op generation (nothing changed or removed)
+                    # leaves the graph identical to the prior generation --
+                    # the recommendation round-trip gate already proved
+                    # resolvability against that unchanged graph, so
+                    # re-running the whole sampled-symbol probe would spend
+                    # real work reconfirming a fact that cannot have
+                    # changed. Reuse the prior probe's verdict verbatim.
+                    recommendation = dict(previous_recommendation)
+                    recommendation["reused_from_previous_generation"] = True
+                else:
+                    # The query engine and MCP wrapper have different failure
+                    # surfaces.  Exercise the exact shared manager/worker
+                    # wrapper once per committed generation so health can
+                    # distinguish an emission/index fault from a wrapper
+                    # regression instead of discovering it after a worker
+                    # wastes a follow-up call.
+                    try:
+                        from . import worker_ai_tools_mcp
 
-                    selfcheck_context = worker_ai_tools_mcp.WorkerToolContext(
-                        task_id="source-graph:selfcheck",
-                        runner="source_graph_daemon",
-                        topic="source_graph_health",
-                        request_id=f"source-graph:{report.get('finished_at') or _utcnow()}",
-                        repo=self.repo_root,
-                        authority_repo=self.repo_root,
-                        source_graph_targets=(),
-                        session_topic="source_graph_health",
-                        audit_ledger_path=None,
-                        audit_hmac_key_path=None,
-                    )
-                    recommendation = (
-                        worker_ai_tools_mcp.source_graph_recommendation_roundtrip_gate(
-                            selfcheck_context,
+                        selfcheck_context = worker_ai_tools_mcp.WorkerToolContext(
+                            task_id="source-graph:selfcheck",
+                            runner="source_graph_daemon",
+                            topic="source_graph_health",
+                            request_id=f"source-graph:{report.get('finished_at') or _utcnow()}",
+                            repo=self.repo_root,
+                            authority_repo=self.repo_root,
+                            source_graph_targets=(),
+                            session_topic="source_graph_health",
+                            audit_ledger_path=None,
+                            audit_hmac_key_path=None,
                         )
-                    )
-                except Exception as exc:  # noqa: BLE001 -- telemetry cannot erase a good index
-                    recommendation = {
-                        "schema_id": "aiworkhub.source_graph.recommendation_roundtrip.v1",
-                        "ok": False,
-                        "status": "probe_failed",
-                        "error": f"{type(exc).__name__}:{exc}"[:300],
-                        "sampled_symbols": 0,
-                        "emitted": 0,
-                        "resolved": 0,
-                        "resolvability_ratio": None,
-                        "failures": [],
-                    }
+                        recommendation = (
+                            worker_ai_tools_mcp.source_graph_recommendation_roundtrip_gate(
+                                selfcheck_context,
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- telemetry cannot erase a good index
+                        recommendation = {
+                            "schema_id": "aiworkhub.source_graph.recommendation_roundtrip.v1",
+                            "ok": False,
+                            "status": "probe_failed",
+                            "error": f"{type(exc).__name__}:{exc}"[:300],
+                            "sampled_symbols": 0,
+                            "emitted": 0,
+                            "resolved": 0,
+                            "resolvability_ratio": None,
+                            "failures": [],
+                        }
+                    recommendation["reused_from_previous_generation"] = False
                 recommendation["build_revision"] = str(
                     report.get("build_revision") or source_graph.BUILD_REVISION
                 )
@@ -759,14 +863,8 @@ class SourceGraphDaemon:
             with self._state_lock:
                 status = self._status
                 error = self._last_error
-            if status in {STATUS_READY, STATUS_EMPTY}:
-                self._finish_refresh_job(refresh_job, state="succeeded")
-            else:
-                self._finish_refresh_job(
-                    refresh_job,
-                    state="failed",
-                    error=error or f"refresh_terminal_status:{status}",
-                )
+            state, terminal_error = self._refresh_terminal_state(status, error)
+            self._finish_refresh_job(refresh_job, state=state, error=terminal_error)
 
     def start(self) -> None:
         """Idempotent: a second call while already running is a no-op.
@@ -811,13 +909,48 @@ class SourceGraphDaemon:
         build after the current build completes. Multiple concurrent
         ``refresh_now()`` calls while one build is in flight coalesce into
         exactly one follow-up build, with no duplicate overlap.
+
+        Also reserves and completes one durable refresh job so callers
+        observe the same job identity / terminal-status contract as
+        ``request_refresh()``.
         """
+        job, coalesced = self._reserve_refresh_job()
+        if not coalesced:
+            persisted, persist_error = self._persist_refresh_job(job)
+            if not persisted:
+                with self._state_lock:
+                    self._pending_refresh_job = None
+                    self._last_refresh_job = {
+                        **job,
+                        "state": "failed",
+                        "finished_at": _utcnow(),
+                        "error": persist_error,
+                    }
+                return {
+                    **self.health(),
+                    "ok": False,
+                    "triggered": False,
+                    "job_id": job["job_id"],
+                    "refresh_job": dict(self._last_refresh_job),
+                    "reason": "refresh_job_persist_failed",
+                }
+        active_job = self._begin_refresh_job()
         triggered = self._run_one_build()
-        health = self.health()
         if not triggered:
             self._refresh_event.set()
+            if active_job is not None:
+                self._finish_refresh_job(
+                    active_job, state="failed", error="build_in_progress"
+                )
+            health = self.health()
             return {**health, "ok": True, "triggered": False, "reason": "build_in_progress"}
-        return {**health, "triggered": True}
+        if active_job is not None:
+            with self._state_lock:
+                status = self._status
+                error = self._last_error
+            state, terminal_error = self._refresh_terminal_state(status, error)
+            self._finish_refresh_job(active_job, state=state, error=terminal_error)
+        return {**self.health(), "triggered": True}
 
     def request_refresh(self) -> dict[str, Any]:
         """Queue an immediate refresh without running indexing on the caller.
@@ -830,26 +963,7 @@ class SourceGraphDaemon:
 
         if not self.is_running():
             self.start()
-        with self._state_lock:
-            existing = self._pending_refresh_job or self._active_refresh_job
-            if existing is not None:
-                job = dict(existing)
-                coalesced = True
-            else:
-                job = {
-                    "schema_id": "aiworkhub.source_graph.refresh_job.v1",
-                    "job_id": uuid.uuid4().hex,
-                    "repo_root": str(self.repo_root),
-                    "state": "queued",
-                    "requested_at": _utcnow(),
-                    "started_at": "",
-                    "finished_at": "",
-                    "error": "",
-                    "report": None,
-                }
-                self._pending_refresh_job = job
-                self._last_refresh_job = job
-                coalesced = False
+        job, coalesced = self._reserve_refresh_job()
         if not coalesced:
             persisted, persist_error = self._persist_refresh_job(job)
             if not persisted:
@@ -951,6 +1065,16 @@ class SourceGraphDaemon:
                 "last_success_at": self._last_success_at,
                 "build_revision": str(last_report.get("build_revision") or ""),
                 "files_seen": int(last_report.get("files_seen") or 0),
+                "hash_workers": int(last_report.get("hash_workers") or 0),
+                "hash_candidates": int(last_report.get("hash_candidates") or 0),
+                "hash_reused": int(last_report.get("hash_reused") or 0),
+                "quality_reused": bool(last_report.get("quality_reused") or False),
+                "recommendation_reused": bool(
+                    (last_report.get("recommendation_resolvability") or {}).get(
+                        "reused_from_previous_generation"
+                    )
+                    or False
+                ),
                 "index_age_seconds": index_age_seconds,
                 "stale_reason": "last_success_exceeded_threshold" if stale else "",
                 "last_report": self._last_report,

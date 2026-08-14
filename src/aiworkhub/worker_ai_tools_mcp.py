@@ -147,6 +147,13 @@ SOURCE_GRAPH_MODES: tuple[str, ...] = (
     "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes",
     "looprisks", "deadmethods", "duplicates", "gaps",
 )
+SOURCE_GRAPH_ANALYTIC_MODES: frozenset[str] = frozenset({
+    "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
+    "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
+    "stats", "summarize", "pipeline",
+    "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes",
+    "looprisks", "deadmethods", "duplicates", "gaps",
+})
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
     "bugfix", "feature", "refactor", "audit", "optimize", "explore",
 )
@@ -425,6 +432,7 @@ def _canonical_json_output(name: str, text: str, *, max_bytes: int) -> tuple[str
     )
     identity_keys = (
         "schema_id", "ok", "tool", "mode", "query", "target", "hit_count", "budget",
+        "coverage", "cursor", "next_cursor",
     )
     semantic_keys = (
         "name", "qualname", "file_path", "kind", "signature",
@@ -1867,6 +1875,7 @@ def source_graph_query(
     query: str,
     budget: int = 64,
     target: str | None = None,
+    cursor: str | None = None,
     bundle_type: SourceGraphBundleType = "explore",
     workflow_stage: WorkflowStage = "unspecified",
     compact_replay: bool = True,
@@ -1882,6 +1891,13 @@ def source_graph_query(
     are kept, everything else is dropped. In ``file`` mode an indexed exact
     target is also the requested file authority; directory targets fall back
     to the query path. Omitting ``target`` returns the unscoped query result.
+
+    For analytic modes (``sganalytics.ANALYTIC_MODES``), ``target`` and
+    ``cursor`` are instead applied INSIDE the engine (``analytics_query``):
+    the engine is the sole authority for which rows are in scope and which
+    page is returned, so this wrapper never re-filters or re-paginates an
+    analytic payload on top of what the engine already decided. ``cursor``
+    is rejected for every non-analytic mode rather than silently ignored.
     """
 
     tool = "source_graph"
@@ -1912,6 +1928,15 @@ def source_graph_query(
     except (TypeError, ValueError):
         return _violation(ctx, tool, "invalid_budget")
 
+    is_analytic_mode = mode in SOURCE_GRAPH_ANALYTIC_MODES
+    if cursor is not None:
+        if not is_analytic_mode:
+            return _violation(ctx, tool, "cursor_not_supported_for_mode")
+        bounded_cursor = _bounded_query(cursor, max_bytes=64)
+        if bounded_cursor is None:
+            return _violation(ctx, tool, "invalid_cursor")
+        cursor = bounded_cursor
+
     scope: str | None = None
     if target is not None:
         bounded_target = _bounded_query(target, max_bytes=256)
@@ -1933,7 +1958,7 @@ def source_graph_query(
     )
     cache_key = (
         "source_graph", ctx.task_id, ctx.request_id, str(query_repo),
-        mode, bounded_query, scope, budget, bundle_type,
+        mode, bounded_query, scope, cursor, budget, bundle_type,
         binding.packet_sha256,
         index_identity["build_revision"], index_identity["finished_at"],
     )
@@ -2036,6 +2061,7 @@ def source_graph_query(
             else:
                 payload = _source_graph_mod.analytics_query(
                     query_repo, mode, bounded_query, budget,
+                    target=scope, cursor=cursor,
                 )
     except _source_graph_mod.SourceGraphError as exc:
         return _violation(ctx, tool, str(exc)[:160])
@@ -2055,6 +2081,16 @@ def source_graph_query(
         # intended bounded result.
         if isinstance(payload, dict):
             payload["scope"] = "target_selector"
+    elif scope is not None and is_analytic_mode:
+        # ``analytics_query`` already applied ``target``/``cursor`` as the
+        # sole in-engine authority (scoping, pagination, coverage truth).
+        # Re-running the generic path-prefix filter here would be a second,
+        # independent filter pass that can silently diverge from what the
+        # engine already decided -- e.g. dropping rows the engine already
+        # excluded for a different reason, or keeping stale unscoped rows
+        # the engine never should have emitted. Trust the engine's payload
+        # verbatim instead of re-deriving scope in the wrapper.
+        pass
     elif scope is not None:
         unscoped_payload = payload
         payload = _filter_by_scope(payload, scope) or {}
@@ -3475,13 +3511,15 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
     @mcp.tool(name="aiworkhub_worker_source_graph_query")
     def _source_graph_query(
         mode: SourceGraphMode, query: str, budget: int = 64,
-        target: str | None = None, bundle_type: SourceGraphBundleType = "explore",
+        target: str | None = None, cursor: str | None = None,
+        bundle_type: SourceGraphBundleType = "explore",
         workflow_stage: WorkflowStage = "unspecified",
     ) -> dict[str, Any]:
         """Bounded Source Graph discovery for this task."""
         return source_graph_query(
             ctx, mode=mode, query=query, budget=budget,
-            target=target, bundle_type=bundle_type, workflow_stage=workflow_stage,
+            target=target, cursor=cursor,
+            bundle_type=bundle_type, workflow_stage=workflow_stage,
         )
 
     @mcp.tool(name="aiworkhub_worker_semantic_edit_prepare")

@@ -25,7 +25,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import core, repository_bootstrap, server, source_graph, source_graph_daemon, task_store  # noqa: E402
+from aiworkhub import core, repository_bootstrap, server, source_graph, source_graph_daemon, task_store, worker_ai_tools_mcp  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -721,5 +721,216 @@ def test_refresh_now_coalescing_arms_event_and_runs_one_follow_up_build(
         assert health["last_success_at"]
         assert health["build_revision"] == "test-rev"
         assert health["files_seen"] == 3
+    finally:
+        daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# 7. NF149: refresh_now()/refresh-job terminal status stays truthful when a
+#    build yields to another writer's lease (STANDBY) instead of fabricating
+#    a false failure or silently discarding a valid prior generation.
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_job_maps_standby_with_readable_generation_to_succeeded(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    """STANDBY with a readable prior canonical generation is not a failure."""
+    root = _init_repo(tmp_path)
+    cleanup_daemons.append(root)
+    (root / "seed.py").write_text("def seeded():\n    return 1\n", encoding="utf-8")
+
+    # A real prior generation must exist and be readable before a later
+    # STANDBY outcome can be truthfully treated as non-failing.
+    source_graph.build_index(root)
+
+    def standby_build(repo_root, *, incremental=True, db_path=None):
+        raise source_graph.SourceGraphBuildInProgressError("locked_by_other_process")
+
+    monkeypatch.setattr(source_graph, "build_index", standby_build)
+
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    result = daemon.refresh_now()
+
+    assert result["triggered"] is True
+    assert result["status"] == source_graph_daemon.STATUS_STANDBY
+    refresh_job = result["refresh_job"]
+    assert refresh_job is not None
+    assert refresh_job["state"] == "succeeded"
+    assert refresh_job["error"] == ""
+    assert result["refresh_job_id"] == refresh_job["job_id"]
+
+
+def test_refresh_job_standby_without_readable_generation_remains_failed(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    """A genuinely absent/unreadable generation is a truthful failure."""
+    root = _init_repo(tmp_path)
+    cleanup_daemons.append(root)
+
+    def standby_build(repo_root, *, incremental=True, db_path=None):
+        raise source_graph.SourceGraphBuildInProgressError("locked_by_other_process")
+
+    monkeypatch.setattr(source_graph, "build_index", standby_build)
+
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    result = daemon.refresh_now()
+
+    assert result["triggered"] is True
+    assert result["status"] == source_graph_daemon.STATUS_STANDBY
+    refresh_job = result["refresh_job"]
+    assert refresh_job is not None
+    assert refresh_job["state"] == "failed"
+    assert refresh_job["error"] == "refresh_terminal_status:standby"
+
+
+# ---------------------------------------------------------------------------
+# 8. NF-2026-00204: an unchanged incremental refresh over a high-fanout
+#    index must reach a truthful terminal state quickly. ``_index_quality_
+#    scorecard`` used to join files -> entities -> edges in one statement,
+#    so re-running the scorecard on every refresh (even a no-op one) scaled
+#    with the whole index instead of the changed delta.
+# ---------------------------------------------------------------------------
+
+
+def test_unchanged_incremental_refresh_reaches_succeeded_terminal_state_quickly(
+    tmp_path, cleanup_daemons,
+):
+    root = _init_repo(tmp_path)
+    cleanup_daemons.append(root)
+
+    # High-fanout data: many files, each with several entities that call
+    # into several other files, so a reintroduced Cartesian aggregation
+    # would show up as a real wall-clock regression here.
+    for i in range(40):
+        callees = "".join(f"    fn_{j}_0()\n" for j in range(max(0, i - 1), i))
+        (root / f"mod_{i}.py").write_text(
+            f"def fn_{i}_0():\n    return {i}\n"
+            f"def fn_{i}_1():\n{callees}    missing_{i}()\n",
+            encoding="utf-8",
+        )
+
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    try:
+        daemon.start()
+        assert daemon.wait_for_first_build(timeout=20), "first build never completed"
+        files_seen_after_full_build = daemon.health()["files_seen"]
+        assert files_seen_after_full_build >= 40
+
+        # ``request_refresh`` queues a job the background loop drains via
+        # ``_run_one_build`` -- the same path a live daemon uses for its
+        # periodic tick, unlike calling ``_run_one_build`` directly.
+        started = time.monotonic()
+        queued = daemon.request_refresh()
+        assert queued["triggered"] is True
+        job_id = queued["refresh_job"]["job_id"]
+
+        deadline = time.monotonic() + 15.0
+        health = daemon.health()
+        while True:
+            health = daemon.health()
+            job = health.get("refresh_job")
+            if job and job.get("job_id") == job_id and job.get("state") in (
+                "succeeded", "failed",
+            ):
+                break
+            if time.monotonic() > deadline:
+                raise AssertionError(
+                    f"unchanged incremental refresh job never reached a "
+                    f"terminal state: {job}"
+                )
+            time.sleep(0.01)
+        elapsed = time.monotonic() - started
+
+        assert job["state"] == "succeeded"
+        assert job["error"] == ""
+        assert health["status"] == source_graph_daemon.STATUS_READY
+        assert health["last_report"]["files_changed"] == 0
+        assert health["last_report"]["files_seen"] == files_seen_after_full_build
+
+        # Generous bound: a no-op refresh over 40 high-fanout files must stay
+        # a small constant, not scale with total entities x edges in the
+        # index (the Cartesian aggregation this fix removed).
+        assert elapsed < 15.0, f"unchanged incremental refresh took {elapsed:.2f}s"
+    finally:
+        daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# 9. NF-2026-00205: health()/refresh must truthfully expose hash-worker and
+#    no-op reuse telemetry -- a true no-op generation (nothing changed or
+#    removed) must reuse the prior generation's recommendation-roundtrip
+#    verdict instead of re-probing, and health() must surface both the hash
+#    reconciliation counts and the reuse flags.
+# ---------------------------------------------------------------------------
+
+
+def test_health_exposes_hash_and_noop_reuse_telemetry_on_unchanged_refresh(
+    tmp_path, cleanup_daemons, monkeypatch,
+):
+    root = _init_repo(tmp_path)
+    cleanup_daemons.append(root)
+    (root / "seed.py").write_text("def seeded():\n    return 1\n", encoding="utf-8")
+
+    probe_calls: list[int] = []
+
+    def fake_gate(context):
+        probe_calls.append(1)
+        return {
+            "schema_id": "aiworkhub.source_graph.recommendation_roundtrip.v1",
+            "ok": True,
+            "status": "ok",
+            "sampled_symbols": 1,
+            "emitted": 1,
+            "resolved": 1,
+            "resolvability_ratio": 1.0,
+            "failures": [],
+        }
+
+    monkeypatch.setattr(
+        worker_ai_tools_mcp, "source_graph_recommendation_roundtrip_gate", fake_gate,
+    )
+
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    try:
+        daemon.start()
+        assert daemon.wait_for_first_build(timeout=20)
+        assert probe_calls == [1]
+        first_health = daemon.health()
+        assert first_health["last_report"]["quality_reused"] is False
+        assert first_health["recommendation_reused"] is False
+
+        queued = daemon.request_refresh()
+        assert queued["triggered"] is True
+        job_id = queued["refresh_job"]["job_id"]
+
+        deadline = time.monotonic() + 15.0
+        health = daemon.health()
+        while True:
+            health = daemon.health()
+            job = health.get("refresh_job")
+            if job and job.get("job_id") == job_id and job.get("state") in (
+                "succeeded", "failed",
+            ):
+                break
+            if time.monotonic() > deadline:
+                raise AssertionError(f"refresh never reached a terminal state: {job}")
+            time.sleep(0.01)
+
+        assert job["state"] == "succeeded"
+        assert health["last_report"]["files_changed"] == 0
+        assert health["last_report"]["files_removed"] == 0
+        # The gate must not have been probed a second time -- the no-op
+        # generation reused the first probe's verdict verbatim rather than
+        # re-running the sampled-symbol round trip.
+        assert probe_calls == [1]
+        assert health["hash_candidates"] >= 1
+        assert health["hash_reused"] == health["hash_candidates"]
+        assert health["quality_reused"] is True
+        assert health["last_report"]["quality_reused"] is True
+        assert health["recommendation_reused"] is True
+        recommendation = health["last_report"].get("recommendation_resolvability") or {}
+        assert recommendation["reused_from_previous_generation"] is True
+        assert recommendation["ok"] is True
     finally:
         daemon.stop()
