@@ -5,7 +5,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 
 from .evidence_levels import EvidenceLevel
 from .scoped_audit import ScopedAuditPacket, packet_fingerprint
@@ -21,6 +21,82 @@ MAX_TEXT_CHARS = 2_000
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _FINDING_CONFIDENCE = frozenset({"low", "medium", "high"})
+
+# One canonical quality-review finding shape, shared by the reviewer prompt,
+# the callable MCP tool schema, runtime normalization, the durable receipt and
+# the coordinator finalization count.  Consumers (quality_evidence) require at
+# least id/severity/disposition/summary/evidence plus the derived actionable
+# and evidence_level fields; the input vocabulary is the strict subset of that
+# shape a reviewer may supply.  Anything outside it is an undocumented alias
+# and is rejected by name.
+FINDING_SEVERITIES = frozenset({"critical", "high", "medium", "low"})
+FINDING_DISPOSITIONS = frozenset({"defect", "observation", "process_limit"})
+
+
+QualityReviewFinding = TypedDict(
+    "QualityReviewFinding",
+    {
+        "severity": str,
+        "summary": str,
+        "evidence": str,
+        "id": NotRequired[str],
+        "disposition": NotRequired[str],
+        "confidence": NotRequired[str],
+        "symbol": NotRequired[str],
+        "claim": NotRequired[str],
+        "reproduction": NotRequired[str],
+        "required_validation": NotRequired[str],
+        "evidence_level": NotRequired[str],
+        "path": NotRequired[str],
+        "line_start": NotRequired[int],
+        "line_end": NotRequired[int],
+        "check_id": NotRequired[str],
+    },
+)
+QualityReviewFinding.__doc__ = (
+    "One canonical quality-review finding submitted by a reviewer. "
+    "severity, summary and evidence are required; the remaining fields are optional."
+)
+
+
+QUALITY_REVIEW_FINDING_INPUT_REQUIRED_KEYS = frozenset(
+    QualityReviewFinding.__required_keys__
+)
+QUALITY_REVIEW_FINDING_INPUT_KEYS = frozenset(QualityReviewFinding.__annotations__)
+QUALITY_REVIEW_FINDING_REQUIRED_KEYS = frozenset(
+    {
+        "id",
+        "severity",
+        "disposition",
+        "actionable",
+        "summary",
+        "evidence",
+        "confidence",
+        "evidence_level",
+        "symbol",
+        "claim",
+        "reproduction",
+        "required_validation",
+    }
+)
+QUALITY_REVIEW_FINDING_KEYS = QUALITY_REVIEW_FINDING_REQUIRED_KEYS | frozenset(
+    {"evidence_reference"}
+)
+QUALITY_REVIEW_FINDING_SCHEMA_DOC = (
+    "One finding object uses the canonical shape with required keys "
+    "severity (critical|high|medium|low), summary and evidence; optional id "
+    "(stable identifier, derived when omitted), disposition (defect default; "
+    "observation and process_limit must be low severity), confidence "
+    "(low|medium|high), symbol, claim, reproduction and required_validation. "
+    "Defects must cite an exact packet-permitted path and line "
+    "(path/line_start/line_end) or a mechanical check_id. The tool derives "
+    "actionable, evidence_level and evidence_reference; do not invent keys "
+    "outside this shape. An empty findings list is valid."
+)
+QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION = (
+    "Submit findings for the exact coordinator-bound review packet. "
+    + QUALITY_REVIEW_FINDING_SCHEMA_DOC
+)
 
 
 class ReviewerEvidenceError(ValueError):
@@ -394,20 +470,28 @@ def build_review_prompt(
         "Do not write, edit, format, or delete repository files.\n"
         f"{scope_instruction}"
         "Report only concrete items supported by file/line or check evidence. "
-        "Use severity critical, high, medium, or low. Candidate defects use "
-        "disposition=defect (the default). Positive confirmations use "
-        "disposition=observation and packet/tool limitations use "
-        "disposition=process_limit; both must be low severity and are retained "
-        "as non-actionable evidence. Every defect must identify an exact "
-        "packet-permitted path and line (path/line_start/line_end), or a "
-        "mechanical check_id. Include confidence, symbol, claim, reproduction "
-        "and required_validation when known; the submission tool derives and "
-        "caps the canonical evidence level. An empty findings list is valid.\n"
+        f"{QUALITY_REVIEW_FINDING_SCHEMA_DOC}\n"
         f"Before finishing, call {submit_tool_name} exactly once with "
         f'packet_sha256="{packet_digest}", lens="{lens}", and your findings array.\n'
         "The tool call is the authoritative submission; prose is not evidence.\n"
         f"{packet_evidence}"
     )
+
+
+def _derive_finding_id(
+    *,
+    lens: str,
+    index: int,
+    severity: str,
+    disposition: str,
+    summary: str,
+    evidence: str,
+) -> str:
+    """Derive a stable finding identifier when the reviewer omits ``id``."""
+    digest = hashlib.sha256(
+        f"{severity}\x00{disposition}\x00{summary}\x00{evidence}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{lens}-{index}-{digest}"
 
 
 def normalize_packet_findings(
@@ -467,10 +551,30 @@ def normalize_packet_findings(
     for index, finding in enumerate(rows):
         if not isinstance(finding, Mapping):
             raise ReviewerEvidenceError(f"review_finding_{index}_not_object")
-        disposition = str(finding.get("disposition") or "defect")
-        severity = str(finding.get("severity") or "")
-        summary = str(finding.get("summary") or "").strip()
-        evidence = str(finding.get("evidence") or "").strip()
+        unknown = set(finding) - QUALITY_REVIEW_FINDING_INPUT_KEYS
+        if unknown:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_unknown_key:{','.join(sorted(unknown))}"
+            )
+        severity_raw = finding.get("severity")
+        if severity_raw is None:
+            raise ReviewerEvidenceError(f"review_finding_{index}_severity_missing")
+        severity = str(severity_raw).strip()
+        if severity not in FINDING_SEVERITIES:
+            raise ReviewerEvidenceError(f"review_finding_{index}_severity_invalid")
+        disposition = str(finding.get("disposition") or "defect").strip()
+        if disposition not in FINDING_DISPOSITIONS:
+            raise ReviewerEvidenceError(f"review_finding_{index}_disposition_invalid")
+        if disposition != "defect" and severity != "low":
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_nondefect_severity_must_be_low"
+            )
+        if "summary" not in finding:
+            raise ReviewerEvidenceError(f"review_finding_{index}_summary_missing")
+        if "evidence" not in finding:
+            raise ReviewerEvidenceError(f"review_finding_{index}_evidence_missing")
+        summary = str(finding["summary"] or "").strip()
+        evidence = str(finding["evidence"] or "").strip()
         if not summary or not evidence:
             raise ReviewerEvidenceError(f"review_finding_{index}_text_missing")
 
@@ -578,28 +682,42 @@ def normalize_packet_findings(
         symbol = str(finding.get("symbol") or "")[:MAX_TEXT_CHARS]
         if symbol and symbol not in permitted_symbols:
             symbol = ""
-        normalized.append(
-            {
-                **dict(finding),
-                "disposition": disposition,
-                "summary": summary[:MAX_TEXT_CHARS],
-                "evidence": evidence[:MAX_TEXT_CHARS],
-                "evidence_reference": evidence_reference,
-                "evidence_level": evidence_level.name.lower(),
-                "confidence": confidence,
-                "symbol": symbol,
-                "claim": str(finding.get("claim") or summary)[:MAX_TEXT_CHARS],
-                "reproduction": str(finding.get("reproduction") or "")[:MAX_TEXT_CHARS],
-                "required_validation": str(
-                    finding.get("required_validation")
-                    or (
-                        "manager must independently validate this finding"
-                        if actionable
-                        else ""
-                    )
-                )[:MAX_TEXT_CHARS],
-            }
-        )
+        finding_id = str(finding.get("id") or "").strip()
+        if not finding_id:
+            finding_id = _derive_finding_id(
+                lens=lens,
+                index=index,
+                severity=severity,
+                disposition=disposition,
+                summary=summary,
+                evidence=evidence,
+            )
+        elif len(finding_id) > 200:
+            finding_id = finding_id[:200]
+        normalized_finding: dict[str, Any] = {
+            "id": finding_id,
+            "severity": severity,
+            "disposition": disposition,
+            "actionable": actionable,
+            "summary": summary[:MAX_TEXT_CHARS],
+            "evidence": evidence[:MAX_TEXT_CHARS],
+            "confidence": confidence,
+            "evidence_level": evidence_level.name.lower(),
+            "symbol": symbol,
+            "claim": str(finding.get("claim") or summary)[:MAX_TEXT_CHARS],
+            "reproduction": str(finding.get("reproduction") or "")[:MAX_TEXT_CHARS],
+            "required_validation": str(
+                finding.get("required_validation")
+                or (
+                    "manager must independently validate this finding"
+                    if actionable
+                    else ""
+                )
+            )[:MAX_TEXT_CHARS],
+        }
+        if evidence_reference is not None:
+            normalized_finding["evidence_reference"] = evidence_reference
+        normalized.append(normalized_finding)
     return normalized
 
 
@@ -796,6 +914,15 @@ __all__ = [
     "RECEIPT_SCHEMA_ID",
     "MAX_SOURCE_EVIDENCE_CHARS",
     "MAX_SOURCE_EVIDENCE_TOTAL_CHARS",
+    "FINDING_SEVERITIES",
+    "FINDING_DISPOSITIONS",
+    "QualityReviewFinding",
+    "QUALITY_REVIEW_FINDING_INPUT_KEYS",
+    "QUALITY_REVIEW_FINDING_INPUT_REQUIRED_KEYS",
+    "QUALITY_REVIEW_FINDING_REQUIRED_KEYS",
+    "QUALITY_REVIEW_FINDING_KEYS",
+    "QUALITY_REVIEW_FINDING_SCHEMA_DOC",
+    "QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION",
     "ReviewerEvidenceError",
     "build_review_packet",
     "build_review_prompt",

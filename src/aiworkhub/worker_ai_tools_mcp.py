@@ -103,6 +103,7 @@ except ImportError:  # minimal copied worker package / direct-script mode
             fchmod(fd, mode)
 
 from .repository_state import RepositoryStateError
+from . import quality_reviewer
 from . import semantic_edit
 
 
@@ -2949,9 +2950,13 @@ def quality_review_submit(
     *,
     packet_sha256: str,
     lens: str,
-    findings: list[dict[str, Any]],
+    findings: list[quality_reviewer.QualityReviewFinding],
 ) -> dict[str, Any]:
     """Submit findings for the exact coordinator-bound review packet.
+
+    Finding objects use the single canonical quality-review finding shape
+    (see quality_reviewer.QUALITY_REVIEW_FINDING_SCHEMA_DOC). Undocumented
+    keys are rejected by name and an empty findings list is valid.
 
     This tool is inert for ordinary workers: the launcher must bind one
     immutable packet path into the worker runtime. The model cannot choose a
@@ -2959,7 +2964,7 @@ def quality_review_submit(
     immutable request/task identity rather than caller-supplied identity.
     """
 
-    from . import quality_evidence, quality_reviewer
+    from . import quality_evidence
 
     tool = "quality_review_submit"
     path = ctx.quality_review_packet_path
@@ -3610,11 +3615,14 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
             provenance=provenance,
         )
 
-    @mcp.tool(name="aiworkhub_worker_quality_review_submit")
+    @mcp.tool(
+        name="aiworkhub_worker_quality_review_submit",
+        description=quality_reviewer.QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION,
+    )
     def _quality_review_submit(
         packet_sha256: str,
         lens: str,
-        findings: list[dict[str, Any]],
+        findings: list[quality_reviewer.QualityReviewFinding],
     ) -> dict[str, Any]:
         """Submit findings for the exact bound anti-anchored packet."""
         return quality_review_submit(
@@ -3623,6 +3631,8 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
             lens=lens,
             findings=findings,
         )
+
+    _quality_review_submit.__doc__ = quality_reviewer.QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION
 
     return MCP_TOOL_NAMES
 

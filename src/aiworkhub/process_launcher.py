@@ -3034,8 +3034,27 @@ def _enforce_quality_review_receipt_schema(
         raise WorkspaceError("quality_review_reviewer_provider_mismatch")
     if str(report.get("provider") or "") != observed_provider:
         raise WorkspaceError("quality_review_report_provider_mismatch")
-    if not isinstance(report.get("findings"), list):
+    findings = report.get("findings")
+    if not isinstance(findings, list):
         raise WorkspaceError("quality_review_report_findings_invalid")
+    for index, finding in enumerate(findings):
+        if not isinstance(finding, dict):
+            raise WorkspaceError(f"quality_review_finding_{index}_invalid")
+        finding_keys = set(finding)
+        if not (
+            quality_reviewer.QUALITY_REVIEW_FINDING_REQUIRED_KEYS <= finding_keys
+            <= quality_reviewer.QUALITY_REVIEW_FINDING_KEYS
+        ):
+            raise WorkspaceError(f"quality_review_finding_{index}_keys_invalid")
+        if str(finding.get("severity") or "") not in quality_reviewer.FINDING_SEVERITIES:
+            raise WorkspaceError(f"quality_review_finding_{index}_severity_invalid")
+        if (
+            str(finding.get("disposition") or "")
+            not in quality_reviewer.FINDING_DISPOSITIONS
+        ):
+            raise WorkspaceError(f"quality_review_finding_{index}_disposition_invalid")
+        if finding.get("actionable") is not (finding.get("disposition") == "defect"):
+            raise WorkspaceError(f"quality_review_finding_{index}_actionable_invalid")
     if authority.get("process_identity_verified") is not True:
         raise WorkspaceError("quality_review_authority_process_identity_invalid")
     if authority.get("audit_verified") is not True:
