@@ -628,6 +628,16 @@ class _QualityReviewFinalized(RuntimeError):
     """Internal control signal: reviewer evidence reached canonical review."""
 
 
+class _ReviewerReservationTerminalized(RuntimeError):
+    """Internal control signal: a reserved reviewer attempt was terminalized.
+
+    Raised by the ownership-aware ``_launch_isolated`` checkpoints when a stale
+    pre-provider owner discovers its exact ``starting`` reservation was already
+    terminalized by the bounded launch owner or reconcile.  It must never be
+    raised once a real provider process exists.
+    """
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -3718,14 +3728,37 @@ class ProcessManager:
         elapses it is no longer live, so it is terminalized (``blocked`` with
         ``reservation_expired``) instead of silently expiring.  A reservation
         that already carries a real pid is only terminalized when pid identity
-        evidence proves a mismatch; a live provider's liveness follows exact
-        process evidence, never elapsed or quiet time.
+        evidence proves a mismatch.  A durable ``provider_spawn_committed``
+        phase is exact spawn authority that outlives its owner process, so it
+        is never terminalized by elapsed or quiet time: only a committed owner
+        proven dead (and no provider running event) is truthfully terminalized
+        once.  A live provider's liveness follows exact process evidence.
         """
 
         now = time.time()
         reconciled = 0
         for request_id, event in self._latest_by_request().items():
-            if event.get("state") != "starting":
+            state = event.get("state")
+            if state == "provider_spawn_committed":
+                owner_pid = int(event.get("owner_pid") or 0)
+                if owner_pid and _pid_identity_evidence(
+                    owner_pid, event.get("owner_pid_start_ticks")
+                ).verdict is PidIdentityVerdict.MISMATCH:
+                    self._append_event({
+                        "request_id": request_id,
+                        "task_id": event.get("task_id"),
+                        "runner": event.get("runner"),
+                        "topic": event.get("topic"),
+                        "adapter_id": event.get("adapter_id"),
+                        "state": "blocked",
+                        "blocked_reason": "provider_spawn_committed_owner_dead",
+                        "reservation_expires_at_epoch": event.get(
+                            "reservation_expires_at_epoch"
+                        ),
+                    })
+                    reconciled += 1
+                continue
+            if state != "starting":
                 continue
             pid = int(event.get("pid") or 0)
             if pid:
@@ -3944,12 +3977,20 @@ class ProcessManager:
             rid for rid, live in self._live.items() if live.process.poll() is None
         }
         for request_id, event in self._latest_by_request().items():
-            if event.get("state") not in ACTIVE_PROCESS_STATES:
+            state = event.get("state")
+            if state == "provider_spawn_committed":
+                owner_pid = int(event.get("owner_pid") or 0)
+                if owner_pid and _pid_identity_evidence(
+                    owner_pid, event.get("owner_pid_start_ticks")
+                ).verdict is not PidIdentityVerdict.MISMATCH:
+                    active.add(request_id)
+                continue
+            if state not in ACTIVE_PROCESS_STATES:
                 continue
             pid = int(event.get("pid") or 0)
             ticks = event.get("pid_start_ticks")
             if (
-                event.get("state") == "starting"
+                state == "starting"
                 and not pid
                 and float(event.get("reservation_expires_at_epoch") or 0.0)
                 > time.time()
@@ -4236,6 +4277,14 @@ class ProcessManager:
     # before any waiter's own ceiling fires. This never classifies a live
     # provider by elapsed time -- there is no process during preparation.
     _QUALITY_REVIEW_PREP_OWNER_SECONDS = 300.0
+    # The reviewer's entire pre-provider isolated-launch preparation runs under
+    # its own bounded owner.  A launch that outlives the ceiling (e.g. a stalled
+    # Source Graph prewarm or MCP callback) is truthfully terminalized as a
+    # pid-null ``quality_review_launch_timeout``; the stale owner becomes
+    # ownership-aware and aborts before spawning, so no provider is ever
+    # time-limited or killed by elapsed time.  Liveness of a real provider still
+    # follows exact process evidence only.
+    _QUALITY_REVIEW_LAUNCH_OWNER_SECONDS = 300.0
     _QUALITY_REVIEW_SOURCE_MAX_BYTES = 4_000
     _QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES = 60_000
     _QUALITY_REVIEW_SOURCE_CONTEXT_LINES = 3
@@ -4648,11 +4697,12 @@ class ProcessManager:
     def _live_reviewer_receipt(self, reviewer_task_id: str) -> dict[str, Any] | None:
         """Return a bounded receipt for an already-live reviewer, else ``None``.
 
-        A reviewer that already holds a live starting reservation or a running
-        provider process is returned as a bounded receipt referencing the
-        existing request instead of launching a duplicate.  Liveness follows
-        the same evidence as every other admission check -- an unexpired
-        pid-null reservation, or a real pid whose identity is not a proven
+        A reviewer that already holds a live starting reservation, a durable
+        spawn-committed phase, or a running provider process is returned as a
+        bounded receipt referencing the existing request instead of launching a
+        duplicate.  Liveness follows the same evidence as every other
+        admission check -- an unexpired pid-null reservation, a committed owner
+        that is not proven dead, or a real pid whose identity is not a proven
         mismatch -- never elapsed or quiet time against a live provider.
         """
 
@@ -4662,10 +4712,18 @@ class ProcessManager:
         for request_id, event in self._latest_by_request().items():
             if event.get("task_id") != reviewer_task_id:
                 continue
-            if event.get("state") not in ACTIVE_PROCESS_STATES:
+            state = event.get("state")
+            if state == "provider_spawn_committed":
+                owner_pid = int(event.get("owner_pid") or 0)
+                if owner_pid and _pid_identity_evidence(
+                    owner_pid, event.get("owner_pid_start_ticks")
+                ).verdict is not PidIdentityVerdict.MISMATCH:
+                    return self._reviewer_receipt(request_id)
+                continue
+            if state not in ACTIVE_PROCESS_STATES:
                 continue
             pid = int(event.get("pid") or 0)
-            if event.get("state") == "starting" and not pid:
+            if state == "starting" and not pid:
                 if (
                     float(event.get("reservation_expires_at_epoch") or 0.0)
                     > time.time()
@@ -4742,6 +4800,55 @@ class ProcessManager:
         latest = self._latest_by_request().get(request_id) or {}
         return latest.get("state") == "starting"
 
+    def _reviewer_provider_committed(self, request_id: str) -> bool:
+        """True once a real reviewer provider process exists for the request.
+
+        ``self._live`` is populated only after ``_popen`` returned a real PID,
+        so presence is exact process evidence -- never elapsed or quiet time.
+        A committed provider is therefore never terminalized by the bounded
+        launch owner or reconcile.
+        """
+
+        with self._lock:
+            return request_id in self._live
+
+    def _reviewer_spawn_transition(self, request_id: str) -> bool:
+        """Atomically advance a still-held reservation to spawn-committed.
+
+        This is the single cross-process registry-lock CAS handoff between the
+        pid-null ``starting`` reservation and the durable
+        ``provider_spawn_committed`` phase.  The bounded launch owner and
+        reconciliation terminalize through the same lock (see
+        ``_terminalize_reviewer_attempt`` and
+        ``_reconcile_expired_starting_reservations``), so commit and
+        terminalization are mutually exclusive across every ProcessManager: a
+        timeout or reconcile only ever observes the exact still-preprovider
+        state, and once this transition wins the reservation is never
+        time-limited or killed by elapsed/quiet time.
+        """
+
+        with self._registry_lock():
+            latest = self._latest_by_request().get(request_id) or {}
+            if latest.get("state") == "provider_spawn_committed":
+                return True
+            if latest.get("state") != "starting":
+                return False
+            self._append_event({
+                "request_id": request_id,
+                "task_id": latest.get("task_id"),
+                "runner": latest.get("runner"),
+                "topic": latest.get("topic") or "quality_review",
+                "adapter_id": latest.get("adapter_id"),
+                "model": latest.get("model"),
+                "state": "provider_spawn_committed",
+                "reservation_expires_at_epoch": latest.get(
+                    "reservation_expires_at_epoch"
+                ),
+                "owner_pid": os.getpid(),
+                "owner_pid_start_ticks": _pid_start_ticks(os.getpid()),
+            })
+            return True
+
     def _terminalize_reviewer_attempt(
         self,
         request_id: str,
@@ -4751,14 +4858,29 @@ class ProcessManager:
         *,
         reason: str,
     ) -> None:
-        """Terminalize a failed or abandoned reviewer attempt exactly once."""
+        """Terminalize a failed or abandoned reviewer attempt exactly once.
 
-        if not self._reviewer_reservation_still_held(request_id):
-            return
-        self._blocked(
-            task_id, runner, "quality_review", adapter_id, reason,
-            request_id=request_id,
-        )
+        Under the cross-process registry lock this rereads the latest exact
+        event and refuses to terminalize a reservation whose spawn authority
+        was durably committed (``provider_spawn_committed``) or whose provider
+        process already exists (``running``/``self._live``).  A bounded launch
+        owner in a *different* ProcessManager therefore never steals a
+        committed spawn and a live provider is never classified by elapsed or
+        quiet time.
+        """
+
+        with self._registry_lock():
+            if request_id in self._live:
+                return
+            latest = self._latest_by_request().get(request_id) or {}
+            if latest.get("state") in ("provider_spawn_committed", "running"):
+                return
+            if latest.get("state") != "starting":
+                return
+            self._blocked(
+                task_id, runner, "quality_review", adapter_id, reason,
+                request_id=request_id,
+            )
 
     def _complete_quality_reviewer_launch(
         self,
@@ -4857,17 +4979,46 @@ class ProcessManager:
             if not self._reviewer_reservation_still_held(request_id):
                 return
             _progress("isolated_launch_started")
-            launched = self._launch_isolated(
-                task_id=reviewer_task_id,
-                runner=runner,
-                topic="quality_review",
-                adapter_id=adapter_id,
-                model=model,
-                owner_prompt="",
-                timeout_seconds=timeout_seconds,
-                quality_review_binding=binding,
-                reserved_request_id=request_id,
+            launch_box: dict[str, dict[str, Any]] = {}
+
+            def _run_isolated_launch() -> None:
+                try:
+                    launch_box["result"] = self._launch_isolated(
+                        task_id=reviewer_task_id,
+                        runner=runner,
+                        topic="quality_review",
+                        adapter_id=adapter_id,
+                        model=model,
+                        owner_prompt="",
+                        timeout_seconds=timeout_seconds,
+                        quality_review_binding=binding,
+                        reserved_request_id=request_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- defensive bounded worker
+                    launch_box["result"] = {
+                        "ok": False,
+                        "error": f"quality_review_launch_failed:{exc}"[:500],
+                    }
+
+            launcher = threading.Thread(
+                target=_run_isolated_launch,
+                name=f"aiworkhub-reviewer-launch-{request_id[:8]}",
+                daemon=True,
             )
+            launcher.start()
+            launcher.join(self._QUALITY_REVIEW_LAUNCH_OWNER_SECONDS)
+            if launcher.is_alive():
+                # The stale pre-provider owner is still preparing.  If a real
+                # provider process already exists, never time-limit it: the
+                # reservation resolves truthfully through the running/monitor
+                # path.  Otherwise terminalize the pid-null reservation exactly
+                # once and return; the worker thread is never killed, but its
+                # ownership-aware checkpoints abort it before it can spawn.
+                if self._reviewer_provider_committed(request_id):
+                    return
+                _fail("quality_review_launch_timeout")
+                return
+            launched = launch_box.get("result")
         except Exception as exc:
             _fail(f"quality_review_launch_failed:{exc}"[:500])
             return
@@ -4989,7 +5140,44 @@ class ProcessManager:
         claimed = False
         provider_env: dict[str, str] | None = None
         launch_phase = "preflight"
+
+        def _abandon_terminalized_reviewer() -> dict[str, Any]:
+            # A stale pre-provider owner discovered its exact ``starting``
+            # reservation was already terminalized.  Clean up partial artifacts
+            # and return a bounded non-ok receipt WITHOUT appending any event,
+            # so terminalization stays exactly-once and a live/terminalized
+            # reservation is never stolen.
+            if workspace is not None:
+                try:
+                    cleanup_workspace(workspace.repo, workspace.path, workspace.home)
+                except WorkspaceError:
+                    pass
+            if spec_path is not None:
+                unlink_if_regular(spec_path)
+            if authority_path is not None:
+                unlink_if_regular(authority_path)
+            if bridge_request is not None:
+                vscode_lm_bridge.cancel_request(bridge_request)
+            return {
+                "ok": False,
+                "launch_implemented": LAUNCH_IMPLEMENTED,
+                "launch_enabled": True,
+                "request_id": reserved_request_id,
+                "task_id": task_id,
+                "runner": runner,
+                "topic": topic,
+                "adapter_id": adapter_id,
+                "state": "blocked",
+                "blocked_reason": "quality_review_reservation_terminalized",
+                "shell": False,
+            }
+
         try:
+            if (
+                reserved_request_id is not None
+                and not self._reviewer_reservation_still_held(reserved_request_id)
+            ):
+                raise _ReviewerReservationTerminalized(reserved_request_id)
             _validate_adapter_identity(runner, adapter_id)
             # Materialize completed dependencies' promoted (accepted-but-not-yet-
             # committed) outputs into this dependent's isolated worktree by
@@ -5300,6 +5488,11 @@ class ProcessManager:
                     self.repo, declared_immutable_inputs
                 )
 
+                if (
+                    reserved_request_id is not None
+                    and not self._reviewer_reservation_still_held(reserved_request_id)
+                ):
+                    raise _ReviewerReservationTerminalized(reserved_request_id)
                 launch_phase = "canonical_claim"
                 claim = task_engine.claim_start_exact(
                     self.repo, task_id, runner, topic, request_id=request_id
@@ -5510,6 +5703,11 @@ class ProcessManager:
                 # shared string as HOME so the two line up by construction,
                 # not by two independently-coincidental Path.home() calls
                 # (B314_F004).
+                if (
+                    reserved_request_id is not None
+                    and not self._reviewer_spawn_transition(reserved_request_id)
+                ):
+                    raise _ReviewerReservationTerminalized(reserved_request_id)
                 launch_phase = "supervisor_spawn"
                 process = self._popen(
                     [sys.executable, str(supervisor), "--spec", str(spec_path)],
@@ -5610,7 +5808,19 @@ class ProcessManager:
                 "prompt_budget": prompt_budget,
                 "shell": False,
             }
+        except _ReviewerReservationTerminalized:
+            return _abandon_terminalized_reviewer()
         except Exception as exc:  # noqa: BLE001 - return durable launch diagnostics
+            if (
+                reserved_request_id is not None
+                and not self._reviewer_reservation_still_held(reserved_request_id)
+                and not self._reviewer_provider_committed(reserved_request_id)
+            ):
+                # The bounded launch owner terminalized this exact reservation
+                # while the stale owner was still preparing and then raised.
+                # Avoid a second terminal event; preserve exactly-once
+                # terminalization and never steal the terminalized reservation.
+                return _abandon_terminalized_reviewer()
             expected = isinstance(
                 exc,
                 (
