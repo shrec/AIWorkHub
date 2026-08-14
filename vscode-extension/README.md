@@ -12,12 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.53
+## What's new in 0.9.54
 
-- Python imported calls now receive cross-file targets only from exact,
-  unambiguous import and call-site evidence.
-- Rust Source Graph extraction now expands nested `use` trees, visibility,
-  aliases, `self` and glob imports while remaining truthfully lexical.
+- Fresh authenticated Source Graph zero-hit queries now count as real worker
+  invocations while evidence usefulness remains separately observable.
+- Concurrent Codex app-server sideband requests retain exact child/response
+  correlation, including late-response isolation and duplicate coalescing.
 
 See the packaged **Changelog** for the complete release summary.
 

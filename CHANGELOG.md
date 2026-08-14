@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.54] - 2026-08-14
+
+### Fixed
+
+- Count authenticated, fresh Source Graph zero-hit queries as real worker
+  invocations while keeping evidence usefulness, cache and authority checks
+  separate and fail-closed.
+- Bind Codex app-server sideband correlation to one exact child generation,
+  coalesce concurrent identical calls and consume late sideband responses
+  instead of leaking them into the extension client.
+
+### Validation
+
+- Worker MCP gate/audit regressions pass: 199 passed and 1 skipped.
+- App-server mux regressions pass: 55 passed, including concurrent distinct,
+  duplicate and late-response correlation cases.
+
 ## [0.9.53] - 2026-08-14
 
 ### Added

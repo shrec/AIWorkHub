@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.54 — 2026-08-14
+
+### Fixed
+
+- Treat a fresh authenticated Source Graph zero-hit result as a real worker
+  invocation without weakening cache, identity or authority gates.
+- Keep concurrent Codex app-server sideband requests exactly correlated and
+  prevent late sideband replies from poisoning the extension client.
+
 ## 0.9.53 — 2026-08-14
 
 ### Added
