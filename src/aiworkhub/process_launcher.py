@@ -28,7 +28,7 @@ import threading
 import time
 import traceback
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -215,6 +215,12 @@ SUPERVISOR_GRACE_SECONDS = 90
 TERMINAL_AUTHORITY_SCHEMA_ID = terminal_authority.SCHEMA_ID
 TERMINAL_AUTHORITY_KEY_FILENAME = terminal_authority.KEY_FILENAME
 ACTIVE_PROCESS_STATES = {"starting", "running", "cancel_requested"}
+# A reviewer attempt reservation outlives the synchronous MCP handler: it is
+# established before expensive preparation and must cover preparation plus
+# provider spawn under one background owner. It remains a bounded pid-null
+# ``starting`` reservation reconciled by the same expiry rules -- never an
+# elapsed/quiet-time classification of a live provider.
+QUALITY_REVIEW_ATTEMPT_RESERVATION_SECONDS = 600.0
 WORKER_BRIDGE_AUTHORIZED_PROCESS_STATES = {"starting", "running"}
 _PERSISTED_WATCH_UNKNOWN_MAX_CONSECUTIVE = 3
 FINALIZATION_PENDING_STATES = {
@@ -3609,6 +3615,7 @@ class ProcessManager:
             "reservation_expires_at_epoch": time.time() + 120.0,
         }
         with self._lock, self._registry_lock():
+            self._reconcile_expired_starting_reservations()
             if self._active_count() >= _configured_limit():
                 raise LaunchRejected("concurrency_limit_reached")
             self._assert_no_duplicate_task(str(event.get("task_id") or ""))
@@ -3686,6 +3693,60 @@ class ProcessManager:
             if request_id:
                 latest[request_id] = event
         return latest
+
+    def _reconcile_expired_starting_reservations(self) -> int:
+        """Truthfully terminalize pid-null starting reservations that expired.
+
+        A ``starting`` reservation with no pid belongs to a provisioner that
+        never reached supervisor spawn.  Once its bounded reservation epoch
+        elapses it is no longer live, so it is terminalized (``blocked`` with
+        ``reservation_expired``) instead of silently expiring.  A reservation
+        that already carries a real pid is only terminalized when pid identity
+        evidence proves a mismatch; a live provider's liveness follows exact
+        process evidence, never elapsed or quiet time.
+        """
+
+        now = time.time()
+        reconciled = 0
+        for request_id, event in self._latest_by_request().items():
+            if event.get("state") != "starting":
+                continue
+            pid = int(event.get("pid") or 0)
+            if pid:
+                if (
+                    _pid_identity_evidence(pid, event.get("pid_start_ticks")).verdict
+                    is PidIdentityVerdict.MISMATCH
+                ):
+                    self._append_event({
+                        "request_id": request_id,
+                        "task_id": event.get("task_id"),
+                        "runner": event.get("runner"),
+                        "topic": event.get("topic"),
+                        "adapter_id": event.get("adapter_id"),
+                        "state": "blocked",
+                        "blocked_reason": "reservation_process_false",
+                        "reservation_expires_at_epoch": event.get(
+                            "reservation_expires_at_epoch"
+                        ),
+                    })
+                    reconciled += 1
+                continue
+            if float(event.get("reservation_expires_at_epoch") or 0.0) >= now:
+                continue
+            self._append_event({
+                "request_id": request_id,
+                "task_id": event.get("task_id"),
+                "runner": event.get("runner"),
+                "topic": event.get("topic"),
+                "adapter_id": event.get("adapter_id"),
+                "state": "blocked",
+                "blocked_reason": "reservation_expired",
+                "reservation_expires_at_epoch": event.get(
+                    "reservation_expires_at_epoch"
+                ),
+            })
+            reconciled += 1
+        return reconciled
 
     def _build_adapter(self, **kwargs: Any) -> Any:
         if self._adapter_builder is not None:
@@ -4403,6 +4464,256 @@ class ProcessManager:
                 cache.pop(next(iter(cache)))
         return {"ok": True, "prepared": prepared}
 
+    def _reviewer_receipt(self, request_id: str) -> dict[str, Any]:
+        """Return a bounded, truthful receipt for an already-reserved reviewer."""
+
+        event = self._latest_by_request().get(request_id) or {}
+        return {
+            "ok": True,
+            "already_reserved": True,
+            "launch_implemented": LAUNCH_IMPLEMENTED,
+            "request_id": request_id,
+            "task_id": event.get("task_id"),
+            "runner": event.get("runner"),
+            "topic": event.get("topic"),
+            "adapter_id": event.get("adapter_id"),
+            "model": event.get("model"),
+            "state": event.get("state"),
+            "pid": event.get("pid"),
+            "shell": False,
+        }
+
+    def _live_reviewer_receipt(self, reviewer_task_id: str) -> dict[str, Any] | None:
+        """Return a bounded receipt for an already-live reviewer, else ``None``.
+
+        A reviewer that already holds a live starting reservation or a running
+        provider process is returned as a bounded receipt referencing the
+        existing request instead of launching a duplicate.  Liveness follows
+        the same evidence as every other admission check -- an unexpired
+        pid-null reservation, or a real pid whose identity is not a proven
+        mismatch -- never elapsed or quiet time against a live provider.
+        """
+
+        for live in self._live.values():
+            if live.task_id == reviewer_task_id and live.process.poll() is None:
+                return self._reviewer_receipt(live.request_id)
+        for request_id, event in self._latest_by_request().items():
+            if event.get("task_id") != reviewer_task_id:
+                continue
+            if event.get("state") not in ACTIVE_PROCESS_STATES:
+                continue
+            pid = int(event.get("pid") or 0)
+            if event.get("state") == "starting" and not pid:
+                if (
+                    float(event.get("reservation_expires_at_epoch") or 0.0)
+                    > time.time()
+                ):
+                    return self._reviewer_receipt(request_id)
+                continue
+            if (
+                pid
+                and _pid_identity_evidence(
+                    pid, event.get("pid_start_ticks")
+                ).verdict
+                is not PidIdentityVerdict.MISMATCH
+            ):
+                return self._reviewer_receipt(request_id)
+        return None
+
+    def _reserve_quality_reviewer_attempt(
+        self,
+        *,
+        reviewer_task_id: str,
+        runner: str,
+        adapter_id: str,
+        target_request_id: str,
+        target_task_id: str,
+        lens: str,
+        model: str | None,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        """Atomically reserve one exact reviewer attempt before any preparation.
+
+        A concurrent or retried call for the same ``reviewer_task_id``
+        reconciles the already-reserved attempt instead of minting a second
+        reservation (and therefore a second provider).  The reservation is a
+        durable pid-null ``starting`` event, so expiry reconciliation and the
+        exact live-pid rules are unchanged.
+        """
+
+        with self._lock, self._registry_lock():
+            self._reconcile_expired_starting_reservations()
+            existing = self._live_reviewer_receipt(reviewer_task_id)
+            if existing is not None:
+                return existing
+            if self._active_count() >= _configured_limit():
+                return {"ok": False, "error": "concurrency_limit_reached"}
+            request_id = uuid.uuid4().hex
+            self._append_event({
+                "request_id": request_id,
+                "task_id": reviewer_task_id,
+                "runner": runner,
+                "topic": "quality_review",
+                "adapter_id": adapter_id,
+                "model": model,
+                "state": "starting",
+                "reservation_expires_at_epoch": (
+                    time.time() + QUALITY_REVIEW_ATTEMPT_RESERVATION_SECONDS
+                ),
+                "timeout_seconds": timeout_seconds,
+                "quality_review_attempt": {
+                    "target_request_id": target_request_id,
+                    "target_task_id": target_task_id,
+                    "lens": lens,
+                },
+            })
+            return {
+                "ok": True,
+                "already_reserved": False,
+                "request_id": request_id,
+                "state": "starting",
+            }
+
+    def _reviewer_reservation_still_held(self, request_id: str) -> bool:
+        """True while the exact attempt still owns an unterminalized reservation."""
+
+        latest = self._latest_by_request().get(request_id) or {}
+        return latest.get("state") == "starting"
+
+    def _terminalize_reviewer_attempt(
+        self,
+        request_id: str,
+        task_id: str,
+        runner: str,
+        adapter_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Terminalize a failed or abandoned reviewer attempt exactly once."""
+
+        if not self._reviewer_reservation_still_held(request_id):
+            return
+        self._blocked(
+            task_id, runner, "quality_review", adapter_id, reason,
+            request_id=request_id,
+        )
+
+    def _complete_quality_reviewer_launch(
+        self,
+        *,
+        request_id: str,
+        target_request_id: str,
+        target_task_id: str,
+        reviewer_task_id: str,
+        runner: str,
+        adapter_id: str,
+        lens: str,
+        model: str | None,
+        timeout_seconds: int,
+    ) -> None:
+        """Run one reserved reviewer attempt under a single background owner.
+
+        The MCP handler already returned a bounded starting/deferred receipt,
+        so preparation and provider start never hold the handler.  Every
+        failure path terminalizes the pre-reserved attempt exactly once and
+        returns, leaving unrelated MCP calls responsive.
+        """
+
+        def _fail(reason: str) -> None:
+            self._terminalize_reviewer_attempt(
+                request_id, reviewer_task_id, runner, adapter_id, reason=reason
+            )
+
+        launched: dict[str, Any] | None = None
+        try:
+            if not self._reviewer_reservation_still_held(request_id):
+                return
+            prep = self._prepared_quality_review(target_request_id, target_task_id)
+            if not prep.get("ok"):
+                _fail(
+                    "quality_review_preparation_failed:"
+                    + str(prep.get("error") or "unknown")[:500]
+                )
+                return
+            prepared = prep["prepared"]
+            if prepared["worker_adapter_id"] == adapter_id:
+                _fail("quality_review_provider_not_independent")
+                return
+            binding = {
+                "target_request_id": target_request_id,
+                "target_task_id": target_task_id,
+                "target_claim_epoch": (
+                    prepared["packet"].get("target", {}).get("claim_epoch")
+                ),
+                "adapter_id": adapter_id,
+                "source_workspace": prepared["workspace"].as_metadata(),
+                "candidate_paths": sorted(prepared["changed_hashes"]),
+                "packet": prepared["packet"],
+                "lens": lens,
+            }
+            created = core.create_task(
+                task_id=reviewer_task_id,
+                title=f"Independent {lens} review for {target_task_id}"[:300],
+                runner=runner,
+                topic="quality_review",
+                objective=(
+                    "Review the exact anti-anchored candidate packet and submit "
+                    f"{lens} findings through the bound reviewer MCP tool."
+                ),
+                acceptance=[
+                    "Exactly one authenticated quality_review_submit receipt",
+                    "No repository mutation",
+                    "Reviewer provider differs from target worker provider",
+                ],
+                allowed_writes=[],
+                forbidden=[
+                    "repository_write",
+                    "worker_rationale_as_evidence",
+                    "model_supplied_provider_identity",
+                ],
+                required_outputs=[],
+                validation=[],
+                priority="high",
+                callback_required=True,
+                task_type="research",
+                read_only=True,
+            )
+            if not created.get("ok"):
+                _fail(
+                    "quality_review_task_create_failed:"
+                    + str(created.get("stderr") or created.get("stdout") or "")[:500]
+                )
+                return
+            if not self._reviewer_reservation_still_held(request_id):
+                return
+            launched = self._launch_isolated(
+                task_id=reviewer_task_id,
+                runner=runner,
+                topic="quality_review",
+                adapter_id=adapter_id,
+                model=model,
+                owner_prompt="",
+                timeout_seconds=timeout_seconds,
+                quality_review_binding=binding,
+                reserved_request_id=request_id,
+            )
+        except Exception as exc:
+            _fail(f"quality_review_launch_failed:{exc}"[:500])
+            return
+        if (
+            launched is None
+            or not launched.get("ok")
+            or str(launched.get("request_id") or "") != request_id
+        ):
+            detail = ""
+            if launched is not None:
+                detail = str(
+                    launched.get("error")
+                    or launched.get("blocked_reason")
+                    or "non_ok_receipt"
+                )
+            _fail(f"quality_review_launch_failed:{detail}"[:500])
+
     def launch_quality_reviewer(
         self,
         *,
@@ -4415,82 +4726,66 @@ class ProcessManager:
         model: str | None = None,
         timeout_seconds: int = 1800,
     ) -> dict[str, Any]:
-        """Create and launch one independent packet-bound reviewer task."""
+        """Create and launch one independent packet-bound reviewer task.
+
+        The handler reserves the exact reviewer attempt and returns a bounded
+        starting/deferred receipt immediately; expensive preparation and
+        provider start run under one background owner so unrelated MCP calls
+        stay serviceable.  Retried calls reconcile the same attempt instead of
+        launching a duplicate.
+        """
 
         if lens not in quality_evidence.JUDGMENT_LENSES:
             return {"ok": False, "error": "quality_review_lens_invalid"}
-        prep = self._prepared_quality_review(target_request_id, target_task_id)
-        if not prep.get("ok"):
-            return {key: value for key, value in prep.items() if key != "prepared"}
-        prepared = prep["prepared"]
-        if prepared["worker_adapter_id"] == adapter_id:
-            return {"ok": False, "error": "quality_review_provider_not_independent"}
-        workspace = prepared["workspace"]
-        changed_hashes = prepared["changed_hashes"]
-        packet = prepared["packet"]
-
-        created = core.create_task(
-            task_id=reviewer_task_id,
-            title=f"Independent {lens} review for {target_task_id}"[:300],
+        existing = self._live_reviewer_receipt(reviewer_task_id)
+        if existing is not None:
+            return existing
+        reservation = self._reserve_quality_reviewer_attempt(
+            reviewer_task_id=reviewer_task_id,
             runner=runner,
-            topic="quality_review",
-            objective=(
-                "Review the exact anti-anchored candidate packet and submit "
-                f"{lens} findings through the bound reviewer MCP tool."
-            ),
-            acceptance=[
-                "Exactly one authenticated quality_review_submit receipt",
-                "No repository mutation",
-                "Reviewer provider differs from target worker provider",
-            ],
-            allowed_writes=[],
-            forbidden=[
-                "repository_write",
-                "worker_rationale_as_evidence",
-                "model_supplied_provider_identity",
-            ],
-            required_outputs=[],
-            validation=[],
-            priority="high",
-            callback_required=True,
-            task_type="research",
-            read_only=True,
-        )
-        if not created.get("ok"):
-            return {
-                "ok": False,
-                "error": "quality_review_task_create_failed",
-                "detail": str(created.get("stderr") or created.get("stdout") or "")[:500],
-            }
-        binding = {
-            "target_request_id": target_request_id,
-            "target_task_id": target_task_id,
-            "target_claim_epoch": packet.get("target", {}).get("claim_epoch"),
-            "adapter_id": adapter_id,
-            "source_workspace": workspace.as_metadata(),
-            "candidate_paths": sorted(changed_hashes),
-            "packet": packet,
-            "lens": lens,
-        }
-        launched = self._launch_isolated(
-            task_id=reviewer_task_id,
-            runner=runner,
-            topic="quality_review",
             adapter_id=adapter_id,
+            target_request_id=target_request_id,
+            target_task_id=target_task_id,
+            lens=lens,
             model=model,
-            owner_prompt="",
             timeout_seconds=timeout_seconds,
-            quality_review_binding=binding,
         )
-        return {
-            **launched,
-            "quality_review": {
+        if reservation.get("ok") is not True:
+            return reservation
+        if reservation.get("already_reserved"):
+            return reservation
+        request_id = str(reservation["request_id"])
+        threading.Thread(
+            target=self._complete_quality_reviewer_launch,
+            kwargs={
+                "request_id": request_id,
                 "target_request_id": target_request_id,
                 "target_task_id": target_task_id,
                 "reviewer_task_id": reviewer_task_id,
+                "runner": runner,
+                "adapter_id": adapter_id,
                 "lens": lens,
-                "packet_sha256": packet["packet_sha256"],
+                "model": model,
+                "timeout_seconds": timeout_seconds,
             },
+            name=f"aiworkhub-reviewer-{request_id[:8]}",
+            daemon=True,
+        ).start()
+        return {
+            "ok": True,
+            "launch_implemented": LAUNCH_IMPLEMENTED,
+            "launch_enabled": True,
+            "request_id": request_id,
+            "task_id": reviewer_task_id,
+            "runner": runner,
+            "topic": "quality_review",
+            "adapter_id": adapter_id,
+            "model": model,
+            "state": "starting",
+            "pid": 0,
+            "deferred": True,
+            "already_reserved": False,
+            "shell": False,
         }
 
     def _launch_isolated(
@@ -4504,6 +4799,7 @@ class ProcessManager:
         owner_prompt: str,
         timeout_seconds: int,
         quality_review_binding: dict[str, Any] | None = None,
+        reserved_request_id: str | None = None,
     ) -> dict[str, Any]:
         if not launch_gates_open():
             return self._blocked(
@@ -4557,21 +4853,26 @@ class ProcessManager:
             provider_env, model = self._resolve_provider_env(adapter_id, model)
             sandbox_backend = _sandbox_backend_for_adapter(adapter_id)
             launch_phase = "workspace_and_runtime_provision"
-            request_id = uuid.uuid4().hex
-            with self._launch_reservation({
-                "request_id": request_id,
-                "task_id": task_id,
-                "runner": runner,
-                "topic": topic,
-                "adapter_id": adapter_id,
-                "model": model,
-                "timeout_seconds": timeout_seconds,
-                "authority": f"coordinator_claim_isolated_worktree_{sandbox_backend}",
-                "sandbox_backend": sandbox_backend,
-                "project_context": (
-                    context_result.metadata if context_result is not None else None
-                ),
-            }):
+            request_id = reserved_request_id or uuid.uuid4().hex
+            reservation_ctx = (
+                nullcontext()
+                if reserved_request_id is not None
+                else self._launch_reservation({
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "runner": runner,
+                    "topic": topic,
+                    "adapter_id": adapter_id,
+                    "model": model,
+                    "timeout_seconds": timeout_seconds,
+                    "authority": f"coordinator_claim_isolated_worktree_{sandbox_backend}",
+                    "sandbox_backend": sandbox_backend,
+                    "project_context": (
+                        context_result.metadata if context_result is not None else None
+                    ),
+                })
+            )
+            with reservation_ctx:
                 self.process_dir.mkdir(parents=True, exist_ok=True)
                 chmod_path(self.process_dir, 0o700)
                 stdout_path = self.process_dir / f"{request_id}.stdout.log"
