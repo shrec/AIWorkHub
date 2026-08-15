@@ -58,7 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-SCHEMA_ID = "aiworkhub.needfix_store.v2"
+SCHEMA_ID = "aiworkhub.needfix_store.v3"
 
 HUB_DIRNAME = ".aiworkhub"
 NEEDFIX_DB_REL = (HUB_DIRNAME, "tasking", "needfix.sqlite")
@@ -124,6 +124,10 @@ KINDS: tuple[str, ...] = (
 
 NF_ID_RE = re.compile(r'^NF-\d{4}-\d{5}$')
 MAX_ID_SEQUENCE = 99999
+
+# Durable lineage authority event: every verified reopen of a superseded task
+# link is recorded once; its exact count drives reopen_generation derivation.
+REOPEN_EVENT = "superseded_task_link_reopened"
 
 
 class NeedFixError(Exception):
@@ -200,6 +204,7 @@ CREATE TABLE IF NOT EXISTS needfix (
     status TEXT NOT NULL,
     duplicate_parent_id TEXT,
     converted_task_id TEXT,
+    reopen_generation INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     task_planned_at TEXT,
@@ -226,6 +231,125 @@ CREATE INDEX IF NOT EXISTS idx_needfix_events_id ON needfix_events(needfix_id);
 """
 
 
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Return True when ``column`` is present in the live ``table`` schema."""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row["name"] == column for row in rows)
+
+
+def _durable_reopen_count(conn: sqlite3.Connection, needfix_id: str) -> int:
+    """Exact durable lineage authority: recorded reopen event count."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM needfix_events "
+        "WHERE needfix_id = ? AND event = ?",
+        (needfix_id, REOPEN_EVENT),
+    ).fetchone()
+    return int(row["n"])
+
+
+def _backfill_legacy_reopen_generation(conn: sqlite3.Connection) -> None:
+    """Derive ``reopen_generation`` for legacy rows from durable reopen events.
+
+    Only rows still carrying the migration default of 0 and with at least one
+    durable ``superseded_task_link_reopened`` event are rewritten; nonzero
+    values are never silently repaired here (they fail closed elsewhere).
+    """
+    conn.execute(
+        "UPDATE needfix SET reopen_generation = ("
+        "    SELECT COUNT(*) FROM needfix_events e "
+        "    WHERE e.needfix_id = needfix.id AND e.event = ?"
+        ") WHERE reopen_generation = 0 AND ("
+        "    SELECT COUNT(*) FROM needfix_events e "
+        "    WHERE e.needfix_id = needfix.id AND e.event = ?"
+        ") > 0",
+        (REOPEN_EVENT, REOPEN_EVENT),
+    )
+
+
+def _migrate_needfix_schema(conn: sqlite3.Connection) -> None:
+    """Additive fail-closed migration adding the ``reopen_generation`` column.
+
+    Reads the live schema via PRAGMA, ALTERs only when the column is absent,
+    re-reads PRAGMA after the ALTER to confirm it landed, treats only a real
+    concurrent winner (the column appears after a duplicate-column error) as
+    benign, and re-raises any unrelated ``OperationalError``.
+    """
+    if _column_exists(conn, "needfix", "reopen_generation"):
+        _backfill_legacy_reopen_generation(conn)
+        return
+    try:
+        conn.execute(
+            "ALTER TABLE needfix ADD COLUMN "
+            "reopen_generation INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        # A concurrent migrator may have already added the column; that is the
+        # only benign OperationalError. Verify via the live schema, otherwise
+        # re-raise the unrelated error.
+        if not _column_exists(conn, "needfix", "reopen_generation"):
+            raise
+    if not _column_exists(conn, "needfix", "reopen_generation"):
+        raise NeedFixError(
+            "needfix schema migration failed: reopen_generation column "
+            "missing after ALTER"
+        )
+    _backfill_legacy_reopen_generation(conn)
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create the base schema and run the additive reopen_generation migration."""
+    conn.executescript(_SCHEMA_SQL)
+    _migrate_needfix_schema(conn)
+
+
+def _validate_reopen_generation_value(stored: Any, needfix_id: str) -> int:
+    """Fail closed unless the stored generation is a non-negative integer."""
+    if isinstance(stored, bool) or not isinstance(stored, int) or stored < 0:
+        raise NeedFixError(
+            f"needfix {needfix_id} has invalid reopen_generation {stored!r} "
+            "(must be a non-negative integer)"
+        )
+    return stored
+
+
+def _authoritative_reopen_generation(conn: sqlite3.Connection, needfix_id: str) -> int:
+    """Return the authoritative reopen generation, failing closed on divergence.
+
+    A legacy stored value of 0 derives solely from the exact durable reopen
+    event count. Any nonzero stored value must exactly equal that count;
+    stored<events, stored>events, bool, negative, and non-integer values all
+    fail closed before any claim or mutation.
+    """
+    row = conn.execute(
+        "SELECT reopen_generation FROM needfix WHERE id = ?", (needfix_id,)
+    ).fetchone()
+    if row is None:
+        raise NeedFixNotFoundError(needfix_id)
+    stored = _validate_reopen_generation_value(row["reopen_generation"], needfix_id)
+    events = _durable_reopen_count(conn, needfix_id)
+    if stored == 0:
+        return events
+    if stored != events:
+        raise NeedFixConflictError(
+            f"needfix {needfix_id} reopen_generation {stored} diverges from "
+            f"{events} durable {REOPEN_EVENT} events"
+        )
+    return stored
+
+
+def successor_task_id(needfix_id: str, generation: int) -> str:
+    """Deterministic, collision-free conversion task_id for one generation.
+
+    Generation 0 preserves the canonical ``needfix-{NF-ID}``; each verified
+    reopen appends a monotonic ``-rN`` suffix so an archived predecessor
+    task_id is never reused.
+    """
+    generation = _validate_reopen_generation_value(generation, needfix_id)
+    if generation == 0:
+        return f"needfix-{needfix_id}"
+    return f"needfix-{needfix_id}-r{generation}"
+
+
 def initialize_repository(repo_root: str | Path) -> dict[str, Any]:
     """Idempotently ensure the NeedFix store exists for ``repo_root``.
 
@@ -236,7 +360,7 @@ def initialize_repository(repo_root: str | Path) -> dict[str, Any]:
 
     conn = _connect(repo_root)
     try:
-        conn.executescript(_SCHEMA_SQL)
+        _ensure_schema(conn)
         row = conn.execute("SELECT COUNT(*) AS n FROM needfix").fetchone()
         return {
             "schema_id": SCHEMA_ID,
@@ -315,6 +439,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "status": row["status"],
         "duplicate_parent_id": row["duplicate_parent_id"],
         "converted_task_id": row["converted_task_id"],
+        "reopen_generation": row["reopen_generation"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "task_planned_at": row["task_planned_at"],
@@ -399,7 +524,7 @@ def _insert(
     dedupe_key = _dedupe_key(title, description, scope)
     conn = _connect(repo_root)
     try:
-        conn.executescript(_SCHEMA_SQL)
+        _ensure_schema(conn)
         existing = conn.execute(
             "SELECT * FROM needfix WHERE dedupe_key = ? AND status != 'archived' LIMIT 1",
             (dedupe_key,),
@@ -545,7 +670,9 @@ def get_needfix(repo_root: str | Path, needfix_id: str) -> dict[str, Any]:
         row = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
         if row is None:
             raise NeedFixNotFoundError(needfix_id)
-        return _row_to_dict(row)
+        result = _row_to_dict(row)
+        result["reopen_generation"] = _authoritative_reopen_generation(conn, needfix_id)
+        return result
     finally:
         conn.close()
 
@@ -1099,8 +1226,9 @@ def default_task_card(needfix_snapshot: Mapping[str, Any]) -> dict[str, Any]:
     scope_files = [
         str(item) for item in (needfix_snapshot.get("scope_files") or []) if str(item).strip()
     ]
+    generation = needfix_snapshot.get("reopen_generation", 0)
     card: dict[str, Any] = {
-        "task_id": f"needfix-{needfix_id}",
+        "task_id": successor_task_id(needfix_id, generation),
         "title": needfix_snapshot["title"],
         "objective": needfix_snapshot["description"],
         "acceptance": [f"Resolve NeedFix {needfix_id}: {needfix_snapshot['title']}"],
@@ -1307,6 +1435,7 @@ def _validate_and_claim(
         )
 
     prior_status: str = row["status"]
+    generation = _authoritative_reopen_generation(conn, needfix_id)
     cur = conn.execute(
         "UPDATE needfix SET status = 'converting', updated_at = ? "
         "WHERE id = ? AND status IN ('accepted', 'task_planned')",
@@ -1321,6 +1450,7 @@ def _validate_and_claim(
     needfix_snapshot = _row_to_dict(
         conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
     )
+    needfix_snapshot["reopen_generation"] = generation
     return prior_status, needfix_snapshot
 
 
@@ -1626,7 +1756,9 @@ def reopen_superseded_task_link(
     archived, and carries ``archive_operation=superseded``. Active, reviewable,
     failed-but-recoverable, missing, foreign, and accepted finished tasks all
     fail closed. The stale link is cleared atomically and retained in the audit
-    event instead of being silently repointed.
+    event instead of being silently repointed. Each verified reopen increments
+    ``reopen_generation`` (derived from the exact durable reopen event count),
+    which drives a deterministic ``-rN`` successor task_id.
     """
     note = str(reason or "").strip()
     if not note:
@@ -1664,11 +1796,13 @@ def reopen_superseded_task_link(
             )
 
         now = _utcnow_iso()
+        current_generation = _authoritative_reopen_generation(conn, needfix_id)
+        new_generation = current_generation + 1
         cur = conn.execute(
             "UPDATE needfix SET status = 'accepted', converted_task_id = NULL, "
-            "task_planned_at = NULL, updated_at = ? "
+            "task_planned_at = NULL, reopen_generation = ?, updated_at = ? "
             "WHERE id = ? AND status = 'task_created' AND converted_task_id = ?",
-            (now, needfix_id, linked_task_id),
+            (new_generation, now, needfix_id, linked_task_id),
         )
         if cur.rowcount != 1:
             raise NeedFixConflictError(
@@ -1683,6 +1817,7 @@ def reopen_superseded_task_link(
                 "prior_converted_task_id": linked_task_id,
                 "task_status": task_status,
                 "archive_operation": archive_operation,
+                "reopen_generation": new_generation,
                 "reason": note,
             },
         )

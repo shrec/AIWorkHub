@@ -1112,6 +1112,239 @@ class TestLinkExistingTask:
         assert unchanged["converted_task_id"] == "task-1"
 
 
+class TestReopenGenerationLifecycle:
+    """Deterministic ``-rN`` successor task IDs driven by the exact durable
+    reopen event count, plus the fail-closed ``reopen_generation`` migration."""
+
+    @staticmethod
+    def _create_task_fn(card):
+        return {"ok": True, "task_id": card["task_id"]}
+
+    @staticmethod
+    def _archived_superseded_get(task_id):
+        return {"id": task_id, "status": "archived", "archive_operation": "superseded"}
+
+    @staticmethod
+    def _canonical_status_fn(task):
+        return task["status"]
+
+    def _accepted(self, init_store: Path):
+        r = needfix_store.capture_proposal(init_store, title="T", description="D")
+        needfix_store.triage_needfix(init_store, r["id"])
+        return needfix_store.accept_needfix(init_store, r["id"])
+
+    def _convert(self, init_store: Path, nid: str):
+        return needfix_store.convert_needfix(init_store, nid, self._create_task_fn)
+
+    def _reopen(self, init_store: Path, nid: str):
+        return needfix_store.reopen_superseded_task_link(
+            init_store,
+            nid,
+            get_task_fn=self._archived_superseded_get,
+            canonical_status_fn=self._canonical_status_fn,
+            reason="Replacement task planned from the rebased residual.",
+        )
+
+    def _set_generation(self, init_store: Path, nid: str, value):
+        conn = needfix_store._connect(init_store)
+        try:
+            conn.execute(
+                "UPDATE needfix SET reopen_generation = ? WHERE id = ?", (value, nid)
+            )
+        finally:
+            conn.close()
+
+    def test_generation_zero_uses_canonical_task_id(self, init_store: Path):
+        r = self._accepted(init_store)
+        assert r["reopen_generation"] == 0
+        conv = self._convert(init_store, r["id"])
+        assert conv["converted_task_id"] == f"needfix-{r['id']}"
+
+    def test_reopen_derives_deterministic_collision_free_successor_id(self, init_store: Path):
+        r = self._accepted(init_store)
+        self._convert(init_store, r["id"])
+        first = needfix_store.get_needfix(init_store, r["id"])["converted_task_id"]
+
+        reopened = self._reopen(init_store, r["id"])
+        assert reopened["reopen_generation"] == 1
+        assert reopened["converted_task_id"] is None
+
+        conv = self._convert(init_store, r["id"])
+        assert conv["converted_task_id"] == f"needfix-{r['id']}-r1"
+        assert conv["converted_task_id"] != first
+
+        self._reopen(init_store, r["id"])
+        conv2 = self._convert(init_store, r["id"])
+        assert conv2["converted_task_id"] == f"needfix-{r['id']}-r2"
+        assert conv2["converted_task_id"] not in (first, conv["converted_task_id"])
+
+    def test_repeated_preview_returns_identical_successor_and_digest(self, init_store: Path):
+        r = self._accepted(init_store)
+        self._convert(init_store, r["id"])
+        self._reopen(init_store, r["id"])
+        plan = {"runner": "x", "topic": "y", "required_outputs": ["f.py"]}
+
+        p1 = needfix_store.preview_convert(init_store, r["id"], plan)
+        p2 = needfix_store.preview_convert(init_store, r["id"], plan)
+
+        assert p1["task_plan"]["task_id"] == f"needfix-{r['id']}-r1"
+        assert p1["plan_digest"] == p2["plan_digest"]
+
+    def test_convert_is_exactly_once_and_reconciles_lost_ack(self, init_store: Path):
+        r = self._accepted(init_store)
+        self._convert(init_store, r["id"])
+        self._reopen(init_store, r["id"])
+
+        conv = self._convert(init_store, r["id"])
+        assert conv["converted_task_id"] == f"needfix-{r['id']}-r1"
+        assert conv["already_converted"] is False
+
+        retry = self._convert(init_store, r["id"])
+        assert retry["already_converted"] is True
+        assert retry["converted_task_id"] == f"needfix-{r['id']}-r1"
+
+    def test_archived_predecessor_lineage_remains_auditable(self, init_store: Path):
+        r = self._accepted(init_store)
+        self._convert(init_store, r["id"])
+        self._reopen(init_store, r["id"])
+        self._convert(init_store, r["id"])
+        self._reopen(init_store, r["id"])
+
+        reopen_events = [
+            e
+            for e in needfix_store.list_events(init_store, r["id"], limit=100)
+            if e["event"] == "superseded_task_link_reopened"
+        ]
+        assert len(reopen_events) == 2
+        # list_events is newest-first.
+        assert reopen_events[0]["detail"]["prior_converted_task_id"] == f"needfix-{r['id']}-r1"
+        assert reopen_events[0]["detail"]["reopen_generation"] == 2
+        assert reopen_events[1]["detail"]["prior_converted_task_id"] == f"needfix-{r['id']}"
+        assert reopen_events[1]["detail"]["reopen_generation"] == 1
+
+    def test_legacy_schema_backfills_generation_from_durable_events(self, repo_root: Path):
+        hub = repo_root / ".aiworkhub" / "tasking"
+        hub.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(hub / "needfix.sqlite"))
+        conn.executescript(
+            """
+            CREATE TABLE needfix (
+                id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL, title TEXT NOT NULL,
+                description TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'other',
+                severity TEXT NOT NULL DEFAULT 'medium', tags_json TEXT NOT NULL DEFAULT '[]',
+                scope TEXT, scope_files_json TEXT DEFAULT '[]',
+                scope_symbols_json TEXT DEFAULT '[]', provenance_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                readiness_score INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+                duplicate_parent_id TEXT, converted_task_id TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, task_planned_at TEXT,
+                resolved_at TEXT, archived_at TEXT,
+                UNIQUE(dedupe_key, status) ON CONFLICT IGNORE
+            );
+            CREATE TABLE needfix_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, needfix_id TEXT NOT NULL,
+                event TEXT NOT NULL, detail_json TEXT, created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO needfix (id, dedupe_key, title, description, provenance_json, "
+            "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "NF-2026-00001",
+                "dk",
+                "t",
+                "d",
+                "{}",
+                "accepted",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        for _ in range(3):
+            conn.execute(
+                "INSERT INTO needfix_events (needfix_id, event, detail_json, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("NF-2026-00001", "superseded_task_link_reopened", "{}", "2026-01-01T00:00:00+00:00"),
+            )
+        conn.commit()
+        conn.close()
+
+        needfix_store.initialize_repository(repo_root)
+        row = needfix_store.get_needfix(repo_root, "NF-2026-00001")
+        assert row["reopen_generation"] == 3
+
+    def test_migration_is_idempotent(self, init_store: Path):
+        r = self._accepted(init_store)
+        needfix_store.initialize_repository(init_store)
+        assert needfix_store.get_needfix(init_store, r["id"])["reopen_generation"] == 0
+
+    def test_migration_concurrent_winner_is_benign(self, monkeypatch):
+        reads = {"n": 0}
+        monkeypatch.setattr(
+            needfix_store,
+            "_column_exists",
+            lambda conn, table, column: (reads.__setitem__("n", reads["n"] + 1) or reads["n"] > 1),
+        )
+
+        class FakeConn:
+            def execute(self, sql, params=()):
+                s = sql.lstrip().upper()
+                if s.startswith("ALTER TABLE"):
+                    raise sqlite3.OperationalError("duplicate column name: reopen_generation")
+                if s.startswith("UPDATE"):
+                    return None
+                raise AssertionError(f"unexpected execute: {sql}")
+
+        # Must not raise: a real concurrent winner is the only benign case.
+        needfix_store._migrate_needfix_schema(FakeConn())
+
+    def test_migration_reraise_unrelated_operational_error(self, monkeypatch):
+        monkeypatch.setattr(needfix_store, "_column_exists", lambda conn, table, column: False)
+
+        class FakeConn:
+            def execute(self, sql, params=()):
+                if sql.lstrip().upper().startswith("ALTER TABLE"):
+                    raise sqlite3.OperationalError("database is locked")
+                raise AssertionError(f"unexpected execute: {sql}")
+
+        with pytest.raises(sqlite3.OperationalError):
+            needfix_store._migrate_needfix_schema(FakeConn())
+
+    def test_mismatch_stored_greater_than_events_fails_closed(self, init_store: Path):
+        r = self._accepted(init_store)
+        self._convert(init_store, r["id"])
+        self._reopen(init_store, r["id"])  # generation 1, one durable event
+        self._set_generation(init_store, r["id"], 5)
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.get_needfix(init_store, r["id"])
+
+    def test_mismatch_stored_less_than_events_fails_closed(self, init_store: Path):
+        r = self._accepted(init_store)
+        self._convert(init_store, r["id"])
+        self._reopen(init_store, r["id"])
+        self._convert(init_store, r["id"])
+        self._reopen(init_store, r["id"])  # generation 2, two durable events
+        self._set_generation(init_store, r["id"], 1)
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.get_needfix(init_store, r["id"])
+
+    @pytest.mark.parametrize("bad", ["abc", 2.5, -3])
+    def test_invalid_generation_values_fail_closed(self, init_store: Path, bad):
+        r = self._accepted(init_store)
+        self._set_generation(init_store, r["id"], bad)
+        with pytest.raises(needfix_store.NeedFixError):
+            needfix_store.get_needfix(init_store, r["id"])
+
+    def test_successor_task_id_rejects_bool_and_invalid_generations(self):
+        assert needfix_store.successor_task_id("NF-2026-00001", 0) == "needfix-NF-2026-00001"
+        assert needfix_store.successor_task_id("NF-2026-00001", 3) == "needfix-NF-2026-00001-r3"
+        for bad in (True, False, -1, "2", 2.5):
+            with pytest.raises(needfix_store.NeedFixError):
+                needfix_store.successor_task_id("NF-2026-00001", bad)
+
+
 class TestManagerVerifiedResolution:
     def _accepted(self, init_store: Path, *, readiness_score: int = 100, evidence=None, refs=None):
         row = needfix_store.capture_proposal(

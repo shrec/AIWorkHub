@@ -318,13 +318,19 @@ def _usage_total_from_output(path: Path, adapter_id: str) -> int | None:
     snapshots would double count. Claude cache fields are disjoint from its
     input count, while OpenAI-shaped adapters report cache hits as an input
     subset.
+
+    Provider stdout is untrusted: malformed or pathologically deep JSON must
+    fail soft here rather than propagate and kill an otherwise healthy child.
     """
-    summary = read_provider_usage(
-        path,
-        max_bytes=MAX_USAGE_SCAN_BYTES,
-        include_samples=False,
-    )
-    return live_total_tokens(summary, adapter_id)
+    try:
+        summary = read_provider_usage(
+            path,
+            max_bytes=MAX_USAGE_SCAN_BYTES,
+            include_samples=False,
+        )
+        return live_total_tokens(summary, adapter_id)
+    except (RecursionError, MemoryError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
 
 
 def _latest_progress_events(
@@ -343,7 +349,7 @@ def _latest_progress_events(
     for raw_line in reversed(raw.splitlines()):
         try:
             payload = json.loads(raw_line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, MemoryError):
             continue
         if not isinstance(payload, dict) or payload.get("type") != "aiworkhub_progress":
             continue
