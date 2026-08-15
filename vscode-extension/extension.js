@@ -6408,6 +6408,16 @@ async function ensureCodexCallbackMuxConfigured(context, options = {}) {
  *  source checkout in PYTHONPATH can fail even while the dashboard is live.
  *  Keep the registration repository-scoped, but make code authority come from
  *  this extension's bundled runtime on every supported host OS. */
+function portableWorkspaceMcpCommand(command, repoRoot) {
+  const rawCommand = String(command || "");
+  if (!rawCommand || !path.isAbsolute(rawCommand)) return rawCommand;
+  const relative = path.relative(repoRoot, rawCommand);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    return rawCommand;
+  }
+  return `${"${workspaceFolder}"}/${relative.split(path.sep).join("/")}`;
+}
+
 function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, python) {
   if (!document || typeof document !== "object" || Array.isArray(document)) {
     return { document, changed: false };
@@ -6416,6 +6426,7 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
     document[containerKey] = {};
   }
   const servers = document[containerKey];
+  const portableCommand = portableWorkspaceMcpCommand(python.command, repoRoot);
   let changed = false;
   let found = false;
   for (const [name, value] of Object.entries(servers)) {
@@ -6438,7 +6449,7 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
     if (!Object.prototype.hasOwnProperty.call(nextEnv, "AIWORKHUB_ALLOW_LAUNCH")) {
       nextEnv.AIWORKHUB_ALLOW_LAUNCH = "1";
     }
-    const next = { ...value, command: python.command, args: nextArgs, env: nextEnv, type: "stdio" };
+    const next = { ...value, command: portableCommand, args: nextArgs, env: nextEnv, type: "stdio" };
     if (JSON.stringify(next) !== JSON.stringify(value)) {
       servers[name] = next;
       changed = true;
@@ -6446,7 +6457,7 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
   }
   if (!found) {
     servers.AIWorkHub = {
-      command: python.command,
+      command: portableCommand,
       args: [...(Array.isArray(python.argsPrefix) ? python.argsPrefix : []), "-m", "aiworkhub.server"],
       env: {
         PYTHONPATH: runtimeDir,
@@ -9205,6 +9216,7 @@ module.exports = {
     migrateCodexConfigTomlRuntimePath,
     repairWorkspaceMcpConfigObject,
     repairClaudeMcpConfigObject,
+    portableWorkspaceMcpCommand,
     ensureWorkspaceMcpConfigsRepaired,
     ensureCodexMcpRegistrationTomlText,
     ensureCodexMcpRegistered,
