@@ -1,10 +1,13 @@
 """Repository-scoped, preview-first retained-worktree quarantine lifecycle.
 
 The dashboard never deletes a worktree directly. A read-only preview identifies
-only clean, fully-pushed, policy-aged worktrees owned by the current repository.
-An explicit user confirmation may atomically move those exact entries into a
-same-volume quarantine. Restore is supported during the bounded undo window;
-purge is a separate explicit action after that deadline.
+policy-aged worktrees owned by the current repository that no live task
+attempt still holds: either clean and fully pushed, or a superseded rework
+attempt whose local commits were deliberately never pushed (see
+:func:`plan_worktree_reclaim`). An explicit user confirmation may atomically
+move those exact entries into a same-volume quarantine. Restore is supported
+during the bounded undo window; purge is a separate explicit action after
+that deadline.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import tempfile
 import time
@@ -54,6 +58,140 @@ def _policy(repo_root: Path) -> tuple[int, int]:
     except (KeyError, TypeError, ValueError, repo_policy.RepoPolicyError):
         defaults = repo_policy.DEFAULT_POLICY["retention"]
         return int(defaults["terminal_runs_days"]), int(defaults["worktree_max_bytes"])
+
+
+def _protected_attempt_ids(repo_root: Path) -> tuple[set[str], bool]:
+    """Worktree ids a live task attempt still holds: never quarantine candidates.
+
+    A worktree is protected only while it is the *current* claimed attempt of
+    a task that is actively ``processing`` or ``review`` (the newest attempt
+    under evaluation). Everything else -- a superseded rework predecessor, or
+    an old attempt of a finished/archived/blocked/pending/superseded card --
+    is no longer live and may be reclaimed regardless of its git dirty/
+    unpushed state, since quarantine only moves it into a same-volume,
+    restorable holding area; nothing is deleted until a separate purge.
+
+    The claim path writes the live worktree's request id into
+    ``launch_request_id``. ``accepted_request_id`` is populated only once a
+    review is ACCEPTED and the card has already flipped to ``finished``, so a
+    card genuinely ``processing`` or ``review`` always has it empty -- keying
+    protection on it left every live attempt unprotected.
+
+    Liveness is resolved with one unbounded read of the canonical ``tasks``
+    table's lifecycle columns, not through ``task_store.list_tasks``: that
+    reader's SQL ``LIMIT`` is capped at 5000 rows no matter what value is
+    passed, so on a repository whose live-task count exceeds it, rows would
+    silently fall outside the window and lose protection -- and any other
+    fixed row cap would carry the identical defect under a different number.
+    Reading every row's (status, worker_status, archived_at, card_json) is a
+    single query whose bound is the exact size of the ``tasks`` table, which
+    can never itself exclude a live card.
+
+    Returns ``(protected_ids, verified)``. ``verified`` is False when task
+    lineage could not be read at all, so the caller fails closed rather than
+    guessing that an unreadable attempt is safe to reclaim.
+    """
+    protected: set[str] = set()
+    try:
+        db_path = task_store.canonical_db_path(repo_root)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            rows = conn.execute(
+                "SELECT status, worker_status, archived_at, card_json FROM tasks"
+            ).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            if task_store.canonical_status(dict(row)) not in ("processing", "review"):
+                continue
+            try:
+                card_json = json.loads(row["card_json"] or "{}")
+            except json.JSONDecodeError:
+                card_json = {}
+            if not isinstance(card_json, dict):
+                continue
+            request_id = str(card_json.get("launch_request_id") or "").strip()
+            if request_id:
+                protected.add(request_id)
+    except (task_store.TaskStoreError, sqlite3.Error, OSError):
+        return set(), False
+    return protected, True
+
+
+def plan_worktree_reclaim(
+    repo_root: Path | str,
+    scan: Mapping[str, Any],
+    *,
+    min_age_days: int,
+    max_bytes: int,
+    current_bytes: int,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Lineage-aware split of a worktree scan into reclaim vs. keep.
+
+    Mirrors :func:`worktree_storage.plan_cleanup`'s shape, but a worktree is
+    eligible once no live task attempt still holds it -- not merely once it is
+    git-clean and fully pushed. A superseded rework attempt commonly carries
+    local commits that were deliberately never pushed (the rework replaced
+    them), which made the pure git-state check protect it forever regardless
+    of rejection count. Orphaned worktrees (broken git metadata) are still
+    never included here; that remains a separate, opt-in cleanup path.
+
+    When ``current_bytes`` exceeds ``max_bytes``, the oldest eligible-but-
+    under-age superseded worktrees are pulled forward (oldest modified first)
+    until the projection clears the cap or the pool is exhausted, so a policy
+    breach is never reported as nothing to reclaim.
+
+    ``now`` is an explicit as-of Unix timestamp used to compute each
+    worktree's age from its ``modified_at_epoch``. It defaults to the real
+    current time; callers (tests included) may inject a synthetic value so
+    age can be exercised deterministically without mutating filesystem
+    mtimes.
+    """
+    root = Path(repo_root).resolve()
+    protected_ids, lineage_verified = _protected_attempt_ids(root)
+    minimum_age_seconds = max(0, min(int(min_age_days), 3650)) * 86400
+    effective_now = time.time() if now is None else float(now)
+
+    would_keep: list[dict[str, Any]] = []
+    reclaimable: list[dict[str, Any]] = []
+    for wt in scan.get("worktrees") or []:
+        wt_id = str(wt.get("id") or "")
+        if wt.get("class") == worktree_storage.CLASS_ORPHANED or wt_id in protected_ids:
+            would_keep.append(wt)
+            continue
+        if wt.get("class") == worktree_storage.CLASS_REMOVABLE_SAFE or lineage_verified:
+            reclaimable.append(wt)
+        else:
+            # Dirty/unpushed and card lineage could not be verified: fail closed.
+            would_keep.append(wt)
+
+    would_remove = [
+        wt for wt in reclaimable
+        if (effective_now - float(wt.get("modified_at_epoch") or 0.0)) >= minimum_age_seconds
+    ]
+    under_age = [wt for wt in reclaimable if wt not in would_remove]
+    would_keep.extend(under_age)
+
+    if current_bytes > max_bytes:
+        projected = current_bytes - sum(int(wt.get("size_bytes") or 0) for wt in would_remove)
+        for wt in sorted(under_age, key=lambda item: float(item.get("modified_at_epoch") or 0.0)):
+            if projected <= max_bytes:
+                break
+            would_remove.append(wt)
+            would_keep.remove(wt)
+            projected -= int(wt.get("size_bytes") or 0)
+
+    return {
+        "base": scan.get("base"),
+        "would_remove": would_remove,
+        "would_keep": would_keep,
+        "reclaim_bytes": sum(int(wt.get("size_bytes") or 0) for wt in would_remove),
+        "kept_bytes": sum(int(wt.get("size_bytes") or 0) for wt in would_keep),
+        "lineage_verified": lineage_verified,
+    }
 
 
 def _quarantine_root(repo_root: Path, base: Path) -> Path:
@@ -105,19 +243,25 @@ def _verified_batch(repo_root: Path, base: Path, batch_id: str) -> Path:
     return batch
 
 
-def _preview_payload(repo_root: Path, base: Path) -> dict[str, Any]:
-    policy_days, max_bytes = _policy(repo_root)
-    scan = worktree_storage.scan_worktrees(
-        base,
-        with_sizes=True,
-        repo_root=repo_root,
-    )
-    global_scan = worktree_storage.scan_worktrees(base, with_sizes=True)
-    registrations = worktree_storage.scan_worktree_registrations(repo_root, base)
+def repo_storage_footprint(repo_root: Path | str, *, base: Path | None = None) -> dict[str, Any]:
+    """Single, shared definition of on-disk footprint bytes for every
+    ``worktree_max_bytes`` cap comparison across this subsystem's surfaces
+    (the retention preview and the dashboard telemetry), so they can never
+    silently disagree about what "current bytes" means.
+
+    Repo-scoped worktree bytes alone under-report usage on a repository whose
+    legacy ``logs/`` tree or ``.aiworkhub/runtime`` canonical data are large;
+    ``observed_total_bytes`` -- global worktree bytes plus both of those -- is
+    the authoritative figure for cap comparisons.
+    """
+    root = Path(repo_root).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
+    scan = worktree_storage.scan_worktrees(worktree_base, with_sizes=True, repo_root=root)
+    global_scan = worktree_storage.scan_worktrees(worktree_base, with_sizes=True)
     repository_worktree_bytes = int(scan.get("summary", {}).get("total_bytes") or 0)
     global_worktree_bytes = int(global_scan.get("summary", {}).get("total_bytes") or 0)
-    legacy_log_root = repo_root / LEGACY_LOG_RELATIVE_PATH
-    canonical_runtime_root = repo_root / CANONICAL_RUNTIME_RELATIVE_PATH
+    legacy_log_root = root / LEGACY_LOG_RELATIVE_PATH
+    canonical_runtime_root = root / CANONICAL_RUNTIME_RELATIVE_PATH
     legacy_log_bytes = (
         worktree_storage.directory_size_bytes(legacy_log_root)
         if legacy_log_root.is_dir() and not legacy_log_root.is_symlink()
@@ -129,10 +273,37 @@ def _preview_payload(repo_root: Path, base: Path) -> dict[str, Any]:
         else 0
     )
     observed_total_bytes = global_worktree_bytes + legacy_log_bytes + canonical_runtime_bytes
-    plan = worktree_storage.plan_cleanup(
+    return {
+        "base": worktree_base,
+        "scan": scan,
+        "observed_total_bytes": observed_total_bytes,
+        "canonical_runtime_bytes": canonical_runtime_bytes,
+        "legacy_log_bytes": legacy_log_bytes,
+        "global_worktree_bytes": global_worktree_bytes,
+        "repository_worktree_bytes": repository_worktree_bytes,
+        "unattributed_or_foreign_worktree_bytes": max(
+            0, global_worktree_bytes - repository_worktree_bytes
+        ),
+        "legacy_log_status": (
+            "present_unmanaged" if legacy_log_bytes else "absent_or_empty"
+        ),
+    }
+
+
+def _preview_payload(repo_root: Path, base: Path, *, now: float | None = None) -> dict[str, Any]:
+    policy_days, max_bytes = _policy(repo_root)
+    footprint = repo_storage_footprint(repo_root, base=base)
+    scan = footprint["scan"]
+    registrations = worktree_storage.scan_worktree_registrations(repo_root, base)
+    observed_total_bytes = footprint["observed_total_bytes"]
+    repository_worktree_bytes = footprint["repository_worktree_bytes"]
+    plan = plan_worktree_reclaim(
+        repo_root,
         scan,
-        include_orphaned=False,
         min_age_days=policy_days,
+        max_bytes=max_bytes,
+        current_bytes=observed_total_bytes,
+        now=now,
     )
     candidates = [
         {
@@ -165,17 +336,7 @@ def _preview_payload(repo_root: Path, base: Path) -> dict[str, Any]:
         "current_bytes": observed_total_bytes,
         "worktree_current_bytes": repository_worktree_bytes,
         "footprint": {
-            "observed_total_bytes": observed_total_bytes,
-            "canonical_runtime_bytes": canonical_runtime_bytes,
-            "legacy_log_bytes": legacy_log_bytes,
-            "global_worktree_bytes": global_worktree_bytes,
-            "repository_worktree_bytes": repository_worktree_bytes,
-            "unattributed_or_foreign_worktree_bytes": max(
-                0, global_worktree_bytes - repository_worktree_bytes
-            ),
-            "legacy_log_status": (
-                "present_unmanaged" if legacy_log_bytes else "absent_or_empty"
-            ),
+            key: value for key, value in footprint.items() if key not in ("base", "scan")
         },
         "projected_bytes": max(
             0,
@@ -196,10 +357,12 @@ def _public_preview(value: Mapping[str, Any]) -> dict[str, Any]:
     return {key: item for key, item in value.items() if key != "base"}
 
 
-def preview(repo_root: Path | str, *, base: Path | None = None) -> dict[str, Any]:
+def preview(
+    repo_root: Path | str, *, base: Path | None = None, now: float | None = None
+) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     worktree_base = (base or configured_worktree_root(root)).resolve()
-    return _public_preview(_preview_payload(root, worktree_base))
+    return _public_preview(_preview_payload(root, worktree_base, now=now))
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -268,12 +431,13 @@ def quarantine(
     preview_digest: str,
     confirm: bool,
     base: Path | None = None,
+    now: float | None = None,
 ) -> dict[str, Any]:
     if not confirm:
         raise StorageRetentionError("explicit_confirmation_required")
     root = Path(repo_root).resolve()
     worktree_base = (base or configured_worktree_root(root)).resolve()
-    current = _preview_payload(root, worktree_base)
+    current = _preview_payload(root, worktree_base, now=now)
     if preview_digest != current["preview_digest"]:
         raise StorageRetentionError("retention_preview_stale")
     if not current["candidates"]:
@@ -323,9 +487,14 @@ def quarantine(
             item["state"] = "skipped_identity_changed"
             _atomic_json(manifest_path, manifest)
             continue
+        # A candidate need not be CLASS_REMOVABLE_SAFE: plan_worktree_reclaim()
+        # also admits superseded-lineage worktrees carrying unpushed local
+        # commits that were deliberately never going to be pushed. Orphaned
+        # (broken git metadata) worktrees are still refused here, matching
+        # preview's own exclusion.
         git_state = worktree_storage._worktree_git_state(source / "worktree")
         if (
-            worktree_storage._classify(git_state) != worktree_storage.CLASS_REMOVABLE_SAFE
+            worktree_storage._classify(git_state) == worktree_storage.CLASS_ORPHANED
             or git_state.get("head") != item["head"]
             or not repo_common_dir
             or git_state.get("parent_git_dir") != repo_common_dir
@@ -534,6 +703,7 @@ __all__ = [
     "SCHEMA_ID",
     "StorageRetentionError",
     "list_batches",
+    "plan_worktree_reclaim",
     "preview",
     "prune_stale_registrations",
     "purge",

@@ -6,6 +6,46 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.72] - 2026-08-15
+
+### Fixed
+
+- Storage retention now actually reclaims. Worktree eligibility previously
+  returned `candidate_count: 0` with `projected_bytes` byte-identical to
+  `current_bytes` while the repository held 43.3 GB against a 5 GB cap, because
+  every attempt workspace stayed pinned through `rework_predecessor` and
+  nothing released a superseded one. A superseded attempt whose successor has
+  been sealed is now an eligible candidate, and exceeding the cap forces
+  reclamation of the oldest superseded lineage instead of reporting nothing to
+  do.
+- Live-worktree protection is keyed on `launch_request_id`, the field the claim
+  path actually writes. It was keyed on `accepted_request_id`, which production
+  only writes once a review is accepted and the card has flipped to finished —
+  so every `processing` and `review` card had it empty and its live worktree was
+  unprotected.
+- Protection is no longer recency-bounded. It previously read only the most
+  recent rows, so past that window a live card silently lost protection; any
+  fixed row cap carries the same defect under a different number. Liveness is
+  now resolved from one unbounded read of the canonical `tasks` lifecycle
+  columns, whose only bound is the exact size of the table.
+- Retention age is an injected input rather than an observed filesystem
+  property, so eligibility is deterministic and testable without mutating file
+  mtimes.
+- When task lineage cannot be read at all the planner fails closed rather than
+  treating an unreadable attempt as safe to reclaim.
+
+### Validation
+
+- `tests/test_storage_retention.py` and `tests/test_storage_retention_reclaim.py`:
+  13 passed, covering the superseded-lineage case, the over-cap forcing case,
+  the protected-live-worktree case, live protection independent of table size,
+  and preview/executor agreement.
+- Measured on this repository after promotion: `candidate_count` 0 → 140,
+  `candidate_bytes` 0 → 17.4 GB, `projected_bytes` 43.3 GB → 25.9 GB, with the
+  two live worker worktrees correctly protected.
+- Passed an independent cross-provider correctness reviewer lens before
+  promotion.
+
 ## [0.9.71] - 2026-08-15
 
 ### Fixed

@@ -69,10 +69,9 @@ def _measure(repo_root: Path) -> dict[str, Any]:
             else:
                 continue
             components.append({"id": entry.name, "bytes": size, "files": files})
-    worktrees = worktree_storage.scan_worktrees(
-        with_sizes=True,
-        repo_root=repo_root,
-    )
+    footprint = storage_retention.repo_storage_footprint(repo_root)
+    worktrees = footprint["scan"]
+    observed_total_bytes = int(footprint["observed_total_bytes"])
     registrations = worktree_storage.scan_worktree_registrations(repo_root)
     summary = worktrees.get("summary") or {}
     worker_bytes = int(summary.get("total_bytes") or 0)
@@ -84,10 +83,20 @@ def _measure(repo_root: Path) -> dict[str, Any]:
         min_age_days = int(repo_policy.DEFAULT_POLICY["retention"]["terminal_runs_days"])
         worktree_max_bytes = int(repo_policy.DEFAULT_POLICY["retention"]["worktree_max_bytes"])
     if isinstance(worktrees.get("worktrees"), list) and worktrees.get("base"):
-        cleanup = worktree_storage.plan_cleanup(
+        cleanup = storage_retention.plan_worktree_reclaim(
+            repo_root,
             worktrees,
-            include_orphaned=False,
             min_age_days=min_age_days,
+            max_bytes=worktree_max_bytes,
+            current_bytes=observed_total_bytes,
+        )
+        # "Safe" keeps its original clean-and-fully-pushed meaning; the newer,
+        # broader lineage-verified reclaim total (which may include dirty/
+        # unpushed superseded attempts) is reported separately as eligible_bytes.
+        safe_reclaim_bytes = sum(
+            int(wt.get("size_bytes") or 0)
+            for wt in cleanup.get("would_remove") or []
+            if wt.get("class") == worktree_storage.CLASS_REMOVABLE_SAFE
         )
     else:
         cleanup = {
@@ -95,6 +104,7 @@ def _measure(repo_root: Path) -> dict[str, Any]:
             "would_keep": [],
             "reclaim_bytes": int(summary.get("removable_safe_bytes") or 0),
         }
+        safe_reclaim_bytes = int(summary.get("removable_safe_bytes") or 0)
     try:
         quarantine = storage_retention.list_batches(repo_root)
         quarantine_batches = quarantine.get("batches") or []
@@ -135,16 +145,17 @@ def _measure(repo_root: Path) -> dict[str, Any]:
         "repo_data_files": repo_files,
         "worker_tree_bytes": worker_bytes,
         "worker_tree_count": int(summary.get("count") or 0),
-        "safe_reclaimable_bytes": int(cleanup.get("reclaim_bytes") or 0),
+        "safe_reclaimable_bytes": safe_reclaim_bytes,
         "quarantine_bytes": quarantine_bytes,
         "managed_total_bytes": repo_bytes + worker_bytes + quarantine_bytes,
         "components": components,
         "retention_preview": {
             "policy_days": min_age_days,
             "max_bytes": worktree_max_bytes,
-            "current_bytes": worker_bytes,
-            "projected_bytes": max(0, worker_bytes - int(cleanup.get("reclaim_bytes") or 0)),
-            "over_limit_bytes": max(0, worker_bytes - worktree_max_bytes),
+            "current_bytes": observed_total_bytes,
+            "current_bytes_definition": "observed_total_bytes",
+            "projected_bytes": max(0, observed_total_bytes - int(cleanup.get("reclaim_bytes") or 0)),
+            "over_limit_bytes": max(0, observed_total_bytes - worktree_max_bytes),
             "eligible_count": len(cleanup.get("would_remove") or []),
             "protected_count": len(cleanup.get("would_keep") or []),
             "eligible_bytes": int(cleanup.get("reclaim_bytes") or 0),
@@ -152,6 +163,9 @@ def _measure(repo_root: Path) -> dict[str, Any]:
             "repository_scoped": True,
             "orphaned_excluded": True,
             "registrations": registrations,
+            "footprint": {
+                key: value for key, value in footprint.items() if key not in ("base", "scan")
+            },
         },
         "quarantine_batches": quarantine_batches,
         "terminal_log_retention": terminal_logs,

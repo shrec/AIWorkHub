@@ -1,5 +1,21 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.72 — 2026-08-15
+
+### Fixed
+
+- Storage retention actually reclaims now. Worktree eligibility returned zero
+  candidates while the repository sat far over its cap, because every attempt
+  workspace stayed pinned and nothing released a superseded one.
+- Live-worktree protection is keyed on the field the claim path writes
+  (`launch_request_id`), not on one that only exists after a review is
+  accepted — previously every processing/review card's live worktree was
+  unprotected.
+- Protection is no longer limited to the most recent rows, so a live card can
+  no longer lose protection just because the task table grew.
+- Retention age is injected rather than read from file mtimes, and the planner
+  fails closed when task lineage cannot be read.
+
 ## 0.9.71 — 2026-08-15
 
 ### Fixed

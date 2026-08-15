@@ -12,6 +12,24 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.72
+
+- Storage retention actually reclaims. Worktree eligibility reported zero
+  candidates while the repository sat at 43.3 GB against a 5 GB cap, because
+  every attempt workspace stayed pinned and nothing released a superseded one.
+  A superseded attempt whose successor has been sealed is now eligible, and
+  exceeding the cap forces reclamation of the oldest superseded lineage.
+- Live-worktree protection is keyed on the field the claim path actually writes,
+  so a `processing` or `review` card's worktree is protected while it runs. It
+  was keyed on a field production only writes after acceptance, leaving every
+  in-flight worktree unprotected.
+- Protection no longer depends on how large the task table has grown, and the
+  planner fails closed when task lineage cannot be read.
+- Measured here after the fix: 140 reclaimable worktrees, 17.4 GB, with the two
+  live workers correctly protected.
+
+See the packaged **Changelog** for the complete release summary.
+
 ## What's new in 0.9.71
 
 - A card owner can now release its own claim. The card-scoped write-action set

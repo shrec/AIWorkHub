@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import time
@@ -10,6 +9,16 @@ from pathlib import Path
 import pytest
 
 from aiworkhub import storage_retention, task_store
+
+# terminal_runs_days defaults to 30; 31 real days pushes a worktree past the
+# default policy threshold without ever touching its on-disk mtime. Age is
+# injected via an explicit ``now`` rather than ``os.utime``: workers run
+# under a landlock sandbox that forbids changing filesystem mtimes.
+_AGED_NOW_OFFSET_DAYS = 31
+
+
+def _aged_now() -> float:
+    return time.time() + _AGED_NOW_OFFSET_DAYS * 86400
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -39,14 +48,13 @@ def retained(tmp_path: Path) -> dict[str, Path]:
     worktree = entry / "worktree"
     entry.mkdir()
     _git(repo, "worktree", "add", "--detach", str(worktree), "HEAD")
-    old = time.time() - 31 * 86400
-    os.utime(entry, (old, old))
     return {"repo": repo, "base": base, "entry": entry}
 
 
 def test_preview_is_repo_scoped_deterministic_and_side_effect_free(retained) -> None:
-    first = storage_retention.preview(retained["repo"], base=retained["base"])
-    second = storage_retention.preview(retained["repo"], base=retained["base"])
+    aged_now = _aged_now()
+    first = storage_retention.preview(retained["repo"], base=retained["base"], now=aged_now)
+    second = storage_retention.preview(retained["repo"], base=retained["base"], now=aged_now)
 
     assert first == second
     assert first["dry_run"] is True
@@ -81,13 +89,15 @@ def test_preview_accounts_for_global_worktrees_runtime_and_legacy_logs(retained)
 
 
 def test_quarantine_and_restore_roundtrip(retained) -> None:
-    preview = storage_retention.preview(retained["repo"], base=retained["base"])
+    aged_now = _aged_now()
+    preview = storage_retention.preview(retained["repo"], base=retained["base"], now=aged_now)
 
     moved = storage_retention.quarantine(
         retained["repo"],
         preview_digest=preview["preview_digest"],
         confirm=True,
         base=retained["base"],
+        now=aged_now,
     )
 
     assert moved["quarantined"] == 1
@@ -107,21 +117,29 @@ def test_quarantine_and_restore_roundtrip(retained) -> None:
 
 
 def test_stale_preview_and_early_purge_fail_closed(retained) -> None:
-    preview = storage_retention.preview(retained["repo"], base=retained["base"])
-    os.utime(retained["entry"], None)
+    aged_now = _aged_now()
+    preview = storage_retention.preview(retained["repo"], base=retained["base"], now=aged_now)
+    # Invalidate the prior scan's identity without touching mtimes directly
+    # (landlock forbids os.utime): writing a new file into the entry bumps
+    # its real mtime as a normal side effect of the write, which changes
+    # modified_at_epoch/size_bytes and therefore the preview digest.
+    (retained["entry"] / "touched.txt").write_text("x", encoding="utf-8")
     with pytest.raises(storage_retention.StorageRetentionError, match="retention_preview_stale"):
         storage_retention.quarantine(
             retained["repo"],
             preview_digest=preview["preview_digest"],
             confirm=True,
             base=retained["base"],
+            now=aged_now,
         )
 
-    old = time.time() - 31 * 86400
-    os.utime(retained["entry"], (old, old))
-    fresh = storage_retention.preview(retained["repo"], base=retained["base"])
+    fresh = storage_retention.preview(retained["repo"], base=retained["base"], now=aged_now)
     moved = storage_retention.quarantine(
-        retained["repo"], preview_digest=fresh["preview_digest"], confirm=True, base=retained["base"]
+        retained["repo"],
+        preview_digest=fresh["preview_digest"],
+        confirm=True,
+        base=retained["base"],
+        now=aged_now,
     )
     with pytest.raises(storage_retention.StorageRetentionError, match="retention_undo_window_active"):
         storage_retention.purge(
@@ -130,9 +148,14 @@ def test_stale_preview_and_early_purge_fail_closed(retained) -> None:
 
 
 def test_purge_requires_expired_manifest_and_explicit_confirmation(retained) -> None:
-    preview = storage_retention.preview(retained["repo"], base=retained["base"])
+    aged_now = _aged_now()
+    preview = storage_retention.preview(retained["repo"], base=retained["base"], now=aged_now)
     moved = storage_retention.quarantine(
-        retained["repo"], preview_digest=preview["preview_digest"], confirm=True, base=retained["base"]
+        retained["repo"],
+        preview_digest=preview["preview_digest"],
+        confirm=True,
+        base=retained["base"],
+        now=aged_now,
     )
     batch = (
         retained["base"]
