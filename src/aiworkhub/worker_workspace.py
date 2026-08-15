@@ -1416,7 +1416,9 @@ def _overlay_regular_path(source_root: Path, target_root: Path, relative: str) -
     if target.is_symlink() or (target.exists() and not target.is_file()):
         raise WorkspaceError(f"combined_tree_target_not_regular:{relative}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
+    # Content-only copy: copystat/copytimes (os.utime) is denied inside the
+    # Landlock validation boundary, so metadata-preserving copy2 would fail.
+    shutil.copyfile(source, target)
 
 
 def create_combined_validation_workspace(

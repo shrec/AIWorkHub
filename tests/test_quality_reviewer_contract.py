@@ -1016,6 +1016,14 @@ def test_review_workspace_materializes_candidate_but_is_read_only(
         "validation",
     )
     (source.path / "source.py").write_text("value = 2\n", encoding="utf-8")
+
+    def _reject_metadata_copy(*_args, **_kwargs):
+        raise AssertionError("review overlay must not use metadata-preserving copy2")
+
+    # The review overlay must materialize byte-identical content without
+    # requesting copystat/utime metadata preservation (denied by the Landlock
+    # validation boundary), so copy2 must never be called here.
+    monkeypatch.setattr(worker_workspace.shutil, "copy2", _reject_metadata_copy)
     review = None
     try:
         review, evidence = worker_workspace.create_quality_review_workspace(

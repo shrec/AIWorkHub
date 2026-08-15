@@ -937,3 +937,45 @@ class TestRunValidationsGitInitIntegration:
         assert results
         assert results[0]["returncode"] == 0, results[0]
         assert not results[0].get("timed_out")
+
+
+class TestReviewOverlayContentOnlyCopy:
+    """NF160: review overlays must copy content only, never copystat/utime.
+
+    ``_overlay_regular_path`` feeds ``create_quality_review_workspace``. The
+    Landlock validation boundary denies ``utime``/``utimensat``, so the
+    overlay copy must not request timestamp/owner preservation via
+    ``shutil.copy2`` and must keep rejecting symlink/non-regular sources.
+    """
+
+    def test_overlay_copies_bytes_without_metadata_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "src"
+        target = tmp_path / "dst"
+        source.mkdir()
+        target.mkdir()
+        (source / "candidate.py").write_text("value = 2\n", encoding="utf-8")
+
+        def _reject_copy2(*_args, **_kwargs):
+            raise AssertionError("review overlay must not use copy2")
+
+        monkeypatch.setattr(worker_workspace.shutil, "copy2", _reject_copy2)
+        worker_workspace._overlay_regular_path(source, target, "candidate.py")
+        assert (target / "candidate.py").read_text(encoding="utf-8") == "value = 2\n"
+
+    def test_overlay_rejects_symlink_and_non_regular_sources(
+        self, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "src"
+        target = tmp_path / "dst"
+        source.mkdir()
+        target.mkdir()
+        real = source / "real.py"
+        real.write_text("value = 1\n", encoding="utf-8")
+        (source / "link.py").symlink_to(real)
+        with pytest.raises(WorkspaceError, match="symlink_path_component_forbidden"):
+            worker_workspace._overlay_regular_path(source, target, "link.py")
+        (source / "subdir").mkdir()
+        with pytest.raises(WorkspaceError, match="combined_tree_source_not_file"):
+            worker_workspace._overlay_regular_path(source, target, "subdir")
