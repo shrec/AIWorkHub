@@ -639,7 +639,9 @@ def test_callback_batches_are_partitioned_by_originating_provider(writable_repo)
         claude = callback_store.claim_pending_callback_batch(conn, provider="claude")
         assert claude is not None
         assert [m["task_id"] for m in claude["members"]] == ["TASK_CLAUDE_ROUTE"]
-        callback_store.mark_batch_delivered(conn, claude["batch_id"])
+        callback_store.mark_batch_delivered(
+            conn, claude["batch_id"], claude["lease_id"]
+        )
         codex = callback_store.claim_pending_callback_batch(conn, provider="codex")
         assert codex is not None
         assert [m["task_id"] for m in codex["members"]] == ["TASK_CODEX_ROUTE"]

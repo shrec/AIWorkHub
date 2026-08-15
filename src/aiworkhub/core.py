@@ -5463,6 +5463,7 @@ def claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
                         conn,
                         str(batch["batch_id"]),
                         "callback_belongs_to_different_claude_session",
+                        str(batch["lease_id"]),
                         delay_seconds=30.0,
                     )
                 finally:

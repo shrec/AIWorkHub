@@ -185,7 +185,12 @@ def test_verified_route_recovers_matching_dead_letter_once(tmp_path: Path) -> No
         callback_store.init_db(conn)
         claimed = callback_store.claim_pending_callback_batch(conn, provider="codex")
         assert claimed is not None
-        callback_store.mark_batch_dead_letter(conn, claimed["batch_id"], "post_ack_turn_cancelled")
+        callback_store.mark_batch_dead_letter(
+            conn,
+            claimed["batch_id"],
+            "post_ack_turn_cancelled",
+            claimed["lease_id"],
+        )
 
         assert callback_store.seed_missing_review_callbacks(
             conn, provider="codex", origin_thread_id="thread-b985"
@@ -197,7 +202,12 @@ def test_verified_route_recovers_matching_dead_letter_once(tmp_path: Path) -> No
 
         claimed_again = callback_store.claim_pending_callback_batch(conn, provider="codex")
         assert claimed_again is not None
-        callback_store.mark_batch_dead_letter(conn, claimed_again["batch_id"], "real_transport_failure")
+        callback_store.mark_batch_dead_letter(
+            conn,
+            claimed_again["batch_id"],
+            "real_transport_failure",
+            claimed_again["lease_id"],
+        )
         assert callback_store.seed_missing_review_callbacks(
             conn, provider="codex", origin_thread_id="thread-b985"
         ) == 0

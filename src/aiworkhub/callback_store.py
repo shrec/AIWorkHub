@@ -747,20 +747,51 @@ def claim_pending_callback_batch(
         }
 
 
-def mark_batch_delivered(conn: sqlite3.Connection, batch_id: str) -> None:
+def _require_lease_id(lease_id: object) -> str:
+    """Validate a caller-provided lease token before any mutating finalizer.
+
+    Fail closed: ``lease_id`` must be a non-empty ``str`` -- never ``None``,
+    a boolean, an int, or any other silently-coercible identity -- and is
+    returned stripped. Missing/invalid tokens raise ``ValueError`` before any
+    batch or outbox row is read or written; the current database row's lease
+    is never consulted to substitute a missing token.
+    """
+    if not isinstance(lease_id, str):
+        raise ValueError("lease_id is required and must be a non-empty string")
+    stripped = lease_id.strip()
+    if not stripped:
+        raise ValueError("lease_id is required and must be a non-empty string")
+    return stripped
+
+
+def mark_batch_delivered(conn: sqlite3.Connection, batch_id: str, lease_id: str) -> bool:
     """Mark every still-inflight member of a delivered batch delivered,
-    together, only after the matching turn/completed."""
+    together, only after the matching turn/completed.
+
+    Requires the exact caller-provided lease: the batch must still be the
+    caller's inflight claim. A stale or mismatched lease fails closed --
+    nothing is mutated and ``False`` is returned.
+    """
+    lease_id = _require_lease_id(lease_id)
     _ensure_callback_batches_table(conn)
     now = utc_now()
+    updated = conn.execute(
+        """
+        UPDATE callback_batches
+        SET state='delivered', updated_at=?
+        WHERE batch_id=? AND lease_id=? AND state='inflight'
+        """,
+        (now, batch_id, lease_id),
+    )
+    if updated.rowcount != 1:
+        conn.rollback()
+        return False
     conn.execute(
         "UPDATE callback_outbox SET state='delivered', updated_at=? WHERE batch_id=? AND state='inflight'",
         (now, batch_id),
     )
-    conn.execute(
-        "UPDATE callback_batches SET state='delivered', updated_at=? WHERE batch_id=?",
-        (now, batch_id),
-    )
     conn.commit()
+    return True
 
 
 def acknowledge_callback_batch(
@@ -792,8 +823,7 @@ def acknowledge_callback_batch(
         or row["origin_thread_id"] != origin_thread_id
     ):
         return False
-    mark_batch_delivered(conn, batch_id)
-    return True
+    return mark_batch_delivered(conn, batch_id, lease_id)
 
 
 def rebind_pending_callbacks(
@@ -991,102 +1021,149 @@ def _iso_plus_seconds(now_iso: str, delay_seconds: float) -> str:
 
 
 def defer_batch_busy(
-    conn: sqlite3.Connection, batch_id: str, error: str = "", *, delay_seconds: float = 0.0,
-) -> None:
+    conn: sqlite3.Connection,
+    batch_id: str,
+    error: str,
+    lease_id: str,
+    *,
+    delay_seconds: float = 0.0,
+) -> bool:
     """Return an inflight batch (and every member) to pending after a
     BUSY/active-thread deferral. Non-blocking: schedules the next eligible
     claim time via ``not_before_at``. Never increments
-    ``hard_failure_count`` and never dead-letters."""
+    ``hard_failure_count`` and never dead-letters.
+
+    Requires the exact caller-provided lease. A stale or mismatched lease
+    fails closed (``False``) without mutating the batch or its members.
+    """
+    lease_id = _require_lease_id(lease_id)
     _ensure_callback_batches_table(conn)
     now = utc_now()
     not_before = _iso_plus_seconds(now, delay_seconds)
     bounded_error = str(error)[:500]
-    conn.execute(
-        "UPDATE callback_outbox SET state='pending', updated_at=? WHERE batch_id=? AND state='inflight'",
-        (now, batch_id),
-    )
-    conn.execute(
+    updated = conn.execute(
         """
         UPDATE callback_batches
         SET state='pending', lease_id='', lease_expires_at='', last_error=?,
             updated_at=?, not_before_at=?, last_failure_kind='busy'
-        WHERE batch_id=?
+        WHERE batch_id=? AND lease_id=? AND state='inflight'
         """,
-        (bounded_error, now, not_before, batch_id),
+        (bounded_error, now, not_before, batch_id, lease_id),
+    )
+    if updated.rowcount != 1:
+        conn.rollback()
+        return False
+    conn.execute(
+        "UPDATE callback_outbox SET state='pending', updated_at=? WHERE batch_id=? AND state='inflight'",
+        (now, batch_id),
     )
     conn.commit()
+    return True
 
 
 def fail_batch_transient(
     conn: sqlite3.Connection,
     batch_id: str,
-    error: str = "",
+    error: str,
+    lease_id: str,
     *,
     max_retries: int,
     delay_seconds: float = 0.0,
 ) -> str:
     """Handle one GENUINE (non-busy) delivery failure for a batch. Bumps
     ``hard_failure_count`` and either reschedules the batch non-blockingly
-    or dead-letters it once the budget is exhausted. Returns ``"requeued"``
-    or ``"dead_letter"``."""
+    or dead-letters it once the budget is exhausted.
+
+    Requires the exact caller-provided lease. Returns ``"requeued"``,
+    ``"dead_letter"``, or ``"lease_rejected"`` (fail closed: no mutation).
+    """
+    lease_id = _require_lease_id(lease_id)
     _ensure_callback_batches_table(conn)
     row = conn.execute(
-        "SELECT hard_failure_count FROM callback_batches WHERE batch_id=?", (batch_id,)
+        "SELECT hard_failure_count FROM callback_batches "
+        "WHERE batch_id=? AND lease_id=? AND state='inflight'",
+        (batch_id, lease_id),
     ).fetchone()
-    new_count = (int(row["hard_failure_count"]) if row is not None else 0) + 1
+    if row is None:
+        return "lease_rejected"
+    new_count = int(row["hard_failure_count"]) + 1
     now = utc_now()
     bounded_error = str(error)[:500]
     if new_count >= max(1, int(max_retries)):
+        updated = conn.execute(
+            """
+            UPDATE callback_batches
+            SET state='dead_letter', last_error=?, updated_at=?,
+                hard_failure_count=?, last_failure_kind='transient_error'
+            WHERE batch_id=? AND lease_id=? AND state='inflight'
+            """,
+            (bounded_error, now, new_count, batch_id, lease_id),
+        )
+        if updated.rowcount != 1:
+            conn.rollback()
+            return "lease_rejected"
         conn.execute(
             "UPDATE callback_outbox SET state='dead_letter', last_error=?, updated_at=? "
             "WHERE batch_id=? AND state='inflight'",
             (bounded_error, now, batch_id),
         )
-        conn.execute(
-            """
-            UPDATE callback_batches
-            SET state='dead_letter', last_error=?, updated_at=?,
-                hard_failure_count=?, last_failure_kind='transient_error'
-            WHERE batch_id=?
-            """,
-            (bounded_error, now, new_count, batch_id),
-        )
         conn.commit()
         return "dead_letter"
     not_before = _iso_plus_seconds(now, delay_seconds)
-    conn.execute(
-        "UPDATE callback_outbox SET state='pending', updated_at=? WHERE batch_id=? AND state='inflight'",
-        (now, batch_id),
-    )
-    conn.execute(
+    updated = conn.execute(
         """
         UPDATE callback_batches
         SET state='pending', lease_id='', lease_expires_at='', last_error=?,
             updated_at=?, hard_failure_count=?, not_before_at=?,
             last_failure_kind='transient_error'
-        WHERE batch_id=?
+        WHERE batch_id=? AND lease_id=? AND state='inflight'
         """,
-        (bounded_error, now, new_count, not_before, batch_id),
+        (bounded_error, now, new_count, not_before, batch_id, lease_id),
+    )
+    if updated.rowcount != 1:
+        conn.rollback()
+        return "lease_rejected"
+    conn.execute(
+        "UPDATE callback_outbox SET state='pending', updated_at=? WHERE batch_id=? AND state='inflight'",
+        (now, batch_id),
     )
     conn.commit()
     return "requeued"
 
 
-def mark_batch_dead_letter(conn: sqlite3.Connection, batch_id: str, error: str = "") -> None:
-    """Dead-letter every still-inflight member of a batch together."""
+def mark_batch_dead_letter(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    error: str,
+    lease_id: str,
+) -> bool:
+    """Dead-letter every still-inflight member of a batch together.
+
+    Requires the exact caller-provided lease. A stale or mismatched lease
+    fails closed (``False``) without mutating the batch or its members.
+    """
+    lease_id = _require_lease_id(lease_id)
     _ensure_callback_batches_table(conn)
     now = utc_now()
     bounded_error = str(error)[:500]
+    updated = conn.execute(
+        """
+        UPDATE callback_batches
+        SET state='dead_letter', last_error=?, updated_at=?
+        WHERE batch_id=? AND lease_id=? AND state='inflight'
+        """,
+        (bounded_error, now, batch_id, lease_id),
+    )
+    if updated.rowcount != 1:
+        conn.rollback()
+        return False
     conn.execute(
         "UPDATE callback_outbox SET state='dead_letter', last_error=?, updated_at=? "
         "WHERE batch_id=? AND state='inflight'",
         (bounded_error, now, batch_id),
     )
-    conn.execute(
-        "UPDATE callback_batches SET state='dead_letter', last_error=?, updated_at=? WHERE batch_id=?",
-        (bounded_error, now, batch_id),
-    )
     conn.commit()
+    return True
 
 
 def recover_dead_letter_row(conn: sqlite3.Connection, outbox_id: int) -> tuple[bool, str]:

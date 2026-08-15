@@ -752,7 +752,7 @@ def test_concurrent_claim_never_forms_a_second_inflight_batch_for_same_thread():
         # Once the first batch resolves, the waiting second event becomes
         # claimable as its own fresh batch.
         finalize_conn = taskdb.open_db(db_path)
-        taskdb.mark_batch_delivered(finalize_conn, first_claim["batch_id"])
+        taskdb.mark_batch_delivered(finalize_conn, first_claim["batch_id"], first_claim["lease_id"])
         finalize_conn.close()
         followup_conn = taskdb.open_db(db_path)
         followup_claim = taskdb.claim_pending_callback_batch(followup_conn, lease_seconds=60)
@@ -886,7 +886,7 @@ def test_dead_letter_recovery_requeues_if_still_matching_else_supersedes():
         _seed_review_task(conn, "E2E_DEADLETTER_MOVED_ON", thread_id)
         claimed = taskdb.claim_pending_callback_batch(conn, lease_seconds=60)
         assert claimed is not None and len(claimed["members"]) == 2
-        taskdb.mark_batch_dead_letter(conn, claimed["batch_id"], "simulated app server outage")
+        taskdb.mark_batch_dead_letter(conn, claimed["batch_id"], "simulated app server outage", claimed["lease_id"])
 
         # E2E_DEADLETTER_MOVED_ON has since been reclaimed away from review.
         _force_task_reclaimed_to_pending(conn, "E2E_DEADLETTER_MOVED_ON")
@@ -1950,7 +1950,7 @@ def test_claim_pending_callback_batch_skips_not_due_thread_and_serves_other_due_
         conn = taskdb.open_db(db_path)
         busy_claim = taskdb.claim_pending_callback_batch(conn, lease_seconds=30)
         assert busy_claim is not None
-        taskdb.defer_batch_busy(conn, busy_claim["batch_id"], "thread_busy", delay_seconds=300.0)
+        taskdb.defer_batch_busy(conn, busy_claim["batch_id"], "thread_busy", busy_claim["lease_id"], delay_seconds=300.0)
         conn.close()
 
         conn = taskdb.open_db(db_path)
@@ -1986,7 +1986,7 @@ def test_claim_pending_callback_batch_never_forms_second_batch_for_thread_with_n
 
         conn = taskdb.open_db(db_path)
         first_claim = taskdb.claim_pending_callback_batch(conn, lease_seconds=30)
-        taskdb.defer_batch_busy(conn, first_claim["batch_id"], "thread_busy", delay_seconds=300.0)
+        taskdb.defer_batch_busy(conn, first_claim["batch_id"], "thread_busy", first_claim["lease_id"], delay_seconds=300.0)
         conn.close()
 
         # A second event on the SAME thread arrives while the batch is
@@ -2123,14 +2123,14 @@ def test_callback_batch_stats_distinguishes_waiting_for_thread_idle_from_genuine
 
         conn = taskdb.open_db(db_path)
         busy_claim = taskdb.claim_pending_callback_batch(conn, lease_seconds=30)
-        taskdb.defer_batch_busy(conn, busy_claim["batch_id"], "thread_busy", delay_seconds=300.0)
+        taskdb.defer_batch_busy(conn, busy_claim["batch_id"], "thread_busy", busy_claim["lease_id"], delay_seconds=300.0)
         conn.close()
 
         conn = taskdb.open_db(db_path)
         _seed_review_task(conn, "E2E_B416_STATS_FAIL", fail_thread)
         fail_claim = taskdb.claim_pending_callback_batch(conn, lease_seconds=30)
         assert fail_claim is not None
-        taskdb.fail_batch_transient(conn, fail_claim["batch_id"], "boom", max_retries=5, delay_seconds=300.0)
+        taskdb.fail_batch_transient(conn, fail_claim["batch_id"], "boom", fail_claim["lease_id"], max_retries=5, delay_seconds=300.0)
         conn.close()
 
         stats = _callback_batch_stats(db_path)

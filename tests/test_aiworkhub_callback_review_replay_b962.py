@@ -70,7 +70,9 @@ def test_repeated_terminal_transition_enqueues_once_per_launch_episode(
     try:
         batch = callback_store.claim_pending_callback_batch(conn, provider="codex")
         assert batch is not None
-        callback_store.mark_batch_delivered(conn, batch["batch_id"])
+        callback_store.mark_batch_delivered(
+            conn, batch["batch_id"], batch["lease_id"]
+        )
         stored = json.loads(conn.execute(
             "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
         ).fetchone()["card_json"])
