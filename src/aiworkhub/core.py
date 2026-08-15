@@ -5154,19 +5154,56 @@ def read_selected_coordinator_target(root: Path | None = None) -> dict[str, Any]
     (``.aiworkhub/config/routing/coordinator-targets.json``). Never invokes
     AITools; missing/corrupt/unrecognized state fails safe to the same
     "codex" default the extension's own ``defaultCoordinatorTargets()``
-    uses -- never a guess at a different provider."""
+    uses -- never a guess at a different provider.
+
+    A verified live Claude manager identity (this process's own confirmed
+    route) is stronger, fresher evidence of the active route than this
+    persisted/default file, which may still say "codex" (its own default)
+    long after the chat that wrote it ended, or before the extension has
+    ever written it. Whenever that identity is observed, every return path
+    below -- default, corrupt/unrecognized payload, and the normal merged
+    result -- resolves the active route to "claude" instead of leaving a
+    Codex-only route_pending/reason pinned on a manager route that is
+    provably Claude. When no such identity is observed, every return path
+    is byte-for-byte unchanged."""
+    claude_identity = _claude_manager_identity()
+
+    def _resolved(d: dict[str, Any]) -> dict[str, Any]:
+        if claude_identity is None:
+            return d
+        result = dict(d)
+        result["selected_provider"] = "claude"
+        targets = result.get("targets")
+        claude_target = targets.get("claude") if isinstance(targets, dict) else None
+        next_claude_target = dict(claude_target) if isinstance(claude_target, dict) else {}
+        next_claude_target["route"] = {
+            "thread_id": "",
+            "session_id": str(claude_identity.get("session_id") or ""),
+            "window_id": str(claude_identity.get("window_id") or ""),
+        }
+        next_claude_target["capability_state"] = "available"
+        next_claude_target["wake"] = {
+            "mode": "mcp_callback_wait",
+            "supported": True,
+        }
+        result["targets"] = {
+            **(targets if isinstance(targets, dict) else {}),
+            "claude": next_claude_target,
+        }
+        return result
+
     resolved_root = root or repo_root()
     path = _coordinator_route_state_path(resolved_root)
     default = {"schema_id": "aiworkhub.coordinator_targets.v1", "selected_provider": "codex"}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return default
+        return _resolved(default)
     if not isinstance(payload, dict):
-        return default
+        return _resolved(default)
     provider = str(payload.get("selected_provider") or "").strip().lower()
     if provider not in ("codex", "claude", "copilot"):
-        return default
+        return _resolved(default)
     merged = {**default, **payload, "selected_provider": provider}
     targets = merged.get("targets")
     if isinstance(targets, dict):
@@ -5207,7 +5244,7 @@ def read_selected_coordinator_target(root: Path | None = None) -> dict[str, Any]
                         "reason": "codex_thread_id_not_observed",
                     }
                     merged["targets"] = {**targets, "codex": next_target}
-    return merged
+    return _resolved(merged)
 
 
 def dispatcher_ensure_started() -> dict[str, Any]:

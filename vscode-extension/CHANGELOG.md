@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.70 — 2026-08-15
+
+### Fixed
+
+- Coordinator routing now resolves from the active verified manager route. A
+  Claude-routed repository no longer shows `automatic: codex`,
+  `route_pending` and `codex_thread_id_not_observed` in the dashboard while
+  manager identity reports `claude`, and no longer raises a Manager
+  coordination Route warning that no action can clear.
+- Codex routing, thread observation and reason strings are unchanged when the
+  active verified route is Codex; a repository with no verified route fails
+  closed instead of defaulting to either provider.
+
 ## 0.9.69 — 2026-08-15
 
 ### Added

@@ -6,6 +6,31 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.70] - 2026-08-15
+
+### Fixed
+
+- Resolve coordinator routing from the active verified manager route instead of
+  pinning it to Codex. A repository whose verified manager route is Claude no
+  longer reports `automatic: codex`, `route_pending` and
+  `codex_thread_id_not_observed` while `manager_identity.provider` says
+  `claude` in the same response, and no longer raises a coordination Route
+  warning that no operator action can clear.
+- Codex coordinator routing, its thread observation and every reported reason
+  string are unchanged when the active verified route really is Codex, and a
+  repository with no verified route still fails closed rather than defaulting
+  to either provider.
+
+### Validation
+
+- `tests/test_coordinator_routing_provider_parity.py`: 10 passed, covering the
+  Claude route resolving, the Codex route staying byte-identical, and the
+  no-verified-route case failing closed.
+- Combined-tree run with the 0.9.69 changes: 143 passed; `ruff check
+  src/aiworkhub scripts tests` clean.
+- Passed an independent cross-provider correctness reviewer lens before
+  promotion.
+
 ## [0.9.69] - 2026-08-15
 
 ### Added

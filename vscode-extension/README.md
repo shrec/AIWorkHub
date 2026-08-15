@@ -12,6 +12,19 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.70
+
+- Coordinator routing resolves from the active verified manager route, so a
+  Claude-routed repository no longer sits permanently at `route_pending`
+  waiting for a Codex thread that will never appear.
+- The dashboard no longer raises a Manager coordination Route warning that no
+  operator action can clear, and manager identity and coordinator routing can
+  no longer disagree inside the same response.
+- Codex routing behaviour is unchanged, and a repository with no verified
+  route fails closed rather than defaulting to a provider.
+
+See the packaged **Changelog** for the complete release summary.
+
 ## What's new in 0.9.69
 
 - A verified Claude manager now receives worker callbacks in its active session
