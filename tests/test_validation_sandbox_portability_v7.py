@@ -686,6 +686,21 @@ class TestCapabilityProbe:
         )
         assert worker_workspace._seccomp_notify_supported() is False
 
+    def test_supported_requires_live_listener_transfer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            worker_workspace, "_seccomp_notify_library", lambda: object()
+        )
+        monkeypatch.setattr(
+            worker_workspace, "_seccomp_kernel_notify_api", lambda: True
+        )
+        monkeypatch.setattr(worker_workspace, "_openat2_available", lambda: True)
+        monkeypatch.setattr(
+            worker_workspace, "_seccomp_notify_runtime_supported", lambda: False
+        )
+        assert worker_workspace._seccomp_notify_supported() is False
+
 
 class TestProcessGroupTeardown:
     def test_kill_and_reap_validator_group(self) -> None:

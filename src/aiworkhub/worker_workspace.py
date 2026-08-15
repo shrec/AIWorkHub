@@ -2777,6 +2777,7 @@ _PR_SET_PDEATHSIG = 1
 # probes the running kernel, so this is a real capability check rather than a
 # libseccomp symbol-presence guess.
 _SECCOMP_NOTIFY_MIN_API = 5
+_SECCOMP_NOTIFY_RUNTIME_SUPPORTED: bool | None = None
 
 
 class _OpenHow(ctypes.Structure):
@@ -2949,7 +2950,9 @@ def _seccomp_notify_supported() -> bool:
         return False
     if not _seccomp_kernel_notify_api():
         return False
-    return _openat2_available()
+    if not _openat2_available():
+        return False
+    return _seccomp_notify_runtime_supported()
 
 
 def _metadata_broker_verify_mode(mode: int) -> int:
@@ -3647,6 +3650,80 @@ def _metadata_broker_child_exec(argv: list[str]) -> int:
         except BaseException:
             pass
     return 126
+
+
+def _seccomp_notify_runtime_supported() -> bool:
+    """Probe listener creation and ``SCM_RIGHTS`` transfer exactly once.
+
+    Kernel/libseccomp API levels alone are insufficient inside containers:
+    the outer runtime policy can terminate ``SECCOMP_FILTER_FLAG_NEW_LISTENER``
+    even though the API probe succeeds.  Use the same freshly exec'd helper
+    and descriptor handoff as the real broker, but run only ``/bin/true`` so
+    the probe cannot mutate the repository or weaken confinement.
+    """
+    global _SECCOMP_NOTIFY_RUNTIME_SUPPORTED
+
+    if _SECCOMP_NOTIFY_RUNTIME_SUPPORTED is not None:
+        return _SECCOMP_NOTIFY_RUNTIME_SUPPORTED
+    if os.name == "nt" or not sys.platform.startswith("linux"):
+        _SECCOMP_NOTIFY_RUNTIME_SUPPORTED = False
+        return False
+
+    import socket
+
+    parent_sock, child_sock = socket.socketpair()
+    process: subprocess.Popen[bytes] | None = None
+    listener_fd = -1
+    try:
+        parent_pid = os.getpid()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--metadata-broker-child",
+                "--parent-pid",
+                str(parent_pid),
+                "--socket-fd",
+                str(child_sock.fileno()),
+                "--",
+                "/bin/true",
+            ],
+            close_fds=True,
+            pass_fds=(child_sock.fileno(),),
+            start_new_session=True,
+            env=os.environ.copy(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        child_sock.close()
+        listener_fd, _error = _metadata_broker_handshake_receive(
+            parent_sock,
+            time.monotonic() + _METADATA_BROKER_HANDSHAKE_SECONDS,
+        )
+        if listener_fd < 0:
+            _kill_validator_group(process.pid)
+            process.wait(timeout=5)
+            _SECCOMP_NOTIFY_RUNTIME_SUPPORTED = False
+            return False
+        _SECCOMP_NOTIFY_RUNTIME_SUPPORTED = process.wait(timeout=5) == 0
+        return _SECCOMP_NOTIFY_RUNTIME_SUPPORTED
+    except (OSError, subprocess.SubprocessError):
+        if process is not None and process.poll() is None:
+            _kill_validator_group(process.pid)
+            try:
+                process.wait(timeout=5)
+            except subprocess.SubprocessError:
+                pass
+        _SECCOMP_NOTIFY_RUNTIME_SUPPORTED = False
+        return False
+    finally:
+        parent_sock.close()
+        try:
+            child_sock.close()
+        except OSError:
+            pass
+        if listener_fd >= 0:
+            os.close(listener_fd)
 
 
 def _landlock_exec(argv: list[str]) -> int:
