@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.64] - 2026-08-15
+
+### Fixed
+
+- Build distinct packet-bound reviewer Source Graph databases concurrently
+  instead of serializing every reviewer behind one process-global lock.
+- Single-flight only callers targeting the same candidate database and publish
+  verified temporary indexes atomically before reviewer queries can use them.
+- Keep long-running reviewer prewarm reservations alive only while the exact
+  owner PID/start identity matches; unknown, dead or recycled identities fail
+  closed.
+
+### Validation
+
+- 122 reviewer-launch and candidate Source Graph tests pass (1 skipped), with
+  independent correctness, security and code-quality review plus Ruff and
+  diff checks.
+
 ## [0.9.63] - 2026-08-14
 
 ### Fixed

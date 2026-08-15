@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.64 — 2026-08-15
+
+### Fixed
+
+- Run independent reviewer Source Graph prewarms concurrently while retaining
+  exact per-candidate single-flight and atomic verified publication.
+- Prevent elapsed reservation expiry from terminating a live exact-owned
+  prewarm; unknown, dead and recycled PID identities remain fail-closed.
+- Keep reviewer runtime queries read-only and free of lazy index builds.
+
 ## 0.9.63 — 2026-08-14
 
 ### Fixed

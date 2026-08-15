@@ -12,14 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.63
+## What's new in 0.9.64
 
-- Reviewer findings now use one canonical contract from prompt through the
-  callable MCP JSON schema, validation and sealed receipt.
-- The generated tool schema requires `severity`, `summary` and `evidence`;
-  malformed aliases and missing keys fail with exact bounded diagnostics.
-- Clean and non-empty reports share the same authenticated exactly-once
-  submission and finalization path.
+- Independent reviewer Source Graph prewarms now run concurrently instead of
+  queueing behind one process-global index lock.
+- Reviewers targeting the same candidate share one exact single-flight build,
+  while distinct packets publish independently and atomically.
+- Live prewarm reservations rely on exact PID/start identity rather than
+  elapsed time; unknown or recycled identities fail closed.
 
 See the packaged **Changelog** for the complete release summary.
 
