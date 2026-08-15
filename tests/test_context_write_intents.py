@@ -164,7 +164,7 @@ def test_registered_worker_write_intents_expose_no_identity_or_path_override(tmp
         def __init__(self) -> None:
             self.registered: dict[str, object] = {}
 
-        def tool(self, *, name: str):
+        def tool(self, *, name: str, description: str | None = None):
             def decorator(fn):
                 self.registered[name] = fn
                 return fn
