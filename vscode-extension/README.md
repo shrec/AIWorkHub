@@ -12,14 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.67
+## What's new in 0.9.68
 
-- VS Code LM semantic staging is now strictly offline and no longer depends on
-  MCP availability once bounded discovery is complete.
-- A role-correct Source Graph request in the staging phase receives one bounded
-  correction instead of terminating as `tool_not_allowed`.
-- Native and text fallback paths retain strict request-scoped authority and
-  deterministic failure after a repeated phase violation.
+- VS Code LM requests are now bound to the exact fresh editor window selected
+  by readiness, so stale or parallel windows cannot steal a worker launch.
+- Progress and terminal receipts identify the claimant window, extension-host
+  process, extension version and supported bridge capabilities.
+- Legacy untargeted requests remain compatible during rolling upgrades.
 
 See the packaged **Changelog** for the complete release summary.
 

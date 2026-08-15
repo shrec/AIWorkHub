@@ -247,6 +247,9 @@ def _host(
                 for model in models
             ],
             "permission_granted": access_state.startswith("granted"),
+            "extension_host_pid": 4242,
+            "extension_version": "0.9.test",
+            "bridge_capabilities": ["offline_staged_semantic_edit_v1"],
         },
     )
     return path
@@ -305,6 +308,35 @@ def test_readiness_reports_durable_model_consent(tmp_path: Path, monkeypatch: py
     assert ready["access_observed"] is True
     assert ready["consent_required"] is False
     assert ready["access_state"] == "granted_remembered"
+
+
+def test_create_request_targets_selected_fresh_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    repo_id = repository_state.inspect_repository(repo).manifest.repo_id
+    _host(root, repo_id, models=["deepseek-v4-pro"], access_state="granted_remembered")
+    request_id = "a" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Target the selected live window.",
+        model="deepseek-v4-pro",
+        allowed_writes=[],
+        timeout_seconds=30,
+    )
+
+    payload = json.loads(request.request_path.read_text(encoding="utf-8"))
+    assert payload["target_window_id"] == "window_test"
 
 
 def _bridge_request_for_cancel_test(

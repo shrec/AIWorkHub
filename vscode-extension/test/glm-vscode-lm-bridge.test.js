@@ -1170,6 +1170,29 @@ async function boundedParallelBridgeChecks() {
   }
 }
 
+function windowTargetClaimChecks() {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-lm-window-target-"));
+  try {
+    const legacy = path.join(temp, "legacy.json");
+    const targeted = path.join(temp, "targeted.json");
+    const other = path.join(temp, "other.json");
+    fs.writeFileSync(legacy, JSON.stringify({ schema_id: internals.constants.VSCODE_LM_REQUEST_SCHEMA }), { mode: 0o600 });
+    fs.writeFileSync(targeted, JSON.stringify({
+      schema_id: internals.constants.VSCODE_LM_REQUEST_SCHEMA,
+      target_window_id: internals.constants.WINDOW_SCOPE_ID,
+    }), { mode: 0o600 });
+    fs.writeFileSync(other, JSON.stringify({
+      schema_id: internals.constants.VSCODE_LM_REQUEST_SCHEMA,
+      target_window_id: "window_other",
+    }), { mode: 0o600 });
+    assert.strictEqual(internals.vscodeLmRequestClaimableByThisWindow(legacy), true);
+    assert.strictEqual(internals.vscodeLmRequestClaimableByThisWindow(targeted), true);
+    assert.strictEqual(internals.vscodeLmRequestClaimableByThisWindow(other), false);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+}
+
 async function nativeProtocolChecks() {
   const finalResponse = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
@@ -3120,6 +3143,7 @@ async function main() {
   await malformedCatalogChecks();
   await permissionPersistenceChecks();
   await boundedParallelBridgeChecks();
+  windowTargetClaimChecks();
   await progressReceiptChecks();
   await claimedCancellationChecks();
   await cancellationToolBoundaryChecks();

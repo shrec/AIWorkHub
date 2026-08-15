@@ -581,6 +581,8 @@ def create_request(
     if workspace_path.parent != workspace_home.parent or workspace_path.parent.name != request_id:
         raise BridgeError("bridge_workspace_request_mismatch")
     repo_id = _repo_id(repo)
+    host_readiness = bridge_readiness(repo, model=model, adapter_id="vscode_lm")
+    target_window_id = str(host_readiness.get("window_id") or "").strip()
     response_path = workspace_home / ".aiworkhub_vscode_lm_response.json"
     progress_path = workspace_home / ".aiworkhub_vscode_lm_progress.json"
     worker_spec_path = workspace_home / ".aiworkhub_vscode_lm_worker.json"
@@ -690,6 +692,10 @@ def create_request(
         "initial_source_graph_request": initial_source_graph_request,
         "initial_source_graph_result": initial_source_graph_result,
         "request_kind": request_kind,
+        # Bind the request to the fresh host selected by readiness.  Older
+        # request fixtures may omit this field, but production requests must
+        # never be stolen by another/stale VS Code window sharing the repo.
+        "target_window_id": target_window_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "deadline": deadline.isoformat(),
         "response_contract": {

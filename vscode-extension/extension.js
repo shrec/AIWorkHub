@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.67";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.68";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2656,6 +2656,21 @@ function vscodeLmRequestPathFromClaim(claimPath) {
   return requestPath;
 }
 
+function vscodeLmRequestClaimableByThisWindow(requestPath) {
+  try {
+    if (!ownerOnlyRegularFile(requestPath)) return true;
+    const payload = JSON.parse(fs.readFileSync(requestPath, "utf8"));
+    const targetWindowId = String(payload && payload.target_window_id || "").trim();
+    // Missing is retained only for backwards-compatible request fixtures and
+    // requests published by an older coordinator during a rolling upgrade.
+    return !targetWindowId || targetWindowId === WINDOW_SCOPE_ID;
+  } catch (_err) {
+    // Let one host claim malformed input so processClaim can emit the existing
+    // bounded validation error instead of leaving poison work queued forever.
+    return true;
+  }
+}
+
 function readVscodeLmCancelDecision(request, retryState = null) {
   const identity = (metadata) => [
     ...(process.platform === "win32" ? [] : [String(metadata.dev)]),
@@ -2771,6 +2786,13 @@ function validateVscodeLmRequest(payload, repoInfo, expectedRequestPath = null) 
   const requestId = String(payload.request_id || "");
   if (!VSCODE_LM_REQUEST_ID_RE.test(requestId)) throw new Error("vscode_lm_request_id_invalid");
   if (!repoInfo || payload.repo_id !== repoInfo.repoId) throw new Error("vscode_lm_repo_id_mismatch");
+  const targetWindowId = String(payload.target_window_id || "").trim();
+  if (targetWindowId && !/^window_[A-Za-z0-9_-]{1,64}$/.test(targetWindowId)) {
+    throw new Error("vscode_lm_target_window_id_invalid");
+  }
+  if (targetWindowId && targetWindowId !== WINDOW_SCOPE_ID) {
+    throw new Error("vscode_lm_target_window_mismatch");
+  }
   if (canonicalRepositoryRoot(String(payload.repo_root || "")) !== canonicalRepositoryRoot(repoInfo.root)) {
     throw new Error("vscode_lm_repo_root_mismatch");
   }
@@ -4916,7 +4938,11 @@ class VscodeLmBridgeHost {
     let claimPath = null;
     let execution = null;
     try {
-      const requestPath = path.join(requestDir, names[0]);
+      const requestName = names.find((name) =>
+        vscodeLmRequestClaimableByThisWindow(path.join(requestDir, name))
+      );
+      if (!requestName) return;
+      const requestPath = path.join(requestDir, requestName);
       claimPath = `${requestPath}.claim-${WINDOW_SCOPE_ID}`;
       try { fs.renameSync(requestPath, claimPath); } catch (_err) { return; }
       execution = {
@@ -5027,6 +5053,10 @@ class VscodeLmBridgeHost {
             schema_id: VSCODE_LM_PROGRESS_SCHEMA,
             request_id: request.requestId,
             repo_id: repoInfo.repoId,
+            window_id: WINDOW_SCOPE_ID,
+            extension_host_pid: process.pid,
+            extension_version: String(this.context.extension && this.context.extension.packageJSON &&
+              this.context.extension.packageJSON.version || ""),
             sequence: progressSequence,
             phase,
             updated_at: new Date(now).toISOString(),
@@ -5106,6 +5136,11 @@ class VscodeLmBridgeHost {
         schema_id: VSCODE_LM_RESPONSE_SCHEMA,
         request_id: request.requestId,
         repo_id: repoInfo.repoId,
+        window_id: WINDOW_SCOPE_ID,
+        extension_host_pid: process.pid,
+        extension_version: String(this.context.extension && this.context.extension.packageJSON &&
+          this.context.extension.packageJSON.version || ""),
+        bridge_capabilities: ["offline_staged_semantic_edit_v1", "tool_transport_receipts_v1"],
         model: { id: model.id, family: model.family, name: model.name, vendor: model.vendor, version: model.version },
         text,
         error,
@@ -9297,6 +9332,7 @@ module.exports = {
     atomicWriteOwnerJson,
     ownerOnlyRegularFile,
     vscodeLmRequestPathFromClaim,
+    vscodeLmRequestClaimableByThisWindow,
     readVscodeLmCancelDecision,
     atomicWriteOwnerJsonExclusive,
     VSCODE_LM_PRIVATE_TOOLS,
@@ -9331,6 +9367,7 @@ module.exports = {
       VSCODE_LM_PROGRESS_PHASES,
       VSCODE_LM_CANCEL_DECISION_SCHEMA,
       VSCODE_LM_CANCEL_POLL_MS,
+      WINDOW_SCOPE_ID,
     },
   },
 };

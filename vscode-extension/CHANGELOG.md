@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.68 — 2026-08-15
+
+### Fixed
+
+- Route each VS Code LM worker request to the exact fresh editor window chosen
+  by preflight instead of allowing another or stale window to claim it.
+- Record claimant window, extension-host PID, extension version and bridge
+  capabilities in progress and terminal receipts for direct diagnosis.
+- Keep legacy untargeted requests compatible during rolling upgrades.
+
 ## 0.9.67 — 2026-08-15
 
 ### Fixed

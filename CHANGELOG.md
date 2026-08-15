@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.68] - 2026-08-15
+
+### Fixed
+
+- Bind every new VS Code LM request to the exact fresh editor window selected
+  by readiness, preventing another or stale window from stealing the request.
+- Enforce the target-window identity again after the atomic claim and publish
+  claimant window, process, extension version and bridge capabilities in live
+  progress and terminal response receipts.
+- Preserve rolling-upgrade compatibility for legacy untargeted requests while
+  keeping malformed requests bounded and fail-closed.
+
+### Validation
+
+- VS Code LM bridge Python suite: 46 passed; full extension suite and
+  changed-file Ruff/diff checks passed.
+
 ## [0.9.67] - 2026-08-15
 
 ### Fixed
