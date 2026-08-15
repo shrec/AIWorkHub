@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.65] - 2026-08-15
+
+### Fixed
+
+- Copy quality-review overlay files by content without preserving host metadata,
+  avoiding cross-platform chmod and ownership failures in isolated workspaces.
+- Keep VS Code LM reviewer tool history structurally valid through bounded
+  stage/final corrections and enforce request-scoped tool authority before
+  invocation.
+- Persist monotonic NeedFix reopen generations and mint deterministic `-rN`
+  successor task IDs without reusing archived task identities.
+- Fail soft when untrusted provider usage output contains pathologically deep,
+  malformed or undecodable JSON instead of terminating a healthy worker.
+
+### Validation
+
+- Independent correctness, security and code-quality reviews passed for the
+  accepted candidates; focused Python and extension suites, Ruff, mypy and
+  diff checks passed before packaging.
+
 ## [0.9.64] - 2026-08-15
 
 ### Fixed

@@ -12,14 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.64
+## What's new in 0.9.65
 
-- Independent reviewer Source Graph prewarms now run concurrently instead of
-  queueing behind one process-global index lock.
-- Reviewers targeting the same candidate share one exact single-flight build,
-  while distinct packets publish independently and atomically.
-- Live prewarm reservations rely on exact PID/start identity rather than
-  elapsed time; unknown or recycled identities fail closed.
+- Reviewer stage/final corrections now preserve exact tool-call/result history
+  and reject cross-role tool calls before invocation.
+- Quality-review overlays copy file content without inheriting host metadata,
+  improving portability across Linux, macOS and native Windows.
+- Reopened NeedFix records receive deterministic monotonic successor task IDs,
+  while malformed provider usage output fails soft without killing workers.
 
 See the packaged **Changelog** for the complete release summary.
 

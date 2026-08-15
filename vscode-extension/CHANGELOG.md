@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.65 — 2026-08-15
+
+### Fixed
+
+- Preserve exact VS Code LM tool-call/result history across bounded reviewer
+  stage and final corrections.
+- Reject cross-role tool calls before callbacks or invocation and recover the
+  reviewer submit phase without widening manager/worker authority.
+- Use content-only review overlay copies for portable Linux, macOS and Windows
+  isolated workspaces.
+- Keep reopened NeedFix generations and malformed provider usage evidence
+  fail-closed without killing otherwise healthy workers.
+
 ## 0.9.64 — 2026-08-15
 
 ### Fixed
