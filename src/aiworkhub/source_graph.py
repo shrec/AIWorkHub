@@ -771,23 +771,18 @@ def _source_graph_extraction_telemetry(
     return selection.to_dict()
 
 
-def _source_graph_unsafe_spawn_context() -> tuple[bool, str]:
-    """Detect a spawn bootstrap that forbids a fresh process pool.
+def _spawn_bootstrap_in_progress() -> bool:
+    """True while the current process is inside multiprocessing spawn bootstrap.
 
-    A process that is itself still bootstrapping under the ``spawn`` start
-    method (for example a quality-review worker pre-warmed by the launcher
-    while its ``__main__`` module is still importing) cannot construct a
-    nested ``ProcessPoolExecutor``: ``multiprocessing`` re-enters spawn
-    preparation and raises ``RuntimeError`` from ``_check_not_importing_main``
-    instead of ``OSError``/``BrokenProcessPool``.  Flagging that context before
-    construction turns the crash into a deterministic sequential extraction.
-
-    Returns ``(unsafe, reason)``; ``reason`` is empty when the context is safe.
+    ``multiprocessing`` sets ``current_process()._inheriting`` only during the
+    handshake a freshly spawned child re-executes before importing and running
+    its target.  Constructing a nested ``ProcessPoolExecutor`` from inside that
+    window would re-enter the spawn bootstrap and deadlock or corrupt the
+    pickle protocol, so callers must detect it *before* pool construction and
+    fall back to deterministic sequential extraction.
     """
 
-    if getattr(multiprocessing.current_process(), "_inheriting", False):
-        return True, "spawn_bootstrap_in_progress"
-    return False, ""
+    return bool(getattr(multiprocessing.current_process(), "_inheriting", False))
 
 
 def _source_graph_hash_workers(
@@ -1684,24 +1679,20 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             for path, rel, file_size, mtime_ns in extraction_candidates
         ]
         if extraction_workers > 1:
-            unsafe_spawn, unsafe_spawn_reason = _source_graph_unsafe_spawn_context()
-            if unsafe_spawn:
-                # A process still bootstrapping under ``spawn`` (for example a
-                # quality-review worker pre-warmed by the launcher while its
-                # ``__main__`` module is importing) cannot construct a nested
-                # ``ProcessPoolExecutor``: ``multiprocessing`` re-enters spawn
-                # preparation and raises ``RuntimeError`` rather than the
-                # ``OSError``/``BrokenProcessPool`` the normal fallback catches.
-                # Detecting that context before construction turns the crash
-                # into a deterministic sequential extraction, and the reason
-                # stays visible in the build receipt.
+            if _spawn_bootstrap_in_progress():
+                # Constructing a nested ProcessPoolExecutor while the current
+                # process is still inside the multiprocessing spawn bootstrap
+                # handshake would re-enter bootstrap and deadlock or corrupt
+                # the pickle protocol.  Extraction never mutates canonical
+                # state, so an all-candidate sequential replay is deterministic
+                # and the fallback stays visible in the build receipt.
                 extraction_workers = 1
                 extraction_backend = "sequential_fallback"
-                extraction_fallback_reason = unsafe_spawn_reason
+                extraction_fallback_reason = "spawn_bootstrap_in_progress"
                 extraction_telemetry = {
                     **extraction_telemetry,
                     "selected_workers": 1,
-                    "reason": f"fallback_{unsafe_spawn_reason}",
+                    "reason": "fallback_spawn_bootstrap_in_progress",
                 }
                 extracted_candidates = [
                     _extract_source_graph_candidate(candidate)

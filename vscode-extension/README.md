@@ -12,14 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.66
+## What's new in 0.9.67
 
-- Quality reviewers now clone the verified canonical Source Graph generation
-  and reconcile only packet-changed files instead of rebuilding the repository.
-- Canonical authority and generation identity are verified before reviewer
-  runtime/provider registration, with atomic packet-local publication.
-- Concurrent correctness, security and code-quality overlays stay isolated
-  while ordinary coordinator Source Graph reads remain responsive.
+- VS Code LM semantic staging is now strictly offline and no longer depends on
+  MCP availability once bounded discovery is complete.
+- A role-correct Source Graph request in the staging phase receives one bounded
+  correction instead of terminating as `tool_not_allowed`.
+- Native and text fallback paths retain strict request-scoped authority and
+  deterministic failure after a repeated phase violation.
 
 See the packaged **Changelog** for the complete release summary.
 

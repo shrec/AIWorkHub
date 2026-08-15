@@ -6,10 +6,18 @@ bounded by explicit length/character rules; missing repo_id, path
 separators, controls, and Unicode confusables are all rejected (fail-
 closed) instead of guessed.
 
-Design contract (B811):
+Design contract (B811, revised for NF222 v2):
 - Immutable, hashable, equatable.
-- Canonical serialization: ``repo_id:thread_id:task_id[:event_id]``.
-- SHA-256 digest for deterministic dedup / client-user-message-id.
+- Canonical serialization (v2): an injective, length-prefixed, versioned
+  encoding. Every field is prefixed by its length, and the whole form is
+  prefixed by the ``v2`` marker, so distinct field tuples -- even ones with
+  adversarial ``:`` placement inside identifier fields -- always yield
+  distinct canonical strings, digests, and client-user-message-ids.
+- SHA-256 digest is computed over the versioned canonical form for
+  deterministic dedup / client-user-message-id.
+- Legacy parsing remains explicit and only accepts unambiguous legacy
+  forms (exactly the expected number of colon-separated fields with no
+  embedded colons); ambiguous colon-containing identities are rejected.
 - Repo-scoped path-key helpers that cannot escape their base directory
   and never expose absolute paths in owner-facing callback text.
 - Same (thread_id, task_id, event_id) in two different repos produces
@@ -111,6 +119,57 @@ def _validate_identifier_field(value: str, field_name: str, max_len: int, *, all
 
 
 # ---------------------------------------------------------------------------
+# Injective versioned canonical encoding (NF222 v2)
+# ---------------------------------------------------------------------------
+
+_CANONICAL_V2_PREFIX = "v2"
+
+
+def _encode_length_prefixed(fields: tuple[str, ...]) -> str:
+    """Injective, versioned, length-prefixed encoding of an ordered tuple.
+
+    Each field is emitted as ``<len>:<field>`` (the field's character length
+    followed by its raw bytes), and the whole body is prefixed with the
+    ``v2`` version marker. Because every field length is explicit, embedded
+    ``:`` characters inside identifier fields can never make two distinct
+    tuples collapse to the same canonical string.
+    """
+    return _CANONICAL_V2_PREFIX + "".join(f"{len(field)}:{field}" for field in fields)
+
+
+def _decode_length_prefixed(canonical: str, num_fields: int) -> list[str] | None:
+    """Decode a v2 length-prefixed canonical string.
+
+    Returns the ordered fields, or ``None`` when the string is not a valid
+    version-2 encoding (wrong marker, malformed/absent length, truncation,
+    or trailing data).
+    """
+    if not canonical.startswith(_CANONICAL_V2_PREFIX):
+        return None
+    rest = canonical[len(_CANONICAL_V2_PREFIX):]
+    fields: list[str] = []
+    pos = 0
+    for _ in range(num_fields):
+        colon = rest.find(":", pos)
+        if colon == -1:
+            return None
+        length_str = rest[pos:colon]
+        # Lengths are bounded by the identifier field limits (<=256), so any
+        # longer digit run is malformed rather than a legitimate field size.
+        if not length_str.isdigit() or len(length_str) > 4:
+            return None
+        length = int(length_str)
+        end = colon + 1 + length
+        if end > len(rest):
+            return None
+        fields.append(rest[colon + 1:end])
+        pos = end
+    if pos != len(rest):
+        return None
+    return fields
+
+
+# ---------------------------------------------------------------------------
 # Composite route key
 # ---------------------------------------------------------------------------
 
@@ -146,12 +205,15 @@ class RepoRouteKey:
         )
 
     def canonical(self) -> str:
-        """Deterministic serialized form: ``repo_id:thread_id:task_id:event_id``.
+        """Injective versioned serialization (v2).
 
-        When event_id is empty the trailing colon is still present so the
-        boundary is unambiguous (``a:b:c:`` ≠ ``a:b:c:d``).
+        Length-prefixed and version-marked so two distinct field tuples --
+        including ones where an identifier itself contains ``:`` -- can never
+        share a canonical string (and therefore never share a digest).
         """
-        return f"{self.repo_id}:{self.thread_id}:{self.task_id}:{self.event_id}"
+        return _encode_length_prefixed(
+            (self.repo_id, self.thread_id, self.task_id, self.event_id)
+        )
 
     def digest(self) -> str:
         """SHA-256 hex digest of ``canonical()``.
@@ -195,9 +257,21 @@ class RepoRouteKey:
     def parse(cls, canonical: str) -> RepoRouteKey:
         """Parse a ``canonical()`` string back into a ``RepoRouteKey``.
 
-        Raises ``ValueError`` if the format is wrong (wrong number of
-        separators, empty repo/thread/task).
+        Accepts the v2 length-prefixed encoding first, then falls back to
+        explicit legacy parsing. Legacy parsing only accepts unambiguous
+        forms: exactly four colon-separated fields with no embedded colons.
+        Any other shape raises ``ValueError``.
         """
+        if not isinstance(canonical, str):
+            raise ValueError(f"canonical must be a string, got {type(canonical).__name__}")
+        fields = _decode_length_prefixed(canonical, 4)
+        if fields is not None:
+            return cls(
+                repo_id=fields[0],
+                thread_id=fields[1],
+                task_id=fields[2],
+                event_id=fields[3],
+            )
         parts = canonical.split(":")
         if len(parts) != 4:
             raise ValueError(
@@ -368,7 +442,7 @@ class CoordinatorRouteKey:
         object.__setattr__(self, "event_id", event_id)
 
     def canonical(self) -> str:
-        return ":".join((
+        return _encode_length_prefixed((
             self.repo_id,
             self.provider,
             self.window_id,
@@ -409,6 +483,24 @@ class CoordinatorRouteKey:
 
     @classmethod
     def parse(cls, canonical: str) -> "CoordinatorRouteKey":
+        """Parse a canonical string back into a ``CoordinatorRouteKey``.
+
+        Accepts the v2 length-prefixed encoding first, then explicit legacy
+        parsing that only accepts unambiguous seven-field forms.
+        """
+        if not isinstance(canonical, str):
+            raise ValueError(f"canonical must be a string, got {type(canonical).__name__}")
+        fields = _decode_length_prefixed(canonical, 7)
+        if fields is not None:
+            return cls(
+                repo_id=fields[0],
+                provider=fields[1],
+                window_id=fields[2],
+                thread_id=fields[3],
+                session_id=fields[4],
+                task_id=fields[5],
+                event_id=fields[6],
+            )
         parts = canonical.split(":")
         if len(parts) != 7:
             raise ValueError(

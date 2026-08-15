@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.67] - 2026-08-15
+
+### Fixed
+
+- Keep the VS Code LM forced semantic-edit stage fully offline: the stage tool
+  never traverses MCP, and only that tool is advertised during the phase.
+- Treat a role-correct Source Graph request during forced staging as one bounded
+  corrective phase violation; repeated requests fail structurally without
+  poisoning manager/worker authority or executing the disallowed call.
+- Preserve exact native/text provider tool-call history while closing the
+  `mcp_unavailable` → `tool_not_allowed` self-dogfood loop.
+- Include the already accepted route-identity, task-store migration and
+  candidate Source Graph follow-up fixes accumulated after 0.9.66.
+
+### Validation
+
+- Full VS Code extension suite passed; focused Python regression suite: 290
+  passed, 1 skipped; changed-file Ruff and diff checks passed.
+
 ## [0.9.66] - 2026-08-15
 
 ### Fixed

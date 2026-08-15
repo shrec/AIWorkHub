@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.66";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.67";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -3988,6 +3988,9 @@ async function runVscodeLmTextProtocol(
     if (typeof assertActive === "function") assertActive();
     throwIfVscodeLmCancelled(cancellationToken);
   };
+  const expectedSgTool = (request.request_kind === "worker" || request.request_kind === "quality_review")
+    ? "aiworkhub_worker_source_graph_query"
+    : "aiworkhub_manager_source_graph_query";
   let sourceGraphAcknowledged = request.request_kind === "quality_review";
   let initialSourceGraphResult = null;
   if (request.initial_source_graph_request) {
@@ -3995,9 +3998,7 @@ async function runVscodeLmTextProtocol(
     if (!initialSourceGraphResult) {
       try {
         assertRequestActive();
-        const prefetchToolName = (request.request_kind === "worker" || request.request_kind === "quality_review")
-          ? "aiworkhub_worker_source_graph_query"
-          : "aiworkhub_manager_source_graph_query";
+        const prefetchToolName = expectedSgTool;
         initialSourceGraphResult = await raceVscodeLmCancellation(invokeTool({
           name: prefetchToolName,
           input: request.initial_source_graph_request,
@@ -4058,6 +4059,7 @@ async function runVscodeLmTextProtocol(
   let reviewSubmitViolations = 0;
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
+  let stagedEditViolations = 0;
   const protocolTrace = [];
   let lastProtocolPreview = "";
   const stagedEdits = createVscodeLmStagedEditCollector(request);
@@ -4222,7 +4224,27 @@ async function runVscodeLmTextProtocol(
       request, sourceGraphAcknowledged, forceStagedEdit,
     );
     const permitted = availableTools.find((tool) => tool.name === envelope.name);
-    if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(envelope.name || "")}`);
+    if (!permitted) {
+      // A role-correct Source Graph request during forced staging is a phase
+      // violation, not an authority violation. Correct it once without invoking
+      // MCP; a repeated request fails with one bounded structured error.
+      if (forceStagedEdit && envelope.name === expectedSgTool) {
+        protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
+        if (stagedEditViolations >= 1) {
+          throw vscodeLmProtocolFailure(
+            "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+          );
+        }
+        stagedEditViolations += 1;
+        messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          `Only ${VSCODE_LM_STAGE_EDIT_TOOL} is accepted in the bounded semantic-edit stage. ` +
+          `Output ONLY one ${VSCODE_LM_TOOL_REQUEST_SCHEMA} request for ${VSCODE_LM_STAGE_EDIT_TOOL}.`,
+        ));
+        continue;
+      }
+      throw new Error(`vscode_lm_tool_not_allowed:${String(envelope.name || "")}`);
+    }
     // NF-2026-00229: quality-review forced-submit boundary — after the initial
     // Source Graph work turns, a non-submit tool request receives one corrective,
     // non-executing result; a repeated violation terminalizes truthfully.
@@ -4317,9 +4339,6 @@ async function runVscodeLmTextProtocol(
     }
     // NF-2026-00169: recognize ONLY the role-correct Source Graph tool as
     // acknowledgement in the fallback text-protocol path.
-    const expectedSgTool = (request.request_kind === "worker" || request.request_kind === "quality_review")
-      ? "aiworkhub_worker_source_graph_query"
-      : "aiworkhub_manager_source_graph_query";
     if (envelope.name === expectedSgTool && result && result.ok === true) {
       sourceGraphAcknowledged = true;
     }
@@ -4372,6 +4391,9 @@ async function runVscodeLmAgent(
   };
   const initialSourceGraphResult = request.initial_source_graph_result || null;
   const qualityReview = request.request_kind === "quality_review";
+  const expectedSgTool = (request.request_kind === "worker" || request.request_kind === "quality_review")
+    ? "aiworkhub_worker_source_graph_query"
+    : "aiworkhub_manager_source_graph_query";
   const agentPrompt = qualityReview
     ? `${request.prompt}\n\nAIWorkHub quality-review contract:\n` +
       `- You MUST finish by calling aiworkhub_worker_quality_review_submit exactly once.\n` +
@@ -4438,7 +4460,7 @@ async function runVscodeLmAgent(
     }
     const startedWithSourceGraph = sourceGraphAcknowledged;
     const availableTools = vscodeLmToolsForRequest(
-      request, sourceGraphAcknowledged, false,
+      request, sourceGraphAcknowledged, forceStagedEdit,
     );
     const options = {
       justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
@@ -4488,19 +4510,24 @@ async function runVscodeLmAgent(
     }
     if (startedWithSourceGraph) postSourceTurns += 1;
     if (forceStagedEdit && calls.some((call) => call.name !== VSCODE_LM_STAGE_EDIT_TOOL)) {
-      protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
-      if (stagedEditViolations >= 1) {
-        throw vscodeLmProtocolFailure(
-          "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
-        );
+      const nonStageCalls = calls.filter((call) => call.name !== VSCODE_LM_STAGE_EDIT_TOOL);
+      if (nonStageCalls.every((call) => call.name === expectedSgTool)) {
+        protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
+        if (stagedEditViolations >= 1) {
+          throw vscodeLmProtocolFailure(
+            "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+          );
+        }
+        stagedEditViolations += 1;
+        messages.push(vscode.LanguageModelChatMessage.Assistant(filterOutToolCallParts(assistantParts)));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          `Only ${VSCODE_LM_STAGE_EDIT_TOOL} is accepted in the bounded semantic-edit stage. ` +
+          `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now with only the smallest required replacement/create.`,
+        ));
+        continue;
       }
-      stagedEditViolations += 1;
-      messages.push(vscode.LanguageModelChatMessage.Assistant(filterOutToolCallParts(assistantParts)));
-      messages.push(vscode.LanguageModelChatMessage.User(
-        `Only ${VSCODE_LM_STAGE_EDIT_TOOL} is accepted in the bounded semantic-edit stage. ` +
-        `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now with only the smallest required replacement/create.`,
-      ));
-      continue;
+      const offending = nonStageCalls.find((call) => call.name !== expectedSgTool);
+      throw new Error(`vscode_lm_tool_not_allowed:${String(offending && offending.name || "")}`);
     }
     if (calls.length === 0) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
@@ -4671,9 +4698,6 @@ async function runVscodeLmAgent(
       // NF-2026-00169: recognize ONLY the role-correct Source Graph tool as
       // acknowledgement. Worker native must never acknowledge manager SG;
       // manager native must never acknowledge worker SG.
-      const expectedSgTool = (request.request_kind === "worker" || request.request_kind === "quality_review")
-        ? "aiworkhub_worker_source_graph_query"
-        : "aiworkhub_manager_source_graph_query";
       if (call.name === expectedSgTool && result && result.ok === true) {
         sourceGraphAcknowledged = true;
       }

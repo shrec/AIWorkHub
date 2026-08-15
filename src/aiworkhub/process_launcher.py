@@ -5495,6 +5495,7 @@ class ProcessManager:
                         review_packet_path,
                         dict(quality_review_binding["packet"]),
                     )
+                    launch_phase = "quality_review_source_graph_prewarm"
                     try:
                         worker_ai_tools_mcp.verify_quality_review_prewarm_authority(
                             authority_repo
@@ -5521,6 +5522,12 @@ class ProcessManager:
                         ) from exc
                     if prewarm_progress is not None:
                         prewarm_progress("reviewer_source_graph_prewarm_complete")
+                    # Any further exception in this block belongs to worker MCP
+                    # runtime registration, not the reviewer Source Graph
+                    # prewarm this block just completed -- restore the phase so
+                    # an unexpected failure there is never misclassified as a
+                    # prewarm contract/data failure.
+                    launch_phase = "workspace_and_runtime_provision"
                 else:
                     workspace = create_workspace(self.repo, request_id, card, adapter_id)
                     residual_contract_manifest = build_residual_contract_manifest(

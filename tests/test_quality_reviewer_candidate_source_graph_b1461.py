@@ -766,3 +766,147 @@ def test_review_packet_rejects_outside_repo_symlink_candidate(tmp_path: Path) ->
         match="quality_review_candidate_path_symlink",
     ):
         quality_reviewer.verify_review_packet_candidate(packet_path, repo)
+
+
+def test_quality_review_prewarm_skips_non_indexable_changed_path_without_aborting(
+    tmp_path: Path,
+) -> None:
+    """A packet touching both an indexable and a non-indexable path must
+    still prewarm successfully: Source Graph has no representation for the
+    non-indexable extension, so it is skipped rather than aborting the whole
+    build, while the indexable path remains exact hash-bound and queryable.
+    """
+
+    canonical = tmp_path / "canonical"
+    candidate = tmp_path / "candidate"
+    canonical.mkdir()
+    candidate.mkdir()
+    (canonical / "module.py").write_text("def canonical_only():\n    return 1\n", encoding="utf-8")
+    _bootstrap_canonical_repo(canonical)
+    candidate_module = candidate / "module.py"
+    candidate_module.write_text(
+        "def canonical_only():\n    return 1\n\n"
+        "def candidate_only_symbol():\n    return 2\n",
+        encoding="utf-8",
+    )
+    candidate_notes = candidate / "NOTES.txt"
+    candidate_notes.write_text("not source code\n", encoding="utf-8")
+    candidate_data = candidate / "data.csv"
+    candidate_data.write_text("a,b\n1,2\n", encoding="utf-8")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    packet = quality_reviewer.build_review_packet(
+        request_id="target-request-1",
+        task_id="TARGET_TASK_1",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={
+            "module.py": hashlib.sha256(candidate_module.read_bytes()).hexdigest(),
+            "NOTES.txt": hashlib.sha256(candidate_notes.read_bytes()).hexdigest(),
+            "data.csv": hashlib.sha256(candidate_data.read_bytes()).hexdigest(),
+        },
+    )
+    packet_path = runtime / "quality_review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+
+    prewarm = worker_tools.prewarm_quality_review_source_graph(
+        packet_path, repo=candidate, authority_repo=canonical,
+    )
+
+    assert prewarm["ok"] is True
+    assert prewarm["built"] is True
+
+    db_path = Path(prewarm["db_path"]).resolve()
+    conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+    try:
+        file_paths = {str(row[0]) for row in conn.execute("SELECT file_path FROM files")}
+    finally:
+        conn.close()
+    assert "NOTES.txt" not in file_paths
+    assert "data.csv" not in file_paths
+    assert "module.py" in file_paths
+
+    ctx = _ctx(runtime, repo=candidate, authority_repo=canonical, packet_path=packet_path)
+    worker_tools._CACHE.clear()
+
+    result = worker_tools.source_graph_query(
+        ctx, mode="function", query="candidate_only_symbol", budget=16,
+    )
+    assert result["ok"] is True
+    assert result["hit_count"] > 0
+    assert "candidate_only_symbol" in result["content"]
+
+
+def test_quality_review_prewarm_all_concurrent_callers_observe_wrapped_data_failure(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A Source Graph contract/data failure raised while reconciling an
+    indexable changed path (for example a hash-mismatch/corruption
+    ``SourceGraphError``) must never leak past ``worker_ai_tools_mcp``'s own
+    boundary: both the single-flight owner and any concurrent joiner must
+    observe the same normalized ``WorkerToolError``, never the raw
+    ``source_graph.SourceGraphError`` -- this is what lets
+    ``ProcessManager`` classify the failure truthfully as
+    ``quality_review_source_graph_prewarm_failed`` instead of an unexpected
+    provider-launch error.
+    """
+
+    canonical = tmp_path / "canonical"
+    candidate = tmp_path / "candidate"
+    canonical.mkdir()
+    candidate.mkdir()
+    (canonical / "module.py").write_text("def canonical_only():\n    return 1\n", encoding="utf-8")
+    _bootstrap_canonical_repo(canonical)
+    candidate_module = candidate / "module.py"
+    candidate_module.write_text(
+        "def canonical_only():\n    return 1\n\n"
+        "def candidate_only_symbol():\n    return 2\n",
+        encoding="utf-8",
+    )
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    packet = quality_reviewer.build_review_packet(
+        request_id="target-request-1",
+        task_id="TARGET_TASK_1",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={
+            "module.py": hashlib.sha256(candidate_module.read_bytes()).hexdigest()
+        },
+    )
+    packet_path = runtime / "quality_review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+
+    def fail_index_file(*_args: object, **_kwargs: object) -> None:
+        raise source_graph.SourceGraphError("source_graph_single_file_hash_mismatch:boom")
+
+    monkeypatch.setattr(source_graph, "index_file", fail_index_file)
+
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+    start = threading.Barrier(2)
+
+    def run() -> None:
+        start.wait(timeout=5)
+        try:
+            worker_tools.prewarm_quality_review_source_graph(
+                packet_path, repo=candidate, authority_repo=canonical,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            with errors_lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "prewarm caller never returned"
+
+    assert len(errors) == 2
+    for exc in errors:
+        assert isinstance(exc, worker_tools.WorkerToolError)
+        assert not isinstance(exc, source_graph.SourceGraphError)
+        assert str(exc).startswith(
+            "quality_review_candidate_source_graph_prewarm_error:SourceGraphError:"
+        )

@@ -4036,3 +4036,68 @@ def test_quality_review_launch_isolated_fails_closed_before_prewarm_and_registra
     assert "quality_review_source_graph_authority_unverified" in str(
         result.get("blocked_reason") or ""
     )
+
+
+def test_quality_review_launch_isolated_classifies_prewarm_data_failure_truthfully(
+    monkeypatch, tmp_path,
+):
+    """A Source Graph contract/data failure surfaced from the prewarm call
+    (as ``worker_ai_tools_mcp.prewarm_quality_review_source_graph`` now always
+    raises ``WorkerToolError`` for its own clone/backup/index/schema
+    failures) must be classified as a truthful, expected
+    ``quality_review_source_graph_prewarm_failed`` launch block -- never
+    folded into the generic ``unexpected_launch_error`` bucket reserved for
+    real provider-launch anomalies -- and must never reach runtime/provider
+    registration.
+    """
+
+    manager, binding = _reviewer_launch_setup(tmp_path, monkeypatch)
+    order: list[str] = []
+
+    def fake_authority(authority_repo):
+        order.append("authority")
+        return SimpleNamespace(
+            authority_source="canonical", authority_state="sole_authority",
+        )
+
+    def fail_prewarm(*_args, **_kwargs):
+        order.append("prewarm")
+        raise worker_ai_tools_mcp.WorkerToolError(
+            "quality_review_candidate_source_graph_prewarm_error:"
+            "OperationalError:disk I/O error"
+        )
+
+    def fake_registration(*_args, **_kwargs):
+        order.append("registration")
+        raise RuntimeError("registration must never run after a failed prewarm")
+
+    monkeypatch.setattr(
+        worker_ai_tools_mcp, "verify_quality_review_prewarm_authority", fake_authority
+    )
+    monkeypatch.setattr(
+        worker_ai_tools_mcp, "prewarm_quality_review_source_graph", fail_prewarm
+    )
+    monkeypatch.setattr(
+        process_launcher, "_provision_worker_mcp_runtime_for_authority", fake_registration
+    )
+
+    result = manager._launch_isolated(
+        task_id="TASK_REVIEW_1",
+        runner="claude_worker_reviewer",
+        topic="quality_review",
+        adapter_id="claude_cli",
+        model=None,
+        owner_prompt="",
+        timeout_seconds=30,
+        quality_review_binding=binding,
+    )
+
+    assert order == ["authority", "prewarm"]
+    assert result.get("ok") is False
+    reason = str(result.get("blocked_reason") or "")
+    assert reason.startswith(
+        "quality_review_source_graph_prewarm_failed:"
+        "quality_review_candidate_source_graph_prewarm_error:"
+    )
+    assert "unexpected_launch_error" not in reason
+    assert "diagnostic" not in result

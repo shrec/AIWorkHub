@@ -1,5 +1,9 @@
 """Tests for aiworkhub.route_identity -- B811 composite route identity.
 
+Intentionally updated for the NF222 v2 canonical/digest contract: the
+canonical form is now an injective, versioned, length-prefixed encoding, and
+digests are computed over that versioned form.
+
 Runs standalone (python3 this_file.py) or via pytest.
 """
 from __future__ import annotations
@@ -75,8 +79,8 @@ def _run_standalone() -> int:
     except Exception:
         check("frozen_immutable", True)
 
-    check("canonical_with_event", RepoRouteKey(repo_id="r", thread_id="t", task_id="k", event_id="e").canonical() == "r:t:k:e")
-    check("canonical_without_event", RepoRouteKey(repo_id="r", thread_id="t", task_id="k").canonical() == "r:t:k:")
+    check("canonical_with_event", RepoRouteKey(repo_id="r", thread_id="t", task_id="k", event_id="e").canonical() == "v21:r1:t1:k1:e")
+    check("canonical_without_event", RepoRouteKey(repo_id="r", thread_id="t", task_id="k").canonical() == "v21:r1:t1:k0:")
     o = RepoRouteKey(repo_id="repo-a", thread_id="th-x", task_id="tk-y", event_id="ev-z")
     check("round_trip", RepoRouteKey.parse(o.canonical()) == o)
     check("round_trip_no_event", RepoRouteKey.parse(RepoRouteKey(repo_id="a", thread_id="b", task_id="c").canonical()) == RepoRouteKey(repo_id="a", thread_id="b", task_id="c"))
@@ -96,8 +100,17 @@ def _run_standalone() -> int:
           != RepoRouteKey(repo_id="repo-b", thread_id="t", task_id="k", event_id="e").digest())
     check("digest_matches_manual",
           RepoRouteKey(repo_id="r", thread_id="t", task_id="k", event_id="e").digest()
-          == hashlib.sha256(b"r:t:k:e").hexdigest()[:32])
+          == hashlib.sha256(b"v21:r1:t1:k1:e").hexdigest()[:32])
     check("short_id_len_12", len(RepoRouteKey(repo_id="r", thread_id="t", task_id="k").short_id()) == 12)
+
+    # NF222 v2: injective, versioned, length-prefixed canonical encoding.
+    check("canonical_v2_prefixed",
+          RepoRouteKey(repo_id="r", thread_id="t", task_id="k").canonical().startswith("v2"))
+    cv2 = RepoRouteKey(repo_id="a:b", thread_id="c", task_id="d", event_id="e")
+    cv2b = RepoRouteKey(repo_id="a", thread_id="b:c", task_id="d", event_id="e")
+    check("v2_round_trip_colon_repo", RepoRouteKey.parse(cv2.canonical()) == cv2)
+    check("v2_colon_collision_disjoint",
+          cv2.canonical() != cv2b.canonical() and cv2.digest() != cv2b.digest())
 
     check("cross_repo_disjoint_eq",
           RepoRouteKey(repo_id="repo-a", thread_id="th-1", task_id="tk-1", event_id="ev-1")

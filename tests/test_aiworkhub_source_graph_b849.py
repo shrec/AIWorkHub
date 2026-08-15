@@ -2784,6 +2784,105 @@ def test_multicore_extraction_denied_process_creation_yields_truthful_sequential
 
 
 # ---------------------------------------------------------------------------
+# NF32: constructing a nested ``ProcessPoolExecutor`` while the current process
+# is still inside the multiprocessing spawn bootstrap handshake
+# (``current_process()._inheriting``) would re-enter bootstrap and deadlock or
+# corrupt the pickle protocol.  The production guard must short-circuit to a
+# deterministic sequential extraction and publish the exact fallback telemetry.
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_bootstrap_in_progress_prevents_nested_pool_and_yields_truthful_fallback(
+    tmp_path, monkeypatch,
+):
+    """Unsafe spawn bootstrap prevents nested pool construction and publishes
+    the exact fallback telemetry while still producing a complete, queryable
+    generation."""
+    repo = _new_repo(tmp_path, "spawn_bootstrap_blocked")
+    names = [f"sb{i:02d}" for i in range(10)]
+    for name in names:
+        _write(repo / "src" / f"{name}.py", f"def {name}():\n    return 1\n")
+
+    class _InheritingProcess:
+        _inheriting = True
+
+    class _PoolConstructionForbidden:
+        def __init__(self, *, max_workers, mp_context=None):
+            raise AssertionError(
+                "nested pool construction must be prevented during spawn bootstrap"
+            )
+
+    monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "4")
+    monkeypatch.setattr(sg.multiprocessing, "current_process", _InheritingProcess)
+    monkeypatch.setattr(
+        sg.concurrent.futures, "ProcessPoolExecutor", _PoolConstructionForbidden
+    )
+
+    report = sg.build_index(repo)
+
+    assert report.errors == []
+    assert report.extraction_workers == 1
+    assert report.extraction_backend == "sequential_fallback"
+    assert report.extraction_fallback_reason == "spawn_bootstrap_in_progress"
+    assert report.extraction_telemetry.get("selected_workers") == 1
+    assert (
+        report.extraction_telemetry.get("reason")
+        == "fallback_spawn_bootstrap_in_progress"
+    )
+
+    # The guard degraded the extraction backend, not the product's truth.
+    for name in names:
+        assert sg.body_query(repo, name, 16)["matches"]
+
+
+def test_spawn_bootstrap_helper_reports_safe_unsafe_bool_and_exact_fallback_reason(
+    tmp_path, monkeypatch,
+):
+    """``_spawn_bootstrap_in_progress`` is an exact bool (safe=False,
+    unsafe=True) and the guard publishes the exact fallback reason string."""
+
+    class _IdleProcess:
+        pass
+
+    class _InheritingProcess:
+        _inheriting = True
+
+    monkeypatch.setattr(sg.multiprocessing, "current_process", _IdleProcess)
+    safe = sg._spawn_bootstrap_in_progress()
+    assert isinstance(safe, bool)
+    assert safe is False
+
+    monkeypatch.setattr(sg.multiprocessing, "current_process", _InheritingProcess)
+    unsafe = sg._spawn_bootstrap_in_progress()
+    assert isinstance(unsafe, bool)
+    assert unsafe is True
+
+    repo = _new_repo(tmp_path, "spawn_bootstrap_helper_reason")
+    names = [f"hr{i:02d}" for i in range(10)]
+    for name in names:
+        _write(repo / "src" / f"{name}.py", f"def {name}():\n    return 1\n")
+
+    class _PoolConstructionForbidden:
+        def __init__(self, *, max_workers, mp_context=None):
+            raise AssertionError("pool must not be constructed in the unsafe state")
+
+    monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "4")
+    monkeypatch.setattr(sg.multiprocessing, "current_process", _InheritingProcess)
+    monkeypatch.setattr(
+        sg.concurrent.futures, "ProcessPoolExecutor", _PoolConstructionForbidden
+    )
+
+    report = sg.build_index(repo)
+
+    assert report.extraction_backend == "sequential_fallback"
+    assert report.extraction_fallback_reason == "spawn_bootstrap_in_progress"
+    assert (
+        report.extraction_telemetry.get("reason")
+        == "fallback_spawn_bootstrap_in_progress"
+    )
+
+
+# ---------------------------------------------------------------------------
 # NF-2026-00204: ``_index_quality_scorecard`` per-language aggregation must
 # never join ``files`` to both ``entities`` and ``edges`` in one statement
 # (that Cartesian product is what stalled a 691-file unchanged incremental

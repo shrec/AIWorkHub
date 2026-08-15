@@ -1475,8 +1475,7 @@ async function nativeProtocolChecks() {
   });
   assert.strictEqual(boundedTurns, 14);
   const boundedStageNames = boundedOptions[13].tools.map((tool) => tool.name);
-  assert.ok(boundedStageNames.includes("aiworkhub_manager_source_graph_query"));
-  assert.ok(boundedStageNames.includes("aiworkhub_manager_semantic_edit_stage"));
+  assert.deepStrictEqual(boundedStageNames, ["aiworkhub_manager_semantic_edit_stage"]);
   assert.strictEqual(
     boundedOptions[13].toolMode,
     fakeVscode.LanguageModelChatToolMode.Required,
@@ -1546,15 +1545,14 @@ async function nativeProtocolChecks() {
   });
   assert.strictEqual(emptyTurns, 14);
   const emptyStageNames = emptyOptions[13].tools.map((tool) => tool.name);
-  assert.ok(emptyStageNames.includes("aiworkhub_manager_source_graph_query"));
-  assert.ok(emptyStageNames.includes("aiworkhub_manager_semantic_edit_stage"));
+  assert.deepStrictEqual(emptyStageNames, ["aiworkhub_manager_semantic_edit_stage"]);
   assert.strictEqual(
     emptyOptions[13].toolMode,
     fakeVscode.LanguageModelChatToolMode.Required,
   );
 
-  // NF164: Option A keeps request-kind tool definitions visible during the forced
-  // staged-edit transition so prior assistant/tool-result history remains valid.
+  // During forced staging only the offline stage tool is advertised; prior
+  // assistant/tool-result history remains valid independently of advertisement.
   let historyCompatTurns = 0;
   const historyCompatModel = {
     capabilities: { toolCalling: true },
@@ -1568,9 +1566,9 @@ async function nativeProtocolChecks() {
         typeof lastMessage.content === "string" ? lastMessage.content : "";
       if (lastUserText.includes("The bounded discovery phase is complete")) {
         const availableNames = options.tools.map((tool) => tool.name);
-        if (!availableNames.includes("aiworkhub_manager_source_graph_query") ||
-            !availableNames.includes("aiworkhub_manager_semantic_edit_stage")) {
-          throw new Error("forced_stage_missing_historical_tools");
+        if (availableNames.length !== 1 ||
+            availableNames[0] !== "aiworkhub_manager_semantic_edit_stage") {
+          throw new Error("forced_stage_unexpected_tool_set");
         }
         return {
           stream: (async function* stream() {
@@ -2938,6 +2936,139 @@ async function nf202600229QualityReviewSubmitBoundaryChecks() {
   ]);
 }
 
+async function nf179ForcedStageRecoveryChecks() {
+  const request = {
+    requestId: "7".repeat(32),
+    request_kind: "worker",
+    prompt: "bounded NF179 stage recovery",
+    allowedWrites: ["out/result.json"],
+    path_contracts: {
+      "out/result.json": {
+        action: "create",
+        current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        line_count: 0,
+        parent_existed: false,
+      },
+    },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  };
+  const toolRequest = (name, input) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name,
+    input,
+  });
+  const lastUserText = (messages) => {
+    const last = messages[messages.length - 1];
+    return last && last.role === "user" && typeof last.content === "string" ? last.content : "";
+  };
+
+  const textInvocations = [];
+  const textModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      const instruction = lastUserText(messages);
+      let value;
+      if (instruction.includes("Only aiworkhub_manager_semantic_edit_stage")) {
+        value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
+          operation: "create", file_path: "out/result.json", content: "{}\n",
+        });
+      } else {
+        value = toolRequest("aiworkhub_worker_source_graph_query", {
+          mode: "focus",
+          query: instruction.includes("bounded discovery phase") ? "forced-stage-corrective" : "work",
+          workflow_stage: "implementation",
+        });
+      }
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const textResult = await internals.runVscodeLmTextProtocol(
+    textModel,
+    request,
+    undefined,
+    async (call) => {
+      textInvocations.push(call);
+      if (call.name === "aiworkhub_manager_semantic_edit_stage") throw new Error("mcp_unavailable");
+      return { ok: true, content: "graph" };
+    },
+  );
+  assert.strictEqual(JSON.parse(textResult).creates[0].path, "out/result.json");
+  assert.ok(!textInvocations.some((call) => call.name === "aiworkhub_manager_semantic_edit_stage"));
+  assert.ok(!textInvocations.some((call) => call.input && call.input.query === "forced-stage-corrective"));
+
+  let repeatedTurns = 0;
+  const repeatedModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      repeatedTurns += 1;
+      return {
+        stream: (async function* stream() {
+          yield { value: toolRequest("aiworkhub_worker_source_graph_query", {
+            mode: "focus", query: `repeat-${repeatedTurns}`, workflow_stage: "implementation",
+          }) };
+        }()),
+      };
+    },
+  };
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(
+      repeatedModel, request, undefined, async () => ({ ok: true, content: "graph" }),
+    ),
+    /vscode_lm_semantic_edit_stage_required/,
+  );
+
+  const nativeInvocations = [];
+  const forcedToolSets = [];
+  const nativeModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (messages, options) => {
+      const instruction = lastUserText(messages);
+      if (instruction.includes("bounded discovery phase") && Array.isArray(options.tools)) {
+        forcedToolSets.push(options.tools.map((tool) => tool.name));
+        return { stream: (async function* stream() {
+          yield {
+            callId: "nf179-corrective",
+            name: "aiworkhub_worker_source_graph_query",
+            input: { mode: "focus", query: "forced-stage-corrective", workflow_stage: "implementation" },
+          };
+        }()) };
+      }
+      if (instruction.includes("Only aiworkhub_manager_semantic_edit_stage")) {
+        return { stream: (async function* stream() {
+          yield {
+            callId: "nf179-stage",
+            name: "aiworkhub_manager_semantic_edit_stage",
+            input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+          };
+        }()) };
+      }
+      return { stream: (async function* stream() {
+        yield {
+          callId: `nf179-work-${nativeInvocations.length}`,
+          name: "aiworkhub_worker_source_graph_query",
+          input: { mode: "focus", query: "work", workflow_stage: "implementation" },
+        };
+      }()) };
+    },
+  };
+  const nativeResult = await internals.runVscodeLmAgent(
+    nativeModel,
+    request,
+    undefined,
+    async (call) => {
+      nativeInvocations.push(call);
+      if (call.name === "aiworkhub_manager_semantic_edit_stage") throw new Error("mcp_unavailable");
+      return { ok: true, content: "graph" };
+    },
+  );
+  assert.strictEqual(JSON.parse(nativeResult).creates[0].path, "out/result.json");
+  assert.ok(forcedToolSets.length > 0);
+  assert.ok(forcedToolSets.every((names) =>
+    names.length === 1 && names[0] === "aiworkhub_manager_semantic_edit_stage"));
+  assert.ok(!nativeInvocations.some((call) => call.name === "aiworkhub_manager_semantic_edit_stage"));
+  assert.ok(!nativeInvocations.some((call) => call.input && call.input.query === "forced-stage-corrective"));
+}
+
 async function main() {
   const schema = internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA;
   const allowed = ["src/*.py", "tests/*.py"];
@@ -3000,6 +3131,7 @@ async function main() {
   await nf168ForceFinalTextProtocol();
   await nf169ContextlessWorkerNative();
   await nf202600229QualityReviewSubmitBoundaryChecks();
+  await nf179ForcedStageRecoveryChecks();
 }
 async function cancellationToolBoundaryChecks() {
   const toolEnvelope = JSON.stringify({

@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.67 — 2026-08-15
+
+### Fixed
+
+- Keep bounded semantic staging offline and advertise only the offline stage
+  tool once the VS Code LM worker enters that phase.
+- Recover one role-correct Source Graph phase violation without invoking it,
+  then fail repeated violations with a bounded structured error.
+- Prevent the `mcp_unavailable` followed by `tool_not_allowed` loop that could
+  terminate otherwise healthy self-development workers before edits.
+
 ## 0.9.66 — 2026-08-15
 
 ### Fixed
