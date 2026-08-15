@@ -539,11 +539,12 @@ def _with_source_graph_db(source_graph_module: Any, db_path: Path):
     """Context-locally bind Source Graph to one already-verified DB.
 
     The worker MCP server is one process per request, but FastMCP may dispatch
-    concurrent calls.  The module-level resolver is therefore changed only
-    while holding a re-entrant lock and is restored in ``finally``.  This is
-    required for a quality reviewer: its repository is the immutable combined
-    candidate worktree while its ephemeral index lives in the private runtime
-    directory, not in that read-only worktree.
+    concurrent calls.  ``database_path_override`` is a ``ContextVar``, so each
+    caller's override is isolated from every other caller and restored in
+    ``finally``.  Distinct overrides therefore never serialize on a shared
+    lock.  This is required for a quality reviewer: its repository is the
+    immutable combined candidate worktree while its ephemeral index lives in
+    the private runtime directory, not in that read-only worktree.
     """
 
     override = getattr(source_graph_module, "database_path_override", None)
@@ -727,60 +728,73 @@ def _candidate_db_is_ready(
     return True
 
 
-def prewarm_quality_review_source_graph(
-    packet_path: Path,
-    *,
-    repo: Path,
-) -> dict[str, Any]:
-    """Prebuild and atomically publish the packet-bound reviewer candidate index.
+class _CandidatePrewarmFlight:
+    """Single-flight guard for one packet-bound candidate overlay build.
 
-    This is the only path that ever builds a reviewer candidate Source Graph
-    index.  The launcher calls it after the review packet is materialized and
-    before the reviewer provider is launched; runtime reviewer Source Graph
-    calls are query-only and never invoke ``build_index`` (the former
-    first-call wedge).  The overlay is built under the shared override lock to
-    a temporary sibling, verified non-empty and packet-bound, then published
-    atomically with ``os.replace``.
+    Distinct candidate DBs share no lock and build concurrently.  Concurrent
+    callers for the same packet-bound ``db_path`` wait on this flight so the
+    overlay is built, verified and atomically published exactly once.
     """
 
-    from . import source_graph as _source_graph_mod
+    __slots__ = ("_condition", "_done", "_result", "_error")
 
-    packet_sha256, target_request_id, target_task_id, db_path, changed_paths = (
-        _verify_quality_review_packet_binding(packet_path, repo)
-    )
-    built = False
-    with _SOURCE_GRAPH_DB_OVERRIDE_LOCK:
-        if db_path.is_symlink():
-            raise WorkerToolError("quality_review_candidate_source_graph_symlink")
-        if not _candidate_db_is_ready(
-            db_path, packet_sha256, target_request_id, target_task_id,
-            changed_paths,
-        ):
-            temporary = db_path.parent / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
-            try:
-                with _with_source_graph_db(_source_graph_mod, temporary):
-                    _source_graph_mod.build_index(
-                        repo, db_path=temporary, incremental=False,
-                    )
-                _write_candidate_db_marker(
-                    temporary, packet_sha256, target_request_id, target_task_id,
-                )
-                if not _candidate_db_is_ready(
-                    temporary, packet_sha256, target_request_id, target_task_id,
-                    changed_paths,
-                ):
-                    raise WorkerToolError(
-                        "quality_review_candidate_source_graph_empty"
-                    )
-                os.replace(temporary, db_path)
-                built = True
-            finally:
-                temporary.unlink(missing_ok=True)
-        if not _candidate_db_is_ready(
-            db_path, packet_sha256, target_request_id, target_task_id,
-            changed_paths,
-        ):
-            raise WorkerToolError("quality_review_candidate_source_graph_empty")
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._done = False
+        self._result: dict[str, Any] | None = None
+        self._error: BaseException | None = None
+
+    def wait(self) -> None:
+        with self._condition:
+            while not self._done:
+                self._condition.wait()
+            if self._error is not None:
+                raise self._error
+
+    def publish(self, result: dict[str, Any]) -> None:
+        with self._condition:
+            self._result = result
+            self._done = True
+            self._condition.notify_all()
+
+    def fail(self, exc: BaseException) -> None:
+        with self._condition:
+            self._error = exc
+            self._done = True
+            self._condition.notify_all()
+
+
+_CANDIDATE_PREWARM_FLIGHTS: dict[Path, _CandidatePrewarmFlight] = {}
+_CANDIDATE_PREWARM_FLIGHTS_LOCK = threading.Lock()
+
+
+def _candidate_prewarm_flight(
+    db_path: Path,
+) -> tuple[_CandidatePrewarmFlight, bool]:
+    """Return ``(flight, is_owner)`` for the overlay at ``db_path``."""
+    with _CANDIDATE_PREWARM_FLIGHTS_LOCK:
+        flight = _CANDIDATE_PREWARM_FLIGHTS.get(db_path)
+        if flight is None:
+            flight = _CandidatePrewarmFlight()
+            _CANDIDATE_PREWARM_FLIGHTS[db_path] = flight
+            return flight, True
+        return flight, False
+
+
+def _release_candidate_prewarm_flight(db_path: Path) -> None:
+    with _CANDIDATE_PREWARM_FLIGHTS_LOCK:
+        _CANDIDATE_PREWARM_FLIGHTS.pop(db_path, None)
+
+
+def _candidate_prewarm_result(
+    *,
+    built: bool,
+    db_path: Path,
+    repo: Path,
+    packet_sha256: str,
+    target_request_id: str,
+    target_task_id: str,
+) -> dict[str, Any]:
     return {
         "ok": True,
         "built": built,
@@ -792,6 +806,102 @@ def prewarm_quality_review_source_graph(
         "target_task_id": target_task_id,
         "packet_sha256": packet_sha256,
     }
+
+
+def prewarm_quality_review_source_graph(
+    packet_path: Path,
+    *,
+    repo: Path,
+) -> dict[str, Any]:
+    """Prebuild and atomically publish the packet-bound reviewer candidate index.
+
+    This is the only path that ever builds a reviewer candidate Source Graph
+    index.  The launcher calls it after the review packet is materialized and
+    before the reviewer provider is launched; runtime reviewer Source Graph
+    calls are query-only and never invoke ``build_index``.  ``build_index`` is
+    bound context-locally through ``source_graph.database_path_override`` (a
+    ``ContextVar``), so distinct candidate DBs build concurrently without any
+    process-global lock.  Only callers for the same packet-bound ``db_path``
+    single-flight, so the overlay is verified and published exactly once.
+    """
+
+    from . import source_graph as _source_graph_mod
+
+    packet_sha256, target_request_id, target_task_id, db_path, changed_paths = (
+        _verify_quality_review_packet_binding(packet_path, repo)
+    )
+    if db_path.is_symlink():
+        raise WorkerToolError("quality_review_candidate_source_graph_symlink")
+    if _candidate_db_is_ready(
+        db_path, packet_sha256, target_request_id, target_task_id,
+        changed_paths,
+    ):
+        return _candidate_prewarm_result(
+            built=False,
+            db_path=db_path,
+            repo=repo,
+            packet_sha256=packet_sha256,
+            target_request_id=target_request_id,
+            target_task_id=target_task_id,
+        )
+
+    flight, is_owner = _candidate_prewarm_flight(db_path)
+    if not is_owner:
+        flight.wait()
+        if not _candidate_db_is_ready(
+            db_path, packet_sha256, target_request_id, target_task_id,
+            changed_paths,
+        ):
+            raise WorkerToolError("quality_review_candidate_source_graph_empty")
+        return _candidate_prewarm_result(
+            built=False,
+            db_path=db_path,
+            repo=repo,
+            packet_sha256=packet_sha256,
+            target_request_id=target_request_id,
+            target_task_id=target_task_id,
+        )
+
+    try:
+        temporary = db_path.parent / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            with _with_source_graph_db(_source_graph_mod, temporary):
+                _source_graph_mod.build_index(
+                    repo, db_path=temporary, incremental=False,
+                )
+            _write_candidate_db_marker(
+                temporary, packet_sha256, target_request_id, target_task_id,
+            )
+            if not _candidate_db_is_ready(
+                temporary, packet_sha256, target_request_id, target_task_id,
+                changed_paths,
+            ):
+                raise WorkerToolError(
+                    "quality_review_candidate_source_graph_empty"
+                )
+            os.replace(temporary, db_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        if not _candidate_db_is_ready(
+            db_path, packet_sha256, target_request_id, target_task_id,
+            changed_paths,
+        ):
+            raise WorkerToolError("quality_review_candidate_source_graph_empty")
+        result = _candidate_prewarm_result(
+            built=True,
+            db_path=db_path,
+            repo=repo,
+            packet_sha256=packet_sha256,
+            target_request_id=target_request_id,
+            target_task_id=target_task_id,
+        )
+        flight.publish(result)
+        return result
+    except BaseException as exc:
+        flight.fail(exc)
+        raise
+    finally:
+        _release_candidate_prewarm_flight(db_path)
 
 
 def _candidate_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding | None:

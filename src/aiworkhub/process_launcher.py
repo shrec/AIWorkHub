@@ -3751,7 +3751,10 @@ class ProcessManager:
         phase is exact spawn authority that outlives its owner process, so it
         is never terminalized by elapsed or quiet time: only a committed owner
         proven dead (and no provider running event) is truthfully terminalized
-        once.  A live provider's liveness follows exact process evidence.
+        once.  A live provider's liveness follows exact process evidence.  A
+        pid-null ``starting`` reservation whose exact owner is still live in the
+        ``reviewer_source_graph_prewarm_started`` phase is likewise deferred
+        rather than terminalized by its elapsed epoch.
         """
 
         now = time.time()
@@ -3823,6 +3826,11 @@ class ProcessManager:
                         ),
                     })
                     reconciled += 1
+                continue
+            if self._reviewer_source_graph_prewarm_live_event(event):
+                # A live owned prewarm keeps extending its own liveness; the
+                # bounded reservation epoch alone is never terminal authority
+                # while the exact owner is still building the Source Graph.
                 continue
             if float(event.get("reservation_expires_at_epoch") or 0.0) >= now:
                 continue
@@ -4039,6 +4047,13 @@ class ProcessManager:
                 continue
             pid = int(event.get("pid") or 0)
             ticks = event.get("pid_start_ticks")
+            if (
+                state == "starting"
+                and not pid
+                and self._reviewer_source_graph_prewarm_live_event(event)
+            ):
+                active.add(request_id)
+                continue
             if (
                 state == "starting"
                 and not pid
@@ -4328,9 +4343,11 @@ class ProcessManager:
     # provider by elapsed time -- there is no process during preparation.
     _QUALITY_REVIEW_PREP_OWNER_SECONDS = 300.0
     # The reviewer's entire pre-provider isolated-launch preparation runs under
-    # its own bounded owner.  A launch that outlives the ceiling (e.g. a stalled
-    # Source Graph prewarm or MCP callback) is truthfully terminalized as a
-    # pid-null ``quality_review_launch_timeout``; the stale owner becomes
+    # its own bounded owner.  A launch that outlives the ceiling with no live
+    # owned Source Graph prewarm (e.g. a stalled MCP callback) is truthfully
+    # terminalized as a pid-null ``quality_review_launch_timeout``.  A live
+    # owned ``reviewer_source_graph_prewarm`` keeps extending the owner ceiling
+    # so it is never expired by elapsed time; the stale owner becomes
     # ownership-aware and aborts before spawning, so no provider is ever
     # time-limited or killed by elapsed time.  Liveness of a real provider still
     # follows exact process evidence only.
@@ -4740,6 +4757,9 @@ class ProcessManager:
             "preparation_phase": phase,
             "preparation_heartbeat_epoch": time.time(),
         }
+        if base.get("owner_pid"):
+            event["owner_pid"] = base.get("owner_pid")
+            event["owner_pid_start_ticks"] = base.get("owner_pid_start_ticks")
         if detail:
             event["preparation_detail"] = str(detail)[:300]
         self._append_event(event)
@@ -4779,6 +4799,8 @@ class ProcessManager:
                 continue
             pid = int(event.get("pid") or 0)
             if state == "starting" and not pid:
+                if self._reviewer_source_graph_prewarm_live_event(event):
+                    return self._reviewer_receipt(request_id)
                 if (
                     float(event.get("reservation_expires_at_epoch") or 0.0)
                     > time.time()
@@ -4835,6 +4857,8 @@ class ProcessManager:
                 "reservation_expires_at_epoch": (
                     time.time() + QUALITY_REVIEW_ATTEMPT_RESERVATION_SECONDS
                 ),
+                "owner_pid": os.getpid(),
+                "owner_pid_start_ticks": _pid_start_ticks(os.getpid()),
                 "timeout_seconds": timeout_seconds,
                 "quality_review_attempt": {
                     "target_request_id": target_request_id,
@@ -5018,6 +5042,69 @@ class ProcessManager:
                 request_id=request_id,
             )
 
+    def _reviewer_source_graph_prewarm_live_event(
+        self, event: dict[str, Any]
+    ) -> bool:
+        """True when one event is a live, exact-owned Source Graph prewarm.
+
+        A prewarm is live only when its reservation is still ``starting``, its
+        latest preparation phase is the started prewarm phase, and its exact
+        owner process identity still matches.  Dead, missing, mismatched, or
+        unknown-identity owners fail closed, so reconciliation still
+        terminalizes them.
+        """
+
+        if event.get("state") != "starting":
+            return False
+        if event.get("preparation_phase") != "reviewer_source_graph_prewarm_started":
+            return False
+        owner_pid = int(event.get("owner_pid") or 0)
+        if owner_pid <= 0:
+            return False
+        return (
+            _pid_identity_evidence(
+                owner_pid, event.get("owner_pid_start_ticks")
+            ).verdict
+            is PidIdentityVerdict.MATCH
+        )
+
+    def _reviewer_source_graph_prewarm_live(self, request_id: str) -> bool:
+        """True while the exact owned reviewer Source Graph prewarm is still running.
+
+        The launcher thread publishes ``reviewer_source_graph_prewarm_started``
+        before the build and ``reviewer_source_graph_prewarm_complete`` after,
+        so the latest preparation phase for a still-``starting`` reservation is
+        the truthful prewarm liveness signal.  A reservation that already moved
+        past the prewarm (or never entered it) is not live here.
+        """
+
+        latest = self._latest_by_request().get(request_id) or {}
+        return self._reviewer_source_graph_prewarm_live_event(latest)
+
+    def _reviewer_launch_owner_join(
+        self, launcher: threading.Thread, request_id: str
+    ) -> str:
+        """Wait for one bounded reviewer launch owner to finish.
+
+        Returns ``"completed"`` when the launcher thread finished (its result is
+        ready), ``"provider_committed"`` when a real provider process already
+        exists (never time-limited), or ``"timeout"`` when the still-live owner
+        should be terminalized.  A live owned Source Graph prewarm keeps
+        extending the owner ceiling: it is never terminalized purely because
+        wall time elapsed.
+        """
+
+        while launcher.is_alive():
+            launcher.join(self._QUALITY_REVIEW_LAUNCH_OWNER_SECONDS)
+            if not launcher.is_alive():
+                return "completed"
+            if self._reviewer_provider_committed(request_id):
+                return "provider_committed"
+            if self._reviewer_source_graph_prewarm_live(request_id):
+                continue
+            return "timeout"
+        return "completed"
+
     def _complete_quality_reviewer_launch(
         self,
         *,
@@ -5129,6 +5216,7 @@ class ProcessManager:
                         timeout_seconds=timeout_seconds,
                         quality_review_binding=binding,
                         reserved_request_id=request_id,
+                        prewarm_progress=_progress,
                     )
                 except Exception as exc:  # noqa: BLE001 -- defensive bounded worker
                     launch_box["result"] = {
@@ -5142,16 +5230,18 @@ class ProcessManager:
                 daemon=True,
             )
             launcher.start()
-            launcher.join(self._QUALITY_REVIEW_LAUNCH_OWNER_SECONDS)
-            if launcher.is_alive():
-                # The stale pre-provider owner is still preparing.  If a real
-                # provider process already exists, never time-limit it: the
-                # reservation resolves truthfully through the running/monitor
-                # path.  Otherwise terminalize the pid-null reservation exactly
-                # once and return; the worker thread is never killed, but its
-                # ownership-aware checkpoints abort it before it can spawn.
-                if self._reviewer_provider_committed(request_id):
-                    return
+            owner_result = self._reviewer_launch_owner_join(launcher, request_id)
+            if owner_result == "provider_committed":
+                # A real provider process already exists: never time-limit it.
+                # The reservation resolves truthfully through the
+                # running/monitor path.
+                return
+            if owner_result == "timeout":
+                # The stale pre-provider owner outlived the ceiling with no
+                # live owned prewarm to explain it.  Terminalize the pid-null
+                # reservation exactly once and return; the worker thread is
+                # never killed, but its ownership-aware checkpoints abort it
+                # before it can spawn.
                 _fail("quality_review_launch_timeout")
                 return
             launched = launch_box.get("result")
@@ -5258,6 +5348,7 @@ class ProcessManager:
         timeout_seconds: int,
         quality_review_binding: dict[str, Any] | None = None,
         reserved_request_id: str | None = None,
+        prewarm_progress: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         if not launch_gates_open():
             return self._blocked(
@@ -5404,15 +5495,21 @@ class ProcessManager:
                         review_packet_path,
                         dict(quality_review_binding["packet"]),
                     )
+                    if prewarm_progress is not None:
+                        prewarm_progress("reviewer_source_graph_prewarm_started")
                     try:
                         worker_ai_tools_mcp.prewarm_quality_review_source_graph(
                             review_packet_path, repo=workspace.path,
                         )
                     except worker_ai_tools_mcp.WorkerToolError as exc:
+                        if prewarm_progress is not None:
+                            prewarm_progress("reviewer_source_graph_prewarm_failed")
                         raise LaunchRejected(
                             "quality_review_source_graph_prewarm_failed:"
                             + str(exc)[:240]
                         ) from exc
+                    if prewarm_progress is not None:
+                        prewarm_progress("reviewer_source_graph_prewarm_complete")
                 else:
                     workspace = create_workspace(self.repo, request_id, card, adapter_id)
                     residual_contract_manifest = build_residual_contract_manifest(
