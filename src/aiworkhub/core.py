@@ -1517,8 +1517,17 @@ def run_taskctl(
     return TaskCtlResult(command, 127, "", f"unsupported_native_task_command:{cmd}")
 
 
+# Card-scoped write actions an exact card owner may perform on its own card.
+# ``launch-failed`` is the release half of the reserve->claim boundary: the
+# owner that legally created a claim must be able to release it, otherwise a
+# reconciled reservation strands its card in processing/claimed forever.
+_CARD_SCOPED_ACTIONS = frozenset(
+    {"claim-start", "launch-blocked", "launch-failed", "review", "usage"}
+)
+
+
 def _task_id_from_write_args(args: list[str]) -> str | None:
-    if not args or args[0] not in {"claim-start", "launch-blocked", "review", "usage"}:
+    if not args or args[0] not in _CARD_SCOPED_ACTIONS:
         return None
     if len(args) < 2:
         return None
@@ -1533,7 +1542,7 @@ def _check_card_scoped_write_authority(
 ) -> dict[str, Any]:
     """Allow exact one-off card owners without widening the static matrix."""
     action = args[0] if args else ""
-    if action not in {"claim-start", "launch-blocked", "review", "usage"}:
+    if action not in _CARD_SCOPED_ACTIONS:
         return {"allowed": False, "reason": f"card_scoped_action_not_allowed:{action}"}
     if runner == CODEX_RUNNER and action != "launch-blocked":
         return {"allowed": False, "reason": "card_scoped_codex_forbidden"}

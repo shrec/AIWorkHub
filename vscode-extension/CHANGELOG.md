@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.71 — 2026-08-15
+
+### Fixed
+
+- A card owner can now release its own claim. The card-scoped write-action set
+  omitted `launch-failed`, so releasing a stale reservation claim was always
+  refused and any reconciled reservation left its card stranded in
+  `processing`/`claimed` forever.
+- The action set is now one named frozenset shared by both authority call
+  sites, so they cannot drift apart. Codex authority is unchanged.
+
 ## 0.9.70 — 2026-08-15
 
 ### Fixed

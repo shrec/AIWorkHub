@@ -12,6 +12,16 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.71
+
+- A card owner can now release its own claim. The card-scoped write-action set
+  omitted `launch-failed`, so a reconciled reservation could leave its card
+  stranded in `processing` forever with no live provider able to finish it.
+- Both authority call sites now share one named action set, so they cannot
+  drift apart. Codex authority is unchanged.
+
+See the packaged **Changelog** for the complete release summary.
+
 ## What's new in 0.9.70
 
 - Coordinator routing resolves from the active verified manager route, so a

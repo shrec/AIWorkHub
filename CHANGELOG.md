@@ -6,6 +6,29 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.71] - 2026-08-15
+
+### Fixed
+
+- Allow a card owner to release its own claim. The card-scoped write-action set
+  omitted `launch-failed`, so `release_stale_reservation_claim` was refused with
+  `card_scoped_action_not_allowed:launch-failed` even with writes enabled. The
+  owner that legally created a claim therefore had no legal way to release it,
+  and any reconciled reservation stranded its card in `processing`/`claimed`
+  with `launch_request_id` still attached — permanently, against a later claim's
+  `launch_request_conflict`.
+- The action set is now a named `_CARD_SCOPED_ACTIONS` frozenset used by both
+  `_task_id_from_write_args` and `_check_card_scoped_write_authority`, so the
+  two call sites can no longer drift apart. Codex authority is unchanged and
+  still restricted to `launch-blocked`.
+
+### Validation
+
+- 142 passed across the process-launcher, Windows launch-lock and task-engine
+  suites; 199 passed across the completion quality-gate, quality-verdict,
+  combined-tree and worker-workspace suites; `ruff check src/aiworkhub/core.py`
+  clean.
+
 ## [0.9.70] - 2026-08-15
 
 ### Fixed
