@@ -4054,6 +4054,8 @@ async function runVscodeLmTextProtocol(
   let finalizationTurns = 0;
   let forceFinal = false;
   let forceFinalViolations = 0;
+  let reviewSubmitForced = false;
+  let reviewSubmitViolations = 0;
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
   const protocolTrace = [];
@@ -4064,12 +4066,8 @@ async function runVscodeLmTextProtocol(
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
     assertRequestActive();
     if (request.request_kind === "quality_review" &&
-        postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS) {
-      throw vscodeLmProtocolFailure(
-        "vscode_lm_quality_review_submit_required",
-        protocolTrace,
-        lastProtocolPreview,
-      );
+        postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS && !reviewSubmitForced) {
+      reviewSubmitForced = true;
     }
     if (request.request_kind !== "quality_review" &&
         sourceGraphAcknowledged && postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
@@ -4225,6 +4223,34 @@ async function runVscodeLmTextProtocol(
     );
     const permitted = availableTools.find((tool) => tool.name === envelope.name);
     if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(envelope.name || "")}`);
+    // NF-2026-00229: quality-review forced-submit boundary — after the initial
+    // Source Graph work turns, a non-submit tool request receives one corrective,
+    // non-executing result; a repeated violation terminalizes truthfully.
+    if (request.request_kind === "quality_review" && reviewSubmitForced &&
+        envelope.name !== "aiworkhub_worker_quality_review_submit") {
+      protocolTrace.push({
+        turn,
+        phase: "review_submit",
+        outcome: "non_submit_tool_rejected",
+        rejectedTool: envelope.name,
+      });
+      if (reviewSubmitViolations >= 1) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_quality_review_submit_required",
+          protocolTrace,
+          lastProtocolPreview,
+        );
+      }
+      reviewSubmitViolations += 1;
+      messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+      messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
+        schema_id: VSCODE_LM_TOOL_RESULT_SCHEMA,
+        name: envelope.name,
+        result: { ok: false, error: "vscode_lm_quality_review_submit_required", corrective: true },
+        instruction: "The review work phase is complete. Call aiworkhub_worker_quality_review_submit now with your findings.",
+      })));
+      continue;
+    }
     if (!envelope.input || typeof envelope.input !== "object" || Array.isArray(envelope.input)) {
       const reason = Array.isArray(envelope.input)
         ? "tool_input_is_array"
@@ -4363,6 +4389,8 @@ async function runVscodeLmAgent(
   let finalizationTurns = 0;
   let forceFinal = false;
   let forceFinalViolations = 0;
+  let reviewSubmitForced = false;
+  let reviewSubmitViolations = 0;
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
   let stagedEditViolations = 0;
@@ -4374,12 +4402,8 @@ async function runVscodeLmAgent(
   let wrongToolViolations = 0;
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
     assertRequestActive();
-    if (qualityReview && postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS) {
-      throw vscodeLmProtocolFailure(
-        "vscode_lm_quality_review_submit_required",
-        protocolTrace,
-        lastProtocolPreview,
-      );
+    if (qualityReview && postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS && !reviewSubmitForced) {
+      reviewSubmitForced = true;
     }
     if (sourceGraphAcknowledged &&
         (toolTurns >= VSCODE_LM_MAX_TOOL_TURNS || postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) &&
@@ -4579,6 +4603,37 @@ async function runVscodeLmAgent(
         `The previous turn contained one or more tool calls that are not permitted for this request role. ` +
         `Allowed tool names: ${JSON.stringify([...permittedToolNames])}. ` +
         `Only call tools from this list.`,
+      ));
+      continue;
+    }
+    // NF-2026-00229: quality-review forced-submit boundary — after the initial
+    // Source Graph work turns, a non-submit tool call receives one corrective,
+    // non-executing result (paired by callId); a repeated violation terminalizes.
+    if (qualityReview && reviewSubmitForced &&
+        calls.some((call) => call.name !== "aiworkhub_worker_quality_review_submit")) {
+      protocolTrace.push({
+        turn,
+        phase: "review_submit",
+        outcome: "non_submit_tool_rejected",
+        rejectedCallIds: calls
+          .filter((c) => c.name !== "aiworkhub_worker_quality_review_submit")
+          .map((c) => c.callId),
+      });
+      if (reviewSubmitViolations >= 1) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_quality_review_submit_required",
+          protocolTrace,
+          lastProtocolPreview,
+        );
+      }
+      reviewSubmitViolations += 1;
+      messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
+      messages.push(vscode.LanguageModelChatMessage.User(
+        calls.map((call) => languageModelToolResultPart(call.callId, {
+          ok: false,
+          error: "vscode_lm_quality_review_submit_required",
+          corrective: true,
+        })),
       ));
       continue;
     }
