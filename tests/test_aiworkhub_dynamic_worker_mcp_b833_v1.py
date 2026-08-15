@@ -825,7 +825,7 @@ class _FakeMcp:
     def __init__(self) -> None:
         self.registered: dict[str, object] = {}
 
-    def tool(self, *, name: str):
+    def tool(self, *, name: str, description: str | None = None):
         def decorator(fn):
             self.registered[name] = fn
             return fn

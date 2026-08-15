@@ -686,6 +686,21 @@ class TestCapabilityProbe:
         )
         assert worker_workspace._seccomp_notify_supported() is False
 
+    def test_supported_requires_live_listener_transfer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            worker_workspace, "_seccomp_notify_library", lambda: object()
+        )
+        monkeypatch.setattr(
+            worker_workspace, "_seccomp_kernel_notify_api", lambda: True
+        )
+        monkeypatch.setattr(worker_workspace, "_openat2_available", lambda: True)
+        monkeypatch.setattr(
+            worker_workspace, "_seccomp_notify_runtime_supported", lambda: False
+        )
+        assert worker_workspace._seccomp_notify_supported() is False
+
 
 class TestProcessGroupTeardown:
     def test_kill_and_reap_validator_group(self) -> None:
@@ -745,6 +760,103 @@ class TestExitStatusMapping:
 
     def test_signal_exit(self) -> None:
         assert worker_workspace._metadata_broker_exit_code(9) == 137
+
+
+class TestMetadataBrokerHandshake:
+    """Pure-userspace coverage of the bounded, observable listener handoff.
+
+    These drive ``socketpair``/``pipe`` directly, so they reproduce the
+    deterministic transfer-failure states (EOF without a listener, child error
+    report, timeout) and prove a real ``SCM_RIGHTS`` descriptor is received,
+    without requiring a live seccomp-notify listener or Landlock sandbox.
+    """
+
+    def test_successful_fd_receipt(self) -> None:
+        import socket
+
+        parent_sock, child_sock = socket.socketpair()
+        probe_r, probe_w = os.pipe()
+        try:
+            worker_workspace._metadata_broker_handshake_send(child_sock, probe_w)
+            child_sock.close()
+            listener_fd, error = worker_workspace._metadata_broker_handshake_receive(
+                parent_sock, time.monotonic() + 5.0
+            )
+            assert listener_fd >= 0
+            assert error == ""
+            try:
+                # The received descriptor is a live, distinct duplicate of the
+                # sent pipe write end.
+                os.write(listener_fd, b"x")
+                assert os.read(probe_r, 1) == b"x"
+            finally:
+                os.close(listener_fd)
+        finally:
+            parent_sock.close()
+            os.close(probe_r)
+            os.close(probe_w)
+
+    def test_eof_without_listener_is_deterministic_failure(self) -> None:
+        import socket
+
+        parent_sock, child_sock = socket.socketpair()
+        child_sock.close()  # child dies without delivering a listener fd
+        try:
+            listener_fd, error = worker_workspace._metadata_broker_handshake_receive(
+                parent_sock, time.monotonic() + 5.0
+            )
+        finally:
+            parent_sock.close()
+        assert listener_fd < 0
+        assert error == "handshake_eof"
+
+    def test_child_error_report_is_observable(self) -> None:
+        import socket
+
+        parent_sock, child_sock = socket.socketpair()
+        try:
+            worker_workspace._metadata_broker_handshake_error(child_sock, b"boom")
+            child_sock.close()
+            listener_fd, error = worker_workspace._metadata_broker_handshake_receive(
+                parent_sock, time.monotonic() + 5.0
+            )
+        finally:
+            parent_sock.close()
+        assert listener_fd < 0
+        assert error == "boom"
+
+    def test_timeout_is_bounded_and_observable(self) -> None:
+        import socket
+
+        parent_sock, child_sock = socket.socketpair()
+        started = time.monotonic()
+        try:
+            # Peer stays open but never sends: the parent must fail closed on
+            # a bounded deadline instead of blocking indefinitely.
+            listener_fd, error = worker_workspace._metadata_broker_handshake_receive(
+                parent_sock, started + 0.2
+            )
+        finally:
+            parent_sock.close()
+            child_sock.close()
+        assert listener_fd < 0
+        assert error == "handshake_timeout"
+        assert time.monotonic() - started < 5.0
+
+    def test_non_error_data_without_fd_is_protocol_violation(self) -> None:
+        import socket
+
+        parent_sock, child_sock = socket.socketpair()
+        try:
+            child_sock.sendall(b"garbage")
+            child_sock.close()
+            listener_fd, error = worker_workspace._metadata_broker_handshake_receive(
+                parent_sock, time.monotonic() + 5.0
+            )
+        finally:
+            parent_sock.close()
+        assert listener_fd < 0
+        assert error == "handshake_protocol_violation"
 
 
 class TestRunValidationsGitInitIntegration:
@@ -840,3 +952,45 @@ class TestRunValidationsGitInitIntegration:
         assert results
         assert results[0]["returncode"] == 0, results[0]
         assert not results[0].get("timed_out")
+
+
+class TestReviewOverlayContentOnlyCopy:
+    """NF160: review overlays must copy content only, never copystat/utime.
+
+    ``_overlay_regular_path`` feeds ``create_quality_review_workspace``. The
+    Landlock validation boundary denies ``utime``/``utimensat``, so the
+    overlay copy must not request timestamp/owner preservation via
+    ``shutil.copy2`` and must keep rejecting symlink/non-regular sources.
+    """
+
+    def test_overlay_copies_bytes_without_metadata_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source = tmp_path / "src"
+        target = tmp_path / "dst"
+        source.mkdir()
+        target.mkdir()
+        (source / "candidate.py").write_text("value = 2\n", encoding="utf-8")
+
+        def _reject_copy2(*_args, **_kwargs):
+            raise AssertionError("review overlay must not use copy2")
+
+        monkeypatch.setattr(worker_workspace.shutil, "copy2", _reject_copy2)
+        worker_workspace._overlay_regular_path(source, target, "candidate.py")
+        assert (target / "candidate.py").read_text(encoding="utf-8") == "value = 2\n"
+
+    def test_overlay_rejects_symlink_and_non_regular_sources(
+        self, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "src"
+        target = tmp_path / "dst"
+        source.mkdir()
+        target.mkdir()
+        real = source / "real.py"
+        real.write_text("value = 1\n", encoding="utf-8")
+        (source / "link.py").symlink_to(real)
+        with pytest.raises(WorkspaceError, match="symlink_path_component_forbidden"):
+            worker_workspace._overlay_regular_path(source, target, "link.py")
+        (source / "subdir").mkdir()
+        with pytest.raises(WorkspaceError, match="combined_tree_source_not_file"):
+            worker_workspace._overlay_regular_path(source, target, "subdir")

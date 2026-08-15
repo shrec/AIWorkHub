@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -141,6 +143,198 @@ def test_quality_reviewer_source_graph_uses_packet_bound_candidate_overlay(
     assert audit["authority_index_identity"] == [
         f"source_graph:candidate_overlay:quality_review_readonly:{candidate.resolve()}"
     ]
+
+
+def _exists_ready(db_path: Path, *args: object, **kwargs: object) -> bool:
+    try:
+        return db_path.is_file() and db_path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def test_quality_review_prewarm_distinct_candidates_build_concurrently(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    db_paths: list[Path] = []
+    for index in range(3):
+        runtime = tmp_path / f"runtime-{index}"
+        runtime.mkdir()
+        db_paths.append(runtime / f"candidate_source_graph_{index:016x}.sqlite")
+
+    def fake_verify(packet_path: Path, _repo: Path):
+        index = int(packet_path.name.split("-")[-1])
+        return (
+            f"packet-{index}",
+            f"target-request-{index}",
+            f"TARGET_TASK_{index}",
+            db_paths[index],
+            [{"path": "module.py", "sha256": "a" * 64}],
+        )
+
+    monkeypatch.setattr(
+        worker_tools, "_verify_quality_review_packet_binding", fake_verify
+    )
+    monkeypatch.setattr(
+        worker_tools, "_write_candidate_db_marker", lambda *a, **k: None
+    )
+    monkeypatch.setattr(worker_tools, "_candidate_db_is_ready", _exists_ready)
+
+    entered: list[str] = []
+    entered_lock = threading.Lock()
+    barrier = threading.Barrier(3)
+
+    def fake_build(_repo, *, db_path, incremental):
+        with entered_lock:
+            entered.append(str(db_path))
+        barrier.wait(timeout=5)
+        db_path.write_bytes(b"fake-overlay-index")
+
+    monkeypatch.setattr(source_graph, "build_index", fake_build)
+
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def run(index: int) -> None:
+        try:
+            results.append(
+                worker_tools.prewarm_quality_review_source_graph(
+                    tmp_path / f"packet-{index}", repo=repo
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert not errors, errors
+    assert len(entered) == 3
+    assert sorted(r["built"] for r in results) == [True, True, True]
+    assert all(path.is_file() for path in db_paths)
+
+
+def test_quality_review_prewarm_same_packet_single_flights(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    db_path = runtime / "candidate_source_graph_0000000000000000.sqlite"
+
+    monkeypatch.setattr(
+        worker_tools,
+        "_verify_quality_review_packet_binding",
+        lambda _packet_path, _repo: (
+            "packet-shared",
+            "target-request",
+            "TARGET_TASK",
+            db_path,
+            [{"path": "module.py", "sha256": "a" * 64}],
+        ),
+    )
+    monkeypatch.setattr(
+        worker_tools, "_write_candidate_db_marker", lambda *a, **k: None
+    )
+    monkeypatch.setattr(worker_tools, "_candidate_db_is_ready", _exists_ready)
+
+    build_count = {"n": 0}
+    build_lock = threading.Lock()
+    release = threading.Event()
+
+    def fake_build(_repo, *, db_path, incremental):
+        with build_lock:
+            build_count["n"] += 1
+        release.wait(timeout=10)
+        db_path.write_bytes(b"fake-overlay-index")
+
+    monkeypatch.setattr(source_graph, "build_index", fake_build)
+
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            results.append(
+                worker_tools.prewarm_quality_review_source_graph(
+                    tmp_path / "packet", repo=repo
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    first = threading.Thread(target=run)
+    first.start()
+    deadline = time.monotonic() + 5
+    while build_count["n"] == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert build_count["n"] == 1
+    second = threading.Thread(target=run)
+    second.start()
+    release.set()
+    first.join(timeout=15)
+    second.join(timeout=15)
+
+    assert not errors, errors
+    assert build_count["n"] == 1
+    assert sorted(r["built"] for r in results) == [False, True]
+    assert db_path.is_file()
+
+
+def test_quality_reviewer_query_fails_closed_without_prewarm(
+    tmp_path: Path, monkeypatch
+) -> None:
+    canonical = tmp_path / "canonical"
+    candidate = tmp_path / "candidate"
+    canonical.mkdir()
+    candidate.mkdir()
+    (canonical / "module.py").write_text(
+        "def canonical_only():\n    return 1\n", encoding="utf-8"
+    )
+    candidate_file = candidate / "module.py"
+    candidate_file.write_text(
+        "def canonical_only():\n    return 1\n\n"
+        "def candidate_only_symbol():\n    return 2\n",
+        encoding="utf-8",
+    )
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    packet = quality_reviewer.build_review_packet(
+        request_id="target-request-1",
+        task_id="TARGET_TASK_1",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={
+            "module.py": hashlib.sha256(candidate_file.read_bytes()).hexdigest()
+        },
+    )
+    packet_path = runtime / "quality_review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _ctx(
+        runtime, repo=candidate, authority_repo=canonical, packet_path=packet_path
+    )
+    worker_tools._CACHE.clear()
+
+    build_calls: list[Path] = []
+
+    def fail_build(_repo, *, db_path, incremental):
+        build_calls.append(db_path)
+        raise AssertionError("runtime reviewer query must never build lazily")
+
+    monkeypatch.setattr(source_graph, "build_index", fail_build)
+
+    result = worker_tools.source_graph_query(
+        ctx, mode="focus", query="candidate_only_symbol", budget=8,
+    )
+
+    assert result["ok"] is False
+    assert "unavailable" in result["reason"]
+    assert build_calls == []
 
 
 def test_review_packet_source_evidence_centers_nf3_late_changed_symbol(

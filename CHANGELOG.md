@@ -6,6 +6,133 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.65] - 2026-08-15
+
+### Fixed
+
+- Copy quality-review overlay files by content without preserving host metadata,
+  avoiding cross-platform chmod and ownership failures in isolated workspaces.
+- Keep VS Code LM reviewer tool history structurally valid through bounded
+  stage/final corrections and enforce request-scoped tool authority before
+  invocation.
+- Persist monotonic NeedFix reopen generations and mint deterministic `-rN`
+  successor task IDs without reusing archived task identities.
+- Fail soft when untrusted provider usage output contains pathologically deep,
+  malformed or undecodable JSON instead of terminating a healthy worker.
+
+### Validation
+
+- Independent correctness, security and code-quality reviews passed for the
+  accepted candidates; focused Python and extension suites, Ruff, mypy and
+  diff checks passed before packaging.
+
+## [0.9.64] - 2026-08-15
+
+### Fixed
+
+- Build distinct packet-bound reviewer Source Graph databases concurrently
+  instead of serializing every reviewer behind one process-global lock.
+- Single-flight only callers targeting the same candidate database and publish
+  verified temporary indexes atomically before reviewer queries can use them.
+- Keep long-running reviewer prewarm reservations alive only while the exact
+  owner PID/start identity matches; unknown, dead or recycled identities fail
+  closed.
+
+### Validation
+
+- 122 reviewer-launch and candidate Source Graph tests pass (1 skipped), with
+  independent correctness, security and code-quality review plus Ruff and
+  diff checks.
+
+## [0.9.63] - 2026-08-14
+
+### Fixed
+
+- Publish one canonical quality-review finding contract across reviewer
+  instructions, the callable MCP JSON schema, normalization and sealed
+  receipts.
+- Require `severity`, `summary` and `evidence` in the generated reviewer
+  tool schema, reject undocumented aliases and report missing keys exactly.
+- Preserve exactly-once review submission counts for both clean reports and
+  authenticated non-empty findings.
+
+### Validation
+
+- 143 reviewer contract/launcher tests and 64 quality-evidence tests pass;
+  changed-file Ruff and diff checks pass.
+
+## [0.9.62] - 2026-08-14
+
+### Fixed
+
+- Bind reviewer-spawn ownership to an exact PID/start-ticks compare-and-swap so
+  a recycled or stale process identity is never accepted as the live reviewer
+  launch.
+- Recover lost-ack and extension-host reload handoff for reviewer spawns with
+  idempotent re-binding instead of leaking a reservation or double-launching.
+- Terminalize live providers only on process/terminal evidence; elapsed or
+  quiet time alone never kills a running model.
+
+### Validation
+
+- Release metadata check for v0.9.62 passes; extension and release-metadata
+  suites pass.
+
+## [0.9.61] - 2026-08-14
+
+### Fixed
+
+- Bound pre-provider quality-review packet preparation independently from
+  provider runtime, so a silent or wedged packet build terminalizes every
+  pid-null reservation truthfully without imposing a model timeout.
+- Publish exact preparation phases and heartbeats under the existing reviewer
+  request identity while keeping status reads bounded and non-blocking.
+- Preserve single-flight packet reuse, distinct reviewer launches and
+  exactly-once failure propagation across all three review lenses.
+
+### Validation
+
+- Reviewer reservation and related launcher/reviewer suites: 47 passed.
+- Ruff, mypy and whitespace checks pass.
+
+## [0.9.60] - 2026-08-14
+
+### Fixed
+
+- Prepare one immutable quality-review packet per target with a per-target
+  single-flight, so correctness, security and code-quality lenses reuse one
+  heavy preparation while retaining distinct reviewer launches.
+- Propagate the preparation owner's exact success or failure to concurrent
+  reviewer waiters without applying elapsed-time death rules to providers.
+- Make the Linux seccomp metadata-broker listener handoff bounded and
+  observable across success, EOF, protocol violation, child error and timeout
+  paths while preserving fail-closed sandbox authority.
+
+### Validation
+
+- Reviewer reservation/process-launch regression suite: 134 passed, 1 skipped.
+- Validation sandbox portability suite: 80 passed.
+- Changed-file Ruff and whitespace checks pass.
+
+## [0.9.59] - 2026-08-14
+
+### Fixed
+
+- Run all extension-owned and stable Codex/Claude/Copilot MCP stdio lanes on
+  the bounded parallel backend instead of the SDK lane that could remain
+  poisoned after a bare `-32602 Invalid request parameters("")` response.
+- Keep long-running tool calls isolated with per-request correlation and a
+  locked response writer, while malformed parameters fail before dispatch and
+  produce a bounded repository-local protocol alert.
+- Recognize the exact live empty-detail `Invalid request parameters("")`
+  shape in the dashboard client's owned-child recovery path.
+
+### Validation
+
+- MCP backend, packaged-runtime and protocol tests: 30 passed.
+- Workspace/Codex configuration and reloadless recovery Node tests pass.
+- Changed-file Ruff and whitespace checks pass.
+
 ## [0.9.58] - 2026-08-14
 
 ### Fixed

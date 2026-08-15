@@ -62,6 +62,9 @@ _PACKAGE_FILES = (
     "repository_state.py",
     "semantic_edit.py",
     "worker_ai_tools_mcp.py",
+    "quality_reviewer.py",
+    "evidence_levels.py",
+    "scoped_audit.py",
 )
 
 

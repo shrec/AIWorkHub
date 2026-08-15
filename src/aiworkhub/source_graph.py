@@ -771,6 +771,25 @@ def _source_graph_extraction_telemetry(
     return selection.to_dict()
 
 
+def _source_graph_unsafe_spawn_context() -> tuple[bool, str]:
+    """Detect a spawn bootstrap that forbids a fresh process pool.
+
+    A process that is itself still bootstrapping under the ``spawn`` start
+    method (for example a quality-review worker pre-warmed by the launcher
+    while its ``__main__`` module is still importing) cannot construct a
+    nested ``ProcessPoolExecutor``: ``multiprocessing`` re-enters spawn
+    preparation and raises ``RuntimeError`` from ``_check_not_importing_main``
+    instead of ``OSError``/``BrokenProcessPool``.  Flagging that context before
+    construction turns the crash into a deterministic sequential extraction.
+
+    Returns ``(unsafe, reason)``; ``reason`` is empty when the context is safe.
+    """
+
+    if getattr(multiprocessing.current_process(), "_inheriting", False):
+        return True, "spawn_bootstrap_in_progress"
+    return False, ""
+
+
 def _source_graph_hash_workers(
     candidate_count: int, candidate_bytes: int = 0,
 ) -> int:
@@ -1665,41 +1684,65 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             for path, rel, file_size, mtime_ns in extraction_candidates
         ]
         if extraction_workers > 1:
-            try:
-                # Spawn is used on every OS.  It avoids forking the live MCP
-                # server (which may already own threads/SQLite handles) and
-                # keeps the worker contract identical on Linux, Windows and
-                # macOS.  Workers only read source and return immutable
-                # extraction records; the parent remains the sole DB writer.
-                with parallelism.worker_pool_scope():
-                    with concurrent.futures.ProcessPoolExecutor(
-                        max_workers=extraction_workers,
-                        mp_context=multiprocessing.get_context("spawn"),
-                    ) as executor:
-                        extracted_candidates = list(
-                            executor.map(
-                                _extract_source_graph_candidate,
-                                process_candidates,
-                                chunksize=1,
-                            )
-                        )
-                extraction_backend = "process_pool"
-            except (OSError, BrokenProcessPool) as exc:
-                # Sandboxes may deny process creation.  No extraction mutates
-                # canonical state, so an all-candidate sequential replay is
-                # safe and the fallback stays visible in the build receipt.
+            unsafe_spawn, unsafe_spawn_reason = _source_graph_unsafe_spawn_context()
+            if unsafe_spawn:
+                # A process still bootstrapping under ``spawn`` (for example a
+                # quality-review worker pre-warmed by the launcher while its
+                # ``__main__`` module is importing) cannot construct a nested
+                # ``ProcessPoolExecutor``: ``multiprocessing`` re-enters spawn
+                # preparation and raises ``RuntimeError`` rather than the
+                # ``OSError``/``BrokenProcessPool`` the normal fallback catches.
+                # Detecting that context before construction turns the crash
+                # into a deterministic sequential extraction, and the reason
+                # stays visible in the build receipt.
                 extraction_workers = 1
                 extraction_backend = "sequential_fallback"
-                extraction_fallback_reason = type(exc).__name__
+                extraction_fallback_reason = unsafe_spawn_reason
                 extraction_telemetry = {
                     **extraction_telemetry,
                     "selected_workers": 1,
-                    "reason": f"fallback_{type(exc).__name__}",
+                    "reason": f"fallback_{unsafe_spawn_reason}",
                 }
                 extracted_candidates = [
                     _extract_source_graph_candidate(candidate)
                     for candidate in process_candidates
                 ]
+            else:
+                try:
+                    # Spawn is used on every OS.  It avoids forking the live MCP
+                    # server (which may already own threads/SQLite handles) and
+                    # keeps the worker contract identical on Linux, Windows and
+                    # macOS.  Workers only read source and return immutable
+                    # extraction records; the parent remains the sole DB writer.
+                    with parallelism.worker_pool_scope():
+                        with concurrent.futures.ProcessPoolExecutor(
+                            max_workers=extraction_workers,
+                            mp_context=multiprocessing.get_context("spawn"),
+                        ) as executor:
+                            extracted_candidates = list(
+                                executor.map(
+                                    _extract_source_graph_candidate,
+                                    process_candidates,
+                                    chunksize=1,
+                                )
+                            )
+                    extraction_backend = "process_pool"
+                except (OSError, BrokenProcessPool) as exc:
+                    # Sandboxes may deny process creation.  No extraction mutates
+                    # canonical state, so an all-candidate sequential replay is
+                    # safe and the fallback stays visible in the build receipt.
+                    extraction_workers = 1
+                    extraction_backend = "sequential_fallback"
+                    extraction_fallback_reason = type(exc).__name__
+                    extraction_telemetry = {
+                        **extraction_telemetry,
+                        "selected_workers": 1,
+                        "reason": f"fallback_{type(exc).__name__}",
+                    }
+                    extracted_candidates = [
+                        _extract_source_graph_candidate(candidate)
+                        for candidate in process_candidates
+                    ]
         else:
             extracted_candidates = [
                 _extract_source_graph_candidate(candidate)

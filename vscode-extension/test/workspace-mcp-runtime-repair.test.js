@@ -40,6 +40,7 @@ try {
 const {
   repairWorkspaceMcpConfigObject,
   repairClaudeMcpConfigObject,
+  portableWorkspaceMcpCommand,
   ensureCodexMcpRegistrationTomlText,
 } = extensionModule.__testInternals;
 
@@ -51,6 +52,7 @@ const {
   assert.strictEqual(result.changed, true);
   assert.strictEqual(result.document.servers.AIWorkHub.command, "python3");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_REPO, "/repo/fresh");
+  assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_MCP_STDIO_BACKEND, "stdlib");
 }
 
 {
@@ -60,6 +62,7 @@ const {
   );
   assert.strictEqual(result.changed, true);
   assert.deepStrictEqual(result.document.mcpServers.AIWorkHub.args, ["-m", "aiworkhub.server"]);
+  assert.strictEqual(result.document.mcpServers.AIWorkHub.env.AIWORKHUB_MCP_STDIO_BACKEND, "stdlib");
 }
 
 {
@@ -104,12 +107,24 @@ const {
   assert.strictEqual(result.changed, true);
   assert.strictEqual(result.document.servers.Perplexity, untouched);
   assert.deepStrictEqual(result.document.servers.AIWorkHub.args, ["-m", "aiworkhub.server"]);
-  assert.strictEqual(result.document.servers.AIWorkHub.command, "/repo/current/.venv/bin/python");
+  assert.strictEqual(result.document.servers.AIWorkHub.command, "${workspaceFolder}/.venv/bin/python");
   assert.strictEqual(result.document.servers.AIWorkHub.env.PYTHONPATH, "/extensions/shrec.aiworkhub-0.6.49/runtime");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_REPO, "/repo/current");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_REPO_ROOT, "/repo/current");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_ALLOW_WRITES, "1");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_ALLOW_LAUNCH, "1");
+  assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_MCP_STDIO_BACKEND, "stdlib");
+}
+
+{
+  assert.strictEqual(
+    portableWorkspaceMcpCommand("/repo/current/.venv/bin/python3", "/repo/current"),
+    "${workspaceFolder}/.venv/bin/python3",
+  );
+  assert.strictEqual(
+    portableWorkspaceMcpCommand("/opt/shared/python3", "/repo/current"),
+    "/opt/shared/python3",
+  );
 }
 
 {
@@ -124,6 +139,7 @@ const {
           AIWORKHUB_REPO_ROOT: "C:\\src\\project",
           AIWORKHUB_ALLOW_WRITES: "1",
           AIWORKHUB_ALLOW_LAUNCH: "1",
+          AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
         },
         type: "stdio",
       },

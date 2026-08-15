@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import get_args, get_type_hints
 
 import pytest
 
@@ -382,3 +384,52 @@ def test_quality_review_prewarm_fails_before_publish_on_wrong_hash(
     ):
         worker_tools.prewarm_quality_review_source_graph(packet_path, repo=candidate)
     assert not list(runtime.glob("candidate_source_graph_*.sqlite"))
+
+
+def test_registered_quality_review_schema_exposes_canonical_finding_shape(
+    tmp_path: Path,
+) -> None:
+    """The generated quality_review_submit schema consumes the one typed model."""
+    repo = tmp_path / "repo"
+    authority = tmp_path / "authority"
+    runtime = tmp_path / "runtime"
+    repo.mkdir()
+    authority.mkdir()
+    ctx = _ctx(
+        runtime,
+        repo=repo,
+        authority_repo=authority,
+        packet_path=None,
+        task_id="SCHEMA_TASK",
+    )
+    server = worker_tools.build_server(ctx)
+
+    if hasattr(server, "_tools"):  # stdlib fallback without mcp installed
+        function = server._tools["aiworkhub_worker_quality_review_submit"]
+        model = get_args(get_type_hints(function)["findings"])[0]
+        assert model is quality_reviewer.QualityReviewFinding
+        assert frozenset(model.__annotations__) == (
+            quality_reviewer.QUALITY_REVIEW_FINDING_INPUT_KEYS
+        )
+        assert frozenset(model.__required_keys__) == (
+            quality_reviewer.QUALITY_REVIEW_FINDING_INPUT_REQUIRED_KEYS
+        )
+        return
+
+    for tool in asyncio.run(server.list_tools()):
+        if tool.name != "aiworkhub_worker_quality_review_submit":
+            continue
+        schema = getattr(tool, "inputSchema", None)
+        if schema is None:
+            schema = getattr(tool, "parameters", None).model_json_schema()
+        items = schema["properties"]["findings"]["items"]
+        if "$ref" in items:
+            items = schema["$defs"][items["$ref"].rsplit("/", 1)[-1]]
+        assert frozenset(items.get("required", ())) == (
+            quality_reviewer.QUALITY_REVIEW_FINDING_INPUT_REQUIRED_KEYS
+        )
+        assert frozenset(items.get("properties", {})) == (
+            quality_reviewer.QUALITY_REVIEW_FINDING_INPUT_KEYS
+        )
+        return
+    pytest.fail("aiworkhub_worker_quality_review_submit not registered")

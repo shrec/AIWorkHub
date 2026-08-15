@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.58";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.65";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -440,7 +440,8 @@ function isPoisonedInvalidParamsError(error) {
     && !(typeof detail === "object" && Object.keys(detail).length === 0);
   if (hasDetail) return false;
   const message = String(error.message || "").trim().toLowerCase();
-  return message === "" || message === "invalid request parameters" || message === "invalid params";
+  return message === "" || message === "invalid request parameters" || message === "invalid params"
+    || message === 'invalid request parameters("")';
 }
 
 // ── Active repository resolution ──────────────────────────────────────────
@@ -1816,6 +1817,7 @@ class McpStdioClient {
     const env = {
       ...process.env,
       PYTHONIOENCODING: "utf-8",
+      AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
       AIWORKHUB_REPO_ROOT: root,
       AIWORKHUB_REPO: root,
       AIWORKHUB_REPO_ID: this.repositoryIdentity.repoId,
@@ -4052,6 +4054,8 @@ async function runVscodeLmTextProtocol(
   let finalizationTurns = 0;
   let forceFinal = false;
   let forceFinalViolations = 0;
+  let reviewSubmitForced = false;
+  let reviewSubmitViolations = 0;
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
   const protocolTrace = [];
@@ -4062,12 +4066,8 @@ async function runVscodeLmTextProtocol(
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
     assertRequestActive();
     if (request.request_kind === "quality_review" &&
-        postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS) {
-      throw vscodeLmProtocolFailure(
-        "vscode_lm_quality_review_submit_required",
-        protocolTrace,
-        lastProtocolPreview,
-      );
+        postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS && !reviewSubmitForced) {
+      reviewSubmitForced = true;
     }
     if (request.request_kind !== "quality_review" &&
         sourceGraphAcknowledged && postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
@@ -4223,6 +4223,34 @@ async function runVscodeLmTextProtocol(
     );
     const permitted = availableTools.find((tool) => tool.name === envelope.name);
     if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(envelope.name || "")}`);
+    // NF-2026-00229: quality-review forced-submit boundary — after the initial
+    // Source Graph work turns, a non-submit tool request receives one corrective,
+    // non-executing result; a repeated violation terminalizes truthfully.
+    if (request.request_kind === "quality_review" && reviewSubmitForced &&
+        envelope.name !== "aiworkhub_worker_quality_review_submit") {
+      protocolTrace.push({
+        turn,
+        phase: "review_submit",
+        outcome: "non_submit_tool_rejected",
+        rejectedTool: envelope.name,
+      });
+      if (reviewSubmitViolations >= 1) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_quality_review_submit_required",
+          protocolTrace,
+          lastProtocolPreview,
+        );
+      }
+      reviewSubmitViolations += 1;
+      messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+      messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
+        schema_id: VSCODE_LM_TOOL_RESULT_SCHEMA,
+        name: envelope.name,
+        result: { ok: false, error: "vscode_lm_quality_review_submit_required", corrective: true },
+        instruction: "The review work phase is complete. Call aiworkhub_worker_quality_review_submit now with your findings.",
+      })));
+      continue;
+    }
     if (!envelope.input || typeof envelope.input !== "object" || Array.isArray(envelope.input)) {
       const reason = Array.isArray(envelope.input)
         ? "tool_input_is_array"
@@ -4361,6 +4389,8 @@ async function runVscodeLmAgent(
   let finalizationTurns = 0;
   let forceFinal = false;
   let forceFinalViolations = 0;
+  let reviewSubmitForced = false;
+  let reviewSubmitViolations = 0;
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
   let stagedEditViolations = 0;
@@ -4372,12 +4402,8 @@ async function runVscodeLmAgent(
   let wrongToolViolations = 0;
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
     assertRequestActive();
-    if (qualityReview && postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS) {
-      throw vscodeLmProtocolFailure(
-        "vscode_lm_quality_review_submit_required",
-        protocolTrace,
-        lastProtocolPreview,
-      );
+    if (qualityReview && postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS && !reviewSubmitForced) {
+      reviewSubmitForced = true;
     }
     if (sourceGraphAcknowledged &&
         (toolTurns >= VSCODE_LM_MAX_TOOL_TURNS || postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) &&
@@ -4577,6 +4603,37 @@ async function runVscodeLmAgent(
         `The previous turn contained one or more tool calls that are not permitted for this request role. ` +
         `Allowed tool names: ${JSON.stringify([...permittedToolNames])}. ` +
         `Only call tools from this list.`,
+      ));
+      continue;
+    }
+    // NF-2026-00229: quality-review forced-submit boundary — after the initial
+    // Source Graph work turns, a non-submit tool call receives one corrective,
+    // non-executing result (paired by callId); a repeated violation terminalizes.
+    if (qualityReview && reviewSubmitForced &&
+        calls.some((call) => call.name !== "aiworkhub_worker_quality_review_submit")) {
+      protocolTrace.push({
+        turn,
+        phase: "review_submit",
+        outcome: "non_submit_tool_rejected",
+        rejectedCallIds: calls
+          .filter((c) => c.name !== "aiworkhub_worker_quality_review_submit")
+          .map((c) => c.callId),
+      });
+      if (reviewSubmitViolations >= 1) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_quality_review_submit_required",
+          protocolTrace,
+          lastProtocolPreview,
+        );
+      }
+      reviewSubmitViolations += 1;
+      messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
+      messages.push(vscode.LanguageModelChatMessage.User(
+        calls.map((call) => languageModelToolResultPart(call.callId, {
+          ok: false,
+          error: "vscode_lm_quality_review_submit_required",
+          corrective: true,
+        })),
       ));
       continue;
     }
@@ -5587,6 +5644,7 @@ function ensureCodexMcpRegistrationTomlText(text, runtimeDir, python) {
     "",
     "[mcp_servers.aiworkhub.env]",
     `PYTHONPATH = ${tomlQuoted(runtimeDir)}`,
+    'AIWORKHUB_MCP_STDIO_BACKEND = "stdlib"',
     'AIWORKHUB_ALLOW_WRITES = "1"',
     'AIWORKHUB_ALLOW_LAUNCH = "1"',
     "",
@@ -5689,9 +5747,11 @@ function materializeStableMcpLauncher(context) {
   const launcher = path.join(binDir, "aiworkhub-mcp-server.py");
   const script = `#!/usr/bin/env python3
 import json
+import os
 import sys
 from pathlib import Path
 
+os.environ["AIWORKHUB_MCP_STDIO_BACKEND"] = "stdlib"
 root = Path(__file__).resolve().parents[1]
 current = json.loads((root / "runtime" / "current.json").read_text(encoding="utf-8"))
 runtime = Path(current["runtime_dir"])
@@ -6348,6 +6408,16 @@ async function ensureCodexCallbackMuxConfigured(context, options = {}) {
  *  source checkout in PYTHONPATH can fail even while the dashboard is live.
  *  Keep the registration repository-scoped, but make code authority come from
  *  this extension's bundled runtime on every supported host OS. */
+function portableWorkspaceMcpCommand(command, repoRoot) {
+  const rawCommand = String(command || "");
+  if (!rawCommand || !path.isAbsolute(rawCommand)) return rawCommand;
+  const relative = path.relative(repoRoot, rawCommand);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    return rawCommand;
+  }
+  return `${"${workspaceFolder}"}/${relative.split(path.sep).join("/")}`;
+}
+
 function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, python) {
   if (!document || typeof document !== "object" || Array.isArray(document)) {
     return { document, changed: false };
@@ -6356,6 +6426,7 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
     document[containerKey] = {};
   }
   const servers = document[containerKey];
+  const portableCommand = portableWorkspaceMcpCommand(python.command, repoRoot);
   let changed = false;
   let found = false;
   for (const [name, value] of Object.entries(servers)) {
@@ -6370,6 +6441,7 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
       PYTHONPATH: runtimeDir,
       AIWORKHUB_REPO: repoRoot,
       AIWORKHUB_REPO_ROOT: repoRoot,
+      AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
     };
     if (!Object.prototype.hasOwnProperty.call(nextEnv, "AIWORKHUB_ALLOW_WRITES")) {
       nextEnv.AIWORKHUB_ALLOW_WRITES = "1";
@@ -6377,7 +6449,7 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
     if (!Object.prototype.hasOwnProperty.call(nextEnv, "AIWORKHUB_ALLOW_LAUNCH")) {
       nextEnv.AIWORKHUB_ALLOW_LAUNCH = "1";
     }
-    const next = { ...value, command: python.command, args: nextArgs, env: nextEnv, type: "stdio" };
+    const next = { ...value, command: portableCommand, args: nextArgs, env: nextEnv, type: "stdio" };
     if (JSON.stringify(next) !== JSON.stringify(value)) {
       servers[name] = next;
       changed = true;
@@ -6385,12 +6457,13 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
   }
   if (!found) {
     servers.AIWorkHub = {
-      command: python.command,
+      command: portableCommand,
       args: [...(Array.isArray(python.argsPrefix) ? python.argsPrefix : []), "-m", "aiworkhub.server"],
       env: {
         PYTHONPATH: runtimeDir,
         AIWORKHUB_REPO: repoRoot,
         AIWORKHUB_REPO_ROOT: repoRoot,
+        AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
         AIWORKHUB_ALLOW_WRITES: "1",
         AIWORKHUB_ALLOW_LAUNCH: "1",
       },
@@ -9143,6 +9216,7 @@ module.exports = {
     migrateCodexConfigTomlRuntimePath,
     repairWorkspaceMcpConfigObject,
     repairClaudeMcpConfigObject,
+    portableWorkspaceMcpCommand,
     ensureWorkspaceMcpConfigsRepaired,
     ensureCodexMcpRegistrationTomlText,
     ensureCodexMcpRegistered,

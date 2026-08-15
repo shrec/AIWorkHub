@@ -3643,3 +3643,230 @@ def test_bounded_review_submit_rejects_provider_spoof_in_receipt() -> None:
             observed_terminal_state="review_ready",
             audit_verified=True,
         )
+
+
+def _reserve_starting(
+    manager,
+    request_id: str,
+    phase: str | None = None,
+    *,
+    expires_at_epoch: float | None = None,
+) -> None:
+    event = {
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "quality_review",
+        "adapter_id": "claude_cli",
+        "state": "starting",
+        "reservation_expires_at_epoch": (
+            time.time() + 600
+            if expires_at_epoch is None
+            else expires_at_epoch
+        ),
+        "owner_pid": os.getpid(),
+        "owner_pid_start_ticks": process_launcher._pid_start_ticks(os.getpid()),
+    }
+    if phase is not None:
+        event["preparation_phase"] = phase
+    manager._append_event(event)
+
+
+def test_quality_review_prewarm_liveness_tracks_started_phase(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "req-prewarm-live"
+    _reserve_starting(
+        manager, request_id, "reviewer_source_graph_prewarm_started"
+    )
+
+    assert manager._reviewer_source_graph_prewarm_live(request_id) is True
+
+    manager._publish_reviewer_progress(
+        request_id, "reviewer_source_graph_prewarm_complete"
+    )
+    assert manager._reviewer_source_graph_prewarm_live(request_id) is False
+
+
+def test_quality_review_launch_owner_join_keeps_live_prewarm(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "req-prewarm-live"
+    _reserve_starting(
+        manager, request_id, "reviewer_source_graph_prewarm_started"
+    )
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_QUALITY_REVIEW_LAUNCH_OWNER_SECONDS",
+        0.05,
+    )
+
+    def owner() -> None:
+        time.sleep(0.25)
+
+    launcher = threading.Thread(target=owner)
+    launcher.start()
+
+    outcome = manager._reviewer_launch_owner_join(launcher, request_id)
+    launcher.join(timeout=5)
+
+    assert outcome == "completed"
+
+
+def test_quality_review_launch_owner_join_timeouts_without_live_prewarm(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "req-prewarm-stale"
+    _reserve_starting(manager, request_id, "packet_prepared")
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_QUALITY_REVIEW_LAUNCH_OWNER_SECONDS",
+        0.05,
+    )
+
+    stop = threading.Event()
+
+    def owner() -> None:
+        while not stop.is_set():
+            time.sleep(0.01)
+
+    launcher = threading.Thread(target=owner, daemon=True)
+    launcher.start()
+
+    outcome = manager._reviewer_launch_owner_join(launcher, request_id)
+    stop.set()
+    launcher.join(timeout=5)
+
+    assert outcome == "timeout"
+
+
+def test_quality_review_prewarm_reconciliation_defers_live_owned_prewarm(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    live_request = "req-live-prewarm-expired"
+    _reserve_starting(
+        manager,
+        live_request,
+        "reviewer_source_graph_prewarm_started",
+        expires_at_epoch=time.time() - 60,
+    )
+    unrelated_request = "req-unrelated-stale"
+    manager._append_event({
+        "request_id": unrelated_request,
+        "task_id": "TASK_UNRELATED",
+        "runner": "claude_worker_b1",
+        "topic": "quality_review",
+        "adapter_id": "claude_cli",
+        "state": "starting",
+        "reservation_expires_at_epoch": time.time() - 60,
+    })
+
+    reconciled = manager._reconcile_expired_starting_reservations()
+
+    assert reconciled == 1
+    live_latest = manager._latest_by_request()[live_request]
+    assert live_latest.get("state") == "starting"
+    assert (
+        live_latest.get("preparation_phase")
+        == "reviewer_source_graph_prewarm_started"
+    )
+    unrelated_latest = manager._latest_by_request()[unrelated_request]
+    assert unrelated_latest.get("state") == "blocked"
+    assert unrelated_latest.get("blocked_reason") == "reservation_expired"
+
+
+def test_quality_review_prewarm_reconciliation_fails_closed_without_live_owner(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    cases = {
+        "req-dead-owner": {
+            "owner_pid": 2**22 + 12345,
+            "owner_pid_start_ticks": 1,
+        },
+        "req-mismatched-owner": {
+            "owner_pid": os.getpid(),
+            "owner_pid_start_ticks": 1,
+        },
+        "req-missing-owner": {},
+    }
+    for request_id, extra in cases.items():
+        event = {
+            "request_id": request_id,
+            "task_id": "TASK_B1",
+            "runner": "claude_worker_b1",
+            "topic": "quality_review",
+            "adapter_id": "claude_cli",
+            "state": "starting",
+            "reservation_expires_at_epoch": time.time() - 60,
+            "preparation_phase": "reviewer_source_graph_prewarm_started",
+        }
+        event.update(extra)
+        manager._append_event(event)
+
+    reconciled = manager._reconcile_expired_starting_reservations()
+
+    assert reconciled == 3
+    for request_id in cases:
+        latest = manager._latest_by_request()[request_id]
+        assert latest.get("state") == "blocked"
+        assert latest.get("blocked_reason") == "reservation_expired"
+
+
+def test_quality_review_prewarm_live_fails_closed_on_unknown_identity(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "req-prewarm-unknown"
+    # A positive owner pid whose start-ticks are missing yields UNKNOWN
+    # identity evidence.  Live prewarm ownership requires an exact MATCH, so
+    # UNKNOWN must fail closed rather than be treated as a live owned build.
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "quality_review",
+        "adapter_id": "claude_cli",
+        "state": "starting",
+        "reservation_expires_at_epoch": time.time() - 60,
+        "preparation_phase": "reviewer_source_graph_prewarm_started",
+        "owner_pid": os.getpid(),
+        "owner_pid_start_ticks": None,
+    })
+
+    assert manager._reviewer_source_graph_prewarm_live(request_id) is False
+
+    reconciled = manager._reconcile_expired_starting_reservations()
+
+    assert reconciled == 1
+    latest = manager._latest_by_request()[request_id]
+    assert latest.get("state") == "blocked"
+    assert latest.get("blocked_reason") == "reservation_expired"

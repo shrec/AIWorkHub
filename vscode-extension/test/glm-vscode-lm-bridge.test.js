@@ -2715,6 +2715,229 @@ async function nf169AuthorityRejection() {
 }
 
 
+async function nf202600229QualityReviewSubmitBoundaryChecks() {
+  const reviewRequest = (requestId) => ({
+    requestId,
+    request_kind: "quality_review",
+    prompt: "bounded review",
+    allowedWrites: [],
+    path_contracts: {},
+  });
+  const sgRequestText = (query) => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_worker_source_graph_query",
+    input: { mode: "focus", query, workflow_stage: "review" },
+  });
+  const submitRequestText = () => JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_worker_quality_review_submit",
+    input: { packet_sha256: "e".repeat(64), lens: "correctness", findings: [] },
+  });
+  const sealedReview = (submissionId) => ({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: `quality review submitted:${submissionId}`,
+    edits: [],
+    creates: [],
+  });
+  const sgInput = (query) => ({ mode: "focus", query, workflow_stage: "review" });
+  const submitInput = () => ({ packet_sha256: "e".repeat(64), lens: "correctness", findings: [] });
+
+  // NF-2026-00229 (GLM text path): after three Source Graph work turns, one
+  // more Source Graph request receives a single corrective, non-executing
+  // result; the next authenticated submit succeeds exactly once.
+  const textCalls = [];
+  let textTurn = 0;
+  const textModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      textTurn += 1;
+      const value = textTurn <= 4 ? sgRequestText(`review-${textTurn}`) : submitRequestText();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const textResult = await internals.runVscodeLmTextProtocol(
+    textModel,
+    reviewRequest("f".repeat(32)),
+    undefined,
+    async (call) => {
+      textCalls.push(call.name);
+      return call.name === "aiworkhub_worker_quality_review_submit"
+        ? { ok: true, durable: true, submission_id: "a".repeat(64) }
+        : { ok: true, content: "graph" };
+    },
+  );
+  assert.deepStrictEqual(JSON.parse(textResult), sealedReview("a".repeat(64)));
+  assert.deepStrictEqual(textCalls, [
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_quality_review_submit",
+  ]);
+  assert.strictEqual(textTurn, 5);
+
+  // NF-2026-00229 (GLM text path): a repeated non-submit violation terminalizes
+  // with bounded vscode_lm_quality_review_submit_required diagnostics.
+  const repeatCalls = [];
+  let repeatTurn = 0;
+  const repeatModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      repeatTurn += 1;
+      const value = sgRequestText(`repeat-${repeatTurn}`);
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(
+      repeatModel,
+      reviewRequest("g".repeat(32)),
+      undefined,
+      async (call) => { repeatCalls.push(call.name); return { ok: true, content: "graph" }; },
+    ),
+    /vscode_lm_quality_review_submit_required/,
+  );
+  assert.strictEqual(repeatTurn, 5);
+  assert.deepStrictEqual(repeatCalls, [
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+  ]);
+
+  // NF-2026-00229 (GLM native path): one corrective, non-executing tool turn
+  // (paired by callId) followed by a sealed submit.
+  const nativeCalls = [];
+  let nativeTurn = 0;
+  const nativeModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async () => {
+      nativeTurn += 1;
+      const part = nativeTurn <= 4
+        ? { callId: `sg-${nativeTurn}`, name: "aiworkhub_worker_source_graph_query", input: sgInput(`review-${nativeTurn}`) }
+        : { callId: "submit-final", name: "aiworkhub_worker_quality_review_submit", input: submitInput() };
+      return { stream: (async function* stream() { yield part; }()) };
+    },
+  };
+  const nativeResult = await internals.runVscodeLmAgent(
+    nativeModel,
+    reviewRequest("a".repeat(32)),
+    undefined,
+    async (call) => {
+      nativeCalls.push(call.name);
+      return call.name === "aiworkhub_worker_quality_review_submit"
+        ? { ok: true, durable: true, submission_id: "b".repeat(64) }
+        : { ok: true, content: "graph" };
+    },
+  );
+  assert.deepStrictEqual(JSON.parse(nativeResult), sealedReview("b".repeat(64)));
+  assert.deepStrictEqual(nativeCalls, [
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_quality_review_submit",
+  ]);
+  assert.strictEqual(nativeTurn, 5);
+
+  // NF-2026-00229 (GLM native path): a repeated non-submit violation fails
+  // truthfully with no infinite loop.
+  const nativeRepeatCalls = [];
+  let nativeRepeatTurn = 0;
+  const nativeRepeatModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async () => {
+      nativeRepeatTurn += 1;
+      return {
+        stream: (async function* stream() {
+          yield { callId: `sg-${nativeRepeatTurn}`, name: "aiworkhub_worker_source_graph_query", input: sgInput(`review-${nativeRepeatTurn}`) };
+        }()),
+      };
+    },
+  };
+  await assert.rejects(
+    internals.runVscodeLmAgent(
+      nativeRepeatModel,
+      reviewRequest("b".repeat(32)),
+      undefined,
+      async (call) => { nativeRepeatCalls.push(call.name); return { ok: true, content: "graph" }; },
+    ),
+    /vscode_lm_quality_review_submit_required/,
+  );
+  assert.strictEqual(nativeRepeatTurn, 5);
+  assert.deepStrictEqual(nativeRepeatCalls, [
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+  ]);
+
+  // NF-2026-00229 (DeepSeek native path): the same phase truth holds on the
+  // DeepSeek-compatible protocol route.
+  const dsCalls = [];
+  let dsTurn = 0;
+  const dsModel = {
+    ...deepseek,
+    sendRequest: async () => {
+      dsTurn += 1;
+      const part = dsTurn <= 4
+        ? { callId: `sg-${dsTurn}`, name: "aiworkhub_worker_source_graph_query", input: sgInput(`review-${dsTurn}`) }
+        : { callId: "submit-final", name: "aiworkhub_worker_quality_review_submit", input: submitInput() };
+      return { stream: (async function* stream() { yield part; }()) };
+    },
+  };
+  const dsResult = await internals.runVscodeLmAgent(
+    dsModel,
+    reviewRequest("d".repeat(32)),
+    undefined,
+    async (call) => {
+      dsCalls.push(call.name);
+      return call.name === "aiworkhub_worker_quality_review_submit"
+        ? { ok: true, durable: true, submission_id: "c".repeat(64) }
+        : { ok: true, content: "graph" };
+    },
+  );
+  assert.deepStrictEqual(JSON.parse(dsResult), sealedReview("c".repeat(64)));
+  assert.deepStrictEqual(dsCalls, [
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_quality_review_submit",
+  ]);
+  assert.strictEqual(dsTurn, 5);
+
+  // NF-2026-00229: a Source Graph mcp_unavailable result is recoverable tool
+  // evidence, never terminalized and never turned into a candidate finding —
+  // all three work turns fail with mcp_unavailable yet the review still seals.
+  const mcpCalls = [];
+  let mcpTurn = 0;
+  const mcpModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async () => {
+      mcpTurn += 1;
+      const part = mcpTurn <= 3
+        ? { callId: `sg-${mcpTurn}`, name: "aiworkhub_worker_source_graph_query", input: sgInput(`review-${mcpTurn}`) }
+        : { callId: "submit-final", name: "aiworkhub_worker_quality_review_submit", input: submitInput() };
+      return { stream: (async function* stream() { yield part; }()) };
+    },
+  };
+  const mcpResult = await internals.runVscodeLmAgent(
+    mcpModel,
+    reviewRequest("e".repeat(32)),
+    undefined,
+    async (call) => {
+      mcpCalls.push(call.name);
+      if (call.name === "aiworkhub_worker_quality_review_submit") {
+        return { ok: true, durable: true, submission_id: "d".repeat(64) };
+      }
+      throw new Error("mcp_unavailable");
+    },
+  );
+  assert.deepStrictEqual(JSON.parse(mcpResult), sealedReview("d".repeat(64)));
+  assert.deepStrictEqual(mcpCalls, [
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_quality_review_submit",
+  ]);
+}
+
 async function main() {
   const schema = internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA;
   const allowed = ["src/*.py", "tests/*.py"];
@@ -2776,6 +2999,7 @@ async function main() {
   await nf168ValidateProviderHistoryUnit();
   await nf168ForceFinalTextProtocol();
   await nf169ContextlessWorkerNative();
+  await nf202600229QualityReviewSubmitBoundaryChecks();
 }
 async function cancellationToolBoundaryChecks() {
   const toolEnvelope = JSON.stringify({

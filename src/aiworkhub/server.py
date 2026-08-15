@@ -20,6 +20,8 @@ from .tool_recovery import unknown_tool_message
 
 _MCP_SDK_AVAILABLE = True
 try:
+    if os.environ.get("AIWORKHUB_MCP_STDIO_BACKEND", "").strip().lower() == "stdlib":
+        raise ModuleNotFoundError("AIWorkHub bounded stdlib MCP backend selected")
     from mcp.server.fastmcp import FastMCP
 except ModuleNotFoundError:
     _MCP_SDK_AVAILABLE = False

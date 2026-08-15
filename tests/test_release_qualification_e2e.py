@@ -240,7 +240,9 @@ def test_fresh_install_task_context_callback_reload_and_repo_isolation(tmp_path,
         batch = callback_store.claim_pending_callback_batch(callback_db, provider="codex")
         assert batch is not None
         assert [member["task_id"] for member in batch["members"]] == [TASK_ID]
-        callback_store.mark_batch_delivered(callback_db, batch["batch_id"])
+        callback_store.mark_batch_delivered(
+            callback_db, batch["batch_id"], batch["lease_id"]
+        )
         callback_db.commit()
     finally:
         callback_db.close()

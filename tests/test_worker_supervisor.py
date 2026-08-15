@@ -607,3 +607,59 @@ def test_posix_worker_spawn_kwargs_are_platform_specific() -> None:
     assert linux["start_new_session"] is True
     assert linux["preexec_fn"] is worker_supervisor._die_with_supervisor
     assert macos == {"start_new_session": True}
+
+
+def test_usage_total_from_output_fails_soft_on_deep_recursion(tmp_path: Path) -> None:
+    output = tmp_path / "stdout.log"
+    output.write_text("[" * 20000, encoding="utf-8")
+
+    assert worker_supervisor._usage_total_from_output(output, "codex_cli") is None
+
+
+def test_usage_total_from_output_fails_soft_on_oversized_line(tmp_path: Path) -> None:
+    output = tmp_path / "stdout.log"
+    output.write_text(
+        json.dumps({"usage": {"input_tokens": 1}})
+        + ("x" * worker_supervisor.MAX_USAGE_SCAN_BYTES),
+        encoding="utf-8",
+    )
+
+    assert worker_supervisor._usage_total_from_output(output, "codex_cli") is None
+
+
+def test_usage_total_from_output_still_recognizes_normal_usage(tmp_path: Path) -> None:
+    output = tmp_path / "stdout.log"
+    output.write_text(
+        json.dumps({"usage": {"input_tokens": 9, "output_tokens": 4}}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert worker_supervisor._usage_total_from_output(output, "codex_cli") == 13
+
+
+def test_latest_progress_events_fail_soft_on_deep_recursion(tmp_path: Path) -> None:
+    output = tmp_path / "stdout.log"
+    output.write_text(
+        json.dumps({"type": "aiworkhub_progress", "sequence": 1, "phase": "tool_turn"})
+        + "\n"
+        + "[" * 20000
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert worker_supervisor._latest_progress_events(output) == (
+        {"sequence": 1, "phase": "tool_turn"},
+        {"sequence": 1, "phase": "tool_turn"},
+    )
+
+
+def test_supervisor_survives_deeply_nested_stdout_line(tmp_path: Path) -> None:
+    script = "print('[' * 20000)"
+    spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
+
+    result = _run_supervisor(spec_path)
+
+    assert result.returncode == 0, result.stderr.decode()
+    status = _read_status(Path(spec["status_path"]))
+    assert status["state"] == "exited"
+    assert status["exit_code"] == 0

@@ -1,5 +1,84 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.65 — 2026-08-15
+
+### Fixed
+
+- Preserve exact VS Code LM tool-call/result history across bounded reviewer
+  stage and final corrections.
+- Reject cross-role tool calls before callbacks or invocation and recover the
+  reviewer submit phase without widening manager/worker authority.
+- Use content-only review overlay copies for portable Linux, macOS and Windows
+  isolated workspaces.
+- Keep reopened NeedFix generations and malformed provider usage evidence
+  fail-closed without killing otherwise healthy workers.
+
+## 0.9.64 — 2026-08-15
+
+### Fixed
+
+- Run independent reviewer Source Graph prewarms concurrently while retaining
+  exact per-candidate single-flight and atomic verified publication.
+- Prevent elapsed reservation expiry from terminating a live exact-owned
+  prewarm; unknown, dead and recycled PID identities remain fail-closed.
+- Keep reviewer runtime queries read-only and free of lazy index builds.
+
+## 0.9.63 — 2026-08-14
+
+### Fixed
+
+- Unify reviewer prompts, callable MCP JSON schema, validation and durable
+  receipts around one canonical finding object.
+- Require `severity`, `summary` and `evidence`, reject undocumented aliases
+  and return exact missing-key errors instead of a guessing loop.
+- Keep clean and non-empty reviewer reports on the same exactly-once
+  finalization path.
+
+## 0.9.62 — 2026-08-14
+
+### Fixed
+
+- Bind reviewer-spawn ownership to an exact PID/start-ticks compare-and-swap so
+  a recycled process identity is never accepted as the live reviewer launch.
+- Recover lost-ack and extension-host reload handoff idempotently without
+  leaking a reservation or double-launching a reviewer.
+- Terminalize live providers only on process/terminal evidence, never on
+  elapsed or quiet time.
+
+## 0.9.61 — 2026-08-14
+
+### Fixed
+
+- Surface live reviewer preparation phases without blocking independent status
+  reads while an expensive packet is built.
+- Bound only the pid-null pre-provider preparation stage and preserve the
+  no-elapsed-timeout contract once a model process exists.
+- Terminalize all single-flight waiters exactly once when packet preparation
+  cannot complete.
+
+## 0.9.60 — 2026-08-14
+
+### Fixed
+
+- Coalesce concurrent correctness, security and code-quality reviewer packet
+  preparation per exact target while keeping three distinct review launches.
+- Keep reviewer launch handlers responsive and propagate the single
+  preparation owner's truthful result to every waiting lens.
+- Harden the Linux validation metadata-broker listener handoff with bounded,
+  fail-closed diagnostics for hosted CI and local secure sandboxes.
+
+## 0.9.59 — 2026-08-14
+
+### Fixed
+
+- Use the bounded parallel stdio backend for dashboard, stable Codex and
+  repaired Claude/Copilot MCP registrations so one long request cannot block
+  independent status/read calls.
+- Reject malformed empty-string parameters before tool dispatch with durable
+  redacted telemetry, avoiding the persistent bare `-32602` connection state.
+- Recover the exact owned dashboard MCP child after the live
+  `Invalid request parameters("")` poison signature repeats.
+
 ## 0.9.58 — 2026-08-14
 
 ### Fixed

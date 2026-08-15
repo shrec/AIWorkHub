@@ -5463,6 +5463,7 @@ def claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
                         conn,
                         str(batch["batch_id"]),
                         "callback_belongs_to_different_claude_session",
+                        str(batch["lease_id"]),
                         delay_seconds=30.0,
                     )
                 finally:
@@ -6028,6 +6029,11 @@ def needfix_convert(
     fails closed instead of silently committing a different plan.
     Idempotent already-task_created retries short-circuit before this
     enforcement, preserving reconciliation without a new create.
+
+    The store mints a deterministic, collision-free ``task_id`` from the
+    NeedFix's current ``reopen_generation``: ``needfix-{NF-ID}`` for the
+    original conversion and ``needfix-{NF-ID}-rN`` after the Nth verified
+    reopen of an archived superseded task link.
     """
     ns = _needfix_store_module()
 
@@ -6108,7 +6114,11 @@ def needfix_link_existing_task(needfix_id: str, existing_task_id: str) -> dict[s
 def needfix_reopen_superseded_task_link(
     needfix_id: str, reason: str
 ) -> dict[str, Any]:
-    """Manager-only reconciliation of an archived superseded task link."""
+    """Manager-only reconciliation of an archived superseded task link.
+
+    Each verified reopen increments the store's ``reopen_generation`` so a
+    later conversion mints a deterministic ``-rN`` successor task_id.
+    """
     ns = _needfix_store_module()
 
     def _get_task_fn(task_id: str) -> dict[str, Any] | None:

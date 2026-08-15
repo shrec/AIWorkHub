@@ -711,6 +711,53 @@ async function testPoisonedInvalidParamsRepairsOnlyOwnedChild(tmp) {
   assert.strictEqual(replacements, 1, "detailed caller errors must not poison transport");
 }
 
+async function testLivePoisonedInvalidParamsShapeRepairsOnce(tmp) {
+  const repoRoot = path.join(tmp, "poisoned-live-shape");
+  fs.mkdirSync(repoRoot);
+  writeRepo(repoRoot, "repo_liveshape00000000000000000009", "poisoned-live-shape");
+  const host = loadExtensionHost(repoRoot);
+  const client = new host.extension.__testInternals.McpStdioClient(
+    repoRoot,
+    { appendLine: () => {} },
+    { repoId: "repo_liveshape00000000000000000009", repoName: "poisoned-live-shape" },
+    "claim-live-shape",
+  );
+  const child = { pid: 4322 };
+  client.lifecycleChild = child;
+  client.lifecyclePid = child.pid;
+  let replacements = 0;
+  client.replaceForExplicitRecovery = async () => { replacements += 1; };
+  const deliver = async (id, body) => {
+    const settled = new Promise((resolve, reject) => {
+      client.pending.set(id, { resolve, reject, timer: setTimeout(() => {}, 5000) });
+      client.pendingChildren.set(id, child);
+    });
+    client._onMessage(child, JSON.stringify({ jsonrpc: "2.0", id, ...body }));
+    await settled.catch(() => {});
+  };
+
+  const liveShape = { error: { code: -32602, message: 'Invalid request parameters("")' } };
+  const liveShapeEmptyData = { error: { code: -32602, message: 'Invalid request parameters("")', data: "" } };
+
+  await deliver(1, { result: { ok: true } });
+  await deliver(2, liveShape);
+  await deliver(3, liveShapeEmptyData);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(replacements, 1);
+
+  await deliver(4, { result: { ok: true } });
+  await deliver(5, liveShape);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(replacements, 1, "single live-shaped error after reset must not replace");
+
+  await deliver(6, { error: { code: -32602, message: "missing request_id", data: { field: "request_id" } } });
+  await deliver(7, { error: { code: -32602, message: "missing request_id", data: { field: "request_id" } } });
+  await deliver(8, { error: { code: -32602, message: 'Invalid request parameters("boom")' } });
+  await deliver(9, { error: { code: -32602, message: 'Invalid request parameters("boom")' } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(replacements, 1, "detailed caller errors must not poison transport");
+}
+
 (async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-reloadless-"));
   await testSelfHealsAndReconnectsWithoutReload(tmp);
@@ -723,6 +770,7 @@ async function testPoisonedInvalidParamsRepairsOnlyOwnedChild(tmp) {
   testExplicitRetryPreservesPartialRuntimeRepairBudget(tmp);
   await testConcurrentRequestFramingAndCorrelation(tmp);
   await testPoisonedInvalidParamsRepairsOnlyOwnedChild(tmp);
+  await testLivePoisonedInvalidParamsShapeRepairsOnce(tmp);
   testPlatformPythonResolution(tmp);
   console.log("AIWorkHub reloadless runtime-repair regression passed");
 })().catch((err) => {

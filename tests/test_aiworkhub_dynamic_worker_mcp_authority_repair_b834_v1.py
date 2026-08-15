@@ -204,7 +204,7 @@ def test_registered_tools_never_accept_an_authority_repo_override_param(
         def __init__(self) -> None:
             self.registered: dict[str, object] = {}
 
-        def tool(self, *, name: str):
+        def tool(self, *, name: str, description: str | None = None):
             def decorator(fn):
                 self.registered[name] = fn
                 return fn

@@ -1416,7 +1416,9 @@ def _overlay_regular_path(source_root: Path, target_root: Path, relative: str) -
     if target.is_symlink() or (target.exists() and not target.is_file()):
         raise WorkspaceError(f"combined_tree_target_not_regular:{relative}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
+    # Content-only copy: copystat/copytimes (os.utime) is denied inside the
+    # Landlock validation boundary, so metadata-preserving copy2 would fail.
+    shutil.copyfile(source, target)
 
 
 def create_combined_validation_workspace(
@@ -2775,6 +2777,7 @@ _PR_SET_PDEATHSIG = 1
 # probes the running kernel, so this is a real capability check rather than a
 # libseccomp symbol-presence guess.
 _SECCOMP_NOTIFY_MIN_API = 5
+_SECCOMP_NOTIFY_RUNTIME_SUPPORTED: bool | None = None
 
 
 class _OpenHow(ctypes.Structure):
@@ -2947,7 +2950,9 @@ def _seccomp_notify_supported() -> bool:
         return False
     if not _seccomp_kernel_notify_api():
         return False
-    return _openat2_available()
+    if not _openat2_available():
+        return False
+    return _seccomp_notify_runtime_supported()
 
 
 def _metadata_broker_verify_mode(mode: int) -> int:
@@ -3511,8 +3516,217 @@ def _apply_metadata_seccomp() -> None:
         library.seccomp_release(context)
 
 
-def _landlock_exec(argv: list[str]) -> int:
+def _metadata_broker_handshake_send(sock: Any, listener_fd: int) -> None:
+    """Deliver the notification listener from the disposable child to the parent.
+
+    One atomic ``SCM_RIGHTS`` transfer (``b"1"`` plus the listener descriptor).
+    Every blocking operation is bounded by a socket timeout so a wedged or
+    slow-to-drain parent can never hold the child before ``exec``.
+    """
+    import socket
+
+    sock.settimeout(_METADATA_BROKER_HANDSHAKE_SECONDS)
+    socket.send_fds(sock, [b"1"], [listener_fd])
+
+
+def _metadata_broker_handshake_error(sock: Any, diagnostic: bytes) -> None:
+    """Best-effort, bounded child error report (data-only, never carries an fd)."""
+    try:
+        sock.settimeout(_METADATA_BROKER_HANDSHAKE_SECONDS)
+        sock.sendall(b"E" + diagnostic)
+    except OSError:
+        pass
+
+
+def _metadata_broker_handshake_receive(sock: Any, deadline: float) -> tuple[int, str]:
+    """Bounded, deterministic parent-side listener receipt.
+
+    Returns ``(listener_fd, diagnostic)`` where ``listener_fd`` is ``-1`` on any
+    failure and ``diagnostic`` names the exact terminal state (timeout, EOF,
+    I/O error, a protocol violation, or the child's bounded ``E``-prefixed
+    report). The caller fails closed with an observable cause instead of a
+    silent downgrade; no code path can block past ``deadline``.
+    """
     import select
+    import socket
+
+    sock.setblocking(False)
+    listener_fd = -1
+    error = ""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            error = "handshake_timeout"
+            break
+        try:
+            ready, _writable, _exceptional = select.select(
+                [sock], [], [], remaining
+            )
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            error = f"handshake_select_error:{type(exc).__name__}:{exc}"
+            break
+        if not ready:
+            error = "handshake_timeout"
+            break
+        try:
+            payload, fds, _flags, _addr = socket.recv_fds(
+                sock, _METADATA_BROKER_PATH_LIMIT, 1
+            )
+        except BlockingIOError:
+            # Spurious readiness from a partial drain: stay within the deadline.
+            continue
+        except OSError as exc:
+            error = f"handshake_recv_error:{type(exc).__name__}:{exc}"
+            break
+        if fds:
+            listener_fd = fds[0]
+            break
+        if payload.startswith(b"E"):
+            error = payload[1:].decode("utf-8", "replace")
+            break
+        if not payload:
+            # EOF: the child closed the socket without delivering a listener.
+            error = "handshake_eof"
+            break
+        # A non-empty data-only message with neither an fd nor an error marker
+        # violates the handshake protocol; never loop on a wedged peer.
+        error = "handshake_protocol_violation"
+        break
+    return listener_fd, error
+
+
+def _metadata_broker_child_exec(argv: list[str]) -> int:
+    """Install the notify filter in a freshly exec'd interpreter.
+
+    ``_landlock_exec`` can run inside a multi-threaded pytest or manager
+    process.  Running Python, ctypes and libseccomp between ``fork`` and
+    ``exec`` is not safe in that situation: an inherited runtime/library lock
+    can make the child disappear before it transfers the listener, which the
+    parent observes only as ``handshake_eof``.  The parent therefore starts
+    this small helper with ``Popen`` (whose fork/exec path stays in CPython's C
+    implementation) and all non-trivial setup happens after a fresh exec.
+    """
+    import socket
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--metadata-broker-child", action="store_true", required=True)
+    parser.add_argument("--parent-pid", required=True, type=int)
+    parser.add_argument("--socket-fd", required=True, type=int)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = list(args.command)
+    if command and command[0] == "--":
+        command.pop(0)
+    if not command:
+        raise WorkspaceError("metadata_broker_command_empty")
+
+    child_sock = socket.socket(fileno=args.socket_fd)
+    try:
+        _set_pdeathsig_sigkill(args.parent_pid)
+        listener = _install_metadata_notify_filter()
+        try:
+            _metadata_broker_handshake_send(child_sock, listener)
+        finally:
+            os.close(listener)
+    except BaseException as exc:
+        diagnostic = f"{type(exc).__name__}:{exc}".encode("utf-8", "replace")[:1024]
+        _metadata_broker_handshake_error(child_sock, diagnostic)
+        return 126
+    finally:
+        child_sock.close()
+
+    try:
+        os.execvpe(command[0], command, os.environ.copy())
+    except BaseException as exc:
+        try:
+            os.write(
+                2,
+                (
+                    f"metadata_broker_exec_failed:{type(exc).__name__}:{exc}\n"
+                ).encode("utf-8", "replace")[:2048],
+            )
+        except BaseException:
+            pass
+    return 126
+
+
+def _seccomp_notify_runtime_supported() -> bool:
+    """Probe listener creation and ``SCM_RIGHTS`` transfer exactly once.
+
+    Kernel/libseccomp API levels alone are insufficient inside containers:
+    the outer runtime policy can terminate ``SECCOMP_FILTER_FLAG_NEW_LISTENER``
+    even though the API probe succeeds.  Use the same freshly exec'd helper
+    and descriptor handoff as the real broker, but run only ``/bin/true`` so
+    the probe cannot mutate the repository or weaken confinement.
+    """
+    global _SECCOMP_NOTIFY_RUNTIME_SUPPORTED
+
+    if _SECCOMP_NOTIFY_RUNTIME_SUPPORTED is not None:
+        return _SECCOMP_NOTIFY_RUNTIME_SUPPORTED
+    if os.name == "nt" or not sys.platform.startswith("linux"):
+        _SECCOMP_NOTIFY_RUNTIME_SUPPORTED = False
+        return False
+
+    import socket
+
+    parent_sock, child_sock = socket.socketpair()
+    process: subprocess.Popen[bytes] | None = None
+    listener_fd = -1
+    try:
+        parent_pid = os.getpid()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--metadata-broker-child",
+                "--parent-pid",
+                str(parent_pid),
+                "--socket-fd",
+                str(child_sock.fileno()),
+                "--",
+                "/bin/true",
+            ],
+            close_fds=True,
+            pass_fds=(child_sock.fileno(),),
+            start_new_session=True,
+            env=os.environ.copy(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        child_sock.close()
+        listener_fd, _error = _metadata_broker_handshake_receive(
+            parent_sock,
+            time.monotonic() + _METADATA_BROKER_HANDSHAKE_SECONDS,
+        )
+        if listener_fd < 0:
+            _kill_validator_group(process.pid)
+            process.wait(timeout=5)
+            _SECCOMP_NOTIFY_RUNTIME_SUPPORTED = False
+            return False
+        _SECCOMP_NOTIFY_RUNTIME_SUPPORTED = process.wait(timeout=5) == 0
+        return _SECCOMP_NOTIFY_RUNTIME_SUPPORTED
+    except (OSError, subprocess.SubprocessError):
+        if process is not None and process.poll() is None:
+            _kill_validator_group(process.pid)
+            try:
+                process.wait(timeout=5)
+            except subprocess.SubprocessError:
+                pass
+        _SECCOMP_NOTIFY_RUNTIME_SUPPORTED = False
+        return False
+    finally:
+        parent_sock.close()
+        try:
+            child_sock.close()
+        except OSError:
+            pass
+        if listener_fd >= 0:
+            os.close(listener_fd)
+
+
+def _landlock_exec(argv: list[str]) -> int:
     import socket
 
     parser = argparse.ArgumentParser(add_help=False)
@@ -3554,59 +3768,38 @@ def _landlock_exec(argv: list[str]) -> int:
         # this trusted parent.
         parent_sock, child_sock = socket.socketpair()
         broker_parent_pid = os.getpid()
-        child_pid = os.fork()
-        if child_pid == 0:
-            try:
-                parent_sock.close()
-                # New session so the whole validator subtree shares
-                # ``pgid == child_pid``: this lets the trusted parent
-                # authenticate brokered requests as descendants and kill the
-                # entire group on error/timeout, and the parent-death signal
-                # makes the child die if the broker parent is killed first.
-                os.setsid()
-                _set_pdeathsig_sigkill(broker_parent_pid)
-                listener = _install_metadata_notify_filter()
-                socket.send_fds(child_sock, [b"1"], [listener])
-                os.close(listener)
-                child_sock.close()
-            except BaseException as exc:
-                try:
-                    diagnostic = (
-                        f"{type(exc).__name__}:{exc}".encode("utf-8", "replace")[:1024]
-                    )
-                    child_sock.sendall(b"E" + diagnostic)
-                except BaseException:
-                    pass
-                os._exit(126)
-            try:
-                os.execvpe(command[0], command, os.environ.copy())
-            except BaseException as exc:
-                try:
-                    os.write(
-                        2,
-                        (
-                            f"metadata_broker_exec_failed:{type(exc).__name__}:{exc}\n"
-                        ).encode("utf-8", "replace")[:2048],
-                    )
-                except BaseException:
-                    pass
-            os._exit(126)
-        child_sock.close()
-        listener_fd = -1
-        listener_error = ""
+        helper_argv = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--metadata-broker-child",
+            "--parent-pid",
+            str(broker_parent_pid),
+            "--socket-fd",
+            str(child_sock.fileno()),
+            "--",
+            *command,
+        ]
         try:
-            parent_sock.setblocking(False)
-            ready, _writable, _exceptional = select.select(
-                [parent_sock], [], [], _METADATA_BROKER_HANDSHAKE_SECONDS
+            child_process = subprocess.Popen(
+                helper_argv,
+                close_fds=True,
+                pass_fds=(child_sock.fileno(),),
+                start_new_session=True,
+                env=os.environ.copy(),
             )
-            if ready:
-                payload, fds, _flags, _addr = socket.recv_fds(parent_sock, 1025, 1)
-                if fds:
-                    listener_fd = fds[0]
-                elif payload.startswith(b"E"):
-                    listener_error = payload[1:].decode("utf-8", "replace")
-        except OSError:
-            listener_fd = -1
+        except OSError as exc:
+            parent_sock.close()
+            child_sock.close()
+            raise WorkspaceError(
+                f"metadata_broker_child_start_failed:{type(exc).__name__}:{exc}"
+            ) from exc
+        child_pid = child_process.pid
+        child_sock.close()
+        try:
+            listener_fd, listener_error = _metadata_broker_handshake_receive(
+                parent_sock,
+                time.monotonic() + _METADATA_BROKER_HANDSHAKE_SECONDS,
+            )
         finally:
             parent_sock.close()
         if listener_fd < 0:
@@ -4617,6 +4810,8 @@ __all__ = [
 
 if __name__ == "__main__":
     try:
+        if "--metadata-broker-child" in sys.argv[1:]:
+            raise SystemExit(_metadata_broker_child_exec(sys.argv[1:]))
         raise SystemExit(_landlock_exec(sys.argv[1:]))
     except (OSError, WorkspaceError) as exc:
         print(f"secure sandbox setup failed: {exc}", file=sys.stderr)

@@ -12,13 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.58
+## What's new in 0.9.65
 
-- Malformed empty-string/non-object MCP parameters are rejected before
-  dispatch with a bounded redacted protocol alert.
-- Valid empty-object calls and parallel healthy clients remain serviceable.
-- Repository-owned sideband sockets remain portable under long retained
-  workspace paths without falling back to global system temp directories.
+- Reviewer stage/final corrections now preserve exact tool-call/result history
+  and reject cross-role tool calls before invocation.
+- Quality-review overlays copy file content without inheriting host metadata,
+  improving portability across Linux, macOS and native Windows.
+- Reopened NeedFix records receive deterministic monotonic successor task IDs,
+  while malformed provider usage output fails soft without killing workers.
 
 See the packaged **Changelog** for the complete release summary.
 

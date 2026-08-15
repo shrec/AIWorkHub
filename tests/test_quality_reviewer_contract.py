@@ -557,6 +557,197 @@ def test_worker_submission_normalizes_exact_evidence_and_caps_model_level(
     assert finding["required_validation"] == "run the focused branch regression"
 
 
+def test_worker_submission_rejects_finding_missing_required_text(
+    tmp_path: Path,
+) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+
+    result = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[{
+            "id": "no-text",
+            "severity": "low",
+            "summary": "summary present but evidence blank",
+            "evidence": "   ",
+        }],
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "review_finding_0_text_missing"
+
+
+def test_worker_submission_rejects_finding_missing_summary_key(
+    tmp_path: Path,
+) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+
+    result = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[{
+            "severity": "low",
+            "evidence": "src/aiworkhub/core.py:1",
+        }],
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "review_finding_0_summary_missing"
+
+
+def test_worker_submission_rejects_finding_missing_evidence_key(
+    tmp_path: Path,
+) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+
+    result = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[{
+            "severity": "low",
+            "summary": "summary present but evidence key omitted",
+        }],
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "review_finding_0_evidence_missing"
+
+
+def test_worker_submission_rejects_undocumented_finding_alias(
+    tmp_path: Path,
+) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+
+    result = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[{
+            "severity": "low",
+            "summary": "aliased finding",
+            "evidence": "src/aiworkhub/core.py:1",
+            "type": "defect",
+        }],
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "review_finding_0_unknown_key:type"
+
+
+def test_canonical_nonempty_finding_submits_and_finalizes_once(
+    tmp_path: Path,
+) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+
+    result = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[{
+            "id": "canonical-defect",
+            "severity": "high",
+            "disposition": "defect",
+            "summary": "Changed branch violates the invariant",
+            "evidence": "src/aiworkhub/core.py:7",
+            "path": "src/aiworkhub/core.py",
+            "line_start": 7,
+            "line_end": 7,
+            "symbol": "src/aiworkhub/core.py.target",
+            "confidence": "high",
+            "claim": "Changed branch violates the invariant",
+            "reproduction": "",
+            "required_validation": "run the focused branch regression",
+        }],
+    )
+    assert result["ok"] is True
+    assert result["finding_count"] == 1
+
+    audit = worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    finding = audit["verified_payloads"][0]["report"]["findings"][0]
+    assert qr.QUALITY_REVIEW_FINDING_REQUIRED_KEYS <= set(finding)
+    assert set(finding) <= qr.QUALITY_REVIEW_FINDING_KEYS
+    assert finding["severity"] == "high"
+    assert finding["disposition"] == "defect"
+    assert finding["actionable"] is True
+
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=ctx.request_id,
+        repo=tmp_path,
+        path=tmp_path,
+        home=tmp_path,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    verified = process_launcher._verified_quality_review_receipt(
+        {
+            "task_id": ctx.task_id,
+            "runner": ctx.runner,
+            "topic": ctx.topic,
+            "adapter_id": "claude_cli",
+            "worker_mcp": {
+                "audit_ledger_path": str(ctx.audit_ledger_path),
+                "audit_hmac_key_path": str(ctx.audit_hmac_key_path),
+            },
+            "quality_review": {
+                "packet_path": str(packet_path),
+                "lens": "correctness",
+            },
+        },
+        workspace,
+        ctx.request_id,
+    )
+    assert verified["report"]["findings"][0]["id"] == "canonical-defect"
+    assert verified["physical_submission_count"] == 1
+    assert verified["logical_submission_count"] == 1
+
+
+def test_canonical_finding_schema_is_single_source_and_documented() -> None:
+    assert qr.QUALITY_REVIEW_FINDING_REQUIRED_KEYS <= qr.QUALITY_REVIEW_FINDING_KEYS
+    for key in ("id", "severity", "disposition", "summary", "evidence"):
+        assert key in qr.QUALITY_REVIEW_FINDING_INPUT_KEYS
+        assert key in qr.QUALITY_REVIEW_FINDING_KEYS
+    # The input vocabulary and its required keys are derived from the one typed
+    # model so the prompt, MCP schema and normalizer share a single source.
+    assert qr.QUALITY_REVIEW_FINDING_INPUT_REQUIRED_KEYS == {
+        "severity", "summary", "evidence",
+    }
+    assert qr.QUALITY_REVIEW_FINDING_INPUT_KEYS == frozenset(
+        qr.QualityReviewFinding.__annotations__
+    )
+    assert qr.QUALITY_REVIEW_FINDING_INPUT_REQUIRED_KEYS == frozenset(
+        qr.QualityReviewFinding.__required_keys__
+    )
+    prompt = qr.build_review_prompt(_packet(), lens="correctness")
+    for token in ("severity", "summary", "evidence", "disposition", "id"):
+        assert token in prompt
+    assert qr.QUALITY_REVIEW_FINDING_SCHEMA_DOC
+    assert qr.QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION
+    assert qr.QUALITY_REVIEW_FINDING_SCHEMA_DOC in qr.QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION
+    assert qr.QUALITY_REVIEW_FINDING_SCHEMA_DOC in prompt
+
+
 def test_worker_submission_rejects_ungrounded_or_out_of_scope_defect(
     tmp_path: Path,
 ) -> None:
@@ -825,6 +1016,14 @@ def test_review_workspace_materializes_candidate_but_is_read_only(
         "validation",
     )
     (source.path / "source.py").write_text("value = 2\n", encoding="utf-8")
+
+    def _reject_metadata_copy(*_args, **_kwargs):
+        raise AssertionError("review overlay must not use metadata-preserving copy2")
+
+    # The review overlay must materialize byte-identical content without
+    # requesting copystat/utime metadata preservation (denied by the Landlock
+    # validation boundary), so copy2 must never be called here.
+    monkeypatch.setattr(worker_workspace.shutil, "copy2", _reject_metadata_copy)
     review = None
     try:
         review, evidence = worker_workspace.create_quality_review_workspace(

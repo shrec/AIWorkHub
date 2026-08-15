@@ -1861,7 +1861,13 @@ class CallbackBridge:
         try:
             try:
                 self._deliver_batch_via_transport(batch, client_user_message_id)
-                self._callback_store.mark_batch_delivered(conn, batch.batch_id)
+                if not self._callback_store.mark_batch_delivered(
+                    conn, batch.batch_id, batch.lease_id,
+                ):
+                    state = self._read_state()
+                    state["last_error"] = "lease_reclaimed_before_delivery_finalization"
+                    self._write_state(state)
+                    return False
                 state = self._read_state()
                 state["last_delivery_at"] = _utcnow()
                 state["last_delivery_task_id"] = batch.members[0].task_id
@@ -1871,7 +1877,9 @@ class CallbackBridge:
                 return True
             except BusyThreadError as exc:
                 reason = str(exc)[:500] or "thread_busy"
-                self._callback_store.defer_batch_busy(conn, batch.batch_id, reason, delay_seconds=backoff_delay)
+                self._callback_store.defer_batch_busy(
+                    conn, batch.batch_id, reason, batch.lease_id, delay_seconds=backoff_delay,
+                )
                 return False
             except AppServerError as exc:
                 error_msg = str(exc)[:500]
@@ -1879,7 +1887,7 @@ class CallbackBridge:
                     self._client.stop()
                     self._client = None
                 self._callback_store.fail_batch_transient(
-                    conn, batch.batch_id, error_msg,
+                    conn, batch.batch_id, error_msg, batch.lease_id,
                     max_retries=DEFAULT_MAX_RETRIES, delay_seconds=backoff_delay,
                 )
                 state = self._read_state()
