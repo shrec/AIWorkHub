@@ -97,9 +97,10 @@ def _authority_repo(tmp_path: Path, *, name: str = "authority_repo") -> Path:
     ):
         (repo / relative).write_bytes(b"SQLite format 3\x00fake-non-empty-authority-db")
     repository_state.bootstrap_repository(repo)
-    source_graph_db = repo / ".aiworkhub" / "source_graph" / "source_graph.sqlite"
-    source_graph_db.parent.mkdir(parents=True, exist_ok=True)
-    source_graph_db.write_bytes(b"SQLite format 3\x00fake-non-empty-source-graph-db")
+    # Canonical Source Graph reads now verify both SQLite schema and build
+    # generation.  Seed the real minimal index instead of the legacy byte
+    # placeholder used before query-only authority verification.
+    source_graph_mod.build_index(repo)
     _write_tool(
         repo / "AITools/transcript_graph.py",
         "import json, sys\n"

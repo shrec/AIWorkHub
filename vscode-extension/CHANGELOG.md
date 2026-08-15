@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.66 — 2026-08-15
+
+### Fixed
+
+- Prepare reviewer Source Graph overlays by cloning the verified canonical
+  SQLite generation and indexing only packet-changed files, with no full
+  repository rebuild in reviewer prewarm.
+- Verify canonical authority, repository binding, schema and generation before
+  reviewer runtime or provider registration begins.
+- Keep concurrent reviewer overlays isolated and coordinator Source Graph
+  reads serviceable while candidate databases are published atomically.
+
 ## 0.9.65 — 2026-08-15
 
 ### Fixed

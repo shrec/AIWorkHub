@@ -11,6 +11,7 @@ from typing import get_args, get_type_hints
 import pytest
 
 from aiworkhub import quality_reviewer
+from aiworkhub import repository_state
 from aiworkhub import source_graph
 from aiworkhub import worker_ai_tools_mcp as worker_tools
 
@@ -54,6 +55,8 @@ def _write_candidate(tmp_path: Path, *, index: int = 0) -> tuple[Path, Path, Pat
     (canonical / "module.py").write_text(
         f"def canonical_only_{index}():\n    return {index}\n", encoding="utf-8"
     )
+    repository_state.bootstrap_repository(canonical)
+    source_graph.build_index(canonical)
     candidate_file = candidate / "module.py"
     candidate_file.write_text(
         f"def canonical_only_{index}():\n    return {index}\n\n"
@@ -88,7 +91,9 @@ def test_quality_review_prewarm_verifies_candidate_bytes_before_build(
         worker_tools.WorkerToolError,
         match="quality_review_candidate_hash_mismatch",
     ):
-        worker_tools.prewarm_quality_review_source_graph(packet_path, repo=candidate)
+        worker_tools.prewarm_quality_review_source_graph(
+            packet_path, repo=candidate, authority_repo=canonical
+        )
     # No candidate overlay may have been published on the failed path.
     assert not list(runtime.glob("candidate_source_graph_*.sqlite"))
 
@@ -99,7 +104,7 @@ def test_quality_review_prewarm_publishes_atomically_without_temp_leftovers(
     canonical, candidate, runtime, packet = _write_candidate(tmp_path)
     packet_path = runtime / "quality_review_packet.json"
     prewarm = worker_tools.prewarm_quality_review_source_graph(
-        packet_path, repo=candidate
+        packet_path, repo=candidate, authority_repo=canonical
     )
     assert prewarm["ok"] is True
     assert prewarm["built"] is True
@@ -117,7 +122,7 @@ def test_quality_review_prewarm_publishes_atomically_without_temp_leftovers(
     }
     # A second prewarm of the same verified packet reuses the overlay.
     again = worker_tools.prewarm_quality_review_source_graph(
-        packet_path, repo=candidate
+        packet_path, repo=candidate, authority_repo=canonical
     )
     assert again["ok"] is True
     assert again["built"] is False
@@ -159,7 +164,7 @@ def test_quality_review_source_graph_query_is_query_only_and_fails_closed(
     # Prewarm with the real build path, then re-arm the query-time guard.
     monkeypatch.setattr(source_graph, "build_index", real_build_index)
     prewarm = worker_tools.prewarm_quality_review_source_graph(
-        packet_path, repo=candidate
+        packet_path, repo=candidate, authority_repo=canonical
     )
     assert prewarm["ok"] is True
     monkeypatch.setattr(source_graph, "build_index", fake_build_index)
@@ -180,7 +185,7 @@ def test_quality_review_corrupt_or_empty_overlay_fails_closed(
     canonical, candidate, runtime, packet = _write_candidate(tmp_path)
     packet_path = runtime / "quality_review_packet.json"
     prewarm = worker_tools.prewarm_quality_review_source_graph(
-        packet_path, repo=candidate
+        packet_path, repo=candidate, authority_repo=canonical
     )
     db_path = Path(prewarm["db_path"])
     # Corrupt the overlay after prewarm; runtime must fail closed, not rebuild.
@@ -210,7 +215,7 @@ def test_three_reviewer_overlays_plus_coordinator_query_no_leakage_or_starvation
         canonical, candidate, runtime, packet = _write_candidate(tmp_path, index=index)
         packet_path = runtime / "quality_review_packet.json"
         prewarm = worker_tools.prewarm_quality_review_source_graph(
-            packet_path, repo=candidate
+            packet_path, repo=candidate, authority_repo=canonical
         )
         assert prewarm["ok"] is True
         ctx = _ctx(
@@ -293,7 +298,9 @@ def _mutate_overlay(db_path: Path, sql: str, params: tuple = ()) -> None:
 def _prewarmed_reviewer_query(tmp_path: Path, *, index: int = 0):
     canonical, candidate, runtime, packet = _write_candidate(tmp_path, index=index)
     packet_path = runtime / "quality_review_packet.json"
-    prewarm = worker_tools.prewarm_quality_review_source_graph(packet_path, repo=candidate)
+    prewarm = worker_tools.prewarm_quality_review_source_graph(
+        packet_path, repo=candidate, authority_repo=canonical
+    )
     ctx = _ctx(
         runtime,
         repo=candidate,
@@ -361,13 +368,14 @@ def test_quality_review_prewarm_fails_before_publish_on_wrong_hash(
 ) -> None:
     canonical, candidate, runtime, packet = _write_candidate(tmp_path)
     packet_path = runtime / "quality_review_packet.json"
-    real_build_index = source_graph.build_index
+    real_index_file = source_graph.index_file
 
-    def fake_build_index(repo: Path, *, db_path: Path, incremental: bool) -> None:
-        # Build a full-schema DB but index a wrong source_hash for the changed
-        # path; the temp-verify must fail closed BEFORE os.replace publishes it.
-        real_build_index(repo, db_path=db_path, incremental=incremental)
-        conn = sqlite3.connect(str(db_path))
+    def fake_index_file(repo: Path, path: str, expected_hash: str) -> dict:
+        # Reconcile the changed path, then corrupt its hash in the private
+        # context-bound clone.  Temp verification must fail closed before the
+        # clone is atomically published.
+        result = real_index_file(repo, path, expected_hash)
+        conn = sqlite3.connect(str(source_graph.resolve_db_path(repo)))
         try:
             conn.execute(
                 "UPDATE files SET source_hash=? WHERE file_path=?",
@@ -376,13 +384,16 @@ def test_quality_review_prewarm_fails_before_publish_on_wrong_hash(
             conn.commit()
         finally:
             conn.close()
+        return result
 
-    monkeypatch.setattr(source_graph, "build_index", fake_build_index)
+    monkeypatch.setattr(source_graph, "index_file", fake_index_file)
     with pytest.raises(
         worker_tools.WorkerToolError,
         match="quality_review_candidate_source_graph_empty",
     ):
-        worker_tools.prewarm_quality_review_source_graph(packet_path, repo=candidate)
+        worker_tools.prewarm_quality_review_source_graph(
+            packet_path, repo=candidate, authority_repo=canonical
+        )
     assert not list(runtime.glob("candidate_source_graph_*.sqlite"))
 
 

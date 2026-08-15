@@ -1296,10 +1296,10 @@ def _strict_read_command_event(
         return None
     output_text = output if isinstance(output, str) else ""
     if drop_output_first_line:
-        _line_count, separator, remaining = output_text.partition("\n")
+        _line_count, separator, after_first_line = output_text.partition("\n")
         if not separator:
             return None
-        output_text = remaining
+        output_text = after_first_line
     encoded = output_text.encode("utf-8")
     return {
         "event_type": "read",
@@ -1395,9 +1395,9 @@ def _provider_read_efficiency_from_output(path: Path) -> dict[str, Any]:
                             pending_reads[tool_id] = event
             if node_type == "tool_result":
                 tool_id = str(node.get("tool_use_id") or node.get("id") or "")
-                event = pending_reads.get(tool_id)
+                pending_event = pending_reads.get(tool_id)
                 content = node.get("content")
-                if event is not None and content is not None:
+                if pending_event is not None and content is not None:
                     if isinstance(content, str):
                         result_text = content
                     else:
@@ -1408,8 +1408,8 @@ def _provider_read_efficiency_from_output(path: Path) -> dict[str, Any]:
                         except (TypeError, ValueError):
                             result_text = ""
                     encoded = result_text.encode("utf-8")
-                    event["content_sha256"] = hashlib.sha256(encoded).hexdigest()
-                    event["bytes_returned"] = len(encoded)
+                    pending_event["content_sha256"] = hashlib.sha256(encoded).hexdigest()
+                    pending_event["bytes_returned"] = len(encoded)
             for value in list(node.values())[:256]:
                 walk(value, ordinal=ordinal, depth=depth + 1)
         elif isinstance(node, list):
@@ -5495,11 +5495,22 @@ class ProcessManager:
                         review_packet_path,
                         dict(quality_review_binding["packet"]),
                     )
+                    try:
+                        worker_ai_tools_mcp.verify_quality_review_prewarm_authority(
+                            authority_repo
+                        )
+                    except worker_ai_tools_mcp.WorkerToolError as exc:
+                        raise LaunchRejected(
+                            "quality_review_source_graph_authority_unverified:"
+                            + str(exc)[:240]
+                        ) from exc
                     if prewarm_progress is not None:
                         prewarm_progress("reviewer_source_graph_prewarm_started")
                     try:
                         worker_ai_tools_mcp.prewarm_quality_review_source_graph(
-                            review_packet_path, repo=workspace.path,
+                            review_packet_path,
+                            repo=workspace.path,
+                            authority_repo=authority_repo,
                         )
                     except worker_ai_tools_mcp.WorkerToolError as exc:
                         if prewarm_progress is not None:
@@ -5766,8 +5777,10 @@ class ProcessManager:
                     ),
                     "timeout_seconds": timeout_seconds,
                     "token_budget": (
-                        dict(card.get("token_budget"))
-                        if isinstance(card.get("token_budget"), dict)
+                        dict(token_budget_value)
+                        if isinstance(
+                            token_budget_value := card.get("token_budget"), dict
+                        )
                         else None
                     ),
                     "stdout_path": str(stdout_path),
@@ -7210,9 +7223,9 @@ class ProcessManager:
                 errors.append(f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500])
 
         events = self._request_events(request_id)
-        identity = self._event_identity(events)
-        task_id = str(identity.get("task_id") or "")
-        runner = str(identity.get("runner") or "")
+        event_identity = self._event_identity(events)
+        task_id = str(event_identity.get("task_id") or "")
+        runner = str(event_identity.get("runner") or "")
         error = "finalizer_retries_exhausted:" + "|".join(errors)
         release_result: dict[str, Any] = {
             "ok": False,
@@ -7237,7 +7250,7 @@ class ProcessManager:
         if release_result.get("ok"):
             unlink_if_regular(self._terminal_authority_grant_path(request_id))
         return self._append_event({
-            **identity,
+            **event_identity,
             "request_id": request_id,
             "state": terminal_state,
             "worker_terminal_state": "finalize_failed",
@@ -7407,6 +7420,8 @@ class ProcessManager:
         ):
             return False, "review_workspace_missing"
 
+        if not isinstance(evidence, dict):
+            return False, "review_workspace_evidence_missing"
         stored_hashes = evidence.get("changed_path_hashes")
         changed_paths = evidence.get("changed_paths")
         if not isinstance(stored_hashes, dict):

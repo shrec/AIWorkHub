@@ -3870,3 +3870,169 @@ def test_quality_review_prewarm_live_fails_closed_on_unknown_identity(
     latest = manager._latest_by_request()[request_id]
     assert latest.get("state") == "blocked"
     assert latest.get("blocked_reason") == "reservation_expired"
+
+
+def _quality_review_card(task_id: str = "TASK_REVIEW_1") -> dict:
+    return {
+        "task_id": task_id,
+        "runner": "claude_worker_reviewer",
+        "topic": "quality_review",
+        "status": "pending",
+        "worker_status": "unclaimed",
+        "claimed_by": "",
+        "allowed_writes": [],
+        "read_only": True,
+        "priority": "high",
+    }
+
+
+def _reviewer_launch_setup(tmp_path: Path, monkeypatch):
+    """Shared scaffolding for the real-``_launch_isolated`` reviewer ordering
+    tests below.  Mocks only what a synthetic reviewer launch cannot
+    reasonably exercise in a unit test -- the task-engine claim, and the
+    git-backed candidate-overlay worktree diffing inside
+    ``create_quality_review_workspace`` -- while calling the actual
+    ``ProcessManager._launch_isolated`` method, so the ordering it enforces
+    (workspace+packet creation, then authority verification, then prewarm,
+    then runtime/provider registration) is exercised for real rather than
+    reimplemented in the test.
+    """
+
+    _open_gates(monkeypatch)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _quality_review_card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    monkeypatch.setattr(
+        process_launcher.task_engine, "claim_start_exact",
+        lambda *a, **k: {"ok": True},
+    )
+    monkeypatch.setattr(
+        process_launcher, "_task_authority_repo", lambda repo, card: repo.resolve()
+    )
+    candidate_dir = tmp_path / "candidate"
+    candidate_dir.mkdir()
+    candidate_home = tmp_path / "candidate_home"
+    (candidate_home / "task_mcp_worker_runtime").mkdir(parents=True)
+    fake_workspace = process_launcher.WorkerWorkspace(
+        request_id="c" * 32,
+        repo=candidate_dir,
+        path=candidate_dir,
+        home=candidate_home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    monkeypatch.setattr(
+        process_launcher, "create_quality_review_workspace",
+        lambda *a, **k: (fake_workspace, {"schema_id": "fake.v1"}),
+    )
+    binding = {
+        "target_request_id": "target-request-1",
+        "target_task_id": "TARGET_TASK_1",
+        "target_claim_epoch": 1,
+        "adapter_id": "claude_cli",
+        "source_workspace": fake_workspace.as_metadata(),
+        "candidate_paths": ["module.py"],
+        "packet": {"packet_sha256": "a" * 64},
+        "lens": "correctness",
+    }
+    return manager, binding
+
+
+def test_quality_review_launch_isolated_orders_authority_prewarm_registration(
+    monkeypatch, tmp_path,
+):
+    manager, binding = _reviewer_launch_setup(tmp_path, monkeypatch)
+    order: list[str] = []
+
+    def fake_authority(authority_repo):
+        order.append("authority")
+        return worker_ai_tools_mcp.AuthorityBinding(
+            db_path=tmp_path / "canonical.sqlite",
+            authority_source="canonical",
+            authority_state="sole_authority",
+            authority_repo=authority_repo,
+        )
+
+    def fake_prewarm(*_args, **_kwargs):
+        order.append("prewarm")
+        return {"ok": True, "built": True}
+
+    def fake_registration(*_args, **_kwargs):
+        order.append("registration")
+        raise RuntimeError(
+            "stop-after-registration: real subprocess spawn is out of scope for this ordering test"
+        )
+
+    monkeypatch.setattr(
+        worker_ai_tools_mcp, "verify_quality_review_prewarm_authority", fake_authority
+    )
+    monkeypatch.setattr(
+        worker_ai_tools_mcp, "prewarm_quality_review_source_graph", fake_prewarm
+    )
+    monkeypatch.setattr(
+        process_launcher, "_provision_worker_mcp_runtime_for_authority", fake_registration
+    )
+
+    manager._launch_isolated(
+        task_id="TASK_REVIEW_1",
+        runner="claude_worker_reviewer",
+        topic="quality_review",
+        adapter_id="claude_cli",
+        model=None,
+        owner_prompt="",
+        timeout_seconds=30,
+        quality_review_binding=binding,
+    )
+
+    assert order == ["authority", "prewarm", "registration"]
+
+
+def test_quality_review_launch_isolated_fails_closed_before_prewarm_and_registration(
+    monkeypatch, tmp_path,
+):
+    manager, binding = _reviewer_launch_setup(tmp_path, monkeypatch)
+    order: list[str] = []
+
+    def fail_authority(authority_repo):
+        order.append("authority")
+        raise worker_ai_tools_mcp.WorkerToolError(
+            "authority_component_not_canonical_active:source_graph.source_graph:shadow"
+        )
+
+    def fake_prewarm(*_args, **_kwargs):
+        order.append("prewarm")
+        return {"ok": True, "built": True}
+
+    def fake_registration(*_args, **_kwargs):
+        order.append("registration")
+        raise RuntimeError("registration must never run after a failed authority check")
+
+    monkeypatch.setattr(
+        worker_ai_tools_mcp, "verify_quality_review_prewarm_authority", fail_authority
+    )
+    monkeypatch.setattr(
+        worker_ai_tools_mcp, "prewarm_quality_review_source_graph", fake_prewarm
+    )
+    monkeypatch.setattr(
+        process_launcher, "_provision_worker_mcp_runtime_for_authority", fake_registration
+    )
+
+    result = manager._launch_isolated(
+        task_id="TASK_REVIEW_1",
+        runner="claude_worker_reviewer",
+        topic="quality_review",
+        adapter_id="claude_cli",
+        model=None,
+        owner_prompt="",
+        timeout_seconds=30,
+        quality_review_binding=binding,
+    )
+
+    assert order == ["authority"]
+    assert result.get("ok") is False
+    assert "quality_review_source_graph_authority_unverified" in str(
+        result.get("blocked_reason") or ""
+    )

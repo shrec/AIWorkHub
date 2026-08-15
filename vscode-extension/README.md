@@ -12,14 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.65
+## What's new in 0.9.66
 
-- Reviewer stage/final corrections now preserve exact tool-call/result history
-  and reject cross-role tool calls before invocation.
-- Quality-review overlays copy file content without inheriting host metadata,
-  improving portability across Linux, macOS and native Windows.
-- Reopened NeedFix records receive deterministic monotonic successor task IDs,
-  while malformed provider usage output fails soft without killing workers.
+- Quality reviewers now clone the verified canonical Source Graph generation
+  and reconcile only packet-changed files instead of rebuilding the repository.
+- Canonical authority and generation identity are verified before reviewer
+  runtime/provider registration, with atomic packet-local publication.
+- Concurrent correctness, security and code-quality overlays stay isolated
+  while ordinary coordinator Source Graph reads remain responsive.
 
 See the packaged **Changelog** for the complete release summary.
 

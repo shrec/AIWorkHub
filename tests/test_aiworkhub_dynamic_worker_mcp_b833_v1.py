@@ -212,9 +212,10 @@ def _fake_repo(tmp_path: Path, *, name: str = "repo") -> Path:
     repo.mkdir(parents=True)
     _bootstrap_manifest_and_registry(repo)
     assert not (repo / "AITools").exists()
-    source_graph_db = repo / ".aiworkhub" / "source_graph" / "source_graph.sqlite"
-    source_graph_db.parent.mkdir(parents=True, exist_ok=True)
-    source_graph_db.write_bytes(b"SQLite format 3\x00fake-non-empty-source-graph-db")
+    # Source Graph reads are query-only and fail closed unless the canonical
+    # database has a verified schema and generation identity.  Build the real
+    # minimal fixture instead of the old non-SQLite placeholder.
+    source_graph_mod.build_index(repo)
     # session_current_state resolves this component's existence/size only --
     # it is never opened -- so a non-empty placeholder is sufficient.
     (repo / ".aiworkhub" / "sessions" / "sessions.sqlite").parent.mkdir(parents=True, exist_ok=True)

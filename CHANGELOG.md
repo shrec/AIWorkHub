@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.66] - 2026-08-15
+
+### Fixed
+
+- Clone the verified canonical Source Graph generation for quality reviewers
+  instead of running a full repository rebuild before every reviewer launch.
+- Reconcile only the review packet's exact changed paths, publish each
+  candidate database atomically and keep runtime reviewer queries read-only.
+- Fail closed before provider registration when Source Graph authority,
+  repository identity, schema or build revision cannot be verified exactly.
+- Keep three concurrent reviewer overlays isolated while an independent
+  canonical coordinator query remains responsive.
+- Remove the remaining mypy errors from the touched reviewer launch and worker
+  Source Graph boundaries without suppressing type checks.
+
+### Validation
+
+- Candidate Source Graph suite: 18 passed; focused reviewer launch suite:
+  15 passed; Ruff, mypy, extension tests and diff checks passed.
+
 ## [0.9.65] - 2026-08-15
 
 ### Fixed

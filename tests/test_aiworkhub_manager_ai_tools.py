@@ -16,6 +16,7 @@ from aiworkhub import (  # noqa: E402
     manager_ai_tools,
     server,
     shared_router,
+    source_graph,
     task_store,
 )
 
@@ -88,6 +89,7 @@ def test_manager_uses_same_canonical_ai_tools_as_workers(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
     assert task_store.initialize_repository(root)["ok"]
+    source_graph.build_index(root)
     monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
 
     results = [

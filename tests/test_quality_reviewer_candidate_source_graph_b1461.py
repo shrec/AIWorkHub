@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -12,7 +13,9 @@ import pytest
 
 from aiworkhub import process_launcher
 from aiworkhub import quality_reviewer
+from aiworkhub import repository_state
 from aiworkhub import source_graph
+from aiworkhub import storage_registry
 from aiworkhub import worker_ai_tools_mcp as worker_tools
 
 
@@ -25,7 +28,12 @@ def _ctx(
 ) -> worker_tools.WorkerToolContext:
     runtime.mkdir(parents=True, exist_ok=True)
     ledger = runtime / "audit.jsonl"
-    ledger.write_text("", encoding="utf-8")
+    # Created directly at 0600 (never via write_text + chmod): the worker
+    # sandbox blocks fchmod/chmod, and _append_line_0600 only tolerates that
+    # denial when the file's mode is already exactly 0600, mirroring how the
+    # coordinator pre-creates the real request-private ledger before launch.
+    ledger_fd = os.open(ledger, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    os.close(ledger_fd)
     key = runtime / "audit.key"
     key.write_bytes(b"k" * 32)
     return worker_tools.WorkerToolContext(
@@ -43,6 +51,18 @@ def _ctx(
     )
 
 
+def _bootstrap_canonical_repo(repo: Path) -> None:
+    """Real repo identity + canonical-only storage registry + a real built
+    Source Graph generation.  This exercises the genuine
+    ``resolve_db_path``/``load_storage_registry`` path instead of
+    monkeypatching authority resolution away -- write any source files under
+    ``repo`` before calling this.
+    """
+
+    repository_state.bootstrap_repository(repo)
+    source_graph.build_index(repo, incremental=False)
+
+
 def test_ordinary_worker_source_graph_remains_canonical(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -50,19 +70,11 @@ def test_ordinary_worker_source_graph_remains_canonical(
     authority = tmp_path / "canonical"
     repo.mkdir()
     authority.mkdir()
-    db = tmp_path / "canonical.sqlite"
-    db.write_bytes(b"not-empty")
-    ctx = _ctx(tmp_path / "runtime", repo=repo, authority_repo=authority, packet_path=None)
-    monkeypatch.setattr(
-        worker_tools,
-        "_resolve_source_graph_db",
-        lambda _ctx: worker_tools.AuthorityBinding(
-            db_path=db,
-            authority_source="canonical",
-            authority_state="sole_authority",
-            authority_repo=authority,
-        ),
+    (authority / "module.py").write_text(
+        "def canonical_marker():\n    return 1\n", encoding="utf-8"
     )
+    _bootstrap_canonical_repo(authority)
+    ctx = _ctx(tmp_path / "runtime", repo=repo, authority_repo=authority, packet_path=None)
     observed: list[Path] = []
     monkeypatch.setattr(
         source_graph,
@@ -75,8 +87,108 @@ def test_ordinary_worker_source_graph_remains_canonical(
 
     assert result["ok"] is True
     assert result["authority_source"] == "canonical"
-    assert result["authority_repo"] == str(authority)
-    assert observed == [authority]
+    assert Path(result["authority_repo"]).resolve() == authority.resolve()
+    assert [p.resolve() for p in observed] == [authority.resolve()]
+
+
+def test_canonical_source_graph_authority_resolves_to_exact_registry_bound_db(
+    tmp_path: Path,
+) -> None:
+    """authority_repo/storage registry must resolve to the exact bound DB,
+    and only a verified canonical ``authority_source``+``sole_authority``
+    ``authority_state`` binding is ever returned.
+    """
+
+    authority = tmp_path / "canonical"
+    authority.mkdir()
+    (authority / "module.py").write_text(
+        "def canonical_marker():\n    return 1\n", encoding="utf-8"
+    )
+    _bootstrap_canonical_repo(authority)
+
+    binding = worker_tools.verify_quality_review_prewarm_authority(authority)
+
+    assert binding.authority_source == "canonical"
+    assert binding.authority_state == "sole_authority"
+    registry = storage_registry.load_storage_registry(authority.resolve())
+    expected = storage_registry.resolve_database_path(registry, "source_graph")
+    assert binding.db_path == expected
+    assert binding.db_path.is_file()
+
+
+@pytest.mark.parametrize(
+    "corrupt, match",
+    [
+        ("shadow_state", "not_canonical_active"),
+        ("missing_db", "absent_or_empty"),
+        ("symlinked_db", "symlink"),
+        ("schema_incomplete", "schema_incomplete"),
+        ("wrong_revision", "wrong_revision"),
+        ("forged_registry_repo_id", "authority_registry_unresolved"),
+    ],
+)
+def test_canonical_source_graph_authority_fails_closed(
+    tmp_path: Path, corrupt: str, match: str
+) -> None:
+    authority = tmp_path / f"canonical-{corrupt}"
+    authority.mkdir()
+    (authority / "module.py").write_text(
+        "def canonical_marker():\n    return 1\n", encoding="utf-8"
+    )
+    _bootstrap_canonical_repo(authority)
+    registry = storage_registry.load_storage_registry(authority.resolve())
+    db_path = storage_registry.resolve_database_path(registry, "source_graph")
+    registry_path = authority / storage_registry.STORAGE_REGISTRY_REL
+
+    if corrupt == "shadow_state":
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        for entry in payload["databases"]:
+            if entry["id"] == "source_graph":
+                entry["authority"] = {
+                    "state": "shadow",
+                    "canonical_active": False,
+                    "legacy_active": False,
+                    "live_cutover": False,
+                }
+        registry_path.write_text(json.dumps(payload), encoding="utf-8")
+    elif corrupt == "missing_db":
+        db_path.unlink()
+    elif corrupt == "symlinked_db":
+        if os.name == "nt":
+            pytest.skip("symlinks unavailable on Windows")
+        real = tmp_path / "elsewhere.sqlite"
+        db_path.replace(real)
+        os.symlink(real, db_path)
+    elif corrupt == "schema_incomplete":
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("DROP TABLE entities_fts")
+            conn.commit()
+        finally:
+            conn.close()
+    elif corrupt == "wrong_revision":
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT key, value FROM meta WHERE key='last_build'"
+            ).fetchall()
+            for key, value in rows:
+                payload = json.loads(value)
+                payload["build_revision"] = "aiworkhub.source_graph.forged.v0"
+                conn.execute(
+                    "UPDATE meta SET value=? WHERE key=?",
+                    (json.dumps(payload), key),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    elif corrupt == "forged_registry_repo_id":
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        payload["repo_id"] = "repo_" + "f" * 32
+        registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(worker_tools.WorkerToolError, match=match):
+        worker_tools.verify_quality_review_prewarm_authority(authority)
 
 
 def test_quality_reviewer_source_graph_uses_packet_bound_candidate_overlay(
@@ -87,6 +199,7 @@ def test_quality_reviewer_source_graph_uses_packet_bound_candidate_overlay(
     canonical.mkdir()
     candidate.mkdir()
     (canonical / "module.py").write_text("def canonical_only():\n    return 1\n", encoding="utf-8")
+    _bootstrap_canonical_repo(canonical)
     candidate_file = candidate / "module.py"
     candidate_file.write_text(
         "def canonical_only():\n    return 1\n\n"
@@ -107,7 +220,7 @@ def test_quality_reviewer_source_graph_uses_packet_bound_candidate_overlay(
     packet_path = runtime / "quality_review_packet.json"
     packet_path.write_text(json.dumps(packet), encoding="utf-8")
     prewarm = worker_tools.prewarm_quality_review_source_graph(
-        packet_path, repo=candidate,
+        packet_path, repo=candidate, authority_repo=canonical,
     )
     assert prewarm["ok"] is True
     assert prewarm["built"] is True
@@ -152,108 +265,190 @@ def _exists_ready(db_path: Path, *args: object, **kwargs: object) -> bool:
         return False
 
 
-def test_quality_review_prewarm_distinct_candidates_build_concurrently(
+def _make_candidate_packet(runtime: Path, candidate: Path, *, index: int) -> Path:
+    runtime.mkdir()
+    candidate.mkdir()
+    candidate_file = candidate / "module.py"
+    candidate_file.write_text(
+        "def canonical_only():\n    return 1\n\n"
+        f"def candidate_only_symbol_{index}():\n    return {index}\n",
+        encoding="utf-8",
+    )
+    packet = quality_reviewer.build_review_packet(
+        request_id=f"target-request-{index}",
+        task_id=f"TARGET_TASK_{index}",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={
+            "module.py": hashlib.sha256(candidate_file.read_bytes()).hexdigest()
+        },
+    )
+    packet_path = runtime / "quality_review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    return packet_path
+
+
+def test_quality_review_prewarm_distinct_candidates_build_concurrently_without_build_index(
     tmp_path: Path, monkeypatch
 ) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    db_paths: list[Path] = []
+    """Three concurrent lenses in one compact test: (1) zero
+    ``source_graph.build_index`` calls, (2) distinct packet DBs built
+    concurrently, serviced independently of each other (a stuck packet can
+    never block an unrelated one, since single-flight keys on ``db_path`` and
+    the per-packet writer lease keys on each packet's own runtime directory),
+    (3) candidate isolation -- one packet's symbol never leaks into another
+    packet's overlay.  Plus bounded completion (joined with a timeout) and
+    no leftover ``.tmp`` residue once every thread finishes.  Each packet
+    gets its own runtime directory, exactly as distinct concurrent reviewer
+    requests do in production (each owns a private
+    ``task_mcp_worker_runtime`` directory) -- sharing one runtime directory
+    across packets would collide on the single-writer index lease, which is
+    scoped to the runtime directory, not the individual db file.
+
+    A fourth thread runs a real bounded canonical coordinator Source Graph
+    query (``source_graph.focus``) against the same ``canonical`` repo
+    concurrently with the three prewarms.  It must complete quickly and
+    successfully: the read-only canonical connection each prewarm opens for
+    its SQLite backup must never starve, or be starved by, an ordinary
+    coordinator read against that same canonical database.
+    """
+
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    (canonical / "module.py").write_text("def canonical_only():\n    return 1\n", encoding="utf-8")
+    _bootstrap_canonical_repo(canonical)
+
+    def fail_build(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("prewarm must never call build_index")
+
+    monkeypatch.setattr(source_graph, "build_index", fail_build)
+
+    packet_paths = []
+    candidates = []
     for index in range(3):
         runtime = tmp_path / f"runtime-{index}"
-        runtime.mkdir()
-        db_paths.append(runtime / f"candidate_source_graph_{index:016x}.sqlite")
-
-    def fake_verify(packet_path: Path, _repo: Path):
-        index = int(packet_path.name.split("-")[-1])
-        return (
-            f"packet-{index}",
-            f"target-request-{index}",
-            f"TARGET_TASK_{index}",
-            db_paths[index],
-            [{"path": "module.py", "sha256": "a" * 64}],
-        )
-
-    monkeypatch.setattr(
-        worker_tools, "_verify_quality_review_packet_binding", fake_verify
-    )
-    monkeypatch.setattr(
-        worker_tools, "_write_candidate_db_marker", lambda *a, **k: None
-    )
-    monkeypatch.setattr(worker_tools, "_candidate_db_is_ready", _exists_ready)
-
-    entered: list[str] = []
-    entered_lock = threading.Lock()
-    barrier = threading.Barrier(3)
-
-    def fake_build(_repo, *, db_path, incremental):
-        with entered_lock:
-            entered.append(str(db_path))
-        barrier.wait(timeout=5)
-        db_path.write_bytes(b"fake-overlay-index")
-
-    monkeypatch.setattr(source_graph, "build_index", fake_build)
+        candidate = tmp_path / f"candidate-{index}"
+        candidates.append(candidate)
+        packet_paths.append(_make_candidate_packet(runtime, candidate, index=index))
 
     results: list[dict] = []
     errors: list[BaseException] = []
+    results_lock = threading.Lock()
 
     def run(index: int) -> None:
         try:
-            results.append(
-                worker_tools.prewarm_quality_review_source_graph(
-                    tmp_path / f"packet-{index}", repo=repo
-                )
+            result = worker_tools.prewarm_quality_review_source_graph(
+                packet_paths[index], repo=candidates[index], authority_repo=canonical,
             )
+            with results_lock:
+                results.append(result)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
+    query_results: list[dict] = []
+    query_errors: list[BaseException] = []
+
+    def run_coordinator_query() -> None:
+        try:
+            query_results.append(source_graph.focus(canonical, "canonical_only", 8))
+        except BaseException as exc:  # noqa: BLE001
+            query_errors.append(exc)
+
     threads = [threading.Thread(target=run, args=(i,)) for i in range(3)]
-    for thread in threads:
+    query_thread = threading.Thread(target=run_coordinator_query)
+    for thread in [*threads, query_thread]:
         thread.start()
+
+    query_join_started = time.monotonic()
+    query_thread.join(timeout=10)
+    query_join_duration = time.monotonic() - query_join_started
+    assert not query_thread.is_alive(), "coordinator query starved by concurrent prewarms"
+    assert query_join_duration < 10, f"coordinator query starved: took {query_join_duration:.2f}s"
+    assert not query_errors, query_errors
+    assert len(query_results) == 1
+    assert len(query_results[0]["matches"]) >= 1, "coordinator query found no canonical matches"
+
     for thread in threads:
-        thread.join(timeout=20)
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads), "prewarm did not complete"
 
     assert not errors, errors
-    assert len(entered) == 3
-    assert sorted(r["built"] for r in results) == [True, True, True]
+    assert len(results) == 3
+    assert all(r["built"] for r in results)
+    db_paths = {Path(r["db_path"]) for r in results}
+    assert len(db_paths) == 3, "each packet must build its own distinct db"
     assert all(path.is_file() for path in db_paths)
+    residue = [str(f) for path in db_paths for f in path.parent.glob(".*.tmp")]
+    assert not residue, f"leftover temp file residue: {residue}"
+
+    by_task_id = {result["target_task_id"]: result for result in results}
+    for index in range(3):
+        result = by_task_id[f"TARGET_TASK_{index}"]
+        db_path = Path(result["db_path"]).resolve()
+        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        try:
+            qualnames = {
+                str(row[0]) for row in conn.execute("SELECT qualname FROM entities")
+            }
+        finally:
+            conn.close()
+        own_symbol = f"candidate_only_symbol_{index}"
+        assert any(own_symbol in qualname for qualname in qualnames)
+        for other in range(3):
+            if other == index:
+                continue
+            other_symbol = f"candidate_only_symbol_{other}"
+            assert not any(other_symbol in qualname for qualname in qualnames), (
+                f"candidate {index} leaked candidate {other}'s symbol"
+            )
 
 
 def test_quality_review_prewarm_same_packet_single_flights(
     tmp_path: Path, monkeypatch
 ) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    (canonical / "module.py").write_text("def canonical_only():\n    return 1\n", encoding="utf-8")
+    _bootstrap_canonical_repo(canonical)
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    candidate_file = candidate / "module.py"
+    candidate_file.write_text(
+        "def canonical_only():\n    return 1\n\n"
+        "def candidate_only_symbol():\n    return 2\n",
+        encoding="utf-8",
+    )
     runtime = tmp_path / "runtime"
     runtime.mkdir()
-    db_path = runtime / "candidate_source_graph_0000000000000000.sqlite"
-
-    monkeypatch.setattr(
-        worker_tools,
-        "_verify_quality_review_packet_binding",
-        lambda _packet_path, _repo: (
-            "packet-shared",
-            "target-request",
-            "TARGET_TASK",
-            db_path,
-            [{"path": "module.py", "sha256": "a" * 64}],
-        ),
+    packet = quality_reviewer.build_review_packet(
+        request_id="target-request-1",
+        task_id="TARGET_TASK_1",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={
+            "module.py": hashlib.sha256(candidate_file.read_bytes()).hexdigest()
+        },
     )
-    monkeypatch.setattr(
-        worker_tools, "_write_candidate_db_marker", lambda *a, **k: None
-    )
-    monkeypatch.setattr(worker_tools, "_candidate_db_is_ready", _exists_ready)
+    packet_path = runtime / "quality_review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
 
-    build_count = {"n": 0}
-    build_lock = threading.Lock()
+    def fail_build(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("prewarm must never call build_index")
+
+    monkeypatch.setattr(source_graph, "build_index", fail_build)
+
+    real_index_file = source_graph.index_file
+    call_count = {"n": 0}
+    call_lock = threading.Lock()
     release = threading.Event()
 
-    def fake_build(_repo, *, db_path, incremental):
-        with build_lock:
-            build_count["n"] += 1
+    def fake_index_file(repo_root: Path, path: str, expected_hash: str):
+        with call_lock:
+            call_count["n"] += 1
         release.wait(timeout=10)
-        db_path.write_bytes(b"fake-overlay-index")
+        return real_index_file(repo_root, path, expected_hash)
 
-    monkeypatch.setattr(source_graph, "build_index", fake_build)
+    monkeypatch.setattr(source_graph, "index_file", fake_index_file)
 
     results: list[dict] = []
     errors: list[BaseException] = []
@@ -262,7 +457,7 @@ def test_quality_review_prewarm_same_packet_single_flights(
         try:
             results.append(
                 worker_tools.prewarm_quality_review_source_graph(
-                    tmp_path / "packet", repo=repo
+                    packet_path, repo=candidate, authority_repo=canonical,
                 )
             )
         except BaseException as exc:  # noqa: BLE001
@@ -271,9 +466,9 @@ def test_quality_review_prewarm_same_packet_single_flights(
     first = threading.Thread(target=run)
     first.start()
     deadline = time.monotonic() + 5
-    while build_count["n"] == 0 and time.monotonic() < deadline:
+    while call_count["n"] == 0 and time.monotonic() < deadline:
         time.sleep(0.005)
-    assert build_count["n"] == 1
+    assert call_count["n"] == 1
     second = threading.Thread(target=run)
     second.start()
     release.set()
@@ -281,9 +476,8 @@ def test_quality_review_prewarm_same_packet_single_flights(
     second.join(timeout=15)
 
     assert not errors, errors
-    assert build_count["n"] == 1
+    assert call_count["n"] == 1
     assert sorted(r["built"] for r in results) == [False, True]
-    assert db_path.is_file()
 
 
 def test_quality_reviewer_query_fails_closed_without_prewarm(

@@ -463,7 +463,7 @@ def _canonical_json_output(name: str, text: str, *, max_bytes: int) -> tuple[str
             }
         return value
 
-    wrapper = {
+    wrapper: dict[str, Any] = {
         "schema_id": "aiworkhub.task_mcp.bounded_json_preview.v1",
         "truncated": True,
         "original_bytes": len(encoded),
@@ -812,20 +812,31 @@ def prewarm_quality_review_source_graph(
     packet_path: Path,
     *,
     repo: Path,
+    authority_repo: Path,
 ) -> dict[str, Any]:
     """Prebuild and atomically publish the packet-bound reviewer candidate index.
 
-    This is the only path that ever builds a reviewer candidate Source Graph
-    index.  The launcher calls it after the review packet is materialized and
-    before the reviewer provider is launched; runtime reviewer Source Graph
-    calls are query-only and never invoke ``build_index``.  ``build_index`` is
-    bound context-locally through ``source_graph.database_path_override`` (a
-    ``ContextVar``), so distinct candidate DBs build concurrently without any
-    process-global lock.  Only callers for the same packet-bound ``db_path``
-    single-flight, so the overlay is verified and published exactly once.
+    This is the only path that ever prepares a reviewer candidate Source
+    Graph index, and it never calls ``build_index``: the launcher calls it
+    after the review packet is materialized and before the reviewer provider
+    is launched.  The overlay is a clone of the already-verified canonical
+    generation (via SQLite's native backup API), reconciled only for this
+    packet's ``changed_paths`` through the exact-file ``index_file``/
+    ``remove_file`` primitives -- never a full rebuild.  This function always
+    re-derives the canonical binding from ``authority_repo`` itself via
+    :func:`verify_quality_review_prewarm_authority`, so a forged or stale
+    binding can never be smuggled in by a caller.  Runtime reviewer Source
+    Graph calls remain query-only and never invoke ``build_index`` either.
+    ``build_index`` is bound context-locally through
+    ``source_graph.database_path_override`` (a ``ContextVar``), so distinct
+    candidate DBs build concurrently without any process-global lock.  Only
+    callers for the same packet-bound ``db_path`` single-flight, so the
+    overlay is verified and published exactly once.
     """
 
     from . import source_graph as _source_graph_mod
+
+    canonical = verify_quality_review_prewarm_authority(authority_repo)
 
     packet_sha256, target_request_id, target_task_id, db_path, changed_paths = (
         _verify_quality_review_packet_binding(packet_path, repo)
@@ -865,10 +876,35 @@ def prewarm_quality_review_source_graph(
     try:
         temporary = db_path.parent / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
         try:
+            source_conn = _source_graph_mod.connect(canonical.db_path, read_only=True)
+            destination_conn = sqlite3.connect(temporary)
+            try:
+                source_conn.backup(destination_conn)
+                destination_conn.commit()
+            finally:
+                destination_conn.close()
+                source_conn.close()
             with _with_source_graph_db(_source_graph_mod, temporary):
-                _source_graph_mod.build_index(
-                    repo, db_path=temporary, incremental=False,
-                )
+                for changed in changed_paths:
+                    relative = str(changed.get("path") or "")
+                    expected_hash = str(changed.get("sha256") or "")
+                    candidate = (repo / relative).resolve(strict=False)
+                    if not candidate.is_relative_to(repo.resolve()):
+                        raise WorkerToolError(
+                            f"quality_review_candidate_path_escapes_workspace:{relative}"
+                        )
+                    if candidate.is_symlink():
+                        raise WorkerToolError(
+                            f"quality_review_candidate_path_symlink:{relative}"
+                        )
+                    if candidate.is_file():
+                        _source_graph_mod.index_file(repo, relative, expected_hash)
+                    elif candidate.exists():
+                        raise WorkerToolError(
+                            f"quality_review_candidate_path_not_file:{relative}"
+                        )
+                    else:
+                        _source_graph_mod.remove_file(repo, relative)
             _write_candidate_db_marker(
                 temporary, packet_sha256, target_request_id, target_task_id,
             )
@@ -1001,27 +1037,115 @@ def _resolve_authority_db(ctx: WorkerToolContext, *, component: str, db_id: str)
     return AuthorityBinding(db_path=db_path, authority_source="canonical", authority_state=state)
 
 
-def _canonical_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding:
-    """Resolve the repository's canonical Source Graph database."""
+def _canonical_source_graph_binding_for_repo(authority_repo: Path) -> AuthorityBinding:
+    """Resolve and verify the repository's sole canonical Source Graph database.
 
+    Unlike :func:`_resolve_authority_db`, Source Graph is never read through a
+    legacy/canonical toggle (task B849 made ``aiworkhub.source_graph`` the
+    sole implementation and storage authority for this component), so once
+    the registry entry is verified ``canonical_active`` in state
+    ``canonical_active`` the resolved database is, by architecture, always
+    the sole authority.  This still fails closed on every other forgery or
+    corruption vector: an unresolved repository identity, a missing registry
+    entry, any state other than a verified canonical cutover (rejecting
+    shadow/rolled-back/forged entries), a resolved path that escapes
+    ``authority_repo`` or is symlinked, a missing/empty/unreadable file, a
+    schema-incomplete database, or a database whose recorded generation
+    ``build_revision`` does not match this runtime's own -- a stale or
+    wrong-generation database is never treated as authoritative.
+    """
+
+    from . import source_graph as _source_graph_mod
     from . import storage_registry as _storage_registry_mod
+
+    resolved_repo = Path(authority_repo).resolve()
     try:
-        registry = _storage_registry_mod.load_storage_registry(ctx.authority_repo)
-        db_path = _storage_registry_mod.resolve_database_path(registry, "source_graph")
+        registry = _storage_registry_mod.load_storage_registry(resolved_repo)
     except (RepositoryStateError, _storage_registry_mod.StorageRegistryError) as exc:
         raise WorkerToolError(
             f"authority_registry_unresolved:source_graph.source_graph:{exc}"
         ) from exc
-    if not db_path.is_file() or db_path.stat().st_size <= 0:
+    db = registry.databases.get("source_graph")
+    if db is None:
+        raise WorkerToolError("authority_registry_entry_missing:source_graph.source_graph")
+    if not db.canonical_active or db.authority_state != "canonical_active":
         raise WorkerToolError(
-            "authority_db_absent_or_empty:source_graph.source_graph:canonical"
+            "authority_component_not_canonical_active:"
+            f"source_graph.source_graph:{db.authority_state}"
+        )
+    try:
+        db_path = _storage_registry_mod.resolve_database_path(registry, "source_graph")
+    except _storage_registry_mod.StorageRegistryError as exc:
+        raise WorkerToolError(
+            f"authority_registry_unresolved:source_graph.source_graph:{exc}"
+        ) from exc
+    if not db_path.is_relative_to(resolved_repo):
+        raise WorkerToolError("authority_db_path_escapes_repo:source_graph.source_graph")
+    if db_path.is_symlink():
+        raise WorkerToolError("authority_source_graph_db_symlink")
+    try:
+        if not db_path.is_file() or db_path.stat().st_size <= 0:
+            raise WorkerToolError(
+                "authority_db_absent_or_empty:source_graph.source_graph:canonical"
+            )
+    except OSError as exc:
+        raise WorkerToolError(f"authority_source_graph_db_unreadable:{exc}") from exc
+    try:
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.Error) as exc:
+        raise WorkerToolError(f"authority_source_graph_db_unreadable:{exc}") from exc
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        try:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+                )
+            }
+        except sqlite3.Error as exc:
+            raise WorkerToolError(f"authority_source_graph_db_unreadable:{exc}") from exc
+    finally:
+        conn.close()
+    if not set(_CANDIDATE_SOURCE_GRAPH_REQUIRED_TABLES).issubset(tables):
+        raise WorkerToolError("authority_source_graph_db_schema_incomplete")
+    identity = _source_graph_index_identity(
+        db_path, default_revision=_source_graph_mod.BUILD_REVISION
+    )
+    if not identity["finished_at"]:
+        raise WorkerToolError("authority_source_graph_db_generation_unrecorded")
+    if identity["build_revision"] != _source_graph_mod.BUILD_REVISION:
+        raise WorkerToolError(
+            f"authority_source_graph_db_wrong_revision:{identity['build_revision']}"
         )
     return AuthorityBinding(
         db_path=db_path,
         authority_source="canonical",
         authority_state="sole_authority",
-        authority_repo=ctx.authority_repo,
+        authority_repo=resolved_repo,
     )
+
+
+def _canonical_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding:
+    """Resolve the repository's canonical Source Graph database."""
+
+    return _canonical_source_graph_binding_for_repo(ctx.authority_repo)
+
+
+def verify_quality_review_prewarm_authority(authority_repo: Path) -> AuthorityBinding:
+    """Fail-closed canonical Source Graph authority binding for reviewer prewarm.
+
+    The launcher calls this before reviewer prewarm and before reviewer
+    runtime/provider registration, so a launch fails closed on a
+    noncanonical, mismatched, missing, symlinked, unreadable, empty,
+    schema-incomplete, or wrong-revision generation before either side
+    effect ever runs.  ``prewarm_quality_review_source_graph`` always
+    re-derives this same binding from ``authority_repo`` itself rather than
+    trusting a caller-supplied value, so a forged or stale binding can never
+    bypass these checks.
+    """
+
+    return _canonical_source_graph_binding_for_repo(authority_repo)
 
 
 def _rework_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding | None:
@@ -1531,7 +1655,10 @@ def verify_audit_ledger(
                 if len(result["source_graph_index_sequence"]) < 64:
                     result["source_graph_index_sequence"].append({
                         "revision": revision,
-                        "finished_at": str(payload.get("index_finished_at") or "")[:64],
+                        "finished_at": (
+                            str(payload.get("index_finished_at") or "")[:64]
+                            if isinstance(payload, dict) else ""
+                        ),
                     })
             try:
                 timestamp = datetime.fromisoformat(
@@ -2775,6 +2902,7 @@ def _ai_memory_exact(ctx: WorkerToolContext, *, key: str, related: bool) -> dict
             "WHERE m.key=? " + state_filter + "ORDER BY m.id DESC LIMIT 1",
             (bounded,),
         ).fetchone()
+        payload: dict[str, Any]
         if not related:
             payload = {"memory": dict(row) if row is not None else None, "count": 1 if row is not None else 0}
         elif row is None:
@@ -3808,6 +3936,7 @@ __all__ = [
     "source_graph_query",
     "source_graph_recommendation_roundtrip_gate",
     "verify_audit_ledger",
+    "verify_quality_review_prewarm_authority",
 ]
 
 
