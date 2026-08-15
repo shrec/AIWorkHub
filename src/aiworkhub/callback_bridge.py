@@ -1633,6 +1633,7 @@ class CallbackBridge:
         claude_repo_id: str = "",
         claude_window_id: str = "",
         claude_cli_run_fn: Any | None = None,
+        claude_session_id: str = "",
         provider: str = "",
     ):
         # lease_margin_seconds is a deliberate, visible constructor override
@@ -1695,6 +1696,11 @@ class CallbackBridge:
         self._claude_repo_id = claude_repo_id
         self._claude_window_id = claude_window_id
         self._claude_cli_run_fn = claude_cli_run_fn
+        # Optional defense-in-depth route pin (B: never claim, and never
+        # attempt delivery of, a batch bound to a DIFFERENT verified
+        # manager session, even within the same repo/provider). Empty
+        # (default) preserves the existing provider-wide claim behavior.
+        self._claude_session_id = str(claude_session_id or "")
         self._claude_adapter: ClaudeCallbackAdapter | None = None
         self._client: AppServerClient | None = None
         self._sideband_client: SidebandCallbackClient | None = None
@@ -2012,12 +2018,13 @@ class CallbackBridge:
             self._callback_store.seed_missing_review_callbacks(
                 conn, provider=self._provider
             )
+        claim_kwargs: dict[str, Any] = {}
         if self._provider:
-            return self._callback_store.claim_pending_callback_batch(
-                conn, self._lease_seconds, self._max_batch_members, provider=self._provider,
-            )
+            claim_kwargs["provider"] = self._provider
+        if self._claude_session_id:
+            claim_kwargs["origin_thread_id"] = self._claude_session_id
         return self._callback_store.claim_pending_callback_batch(
-            conn, self._lease_seconds, self._max_batch_members,
+            conn, self._lease_seconds, self._max_batch_members, **claim_kwargs,
         )
 
     def run_once(self) -> dict[str, Any]:
@@ -2286,8 +2293,13 @@ class CallbackDispatcher:
 
     def health(self) -> dict[str, Any]:
         running = self.is_running()
+        problems: list[str] = []
+        if not self.supported:
+            problems.append(f"unsupported_provider:{self.provider or 'unset'}")
+        elif self._start_error:
+            problems.append(f"start_error:{self._start_error}")
         out: dict[str, Any] = {
-            "ok": self.supported,
+            "ok": self.supported and not self._start_error,
             "dispatcher_running": running,
             "provider": self.provider,
             "provider_supported": self.supported,
@@ -2295,6 +2307,7 @@ class CallbackDispatcher:
             "repo_id": self.repo_id,
             "started_at": self._started_at,
             "last_start_error": self._start_error,
+            "problems": problems,
         }
         bridge = self._bridge
         if bridge is not None:
@@ -2346,6 +2359,33 @@ def ensure_dispatcher(
     return dispatcher
 
 
+def ensure_claude_delivery(
+    repo_root: Path | str,
+    *,
+    repo_id: str,
+    window_id: str,
+    bridge_kwargs: Mapping[str, Any] | None = None,
+) -> CallbackDispatcher:
+    """Start (or return) the ONE background delivery channel that surfaces
+    pending worker callbacks to a verified Claude manager's bound route
+    promptly, without the manager needing to remember to call the manual
+    long-poll wait tool.
+
+    Explicitly-named "claude" entry point over ``ensure_dispatcher`` so a
+    caller opting a verified Claude route into push delivery never needs
+    the generic multi-provider signature. ``repo_id``/``window_id`` are
+    required here (never guessed or defaulted) -- the underlying
+    ``CallbackBridge`` "claude_cli" transport already fails closed at
+    construction without both (B856); this entry point fails closed one
+    layer earlier, before any dispatcher is even registered.
+    """
+    if not repo_id or not window_id:
+        raise ValueError("ensure_claude_delivery requires repo_id and window_id")
+    return ensure_dispatcher(
+        repo_root, "claude", repo_id=repo_id, window_id=window_id, bridge_kwargs=bridge_kwargs,
+    )
+
+
 def get_dispatcher(repo_root: Path | str) -> CallbackDispatcher | None:
     with _DISPATCHER_REGISTRY_LOCK:
         return _DISPATCHER_REGISTRY.get(_dispatcher_registry_key(repo_root))
@@ -2378,17 +2418,30 @@ def stop_all_dispatchers() -> int:
     return len(dispatchers)
 
 
-def dispatcher_health(repo_root: Path | str) -> dict[str, Any]:
-    """Read-only health for the repo's dispatcher, or a not-running shape
-    if none is registered yet (never an error -- an unregistered dispatcher
-    on an otherwise-healthy repository is a normal, not-degraded state)."""
+def dispatcher_health(repo_root: Path | str, provider: str = "") -> dict[str, Any]:
+    """Read-only health for the repo's dispatcher, or a truthful
+    not-yet-started shape if none is registered yet (never an error -- an
+    unregistered dispatcher on an otherwise-healthy repository is a
+    normal, not-degraded state).
+
+    ``provider``, when given, scopes the not-registered shape to the
+    EXACT route being asked about: the reported ``provider``/
+    ``provider_supported`` reflect that requested route, never a stale or
+    unrelated default -- a Claude route must never read back a
+    ``provider_supported=False``/blank-provider shape (which upstream
+    callers could otherwise misreport as e.g. ``selected_provider=codex``
+    or a fabricated ``dispatcher_unregistered`` problem) merely because no
+    dispatcher for that route has been asked to start yet. Default ''
+    preserves the exact prior unscoped shape for existing callers.
+    """
     dispatcher = get_dispatcher(repo_root)
+    provider = str(provider or "").strip().lower()
     if dispatcher is None:
         return {
             "ok": True,
             "dispatcher_running": False,
-            "provider": "",
-            "provider_supported": False,
+            "provider": provider,
+            "provider_supported": provider in SUPPORTED_DISPATCH_PROVIDERS,
             "repo_root": str(Path(repo_root)),
             "repo_id": "",
             "started_at": "",
@@ -2397,6 +2450,7 @@ def dispatcher_health(repo_root: Path | str) -> dict[str, Any]:
             "pending_count": 0,
             "last_delivery_error": "",
             "registered": False,
+            "problems": [],
         }
     out = dispatcher.health()
     out["registered"] = True
@@ -2517,6 +2571,7 @@ __all__ = [
     "SidebandUnavailableError",
     "SUPPORTED_DISPATCH_PROVIDERS",
     "dispatcher_health",
+    "ensure_claude_delivery",
     "ensure_dispatcher",
     "get_dispatcher",
     "stop_all_dispatchers",

@@ -6,6 +6,40 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.69] - 2026-08-15
+
+### Added
+
+- Deliver worker callbacks to a verified Claude manager without manual polling,
+  so `review_ready` and `worker_failed` transitions reach the manager's active
+  MCP session instead of waiting in the inbox until it happens to poll. The
+  existing lease/ack contract is unchanged: one verified manager route holds a
+  batch, ack stays mandatory, an unacked batch stays redeliverable, and a route
+  whose provider, repo_id or session identity does not match never receives it.
+- Report a truthful provider-specific state from `dispatcher_health` on a Claude
+  route rather than `problems=[dispatcher_unregistered]` with
+  `selected_provider=codex`, which read as a broken dispatcher where none is
+  expected.
+
+### Changed
+
+- Run explicit platform-owned regression manifests on the Windows and macOS CI
+  jobs, covering native process/lock/temp/validation and Darwin
+  identity/launch/PATH/RSS/cleanup behaviour. Each OS step preflights with
+  `pytest --collect-only` and fails if a manifest entry collects nothing, so CI
+  can no longer pass silently on zero collected platform tests. Linux coverage
+  and the existing install/VSIX checks are unchanged.
+- Pin the three-OS CI contract with `tests/test_cross_platform_ci_contract.py`,
+  which fails if an OS manifest, a collection guard, or the full Linux suite is
+  removed.
+
+### Validation
+
+- Combined-tree run of the promoted changes: 133 passed; `ruff check
+  src/aiworkhub scripts tests` clean.
+- Each change additionally passed three independent cross-provider quality
+  reviewer lenses (correctness, security, code quality) before promotion.
+
 ## [0.9.68] - 2026-08-15
 
 ### Fixed

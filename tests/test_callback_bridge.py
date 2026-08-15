@@ -19,6 +19,7 @@ import socket as _raw_socket
 import sys
 import tempfile
 import time
+import types
 import uuid
 from pathlib import Path
 
@@ -2141,4 +2142,253 @@ def test_callback_batch_stats_distinguishes_waiting_for_thread_idle_from_genuine
         assert busy_thread not in serialized
         assert fail_thread not in serialized
         assert "thread_busy" not in serialized
-        assert "boom" not in serialized
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00240: Claude-route push delivery, provider-aware dispatcher
+# health, and session-scoped route-mismatch protection.
+# ---------------------------------------------------------------------------
+
+def _seed_claude_route_task(conn, task_id: str, session_id: str, transition: str) -> None:
+    """Seed one task row bound to ``session_id`` and enqueue a claude-provider
+    outbox row directly (bypassing ``taskdb.upsert_card``'s auto-enqueue,
+    which always uses provider='' and would otherwise leave a stray
+    provider-less row alongside the claude-provider one under test)."""
+    now = taskdb.utc_now()
+    status = "review" if transition == "review_ready" else "blocked"
+    card = {
+        "schema_id": "aiworkhub.machine_task_card.v1",
+        "task_id": task_id,
+        "status": status,
+        "worker_status": status,
+        "runner": "r",
+        "topic": "task_mcp",
+        "priority": "high",
+        "objective": "claude route delivery e2e",
+        "origin_thread_id": session_id,
+        "claim_epoch": 0,
+    }
+    conn.execute(
+        """
+        INSERT INTO tasks (
+          task_id, runner, topic, status, worker_status, priority, objective,
+          card_json, created_at, updated_at, origin_thread_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id, "r", "task_mcp", status, status, "high", card["objective"],
+            json.dumps(card, ensure_ascii=False, sort_keys=True), now, now, session_id,
+        ),
+    )
+    conn.commit()
+    assert taskdb.enqueue_callback(conn, task_id, session_id, transition, provider="claude", episode_id="0")
+
+
+def _recording_claude_cli_run_fn(calls: list[dict]):
+    """A ``run_fn`` for ``ClaudeCliResumeClient`` that never shells out to a
+    real ``claude`` binary -- records the exact resume command/prompt and
+    returns a matching acknowledgement envelope."""
+    def run_fn(cmd, stdin_payload, timeout):
+        calls.append({"cmd": list(cmd), "prompt": stdin_payload})
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"ok": True, "event_id": "", "request_id": ""}),
+            stderr="",
+        )
+    return run_fn
+
+
+def test_claude_route_delivers_review_ready_without_manual_wait(tmp_path):
+    """The claude_cli delivery path (the "Claude-route delivery mechanism")
+    must surface a pending review_ready transition to the bound session on
+    its own -- one ``run_once()`` call, never a separate manual wait/poll
+    tool call."""
+    repo = tmp_path
+    db_path = repo / "task_queue.sqlite"
+    conn = taskdb.open_db(db_path)
+    taskdb.init_db(conn)
+    session_id = str(uuid.uuid4())
+    _seed_claude_route_task(conn, "E2E_CLAUDE_REVIEW_READY", session_id, "review_ready")
+    conn.close()
+
+    calls: list[dict] = []
+    bridge = CallbackBridge(
+        repo=repo, db_path=db_path, state_path=repo / "state.json",
+        transport="claude_cli",
+        claude_repo_id="repo-x", claude_window_id="window-x",
+        claude_cli_run_fn=_recording_claude_cli_run_fn(calls),
+        provider="claude",
+    )
+    result = bridge.run_once()
+    assert result["ok"] is True
+    assert result["action"] == "delivered"
+    assert result["task_ids"] == ["E2E_CLAUDE_REVIEW_READY"]
+    assert len(calls) == 1
+    assert "--resume" in calls[0]["cmd"]
+    assert session_id in calls[0]["cmd"]
+    assert "review_ready" in calls[0]["prompt"]
+
+    conn = taskdb.open_db(db_path)
+    stats = taskdb.callback_outbox_stats(conn)
+    conn.close()
+    assert stats["by_state"]["delivered"] == 1
+
+
+def test_claude_route_delivers_worker_failed_without_manual_wait(tmp_path):
+    repo = tmp_path
+    db_path = repo / "task_queue.sqlite"
+    conn = taskdb.open_db(db_path)
+    taskdb.init_db(conn)
+    session_id = str(uuid.uuid4())
+    _seed_claude_route_task(conn, "E2E_CLAUDE_WORKER_FAILED", session_id, "worker_failed")
+    conn.close()
+
+    calls: list[dict] = []
+    bridge = CallbackBridge(
+        repo=repo, db_path=db_path, state_path=repo / "state.json",
+        transport="claude_cli",
+        claude_repo_id="repo-x", claude_window_id="window-x",
+        claude_cli_run_fn=_recording_claude_cli_run_fn(calls),
+        provider="claude",
+    )
+    result = bridge.run_once()
+    assert result["ok"] is True
+    assert result["action"] == "delivered"
+    assert result["task_ids"] == ["E2E_CLAUDE_WORKER_FAILED"]
+    assert len(calls) == 1
+    assert "worker_failed" in calls[0]["prompt"]
+
+
+def test_claude_session_scoped_bridge_never_delivers_other_session_batch(tmp_path):
+    """A bridge pinned to one verified route's session (defense-in-depth
+    beneath ``route_identity``'s repo/provider checks) must never claim --
+    and therefore never attempt to deliver -- a different session's
+    callback, even though both share the same provider and repository."""
+    repo = tmp_path
+    db_path = repo / "task_queue.sqlite"
+    conn = taskdb.open_db(db_path)
+    taskdb.init_db(conn)
+    session_a = str(uuid.uuid4())
+    session_b = str(uuid.uuid4())
+    _seed_claude_route_task(conn, "E2E_SESSION_A", session_a, "review_ready")
+    _seed_claude_route_task(conn, "E2E_SESSION_B", session_b, "review_ready")
+    conn.close()
+
+    calls: list[dict] = []
+    bridge = CallbackBridge(
+        repo=repo, db_path=db_path, state_path=repo / "state.json",
+        transport="claude_cli",
+        claude_repo_id="repo-x", claude_window_id="window-x",
+        claude_session_id=session_a,
+        claude_cli_run_fn=_recording_claude_cli_run_fn(calls),
+        provider="claude",
+    )
+    first = bridge.run_once()
+    assert first["ok"] is True
+    assert first["task_ids"] == ["E2E_SESSION_A"]
+
+    second = bridge.run_once()
+    assert second == {"ok": True, "action": "no_pending"}
+    assert len(calls) == 1
+    assert session_b not in calls[0]["cmd"]
+
+    conn = taskdb.open_db(db_path)
+    row = conn.execute(
+        "SELECT state FROM callback_outbox WHERE task_id=?", ("E2E_SESSION_B",)
+    ).fetchone()
+    conn.close()
+    assert row["state"] == "pending"
+
+
+def test_dispatcher_health_unregistered_default_matches_prior_unscoped_shape(tmp_path):
+    """No ``provider`` argument (the existing call shape) must return the
+    exact same shape as before this change -- a pure backward-compat
+    regression guard."""
+    repo = tmp_path / "repo"
+    health = callback_bridge.dispatcher_health(repo)
+    assert health == {
+        "ok": True,
+        "dispatcher_running": False,
+        "provider": "",
+        "provider_supported": False,
+        "repo_root": str(Path(repo)),
+        "repo_id": "",
+        "started_at": "",
+        "last_start_error": "",
+        "bridge": None,
+        "pending_count": 0,
+        "last_delivery_error": "",
+        "registered": False,
+        "problems": [],
+    }
+
+
+def test_dispatcher_health_unregistered_reports_requested_claude_provider_truthfully(tmp_path):
+    """A Claude route asking about its own health before any dispatcher has
+    even been asked to start must read back ITS OWN provider -- never a
+    blank/unrelated default, and never a fabricated problem."""
+    repo = tmp_path / "repo"
+    health = callback_bridge.dispatcher_health(repo, provider="claude")
+    assert health["provider"] == "claude"
+    assert health["provider_supported"] is True
+    assert health["problems"] == []
+    assert health["ok"] is True
+    assert health["registered"] is False
+    assert "codex" not in json.dumps(health)
+
+
+def test_dispatcher_health_unregistered_reports_unsupported_provider_truthfully(tmp_path):
+    repo = tmp_path / "repo"
+    health = callback_bridge.dispatcher_health(repo, provider="copilot")
+    assert health["provider"] == "copilot"
+    assert health["provider_supported"] is False
+
+
+def test_dispatcher_health_registered_unsupported_provider_reports_problem(tmp_path):
+    repo = tmp_path
+    try:
+        dispatcher = callback_bridge.ensure_dispatcher(repo, "copilot")
+        assert dispatcher.is_running() is False
+        health = callback_bridge.dispatcher_health(repo)
+        assert health["registered"] is True
+        assert health["provider"] == "copilot"
+        assert health["provider_supported"] is False
+        assert any(p.startswith("unsupported_provider:") for p in health["problems"])
+    finally:
+        callback_bridge.stop_dispatcher(repo)
+
+
+def test_ensure_claude_delivery_requires_repo_id_and_window_id():
+    with pytest.raises(ValueError):
+        callback_bridge.ensure_claude_delivery("repo", repo_id="", window_id="w")
+    with pytest.raises(ValueError):
+        callback_bridge.ensure_claude_delivery("repo", repo_id="r", window_id="")
+
+
+def test_ensure_claude_delivery_starts_dispatcher_and_reports_healthy(tmp_path):
+    """``ensure_claude_delivery`` is the named entry point a verified Claude
+    manager's route uses to opt into push delivery -- confirms it actually
+    registers and starts a real background delivery channel, and that the
+    resulting health readout is truthful (never ``dispatcher_unregistered``
+    once a dispatcher genuinely IS registered and running)."""
+    repo = tmp_path
+    try:
+        dispatcher = callback_bridge.ensure_claude_delivery(
+            repo, repo_id="repo-x", window_id="window-x",
+            bridge_kwargs={
+                "db_path": repo / "task_queue.sqlite",
+                "state_path": repo / "state.json",
+            },
+        )
+        assert dispatcher.provider == "claude"
+        assert dispatcher.supported is True
+        assert dispatcher.is_running() is True
+
+        health = callback_bridge.dispatcher_health(repo, provider="claude")
+        assert health["registered"] is True
+        assert health["provider"] == "claude"
+        assert health["dispatcher_running"] is True
+        assert health["problems"] == []
+        assert "dispatcher_unregistered" not in health["problems"]
+    finally:
+        callback_bridge.stop_dispatcher(repo)

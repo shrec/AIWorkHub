@@ -12,13 +12,20 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.68
+## What's new in 0.9.69
 
-- VS Code LM requests are now bound to the exact fresh editor window selected
-  by readiness, so stale or parallel windows cannot steal a worker launch.
-- Progress and terminal receipts identify the claimant window, extension-host
-  process, extension version and supported bridge capabilities.
-- Legacy untargeted requests remain compatible during rolling upgrades.
+- A verified Claude manager now receives worker callbacks in its active session
+  instead of waiting in the inbox until it happens to poll, so `review_ready`
+  and `worker_failed` transitions reach the manager as they happen.
+- The lease and ack contract is unchanged: one verified manager route holds a
+  batch, ack stays mandatory, an unacked batch stays redeliverable, and a route
+  whose provider, repository or session identity does not match never receives
+  it.
+- `dispatcher_health` reports a truthful provider-specific state on a Claude
+  route instead of flagging an unregistered dispatcher where none is expected.
+- Windows and macOS CI jobs run explicit platform-owned regression manifests and
+  fail if a manifest entry collects nothing, so CI can no longer pass silently
+  on zero collected platform tests.
 
 See the packaged **Changelog** for the complete release summary.
 

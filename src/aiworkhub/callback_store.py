@@ -388,8 +388,19 @@ def _task_still_in_matching_terminal_state(
     # recheck must derive its expectation the exact same way or every
     # non-review_ready callback would mismatch here and be superseded
     # (silently dropped) instead of delivered.
-    raw_terminal = str(card.get("terminal_substatus") or "").strip() or current_status
-    if resolve_callback_transition(raw_terminal) != transition:
+    terminal_substatus = str(card.get("terminal_substatus") or "").strip()
+    if terminal_substatus:
+        # An explicit substatus is the authoritative signal for exactly
+        # which transition the task is currently in.
+        if resolve_callback_transition(terminal_substatus) != transition:
+            return False
+    elif resolve_callback_transition(current_status) != transition and current_status != "blocked":
+        # No substatus recorded (e.g. a worker-crash path that only ever
+        # set the coarse status/worker_status columns): a "blocked"
+        # status alone is ambiguous between the literal "blocked"
+        # transition and every other terminal-failure transition that
+        # also lands the task in "blocked" -- defer to the status-based
+        # checks below instead of rejecting on this coarse mismatch.
         return False
     if transition == "blocked":
         return current_status in ("review", "blocked")
@@ -608,6 +619,7 @@ def claim_pending_callback_batch(
     lease_seconds: int = 120,
     max_members: int = DEFAULT_CALLBACK_BATCH_MAX_MEMBERS,
     provider: str = "",
+    origin_thread_id: str = "",
 ) -> dict | None:
     """Atomically claim one delivery batch, or None if nothing is claimable.
 
@@ -616,11 +628,20 @@ def claim_pending_callback_batch(
     unassigned pending row for the same origin_thread_id (bounded to
     ``max_members``). Never two inflight batches for the same thread.
     Non-blocking scheduled retry: a 'pending' batch whose ``not_before_at``
-    is still in the future is skipped, never blocking other threads."""
+    is still in the future is skipped, never blocking other threads.
+
+    ``origin_thread_id``, when non-empty, scopes claiming to exactly that
+    route's own batches -- a caller that knows its own verified route's
+    bound session/thread identity never claims (and is never handed) a
+    different route's callback, even when both share the same provider.
+    Default '' preserves the existing provider-wide claim behavior."""
     _ensure_callback_outbox_table(conn)
     _ensure_callback_batches_table(conn)
     provider = str(provider or "").strip().lower()
+    origin_thread_id = str(origin_thread_id or "").strip()
     provider_where = " AND provider=?" if provider else ""
+    thread_where = " AND origin_thread_id=?" if origin_thread_id else ""
+    scope_params = tuple(p for p in (provider, origin_thread_id) if p)
     while True:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -630,16 +651,16 @@ def claim_pending_callback_batch(
             inflight_threads = {
                 row["origin_thread_id"]
                 for row in conn.execute(
-                    "SELECT DISTINCT origin_thread_id FROM callback_batches WHERE state='inflight'" + provider_where,
-                    (provider,) if provider else (),
+                    "SELECT DISTINCT origin_thread_id FROM callback_batches WHERE state='inflight'" + provider_where + thread_where,
+                    scope_params,
                 ).fetchall()
             }
 
             due_pending_batch = None
             for row in conn.execute(
-                "SELECT * FROM callback_batches WHERE state='pending' " + provider_where +
+                "SELECT * FROM callback_batches WHERE state='pending' " + provider_where + thread_where +
                 " ORDER BY created_at ASC, batch_id ASC",
-                (provider,) if provider else (),
+                scope_params,
             ).fetchall():
                 if row["origin_thread_id"] in inflight_threads:
                     continue
@@ -653,16 +674,16 @@ def claim_pending_callback_batch(
                 reserved_threads = inflight_threads | {
                     row["origin_thread_id"]
                     for row in conn.execute(
-                        "SELECT DISTINCT origin_thread_id FROM callback_batches WHERE state='pending'" + provider_where,
-                        (provider,) if provider else (),
+                        "SELECT DISTINCT origin_thread_id FROM callback_batches WHERE state='pending'" + provider_where + thread_where,
+                        scope_params,
                     ).fetchall()
                 }
                 oldest_unassigned = None
                 for row in conn.execute(
                     "SELECT origin_thread_id FROM callback_outbox "
-                    "WHERE state='pending' AND batch_id='' " + provider_where +
+                    "WHERE state='pending' AND batch_id='' " + provider_where + thread_where +
                     " ORDER BY created_at ASC, outbox_id ASC",
-                    (provider,) if provider else (),
+                    scope_params,
                 ).fetchall():
                     if row["origin_thread_id"] not in reserved_threads:
                         oldest_unassigned = row
@@ -745,6 +766,37 @@ def claim_pending_callback_batch(
             "attempts": int(batch_row["attempts"]),
             "members": [dict(m) for m in member_rows],
         }
+
+
+def has_deliverable_callback(
+    conn: sqlite3.Connection, *, provider: str, origin_thread_id: str,
+) -> bool:
+    """Non-mutating peek: is there a pending, currently-due callback for
+    this exact verified route right now?
+
+    Never claims, leases, or mutates anything -- a caller deciding whether
+    a prompt delivery attempt is worthwhile (e.g. a push-delivery channel
+    surfacing a wake to a verified Claude manager) can check this without
+    consuming a claim cycle or racing the real ``claim_pending_callback_batch``
+    caller for the lease."""
+    _ensure_callback_outbox_table(conn)
+    _ensure_callback_batches_table(conn)
+    provider = str(provider or "").strip().lower()
+    origin_thread_id = str(origin_thread_id or "").strip()
+    if not provider or not origin_thread_id:
+        return False
+    now_iso = utc_now()
+    row = conn.execute(
+        """
+        SELECT o.outbox_id FROM callback_outbox o
+        LEFT JOIN callback_batches b ON b.batch_id = o.batch_id AND o.batch_id != ''
+        WHERE o.state='pending' AND o.provider=? AND o.origin_thread_id=?
+          AND (b.batch_id IS NULL OR (b.state='pending' AND (b.not_before_at='' OR b.not_before_at<=?)))
+        LIMIT 1
+        """,
+        (provider, origin_thread_id, now_iso),
+    ).fetchone()
+    return row is not None
 
 
 def _require_lease_id(lease_id: object) -> str:
@@ -1312,6 +1364,7 @@ __all__ = [
     "current_claim_episode",
     "enqueue_callback",
     "claim_pending_callback_batch",
+    "has_deliverable_callback",
     "recover_incompatible_long_inflight_batches",
     "mark_batch_delivered",
     "defer_batch_busy",

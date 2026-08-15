@@ -51,10 +51,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux, os: ubuntu-latest, mode: local }
-          - { name: remote-ssh-contract, os: ubuntu-latest, mode: remote_ssh_contract }
-          - { name: windows, os: windows-latest, mode: local }
-          - { name: macos, os: macos-latest, mode: local }
+          - { name: linux, os: ubuntu-latest, mode: local, platform: linux }
+          - { name: remote-ssh-contract, os: ubuntu-latest, mode: remote_ssh_contract, platform: linux }
+          - { name: windows, os: windows-latest, mode: local, platform: windows }
+          - { name: macos, os: macos-latest, mode: local, platform: macos }
 
     steps:
       - uses: actions/checkout@v7
@@ -83,6 +83,113 @@ jobs:
           python -m pip install ".[source-graph-semantic]"
           python -m pip install "pytest>=8,<10"
           python -m pytest tests/test_platform_io.py tests/test_cross_platform_runtime.py tests/test_release_qualification_e2e.py tests/test_quality_calibration.py tests/test_source_graph_tree_sitter_semantic.py -q --tb=short --junitxml=qualification-${{ matrix.name }}.xml
+
+      - name: Run Windows-owned nt regressions (lock/process/temp/validation)
+        if: matrix.platform == 'windows'
+        shell: bash
+        env:
+          AIWORKHUB_QUALIFICATION_MODE: ${{ matrix.mode }}
+        run: |
+          WINDOWS_NT_MANIFEST=(
+            tests/test_windows_launch_lock_regression.py
+            tests/test_windows_pid_identity.py
+            tests/test_windows_vscode_lm_launch_portability.py
+            tests/test_terminal_authority_windows.py
+            tests/test_completion_inbox_process_enrichment_windows_v1.py
+            tests/test_completion_inbox_finalize_failed_windows_v3.py
+            tests/test_aiworkhub_windows_secure_broker_b1464.py
+            tests/test_runtime_temp.py
+            tests/test_validation_pytest_runtime_b755_v1.py
+            tests/test_validation_exec_scratch_b753_v1.py
+            tests/test_validation_tmpdir_prefix_b773_v1.py
+            tests/test_validation_cwd_prefix_b892.py
+            tests/test_validation_executable_resolution_b1460.py
+            tests/test_platform_io_blocking_lock.py
+          )
+          python - windows "${WINDOWS_NT_MANIFEST[@]}" <<'PY'
+          import subprocess
+          import sys
+
+          platform, *manifest = sys.argv[1:]
+          proc = subprocess.run(
+              [sys.executable, "-m", "pytest", "--collect-only", "-q", *manifest],
+              capture_output=True,
+              text=True,
+          )
+          if proc.returncode != 0:
+              raise SystemExit(
+                  f"{platform} collection failed:\n{proc.stdout}\n{proc.stderr}"
+              )
+          collected = [
+              line.strip() for line in proc.stdout.splitlines() if "::" in line
+          ]
+          if not collected:
+              raise SystemExit(
+                  f"{platform} collected zero platform-owned tests; "
+                  "refusing to pass silently"
+              )
+          contributed = {line.split("::", 1)[0] for line in collected}
+          missing = [path for path in manifest if path not in contributed]
+          if missing:
+              raise SystemExit(
+                  f"{platform} manifest collected nothing for: {missing}"
+              )
+          print(
+              f"{platform}: collected {len(collected)} tests across "
+              f"{len(manifest)} manifest files"
+          )
+          PY
+          python -m pytest "${WINDOWS_NT_MANIFEST[@]}" -q --tb=short --junitxml=qualification-${{ matrix.name }}-nt.xml
+
+      - name: Run macOS-owned Darwin regressions (identity/launch/PATH/RSS/cleanup)
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          AIWORKHUB_QUALIFICATION_MODE: ${{ matrix.mode }}
+        run: |
+          MACOS_DARWIN_MANIFEST=(
+            tests/test_process_launcher.py
+            tests/test_aiworkhub_atomic_launch_lifecycle_b1462.py
+            tests/test_validation_executable_resolution_b1460.py
+            tests/test_evidence_instruments.py
+            tests/test_finalized_workspace_gc_b512_v1.py
+            tests/test_runtime_temp.py
+            tests/test_validation_cwd_prefix_b892.py
+          )
+          python - macos "${MACOS_DARWIN_MANIFEST[@]}" <<'PY'
+          import subprocess
+          import sys
+
+          platform, *manifest = sys.argv[1:]
+          proc = subprocess.run(
+              [sys.executable, "-m", "pytest", "--collect-only", "-q", *manifest],
+              capture_output=True,
+              text=True,
+          )
+          if proc.returncode != 0:
+              raise SystemExit(
+                  f"{platform} collection failed:\n{proc.stdout}\n{proc.stderr}"
+              )
+          collected = [
+              line.strip() for line in proc.stdout.splitlines() if "::" in line
+          ]
+          if not collected:
+              raise SystemExit(
+                  f"{platform} collected zero platform-owned tests; "
+                  "refusing to pass silently"
+              )
+          contributed = {line.split("::", 1)[0] for line in collected}
+          missing = [path for path in manifest if path not in contributed]
+          if missing:
+              raise SystemExit(
+                  f"{platform} manifest collected nothing for: {missing}"
+              )
+          print(
+              f"{platform}: collected {len(collected)} tests across "
+              f"{len(manifest)} manifest files"
+          )
+          PY
+          python -m pytest "${MACOS_DARWIN_MANIFEST[@]}" -q --tb=short --junitxml=qualification-${{ matrix.name }}-darwin.xml
 
       - name: Set up Node.js
         uses: actions/setup-node@v6

@@ -1,5 +1,31 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.69 — 2026-08-15
+
+### Added
+
+- Deliver worker callbacks to a verified Claude manager without manual polling,
+  so `review_ready` and `worker_failed` transitions reach the manager's active
+  session instead of waiting in the inbox until it happens to poll.
+- Keep the lease and ack contract unchanged: one verified manager route holds a
+  batch, ack stays mandatory, an unacked batch stays redeliverable, and a route
+  whose provider, repository or session identity does not match never receives
+  it.
+
+### Fixed
+
+- Report a truthful provider-specific state from `dispatcher_health` on a Claude
+  route instead of an unregistered-dispatcher problem where no dispatcher is
+  expected.
+
+### Changed
+
+- Run explicit platform-owned regression manifests on the Windows and macOS CI
+  jobs, each preflighted with a collection guard that fails when a manifest
+  entry collects nothing, so CI can no longer pass silently on zero collected
+  platform tests. Linux coverage and the existing install/VSIX checks are
+  unchanged.
+
 ## 0.9.68 — 2026-08-15
 
 ### Fixed
