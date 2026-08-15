@@ -3594,6 +3594,61 @@ def _metadata_broker_handshake_receive(sock: Any, deadline: float) -> tuple[int,
     return listener_fd, error
 
 
+def _metadata_broker_child_exec(argv: list[str]) -> int:
+    """Install the notify filter in a freshly exec'd interpreter.
+
+    ``_landlock_exec`` can run inside a multi-threaded pytest or manager
+    process.  Running Python, ctypes and libseccomp between ``fork`` and
+    ``exec`` is not safe in that situation: an inherited runtime/library lock
+    can make the child disappear before it transfers the listener, which the
+    parent observes only as ``handshake_eof``.  The parent therefore starts
+    this small helper with ``Popen`` (whose fork/exec path stays in CPython's C
+    implementation) and all non-trivial setup happens after a fresh exec.
+    """
+    import socket
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--metadata-broker-child", action="store_true", required=True)
+    parser.add_argument("--parent-pid", required=True, type=int)
+    parser.add_argument("--socket-fd", required=True, type=int)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = list(args.command)
+    if command and command[0] == "--":
+        command.pop(0)
+    if not command:
+        raise WorkspaceError("metadata_broker_command_empty")
+
+    child_sock = socket.socket(fileno=args.socket_fd)
+    try:
+        _set_pdeathsig_sigkill(args.parent_pid)
+        listener = _install_metadata_notify_filter()
+        try:
+            _metadata_broker_handshake_send(child_sock, listener)
+        finally:
+            os.close(listener)
+    except BaseException as exc:
+        diagnostic = f"{type(exc).__name__}:{exc}".encode("utf-8", "replace")[:1024]
+        _metadata_broker_handshake_error(child_sock, diagnostic)
+        return 126
+    finally:
+        child_sock.close()
+
+    try:
+        os.execvpe(command[0], command, os.environ.copy())
+    except BaseException as exc:
+        try:
+            os.write(
+                2,
+                (
+                    f"metadata_broker_exec_failed:{type(exc).__name__}:{exc}\n"
+                ).encode("utf-8", "replace")[:2048],
+            )
+        except BaseException:
+            pass
+    return 126
+
+
 def _landlock_exec(argv: list[str]) -> int:
     import socket
 
@@ -3636,46 +3691,32 @@ def _landlock_exec(argv: list[str]) -> int:
         # this trusted parent.
         parent_sock, child_sock = socket.socketpair()
         broker_parent_pid = os.getpid()
-        child_pid = os.fork()
-        if child_pid == 0:
-            try:
-                parent_sock.close()
-                # New session so the whole validator subtree shares
-                # ``pgid == child_pid``: this lets the trusted parent
-                # authenticate brokered requests as descendants and kill the
-                # entire group on error/timeout, and the parent-death signal
-                # makes the child die if the broker parent is killed first.
-                os.setsid()
-                _set_pdeathsig_sigkill(broker_parent_pid)
-                listener = _install_metadata_notify_filter()
-                _metadata_broker_handshake_send(child_sock, listener)
-                os.close(listener)
-                child_sock.close()
-            except BaseException as exc:
-                diagnostic = (
-                    f"{type(exc).__name__}:{exc}".encode("utf-8", "replace")[:1024]
-                )
-                try:
-                    _metadata_broker_handshake_error(child_sock, diagnostic)
-                finally:
-                    try:
-                        child_sock.close()
-                    except OSError:
-                        pass
-                os._exit(126)
-            try:
-                os.execvpe(command[0], command, os.environ.copy())
-            except BaseException as exc:
-                try:
-                    os.write(
-                        2,
-                        (
-                            f"metadata_broker_exec_failed:{type(exc).__name__}:{exc}\n"
-                        ).encode("utf-8", "replace")[:2048],
-                    )
-                except BaseException:
-                    pass
-            os._exit(126)
+        helper_argv = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--metadata-broker-child",
+            "--parent-pid",
+            str(broker_parent_pid),
+            "--socket-fd",
+            str(child_sock.fileno()),
+            "--",
+            *command,
+        ]
+        try:
+            child_process = subprocess.Popen(
+                helper_argv,
+                close_fds=True,
+                pass_fds=(child_sock.fileno(),),
+                start_new_session=True,
+                env=os.environ.copy(),
+            )
+        except OSError as exc:
+            parent_sock.close()
+            child_sock.close()
+            raise WorkspaceError(
+                f"metadata_broker_child_start_failed:{type(exc).__name__}:{exc}"
+            ) from exc
+        child_pid = child_process.pid
         child_sock.close()
         try:
             listener_fd, listener_error = _metadata_broker_handshake_receive(
@@ -4692,6 +4733,8 @@ __all__ = [
 
 if __name__ == "__main__":
     try:
+        if "--metadata-broker-child" in sys.argv[1:]:
+            raise SystemExit(_metadata_broker_child_exec(sys.argv[1:]))
         raise SystemExit(_landlock_exec(sys.argv[1:]))
     except (OSError, WorkspaceError) as exc:
         print(f"secure sandbox setup failed: {exc}", file=sys.stderr)
