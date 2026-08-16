@@ -6,6 +6,31 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.75] - 2026-08-16
+
+### Fixed
+
+- The context audit trail no longer disagrees with itself about whether a task
+  is required. `context_writes` treated `task_id` as optional while the
+  `context_mutations` schema declared it `NOT NULL` with no default; the two
+  only coexisted because the bounds helper always returned a string, so an
+  absent task was stored as the empty string. A KB or AI Memory write made by a
+  manager outside any task genuinely has no task, and an empty string is a lie
+  shaped like data — indistinguishable from a task whose id is blank. `task_id`
+  is now nullable, absence is stored as `NULL`, and the code and the schema
+  state the same contract.
+- A context write that fails an integrity constraint now names the offending
+  column. Previously the caller saw only `SQLITE_CONSTRAINT_NOTNULL` and had to
+  guess which of twelve `NOT NULL` columns was at fault. The error now carries
+  the component, the action and the exact column, turning a future occurrence
+  from a guess into a fact.
+- The `context_mutations` migration is atomic. The table rebuild runs inside a
+  single transaction and verifies that the copied row count matches the source
+  before committing; on mismatch it rolls back and leaves the original table
+  untouched. A partial failure could previously strand audit rows while
+  reporting success — destroying, silently, the very evidence the table exists
+  to hold.
+
 ## [0.9.74] - 2026-08-16
 
 ### Security

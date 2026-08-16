@@ -1,5 +1,22 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.75 — 2026-08-16
+
+### Fixed
+
+- The context audit trail no longer disagrees with itself about whether a task
+  is required. Knowledge Base and AI Memory writes made by a manager outside any
+  task genuinely have no task, and they were being stored with an empty-string
+  `task_id` because the code called the field optional while the schema declared
+  it mandatory. Absence is now stored as `NULL`, and the code and the schema
+  state the same contract.
+- A context write that fails an integrity constraint now names the offending
+  column, instead of reporting only `SQLITE_CONSTRAINT_NOTNULL` and leaving the
+  caller to guess which of twelve columns was at fault.
+- The `context_mutations` migration is atomic: the rebuild runs in a single
+  transaction and verifies the copied row count before committing, so a partial
+  failure can no longer strand audit rows while reporting success.
+
 ## 0.9.74 — 2026-08-16
 
 ### Security

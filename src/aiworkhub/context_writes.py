@@ -44,11 +44,48 @@ def _bounded(value: Any, *, field: str, max_bytes: int, required: bool = True) -
     return text
 
 
-def _identity(actor: dict[str, Any]) -> dict[str, str]:
-    result = {
+_INTEGRITY_COLUMN_RE = re.compile(r"failed:\s*([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)?)")
+
+
+def _integrity_column(exc: sqlite3.IntegrityError) -> str:
+    """Parse the exact offending ``table.column`` from a sqlite integrity error.
+
+    sqlite spells NOT NULL / UNIQUE / CHECK failures as
+    ``... constraint failed: <table>.<column>``.  Surfacing that qualified name
+    turns every future occurrence from a guess across a dozen NOT NULL columns
+    into a fact.  When no column is present, fall back to a *bounded* slice of
+    the raw message: the structured component/action/column fields stay the
+    primary signal, and the raw text is a capped fallback, never an unbounded
+    leak of sqlite internals to the caller.
+    """
+    match = _INTEGRITY_COLUMN_RE.search(str(exc))
+    if match:
+        return match.group(1)
+    raw = " ".join(str(exc).split())
+    return raw[:120] if raw else "unknown"
+
+
+def _integrity_error(
+    exc: sqlite3.IntegrityError, *, component: str, action: str
+) -> ContextWriteError:
+    """Re-shape a raw sqlite IntegrityError into a column-naming ContextWriteError."""
+    column = _integrity_column(exc)
+    return ContextWriteError(
+        f"context_write_integrity_error:component={component}:action={action}:column={column}"
+    )
+
+
+def _identity(actor: dict[str, Any]) -> dict[str, str | None]:
+    # task_id is genuinely optional: a manager write made outside any task has
+    # no task, and that absence is stored as NULL (see the nullable task_id
+    # column in _open) rather than as an empty-string sentinel that cannot be
+    # told apart from a task whose id is blank.  _bounded still rejects a
+    # malformed task_id; an absent or blank one collapses to None.
+    task_id = _bounded(actor.get("task_id", ""), field="task_id", max_bytes=256, required=False)
+    result: dict[str, str | None] = {
         "role": _bounded(actor.get("role", ""), field="actor_role", max_bytes=32),
         "actor_id": _bounded(actor.get("actor_id", ""), field="actor_id", max_bytes=256),
-        "task_id": _bounded(actor.get("task_id", ""), field="task_id", max_bytes=256, required=False),
+        "task_id": task_id or None,
         "provider": _bounded(actor.get("provider", ""), field="provider", max_bytes=64),
         "session_id": _bounded(actor.get("session_id", ""), field="session_id", max_bytes=256),
     }
@@ -70,12 +107,13 @@ def _open(repo: Path, db_id: str) -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS context_mutations("
         "id INTEGER PRIMARY KEY,idempotency_key TEXT UNIQUE NOT NULL,component TEXT NOT NULL,"
         "action TEXT NOT NULL,entity_key TEXT NOT NULL,actor_role TEXT NOT NULL,actor_id TEXT NOT NULL,"
-        "task_id TEXT NOT NULL,provider TEXT NOT NULL,session_id TEXT NOT NULL,provenance TEXT NOT NULL,"
+        "task_id TEXT,provider TEXT NOT NULL,session_id TEXT NOT NULL,provenance TEXT NOT NULL,"
         "payload_sha256 TEXT NOT NULL,created_at TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS context_entity_state("
         "entity_type TEXT NOT NULL,entity_id INTEGER NOT NULL,status TEXT NOT NULL,"
         "superseded_by INTEGER,updated_at TEXT NOT NULL,PRIMARY KEY(entity_type,entity_id));"
     )
+    _normalize_context_mutations_schema(con)
     if db_id == "memory":
         _normalize_memory_schema(con)
     return con
@@ -160,6 +198,72 @@ def _normalize_memory_schema(con: sqlite3.Connection) -> None:
         raise ContextWriteError(f"fts_normalization_failed:{result.get('error', 'unknown')}")
 
 
+def _normalize_context_mutations_schema(con: sqlite3.Connection) -> None:
+    """Make ``context_mutations.task_id`` nullable on legacy stores.
+
+    Early databases declared ``task_id TEXT NOT NULL`` and recorded every
+    task-less manager write as the empty string -- data shaped like a lie,
+    indistinguishable from a task whose id is genuinely blank.  When an actual
+    NOT NULL constraint on task_id is observed, rebuild the table with a
+    nullable task_id, preserve ids, and normalise the historical empty-string
+    sentinel to NULL so absence becomes representable and honest.  Every other
+    column keeps its NOT NULL guarantee.  Idempotent: once task_id is already
+    nullable this is a cheap no-op.
+
+    The rebuild is atomic.  ``context_mutations`` *is* the audit trail; a
+    partial rebuild that stranded or dropped rows while reporting success would
+    destroy exactly the evidence the table exists to hold, undetectably -- the
+    original NF-2026-00268 failure mode, where an empty audit table could not be
+    told apart from one that was never written.  So the whole
+    rename/create/copy/drop runs inside one ``BEGIN IMMEDIATE`` transaction, the
+    copied row count is verified against the source count, and any failure --
+    a count mismatch or any exception -- rolls back to leave the original table
+    untouched and complete, then re-raises.
+    """
+    info = con.execute("PRAGMA table_info(context_mutations)").fetchall()
+    if not info:
+        return
+    # PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk.
+    task_id_notnull = any(str(col[1]) == "task_id" and bool(col[3]) for col in info)
+    if not task_id_notnull:
+        return
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        source_count = con.execute(
+            "SELECT COUNT(*) FROM context_mutations"
+        ).fetchone()[0]
+        con.execute(
+            "ALTER TABLE context_mutations RENAME TO context_mutations_legacy_notnull"
+        )
+        con.execute(
+            "CREATE TABLE context_mutations("
+            "id INTEGER PRIMARY KEY,idempotency_key TEXT UNIQUE NOT NULL,component TEXT NOT NULL,"
+            "action TEXT NOT NULL,entity_key TEXT NOT NULL,actor_role TEXT NOT NULL,actor_id TEXT NOT NULL,"
+            "task_id TEXT,provider TEXT NOT NULL,session_id TEXT NOT NULL,provenance TEXT NOT NULL,"
+            "payload_sha256 TEXT NOT NULL,created_at TEXT NOT NULL)"
+        )
+        con.execute(
+            "INSERT INTO context_mutations(id,idempotency_key,component,action,entity_key,actor_role,"
+            "actor_id,task_id,provider,session_id,provenance,payload_sha256,created_at) "
+            "SELECT id,idempotency_key,component,action,entity_key,actor_role,actor_id,"
+            "NULLIF(task_id,''),provider,session_id,provenance,payload_sha256,created_at "
+            "FROM context_mutations_legacy_notnull"
+        )
+        copied_count = con.execute(
+            "SELECT COUNT(*) FROM context_mutations"
+        ).fetchone()[0]
+        if copied_count != source_count:
+            raise ContextWriteError(
+                "context_mutations_migration_row_count_mismatch:"
+                f"source={source_count}:copied={copied_count}"
+            )
+        con.execute("DROP TABLE context_mutations_legacy_notnull")
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+
+
 def ensure_memories_fts(repo: Path) -> dict[str, Any]:
     """Public entry point for search-path FTS repair on the canonical memory DB.
 
@@ -207,7 +311,7 @@ def _begin(con: sqlite3.Connection, *, idempotency_key: str) -> sqlite3.Row | No
 
 def _record(
     con: sqlite3.Connection, *, idempotency_key: str, component: str, action: str,
-    entity_key: str, actor: dict[str, str], provenance: str, payload: dict[str, Any],
+    entity_key: str, actor: dict[str, str | None], provenance: str, payload: dict[str, Any],
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     digest = hashlib.sha256(
@@ -276,7 +380,10 @@ def session_write(
                 topic=topic,
                 content=content,
                 document_id=doc_id,
-                task_id=identity["task_id"],
+                # The context_graph projection keeps its own empty-string
+                # convention for a task-less write; only the audit trail
+                # (context_mutations, via _record) stores NULL.
+                task_id=identity["task_id"] or "",
                 occurred_at=timestamp,
             )
         _record(
@@ -286,6 +393,9 @@ def session_write(
         )
         con.commit()
         return {"ok": True, "idempotent": False, "action": action, "document_id": doc_id, "timestamp": timestamp}
+    except sqlite3.IntegrityError as exc:
+        con.rollback()
+        raise _integrity_error(exc, component="session", action=action) from exc
     except Exception:
         con.rollback()
         raise
@@ -350,6 +460,9 @@ def memory_write(
                 payload={"key": key, "value": value, "tags": tags, "scope": scope})
         con.commit()
         return {"ok": True, "idempotent": False, "action": action, "key": key, "memory_id": entity_id, "status": "archived" if action == "archive" else "active"}
+    except sqlite3.IntegrityError as exc:
+        con.rollback()
+        raise _integrity_error(exc, component="memory", action=action) from exc
     except Exception:
         con.rollback()
         raise
@@ -413,6 +526,9 @@ def kb_write(
                 payload={"key": key, "title": title, "body": body, "category": category, "tags": tags, "source_refs": source_refs})
         con.commit()
         return {"ok": True, "idempotent": False, "action": action, "key": key, "entry_id": entity_id, "status": "archived" if action == "archive" else "active"}
+    except sqlite3.IntegrityError as exc:
+        con.rollback()
+        raise _integrity_error(exc, component="kb", action=action) from exc
     except Exception:
         con.rollback()
         raise
