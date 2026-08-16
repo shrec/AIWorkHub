@@ -1,5 +1,21 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.73 — 2026-08-16
+
+### Security
+
+- A read-only SQLite open is now actually read-only. Every such connection was
+  built by string interpolation, and in SQLite URI syntax a `#` in the path
+  swallows the `?mode=ro` query — so the database opened read-write with
+  create-if-missing, at a path truncated at the `#`. Verified: the old form
+  accepted a write and left a stray file behind; the new form refuses both.
+- All eight affected call sites now go through one shared helper with two
+  independent guarantees: the path is percent-encoded so the query survives,
+  and `PRAGMA query_only = ON` refuses writes even if URI parsing were
+  bypassed.
+- Each converted call site keeps its exact previous timeout, so behaviour
+  under concurrent load is unchanged.
+
 ## 0.9.72 — 2026-08-15
 
 ### Fixed

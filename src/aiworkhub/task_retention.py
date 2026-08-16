@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import repo_policy, task_store
+from .sqlite_readonly import connect_readonly
 
 
 SCHEMA_ID = "aiworkhub.task_retention.v1"
@@ -57,7 +58,7 @@ CREATE TABLE IF NOT EXISTS task_retention_audit (
 def _connect(root: Path | str, *, readonly: bool = False) -> sqlite3.Connection:
     path = task_store.canonical_db_path(root)
     if readonly:
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        connection = connect_readonly(path)
         connection.execute("PRAGMA query_only=ON")
     else:
         connection = sqlite3.connect(str(path))

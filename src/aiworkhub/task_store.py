@@ -53,6 +53,7 @@ from .storage_registry import (
 )
 from .provider_tool_guards import ProviderGuardError, apply_repository_guards
 from . import task_fsm
+from .sqlite_readonly import connect_readonly
 
 
 SCHEMA_ID = "aiworkhub.task_store.v1"
@@ -289,7 +290,7 @@ def _connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
     else:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+        conn = connect_readonly(path, timeout=5.0)
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA query_only=ON")
     conn.row_factory = sqlite3.Row
@@ -349,7 +350,7 @@ def _sqlite_backup(source: Path, destination: Path) -> None:
     tmp = destination.with_suffix(destination.suffix + ".migration.tmp")
     if tmp.exists():
         tmp.unlink()
-    src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    src = connect_readonly(source)
     dst = sqlite3.connect(str(tmp))
     try:
         src.backup(dst)
@@ -423,7 +424,7 @@ def _reconcile_auxiliary_databases(repo: RepositoryState, registry_path: Path) -
             else:
                 _initialize_auxiliary_schema(db_id, canonical)
                 initialized.append(db_id)
-        conn = sqlite3.connect(f"file:{canonical}?mode=ro", uri=True)
+        conn = connect_readonly(canonical)
         try:
             qc = conn.execute("PRAGMA quick_check(1)").fetchone()[0]
         finally:

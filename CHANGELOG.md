@@ -6,6 +6,53 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.73] - 2026-08-16
+
+### Security
+
+- A read-only SQLite open is now actually read-only. Every such connection was
+  built as `sqlite3.connect(f"file:{path}?mode=ro", uri=True)`. In SQLite URI
+  syntax `#` begins a fragment, so any path containing `#` swallowed the whole
+  `?mode=ro` query: the database opened READ-WRITE with create-if-missing, and
+  because the fragment was stripped it opened a *different file than the caller
+  named*. Reproduced directly — a control path refused the write with "attempt
+  to write a readonly database", while a `db#frag.db` target accepted a
+  `CREATE TABLE` and left an 8192-byte file named `db` on disk. Those are two
+  independent failures: writes were permitted, and the write landed on a path
+  nobody requested.
+- All eight affected call sites now route through one shared helper,
+  `aiworkhub.sqlite_readonly.connect_readonly`, instead of eight independent
+  f-strings that each had to stay correct forever: `task_store` (three sites),
+  `task_retention`, `source_graph`, `context_importer`, `context_write_intents`
+  and `worker_ai_tools_mcp`.
+- The helper applies two independent guarantees rather than one: the path is
+  percent-encoded through `Path.resolve().as_uri()` so `#` becomes `%23` and
+  the query survives URI parsing, and `PRAGMA query_only = ON` is issued after
+  connecting so a write is refused even if URI parsing were bypassed.
+- Every converted call site keeps its exact previous `timeout` and row-factory
+  behaviour — `source_graph` 30.0s, `task_store` 5.0s, `context_importer` and
+  `context_write_intents` 5s, and `worker_ai_tools_mcp`'s own constant — so
+  concurrency behaviour under load is unchanged.
+
+### Fixed
+
+- The worker MCP portability fixture copied a hand-listed subset of package
+  modules into its synthetic layouts and did not include the new shared
+  helper, so it failed on a missing file rather than on the import-root
+  behaviour it exists to prove.
+
+### Validation
+
+- `tests/test_sqlite_readonly_boundary.py`: a path containing `#` refuses
+  writes AND creates no file, asserted on the filesystem after the attempt
+  rather than only on the raised exception, because those are separate
+  failures.
+- Full suite: 3885 passed, 36 skipped. Three pre-existing
+  `test_storage_observability_dashboard` failures are unchanged from 0.9.72 and
+  are unrelated to this release; they are tracked separately.
+- Passed three independent cross-provider reviewer lenses with zero defects
+  before promotion.
+
 ## [0.9.72] - 2026-08-15
 
 ### Fixed

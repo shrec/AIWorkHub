@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import context_writes, storage_registry
+from .sqlite_readonly import connect_readonly
 from .platform_io import chmod_fd
 
 
@@ -213,7 +214,7 @@ def _decision_connection(repo: Path, *, writable: bool) -> sqlite3.Connection:
     if writable:
         con = sqlite3.connect(str(path), timeout=5)
     else:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        con = connect_readonly(path, timeout=5)
         con.execute("PRAGMA query_only=ON")
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA busy_timeout=5000")

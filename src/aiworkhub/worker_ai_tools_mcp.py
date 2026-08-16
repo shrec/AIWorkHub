@@ -105,6 +105,7 @@ except ImportError:  # minimal copied worker package / direct-script mode
 from .repository_state import RepositoryStateError
 from . import quality_reviewer
 from . import semantic_edit
+from .sqlite_readonly import connect_readonly
 
 
 SERVER_NAME = "aiworkhub_worker_ai_tools"
@@ -351,10 +352,7 @@ def _sqlite_like_literal(raw: str) -> str:
 
 def _open_readonly_db(path: Path, *, tool: str) -> sqlite3.Connection:
     try:
-        con = sqlite3.connect(
-            f"file:{path.as_posix()}?mode=ro", uri=True,
-            timeout=SQLITE_QUERY_TIMEOUT_SECONDS,
-        )
+        con = connect_readonly(path, timeout=SQLITE_QUERY_TIMEOUT_SECONDS)
         con.row_factory = sqlite3.Row
     except sqlite3.Error as exc:
         raise WorkerToolError(f"tool_db_unopenable:{tool}:{exc}") from exc

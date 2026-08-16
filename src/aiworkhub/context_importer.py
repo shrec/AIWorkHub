@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import repository_state, storage_registry, transcript_store
+from .sqlite_readonly import connect_readonly
 
 
 Component = Literal["session", "memory", "kb"]
@@ -73,7 +74,7 @@ def _source_path(repo: Path, value: str) -> Path:
 
 def _open_source(path: Path) -> sqlite3.Connection:
     try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        con = connect_readonly(path, timeout=5)
         con.row_factory = sqlite3.Row
         if con.execute("PRAGMA quick_check(1)").fetchone()[0] != "ok":
             raise ContextImportError("source_quick_check_failed")

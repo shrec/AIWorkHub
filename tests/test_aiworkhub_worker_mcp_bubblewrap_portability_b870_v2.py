@@ -65,6 +65,11 @@ _PACKAGE_FILES = (
     "quality_reviewer.py",
     "evidence_levels.py",
     "scoped_audit.py",
+    # worker_ai_tools_mcp imports the shared read-only SQLite helper; a synthetic
+    # layout that omits it cannot import the package at all, which would make
+    # this fixture fail for a missing file rather than for the import-root
+    # behaviour it exists to prove.
+    "sqlite_readonly.py",
 )
 
 

@@ -12,6 +12,24 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.73
+
+- A read-only SQLite open is now actually read-only. Every such connection was
+  built by interpolating the path into a URI string, and in SQLite URI syntax a
+  `#` in the path swallows the `?mode=ro` query — so the database opened
+  read-write with create-if-missing, at a path truncated at the `#`. Verified
+  directly: the old form accepted a write and left a stray file on disk, while
+  the corrected form refuses the write and creates nothing.
+- All eight affected call sites now route through one shared helper rather than
+  eight independent strings that each had to stay correct forever, and the
+  helper applies two independent guarantees: percent-encoding so the query
+  survives URI parsing, and `PRAGMA query_only = ON` so a write is refused even
+  if it did not.
+- Every converted call site keeps its exact previous timeout, so behaviour
+  under concurrent load is unchanged.
+
+See the packaged **Changelog** for the complete release summary.
+
 ## What's new in 0.9.72
 
 - Storage retention actually reclaims. Worktree eligibility reported zero

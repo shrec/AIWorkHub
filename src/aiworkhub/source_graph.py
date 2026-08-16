@@ -54,6 +54,7 @@ from . import source_graph_ast as sgast
 from . import source_graph_analytics as sganalytics
 from . import source_graph_insights as sginsights
 from . import source_graph_languages as sglanguages
+from .sqlite_readonly import connect_readonly
 from .repository_state import HUB_DIRNAME, RepositoryStateError, inspect_repository
 from .storage_registry import (
     StorageRegistryError,
@@ -270,7 +271,7 @@ def migration_dir(repo_root: Path) -> Path:
 
 def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30.0)
+        conn = connect_readonly(db_path, timeout=30.0)
         conn.execute("PRAGMA query_only=ON")
     else:
         conn = sqlite3.connect(str(db_path), timeout=30.0)
