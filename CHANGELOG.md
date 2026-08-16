@@ -6,6 +6,39 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.77] - 2026-08-16
+
+### Fixed
+
+- **An installation with a single model provider could never accept any
+  high-risk or critical change.** The acceptance fold in
+  `src/aiworkhub/quality_evidence.py` required at least one reviewer report
+  whose provider differed from the worker's, and both the `high` and `critical`
+  risk profiles set that requirement. Since the worker provider is the worker's
+  adapter id and a reviewer receipt carries the reviewer's own adapter id, the
+  condition could not be satisfied when only one sighted adapter was installed,
+  and every change failed acceptance with `independent_reviewer_missing` no
+  matter how complete it was. Both escapes were closed at once: a same-provider
+  reviewer could read the review packet but failed the vendor comparison, while
+  a different-provider adapter that could not read the packet failed
+  `reviewer_could_not_inspect` instead.
+
+  Reviewer independence is now the recorded ladder that the launch and
+  submission paths already used — `cross_provider` degrading to
+  `cross_model_same_provider` and then to `same_model_fresh_context` — and
+  acceptance blocks only when no rung applies. The achieved rung is resolved per
+  lens, recorded on the lens row and in the verdict, and written into the
+  acceptance evidence, so an accepted change states exactly how independent each
+  review was. Multi-model routing exists to allocate work by cost and
+  difficulty; it was never a requirement that one vendor review another.
+
+  Every property that actually produces independence is unchanged: the
+  anti-anchored packet, the sealed candidate, the separate read-only reviewer
+  process, the authenticated `packet_sha256`-bound submission, and the discarding
+  of any reviewer-supplied verdict in favour of the deterministic fold. A
+  reviewer that cannot inspect the packet is still refused for its lens, and a
+  review that cannot be attributed to a worker provider is still refused.
+
 ## [0.9.76] - 2026-08-16
 
 ### Fixed

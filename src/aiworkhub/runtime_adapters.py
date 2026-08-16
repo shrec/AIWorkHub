@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -101,6 +101,101 @@ COPILOT_RAW_DISCOVERY_DENIES: tuple[str, ...] = (
     "shell(find:*)",
     "shell(tree:*)",
 )
+
+# ---------------------------------------------------------------------------
+# Reviewer file-read capability.
+#
+# A quality reviewer receives its candidate as a review packet.  The vscode_lm
+# routes run the reviewer model in-process inside the editor host and launch
+# only a bounded response-applier subprocess, so the model is handed no
+# file-read tool of any kind: it physically cannot open a packet delivered only
+# as a filesystem path.  Such a reviewer is "blind" and needs the packet
+# content delivered inline in its prompt instead (see quality_review).
+#
+# A Copilot CLI adapter normally does expose a file-read tool, but when the
+# workforce records ``adapter_fallback_used`` the effective transport is the
+# in-process vscode_lm bridge, so the reviewer is blind for this purpose too.
+# ---------------------------------------------------------------------------
+
+# Canonical worker file-read tool vocabulary, matched case-insensitively with
+# ``-`` normalized to ``_``.  Kept identical to the provider read-event
+# classifier so an offered capability set and an observed provider tool record
+# agree on what counts as a file read.
+WORKER_FILE_READ_TOOL_NAMES: frozenset[str] = frozenset(
+    {"read", "read_file", "readfile", "file_read"}
+)
+
+# Adapters that run the reviewer model in-process and expose no file-read tool.
+NO_FILE_READ_ADAPTERS: frozenset[str] = frozenset(
+    {VSCODE_LM_ADAPTER, GLM_VSCODE_LM_ADAPTER, DEEPSEEK_VSCODE_LM_ADAPTER}
+)
+
+# Provider family for each supported adapter.  Independence is measured by
+# provider (and then model), never by adapter route, so both GLM routes map to
+# the same provider.  An unknown adapter maps to itself so it can never be
+# silently treated as identical to a known provider.
+_ADAPTER_PROVIDERS: Mapping[str, str] = MappingProxyType(
+    {
+        "vscode_lm": "vscode_lm",
+        "claude_cli": "claude",
+        "codex_cli": "gpt",
+        "deepseek_copilot_cli": "deepseek",
+        "deepseek_vscode_lm": "deepseek",
+        "glm_copilot_cli": "glm",
+        "glm_vscode_lm": "glm",
+    }
+)
+
+
+def provider_for_adapter(adapter_id: str) -> str:
+    """Return the provider family an adapter belongs to.
+
+    Independence classification compares provider families, so both GLM routes
+    (`glm_copilot_cli`, `glm_vscode_lm`) resolve to ``glm``.  An unknown adapter
+    resolves to its own id so it is never conflated with a known provider.
+    """
+
+    return _ADAPTER_PROVIDERS.get(str(adapter_id), str(adapter_id))
+
+
+def adapter_provides_file_read(
+    adapter_id: str, *, adapter_fallback_used: bool = False
+) -> bool:
+    """Return True when a reviewer on this adapter has a worker file-read tool.
+
+    In-process vscode_lm routes never do.  A Copilot CLI adapter that fell back
+    to the in-process bridge (``adapter_fallback_used``) is treated as blind for
+    the same reason.  This is a pure capability statement and starts no process.
+    """
+
+    if adapter_id not in SUPPORTED_ADAPTERS:
+        return False
+    if adapter_id in NO_FILE_READ_ADAPTERS:
+        return False
+    if adapter_fallback_used:
+        return False
+    return True
+
+
+def capability_set_has_file_read(tool_names: Iterable[str]) -> bool:
+    """Return True when a reviewer tool capability set includes a file read.
+
+    ``tool_names`` is the exact set of tool names offered to the reviewer.
+    Names are lower-cased with ``-`` normalized to ``_``; a name matches when it
+    equals a known read tool or ends with one on an underscore boundary, so
+    ``Read``, ``read_file`` and ``aiworkhub_worker_file_read`` all count while a
+    submit or source-graph tool does not.
+    """
+
+    for name in tool_names:
+        normalized = str(name).strip().lower().replace("-", "_")
+        if normalized in WORKER_FILE_READ_TOOL_NAMES:
+            return True
+        for candidate in WORKER_FILE_READ_TOOL_NAMES:
+            if normalized.endswith("_" + candidate):
+                return True
+    return False
+
 
 PathValue = str | os.PathLike[str]
 ExecutableOverrides = Mapping[str, PathValue]

@@ -827,11 +827,19 @@ def test_launch_publishes_phased_progress_under_same_reservation(
         e for e in manager._request_events(request_id)
         if e.get("state") == "starting" and e.get("preparation_phase")
     ]
+    # RECORDED REASON for the moved sequence: the reviewer launch path now
+    # resolves the independence rung between packet build and packet_prepared and
+    # publishes it as "independence_rung_recorded" (with the rung as its detail)
+    # under the same reservation, exactly like every sibling preparation
+    # milestone.  This is a legitimate new phase, not a loosening -- the
+    # assertion is still an exact, ordered equality; the single new phase is
+    # inserted in its true position.
     assert [e["preparation_phase"] for e in progress_events] == [
         "packet_build_started",
         "scope_audits_started",
         "scope_audits_complete",
         "packet_built",
+        "independence_rung_recorded",
         "packet_prepared",
         "reviewer_task_created",
         "isolated_launch_started",

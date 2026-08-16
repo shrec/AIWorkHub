@@ -217,6 +217,16 @@ class SourceGraphBuildInProgressError(SourceGraphError):
     """Another process currently owns this repository's index writer lease."""
 
 
+class SourceGraphBuildFailedError(SourceGraphError):
+    """A build's per-file write containment tripped its floor.
+
+    Per-file skips exist so one bad file cannot take a repository down. They do
+    NOT exist to let a wholesale write failure return a clean report over a
+    near-empty index. When a generation attempted writes but committed none, or
+    skipped more than half of what it attempted, the build failed and says so.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Repository / database resolution -- identity-bound, never a fixed path
 # ---------------------------------------------------------------------------
@@ -663,13 +673,15 @@ class BuildReport:
     hash_backend: str = "sequential"
     hash_telemetry: dict[str, Any] = field(default_factory=dict)
     quality_reused: bool = False
+    files_skipped: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return {
             "repo_root": self.repo_root, "db_path": self.db_path,
             "incremental": self.incremental, "files_seen": self.files_seen,
             "files_changed": self.files_changed, "files_unchanged": self.files_unchanged,
-            "files_removed": self.files_removed, "entities_written": self.entities_written,
+            "files_removed": self.files_removed, "files_skipped": self.files_skipped,
+            "entities_written": self.entities_written,
             "edges_written": self.edges_written, "errors": self.errors,
             "build_revision": self.build_revision, "finished_at": self.finished_at,
             "compaction_performed": self.compaction_performed,
@@ -1145,13 +1157,33 @@ def _write_extraction(
     *,
     file_size: int = -1,
     mtime_ns: int = -1,
-) -> tuple[int, int]:
-    """Persist one extraction and return the rows actually inserted.
+) -> tuple[int, int, list[dict[str, str]]]:
+    """Persist one extraction; return ``(entities, edges, dropped_duplicates)``.
 
     Extractors may conservatively emit the same edge more than once.  The
     database writer deliberately deduplicates those identities, so callers
     must report the inserted population rather than the pre-dedup candidate
     population.
+
+    The dropped-duplicate report is RETURNED rather than accumulated through a
+    caller-supplied out-parameter on purpose: the write contract stays
+    ``(conn, extraction, *, file_size, mtime_ns)`` so any forwarding wrapper or
+    subclass around this path keeps working. (An earlier revision took a mutable
+    ``dropped_duplicates`` keyword; a stub that forwarded the old signature then
+    raised ``TypeError`` on the new keyword, and the broad per-file containment
+    swallowed it for every file -- turning a total write failure into a
+    success-costumed empty index.)
+
+    The ``(file_path, qualname)`` entity dedup is a last-resort guard: every
+    extractor is expected to disambiguate before this point (Python and JS/TS
+    thread ``_dedupe_qualname``/``_unique_qualname`` through every emitted kind;
+    PHP, the C family and the polyglot lexical path thread one per-file counter
+    likewise). A duplicate reaching here is therefore an extractor defect, not
+    normal output, so it must stay VISIBLE rather than vanish: every collapsed
+    identity is recorded in the returned ``dropped_duplicates`` list (file,
+    qualname, extractor, kind) for the caller to surface in the build report.
+    The row is still dropped rather than inserted so one such defect cannot
+    abort the whole run.
     """
     conn.execute(
         "INSERT INTO files(file_path, language, status, source_hash, file_size, mtime_ns, "
@@ -1159,20 +1191,47 @@ def _write_extraction(
         (extraction.file_path, extraction.language, extraction.status,
          extraction.source_hash, file_size, mtime_ns, _now_iso(), BUILD_REVISION),
     )
+    seen_entities: set[tuple[str, str]] = set()
+    inserted_entities = 0
+    dropped: list[dict[str, str]] = []
     for entity in extraction.entities:
-        cur = conn.execute(
-            "INSERT INTO entities(file_path, kind, name, qualname, line_start, line_end, "
-            "signature, evidence_label, extractor, confidence, source_hash, build_revision) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (entity.file_path, entity.kind, entity.name, entity.qualname, entity.line_start,
-             entity.line_end, entity.signature, entity.evidence_label, entity.extractor,
-             entity.confidence, entity.source_hash, entity.build_revision),
-        )
+        natural_key = (entity.file_path, entity.qualname)
+        if natural_key in seen_entities:
+            # Idempotent on the ``(file_path, qualname)`` natural key: an
+            # extractor that emits the very same identity twice must never abort
+            # the run. Genuinely distinct declarations already carry distinct
+            # qualnames (the extractors disambiguate before this point), so a
+            # real declaration is never the row that gets collapsed here -- but
+            # record every collapse so a genuine extractor defect stays visible
+            # instead of silently vanishing.
+            dropped.append({
+                "file": entity.file_path, "qualname": entity.qualname,
+                "extractor": entity.extractor, "kind": entity.kind,
+            })
+            continue
+        seen_entities.add(natural_key)
+        try:
+            cur = conn.execute(
+                "INSERT INTO entities(file_path, kind, name, qualname, line_start, line_end, "
+                "signature, evidence_label, extractor, confidence, source_hash, build_revision) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (entity.file_path, entity.kind, entity.name, entity.qualname, entity.line_start,
+                 entity.line_end, entity.signature, entity.evidence_label, entity.extractor,
+                 entity.confidence, entity.source_hash, entity.build_revision),
+            )
+        except sqlite3.IntegrityError as exc:
+            # Name the file, qualname and extractor id so an integrity failure is
+            # diagnosable instead of an opaque "UNIQUE constraint failed".
+            raise sqlite3.IntegrityError(
+                f"entities uniqueness violated: file={entity.file_path!r} "
+                f"qualname={entity.qualname!r} extractor={entity.extractor!r}"
+            ) from exc
         conn.execute(
             "INSERT INTO entities_fts(entity_id, name, qualname, signature, file_path) "
             "VALUES (?,?,?,?,?)",
             (cur.lastrowid, entity.name, entity.qualname, entity.signature, entity.file_path),
         )
+        inserted_entities += 1
     seen_edges: set[tuple[Any, ...]] = set()
     for edge in extraction.edges:
         identity = (
@@ -1191,7 +1250,7 @@ def _write_extraction(
              edge.line, edge.evidence_label, edge.extractor, edge.confidence,
              edge.source_hash, edge.build_revision),
         )
-    return len(extraction.entities), len(seen_edges)
+    return inserted_entities, len(seen_edges), dropped
 
 
 def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
@@ -1533,6 +1592,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
     files_on_disk = iter_source_files(repo_root)
     seen_rel: set[str] = set()
     changed = unchanged = removed = entities_written = edges_written = 0
+    skipped = 0
     errors: list[dict[str, str]] = []
     extraction_workers = 1
     extraction_seconds = 0.0
@@ -1771,14 +1831,60 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                     "UPDATE files SET file_size=?, mtime_ns=? WHERE file_path=?",
                     pending_stat_updates,
                 )
-            for extraction, file_size, mtime_ns in pending_extractions:
-                _invalidate_file(conn, extraction.file_path)
-                inserted_entities, inserted_edges = _write_extraction(
-                    conn, extraction, file_size=file_size, mtime_ns=mtime_ns,
-                )
+            for write_index, (extraction, file_size, mtime_ns) in enumerate(
+                pending_extractions
+            ):
+                # Fail closed PER FILE, never per repository. A single file whose
+                # rows cannot be persisted is rolled back to its own savepoint,
+                # skipped and counted, while every other file in the run still
+                # commits. One bad row must never leave the entire repository
+                # index unavailable. The savepoint is taken BEFORE invalidation
+                # so a skip restores the file's prior generation intact rather
+                # than leaving a half-deleted partial.
+                savepoint = f"sg_write_{write_index}"
+                file_dropped: list[dict[str, str]] = []
+                conn.execute(f"SAVEPOINT {savepoint}")
+                try:
+                    _invalidate_file(conn, extraction.file_path)
+                    inserted_entities, inserted_edges, file_dropped = _write_extraction(
+                        conn, extraction, file_size=file_size, mtime_ns=mtime_ns,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Containment is deliberately BROAD. The whole point of this
+                    # boundary is that ONE file must never take down a repository,
+                    # and the failure this exists for -- an IntegrityError -- is
+                    # exactly the kind of exception nobody enumerated in advance.
+                    # Catching only the types we thought of is how the original
+                    # repository-wide abort was written; so any Exception rolls
+                    # the file back to its own savepoint, is recorded with its
+                    # type, and the run keeps going. Only BaseException
+                    # (KeyboardInterrupt/SystemExit) still propagates, because a
+                    # cancellation or interpreter shutdown genuinely must abort
+                    # the whole build rather than be swallowed per file.
+                    conn.execute(f"ROLLBACK TO {savepoint}")
+                    conn.execute(f"RELEASE {savepoint}")
+                    skipped += 1
+                    errors.append({
+                        "file": extraction.file_path, "status": "index_write_skipped",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+                    continue
+                conn.execute(f"RELEASE {savepoint}")
                 changed += 1
                 entities_written += inserted_entities
                 edges_written += inserted_edges
+                for dropped in file_dropped:
+                    # A duplicate natural key reaching the writer is an extractor
+                    # defect, not normal output. Surface it instead of letting it
+                    # vanish behind the idempotent dedup.
+                    errors.append({
+                        "file": dropped["file"], "status": "duplicate_entity_dropped",
+                        "error": (
+                            f"duplicate (file_path, qualname) collapsed: "
+                            f"qualname={dropped['qualname']!r} kind={dropped['kind']!r} "
+                            f"extractor={dropped['extractor']!r}"
+                        ),
+                    })
                 if extraction.status != "ok" and extraction.error:
                     errors.append({
                         "file": extraction.file_path, "status": extraction.status,
@@ -1796,6 +1902,10 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 conn, repo_root, sorted(seen_rel), limit=10000,
             )
             finished_at = _now_iso()
+            skipped_files = [
+                entry["file"] for entry in errors
+                if entry.get("status") == "index_write_skipped"
+            ]
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('last_build', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1803,7 +1913,31 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                     "finished_at": finished_at, "incremental": incremental,
                     "files_seen": len(files_on_disk), "files_changed": changed,
                     "files_removed": removed, "build_revision": BUILD_REVISION,
+                    # Persist the skip outcome so a partially-failed build cannot
+                    # be mistaken for a clean one by any consumer that reads meta
+                    # rather than the in-memory BuildReport. ``files_skipped`` > 0
+                    # (and the named ``skipped_files``) makes the degradation
+                    # visible to an operator after the fact.
+                    "files_skipped": skipped,
+                    "skipped_files": skipped_files,
                 }),),
+            )
+        # Containment floor. Per-file skips exist so ONE bad file cannot take a
+        # repository down -- never so a wholesale write failure can pass as a
+        # healthy build. A generation that attempted writes but committed NONE
+        # (every file skipped), or whose skips exceed half of what it attempted,
+        # is a FAILED build and must fail loudly instead of returning a clean
+        # report over a near-empty index. ``last_build`` above already recorded
+        # files_skipped/skipped_files, so the failure stays durable and
+        # diagnosable after this raise. ``changed``/``skipped`` count only files
+        # that reached the writer this run, so a legitimate no-op incremental
+        # refresh (attempted == 0) and a clean full build never trip the floor.
+        attempted_writes = changed + skipped
+        if attempted_writes and (changed == 0 or skipped * 2 > attempted_writes):
+            raise SourceGraphBuildFailedError(
+                "source_graph_build_failed_write_containment: "
+                f"changed={changed} skipped={skipped} "
+                f"attempted={attempted_writes} skipped_files={skipped_files}"
             )
         bytes_before_compaction = resolved_db_path.stat().st_size
         page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
@@ -1877,6 +2011,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
         repo_root=str(repo_root), db_path=str(resolved_db_path), incremental=incremental,
         files_seen=len(files_on_disk), files_changed=changed, files_unchanged=unchanged,
         files_removed=removed, entities_written=entities_written, edges_written=edges_written,
+        files_skipped=skipped,
         errors=errors, build_revision=BUILD_REVISION, finished_at=finished_at,
         compaction_performed=compaction_performed,
         database_bytes_before_compaction=bytes_before_compaction,
@@ -3509,7 +3644,7 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                 except OSError:
                     file_size = -1
                     mtime_ns = -1
-                inserted_entities, inserted_edges = _write_extraction(
+                inserted_entities, inserted_edges, _dropped = _write_extraction(
                     conn, extraction, file_size=file_size, mtime_ns=mtime_ns,
                 )
                 conn.execute(

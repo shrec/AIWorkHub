@@ -362,6 +362,16 @@ def _extract_php_lexical(
         confidence=1.0, source_hash=source_hash, build_revision=build_revision,
     )]
     edges: list[Edge] = []
+    # One per-file qualname counter shared by EVERY declaration kind this
+    # extractor emits -- class-like declarations, imports and functions/methods
+    # -- mirroring the C family's single ``counts`` dict threaded through
+    # _cpp_qualname. Two same-named class/interface/trait declarations, or a
+    # class and a free function that resolve to one namespaced name, would
+    # otherwise emit an identical ``(file_path, qualname)`` pair and abort the
+    # whole index on the UNIQUE constraint. The ``module`` entity deliberately
+    # keeps the bare relative path: it is unique per file and can never collide
+    # with any ``::``/``\\``-qualified declaration, matching the C family.
+    seen_qualnames: dict[str, int] = {}
 
     class_pattern = re.compile(
         r"\b(class|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b([^;{]*)\{",
@@ -374,8 +384,17 @@ def _extract_php_lexical(
         kind_label, name, tail = match.group(1).lower(), match.group(2), match.group(3)
         open_brace = match.end() - 1
         close_brace = _matching_delimiter(masked, open_brace, "{", "}")
-        qualname = f"{namespace}\\{name}" if namespace else f"{rel}::{name}"
-        local_classes[name] = qualname
+        qualname = _dedupe_qualname(
+            seen_qualnames, f"{namespace}\\{name}" if namespace else f"{rel}::{name}"
+        )
+        # First-wins for the bare-name -> qualname table: when a file declares
+        # the same class-like name twice, a same-file ``extends``/``implements``
+        # edge must resolve to the FIRST (primary) declaration, never the
+        # ``~N``-suffixed duplicate. PHP itself would fatal on a genuine
+        # redeclaration, so the first lexical occurrence is the only sensible
+        # owner of the bare name; keeping it stable also avoids re-pointing
+        # every inheritance edge whenever a duplicate is added or removed.
+        local_classes.setdefault(name, qualname)
         class_ranges.append((match.start(), close_brace, name, qualname))
         signature = _php_signature(text, match.start(), open_brace)
         line = _php_line(text, match.start())
@@ -426,7 +445,9 @@ def _extract_php_lexical(
             alias = explicit_alias or target.rsplit("\\", 1)[-1]
             import_aliases[alias] = target
             line = _php_line(text, match.start())
-            import_qualname = f"{rel}::import::{alias}::{line}"
+            import_qualname = _dedupe_qualname(
+                seen_qualnames, f"{rel}::import::{alias}::{line}"
+            )
             entities.append(Entity(
                 kind="import", name=alias, qualname=import_qualname,
                 file_path=rel, line_start=line, line_end=line, signature=target,
@@ -444,7 +465,6 @@ def _extract_php_lexical(
         r"\bfunction\s+&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(",
         re.IGNORECASE,
     )
-    seen_qualnames: dict[str, int] = {}
     for match in function_pattern.finditer(masked):
         name = match.group(1)
         open_paren = match.end() - 1

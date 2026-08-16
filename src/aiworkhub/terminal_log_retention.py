@@ -657,6 +657,16 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
     manifest["quarantined_files"] = moved_files
     manifest["quarantined_bytes"] = moved_bytes
     _atomic_json(manifest_path, manifest)
+    if _batch_is_empty(manifest):
+        # The eligible population changed between the digest snapshot and this
+        # apply (typically a concurrent sweep in another process moved the
+        # files first).  An empty batch holds nothing to restore, so its
+        # seven-day undo window protects nothing while the entry sits on the
+        # storage panel forever, shape-identical to a real batch.  Reap it now
+        # instead of accumulating operator-visible noise.
+        shutil.rmtree(batch, ignore_errors=True)
+        _append_audit(root, {"schema_id": AUDIT_SCHEMA_ID, "timestamp": now_utc().isoformat(), "action": "quarantine_empty_reaped", "batch_id": batch_id, "files": 0, "bytes": 0})
+        return {"ok": True, "batch_id": "", "quarantined": 0, "bytes": 0, "no_op": True}
     _append_audit(root, {"schema_id": AUDIT_SCHEMA_ID, "timestamp": now_utc().isoformat(), "action": "quarantine_completed", "batch_id": batch_id, "files": moved_files, "bytes": moved_bytes})
     return {"ok": True, "batch_id": batch_id, "quarantined": moved_files, "bytes": moved_bytes, "no_op": False}
 
@@ -687,7 +697,11 @@ def list_batches(repo_root: Path | str) -> dict[str, Any]:
             "quarantined_count": states.count("quarantined"),
             "restored_count": states.count("restored"),
             "bytes": int(value.get("quarantined_bytes") or 0),
-            "purge_eligible": now_utc() >= deadline,
+            # A batch is reapable now if its undo window has expired *or* it is
+            # empty (holds nothing to restore).  This mirrors exactly what
+            # ``purge`` will accept, so the storage panel is truthful about the
+            # empty batches an operator may choose to release.
+            "purge_eligible": now_utc() >= deadline or _batch_is_empty(value),
         })
     return {"ok": True, "batches": rows[:100], "count": len(rows[:100])}
 
@@ -736,6 +750,36 @@ def restore(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str,
     return {"ok": True, "batch_id": batch_id, "restored": restored}
 
 
+_EMPTY_BATCH_ITEM_STATES = frozenset({"skipped_identity_changed"})
+
+
+def _batch_is_empty(manifest: Mapping[str, Any]) -> bool:
+    """Single source of truth for "this batch holds nothing to restore".
+
+    A batch is empty only when nothing was ever moved into it: every recorded
+    item was skipped because its on-disk identity changed before the move
+    (``skipped_identity_changed``), and no legacy store was captured.  Such a
+    batch has no files under its directory, so its seven-day undo window
+    protects nothing and it is reapable immediately.
+
+    Any item still ``quarantined`` (files sit in the batch), already
+    ``restored`` (the operator relied on that outcome), or in
+    ``restore_conflict`` (files sit in the batch because the restore could not
+    place them) keeps the batch's full restore deadline.  ``restore_conflict``
+    in particular means the file is still physically present and is *more*
+    likely to be wanted, so it must never be treated as absent.
+    """
+    for item in manifest.get("items") or []:
+        if not isinstance(item, dict):
+            return False
+        if item.get("state") not in _EMPTY_BATCH_ITEM_STATES:
+            return False
+    legacy = manifest.get("legacy_store")
+    if isinstance(legacy, dict) and legacy.get("state") not in _EMPTY_BATCH_ITEM_STATES:
+        return False
+    return True
+
+
 def purge(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str, Any]:
     if confirm is not True:
         raise TerminalLogRetentionError("explicit_confirmation_required")
@@ -746,7 +790,12 @@ def purge(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str, A
         deadline = datetime.fromisoformat(str(manifest.get("restore_deadline") or ""))
     except ValueError as exc:
         raise TerminalLogRetentionError("terminal_log_deadline_invalid") from exc
-    if now_utc() < deadline:
+    # The undo window protects every batch that still holds files a restore
+    # could return -- items in any state other than ``skipped_identity_changed``
+    # (including ``restore_conflict``, whose files are still physically present
+    # and are more likely to be wanted).  Only a genuinely empty batch, which
+    # holds nothing to restore, is reapable before its deadline expires.
+    if now_utc() < deadline and not _batch_is_empty(manifest):
         raise TerminalLogRetentionError("retention_undo_window_active")
     released = int(manifest.get("quarantined_bytes") or 0)
     shutil.rmtree(batch)
@@ -805,7 +854,18 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
         purged_batches = 0
         purged_bytes = 0
         for row in list_batches(root).get("batches") or []:
-            if not row.get("purge_eligible"):
+            # Reap only batches whose independent seven-day undo window has
+            # actually expired.  A pre-existing empty batch is reapable on an
+            # explicit operator purge (see ``purge``/``_batch_is_empty``), but
+            # enforce never deletes a batch the operator has not asked to
+            # release: this repository has spent enough of its history letting
+            # retention destroy things that were still wanted, so an empty batch
+            # is made eligible and surfaced, not silently swept.
+            try:
+                deadline = datetime.fromisoformat(str(row.get("restore_deadline") or ""))
+            except ValueError:
+                continue
+            if now_utc() < deadline:
                 continue
             result = purge(root, batch_id=str(row["batch_id"]), confirm=True)
             purged_batches += 1

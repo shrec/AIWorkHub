@@ -27,6 +27,7 @@ from . import (
 )
 from . import repository_state
 from . import shared_router
+from . import sqlite_readonly
 from . import task_store
 from . import callback_store
 from . import task_plan
@@ -122,8 +123,12 @@ def _canonical_db_path() -> Path:
 def _canonical_connect(*, readonly: bool = False) -> sqlite3.Connection:
     path = _canonical_db_path()
     if readonly:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        conn.execute("PRAGMA query_only=ON")
+        # A raw ``file:{path}?mode=ro`` f-string is not a read-only open: a path
+        # containing ``#`` starts a URI fragment that swallows ``?mode=ro`` and
+        # silently opens a DIFFERENT file read-write.  Route every read-only
+        # open through the fail-closed helper, which percent-encodes the path
+        # and also issues ``PRAGMA query_only=ON``.
+        conn = sqlite_readonly.connect_readonly(path)
     else:
         conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row

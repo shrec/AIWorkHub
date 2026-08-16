@@ -150,7 +150,13 @@ def test_medium_risk_passes_with_read_only_review_and_green_union() -> None:
     assert verdict["blocking_evidence"] == []
 
 
-def test_high_risk_requires_cross_provider_for_every_judgment_lens() -> None:
+def test_high_risk_same_provider_review_records_fresh_context_rung() -> None:
+    # Before: this asserted ``verdict["passed"] is False`` and that every
+    # judgment lens carried ``independent_reviewer_missing`` -- a same-provider
+    # reviewer was refused purely for sharing the worker's vendor. After the
+    # ladder conversion that vendor refusal is gone: a same-provider (here also
+    # single-model) review degrades to the same_model_fresh_context rung and is
+    # accepted, and the achieved rung is recorded on the verdict and each lens.
     profile = qe.resolve_risk_profile("high")
     reports = [
         _report(lens, provider="worker-a")
@@ -162,13 +168,24 @@ def test_high_risk_requires_cross_provider_for_every_judgment_lens() -> None:
         reviewer_reports=reports,
         combined_tree_checks=[_check("union-tests")],
         worker_provider="worker-a",
+        human_approval=True,
     )
 
-    assert verdict["passed"] is False
-    assert all(
-        f"independent_reviewer_missing:{lens}" in verdict["blocking_evidence"]
-        for lens in qe.JUDGMENT_LENSES
+    assert verdict["passed"] is True
+    assert not any(
+        b.startswith("independent_reviewer_missing")
+        for b in verdict["blocking_evidence"]
     )
+    for lens in sorted(qe.JUDGMENT_LENSES):
+        assert (
+            verdict["independence_rungs"][lens]["rung"]
+            == qe.quality_review.RUNG_SAME_MODEL_FRESH_CONTEXT
+        )
+        row = next(r for r in verdict["lenses"] if r["lens"] == lens)
+        assert (
+            row["independence_rung"]
+            == qe.quality_review.RUNG_SAME_MODEL_FRESH_CONTEXT
+        )
 
 
 def test_high_risk_cross_provider_clean_reports_are_verified() -> None:

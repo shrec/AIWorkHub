@@ -59,14 +59,35 @@ def test_helpers_resolve_without_scripts_and_use_production_semantics() -> None:
     assert callable(load)
 
 
-def test_preflight_no_cards_file_is_not_an_error(tmp_path, monkeypatch) -> None:
-    """The historical failure was ModuleNotFoundError on invocation. A missing
-    cards file must instead be a clean, read-only 'no active claims' answer."""
-    monkeypatch.setenv(_CARDS_ENV, str(tmp_path / "does_not_exist.jsonl"))
+def test_preflight_explicit_missing_source_is_unresolved_not_a_confident_zero(
+    tmp_path, monkeypatch
+) -> None:
+    """An EXPLICITLY configured card source that does not exist is UNRESOLVED,
+    never a confident 'zero active claims, safe to proceed'.
+
+    This is the contract this card exists to establish. When an operator points
+    ``BITNN_TASK_CARDS_PATH`` (or ``AIWORKHUB_COLLISION_CARDS_PATH``) at a file
+    that is absent, the honest answer is 'I could not resolve my source', not
+    '0 active cards'. A preflight that approves overlapping write scopes because
+    it could not find its own source is the original defect -- it is how a
+    collision guard reported 0 active cards while the canonical guard saw 14.
+    """
+    missing = tmp_path / "does_not_exist.jsonl"
+    monkeypatch.setenv(_CARDS_ENV, str(missing))
     result = tool.collision_preflight(task_id="T1", runner="claude_opus48", topic="x")
-    assert result["would_collide"] is False
-    assert result["cards_source_exists"] is False
-    assert result["active_card_count"] == 0
+    # Unresolved shape -- None, not 0/False, so it can never read as "safe".
+    assert result["cards_source_resolved"] is False
+    assert result["active_card_count"] is None
+    assert result["would_collide"] is None
+    # unresolved_reason names WHY (the env var), and leaks no absolute path.
+    assert result["unresolved_reason"]
+    assert str(missing) not in result["unresolved_reason"]
+    assert "does_not_exist.jsonl" not in result["unresolved_reason"]
+    # The WHOLE unresolved structure is path-free: cards_source names the env
+    # var beside the reason, it does not print the (absolute) path either.
+    assert str(missing) not in result["cards_source"]
+    assert "does_not_exist.jsonl" not in result["cards_source"]
+    # Still strictly read-only regardless of resolution outcome.
     assert result["read_only"] is True and result["mutated_state"] is False
 
 

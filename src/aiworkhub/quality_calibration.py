@@ -125,7 +125,16 @@ def run_calibration() -> dict[str, Any]:
         _case("combined_schema", expected_pass=False, expected_blocker="combined_tree_schema:", risk=qe.RISK_MEDIUM, reports=good_medium, combined=[{"kind": "test", "status": qe.STATUS_PASSED}]),
         _case("reference_high", expected_pass=True, risk=qe.RISK_HIGH, reports=good_high, combined=_combined(), approval=True),
         _case("worker_provider_missing", expected_pass=False, expected_blocker="worker_provider_missing_for_independence:", risk=qe.RISK_HIGH, reports=good_high, combined=_combined(), worker_provider="", approval=True),
-        _case("independent_reviewer", expected_pass=False, expected_blocker="independent_reviewer_missing:", risk=qe.RISK_HIGH, reports=[_report(lens, provider="worker-a") for lens in sorted(qe.JUDGMENT_LENSES)], combined=_combined(), approval=True),
+        # Independence is a recorded ladder, not a vendor check: a same-provider
+        # reviewer with a present worker provider is no longer refused (see the
+        # ``single_provider_same_model`` positive below). What still blocks is a
+        # review with no resolvable rung -- an unattributable worker (missing
+        # worker_provider) -- and that holds regardless of the reviewer vendor.
+        _case("independence_no_resolvable_rung", expected_pass=False, expected_blocker="worker_provider_missing_for_independence:", risk=qe.RISK_HIGH, reports=[_report(lens, provider="worker-a") for lens in sorted(qe.JUDGMENT_LENSES)], combined=_combined(), worker_provider="", approval=True),
+        # A single-provider, single-model install still gets a real independent
+        # review: it degrades to the same_model_fresh_context rung and PASSES the
+        # high-risk profile with three lenses and explicit approval.
+        _case("single_provider_same_model", expected_pass=True, risk=qe.RISK_HIGH, reports=[_report(lens, provider="worker-a") for lens in sorted(qe.JUDGMENT_LENSES)], combined=_combined(), worker_provider="worker-a", approval=True),
         _case("human_approval", expected_pass=False, expected_blocker="explicit_human_approval_missing", risk=qe.RISK_HIGH, reports=good_high, combined=_combined()),
         _case("quality_config", expected_pass=False, expected_blocker="quality_config_error", config_error="broken policy"),
     ]

@@ -73,6 +73,7 @@ except ImportError:
 
     project_context = _FallbackProjectContext()  # type: ignore[assignment]
 from . import runtime_adapters
+from . import quality_review
 from . import quality_reviewer
 from . import terminal_authority
 from . import vscode_lm_bridge
@@ -3146,8 +3147,24 @@ def _verified_quality_review_receipt(
     target = packet.get("target") if isinstance(packet, dict) else None
     if not isinstance(target, dict):
         raise WorkspaceError("quality_review_packet_target_missing")
-    if observed_provider == str(target.get("worker_provider") or ""):
-        raise WorkspaceError("quality_review_provider_not_independent")
+    # Independence is a recorded ladder, not a vendor check.  Resolve the rung
+    # first: a same-provider (or single-provider) review is no longer discarded
+    # here after it has already been launched, run and submitted -- it degrades
+    # to same_model_fresh_context and completes.  Refuse only when no rung in the
+    # ladder applies at all, naming both providers so the refusal is legible.
+    worker_provider_name = str(target.get("worker_provider") or "")
+    rung_record = quality_review.resolve_independence_rung(
+        worker_provider=worker_provider_name,
+        reviewer_provider=observed_provider,
+        worker_model=worker_provider_name,
+        reviewer_model=observed_provider,
+    )
+    if rung_record["rung"] not in quality_review.INDEPENDENCE_LADDER:
+        raise WorkspaceError(
+            "quality_review_provider_not_independent:"
+            f"worker_provider={worker_provider_name},"
+            f"reviewer_provider={observed_provider}"
+        )
     receipt = json.loads(json.dumps(receipt_payload, ensure_ascii=False))
     reviewer = receipt.get("reviewer")
     report = receipt.get("report")
@@ -5149,9 +5166,25 @@ class ProcessManager:
                 )
                 return
             prepared = prep["prepared"]
-            if prepared["worker_adapter_id"] == adapter_id:
-                _fail("quality_review_provider_not_independent")
-                return
+            worker_adapter_id = str(prepared["worker_adapter_id"] or "")
+            # Independence is a recorded ladder, not a vendor check.  Multi-model
+            # routing exists to send work to a model by cost/difficulty; a
+            # single-provider (or single-model) installation must still be able
+            # to complete a review.  Record the best available rung -- best
+            # first -- and never refuse on provider identity.  The anti-anchored
+            # packet, sealed candidate, separate read-only process and
+            # authenticated packet_sha256-bound submission (all enforced below
+            # and in the reviewer receipt path) are what make the review
+            # independent on every rung.
+            independence = quality_review.resolve_independence_rung(
+                worker_provider=runtime_adapters.provider_for_adapter(
+                    worker_adapter_id
+                ),
+                reviewer_provider=runtime_adapters.provider_for_adapter(adapter_id),
+                worker_model=worker_adapter_id,
+                reviewer_model=str(adapter_id or ""),
+            )
+            _progress("independence_rung_recorded", str(independence["rung"]))
             _progress("packet_prepared")
             binding = {
                 "target_request_id": target_request_id,
@@ -5164,6 +5197,7 @@ class ProcessManager:
                 "candidate_paths": sorted(prepared["changed_hashes"]),
                 "packet": prepared["packet"],
                 "lens": lens,
+                "independence": independence,
             }
             created = core.create_task(
                 task_id=reviewer_task_id,
@@ -5177,7 +5211,7 @@ class ProcessManager:
                 acceptance=[
                     "Exactly one authenticated quality_review_submit receipt",
                     "No repository mutation",
-                    "Reviewer provider differs from target worker provider",
+                    quality_review.independence_acceptance_line(independence),
                 ],
                 allowed_writes=[],
                 forbidden=[
@@ -5631,11 +5665,12 @@ class ProcessManager:
                 launch_phase = "prompt_and_adapter_plan"
                 if quality_review_binding is not None:
                     private_tool_name = "aiworkhub_worker_quality_review_submit"
-                    prompt = quality_reviewer.build_review_prompt(
+                    prompt = quality_review.assemble_reviewer_prompt(
                         quality_review_binding["packet"],
                         lens=str(quality_review_binding["lens"]),
+                        adapter_id=adapter_id,
                         submit_tool_name=private_tool_name,
-                        packet_file=(
+                        packet_path=(
                             str(review_packet_path) if review_packet_path is not None else None
                         ),
                     )

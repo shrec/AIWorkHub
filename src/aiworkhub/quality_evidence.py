@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Mapping
 
-from . import eval_artifact_gate, evidence_levels, known_bug_scanner
+from . import eval_artifact_gate, evidence_levels, known_bug_scanner, quality_review
 
 # ---------------------------------------------------------------------------
 # 0.6.30 Quality Evidence Engine foundation.
@@ -891,6 +891,63 @@ def reviewer_report_could_not_inspect(report: Mapping[str, Any]) -> bool:
     return False
 
 
+def _reviewer_model_for(
+    raw_reports: list[Mapping[str, Any]], lens: str, provider: str
+) -> str:
+    """Recover a reviewer's declared model from the raw report for (lens, provider).
+
+    The normalized report intentionally carries no ``model`` key (its shape is a
+    fixed five-key contract), so the fold reads the model -- when a receipt
+    supplies one -- straight from the raw report. Absent/non-string is a bounded
+    ``""``, which resolves to the same_model rung against a same-provider worker.
+    """
+
+    for report in raw_reports:
+        if not isinstance(report, Mapping):
+            continue
+        if report.get("lens") != lens:
+            continue
+        raw_provider = report.get("provider")
+        if isinstance(raw_provider, str) and raw_provider.strip() == provider:
+            model = report.get("model")
+            return model.strip() if isinstance(model, str) else ""
+    return ""
+
+
+def _best_independence_rung(
+    *,
+    worker_provider: str,
+    worker_model: str,
+    lens: str,
+    reports: list[Mapping[str, Any]],
+    raw_reports: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return the most independent rung any sighted reviewer for a lens reached.
+
+    Independence is the recorded ladder resolved by
+    :func:`quality_review.resolve_independence_rung`, never a vendor comparison.
+    Only the validated normalized ``provider`` is trusted for identity; the
+    reviewer model is recovered from the raw report. When a lens has several
+    reports the best (lowest ``rung_index``, i.e. most independent) rung is the
+    one recorded. ``reports`` is non-empty by construction, so a rung is always
+    returned.
+    """
+
+    best: dict[str, Any] | None = None
+    for report in reports:
+        provider = str(report.get("provider") or "")
+        record = quality_review.resolve_independence_rung(
+            worker_provider=worker_provider,
+            reviewer_provider=provider,
+            worker_model=worker_model,
+            reviewer_model=_reviewer_model_for(raw_reports, lens, provider),
+        )
+        if best is None or record["rung_index"] < best["rung_index"]:
+            best = record
+    assert best is not None  # reports is non-empty by construction
+    return best
+
+
 def fold_quality_verdict(
     checks: Iterable[EvidenceCheck | Mapping[str, Any]],
     *,
@@ -898,6 +955,7 @@ def fold_quality_verdict(
     reviewer_reports: Iterable[Mapping[str, Any]] = (),
     combined_tree_checks: Iterable[EvidenceCheck | Mapping[str, Any]] = (),
     worker_provider: str = "",
+    worker_model: str = "",
     human_approval: bool = False,
     config_error: str = "",
 ) -> dict[str, Any]:
@@ -982,7 +1040,18 @@ def fold_quality_verdict(
         if reviewer_report_could_not_inspect(report):
             blind_lenses.add(lens)
 
-    cross_provider_required = bool(profile.get("cross_provider_required"))
+    # Independence is a recorded ladder, not a vendor check. The
+    # ``cross_provider_required`` flag now only marks the tiers that *require* an
+    # attributable independent review; it no longer gates acceptance by comparing
+    # vendors. A same-provider (or single-provider, single-model) review is
+    # accepted at the ``same_model_fresh_context`` rung -- what makes it
+    # independent (the anti-anchored packet, the sealed candidate, the separate
+    # read-only reviewer process and the authenticated packet_sha256-bound
+    # submission) holds on every rung. The fold blocks only when no rung in the
+    # ladder applies: an unattributable worker (missing ``worker_provider``) is
+    # not a review, so it stays a blocker.
+    independence_required = bool(profile.get("cross_provider_required"))
+    independence_rungs: dict[str, dict[str, Any]] = {}
     for lens in required_lenses:
         reports = reports_by_lens.get(lens, [])
         if not reports:
@@ -994,13 +1063,28 @@ def fold_quality_verdict(
             blockers.append(f"reviewer_could_not_inspect:{lens}")
             lens_rows[lens]["status"] = STATUS_REVIEWER_COULD_NOT_INSPECT
             continue
-        if cross_provider_required:
-            if not worker_provider:
-                blockers.append(f"worker_provider_missing_for_independence:{lens}")
-                lens_rows[lens]["status"] = STATUS_NOT_AVAILABLE
-            elif not any(report["provider"] != worker_provider for report in reports):
-                blockers.append(f"independent_reviewer_missing:{lens}")
-                lens_rows[lens]["status"] = STATUS_NOT_AVAILABLE
+        if not independence_required:
+            continue
+        if not worker_provider:
+            # No rung on the ladder applies to an unattributable worker.
+            blockers.append(f"worker_provider_missing_for_independence:{lens}")
+            lens_rows[lens]["status"] = STATUS_NOT_AVAILABLE
+            continue
+        rung_record = _best_independence_rung(
+            worker_provider=worker_provider,
+            worker_model=worker_model,
+            lens=lens,
+            reports=reports,
+            raw_reports=raw_reports,
+        )
+        if rung_record["rung"] not in quality_review.INDEPENDENCE_LADDER:
+            # Defensive: an unresolvable rung is never accepted silently.
+            blockers.append(f"independence_rung_unresolved:{lens}")
+            lens_rows[lens]["status"] = STATUS_NOT_AVAILABLE
+            continue
+        independence_rungs[lens] = rung_record
+        lens_rows[lens]["independence_rung"] = rung_record["rung"]
+        lens_rows[lens]["independence"] = rung_record
 
     combined_rows: list[dict[str, Any]] = []
     try:
@@ -1038,6 +1122,9 @@ def fold_quality_verdict(
         "combined_tree_checks": combined_rows,
         "blocking_evidence": unique_blockers,
         "refine_required": bool(refine_required),
+        # The achieved independence rung per required lens, so an accepted card
+        # records exactly how independent each review was.
+        "independence_rungs": independence_rungs,
         "config_error": config_error[:MAX_SUMMARY_CHARS],
     }
 

@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.77 — 2026-08-16
+
+### Fixed
+
+- **If you have only one model provider installed, finished work could never be
+  accepted.** The acceptance gate demanded a review from a different vendor than
+  the one that did the work, so on a single-provider setup nothing could pass,
+  however complete and green it was. Reviewer independence is now a recorded
+  ladder that degrades to a fresh-context review by the same model, and the
+  achieved level is written into the acceptance evidence so you can see exactly
+  how independent each review was. A reviewer that cannot actually read the
+  review packet is still refused, and every other safeguard is unchanged.
+
 ## 0.9.76 — 2026-08-16
 
 ### Fixed

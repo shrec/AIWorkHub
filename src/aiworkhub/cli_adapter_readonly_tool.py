@@ -35,26 +35,50 @@ future wiring a one-liner without this task touching the server module.
 
 B107 adds a READ-ONLY collision preflight to the plan output (``would_collide``
 / ``collision_preflight``). It answers "would this task_id/runner collide with
-an already-active claim?" by reading the SAME task-card JSONL the tasking
-collision guard scans (``scripts/build_tasking_parallel_group_collision_guard_
-v1.py``: ``load_cards`` + ``canonical_status`` + ``ACTIVE_STATUSES``) with a
-plain file read. No lock is taken, no claim is written, and no queue/audit
-state is ever mutated by this preflight -- it only classifies cards that are
-already on disk. The card source path is env-overridable
-(``AIWORKHUB_COLLISION_CARDS_PATH``, falling back to the existing
-``BITNN_TASK_CARDS_PATH`` override taskctl.py already honors) so tests can
-point it at an isolated temp directory instead of the shared production file.
+an already-active claim?" with the SAME active-bucket semantics the live
+``core.collision_guard`` uses (``task_store.canonical_status`` +
+``pending``/``processing``/``review``), so the two can never disagree on the
+active-card count. No lock is taken, no claim is written, and no queue/audit
+state is ever mutated -- it only classifies cards that are already on disk.
+
+Card source resolution is FAIL-CLOSED. When an operator EXPLICITLY configures a
+JSONL source (``AIWORKHUB_COLLISION_CARDS_PATH`` or the legacy
+``BITNN_TASK_CARDS_PATH``) that source is authoritative; a configured source
+that cannot be READ -- whether it is MISSING or exists but is UNREADABLE (a
+directory where a file was expected, a permission-denied file, an unreadable
+device, undecodable bytes) -- is reported as UNRESOLVED (``cards_source_resolved``
+false, ``active_card_count`` / ``would_collide`` ``None``) rather than a
+confident "0 active cards, safe to proceed". A missing file and an unreadable
+file are the SAME epistemic state -- no cards were observed -- so the preflight
+must never answer "no collisions" when what actually happened is "I could not
+look"; approving overlapping write scopes because the preflight could not read
+its own source is the original defect. With no override the preflight resolves
+from the canonical task store of the BOUND repository (no hardcoded foreign
+``bitnnv2`` path), and an unavailable store -- a readiness error OR a
+non-readiness SQLite failure (a deleted/locked database after the readiness
+check) -- is UNRESOLVED for the same reason. A ``repo`` argument SCOPES that
+canonical scan to a named repository (the same parameter ``plan_dryrun``
+honours), so the preflight and the plan answer about the SAME repository rather
+than one silently answering about the process-bound one.
+
+REDACTION applies to EVERY branch, not just the failure path (the success path
+is the one that runs constantly): neither the UNRESOLVED structure
+(``unresolved_reason`` AND ``cards_source``) NOR the RESOLVED explicit-source
+result leaks the operator's absolute filesystem path -- ``cards_source`` names
+the env var (``configured:<ENV>``) or the canonical store, never the path.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 from aiworkhub import cli_adapter_dryrun as dryrun
 from aiworkhub import core
+from aiworkhub import sqlite_readonly
 from aiworkhub import task_store
 
 
@@ -104,44 +128,45 @@ def _authority_flags() -> dict[str, bool]:
 
 _COLLISION_CARDS_ENV = "AIWORKHUB_COLLISION_CARDS_PATH"
 _COLLISION_CARDS_LEGACY_ENV = "BITNN_TASK_CARDS_PATH"
-_COLLISION_CARDS_DEFAULT_REL = Path("bitnnv2") / "data" / "tasking" / "machine_task_cards_v1.jsonl"
-
-
-def collision_cards_path(repo: Any = None) -> Path:
-    """Resolve the read-only task-card source scanned for the preflight.
-
-    Priority: ``AIWORKHUB_COLLISION_CARDS_PATH`` (dedicated, test-safe
-    override) > ``BITNN_TASK_CARDS_PATH`` (the existing taskctl.py override,
-    kept for production consistency) > the default cards JSONL under the
-    repo root. Never falls back to any lock/claim file.
-    """
-    override = os.environ.get(_COLLISION_CARDS_ENV, "")
-    if override:
-        return Path(override).expanduser().resolve()
-    legacy = os.environ.get(_COLLISION_CARDS_LEGACY_ENV, "")
-    if legacy:
-        return Path(legacy).expanduser().resolve()
-    root = repo or core.repo_root()
-    return Path(root) / _COLLISION_CARDS_DEFAULT_REL
-
 
 # The active lifecycle buckets that count as a live claim -- the EXACT set the
 # production collision guard uses (see core._active_cards_for_collision_guard).
 _ACTIVE_STATUSES = frozenset({"pending", "processing", "review"})
 
 
-def _load_cards(cards_path: Path) -> list[dict[str, Any]]:
-    """Read the machine task-card JSONL into a list of card dicts (read-only).
+def _explicit_cards_source() -> tuple[str | None, str | None]:
+    """Return ``(raw_path, env_name)`` when an operator EXPLICITLY configured a
+    JSONL card source, else ``(None, None)``.
 
-    Tolerant by design: blank lines and individually malformed JSON lines are
-    skipped rather than failing the whole preflight, and a non-object line is
-    ignored. Never acquires a lock and never mutates the file.
+    There is no hardcoded default. The former
+    ``bitnnv2/data/tasking/machine_task_cards_v1.jsonl`` fallback pointed at a
+    foreign repo layout that does not exist in an installed/VSIX runtime, so an
+    unconfigured preflight now resolves from the canonical task store of the
+    bound repository instead (see :func:`collision_preflight`).
+    """
+    override = os.environ.get(_COLLISION_CARDS_ENV, "").strip()
+    if override:
+        return override, _COLLISION_CARDS_ENV
+    legacy = os.environ.get(_COLLISION_CARDS_LEGACY_ENV, "").strip()
+    if legacy:
+        return legacy, _COLLISION_CARDS_LEGACY_ENV
+    return None, None
+
+
+def _load_cards(cards_path: Path) -> tuple[list[dict[str, Any]], int]:
+    """Read the machine task-card JSONL into ``(cards, skipped_malformed)``.
+
+    Tolerant to a bad ROW: a blank line is skipped, and an individually
+    malformed JSON line or a non-object line is SKIPPED and COUNTED rather than
+    disabling the whole diagnostic. It is deliberately NOT tolerant to a source
+    it cannot READ: a read failure (missing / directory / permission-denied /
+    undecodable bytes) PROPAGATES so the caller fails closed with the UNRESOLVED
+    shape instead of a confident zero. Never acquires a lock and never mutates
+    the file.
     """
     cards: list[dict[str, Any]] = []
-    try:
-        text = cards_path.read_text(encoding="utf-8")
-    except OSError:
-        return cards
+    skipped_malformed = 0
+    text = cards_path.read_text(encoding="utf-8")
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -149,10 +174,13 @@ def _load_cards(cards_path: Path) -> list[dict[str, Any]]:
         try:
             card = json.loads(line)
         except json.JSONDecodeError:
+            skipped_malformed += 1
             continue
         if isinstance(card, dict):
             cards.append(card)
-    return cards
+        else:
+            skipped_malformed += 1
+    return cards, skipped_malformed
 
 
 def _collision_guard_helpers():
@@ -164,63 +192,231 @@ def _collision_guard_helpers():
     ``core.collision_guard`` uses, so the preflight can never drift from
     production semantics. These ship INSIDE the installed package: the former
     ``scripts/build_tasking_parallel_group_collision_guard_v1.py`` import was
-    unshippable (``scripts/`` is not packaged into the wheel or the VSIX
-    runtime, and that file no longer exists anywhere), so any invocation on an
+    unshippable (that path is not packaged into the wheel or the VSIX runtime,
+    and that file no longer exists anywhere), so any invocation on an
     installed/VSIX runtime raised ``ModuleNotFoundError``.
     """
     return _ACTIVE_STATUSES, task_store.canonical_status, _load_cards
 
 
-def collision_preflight(
-    *,
-    task_id: str,
-    runner: str,
-    topic: str,
-    repo: Any = None,
-) -> dict[str, Any]:
-    """READ-ONLY: would this task_id/runner collide with an active claim?
+def _active_cards_for_repo(repo: Any) -> list[dict[str, Any]]:
+    """READ-ONLY active-card scan scoped to an EXPLICIT repository ``repo``.
 
-    Reads the task-card JSONL with a plain file read -- no lock is acquired,
-    no claim is written, and no queue/audit state is mutated. ``would_collide``
-    is true when an ACTIVE (pending/processing/review) card already
-    claims this exact ``task_id``, or when the same ``runner`` already holds a
-    different active task. A blocked card has no live worker or promotable
-    candidate and therefore cannot retain a write/runner lock indefinitely.
+    Mirrors :func:`core._active_cards_for_collision_guard` EXACTLY -- the same
+    canonical ``tasks`` scan, the SAME production classifier
+    (``task_store.canonical_status``) and the SAME active bucket set
+    (:data:`_ACTIVE_STATUSES`) -- but against the canonical store of the
+    repository the CALLER named rather than the process-bound one, so a preflight
+    can never answer about the ambient repo when it was asked about another (the
+    same defect this card exists to kill, one level up in the signature).
+
+    The store is opened through the hardened read-only helper
+    (``sqlite_readonly.connect_readonly`` -- ``as_uri`` percent-encoding plus
+    ``PRAGMA query_only``), so it can neither create nor mutate a file. An
+    unavailable store raises (``StorageNotReadyError`` from the readiness check,
+    or a bare ``sqlite3.Error`` from a deleted/locked DB after it) exactly like
+    the canonical path, so the caller fails closed with the UNRESOLVED shape.
     """
-    cards_path = collision_cards_path(repo)
-    exists = cards_path.exists()
-    active_cards: list[dict[str, Any]] = []
-    if exists:
-        active_statuses, canonical_status, load_cards = _collision_guard_helpers()
-        for card in load_cards(cards_path):
-            if canonical_status(card) in active_statuses:
-                active_cards.append(card)
+    readiness = task_store.storage_readiness(repo)
+    if not readiness.ready:
+        raise task_store.StorageNotReadyError(readiness.reason)
+    conn = sqlite_readonly.connect_readonly(Path(readiness.canonical_db))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT task_id, runner, topic, status, worker_status, card_json, archived_at FROM tasks"
+        ).fetchall()
+    finally:
+        conn.close()
+    active: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        bucket = task_store.canonical_status(item)
+        if bucket not in _ACTIVE_STATUSES:
+            continue
+        try:
+            card_json = json.loads(item.get("card_json") or "{}")
+        except json.JSONDecodeError:
+            card_json = {}
+        card = {**card_json, **{k: v for k, v in item.items() if k != "card_json"}}
+        card["status"] = bucket
+        active.append(card)
+    return active
 
+
+def _classify_collision(
+    active_cards: list[dict[str, Any]], *, task_id: str, runner: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     same_task = [c for c in active_cards if str(c.get("task_id", "")) == task_id]
     same_runner_other_task = [
         c for c in active_cards
         if str(c.get("runner", "")) == runner and str(c.get("task_id", "")) != task_id
     ]
-
     reasons: list[str] = []
     if same_task:
         reasons.append("active_claim_exists_for_task_id")
     if same_runner_other_task:
         reasons.append("runner_already_claims_other_active_task")
+    return same_task, same_runner_other_task, reasons
 
+
+def _resolved_preflight(
+    active_cards: list[dict[str, Any]],
+    *,
+    task_id: str,
+    runner: str,
+    cards_source: str,
+    skipped_malformed: int,
+) -> dict[str, Any]:
+    same_task, same_runner_other_task, reasons = _classify_collision(
+        active_cards, task_id=task_id, runner=runner
+    )
     return {
         "would_collide": bool(reasons),
         "read_only": True,
         "mutated_state": False,
         "lock_acquired": False,
         "claim_written": False,
-        "cards_source": str(cards_path),
-        "cards_source_exists": exists,
+        "cards_source": cards_source,
+        "cards_source_resolved": True,
+        "cards_source_exists": True,
         "active_card_count": len(active_cards),
         "matching_task_id_active_claims": len(same_task),
         "same_runner_other_active_claims": len(same_runner_other_task),
+        "skipped_malformed_rows": skipped_malformed,
         "collision_reasons": reasons,
+        "unresolved_reason": None,
     }
+
+
+def _unresolved_preflight(*, cards_source: str, unresolved_reason: str) -> dict[str, Any]:
+    """FAIL-CLOSED result: an unusable card source is UNRESOLVED, never a
+    confident zero. The WHOLE structure is path-free -- both ``unresolved_reason``
+    and ``cards_source`` name WHY (the env var / store) without leaking an
+    absolute filesystem path; ``active_card_count`` / ``would_collide`` are
+    ``None`` so a caller can never misread "could not resolve" as "safe to
+    proceed". Callers MUST pass a path-free ``cards_source`` here.
+    """
+    return {
+        "would_collide": None,
+        "read_only": True,
+        "mutated_state": False,
+        "lock_acquired": False,
+        "claim_written": False,
+        "cards_source": cards_source,
+        "cards_source_resolved": False,
+        "cards_source_exists": False,
+        "active_card_count": None,
+        "matching_task_id_active_claims": None,
+        "same_runner_other_active_claims": None,
+        "skipped_malformed_rows": None,
+        "collision_reasons": [],
+        "unresolved_reason": unresolved_reason,
+    }
+
+
+def collision_preflight(
+    *,
+    task_id: str,
+    runner: str,
+    topic: str | None = None,
+    repo: Any = None,
+) -> dict[str, Any]:
+    """READ-ONLY: would this task_id/runner collide with an active claim?
+
+    No lock is acquired, no claim is written, and no queue/audit state is
+    mutated. ``would_collide`` is true when an ACTIVE (pending/processing/
+    review) card already claims this exact ``task_id``, or when the same
+    ``runner`` already holds a different active task.
+
+    ``repo`` SCOPES the canonical scan to a named repository -- the same
+    parameter ``plan_dryrun`` honours -- so the two sibling surfaces answer
+    about the SAME repository. When ``repo`` is None the process-bound repository
+    is scanned through the canonical guard's own function (so the counts can
+    never drift from the authority); when a ``repo`` is given, that repository's
+    canonical store is scanned with identical production semantics
+    (:func:`_active_cards_for_repo`). A parameter that were accepted and silently
+    dropped would let a caller get a confident answer about the WRONG repository
+    -- the very defect this card exists to eliminate -- so ``repo`` is either
+    honoured or (on an unreadable store) reported UNRESOLVED, never swallowed.
+
+    ``topic`` is accepted for call-shape symmetry with ``plan_dryrun`` but is
+    DELIBERATELY not part of collision semantics and is therefore no longer
+    required: the canonical collision guard scopes by ``task_id``/``runner``
+    across ALL active cards regardless of topic, and narrowing the active set by
+    ``topic`` here would WEAKEN the guard (it could miss a real collision), which
+    the authority forbids. It is documented-and-unused rather than silently
+    required so the signature promises only what it performs.
+
+    Resolution is FAIL-CLOSED (see the module docstring): an EXPLICITLY
+    configured JSONL source that does not exist, or an unavailable canonical
+    task store, is reported as UNRESOLVED rather than a confident zero.
+    """
+    explicit, env_name = _explicit_cards_source()
+    if explicit is not None:
+        cards_path = Path(explicit).expanduser()
+        # A configured source is UNRESOLVED unless it can actually be READ. A
+        # missing file and an unreadable one (a directory where a file was
+        # expected, a permission-denied file, an unreadable device, undecodable
+        # bytes) are the SAME epistemic state -- no cards observed -- so BOTH
+        # fail closed rather than returning a confident zero. The honest "why"
+        # AND ``cards_source`` name the env var, NOT the (absolute) path it held.
+        try:
+            cards, skipped_malformed = _load_cards(cards_path)
+        except FileNotFoundError:
+            return _unresolved_preflight(
+                cards_source=f"configured:{env_name}",
+                unresolved_reason=f"configured_cards_source_missing:{env_name}",
+            )
+        except (OSError, UnicodeDecodeError) as exc:
+            return _unresolved_preflight(
+                cards_source=f"configured:{env_name}",
+                unresolved_reason=(
+                    f"configured_cards_source_unreadable:{env_name}:{type(exc).__name__}"
+                ),
+            )
+        active_cards = [
+            card for card in cards if task_store.canonical_status(card) in _ACTIVE_STATUSES
+        ]
+        # PATH-FREE on the RESOLVED branch too: the success path runs constantly,
+        # so redacting only the failure path is not redaction. ``cards_source``
+        # names the env var that configured the source, never the operator's
+        # absolute filesystem path -- honouring the module's redaction invariant.
+        return _resolved_preflight(
+            active_cards,
+            task_id=task_id,
+            runner=runner,
+            cards_source=f"configured:{env_name}",
+            skipped_malformed=skipped_malformed,
+        )
+
+    # No JSONL override: resolve from the canonical task store, using the SAME
+    # scan the live collision guard uses so the counts agree. ``repo`` SCOPES
+    # which repository's store is read: with no ``repo`` the process-bound store
+    # is read through the guard's OWN function (the authority, so counts can
+    # never drift); with an explicit ``repo`` that repository's canonical store
+    # is scanned with identical production semantics. Any failure to read the
+    # store is UNRESOLVED, not a confident zero: a ``TaskStoreError`` from the
+    # readiness check, and ALSO the non-readiness SQLite failures a
+    # deleted/locked database raises AFTER it inside the scan (``sqlite3.Error``,
+    # which is NOT a ``TaskStoreError`` so it would otherwise escape or degrade).
+    try:
+        if repo is None:
+            active_cards = core._active_cards_for_collision_guard()
+        else:
+            active_cards = _active_cards_for_repo(repo)
+    except (task_store.TaskStoreError, sqlite3.Error):
+        return _unresolved_preflight(
+            cards_source="canonical_task_store",
+            unresolved_reason="canonical_task_store_unavailable",
+        )
+    return _resolved_preflight(
+        active_cards,
+        task_id=task_id,
+        runner=runner,
+        cards_source="canonical_task_store",
+        skipped_malformed=0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +455,9 @@ def plan_command_readonly(
     plan["readonly"] = True
     plan["audit_written"] = False
     plan["redacted_env"] = redact_env(env)
-    preflight = collision_preflight(task_id=task_id, runner=runner, topic=topic, repo=repo)
+    # ``repo`` is forwarded so the preflight scopes to the SAME repository the
+    # plan does; ``topic`` is not part of collision semantics and so is not.
+    preflight = collision_preflight(task_id=task_id, runner=runner, repo=repo)
     plan["would_collide"] = preflight["would_collide"]
     plan["collision_preflight"] = preflight
     plan["authority_flags"].update(_authority_flags())

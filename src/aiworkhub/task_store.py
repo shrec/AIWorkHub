@@ -932,6 +932,13 @@ def database_identity(root: str | Path) -> dict[str, Any]:
     }
 
 
+# Terminal ``status`` column values that are legally consistent with a set
+# ``archived_at``.  A row carrying ``archived_at`` while its raw ``status`` is
+# anything else is the "impossible" half-applied-archive state that this
+# module now refuses to create and can explicitly repair.
+_ARCHIVE_TERMINAL_STATUSES: frozenset[str] = frozenset({"archived", "superseded", "finished"})
+
+
 def archive_task(
     root: str | Path,
     task_id: str,
@@ -942,8 +949,19 @@ def archive_task(
     operation: str = "archived",
     superseded_by: str = "",
 ) -> tuple[bool, str]:
-    """Archive one task in the bound canonical queue without deleting audit history."""
+    """Archive one task in the bound canonical queue without deleting audit history.
+
+    The archive is a single atomic transition.  ``archived_at`` and the
+    terminal ``status`` column are written together in one UPDATE, guarded by
+    a preimage ``WHERE`` clause, inside one transaction.  A row can therefore
+    never be left with ``archived_at`` set while ``status`` is still a
+    non-terminal value: either the whole transition commits or the row is
+    untouched.  After commit the row is re-read and the reported outcome
+    reflects what is actually stored, so a write that did not persist reports
+    failure rather than the value it merely intended to write.
+    """
     _readiness, db_path = _require_ready(root)
+    terminal_status = "superseded" if operation == "superseded" else "archived"
     conn = _connect(db_path)
     try:
         row = conn.execute(
@@ -956,6 +974,7 @@ def archive_task(
             return True, "already_archived"
         if canonical_status(dict(row)) == "processing" and not allow_processing:
             return False, "archive_processing_forbidden"
+        source_status = str(row["status"] or "")
         now = datetime.now(timezone.utc).isoformat()
         try:
             card = json.loads(str(row["card_json"] or "{}"))
@@ -964,38 +983,245 @@ def archive_task(
         if not isinstance(card, dict):
             card = {}
         card["archived_at"] = now
+        card["status"] = terminal_status
         card["archive_operation"] = operation
         card["archive_reason"] = reason[:200]
         if operation == "superseded" and str(superseded_by or "").strip():
             card["superseded_by"] = str(superseded_by).strip()
-        conn.execute(
-            "UPDATE tasks SET archived_at=?, updated_at=?, card_json=? WHERE task_id=?",
-            (now, now, json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
-        )
-        conn.execute(
-            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                task_id,
-                operation,
-                actor,
-                json.dumps(
-                    {
-                        "reason": reason[:200],
-                        **(
-                            {"superseded_by": str(superseded_by).strip()}
-                            if operation == "superseded"
-                            and str(superseded_by or "").strip()
-                            else {}
-                        ),
-                    },
-                    sort_keys=True,
+        try:
+            cur = conn.execute(
+                "UPDATE tasks SET archived_at=?, status=?, updated_at=?, card_json=? "
+                "WHERE task_id=? AND COALESCE(archived_at, '')='' AND status=?",
+                (
+                    now,
+                    terminal_status,
+                    now,
+                    json.dumps(card, ensure_ascii=False, sort_keys=True),
+                    task_id,
+                    source_status,
                 ),
-                now,
-            ),
-        )
-        conn.commit()
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False, "archive_write_conflict"
+            conn.execute(
+                "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    operation,
+                    actor,
+                    json.dumps(
+                        {
+                            "reason": reason[:200],
+                            **(
+                                {"superseded_by": str(superseded_by).strip()}
+                                if operation == "superseded"
+                                and str(superseded_by or "").strip()
+                                else {}
+                            ),
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 -- a partial archive must never persist
+            conn.rollback()
+            return False, f"archive_write_failed:{type(exc).__name__}"
+        stored = conn.execute(
+            "SELECT archived_at, status FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if (
+            stored is None
+            or not str(stored["archived_at"] or "").strip()
+            or str(stored["status"] or "").strip().lower() not in _ARCHIVE_TERMINAL_STATUSES
+        ):
+            return False, "archive_not_persisted"
         return True, operation
+    finally:
+        conn.close()
+
+
+def find_archive_inconsistencies(root: str | Path) -> list[dict[str, str]]:
+    """Detect rows whose archive half-applied: ``archived_at`` is set while the
+    raw ``status`` column is still non-terminal.  Pure read; never mutates.
+
+    Three such rows exist in this repository right now
+    (``CLAUDE_SONNET5_CLI_QR_NF202_SECURITY_V2``,
+    ``CLAUDE_SONNET5_CLI_QR_NF202_CODE_QUALITY_V2`` and
+    ``GLM52_VSCODE_QR_NF229_POSTRELOAD_CORRECTNESS_20260815_V2``); this is how
+    they are found.
+    """
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT task_id, status, worker_status, archived_at FROM tasks "
+            "WHERE COALESCE(archived_at, '') <> ''"
+        ).fetchall()
+    finally:
+        conn.close()
+    inconsistent: list[dict[str, str]] = []
+    for row in rows:
+        if str(row["status"] or "").strip().lower() not in _ARCHIVE_TERMINAL_STATUSES:
+            inconsistent.append(
+                {
+                    "task_id": str(row["task_id"]),
+                    "status": str(row["status"] or ""),
+                    "worker_status": str(row["worker_status"] or ""),
+                    "archived_at": str(row["archived_at"] or ""),
+                }
+            )
+    return inconsistent
+
+
+def repair_archive_inconsistencies(
+    root: str | Path,
+    *,
+    actor: str = "coordinator",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Explicit, logged repair for rows left in the impossible
+    ``archived_at``-set / non-terminal-``status`` state.
+
+    This is never run implicitly on import or initialization; a caller must
+    invoke it deliberately.  Each repaired row completes its interrupted
+    archive by writing the terminal ``status`` column under a preimage guard
+    and records an ``archive_inconsistency_repaired`` audit event carrying the
+    prior status.  ``dry_run`` reports what would be repaired without writing.
+    """
+    detected = find_archive_inconsistencies(root)
+    if dry_run or not detected:
+        return {"detected": detected, "repaired": [], "count": len(detected), "dry_run": dry_run}
+    _readiness, db_path = _require_ready(root)
+    repaired: list[str] = []
+    conn = _connect(db_path)
+    try:
+        for item in detected:
+            task_id = item["task_id"]
+            now = datetime.now(timezone.utc).isoformat()
+            cur = conn.execute(
+                "UPDATE tasks SET status='archived', updated_at=? "
+                "WHERE task_id=? AND COALESCE(archived_at, '') <> '' AND status=?",
+                (now, task_id, item["status"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            conn.execute(
+                "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                "VALUES (?, 'archive_inconsistency_repaired', ?, ?, ?)",
+                (
+                    task_id,
+                    actor,
+                    json.dumps(
+                        {"from_status": item["status"], "archived_at": item["archived_at"]},
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            repaired.append(task_id)
+        conn.commit()
+    finally:
+        conn.close()
+    return {"detected": detected, "repaired": repaired, "count": len(detected), "dry_run": False}
+
+
+def force_terminalize(
+    root: str | Path,
+    task_id: str,
+    *,
+    reason: str,
+    actor: str = "manager",
+    substatus: str = "force_terminalized",
+) -> tuple[bool, str]:
+    """The one supported manual exit: force a stuck request to a terminal
+    state with a recorded reason.
+
+    A control plane with no manual exit is one bad row away from total
+    paralysis.  This moves any non-terminal request to a terminal ``blocked``
+    state, records ``reason`` on the card and in an audit event, and is
+    idempotent: a request that is already terminal is left untouched and
+    reported as ``already_terminal`` rather than transitioned again.  A
+    finalizer whose retries are exhausted must call this instead of retrying:
+    exhausted means terminal, not another attempt.
+    """
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT status, worker_status, archived_at, card_json FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_not_found"
+        current = canonical_status(dict(row))
+        if current in {"archived", "finished", "superseded", "blocked"}:
+            return True, "already_terminal"
+        source_status = str(row["status"] or "")
+        source_worker = str(row["worker_status"] or "")
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            card = json.loads(str(row["card_json"] or "{}"))
+        except json.JSONDecodeError:
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        card["status"] = "blocked"
+        card["worker_status"] = "blocked"
+        card["blocker_reason"] = reason[:200]
+        card["terminal_failure"] = {
+            "substatus": substatus,
+            "reason": reason[:200],
+            "actor": actor,
+            "forced_at": now,
+            "from_status": current,
+        }
+        try:
+            cur = conn.execute(
+                "UPDATE tasks SET status='blocked', worker_status='blocked', "
+                "completed_at=?, updated_at=?, card_json=? "
+                "WHERE task_id=? AND status=? AND worker_status=? "
+                "AND COALESCE(archived_at, '')=''",
+                (
+                    now,
+                    now,
+                    json.dumps(card, ensure_ascii=False, sort_keys=True),
+                    task_id,
+                    source_status,
+                    source_worker,
+                ),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False, "force_terminalize_conflict"
+            conn.execute(
+                "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                "VALUES (?, 'force_terminalized', ?, ?, ?)",
+                (
+                    task_id,
+                    actor,
+                    json.dumps(
+                        {"reason": reason[:200], "substatus": substatus, "from_status": current},
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 -- a forced exit must never half-apply
+            conn.rollback()
+            return False, f"force_terminalize_failed:{type(exc).__name__}"
+        stored = conn.execute(
+            "SELECT status FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if stored is None or canonical_status({"status": str(stored["status"] or "")}) != "blocked":
+            return False, "force_terminalize_not_persisted"
+        return True, "blocked"
     finally:
         conn.close()
 

@@ -1,0 +1,535 @@
+"""Deliver a quality-review packet as inline content and gate reviewer launch.
+
+This module fixes the assurance-delivery defect where a reviewer received its
+candidate only as a filesystem path to ``quality_review_packet.json``.  A
+reviewer on an in-process ``vscode_lm`` adapter has no file-read tool of any
+kind and therefore could never open that packet, so its lens stayed
+unsatisfiable while a green worker suite was blocked from acceptance.
+
+Everything here is pure: it performs no process launch and no repository
+mutation.  The functions:
+
+* deliver the packet as content in the reviewer prompt
+  (:func:`deliver_packet_content` / :func:`build_reviewer_prompt_with_content`)
+  while preserving the exact ``packet_sha256`` contract, keeping the on-disk
+  path only as a convenience for adapters that *do* have a file-read tool;
+* assemble the reviewer prompt for the exact adapter that will run it
+  (:func:`assemble_reviewer_prompt`) -- the single seam the reviewer launch
+  path uses so a blind adapter is handed content and a sighted one keeps its
+  path transport;
+* decide when a reviewer may keep inspecting rather than being forced to submit
+  after a single zero-hit Source Graph query
+  (:func:`reviewer_may_query_source_graph_again` / :func:`reviewer_submit_forced`);
+* choose whether a reviewer's Source Graph is scoped to its own worktree or to
+  the parent repository when the worktree index has no rows
+  (:func:`choose_reviewer_source_graph_scope`);
+* refuse the launch immediately, naming the reason per provider, when no
+  independent *sighted* reviewer exists for the target
+  (:func:`assess_reviewer_availability`); and
+* record the best available *independence rung* for a review
+  (:func:`resolve_independence_rung`) so a single-provider installation still
+  completes a review and every acceptance names exactly how independent it was.
+
+The 0.9.74 blind-reviewer gate in :mod:`aiworkhub.quality_evidence` is not
+weakened here: a report whose only finding is ``process_limit`` still fails its
+lens.  Content delivery makes blind adapters able to *see*; it never accepts an
+uninspected review or a same-provider review.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
+
+from . import quality_reviewer, runtime_adapters
+from .quality_reviewer import ReviewerEvidenceError
+
+DELIVERY_SCHEMA_ID = "aiworkhub.quality_review_packet_delivery.v1"
+AVAILABILITY_SCHEMA_ID = "aiworkhub.quality_review_reviewer_availability.v1"
+SCOPE_SCHEMA_ID = "aiworkhub.quality_review_source_graph_scope.v1"
+INDEPENDENCE_SCHEMA_ID = "aiworkhub.quality_review_independence.v1"
+
+DEFAULT_SUBMIT_TOOL = "aiworkhub_worker_quality_review_submit"
+
+# Inline transport marker emitted by ``quality_reviewer.build_review_prompt``
+# when the packet content is embedded rather than referenced by path.
+_INLINE_PACKET_PREFIX = "QUALITY_REVIEW_PACKET: "
+_CONVENIENCE_PREFIX = "QUALITY_REVIEW_PACKET_FILE_CONVENIENCE: "
+
+# A reviewer must be allowed at least this many Source Graph inspection queries
+# before submission can be forced; one zero-hit orientation query is never
+# enough to end the inspection phase.  A hard maximum keeps the phase bounded.
+REVIEWER_MIN_INSPECTION_QUERIES = 2
+REVIEWER_MAX_INSPECTION_QUERIES = 8
+
+# Reviewer provider availability, observed from the launch/provider layer.
+AVAILABILITY_AVAILABLE = "available"
+AVAILABILITY_PROVIDER_REFUSED = "provider_refused"
+AVAILABILITY_QUOTA_UNOBSERVED = "quota_unobserved"
+
+# Per-provider assessment reasons.
+REASON_AVAILABLE = "available_independent_sighted"
+# Retained for compatibility only.  ``assess_reviewer_availability`` no longer
+# emits this: sharing the worker's provider is not a blocking reason, because
+# independence is a recorded ladder (:func:`resolve_independence_rung`), not a
+# vendor check.  A same-provider reviewer completes at the fresh-context rung.
+REASON_SAME_PROVIDER = "same_provider_not_independent"
+REASON_PROVIDER_REFUSED = "provider_refused"
+REASON_QUOTA_UNOBSERVED = "quota_unobserved"
+REASON_BLIND_NO_FILE_READ = "blind_adapter_no_file_read"
+
+REFUSAL_NO_INDEPENDENT_SIGHTED = "no_independent_sighted_reviewer_available"
+
+# Review independence ladder.
+#
+# Multi-model routing exists so work can be sent to a model by cost and
+# difficulty; it was never a requirement that one *vendor* review another.  A
+# user who has only one provider must still get a real independent review, so
+# independence is a recorded ladder, best rung first, never a hard refusal:
+#
+#     cross_provider  ->  cross_model_same_provider  ->  same_model_fresh_context
+#
+# What actually makes a review independent -- the anti-anchored packet, the
+# sealed candidate, the separate read-only process and the authenticated
+# packet_sha256-bound submission -- holds on every rung and is unchanged by this
+# classification; vendor identity never was one of them.
+RUNG_CROSS_PROVIDER = "cross_provider"
+RUNG_CROSS_MODEL_SAME_PROVIDER = "cross_model_same_provider"
+RUNG_SAME_MODEL_FRESH_CONTEXT = "same_model_fresh_context"
+
+# Best rung first: the ladder is walked top-to-bottom and the first rung whose
+# condition holds is the one recorded.
+INDEPENDENCE_LADDER = (
+    RUNG_CROSS_PROVIDER,
+    RUNG_CROSS_MODEL_SAME_PROVIDER,
+    RUNG_SAME_MODEL_FRESH_CONTEXT,
+)
+
+
+def _canonical_bytes(payload: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+
+
+def _verify_packet_digest(packet: Mapping[str, Any]) -> str:
+    """Return the packet's ``packet_sha256`` after re-deriving and matching it.
+
+    Fail-closed: the digest is recomputed over the packet body (every key except
+    ``packet_sha256``) exactly as :func:`quality_reviewer.build_review_packet`
+    computed it, so delivery can never change or forge the contract.
+    """
+
+    if not isinstance(packet, Mapping):
+        raise ReviewerEvidenceError("review_packet_not_object")
+    stored = str(packet.get("packet_sha256") or "")
+    body = {key: value for key, value in packet.items() if key != "packet_sha256"}
+    recomputed = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    if not stored or stored != recomputed:
+        raise ReviewerEvidenceError("review_packet_digest_invalid")
+    return stored
+
+
+def deliver_packet_content(
+    packet: Mapping[str, Any], *, packet_path: str | None = None
+) -> dict[str, Any]:
+    """Package the review packet for delivery as content, not as a path.
+
+    The returned ``packet_content`` is the authoritative, self-contained
+    evidence a reviewer needs with no file-read tool.  ``packet_path`` is kept
+    only as a convenience for reviewers that can read files.  ``packet_sha256``
+    is the unchanged contract digest.
+    """
+
+    digest = _verify_packet_digest(packet)
+    content = json.dumps(
+        packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    return {
+        "schema_id": DELIVERY_SCHEMA_ID,
+        "packet_sha256": digest,
+        "packet_content": content,
+        "packet_path": str(packet_path) if packet_path is not None else None,
+        "requires_file_read": False,
+    }
+
+
+def capability_set_has_file_read(tool_names: Iterable[str]) -> bool:
+    """True when a reviewer's exact tool capability set includes a file read."""
+
+    return runtime_adapters.capability_set_has_file_read(tool_names)
+
+
+def build_reviewer_prompt_with_content(
+    packet: Mapping[str, Any],
+    *,
+    lens: str,
+    reviewer_tool_names: Iterable[str] = (),
+    submit_tool_name: str = DEFAULT_SUBMIT_TOOL,
+    packet_path: str | None = None,
+) -> str:
+    """Render a reviewer prompt that always embeds the packet content inline.
+
+    Unlike a path-only delivery, the returned prompt carries the full packet
+    JSON, so a reviewer with no file-read tool can still inspect every candidate
+    path/line and mechanical check.  When the reviewer *does* have a file-read
+    tool and ``packet_path`` is provided, an explicitly non-authoritative
+    convenience reference to the identical on-disk packet is appended.
+    """
+
+    # ``packet_file=None`` forces the inline transport in build_review_prompt,
+    # which also re-validates the packet digest before embedding it.
+    prompt = quality_reviewer.build_review_prompt(
+        packet,
+        lens=lens,
+        submit_tool_name=submit_tool_name,
+        packet_file=None,
+    )
+    if packet_path is not None and capability_set_has_file_read(reviewer_tool_names):
+        prompt += (
+            f"{_CONVENIENCE_PREFIX}{packet_path}\n"
+            "The identical packet content is also written to this path for "
+            "reviewers that have a file-read tool; the inline packet above is "
+            "authoritative and requires no file read.\n"
+        )
+    return prompt
+
+
+def assemble_reviewer_prompt(
+    packet: Mapping[str, Any],
+    *,
+    lens: str,
+    adapter_id: str,
+    submit_tool_name: str = DEFAULT_SUBMIT_TOOL,
+    packet_path: str | None = None,
+    adapter_fallback_used: bool = False,
+) -> str:
+    """Assemble the reviewer prompt for the exact adapter that will run it.
+
+    This is the single prompt-assembly seam used by the reviewer launch path in
+    :mod:`aiworkhub.process_launcher`.  A *sighted* adapter -- one whose reviewer
+    is handed a worker file-read tool -- keeps the path-referenced transport,
+    which avoids passing a large packet through argv on native CLI adapters.  A
+    *blind* adapter -- notably the in-process ``vscode_lm`` routes, which hand
+    the model no file-read tool of any kind -- receives the packet content
+    inline so it can still cite an exact packet-permitted path and line.  A
+    blind reviewer is never handed only an unreadable path.
+    """
+
+    if runtime_adapters.adapter_provides_file_read(
+        adapter_id, adapter_fallback_used=adapter_fallback_used
+    ):
+        return quality_reviewer.build_review_prompt(
+            packet,
+            lens=lens,
+            submit_tool_name=submit_tool_name,
+            packet_file=packet_path,
+        )
+    return build_reviewer_prompt_with_content(
+        packet,
+        lens=lens,
+        reviewer_tool_names=(),
+        submit_tool_name=submit_tool_name,
+        packet_path=packet_path,
+    )
+
+
+def extract_inline_packet(prompt: str) -> dict[str, Any] | None:
+    """Recover the inline packet a blind reviewer reads straight from its prompt.
+
+    Returns the parsed packet dict, or ``None`` when the prompt carries no
+    inline packet.  This performs no file I/O -- it is the exact path a reviewer
+    with no file-read tool uses to reach the candidate content.
+    """
+
+    for line in prompt.splitlines():
+        if line.startswith(_INLINE_PACKET_PREFIX):
+            encoded = line[len(_INLINE_PACKET_PREFIX):]
+            try:
+                parsed = json.loads(encoded)
+            except json.JSONDecodeError:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def reviewer_may_query_source_graph_again(
+    prior_query_count: int, *, prior_hit_total: int = 0
+) -> bool:
+    """Whether a reviewer may issue a further Source Graph query.
+
+    A single zero-hit orientation query must never end the inspection phase, so
+    the reviewer is always allowed at least ``REVIEWER_MIN_INSPECTION_QUERIES``
+    queries.  Past that minimum the reviewer may keep querying only while it has
+    still found nothing, and never beyond ``REVIEWER_MAX_INSPECTION_QUERIES``.
+    """
+
+    count = max(0, int(prior_query_count))
+    if count >= REVIEWER_MAX_INSPECTION_QUERIES:
+        return False
+    if count < REVIEWER_MIN_INSPECTION_QUERIES:
+        return True
+    return int(prior_hit_total) <= 0
+
+
+def reviewer_submit_forced(
+    prior_query_count: int, *, prior_hit_total: int = 0
+) -> bool:
+    """Inverse of :func:`reviewer_may_query_source_graph_again`."""
+
+    return not reviewer_may_query_source_graph_again(
+        prior_query_count, prior_hit_total=prior_hit_total
+    )
+
+
+def _baseline_paths(workspace_baseline: Iterable[Any]) -> list[str]:
+    paths: list[str] = []
+    for row in workspace_baseline or ():
+        if isinstance(row, Mapping):
+            value = str(row.get("path") or "")
+        else:
+            value = str(row or "")
+        if value:
+            paths.append(value)
+    return paths
+
+
+def choose_reviewer_source_graph_scope(
+    *,
+    worktree_evidence: Mapping[str, Any] | None,
+    workspace_baseline: Iterable[Any] = (),
+    parent_repo: str | None = None,
+) -> dict[str, Any]:
+    """Decide whether the reviewer Source Graph uses the worktree or the parent.
+
+    A zero-row worktree index must mean *nothing matched*, never *nothing
+    exists*: when the worktree index reports no rows but ``workspace_baseline``
+    lists candidate files, the reviewer Source Graph is scoped to the parent
+    repository instead.  The returned record always states which scope was
+    chosen and why.
+    """
+
+    counts = worktree_evidence or {}
+    entity_rows = int(counts.get("entity_rows") or 0)
+    edge_rows = int(counts.get("edge_rows") or 0)
+    file_rows = int(counts.get("file_rows") or 0)
+    baseline = _baseline_paths(workspace_baseline)
+    evidence_counts = {
+        "entity_rows": entity_rows,
+        "edge_rows": edge_rows,
+        "file_rows": file_rows,
+    }
+    if entity_rows > 0 or edge_rows > 0 or file_rows > 0:
+        return {
+            "schema_id": SCOPE_SCHEMA_ID,
+            "scope": "reviewer_worktree",
+            "reason": "reviewer_worktree_indexed",
+            "why": (
+                "the reviewer worktree index returned non-zero Source Graph "
+                "evidence for its candidate files"
+            ),
+            "evidence_counts": evidence_counts,
+            "baseline_file_count": len(baseline),
+        }
+    if baseline and parent_repo:
+        return {
+            "schema_id": SCOPE_SCHEMA_ID,
+            "scope": "parent_repository",
+            "parent_repo": str(parent_repo),
+            "reason": "reviewer_worktree_unindexed_baseline_present",
+            "why": (
+                "the reviewer worktree index returned zero rows while its "
+                "workspace_baseline lists candidate files, so a zero hit would "
+                "otherwise falsely read as nothing exists; the reviewer Source "
+                "Graph is scoped to the parent repository instead"
+            ),
+            "evidence_counts": evidence_counts,
+            "baseline_file_count": len(baseline),
+        }
+    return {
+        "schema_id": SCOPE_SCHEMA_ID,
+        "scope": "unavailable",
+        "reason": (
+            "reviewer_worktree_unindexed_no_parent_scope"
+            if baseline
+            else "reviewer_worktree_unindexed_empty_baseline"
+        ),
+        "why": (
+            "the reviewer worktree index returned zero rows and no parent "
+            "repository scope was available to fall back to"
+        ),
+        "evidence_counts": evidence_counts,
+        "baseline_file_count": len(baseline),
+    }
+
+
+def _candidate_can_inspect(
+    candidate: Mapping[str, Any], *, packet_delivered_as_content: bool
+) -> bool:
+    if packet_delivered_as_content:
+        return True
+    explicit = candidate.get("file_read")
+    if isinstance(explicit, bool):
+        return explicit
+    adapter_id = str(candidate.get("adapter_id") or "")
+    fallback = bool(candidate.get("adapter_fallback_used"))
+    return runtime_adapters.adapter_provides_file_read(
+        adapter_id, adapter_fallback_used=fallback
+    )
+
+
+def assess_reviewer_availability(
+    *,
+    worker_provider: str,
+    candidates: Sequence[Mapping[str, Any]],
+    packet_delivered_as_content: bool,
+) -> dict[str, Any]:
+    """Refuse -- with a per-provider reason -- when no reviewer can actually see.
+
+    Reviewer independence is a recorded *ladder* (:func:`resolve_independence_rung`),
+    not a vendor check: multi-model routing exists to send work to a model by
+    cost and difficulty, and a single-provider installation must still get a real
+    review rather than a refusal.  So a reviewer is usable when it is (1)
+    *available* (the provider did not refuse and its quota was observed) and (2)
+    *sighted*, i.e. it can inspect the candidate.  A reviewer that shares the
+    worker's provider is **not** blocked here -- its independence is recorded as
+    the ``same_model_fresh_context`` / ``cross_model_same_provider`` rung, and the
+    real independence invariants (the anti-anchored packet, the sealed candidate,
+    the separate read-only process and the authenticated ``packet_sha256``-bound
+    submission) hold on every rung.  Content delivery makes an otherwise-blind
+    adapter sighted; it is never used to accept a refused reviewer.  When no
+    candidate is both available and sighted, ``can_launch`` is False and
+    ``refusal_reason`` is set, so the launch fails immediately instead of
+    producing an uninspected review.
+    """
+
+    reasons_by_provider: dict[str, str] = {}
+    viable: list[str] = []
+    for candidate in candidates or ():
+        provider = str(candidate.get("provider") or "")
+        if not provider:
+            continue
+        availability = str(candidate.get("availability") or AVAILABILITY_AVAILABLE)
+        # Provider identity is deliberately not consulted: a same-provider
+        # reviewer is independent by the ladder, not refused here.
+        if availability == AVAILABILITY_PROVIDER_REFUSED:
+            reason = REASON_PROVIDER_REFUSED
+        elif availability == AVAILABILITY_QUOTA_UNOBSERVED:
+            reason = REASON_QUOTA_UNOBSERVED
+        elif not _candidate_can_inspect(
+            candidate, packet_delivered_as_content=packet_delivered_as_content
+        ):
+            reason = REASON_BLIND_NO_FILE_READ
+        else:
+            reason = REASON_AVAILABLE
+            viable.append(provider)
+        # First decisive reason per provider wins, but an ``available`` verdict
+        # always upgrades a previously recorded blocking reason for it.
+        if provider not in reasons_by_provider or reason == REASON_AVAILABLE:
+            reasons_by_provider[provider] = reason
+    viable = list(dict.fromkeys(viable))
+    can_launch = bool(viable)
+    return {
+        "schema_id": AVAILABILITY_SCHEMA_ID,
+        "worker_provider": worker_provider,
+        "packet_delivered_as_content": bool(packet_delivered_as_content),
+        "can_launch": can_launch,
+        "viable_reviewers": viable,
+        "reasons_by_provider": reasons_by_provider,
+        "refusal_reason": None if can_launch else REFUSAL_NO_INDEPENDENT_SIGHTED,
+    }
+
+
+def resolve_independence_rung(
+    *,
+    worker_provider: str,
+    reviewer_provider: str,
+    worker_model: str = "",
+    reviewer_model: str = "",
+) -> dict[str, Any]:
+    """Record the best available independence rung for this review.
+
+    The ladder degrades ``cross_provider`` -> ``cross_model_same_provider`` ->
+    ``same_model_fresh_context`` and never refuses: a single-provider,
+    single-model installation still reaches ``same_model_fresh_context`` and can
+    complete a review.  The returned record names the rung so it can be written
+    onto the acceptance evidence, and every rung still relies on the sealed,
+    anti-anchored packet reviewed by a separate read-only process that submits
+    through the authenticated ``packet_sha256``-bound tool.
+    """
+
+    wp, rp = str(worker_provider or ""), str(reviewer_provider or "")
+    wm, rm = str(worker_model or ""), str(reviewer_model or "")
+    if rp != wp:
+        rung = RUNG_CROSS_PROVIDER
+    elif rm != wm:
+        rung = RUNG_CROSS_MODEL_SAME_PROVIDER
+    else:
+        rung = RUNG_SAME_MODEL_FRESH_CONTEXT
+    return {
+        "schema_id": INDEPENDENCE_SCHEMA_ID,
+        "rung": rung,
+        "rung_index": INDEPENDENCE_LADDER.index(rung),
+        "worker_provider": wp,
+        "reviewer_provider": rp,
+        "worker_model": wm,
+        "reviewer_model": rm,
+        "cross_provider": rp != wp,
+        # Same provider *and* same model is still independent, but only because
+        # the reviewer runs in a separate read-only process with a fresh
+        # context against the sealed, anti-anchored packet.
+        "fresh_context_required": rung == RUNG_SAME_MODEL_FRESH_CONTEXT,
+    }
+
+
+def independence_acceptance_line(rung_record: Mapping[str, Any] | str) -> str:
+    """Render the acceptance-evidence line that records the independence rung.
+
+    Every acceptance names its rung so an auditor sees exactly how independent
+    the review was.
+    """
+
+    if isinstance(rung_record, Mapping):
+        rung = str(rung_record.get("rung") or "")
+    else:
+        rung = str(rung_record or "")
+    if rung not in INDEPENDENCE_LADDER:
+        raise ReviewerEvidenceError("invalid_independence_rung")
+    return f"Independent review recorded at rung: {rung}"
+
+
+__all__ = [
+    "DELIVERY_SCHEMA_ID",
+    "AVAILABILITY_SCHEMA_ID",
+    "SCOPE_SCHEMA_ID",
+    "INDEPENDENCE_SCHEMA_ID",
+    "DEFAULT_SUBMIT_TOOL",
+    "REVIEWER_MIN_INSPECTION_QUERIES",
+    "REVIEWER_MAX_INSPECTION_QUERIES",
+    "AVAILABILITY_AVAILABLE",
+    "AVAILABILITY_PROVIDER_REFUSED",
+    "AVAILABILITY_QUOTA_UNOBSERVED",
+    "REASON_AVAILABLE",
+    "REASON_SAME_PROVIDER",
+    "REASON_PROVIDER_REFUSED",
+    "REASON_QUOTA_UNOBSERVED",
+    "REASON_BLIND_NO_FILE_READ",
+    "REFUSAL_NO_INDEPENDENT_SIGHTED",
+    "RUNG_CROSS_PROVIDER",
+    "RUNG_CROSS_MODEL_SAME_PROVIDER",
+    "RUNG_SAME_MODEL_FRESH_CONTEXT",
+    "INDEPENDENCE_LADDER",
+    "deliver_packet_content",
+    "capability_set_has_file_read",
+    "build_reviewer_prompt_with_content",
+    "assemble_reviewer_prompt",
+    "extract_inline_packet",
+    "reviewer_may_query_source_graph_again",
+    "reviewer_submit_forced",
+    "choose_reviewer_source_graph_scope",
+    "assess_reviewer_availability",
+    "resolve_independence_rung",
+    "independence_acceptance_line",
+]

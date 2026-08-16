@@ -166,6 +166,10 @@ def _measure(repo_root: Path) -> dict[str, Any]:
             "footprint": {
                 key: value for key, value in footprint.items() if key not in ("base", "scan")
             },
+            # Surface a material unattributed/foreign footprint prominently so the
+            # dashboard cannot read as clean while gigabytes sit stranded outside
+            # every reclamation path (see storage_retention.recover_stranded_worktrees).
+            "unattributed_alert": storage_retention._unattributed_alert(footprint),
         },
         "quarantine_batches": quarantine_batches,
         "terminal_log_retention": terminal_logs,

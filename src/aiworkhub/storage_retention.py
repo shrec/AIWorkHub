@@ -39,6 +39,11 @@ LEGACY_LOG_RELATIVE_PATH = Path("logs")
 CANONICAL_RUNTIME_RELATIVE_PATH = Path(".aiworkhub/runtime")
 UNDO_DAYS = 7
 MAX_MANIFEST_BYTES = 512 * 1024
+# When unattributed/foreign worktree bytes reach this share of the observed
+# footprint, the preview flags it prominently (byte figure + count) so a short
+# reclaim-candidate list can never read as "this repository is nearly clean"
+# while gigabytes sit outside every reclamation path (see _unattributed_alert).
+MATERIAL_UNATTRIBUTED_SHARE = 0.10
 # Wall-clock ceiling for the read-only preview's on-disk measurement. The
 # dashboard snapshot is already bounded because it measures in a background
 # thread and serves a cached result; the preview acquires the identical bound
@@ -61,6 +66,10 @@ MAX_DEADLINE_SECONDS = 86_400.0
 # predecessor attempt protected. Keyed on lifecycle only -- never mtime/age.
 _FINISHED_STATUSES = frozenset({"finished", "archived", "superseded"})
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+# A worktree HEAD recorded in a manifest is either a raw object name (sha1 or
+# sha256) or a symbolic ref. Reconstructing a pruned registration writes this
+# verbatim into the admin ``HEAD`` file, so it is validated before it is trusted.
+_HEAD_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64}|ref: refs/[^\s]+)$")
 
 
 class StorageRetentionError(RuntimeError):
@@ -372,6 +381,8 @@ def repo_storage_footprint(repo_root: Path | str, *, base: Path | None = None) -
     global_scan = worktree_storage.scan_worktrees(worktree_base, with_sizes=True)
     repository_worktree_bytes = int(scan.get("summary", {}).get("total_bytes") or 0)
     global_worktree_bytes = int(global_scan.get("summary", {}).get("total_bytes") or 0)
+    repository_worktree_count = int(scan.get("summary", {}).get("count") or 0)
+    global_worktree_count = int(global_scan.get("summary", {}).get("count") or 0)
     legacy_log_root = root / LEGACY_LOG_RELATIVE_PATH
     canonical_runtime_root = root / CANONICAL_RUNTIME_RELATIVE_PATH
     legacy_log_bytes = (
@@ -396,9 +407,48 @@ def repo_storage_footprint(repo_root: Path | str, *, base: Path | None = None) -
         "unattributed_or_foreign_worktree_bytes": max(
             0, global_worktree_bytes - repository_worktree_bytes
         ),
+        "repository_worktree_count": repository_worktree_count,
+        "global_worktree_count": global_worktree_count,
+        "unattributed_or_foreign_worktree_count": max(
+            0, global_worktree_count - repository_worktree_count
+        ),
         "legacy_log_status": (
             "present_unmanaged" if legacy_log_bytes else "absent_or_empty"
         ),
+    }
+
+
+def _unattributed_alert(footprint: Mapping[str, Any]) -> dict[str, Any]:
+    """Prominent flag when unattributed/foreign worktrees are a material share.
+
+    A short reclaim-candidate list next to a large unattributed footprint reads
+    as "nearly clean" while gigabytes sit outside every reclamation path. When
+    that unattributed share crosses :data:`MATERIAL_UNATTRIBUTED_SHARE` of the
+    observed footprint, the preview says so up front -- with the byte figure and
+    the count -- and names the explicit recovery action, so the false impression
+    cannot survive a glance at the candidate count alone.
+    """
+    observed = int(footprint.get("observed_total_bytes") or 0)
+    unattributed_bytes = int(footprint.get("unattributed_or_foreign_worktree_bytes") or 0)
+    count = int(footprint.get("unattributed_or_foreign_worktree_count") or 0)
+    share = (unattributed_bytes / observed) if observed > 0 else 0.0
+    material = unattributed_bytes > 0 and count > 0 and share >= MATERIAL_UNATTRIBUTED_SHARE
+    message = ""
+    if material:
+        message = (
+            f"{count} worktree(s) totalling "
+            f"{worktree_storage._human_bytes(unattributed_bytes)} are unattributed or "
+            "foreign and are NOT covered by the reclaim candidates below; run "
+            "recover_stranded_worktrees() to re-register or reclaim them."
+        )
+    return {
+        "material": material,
+        "bytes": unattributed_bytes,
+        "count": count,
+        "share": round(share, 4),
+        "threshold_share": MATERIAL_UNATTRIBUTED_SHARE,
+        "recovery_action": "storage_retention.recover_stranded_worktrees",
+        "message": message,
     }
 
 
@@ -479,6 +529,16 @@ def _preview_payload(repo_root: Path, base: Path, *, now: float | None = None) -
         "preview_digest": digest,
         "candidates": candidates,
         "registration_health": registrations,
+        # Report-only fields (deliberately outside ``digest_input`` so the
+        # quarantine digest reconfirmation is unaffected): make a material
+        # unattributed/foreign footprint impossible to miss beside the candidates.
+        "unattributed_or_foreign_worktree_bytes": int(
+            footprint.get("unattributed_or_foreign_worktree_bytes") or 0
+        ),
+        "unattributed_or_foreign_worktree_count": int(
+            footprint.get("unattributed_or_foreign_worktree_count") or 0
+        ),
+        "unattributed_alert": _unattributed_alert(footprint),
         "base": base,
     }
 
@@ -721,6 +781,9 @@ def _incomplete_preview(
         "pinned_predecessor_bytes",
         "pinned_predecessors",
         "registration_health",
+        "unattributed_or_foreign_worktree_bytes",
+        "unattributed_or_foreign_worktree_count",
+        "unattributed_alert",
         "preview_digest",
     }
     return {
@@ -754,6 +817,9 @@ def _incomplete_preview(
         "pinned_predecessor_bytes": None,
         "pinned_predecessors": [],
         "registration_health": None,
+        "unattributed_or_foreign_worktree_bytes": None,
+        "unattributed_or_foreign_worktree_count": None,
+        "unattributed_alert": None,
         "preview_digest": "",
     }
 
@@ -1058,6 +1124,94 @@ def list_batches(repo_root: Path | str, *, base: Path | None = None) -> dict[str
     return {"ok": True, "batches": rows[:100], "count": len(rows[:100])}
 
 
+def _worktree_admin_dir(checkout: Path) -> Path | None:
+    """The ``.git/worktrees/<name>`` administrative dir a checkout points at.
+
+    A linked worktree's ``worktree/.git`` is a FILE whose ``gitdir:`` line names
+    the admin entry that registers it. Returns that path (resolved against the
+    checkout for the relative-path layout), or ``None`` when the checkout has no
+    readable ``.git`` pointer (e.g. it is a plain directory, not a linked
+    worktree).
+    """
+    try:
+        text = (checkout / ".git").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("gitdir:"):
+            target = stripped[len("gitdir:"):].strip()
+            if not target:
+                return None
+            candidate = Path(target)
+            if not candidate.is_absolute():
+                candidate = (checkout / candidate).resolve()
+            return candidate
+    return None
+
+
+def _admin_under_repo(admin: Path, repo_common_dir: str) -> bool:
+    """True only when ``admin`` is this repository's own ``.git/worktrees/<name>``.
+
+    Proof of ownership before any re-registration: the admin entry must sit
+    directly under the exact git common dir resolved for this repository, so a
+    foreign or unprovable claim is never fabricated into a registration.
+    """
+    if not repo_common_dir or admin.parent.name != "worktrees":
+        return False
+    git_dir = admin.parent.parent
+    try:
+        resolved = os.path.normcase(str(git_dir.resolve()))
+    except OSError:
+        resolved = os.path.normcase(str(git_dir))
+    return resolved == repo_common_dir
+
+
+def _reconstruct_registration(
+    admin: Path, checkout: Path, head: str, repo_common_dir: str
+) -> None:
+    """Recreate a pruned ``.git/worktrees/<name>`` entry for a restored checkout.
+
+    Only ever recreates an entry this repository provably owns (``admin`` under
+    this repo's git dir) with a validated HEAD; anything unprovable raises so the
+    caller records a loud failure rather than inventing a registration.
+    """
+    if not _admin_under_repo(admin, repo_common_dir):
+        raise StorageRetentionError("retention_restore_foreign_registration")
+    head = str(head or "").strip()
+    if not _HEAD_RE.fullmatch(head):
+        raise StorageRetentionError("retention_restore_head_unknown")
+    admin.mkdir(parents=True, exist_ok=True)
+    (admin / "commondir").write_text("../..\n", encoding="utf-8")
+    (admin / "gitdir").write_text(str(checkout / ".git") + "\n", encoding="utf-8")
+    (admin / "HEAD").write_text(head + "\n", encoding="utf-8")
+
+
+def _reinstate_registration(
+    root: Path,
+    worktree_base: Path,
+    item: Mapping[str, Any],
+    repo_common_dir: str,
+    *,
+    head: str | None = None,
+) -> None:
+    """Reconnect one restored worktree to this repository's git registration.
+
+    When the admin entry merely dangled (the checkout was moved and moved back
+    but never pruned) ``git worktree repair`` reconnects it. When it was pruned
+    away entirely, the entry is first reconstructed from the recorded HEAD, then
+    repaired to canonicalise the two-way link. The caller verifies attribution
+    afterwards, so a checkout that cannot be reconnected is never mistaken for a
+    reinstated one.
+    """
+    checkout = worktree_base / str(item.get("id") or "") / "worktree"
+    admin = _worktree_admin_dir(checkout)
+    if admin is not None and not admin.exists():
+        recovered_head = head if head is not None else str(item.get("head") or "")
+        _reconstruct_registration(admin, checkout, recovered_head, repo_common_dir)
+    worktree_storage._git(root, "worktree", "repair", str(checkout))
+
+
 def restore(
     repo_root: Path | str,
     *,
@@ -1072,7 +1226,10 @@ def restore(
     batch = _verified_batch(root, worktree_base, batch_id)
     manifest_path = batch / MANIFEST_NAME
     manifest = _load_manifest(manifest_path, _repo_id(root))
+    repo_common_dir = worktree_storage._git_common_dir(root)
     restored = 0
+    reinstated: list[str] = []
+    registration_lost: list[str] = []
     for item in manifest["items"]:
         if not isinstance(item, dict) or item.get("state") != "quarantined":
             continue
@@ -1086,10 +1243,31 @@ def restore(
             _atomic_json(manifest_path, manifest)
             continue
         os.replace(source, destination)
-        item["state"] = "restored"
         restored += 1
+        # Moving the checkout back is only half the round trip: the git worktree
+        # registration the quarantine move orphaned must be reinstated too, or the
+        # restored directory is attributed to nobody and every reclamation path
+        # loses sight of it permanently. Reinstate best-effort, then VERIFY the
+        # attribution below so one un-reinstatable entry can never silently ride
+        # out as a success.
+        try:
+            _reinstate_registration(root, worktree_base, item, repo_common_dir)
+        except StorageRetentionError:
+            pass
+        checkout = destination / "worktree"
+        if repo_common_dir and worktree_storage._git_common_dir(checkout) == repo_common_dir:
+            item["state"] = "restored"
+            reinstated.append(item_id)
+        else:
+            # Files are back, but the registration could not be reinstated: record
+            # a loud, non-ok outcome instead of reporting the worktree restored
+            # when it is in fact stranded.
+            item["state"] = "restored_registration_lost"
+            registration_lost.append(item_id)
         _atomic_json(manifest_path, manifest)
     manifest["status"] = "restored" if restored else manifest.get("status", "quarantined")
+    manifest["restored_count"] = len(reinstated)
+    manifest["registration_lost"] = sorted(registration_lost)
     _atomic_json(manifest_path, manifest)
     _append_audit(root, {
         "schema_id": "aiworkhub.storage_retention_audit.v1",
@@ -1097,8 +1275,22 @@ def restore(
         "action": "restore_completed",
         "batch_id": batch_id,
         "count": restored,
+        "reinstated": len(reinstated),
+        "registration_lost": sorted(registration_lost),
     })
-    return {"ok": True, "batch_id": batch_id, "restored": restored}
+    if registration_lost:
+        # A restore that returns the files but not their registration is worse
+        # than a failed restore: it looks like success while permanently
+        # stranding storage. Fail loudly instead.
+        raise StorageRetentionError(
+            "retention_restore_registration_failed:" + ",".join(sorted(registration_lost))
+        )
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "restored": restored,
+        "reinstated": len(reinstated),
+    }
 
 
 def purge(
@@ -1135,6 +1327,156 @@ def purge(
     return {"ok": True, "batch_id": batch_id, "purged": True, "bytes": int(manifest.get("quarantined_bytes") or 0)}
 
 
+def _recorded_heads(root: Path, worktree_base: Path) -> dict[str, str]:
+    """Map worktree id -> recorded HEAD from this repository's batch manifests.
+
+    A worktree whose admin entry (and its HEAD) was pruned can still be proven to
+    belong here when a quarantine batch this repository wrote recorded that exact
+    id and head. Read-only: consults only manifests this repo's identity opens.
+    """
+    heads: dict[str, str] = {}
+    try:
+        qroot = _read_quarantine_root(root, worktree_base)
+        repo_id = _repo_id(root)
+    except StorageRetentionError:
+        return heads
+    if qroot is None:
+        return heads
+    for entry in sorted(qroot.iterdir()):
+        if not entry.is_dir() or not _ID_RE.fullmatch(entry.name):
+            continue
+        try:
+            manifest = _load_manifest(entry / MANIFEST_NAME, repo_id)
+        except StorageRetentionError:
+            continue
+        for item in manifest.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "")
+            head = str(item.get("head") or "").strip()
+            if item_id and _HEAD_RE.fullmatch(head):
+                heads.setdefault(item_id, head)
+    return heads
+
+
+def recover_stranded_worktrees(
+    repo_root: Path | str,
+    *,
+    confirm: bool = False,
+    reason: str = "",
+    base: Path | None = None,
+) -> dict[str, Any]:
+    """Explicit, operator-invoked recovery for already-stranded worktrees.
+
+    A worktree stranded by a past lossy restore is on disk, counted in the
+    footprint, yet attributed to nobody -- outside every reclamation path. This
+    is the inverse of :func:`prune_stale_registrations` (which drops stale
+    registrations): it reinstates the registration for stranded worktrees this
+    repository provably owns, and reports the remainder as orphaned-but-
+    reclaimable with their count and bytes so an operator can act.
+
+    It is invoked ONLY by an explicit operator call (e.g. the dashboard's
+    "recover stranded storage" action). It NEVER runs on import, on a read, or as
+    a side effect of any preview/snapshot/restore path -- ``invoked_from`` in the
+    result records exactly that. ``confirm=False`` (the default) is a read-only
+    report of what it would do; ``confirm=True`` requires a non-empty ``reason``,
+    performs the re-registration, and records the reason in the audit log.
+    """
+    root = Path(repo_root).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
+    repo_common_dir = worktree_storage._git_common_dir(root)
+    if not repo_common_dir:
+        raise StorageRetentionError("retention_repo_git_dir_unresolved")
+    recorded_heads = _recorded_heads(root, worktree_base)
+    reattachable: list[dict[str, Any]] = []
+    orphaned: list[dict[str, Any]] = []
+    if worktree_base.is_dir():
+        for entry in sorted(worktree_base.iterdir()):
+            if (
+                not entry.is_dir()
+                or entry.name.startswith(".")
+                or not _ID_RE.fullmatch(entry.name)
+            ):
+                continue
+            checkout = entry / "worktree"
+            if not checkout.is_dir():
+                continue
+            if worktree_storage._git_common_dir(checkout) == repo_common_dir:
+                continue  # healthy: still attributed to this repository
+            size = worktree_storage.directory_size_bytes(entry)
+            admin = _worktree_admin_dir(checkout)
+            admin_ours = admin is not None and _admin_under_repo(admin, repo_common_dir)
+            head = recorded_heads.get(entry.name, "")
+            # Provably ours when the admin entry it names is under this repo's git
+            # dir AND is either still present (repair reconnects it) or its HEAD
+            # was recorded by one of our own batches (reconstruct then repair).
+            provable = bool(admin_ours) and (admin.exists() or bool(_HEAD_RE.fullmatch(head)))
+            if provable:
+                reattachable.append({"id": entry.name, "size_bytes": size})
+            else:
+                orphaned.append({
+                    "id": entry.name,
+                    "size_bytes": size,
+                    "reason": "head_unrecoverable" if admin_ours else "unprovable_foreign_repo",
+                })
+    reattachable.sort(key=lambda item: item["id"])
+    orphaned.sort(key=lambda item: item["id"])
+    report: dict[str, Any] = {
+        "ok": True,
+        "schema_id": SCHEMA_ID,
+        "dry_run": not confirm,
+        "invoked_from": (
+            "storage_retention.recover_stranded_worktrees "
+            "(explicit operator action; never on import or as a read side effect)"
+        ),
+        "reason": str(reason or ""),
+        "reattachable": reattachable,
+        "reattachable_count": len(reattachable),
+        "reattachable_bytes": sum(int(item["size_bytes"]) for item in reattachable),
+        "orphaned_reclaimable": orphaned,
+        "orphaned_reclaimable_count": len(orphaned),
+        "orphaned_reclaimable_bytes": sum(int(item["size_bytes"]) for item in orphaned),
+    }
+    if not confirm:
+        return report
+    if not str(reason or "").strip():
+        raise StorageRetentionError("retention_recover_reason_required")
+    reattached: list[str] = []
+    failed: list[str] = []
+    for item in reattachable:
+        item_id = item["id"]
+        try:
+            _reinstate_registration(
+                root,
+                worktree_base,
+                {"id": item_id, "head": recorded_heads.get(item_id, "")},
+                repo_common_dir,
+                head=recorded_heads.get(item_id, ""),
+            )
+        except StorageRetentionError:
+            pass
+        checkout = worktree_base / item_id / "worktree"
+        if worktree_storage._git_common_dir(checkout) == repo_common_dir:
+            reattached.append(item_id)
+        else:
+            failed.append(item_id)
+    _append_audit(root, {
+        "schema_id": "aiworkhub.storage_retention_audit.v1",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "stranded_recovery_completed",
+        "reason": str(reason or ""),
+        "reattached": sorted(reattached),
+        "reattach_failed": sorted(failed),
+        "orphaned_reclaimable_count": len(orphaned),
+        "orphaned_reclaimable_bytes": report["orphaned_reclaimable_bytes"],
+    })
+    report["reattached"] = sorted(reattached)
+    report["reattached_count"] = len(reattached)
+    report["reattach_failed"] = sorted(failed)
+    report["ok"] = not failed
+    return report
+
+
 __all__ = [
     "AUDIT_RELATIVE_PATH",
     "QUARANTINE_DIRNAME",
@@ -1146,5 +1488,6 @@ __all__ = [
     "prune_stale_registrations",
     "purge",
     "quarantine",
+    "recover_stranded_worktrees",
     "restore",
 ]
