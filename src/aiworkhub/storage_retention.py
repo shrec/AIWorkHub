@@ -364,7 +364,9 @@ def _verified_batch(repo_root: Path, base: Path, batch_id: str) -> Path:
     return batch
 
 
-def repo_storage_footprint(repo_root: Path | str, *, base: Path | None = None) -> dict[str, Any]:
+def repo_storage_footprint(
+    repo_root: Path | str, *, base: Path | None = None, progress: Any | None = None
+) -> dict[str, Any]:
     """Single, shared definition of on-disk footprint bytes for every
     ``worktree_max_bytes`` cap comparison across this subsystem's surfaces
     (the retention preview and the dashboard telemetry), so they can never
@@ -374,15 +376,27 @@ def repo_storage_footprint(repo_root: Path | str, *, base: Path | None = None) -
     legacy ``logs/`` tree or ``.aiworkhub/runtime`` canonical data are large;
     ``observed_total_bytes`` -- global worktree bytes plus both of those -- is
     the authoritative figure for cap comparisons.
+
+    The repo-scoped scan and the global aggregate come from ONE pass over the
+    worktree tree (``scan_worktrees`` returns ``global_summary`` alongside the
+    repo-scoped ``summary``): the previous two separate full walks each re-ran
+    per-worktree git state over every entry, which -- together with the runtime
+    subtotal re-walking the worktree bytes a third time -- is why the measurement
+    could not finish. The runtime subtotal now prunes the worktree base (it lives
+    under ``.aiworkhub/runtime``) so those bytes are walked and counted once.
+    ``progress`` is threaded to the scan so a deadline-limited preview can report
+    the candidates it did establish.
     """
     root = Path(repo_root).resolve()
     worktree_base = (base or configured_worktree_root(root)).resolve()
-    scan = worktree_storage.scan_worktrees(worktree_base, with_sizes=True, repo_root=root)
-    global_scan = worktree_storage.scan_worktrees(worktree_base, with_sizes=True)
+    scan = worktree_storage.scan_worktrees(
+        worktree_base, with_sizes=True, repo_root=root, progress=progress
+    )
+    global_summary = scan.get("global_summary") or scan.get("summary") or {}
     repository_worktree_bytes = int(scan.get("summary", {}).get("total_bytes") or 0)
-    global_worktree_bytes = int(global_scan.get("summary", {}).get("total_bytes") or 0)
+    global_worktree_bytes = int(global_summary.get("total_bytes") or 0)
     repository_worktree_count = int(scan.get("summary", {}).get("count") or 0)
-    global_worktree_count = int(global_scan.get("summary", {}).get("count") or 0)
+    global_worktree_count = int(global_summary.get("count") or 0)
     legacy_log_root = root / LEGACY_LOG_RELATIVE_PATH
     canonical_runtime_root = root / CANONICAL_RUNTIME_RELATIVE_PATH
     legacy_log_bytes = (
@@ -391,7 +405,9 @@ def repo_storage_footprint(repo_root: Path | str, *, base: Path | None = None) -
         else 0
     )
     canonical_runtime_bytes = (
-        worktree_storage.directory_size_bytes(canonical_runtime_root)
+        worktree_storage.directory_size_bytes(
+            canonical_runtime_root, exclude=[worktree_base]
+        )
         if canonical_runtime_root.is_dir() and not canonical_runtime_root.is_symlink()
         else 0
     )
@@ -452,9 +468,31 @@ def _unattributed_alert(footprint: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _preview_payload(repo_root: Path, base: Path, *, now: float | None = None) -> dict[str, Any]:
+def _preview_payload(
+    repo_root: Path,
+    base: Path,
+    *,
+    now: float | None = None,
+    progress: "_PreviewProgress | None" = None,
+) -> dict[str, Any]:
     policy_days, max_bytes = _policy(repo_root)
-    footprint = repo_storage_footprint(repo_root, base=base)
+    if progress is not None:
+        # Seed the partial-progress sink so it can classify each worktree the walk
+        # measures as a definite reclaim candidate on the fly -- repository-scoped,
+        # aged past policy, unprotected, and either removable-safe or on verified
+        # lineage. Ownership is proved from the canonical task lifecycle
+        # (_protected_attempt_ids) and the git common dir, never from a name or an
+        # age alone. If the deadline is hit mid-walk the preview surfaces exactly
+        # these instead of an empty list that reads as a clean repository.
+        protected_ids, lineage_verified, _pinned_by = _protected_attempt_ids(repo_root)
+        progress.configure(
+            repo_common_dir=worktree_storage._git_common_dir(repo_root),
+            protected_ids=protected_ids,
+            lineage_verified=lineage_verified,
+            min_age_days=policy_days,
+            now=now,
+        )
+    footprint = repo_storage_footprint(repo_root, base=base, progress=progress)
     scan = footprint["scan"]
     registrations = worktree_storage.scan_worktree_registrations(repo_root, base)
     observed_total_bytes = footprint["observed_total_bytes"]
@@ -562,7 +600,7 @@ _measurements: dict[Any, "_Measurement"] = {}
 
 
 class _Measurement:
-    __slots__ = ("done", "value", "error", "succeeded")
+    __slots__ = ("done", "value", "error", "succeeded", "progress")
 
     def __init__(self) -> None:
         self.done = threading.Event()
@@ -575,6 +613,123 @@ class _Measurement:
         # ``error is None`` -- makes a failed measurement impossible to represent
         # as a ``(value, True)`` success by any path (see _measure_within_deadline).
         self.succeeded = False
+        # The partial-progress sink of THIS single-flight walk. The starter binds
+        # its ``_PreviewProgress`` here; every caller (the starter and any that
+        # ATTACH to the same running walk) reads the sink back off the measurement,
+        # so a second operator released at the deadline sees the SAME partial
+        # evidence the shared walk established -- never its own empty sink handed
+        # straight to ``_incomplete_preview`` as a false "clean" candidates=[].
+        self.progress: "_PreviewProgress | None" = None
+
+
+class _PreviewProgress:
+    """Thread-safe partial-progress sink for the off-thread footprint walk.
+
+    The measurement runs on a daemon thread (see :func:`_measure_within_deadline`).
+    If the wall-clock deadline is hit while that walk is still running, ``preview``
+    reads a SNAPSHOT of the reclaim candidates the walk has ALREADY fully
+    established -- each worktree whose size and git state are both measured and
+    which is provably eligible: repository-scoped, aged past policy, not protected,
+    and either removable-safe or on verified lineage. Reporting those, explicitly
+    marked partial with the worktrees not yet covered, is what stops a
+    deadline-limited preview from reading as a clean repository (the same class of
+    lie as a build that indexed nothing reporting success).
+
+    A definite candidate here is the non-forcing subset of
+    :func:`plan_worktree_reclaim`: the over-cap forcing pass (pulling under-age
+    worktrees when the cap is breached) only ever ADDS candidates, so omitting it
+    keeps the partial set a strict subset of the complete one -- never a superset
+    that could name something the full plan would have protected. Protection is
+    keyed on the canonical task lifecycle and the git common dir handed to
+    :meth:`configure`, never on a directory name or an mtime.
+    """
+
+    __slots__ = (
+        "_lock", "_configured", "_repo_common_dir", "_protected_ids",
+        "_lineage_verified", "_min_age_seconds", "_now", "_all_ids", "_covered",
+        "_candidates",
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._configured = False
+        self._repo_common_dir = ""
+        self._protected_ids: frozenset[str] = frozenset()
+        self._lineage_verified = False
+        self._min_age_seconds = 0
+        self._now: float | None = None
+        self._all_ids: list[str] = []
+        self._covered: set[str] = set()
+        self._candidates: dict[str, dict[str, Any]] = {}
+
+    def configure(
+        self,
+        *,
+        repo_common_dir: str,
+        protected_ids: Mapping[str, str] | Any,
+        lineage_verified: bool,
+        min_age_days: int,
+        now: float | None,
+    ) -> None:
+        with self._lock:
+            self._repo_common_dir = repo_common_dir or ""
+            self._protected_ids = frozenset(protected_ids or ())
+            self._lineage_verified = bool(lineage_verified)
+            self._min_age_seconds = max(0, min(int(min_age_days), 3650)) * 86400
+            self._now = time.time() if now is None else float(now)
+            self._configured = True
+
+    def begin(self, ids: Any) -> None:
+        with self._lock:
+            self._all_ids = [str(item) for item in (ids or [])]
+
+    def observe(self, worktree: Mapping[str, Any]) -> None:
+        with self._lock:
+            wt_id = str(worktree.get("id") or "")
+            if wt_id:
+                self._covered.add(wt_id)
+            if not self._configured or not wt_id:
+                return
+            # Repository scope only: a foreign or orphaned worktree is never a
+            # candidate here, exactly as the complete plan excludes it. When the
+            # repository's git common dir could not be resolved (``_git_common_dir``
+            # returns "" on any ``git rev-parse`` failure -- a broken/inaccessible
+            # ``.git`` or missing git), ownership can be proved for NO worktree.
+            # ``scan_worktrees`` keeps its repo-scoped list empty in that exact
+            # case (``in_repo = bool(repo_common_dir) and ...``); the partial sink
+            # must fail closed the same way, or it would admit every foreign
+            # worktree the walk observed and read as a SUPERSET of an empty
+            # complete plan. Prove scope by the common dir, never by name or age.
+            if not self._repo_common_dir or worktree.get("parent_git_dir") != self._repo_common_dir:
+                return
+            if worktree.get("class") == worktree_storage.CLASS_ORPHANED:
+                return
+            if wt_id in self._protected_ids:
+                return
+            eligible_class = worktree.get("class") == worktree_storage.CLASS_REMOVABLE_SAFE
+            if not (eligible_class or self._lineage_verified):
+                return
+            age = (self._now or 0.0) - float(worktree.get("modified_at_epoch") or 0.0)
+            if age < self._min_age_seconds:
+                return
+            self._candidates[wt_id] = {
+                "id": wt_id,
+                "head": str(worktree.get("head") or ""),
+                "size_bytes": int(worktree.get("size_bytes") or 0),
+                "modified_at_epoch": int(float(worktree.get("modified_at_epoch") or 0.0)),
+            }
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            candidates = sorted(self._candidates.values(), key=lambda item: item["id"])
+            covered = set(self._covered)
+            not_covered = [wt_id for wt_id in self._all_ids if wt_id not in covered]
+            return {
+                "candidates": candidates,
+                "covered_count": len(covered),
+                "total_count": len(self._all_ids),
+                "not_covered": sorted(not_covered),
+            }
 
 
 def _require_finite(
@@ -684,30 +839,45 @@ def _measure_worker(key: Any, measurement: "_Measurement", fn: Any) -> None:
 
 
 def _measure_within_deadline(
-    key: Any, fn: Any, deadline_seconds: float
+    key: Any, fn: Any, deadline_seconds: float, *, progress: "_PreviewProgress | None" = None
 ) -> tuple[Any, bool]:
     """Run ``fn`` under a shared single-flight walk; return ``(value, True)`` if
-    it finishes within ``deadline_seconds``, else ``(None, False)``.
+    it finishes within ``deadline_seconds``, else ``(<shared partial>, False)``.
 
     Concurrent or repeated callers for the same ``key`` attach to ONE running
     daemon walk instead of each starting their own, so a stalled measurement can
     never be amplified into stacked threads and stacked disk I/O. The caller is
     released at the deadline even while the walk is still running (matching the
-    bounded snapshot path). An ``(None, False)`` result is returned ONLY once the
-    walk is confirmed still in flight -- an honest "still measuring" partial, not
-    a failure. If the walk has already raised by the time the caller is released,
-    that exception is re-raised here rather than being silently discarded and
-    presented as an incomplete ``ok: True`` success. A walk that finished without
-    producing a value (``succeeded`` False -- e.g. a control-flow BaseException
-    tore the worker down, leaving ``error`` None) is likewise raised as a
-    measurement failure, never returned as ``(None, True)``.
+    bounded snapshot path).
+
+    ``progress`` is the STARTER's sink -- the one bound into ``fn``'s closure and
+    populated by the running walk. It is recorded on the shared ``_Measurement``,
+    so a caller that ATTACHES to an existing walk reads that SAME sink back
+    (``measurement.progress``) rather than its own empty one: on a deadline miss
+    every caller receives a snapshot of the evidence the shared walk actually
+    established, not a false ``candidates=[]``. The incomplete result is returned
+    ONLY once the walk is confirmed still in flight -- an honest "still measuring"
+    partial, not a failure. If the walk has already raised by the time the caller
+    is released, that exception is re-raised here rather than being silently
+    discarded and presented as an incomplete ``ok: True`` success. A walk that
+    finished without producing a value (``succeeded`` False -- e.g. a control-flow
+    BaseException tore the worker down, leaving ``error`` None) is likewise raised
+    as a measurement failure, never returned as ``(None, True)``.
     """
     with _measure_lock:
         measurement = _measurements.get(key)
         start = measurement is None
         if start:
             measurement = _Measurement()
+            if progress is not None:
+                # Bind the starter's sink to the single-flight measurement so every
+                # attaching caller reads it back instead of its own empty sink.
+                measurement.progress = progress
             _measurements[key] = measurement
+
+    # The sink of the ONE walk this caller is bound to: the starter's, for an
+    # attaching caller too. Read off the shared measurement, never the caller's own.
+    shared_progress = measurement.progress
 
     if start:
         threading.Thread(
@@ -720,8 +890,10 @@ def _measure_within_deadline(
     finished = measurement.done.wait(deadline_seconds)
     if not finished and not measurement.done.is_set():
         # Genuinely still walking: an honest incomplete result, never a failure
-        # dressed as one -- no error has occurred yet at this point.
-        return None, False
+        # dressed as one -- no error has occurred yet at this point. Hand back the
+        # SHARED walk's partial evidence so the attaching caller sees exactly what
+        # the caller that started the walk sees.
+        return (shared_progress.snapshot() if shared_progress is not None else None), False
     # Finished within the deadline, or completed in the instant between the wait
     # timing out and this check. Either way surface a real error so a genuine
     # failure is never reported as a partial success.
@@ -744,24 +916,34 @@ def _measure_key(root: Path, base: Path, now: float | None) -> tuple[str, str, f
 
 
 def _incomplete_preview(
-    repo_root: Path, deadline_seconds: float, unmeasured: list[str]
+    repo_root: Path,
+    deadline_seconds: float,
+    unmeasured: list[str],
+    *,
+    partial: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A bounded fail-safe when the on-disk measurement cannot finish in time.
 
-    A partial scan must never be published as a completed footprint: reporting
-    a smaller number than reality would invite an operator to quarantine on
-    incomplete evidence. Every measured byte/candidate field is therefore
-    withheld (``None``/empty), no actionable preview digest is emitted, and the
-    result is explicitly labelled ``complete=False`` naming exactly which
-    measurements did not finish.
+    A partial scan must never be published as a *completed* footprint: reporting
+    a smaller total than reality would invite an operator to quarantine on
+    incomplete evidence. Every aggregate byte field and the actionable preview
+    digest are therefore withheld (``None``/empty) and the result is explicitly
+    labelled ``complete=False``.
 
-    The response keeps the SAME keys the complete payload always emits, so a
-    caller parses one schema whether or not the deadline was hit. The cheap
-    policy fields need no filesystem walk and carry their real values; every
-    field that depends on the unfinished walk -- ``footprint``,
-    ``registration_health`` and every measured byte/candidate/pinned field -- is
-    present but explicitly ``None``/empty and named in ``unmeasured`` rather than
-    being absent (which would silently change the response shape).
+    But an incomplete measurement must ALSO never read as a clean repository. When
+    the walk established some reclaim candidates before the deadline (``partial``
+    carries them and the ids ``not_covered``), those exact candidates are
+    surfaced, ``partial`` is set True, and ``not_covered`` names the worktrees the
+    walk did not reach -- so a deadline-hit preview shows real work to do with an
+    honest boundary, never an empty list. When nothing was established the result
+    is byte-for-byte the fully-withheld shape (empty candidates, ``partial``
+    False), so a genuinely stalled walk still cannot masquerade as clean.
+
+    The response keeps the SAME keys the complete payload always emits (plus
+    ``partial``/``not_covered``), so a caller parses one schema whether or not the
+    deadline was hit. The cheap policy fields carry their real values; every field
+    that depends on the unfinished aggregate is present but explicitly
+    ``None``/empty and named in ``unmeasured``.
     """
     policy_days, max_bytes = _policy(repo_root)
     # Every response field whose value depends on the unfinished walk is both
@@ -786,7 +968,9 @@ def _incomplete_preview(
         "unattributed_alert",
         "preview_digest",
     }
-    return {
+    established = list((partial or {}).get("candidates") or [])
+    not_covered = list((partial or {}).get("not_covered") or [])
+    result = {
         # ``ok`` tracks ``complete`` so a consumer keying on ``ok`` alone can never
         # read a partial measurement as a whole one: a completed footprint is
         # ``ok=True/complete=True``; an unfinished one is ``ok=False/complete=False``
@@ -821,7 +1005,29 @@ def _incomplete_preview(
         "unattributed_or_foreign_worktree_count": None,
         "unattributed_alert": None,
         "preview_digest": "",
+        # Whether the walk established any reclaim candidates before the deadline,
+        # and which worktrees it did not reach. Always present so the schema does
+        # not change shape; ``partial`` is False (and ``not_covered`` whatever was
+        # enumerated) when nothing was established.
+        "partial": False,
+        "not_covered": sorted(not_covered),
     }
+    if established:
+        # Surface the candidates the walk already fully established. They are a
+        # strict subset of the complete plan's candidates, so they can be acted on
+        # exactly like a complete result -- while the aggregate byte totals stay
+        # withheld (unknown until the walk finishes) and ``not_covered`` bounds
+        # what is missing. The candidate fields are no longer wholly unmeasured, so
+        # they are dropped from ``unmeasured``.
+        result["partial"] = True
+        result["candidates"] = established
+        result["candidate_count"] = len(established)
+        result["candidate_bytes"] = sum(int(item.get("size_bytes") or 0) for item in established)
+        result["unmeasured"] = sorted(
+            (set(unmeasured) | withheld_fields)
+            - {"candidates", "candidate_count", "candidate_bytes"}
+        )
+    return result
 
 
 def preview(
@@ -844,14 +1050,27 @@ def preview(
     worktree_base = (base or configured_worktree_root(root)).resolve()
     now = _resolve_now(now)
     deadline = _resolve_deadline(deadline_seconds)
+    progress = _PreviewProgress()
+    # Pass the sink to the single-flight coordinator so it is recorded on the ONE
+    # measurement. A caller that STARTS the walk populates this exact sink; a
+    # caller that ATTACHES gets the starter's sink back from the coordinator, so
+    # both see the same partial evidence on a deadline miss.
     payload, complete = _measure_within_deadline(
         _measure_key(root, worktree_base, now),
-        lambda: _preview_payload(root, worktree_base, now=now),
+        lambda: _preview_payload(root, worktree_base, now=now, progress=progress),
         deadline,
+        progress=progress,
     )
     if not complete:
+        # ``payload`` is the snapshot of the SHARED walk's sink (the starter's),
+        # so the candidates the walk established before the deadline are returned
+        # -- explicitly partial and naming what was not covered -- rather than an
+        # empty "clean" list, for the attaching caller exactly as for the starter.
         return _incomplete_preview(
-            root, deadline, ["worktree_footprint_scan", "reclaim_candidates"]
+            root,
+            deadline,
+            ["worktree_footprint_scan", "reclaim_candidates"],
+            partial=payload,
         )
     return _public_preview(payload)
 

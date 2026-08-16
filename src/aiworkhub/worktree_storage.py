@@ -77,18 +77,46 @@ def _git(cwd: Path, *args: str) -> tuple[int, str]:
     return result.returncode, result.stdout.strip()
 
 
-def directory_size_bytes(path: Path) -> int:
-    """Apparent size of ``path`` in bytes (symlinks never followed)."""
+def directory_size_bytes(path: Path, *, exclude=None) -> int:
+    """Apparent size of ``path`` in bytes (symlinks never followed).
+
+    Walks with ``os.scandir`` rather than ``os.walk``: each entry's type comes
+    from the single ``readdir`` batch instead of a separate ``lstat`` per file,
+    and ``st_size`` is read with one ``stat`` -- roughly halving the syscalls per
+    file over a tree of hundreds of thousands of files, which is a direct cause
+    of the retention footprint walk running to its caller's deadline.
+
+    ``exclude`` names directories to prune from the walk (compared by absolute
+    path). The footprint measurement passes the worktree base here when it lives
+    under ``.aiworkhub/runtime`` so the runtime subtotal never re-walks -- and
+    never double-counts -- the same worktree bytes the worktree scan already
+    measured. Pruning by exact path only; ownership is never inferred by name.
+    """
+    excluded: set[str] = set()
+    for item in exclude or ():
+        excluded.add(os.path.normcase(os.path.abspath(str(item))))
     total = 0
-    for root, dirs, files in os.walk(path, followlinks=False):
-        for name in files:
-            fp = Path(root) / name
-            try:
-                if fp.is_symlink():
-                    continue
-                total += fp.stat().st_size
-            except OSError:
-                continue
+    stack = [str(path)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as iterator:
+                for entry in iterator:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            if excluded and os.path.normcase(
+                                os.path.abspath(entry.path)
+                            ) in excluded:
+                                continue
+                            stack.append(entry.path)
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
     return total
 
 
@@ -272,20 +300,44 @@ def scan_worktrees(
     *,
     with_sizes: bool = True,
     repo_root: Path | None = None,
+    progress: Any | None = None,
 ) -> dict[str, Any]:
     """Enumerate every retained worktree under ``base`` with its safety class.
 
     Returns ``{base, exists, worktrees: [...], summary: {...}}``. Read-only:
     mutates nothing. ``with_sizes=False`` skips the (potentially slow) disk-usage
     walk for a fast listing.
+
+    When ``repo_root`` is given the returned ``worktrees``/``summary`` stay
+    repository-scoped exactly as before, but the single enumeration ALSO measures
+    the foreign/orphaned entries once and returns their aggregate as
+    ``global_summary`` -- so the footprint measurement obtains both the
+    repo-scoped and the global figures from ONE pass instead of two full walks
+    that each re-ran per-worktree git state over every entry. Eliminating that
+    duplicated walk (and its ~5 git subprocesses per worktree) is a primary
+    reason the measurement can now finish inside its deadline.
+
+    ``progress`` is an optional sink notified as each worktree is fully measured
+    (``begin`` with the id list, then ``observe`` per worktree). It lets a
+    deadline-limited preview surface the reclaim candidates already established
+    rather than an empty list; it never changes what is measured.
     """
     base = (base or configured_worktree_root(repo_root)).resolve()
     repo_common_dir = _git_common_dir(Path(repo_root).resolve()) if repo_root else ""
+    all_worktrees: list[dict[str, Any]] = []
     worktrees: list[dict[str, Any]] = []
     if base.is_dir():
-        for entry in sorted(base.iterdir()):
-            if not entry.is_dir() or entry.name.startswith("."):
-                continue
+        entries = [
+            entry
+            for entry in sorted(base.iterdir())
+            if entry.is_dir() and not entry.name.startswith(".")
+        ]
+        if progress is not None:
+            try:
+                progress.begin([entry.name for entry in entries])
+            except Exception:  # noqa: BLE001 -- progress is best-effort telemetry
+                pass
+        for entry in entries:
             worktree_dir = entry / "worktree"
             git_state = (
                 _worktree_git_state(worktree_dir)
@@ -293,42 +345,52 @@ def scan_worktrees(
                 else {"git_ok": False, "origin": "", "head": "", "dirty": False,
                       "unpushed": False, "parent_git_dir": ""}
             )
-            if repo_root and (
-                not repo_common_dir
-                or git_state.get("parent_git_dir") != repo_common_dir
-            ):
-                # Orphaned or foreign-repository worktrees are deliberately
-                # excluded from a repository-scoped view. Ownership cannot be
-                # inferred from the directory name or remote URL.
-                continue
             try:
                 modified_at = entry.stat().st_mtime
             except OSError:
                 modified_at = time.time()
-            worktrees.append(
-                {
-                    "id": entry.name,
-                    "path": str(entry),
-                    "size_bytes": directory_size_bytes(entry) if with_sizes else None,
-                    "repo": _repo_name(git_state["origin"]),
-                    "origin": git_state["origin"],
-                    "head": git_state["head"],
-                    "git_ok": git_state["git_ok"],
-                    "dirty": git_state["dirty"],
-                    "unpushed": git_state["unpushed"],
-                    "parent_git_dir": git_state["parent_git_dir"],
-                    "modified_at_epoch": modified_at,
-                    "age_seconds": max(0.0, time.time() - modified_at),
-                    "class": _classify(git_state),
-                }
+            worktree = {
+                "id": entry.name,
+                "path": str(entry),
+                "size_bytes": directory_size_bytes(entry) if with_sizes else None,
+                "repo": _repo_name(git_state["origin"]),
+                "origin": git_state["origin"],
+                "head": git_state["head"],
+                "git_ok": git_state["git_ok"],
+                "dirty": git_state["dirty"],
+                "unpushed": git_state["unpushed"],
+                "parent_git_dir": git_state["parent_git_dir"],
+                "modified_at_epoch": modified_at,
+                "age_seconds": max(0.0, time.time() - modified_at),
+                "class": _classify(git_state),
+            }
+            all_worktrees.append(worktree)
+            in_repo = repo_root is None or (
+                bool(repo_common_dir)
+                and git_state.get("parent_git_dir") == repo_common_dir
             )
-    return {
+            if in_repo:
+                # Orphaned or foreign-repository worktrees are deliberately
+                # excluded from a repository-scoped view. Ownership cannot be
+                # inferred from the directory name or remote URL.
+                worktrees.append(worktree)
+            if progress is not None:
+                try:
+                    progress.observe(worktree)
+                except Exception:  # noqa: BLE001 -- progress is best-effort telemetry
+                    pass
+    result: dict[str, Any] = {
         "base": str(base),
         "exists": base.is_dir(),
         "scope": "repository" if repo_root else "global",
         "worktrees": worktrees,
         "summary": summarize(worktrees),
     }
+    if repo_root is not None:
+        # Same single pass, no second walk: the global aggregate the observed
+        # footprint and unattributed-share comparison need.
+        result["global_summary"] = summarize(all_worktrees)
+    return result
 
 
 def summarize(worktrees: list[dict[str, Any]]) -> dict[str, Any]:

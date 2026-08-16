@@ -722,12 +722,23 @@ def test_second_caller_in_finish_window_does_not_duplicate_walk(monkeypatch) -> 
         def is_set(self):
             return self._ev.is_set()
 
+    constructed: list[int] = []
+
     class _HookedMeasurement:
         def __init__(self) -> None:
+            # One measurement per single-flight walk. Counting constructions proves
+            # the attaching caller did NOT build its own: it read the shared sink
+            # off the measurement the starter created.
+            constructed.append(1)
             self.done = _HookedEvent()
             self.value = None
             self.error = None
             self.succeeded = False
+            # The shared partial-evidence sink _measure_within_deadline records on
+            # the measurement and every caller (starter and attacher) reads back.
+            # Absent it, the attaching caller would fall back to its own empty sink
+            # -- the exact ``candidates=[]`` regression round two closed.
+            self.progress = None
 
     monkeypatch.setattr(storage_retention, "_Measurement", _HookedMeasurement)
 
@@ -738,7 +749,11 @@ def test_second_caller_in_finish_window_does_not_duplicate_walk(monkeypatch) -> 
     with calls_lock:
         assert calls == [1]  # attached to the finished walk; never a second one
     assert second_result["complete"] is True
+    # The attaching caller sees the SAME result as the starter: it read the shared
+    # measurement's sink rather than starting its own walk. Exactly ONE measurement
+    # (hence one sink, one walk) was constructed across both callers.
     assert second_result["value"] == {"preview_digest": "d"}
+    assert constructed == [1]
 
 
 # --- Rework round 2, finding 3: a worktree pinned for two reasons at once is ----
