@@ -1,5 +1,22 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.78 — 2026-08-16
+
+### Fixed
+
+- **On macOS, process identity did not exist.** A pid alone is not an identity —
+  the operating system reuses pids — so the launcher could mistake a reused pid
+  for a live worker. Darwin now supplies a real process creation time, and the
+  eight launcher regressions that failed on every macOS CI run now pass rather
+  than being skipped. Identity now lives in one place shared by the launcher, the
+  supervisor and the temp collector, and an unknown identity fails closed: a
+  runtime directory whose owner cannot be identified is never reclaimed.
+- **The manager callback now follows whoever holds the manager seat.** Codex kept
+  its existing push path unchanged; a Claude manager is now woken through its own
+  channel instead of only receiving work while it happened to be waiting. A
+  provider with no push transport says so plainly rather than silently leaving the
+  manager to poll.
+
 ## 0.9.77 — 2026-08-16
 
 ### Fixed

@@ -46,6 +46,11 @@ except ImportError:  # direct-script entrypoint
         if fchmod is not None:
             fchmod(fd, mode)
 
+try:
+    from .runtime_temp import process_start_ticks
+except ImportError:  # direct-script entrypoint
+    from runtime_temp import process_start_ticks  # type: ignore[no-redef]
+
 
 POLL_SECONDS = 0.1
 KILL_GRACE_SECONDS = 5.0
@@ -266,40 +271,17 @@ def _posix_worker_spawn_kwargs(platform: str | None = None) -> dict[str, Any]:
 
 
 def _pid_start_ticks(pid: int) -> int | None:
-    if os.name == "nt":
-        class _FileTime(ctypes.Structure):
-            _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+    """Stable process creation stamp guarding against PID reuse.
 
-        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        handle = kernel32.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return None
-        creation = _FileTime()
-        exit_time = _FileTime()
-        kernel = _FileTime()
-        user = _FileTime()
-        try:
-            if not kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(creation),
-                ctypes.byref(exit_time),
-                ctypes.byref(kernel),
-                ctypes.byref(user),
-            ):
-                return None
-            return (int(creation.high) << 32) | int(creation.low)
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        _head, separator, tail = raw.rpartition(")")
-        if not separator:
-            return None
-        return int(tail.strip().split()[19])
-    except (OSError, ValueError, IndexError):
-        return None
+    Delegates to the single cross-platform primitive
+    :func:`runtime_temp.process_start_ticks` so the supervisor and the launcher
+    can never disagree about process identity.  Returns None on a platform that
+    cannot supply a creation time; the status writers below persist that None
+    verbatim (``child_pid_start_ticks``/``supervisor_pid_start_ticks`` become
+    JSON null) and never do arithmetic on it, so an absent identity degrades to
+    bare-liveness reporting rather than raising.
+    """
+    return process_start_ticks(pid)
 
 
 def _file_size(path: Path) -> int:

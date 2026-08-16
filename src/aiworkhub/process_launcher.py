@@ -55,6 +55,7 @@ from . import process_event_ledger
 from . import provider_usage
 from . import repo_policy
 from . import read_efficiency
+from . import runtime_temp
 from . import task_engine
 try:
     from . import project_context
@@ -10729,46 +10730,16 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _pid_start_ticks(pid: int) -> int | None:
-    """Read a stable process creation timestamp to guard against PID reuse."""
-    if pid <= 0:
-        return None
-    if os.name == "nt":
-        class _FileTime(ctypes.Structure):
-            _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+    """Read a stable process creation timestamp to guard against PID reuse.
 
-        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        handle = kernel32.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return None
-        creation = _FileTime()
-        exit_time = _FileTime()
-        kernel = _FileTime()
-        user = _FileTime()
-        try:
-            ok = kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(creation),
-                ctypes.byref(exit_time),
-                ctypes.byref(kernel),
-                ctypes.byref(user),
-            )
-            if not ok:
-                return None
-            return (int(creation.high) << 32) | int(creation.low)
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        _head, separator, tail = raw.rpartition(")")
-        if not separator:
-            return None
-        fields = tail.strip().split()
-        # tail starts at field 3 (state); starttime is field 22.
-        return int(fields[19])
-    except (OSError, ValueError, IndexError):
-        return None
+    Cross-platform process identity lives in exactly one place --
+    :func:`runtime_temp.process_start_ticks` -- so the launcher, the standalone
+    supervisor, and the temp-owner GC can never disagree about what identifies
+    a process.  See that function for the per-platform source and units.  On a
+    platform that genuinely cannot supply a creation time this returns None;
+    every caller here treats None as "identity unknown" and fails closed.
+    """
+    return runtime_temp.process_start_ticks(pid)
 
 
 def _pid_matches(pid: int, expected_start_ticks: Any) -> bool:

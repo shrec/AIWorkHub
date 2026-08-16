@@ -136,6 +136,172 @@ def build_channel_event(members: list[dict[str, Any]], *, batch_id: str = "") ->
     }
 
 
+# ---------------------------------------------------------------------------
+# Push-transport activation -- follows whoever holds the verified manager seat
+# ---------------------------------------------------------------------------
+# Every terminal review callback MUST wake the manager. The push transport is
+# NOT configured by hand: it is selected from the verified manager route so
+# that whoever sits in the model-agnostic manager seat gets *their* provider's
+# push wired automatically.
+#
+#   * Claude seat -> this module's channel (``notifications/claude/channel``).
+#   * Codex seat  -> the existing App Server sideband path, owned by
+#                    ``app_server_mux.py`` / ``callback_bridge.py``. It is named
+#                    here, never spawned or modified from this module.
+#   * A provider with no push transport -> a named, manager-visible DEGRADED
+#                    state (never a silent downgrade to polling): it says which
+#                    provider, that push is unavailable, and that the pull inbox
+#                    (``core.claude_callback_wait``) is what remains.
+TRANSPORT_CLAUDE_CHANNEL = "claude_channel"
+TRANSPORT_CODEX_APP_SERVER_SIDEBAND = "app_server_sideband"
+PULL_INBOX_NAME = "core.claude_callback_wait"
+
+# provider -> push-transport descriptor. ``owned_here`` marks the ONLY transport
+# this module actually spawns; the Codex row is a pointer to an external,
+# unchanged path so the seat resolver can hand Codex back its own transport.
+_PUSH_TRANSPORTS: dict[str, dict[str, Any]] = {
+    "claude": {
+        "transport": TRANSPORT_CLAUDE_CHANNEL,
+        "owner": "aiworkhub.callback_channel",
+        "spawned_by": "claude_code_mcp_channel",
+        "mcp_server": "aiworkhub-callback-channel",
+        "owned_here": True,
+    },
+    "codex": {
+        "transport": TRANSPORT_CODEX_APP_SERVER_SIDEBAND,
+        "owner": "aiworkhub.app_server_mux+aiworkhub.callback_bridge",
+        "spawned_by": "vscode_extension_app_server_mux",
+        "owned_here": False,
+    },
+}
+
+
+def _default_verified_manager_route() -> dict[str, Any]:
+    """Resolve the verified manager route (identity) for THIS process.
+
+    Uses the exact verified resolution the manager bootstrap uses --
+    ``core._claude_manager_identity()`` then ``core._codex_manager_identity()``
+    -- so the decision comes from the locally verified process chain / route
+    record, never from chat prose or a guess. Returns ``{}`` when no manager
+    seat can be verified; any inspection error fails closed to unverified.
+    """
+    try:
+        from . import core
+
+        identity = core._claude_manager_identity() or core._codex_manager_identity()
+    except Exception:  # noqa: BLE001 -- an unverifiable route is simply "no seat"
+        return {}
+    return dict(identity) if isinstance(identity, dict) else {}
+
+
+def resolve_push_transport(
+    route: dict[str, Any] | None = None,
+    *,
+    route_fn: Callable[[], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Decide the push transport from the verified manager route alone.
+
+    ``route`` (or the value returned by ``route_fn``) is the verified manager
+    identity; only its ``provider`` decides the transport -- nothing is read
+    from the environment, cwd, or chat text. The returned decision is
+    manager-visible: a provider with no push transport yields a named degraded
+    state rather than a silent fall-back to the pull inbox.
+    """
+    if route is None:
+        route = (route_fn or _default_verified_manager_route)()
+    provider = str((route or {}).get("provider") or "").strip().lower()
+    if not provider:
+        return {
+            "provider": "unverified",
+            "transport": None,
+            "push_available": False,
+            "active": False,
+            "degraded": True,
+            "pull_inbox_active": True,
+            "pull_inbox": PULL_INBOX_NAME,
+            "manager_visible": True,
+            "owner": "",
+            "reason": (
+                "No verified manager seat: push callback is unavailable and the "
+                f"pull inbox ({PULL_INBOX_NAME}) is what remains."
+            ),
+        }
+    descriptor = _PUSH_TRANSPORTS.get(provider)
+    if descriptor is None:
+        return {
+            "provider": provider,
+            "transport": None,
+            "push_available": False,
+            "active": False,
+            "degraded": True,
+            "pull_inbox_active": True,
+            "pull_inbox": PULL_INBOX_NAME,
+            "manager_visible": True,
+            "owner": "",
+            "reason": (
+                f"Provider '{provider}' has no push transport: push is "
+                f"unavailable and the manager is on the pull inbox "
+                f"({PULL_INBOX_NAME})."
+            ),
+        }
+    owned_here = bool(descriptor.get("owned_here"))
+    return {
+        "provider": provider,
+        "transport": descriptor["transport"],
+        "push_available": True,
+        # ``active`` is True only for the transport THIS process runs; an
+        # externally-owned transport (Codex sideband) is available but dormant
+        # in this module and is neither spawned nor modified here.
+        "active": owned_here,
+        "owned_here": owned_here,
+        "degraded": False,
+        "pull_inbox_active": False,
+        "pull_inbox": PULL_INBOX_NAME,
+        "manager_visible": True,
+        "owner": descriptor["owner"],
+        "spawned_by": descriptor.get("spawned_by", ""),
+        "mcp_server": descriptor.get("mcp_server", ""),
+        "reason": (
+            f"Provider '{provider}' push transport '{descriptor['transport']}' "
+            + (
+                "activated by this channel."
+                if owned_here
+                else "is owned elsewhere and left unchanged; channel stays dormant."
+            )
+        ),
+    }
+
+
+def build_degraded_notice(decision: dict[str, Any]) -> dict[str, Any]:
+    """A ``notifications/claude/channel`` event that surfaces a degraded state.
+
+    Emitted so a manager whose provider has no push transport SEES the refusal
+    in-session instead of silently polling. Carries only the provider name and
+    the fixed degraded facts -- never worker output, logs, or session ids,
+    matching the fixed-prompt safety contract of ``build_channel_event``.
+    """
+    provider = str(decision.get("provider") or "unverified")
+    content = (
+        f"AIWorkHub callback DEGRADED: manager provider '{provider}' has no push "
+        "transport. Push wake is unavailable; the pull inbox (aiworkhub "
+        "claude_callback_wait) is in use, so inspect the trusted AIWorkHub "
+        "review queue yourself -- callbacks will not wake this session."
+    )
+    return {
+        "jsonrpc": "2.0",
+        "method": CHANNEL_NOTIFICATION_METHOD,
+        "params": {
+            "content": content,
+            "meta": {
+                "source_kind": "aiworkhub_callback_degraded",
+                "provider": provider,
+                "push_available": "false",
+                "pull_inbox_active": "true",
+            },
+        },
+    }
+
+
 class CallbackChannelServer:
     """Dependency-free stdio MCP channel server.
 
@@ -157,6 +323,7 @@ class CallbackChannelServer:
         stdout: Any | None = None,
         wait_fn: Callable[..., dict[str, Any]] | None = None,
         ack_fn: Callable[..., dict[str, Any]] | None = None,
+        route_fn: Callable[[], dict[str, Any]] | None = None,
         wait_timeout: int = 60,
         server_name: str = "aiworkhub",
         idle_backoff_seconds: float = DEFAULT_IDLE_BACKOFF_SECONDS,
@@ -165,6 +332,9 @@ class CallbackChannelServer:
         self._stdout = stdout if stdout is not None else sys.stdout
         self._wait_fn = wait_fn or _default_wait_fn
         self._ack_fn = ack_fn or _default_ack_fn
+        # The verified manager route resolver -- injectable so activation is
+        # unit-tested without a live manager parent, exactly like wait_fn/ack_fn.
+        self._route_fn = route_fn or _default_verified_manager_route
         self._wait_timeout = max(1, min(int(wait_timeout), 300))
         self._server_name = server_name
         self._idle_backoff_seconds = max(0.0, float(idle_backoff_seconds))
@@ -172,6 +342,8 @@ class CallbackChannelServer:
         self._initialized = threading.Event()
         self._stop = threading.Event()
         self._pump_thread: threading.Thread | None = None
+        self._activation: dict[str, Any] | None = None
+        self._degraded_announced = False
 
     # --- wire I/O -----------------------------------------------------------
     def _write(self, message: dict[str, Any]) -> None:
@@ -232,6 +404,39 @@ class CallbackChannelServer:
         self._pump_thread = thread
         thread.start()
 
+    def _activate_push_transport(self) -> dict[str, Any]:
+        """Select and start the push transport for the *verified* manager seat.
+
+        The channel is spawned by Claude Code, but the transport it runs is
+        decided from the verified manager route, never from prose. When this
+        process is the Claude seat's own transport it starts the push pump. When
+        a different provider holds the seat (Codex owns the App Server sideband
+        path) the channel stays dormant instead of pushing. When the seat
+        resolves to a provider with no push transport at all, it refuses
+        legibly: it emits one manager-visible degraded notice and does NOT
+        silently fall back to polling.
+        """
+        decision = resolve_push_transport(route_fn=self._route_fn)
+        self._activation = decision
+        provider = str(decision.get("provider") or "")
+        if decision.get("transport") == TRANSPORT_CLAUDE_CHANNEL:
+            # This process is the seat's own push transport.
+            self._ensure_pump_started()
+        elif decision.get("degraded") and provider not in ("", "unverified"):
+            # A verified seat whose provider has no push transport: name it
+            # where the manager can see it -- never a silent downgrade.
+            if not self._degraded_announced:
+                self._write(build_degraded_notice(decision))
+                self._degraded_announced = True
+        elif provider in ("", "unverified"):
+            # No manager seat verified yet. Preserve the safe legacy behaviour:
+            # the pump self-guards via ``no_manager`` and backs off, so it never
+            # hot-spins and never pushes into a non-manager session.
+            self._ensure_pump_started()
+        # A provider with its own non-channel transport (Codex sideband) stays
+        # dormant here: that push path is owned elsewhere and left untouched.
+        return decision
+
     def stop(self, *, timeout: float = 2.0) -> None:
         """Stop the push loop and join its thread (idempotent, bounded).
 
@@ -257,7 +462,7 @@ class CallbackChannelServer:
         msg_id = message.get("id")
         if method == "initialize":
             self._initialized.set()
-            self._ensure_pump_started()
+            self._activate_push_transport()
             return {"jsonrpc": "2.0", "id": msg_id, "result": initialize_result(self._server_name)}
         if method == "notifications/initialized":
             return None

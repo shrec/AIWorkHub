@@ -182,6 +182,7 @@ def test_handle_message_initialize_returns_capability_and_marks_initialized():
     server = CallbackChannelServer(
         wait_fn=lambda *, timeout_seconds: {"ok": True, "status": "timeout_no_callback"},
         ack_fn=lambda *_: {"ok": True},
+        route_fn=lambda: {"provider": "claude"},  # pin the Claude seat: initialize starts the pump
     )
     try:
         response = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
@@ -206,6 +207,7 @@ def test_serve_answers_initialize_over_stdio():
     stdin = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"method":"initialize"}\n')
     server = CallbackChannelServer(
         stdin=stdin, stdout=out, wait_fn=blocking_wait, ack_fn=lambda *_: {"ok": True},
+        route_fn=lambda: {"provider": "claude"},  # pin the Claude seat for pure framing
     )
     try:
         server.serve()  # returns at EOF
@@ -253,6 +255,7 @@ def test_pump_loop_backs_off_and_never_hot_spins_when_idle():
     server = CallbackChannelServer(
         wait_fn=wait_fn,
         ack_fn=lambda *_: {"ok": True},
+        route_fn=lambda: {"provider": "claude"},  # pin the Claude seat: pump must run
         idle_backoff_seconds=30.0,  # large: one idle poll, then park until stop
     )
     server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize"})  # starts pump

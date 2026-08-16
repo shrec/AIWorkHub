@@ -6,6 +6,44 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.78] - 2026-08-16
+
+### Fixed
+
+- **macOS had no process identity at all, so eight launcher regressions failed on
+  every CI run.** `_pid_start_ticks` read field 22 of `/proc/<pid>/stat`, which
+  Darwin does not have, so it returned `None` on every call while its callers
+  treated the result as an integer. That single `None` produced a `TypeError`
+  adding `None` to an `int`, a prewarm liveness that could never be true, a
+  reconciliation that counted two where one was expected, and ordering
+  assertions that collected nothing.
+
+  Process identity exists so a reused pid cannot be mistaken for a live worker;
+  on macOS that protection was simply absent. Darwin now supplies a real process
+  creation time through `libc` `sysctl` with mib
+  `[CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]`, decoding `p_starttime` from the
+  leading union member of `struct extern_proc`, with no third-party dependency.
+  None of the eight tests is skipped or marked `xfail` on Darwin. Cross-platform
+  identity now lives in exactly one place, `runtime_temp.process_start_ticks`, so
+  the launcher, the standalone supervisor and the temp-owner collector cannot
+  disagree about what identifies a process. An absent identity is treated as
+  "identity unknown" and fails closed: an owner manifest carrying no pid still
+  answers alive, so a runtime directory whose owner cannot be identified is never
+  reclaimed.
+
+- **A manager could only be woken if it happened to be waiting.** The Codex
+  callback wakes an already-open coordinator thread through the extension-owned
+  App Server sideband mux; the Claude route had a durable inbox with no trigger,
+  so a Claude manager either blocked on a synchronous wait or was told by hand.
+  The push transport is now selected from the verified manager route, so whoever
+  holds the manager seat gets their own callback activated without configuration:
+  Codex keeps the existing sideband path unchanged, Claude gets the channel. A
+  provider with no push transport reports a named, manager-visible degraded state
+  instead of silently leaving the manager to poll.
+
+- The extension README now names the shipped version, which the packaged static
+  contract check has required since 0.9.75.
+
 ## [0.9.77] - 2026-08-16
 
 ### Fixed

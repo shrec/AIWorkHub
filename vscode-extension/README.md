@@ -12,6 +12,20 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.78
+
+- **On macOS, process identity did not exist.** A pid alone is not an identity —
+  the operating system reuses them — so a reused pid could be read as a live
+  worker. Darwin now supplies a real process creation time, and the eight
+  launcher regressions that failed on every macOS CI run pass rather than being
+  skipped. An unknown identity fails closed: a runtime directory whose owner
+  cannot be identified is never reclaimed.
+- **The manager callback follows whoever holds the manager seat.** Codex keeps its
+  existing push path unchanged; a Claude manager is now woken through its own
+  channel instead of only receiving work while it happened to be waiting.
+
+See the packaged **Changelog** for the complete release summary.
+
 ## What's new in 0.9.77
 
 - **If you have only one model provider installed, finished work could never be

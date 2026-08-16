@@ -25,12 +25,14 @@ system temp.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -171,8 +173,138 @@ def _proc_stat_starttime(pid: int) -> int | None:
         return None
 
 
+def _libc_with_sysctl() -> Any | None:
+    """Return a libc handle exposing ``sysctl``, or None when unavailable."""
+    for name in ("libc.dylib", "libSystem.dylib", None):
+        try:
+            lib = ctypes.CDLL(name, use_errno=True)
+        except (OSError, TypeError):
+            continue
+        if hasattr(lib, "sysctl"):
+            return lib
+    return None
+
+
+def _darwin_start_ticks_from_kinfo(raw: bytes) -> int | None:
+    """Parse ``kp_proc.p_starttime`` from the head of a ``kinfo_proc`` record.
+
+    ``p_starttime`` is a ``struct timeval`` at offset 0 of ``kinfo_proc`` on
+    64-bit Darwin -- it is the leading union member of ``struct extern_proc``:
+    an 8-byte little-endian ``tv_sec`` followed by a 4-byte ``tv_usec``.  Only
+    this 12-byte prefix is read, so the full, version-sensitive struct layout
+    is never depended upon.  Returns microseconds since the epoch, or None when
+    the bytes are too short or not a plausible wall-clock time.  Kept as a pure
+    function so the byte parsing is testable on any platform.
+    """
+    if len(raw) < 12:
+        return None
+    tv_sec = int.from_bytes(raw[0:8], "little", signed=True)
+    tv_usec = int.from_bytes(raw[8:12], "little", signed=True)
+    if tv_sec <= 0 or not (0 <= tv_usec < 1_000_000):
+        return None
+    return tv_sec * 1_000_000 + tv_usec
+
+
+def _darwin_start_ticks(pid: int) -> int | None:
+    """Darwin process creation time via ``sysctl kern.proc.pid`` (no /proc).
+
+    Dependency-free: reads ``kp_proc.p_starttime`` straight from the kernel
+    through libc's ``sysctl`` with mib ``[CTL_KERN, KERN_PROC, KERN_PROC_PID,
+    pid]``.  No third-party module and no subprocess.  Returns None for an
+    unknown/dead pid or when the syscall is unavailable, so callers fail
+    closed rather than treating an absence as a match.
+    """
+    libc = _libc_with_sysctl()
+    if libc is None:
+        return None
+    libc.sysctl.restype = ctypes.c_int
+    libc.sysctl.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    ctl_kern, kern_proc, kern_proc_pid = 1, 14, 1
+    mib = (ctypes.c_int * 4)(ctl_kern, kern_proc, kern_proc_pid, int(pid))
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 4, None, ctypes.byref(size), None, 0) != 0:
+        return None
+    if size.value < 12:
+        return None
+    buf = (ctypes.c_char * size.value)()
+    if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0:
+        return None
+    if size.value < 12:
+        return None  # process vanished; the kernel returned an empty record
+    return _darwin_start_ticks_from_kinfo(bytes(buf.raw[:12]))
+
+
+def _windows_start_ticks(pid: int) -> int | None:
+    """Windows process creation ``FILETIME`` via ``GetProcessTimes``."""
+    class _FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return None
+    creation = _FileTime()
+    exit_time = _FileTime()
+    kernel = _FileTime()
+    user = _FileTime()
+    try:
+        ok = kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+        if not ok:
+            return None
+        return (int(creation.high) << 32) | int(creation.low)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def process_start_ticks(pid: int) -> int | None:
+    """Stable per-process creation stamp, or None when unavailable.
+
+    This is the single cross-platform process-identity primitive shared by the
+    launcher, the standalone supervisor, and this module's temp-owner GC, so
+    those paths can never drift.  The value is an opaque integer compared only
+    for equality against another value read the same way on the same host; its
+    units differ by platform and must never be interpreted across platforms or
+    used in arithmetic:
+
+    * Linux   -- field 22 of ``/proc/<pid>/stat`` (clock ticks since boot).
+    * Darwin  -- ``kp_proc.p_starttime`` via ``sysctl kern.proc.pid``
+      (microseconds since the epoch); Darwin has no ``/proc``.
+    * Windows -- process creation ``FILETIME`` via ``GetProcessTimes``.
+
+    Returns None only where the host genuinely cannot supply a creation time
+    (an unknown/dead pid, or a future platform with no supported source).
+    Callers must treat None as "identity unknown", fail closed, and never as a
+    match -- a bare pid is not an identity because the OS recycles pids.
+    """
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            return _windows_start_ticks(pid)
+        except OSError:
+            return None
+    if sys.platform == "darwin":
+        return _darwin_start_ticks(pid)
+    return _proc_stat_starttime(pid)
+
+
 def _self_starttime() -> int:
-    value = _proc_stat_starttime(os.getpid())
+    value = process_start_ticks(os.getpid())
     return value if value is not None else 0
 
 
@@ -259,23 +391,30 @@ def _pid_alive(pid: int) -> bool | None:
 def owner_alive(manifest: Mapping[str, Any]) -> bool:
     """True unless the recorded owner process is provably dead.
 
-    A live PID (or an undeterminable owner) always fails closed to *alive*.
-    When the recorded PID is dead we additionally guard against PID reuse by
-    comparing the recorded start-time with the current owner's start-time.
+    Fail-closed on any absence of identity.  An owner we cannot identify --
+    no usable PID at all -- must never have its runtime directory reclaimed,
+    so it answers *alive*; absence of identity is not evidence of death.  A
+    live PID (or an undeterminable one) also fails closed to *alive*.  Only a
+    PID that is provably dead reclaims, and even then we guard against PID
+    reuse by comparing the recorded start-time identity with the current
+    owner's -- a mismatch means the PID was recycled and the directory is
+    foreign, so it stays.
     """
     try:
         pid = int(manifest.get("pid") or 0)
         starttime = int(manifest.get("starttime") or 0)
     except (TypeError, ValueError):
         return True
+    if pid <= 0:
+        return True  # no identifiable owner -> fail closed, never delete
     alive = _pid_alive(pid)
     if alive is True:
         return True
     if alive is None:
-        return True  # unknown owner -> never delete
+        return True  # undeterminable owner -> never delete
     # The PID is currently dead.  If we can still read a start-time for a
     # recycled PID that differs from ours, treat the directory as foreign.
-    current = _proc_stat_starttime(pid)
+    current = process_start_ticks(pid)
     if current is not None and current != starttime:
         return True
     return False
@@ -483,6 +622,7 @@ __all__ = [
     "namespace_root",
     "now_utc",
     "owner_alive",
+    "process_start_ticks",
     "provision_request_temp",
     "quota",
     "read_owner_manifest",
