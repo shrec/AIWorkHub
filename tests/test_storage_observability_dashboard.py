@@ -26,7 +26,10 @@ def test_storage_snapshot_counts_repo_data_and_never_follows_symlinks(tmp_path, 
     monkeypatch.setattr(
         storage_observability.worktree_storage,
         "scan_worktrees",
-        lambda **_kwargs: {
+        # scan_worktrees is reached through storage_retention.repo_storage_footprint,
+        # which passes `base` positionally; a keyword-only stub raises TypeError
+        # before the stub body runs and the test then asserts on the wrong error.
+        lambda *_args, **_kwargs: {
             "summary": {"total_bytes": 256, "count": 2, "removable_safe_bytes": 64}
         },
     )
@@ -71,7 +74,7 @@ def test_storage_snapshot_returns_immediately_while_slow_scan_runs(tmp_path, mon
     repo = tmp_path / "repo"
     repo.mkdir()
 
-    def slow_scan(**_kwargs):
+    def slow_scan(*_args, **_kwargs):
         time.sleep(0.15)
         return {"summary": {"total_bytes": 1, "count": 1, "removable_safe_bytes": 0}}
 
@@ -92,7 +95,7 @@ def test_storage_scan_failure_is_bounded_and_does_not_break_capacity(tmp_path, m
     monkeypatch.setattr(
         storage_observability.worktree_storage,
         "scan_worktrees",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("secret details")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("secret details")),
     )
     storage_observability._reset_cache_for_tests()
 
