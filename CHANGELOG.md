@@ -6,6 +6,45 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.74] - 2026-08-16
+
+### Security
+
+- A quality lens can no longer be satisfied by a reviewer that could not inspect
+  anything. Observed four times: a reviewer on the `vscode_lm_in_process`
+  sandbox is given no file-read tool while its review packet is handed to it as
+  a file path, so it cannot open the candidate at all — and its report still
+  came back `terminal_state: review_ready`, `audit_verified: true`, shaped
+  identically to a real one. On the identical packet
+  (`packet_sha256: 440f1eb1…`) a sighted reviewer produced exact file/line
+  evidence and found a real defect.
+- The gate now marks a lens `reviewer_could_not_inspect` on either POSITIVE
+  signal of blindness: a report whose findings are all `disposition:
+  process_limit` — the reviewer itself saying it was prevented from inspecting —
+  or `usage` telemetry that is PRESENT and records zero activity
+  (`usage_observed: false` with `input_tokens: 0` and `output_tokens: 0`).
+  Both are exactly what the blind reviewer produced.
+- Missing telemetry is deliberately treated as unknown rather than as
+  blindness, and keeps satisfying the lens. An earlier attempt required proof
+  of inspection and broke five legitimate tests, because most honest reviews
+  carry no inspection telemetry at all. Absence of evidence is not evidence of
+  absence, and a gate that pretends otherwise rejects real work.
+- The residual gap is named rather than papered over: a reviewer that inspects
+  nothing and emits no telemetry is still indistinguishable from a good one.
+  Closing it belongs at the harness, which must record inspection evidence for
+  every attempt including zero-activity ones, so that absence becomes a fact
+  about the reviewer instead of a gap in the instrumentation.
+
+### Validation
+
+- `tests/test_quality_gate_blind_reviewer.py` plus the declared quality-gate
+  regression set (`test_completion_quality_gate.py`, `test_quality_verdict_v2.py`,
+  `test_combined_tree_workspace.py`): 92 passed, 4 skipped.
+- Full repository suite: 3909 passed, 36 skipped, 0 failed — 21 new tests over
+  the 0.9.73 baseline with no regression.
+- Three independent cross-provider reviewer lenses: security 0 findings,
+  correctness 0 findings, code_quality 1 non-actionable observation.
+
 ## [0.9.73] - 2026-08-16
 
 ### Security

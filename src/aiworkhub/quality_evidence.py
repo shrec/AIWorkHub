@@ -37,6 +37,7 @@ STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
 STATUS_NOT_AVAILABLE = "not_available"
 STATUS_SKIPPED = "skipped"
+STATUS_REVIEWER_COULD_NOT_INSPECT = "reviewer_could_not_inspect"
 VALID_STATUSES = frozenset({STATUS_PASSED, STATUS_FAILED, STATUS_NOT_AVAILABLE, STATUS_SKIPPED})
 
 LENS_CORRECTNESS = "correctness"
@@ -850,6 +851,46 @@ def normalize_reviewer_reports(
     return normalized, errors
 
 
+def reviewer_report_could_not_inspect(report: Mapping[str, Any]) -> bool:
+    """Detect a positive signal that a reviewer could not inspect its packet.
+
+    Two affirmative signals mark a report as blind rather than merely
+    low-signal:
+
+    * every finding carries ``disposition: process_limit`` -- the reviewer
+      itself reporting it was prevented from inspecting; or
+    * ``usage`` telemetry is present and records zero activity
+      (``usage_observed: false`` with ``input_tokens: 0`` and
+      ``output_tokens: 0``).
+
+    Missing telemetry is unknown, never blindness: a report with no ``usage``
+    field keeps satisfying its lens. This function performs no I/O and never
+    requires proof of inspection.
+    """
+
+    findings = report.get("findings")
+    if isinstance(findings, list) and findings:
+        all_process_limit = True
+        for finding in findings:
+            if not isinstance(finding, Mapping):
+                all_process_limit = False
+                break
+            if finding.get("disposition") != FINDING_DISPOSITION_PROCESS_LIMIT:
+                all_process_limit = False
+                break
+        if all_process_limit:
+            return True
+    usage = report.get("usage")
+    if isinstance(usage, Mapping):
+        if (
+            usage.get("usage_observed") is False
+            and usage.get("input_tokens") == 0
+            and usage.get("output_tokens") == 0
+        ):
+            return True
+    return False
+
+
 def fold_quality_verdict(
     checks: Iterable[EvidenceCheck | Mapping[str, Any]],
     *,
@@ -905,7 +946,8 @@ def fold_quality_verdict(
         if status in {STATUS_FAILED, STATUS_NOT_AVAILABLE}:
             blockers.append(check_id)
 
-    normalized_reports, schema_errors = normalize_reviewer_reports(reviewer_reports)
+    raw_reports = list(reviewer_reports)
+    normalized_reports, schema_errors = normalize_reviewer_reports(raw_reports)
     blockers.extend(schema_errors)
     reports_by_lens: dict[str, list[dict[str, Any]]] = {}
     refine_required = False
@@ -930,6 +972,16 @@ def fold_quality_verdict(
                     blockers.append(f"refinement_required:{finding_id}")
                     row["status"] = STATUS_FAILED
 
+    blind_lenses: set[str] = set()
+    for report in raw_reports:
+        if not isinstance(report, Mapping):
+            continue
+        lens = report.get("lens")
+        if not isinstance(lens, str) or lens not in JUDGMENT_LENSES:
+            continue
+        if reviewer_report_could_not_inspect(report):
+            blind_lenses.add(lens)
+
     cross_provider_required = bool(profile.get("cross_provider_required"))
     for lens in required_lenses:
         reports = reports_by_lens.get(lens, [])
@@ -937,6 +989,10 @@ def fold_quality_verdict(
             blocker = f"required_reviewer_missing:{lens}"
             blockers.append(blocker)
             lens_rows[lens]["status"] = STATUS_NOT_AVAILABLE
+            continue
+        if lens in blind_lenses:
+            blockers.append(f"reviewer_could_not_inspect:{lens}")
+            lens_rows[lens]["status"] = STATUS_REVIEWER_COULD_NOT_INSPECT
             continue
         if cross_provider_required:
             if not worker_provider:

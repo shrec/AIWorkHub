@@ -1,5 +1,20 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.74 — 2026-08-16
+
+### Security
+
+- A quality lens can no longer be satisfied by a reviewer that could not inspect
+  anything. A reviewer whose sandbox gives it no file-read tool cannot open the
+  review packet it is handed, yet its empty report came back shaped identically
+  to a real review — so a required lens was satisfied by an inspection that
+  never happened.
+- The gate now marks such a lens `reviewer_could_not_inspect` on a positive
+  signal only: findings that are all `process_limit`, or usage telemetry that is
+  present and records zero activity.
+- Missing telemetry stays "unknown" and keeps satisfying the lens, because most
+  honest reviews carry none; demanding proof of inspection rejects real work.
+
 ## 0.9.73 — 2026-08-16
 
 ### Security

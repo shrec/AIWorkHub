@@ -12,6 +12,22 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.74
+
+- A quality lens can no longer be satisfied by a reviewer that could not inspect
+  anything. A reviewer whose sandbox gives it no file-read tool cannot open the
+  review packet it is handed as a file path — and its empty report still came
+  back shaped identically to a real review, so a required lens counted as
+  satisfied by an inspection that never happened. Observed four times.
+- The gate now marks such a lens `reviewer_could_not_inspect`, but only on a
+  positive signal: findings that are all `process_limit`, or usage telemetry
+  that is present and records zero activity.
+- Missing telemetry deliberately stays "unknown" and keeps satisfying the lens.
+  Most honest reviews carry no inspection telemetry, and demanding proof of
+  inspection rejects real work — absence of evidence is not evidence of absence.
+
+See the packaged **Changelog** for the complete release summary.
+
 ## What's new in 0.9.73
 
 - A read-only SQLite open is now actually read-only. Every such connection was
