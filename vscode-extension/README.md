@@ -12,6 +12,26 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.77
+
+- **If you have only one model provider installed, finished work could never be
+  accepted.** The acceptance gate demanded a review from a different vendor than
+  the one that did the work, so on a single-provider setup nothing could pass,
+  however complete and green it was.
+- Reviewer independence is now a recorded ladder — `cross_provider` degrading to
+  `cross_model_same_provider` and then to `same_model_fresh_context` — and the
+  level actually achieved is written into the acceptance evidence, so you can see
+  exactly how independent each review was.
+- A reviewer that cannot read the review packet is still refused for its lens,
+  and a review that cannot be attributed to a worker provider is still refused.
+  Every other safeguard is unchanged.
+- Source Graph no longer reports success for a build that indexed nothing, and a
+  duplicate declaration in one PHP file no longer aborts the whole index.
+- Restoring a quarantined worktree reinstates its git registration and says so
+  when it cannot, rather than leaving the directory attributed to nobody.
+
+See the packaged **Changelog** for the complete release summary.
+
 ## What's new in 0.9.74
 
 - A quality lens can no longer be satisfied by a reviewer that could not inspect
