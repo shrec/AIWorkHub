@@ -41,6 +41,13 @@ MAX_POLICY_BYTES = 64 * 1024
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 MANDATORY_RAW_DISCOVERY_DENIES = ("grep", "rg", "find", "tree")
 
+# Workforce readiness vocabulary. A route must never be labeled "ready" when
+# the provider quota that gates it has not actually been observed; the
+# distinct value below lets a caller reading readiness alone route honestly.
+READINESS_READY = "ready"
+READINESS_READY_UNVERIFIED = "ready_unverified"
+QUOTA_STATE_UNAVAILABLE = "unavailable_from_provider_api"
+
 DEFAULT_POLICY: dict[str, Any] = {
     "schema_id": SCHEMA_ID,
     "providers": {"allowed_adapters": list(runtime_adapters.LOCAL_ADAPTERS)},
@@ -292,6 +299,10 @@ def _provider_status(
         "installed": bool(resolution.ok),
         "launchable": bool(resolution.ok),
         "access_observed": False,
+        # No credential/auth helper can observe a provider's metered quota
+        # today, so the honest default is unobserved until a helper reports it.
+        "quota_observed": False,
+        "quota_state": QUOTA_STATE_UNAVAILABLE,
         "status": "installed_unverified_access" if resolution.ok else "not_installed",
         "reason": str(resolution.reason or "")[:200],
     }
@@ -339,13 +350,26 @@ def _provider_status(
                 or readiness.get("launchable")
             )
         result["launchable"] = bool(resolution.ok and readiness.get("launchable"))
+        # Quota is a separate axis from credential/access observation. A route
+        # that is launchable and whose access is observed may still be
+        # unverifiable because the provider's quota was never observed. Such a
+        # route must not be labeled "ready"; it is "ready_unverified", and the
+        # quota reason travels alongside the readiness value.
+        quota_observed = bool(readiness.get("quota_observed"))
+        quota_state = str(readiness.get("quota_state") or QUOTA_STATE_UNAVAILABLE)[:128]
+        result["quota_observed"] = quota_observed
+        result["quota_state"] = quota_state
         if result["launchable"] and result["access_observed"]:
-            result["status"] = "ready"
+            result["status"] = (
+                READINESS_READY if quota_observed else READINESS_READY_UNVERIFIED
+            )
         elif result["launchable"] and readiness.get("consent_required"):
             result["status"] = "consent_required"
         else:
             result["status"] = "access_unavailable"
         result["reason"] = str(readiness.get("blocker_reason") or readiness.get("reason") or "")[:200]
+        if result["status"] == READINESS_READY_UNVERIFIED:
+            result["reason"] = f"quota_unobserved:{quota_state}"
         # Preserve only bounded, secret-free broker observability.  The UI can
         # then report real editor model capacity instead of presenting
         # redundant transports as if they were distinct models.
@@ -609,6 +633,9 @@ __all__ = [
     "DEFAULT_POLICY",
     "POLICY_RELATIVE_PATH",
     "PREFLIGHT_SCHEMA_ID",
+    "QUOTA_STATE_UNAVAILABLE",
+    "READINESS_READY",
+    "READINESS_READY_UNVERIFIED",
     "RepoPolicyError",
     "SCHEMA_ID",
     "build_preflight",

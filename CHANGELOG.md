@@ -6,6 +6,37 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.76] - 2026-08-16
+
+### Fixed
+
+- **The 0.9.75 VSIX shipped without its bundled Python runtime and the dashboard
+  could not start.** The extension was packaged with a raw `vsce package`
+  invocation instead of the repository's own packager,
+  `vscode-extension/test/package-vsix.js`, which is the single source of truth
+  for staging `src/aiworkhub` into the extension's `runtime/` directory and the
+  mux launcher into `bin/`. Both directories were absent from the 0.9.75
+  package, so a reloaded window reported
+  `bundled_mux_runtime_missing:.../ivanechkheidze.aiworkhub-0.9.75/runtime` and
+  the dashboard never initialised. The symptom appeared only after a window
+  reload, because until then the extension host was still running the previous
+  build. 0.9.76 is built through the canonical packager, which additionally
+  asserts that `server.py`, `callback_store.py` and
+  `dashboard_static/index.html` are present in the staged runtime.
+- `dashboard_storage_retention_preview` no longer hangs. The caller's wait is
+  bounded by a validated wall-clock deadline, the footprint walk is single-flight
+  so a second caller in the finish window does not duplicate it, and an aborted
+  measurement can no longer report partial success. Rework-predecessor worktrees
+  are pinned as live, so retention can no longer reclaim work that is still in
+  flight — the failure that destroyed an in-progress card's predecessor earlier
+  in this release series.
+- The workforce catalog no longer reports a worker `ready` when it has never
+  observed that worker's quota. It reports `ready_unverified` with the reason
+  attached, while a worker with observed, healthy quota still reports `ready`.
+  Routing on unverified readiness cost three cards their attempt history when a
+  provider's quota turned out to be exhausted; `available` stays boolean and the
+  distinction now lives in `readiness_status`.
+
 ## [0.9.75] - 2026-08-16
 
 ### Fixed

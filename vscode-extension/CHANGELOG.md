@@ -1,5 +1,21 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.76 — 2026-08-16
+
+### Fixed
+
+- **0.9.75 shipped without its bundled Python runtime and the dashboard could
+  not start.** That build was packaged with a raw `vsce package` call instead of
+  the repository's own packager, which is what stages the runtime and the mux
+  launcher into the extension. A reloaded window reported
+  `bundled_mux_runtime_missing` and the dashboard never came up. If you are on
+  0.9.75, install this build. The symptom only appeared after a window reload,
+  because until then the extension host was still running the previous build.
+- The storage retention preview no longer hangs, and retention can no longer
+  reclaim a worktree that a task is still working in.
+- The workforce catalog no longer claims a worker is `ready` when it has never
+  seen that worker's quota; it says `ready_unverified` and gives the reason.
+
 ## 0.9.75 — 2026-08-16
 
 ### Fixed

@@ -186,14 +186,19 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
     report = repo_policy.build_preflight(root)
     assert report["ok"] is True
     by_adapter = {item["adapter_id"]: item for item in report["providers"]}
-    assert by_adapter["deepseek_copilot_cli"]["status"] == "ready"
+    # NF-2026-00264: access being observed is not quota being observed. This
+    # fixture grants access and says nothing about quota, so the honest status
+    # is ready_unverified — the catalog must not assert "ready" on a provider
+    # whose remaining quota it has never seen.
+    assert by_adapter["deepseek_copilot_cli"]["status"] == "ready_unverified"
+    assert by_adapter["deepseek_copilot_cli"]["quota_observed"] is False
     assert by_adapter["glm_vscode_lm"]["access_observed"] is True
-    assert by_adapter["vscode_lm"]["status"] == "ready"
+    assert by_adapter["vscode_lm"]["status"] == "ready_unverified"
     assert by_adapter["vscode_lm"]["observed_models"] == [
         "glm-5.2",
         "deepseek-v4-pro",
     ]
-    assert by_adapter["claude_cli"]["status"] == "ready"
+    assert by_adapter["claude_cli"]["status"] == "ready_unverified"
     assert by_adapter["claude_cli"]["access_observed"] is True
     assert by_adapter["claude_cli"]["sandbox_backend"] == "bubblewrap"
     assert by_adapter["vscode_lm"]["sandbox_backend"] == "vscode_lm_in_process"

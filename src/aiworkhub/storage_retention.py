@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import sqlite3
 import stat
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,6 +39,27 @@ LEGACY_LOG_RELATIVE_PATH = Path("logs")
 CANONICAL_RUNTIME_RELATIVE_PATH = Path(".aiworkhub/runtime")
 UNDO_DAYS = 7
 MAX_MANIFEST_BYTES = 512 * 1024
+# Wall-clock ceiling for the read-only preview's on-disk measurement. The
+# dashboard snapshot is already bounded because it measures in a background
+# thread and serves a cached result; the preview acquires the identical bound
+# (see :func:`preview`) so a per-file walk over hundreds of worktrees can never
+# run to the caller's request timeout. Past this deadline the preview returns a
+# result explicitly labelled incomplete rather than blocking.
+PREVIEW_DEADLINE_SECONDS = 90.0
+# Upper bound on any accepted wall-clock deadline. A preview measurement can
+# never sanely need more than a day, and -- more importantly -- a finiteness
+# check alone is not enough: an absurd-but-finite value such as ``1e300`` passes
+# ``math.isfinite`` yet overflows the C timeout ``threading.Event.wait`` derives
+# from it (seconds -> int64 nanoseconds), so the wait raises ``OverflowError``
+# instead of honouring a bound. Anything above this ceiling is rejected, not
+# clamped, for the same reason ``inf``/NaN are: a bound a caller can push past
+# what the wait can represent is not a bound.
+MAX_DEADLINE_SECONDS = 86_400.0
+# Canonical lifecycle states in which a card can never launch again, so any
+# ``rework_predecessor`` it once referenced is genuinely superseded and stays
+# reclaimable. Every other state (pending/processing/review/blocked) keeps its
+# predecessor attempt protected. Keyed on lifecycle only -- never mtime/age.
+_FINISHED_STATUSES = frozenset({"finished", "archived", "superseded"})
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
@@ -60,22 +83,36 @@ def _policy(repo_root: Path) -> tuple[int, int]:
         return int(defaults["terminal_runs_days"]), int(defaults["worktree_max_bytes"])
 
 
-def _protected_attempt_ids(repo_root: Path) -> tuple[set[str], bool]:
-    """Worktree ids a live task attempt still holds: never quarantine candidates.
+def _protected_attempt_ids(
+    repo_root: Path,
+) -> tuple[dict[str, str], bool, dict[str, list[str]]]:
+    """Worktree ids a live attempt or in-flight rework lineage still holds.
 
-    A worktree is protected only while it is the *current* claimed attempt of
-    a task that is actively ``processing`` or ``review`` (the newest attempt
-    under evaluation). Everything else -- a superseded rework predecessor, or
-    an old attempt of a finished/archived/blocked/pending/superseded card --
-    is no longer live and may be reclaimed regardless of its git dirty/
-    unpushed state, since quarantine only moves it into a same-volume,
-    restorable holding area; nothing is deleted until a separate purge.
+    A worktree is protected -- and therefore never a quarantine candidate --
+    while any of these hold, keyed strictly on the canonical card lifecycle
+    (never on file mtime, age, or recency):
 
-    The claim path writes the live worktree's request id into
-    ``launch_request_id``. ``accepted_request_id`` is populated only once a
-    review is ACCEPTED and the card has already flipped to ``finished``, so a
-    card genuinely ``processing`` or ``review`` always has it empty -- keying
-    protection on it left every live attempt unprotected.
+    * ``live_worker`` -- it is the *current* claimed attempt of a card that is
+      actively ``processing`` or ``review`` (the newest attempt under
+      evaluation), recorded by the claim path in ``card_json`` as
+      ``launch_request_id``.
+    * ``rework_predecessor_retained`` -- it is referenced as the
+      ``rework_predecessor`` of a card that has NOT yet reached a finished
+      lifecycle state. A card rejected back to ``pending`` (or otherwise still
+      ``processing``/``review``/``blocked``) can relaunch, and the launcher
+      overlays this predecessor's changed files into the successor attempt
+      (see ``worker_workspace._materialize_rework_predecessor``); reclaiming it
+      would strand the card with ``rework_predecessor_workspace_missing`` and
+      silently destroy work no successor has replaced. Protection ends only
+      once the referencing card itself reaches a finished state
+      (``finished``/``archived``/``superseded``) -- i.e. once a successor has
+      genuinely been sealed -- so genuinely superseded lineage stays
+      reclaimable and an over-cap repository can still force reclamation.
+
+    ``accepted_request_id`` is populated only once a review is ACCEPTED and the
+    card has already flipped to ``finished``, so a card genuinely
+    ``processing``/``review`` always has it empty -- keying protection on it
+    left every live attempt unprotected.
 
     Liveness is resolved with one unbounded read of the canonical ``tasks``
     table's lifecycle columns, not through ``task_store.list_tasks``: that
@@ -87,37 +124,63 @@ def _protected_attempt_ids(repo_root: Path) -> tuple[set[str], bool]:
     single query whose bound is the exact size of the ``tasks`` table, which
     can never itself exclude a live card.
 
-    Returns ``(protected_ids, verified)``. ``verified`` is False when task
-    lineage could not be read at all, so the caller fails closed rather than
-    guessing that an unreadable attempt is safe to reclaim.
+    Returns ``(protected, verified, pinned_by)``. ``protected`` maps each
+    protected request id to its reason. ``pinned_by`` maps each
+    ``rework_predecessor_retained`` worktree id to the sorted list of card ids
+    still pinning it, so the preview can report how much storage is held by
+    in-flight rework lineage AND which cards hold it -- an operator can then see
+    a bounded, named standoff (see :func:`plan_worktree_reclaim`) rather than a
+    silent one. ``verified`` is False when task lineage could not be read at
+    all, so the caller fails closed rather than guessing that an unreadable
+    attempt is safe to reclaim.
     """
-    protected: set[str] = set()
+    protected: dict[str, str] = {}
+    pinned_by: dict[str, list[str]] = {}
     try:
         db_path = task_store.canonical_db_path(repo_root)
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+        # Path().resolve().as_uri() percent-encodes '#' as %23; the raw
+        # f"file:{db_path}?mode=ro" form lets a '#' in the path start a URI
+        # fragment, silently dropping ?mode=ro so SQLite opens the connection
+        # read-write and create-if-missing at a truncated path.
+        ro_uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0)
         conn.row_factory = sqlite3.Row
         try:
+            conn.execute("PRAGMA query_only = ON")
             conn.execute("PRAGMA busy_timeout=5000")
             rows = conn.execute(
-                "SELECT status, worker_status, archived_at, card_json FROM tasks"
+                "SELECT task_id, status, worker_status, archived_at, card_json FROM tasks"
             ).fetchall()
         finally:
             conn.close()
         for row in rows:
-            if task_store.canonical_status(dict(row)) not in ("processing", "review"):
-                continue
+            status = task_store.canonical_status(dict(row))
             try:
                 card_json = json.loads(row["card_json"] or "{}")
             except json.JSONDecodeError:
                 card_json = {}
             if not isinstance(card_json, dict):
                 continue
-            request_id = str(card_json.get("launch_request_id") or "").strip()
-            if request_id:
-                protected.add(request_id)
+            if status in ("processing", "review"):
+                request_id = str(card_json.get("launch_request_id") or "").strip()
+                if request_id:
+                    protected[request_id] = "live_worker"
+            if status not in _FINISHED_STATUSES:
+                predecessor = card_json.get("rework_predecessor")
+                if isinstance(predecessor, dict):
+                    predecessor_id = str(predecessor.get("request_id") or "").strip()
+                    if predecessor_id:
+                        protected.setdefault(predecessor_id, "rework_predecessor_retained")
+                        card_id = str(row["task_id"] or "").strip()
+                        if card_id:
+                            holders = pinned_by.setdefault(predecessor_id, [])
+                            if card_id not in holders:
+                                holders.append(card_id)
     except (task_store.TaskStoreError, sqlite3.Error, OSError):
-        return set(), False
-    return protected, True
+        return {}, False, {}
+    for holders in pinned_by.values():
+        holders.sort()
+    return protected, True, pinned_by
 
 
 def plan_worktree_reclaim(
@@ -151,22 +214,32 @@ def plan_worktree_reclaim(
     mtimes.
     """
     root = Path(repo_root).resolve()
-    protected_ids, lineage_verified = _protected_attempt_ids(root)
+    protected_ids, lineage_verified, pinned_by = _protected_attempt_ids(root)
     minimum_age_seconds = max(0, min(int(min_age_days), 3650)) * 86400
-    effective_now = time.time() if now is None else float(now)
+    validated_now = _resolve_now(now)
+    effective_now = time.time() if validated_now is None else validated_now
 
     would_keep: list[dict[str, Any]] = []
     reclaimable: list[dict[str, Any]] = []
+    # Why each kept worktree is being retained, so the preview can distinguish a
+    # live worker from a retained rework predecessor without reading the code.
+    protection_reasons: dict[str, str] = {}
     for wt in scan.get("worktrees") or []:
         wt_id = str(wt.get("id") or "")
-        if wt.get("class") == worktree_storage.CLASS_ORPHANED or wt_id in protected_ids:
+        if wt.get("class") == worktree_storage.CLASS_ORPHANED:
             would_keep.append(wt)
+            protection_reasons[wt_id] = "orphaned"
+            continue
+        if wt_id in protected_ids:
+            would_keep.append(wt)
+            protection_reasons[wt_id] = protected_ids[wt_id]
             continue
         if wt.get("class") == worktree_storage.CLASS_REMOVABLE_SAFE or lineage_verified:
             reclaimable.append(wt)
         else:
             # Dirty/unpushed and card lineage could not be verified: fail closed.
             would_keep.append(wt)
+            protection_reasons[wt_id] = "lineage_unverified"
 
     would_remove = [
         wt for wt in reclaimable
@@ -174,6 +247,8 @@ def plan_worktree_reclaim(
     ]
     under_age = [wt for wt in reclaimable if wt not in would_remove]
     would_keep.extend(under_age)
+    for wt in under_age:
+        protection_reasons.setdefault(str(wt.get("id") or ""), "under_age")
 
     if current_bytes > max_bytes:
         projected = current_bytes - sum(int(wt.get("size_bytes") or 0) for wt in would_remove)
@@ -182,7 +257,41 @@ def plan_worktree_reclaim(
                 break
             would_remove.append(wt)
             would_keep.remove(wt)
+            protection_reasons.pop(str(wt.get("id") or ""), None)
             projected -= int(wt.get("size_bytes") or 0)
+
+    # Rework-predecessor lineage is pinned while its card is not finished, and
+    # the over-cap forcing path above deliberately cannot evict it -- reclaiming
+    # an in-flight predecessor is the exact data loss this planner exists to
+    # prevent. That protection has no upper bound, so a card abandoned in
+    # ``pending`` pins its predecessor's bytes indefinitely. Rather than let that
+    # be a silent standoff between two correct rules, surface it: report the
+    # pinned bytes and the exact cards holding them as their own preview line. If
+    # ``pinned_predecessor_bytes`` alone exceeds the cap, the correct escalation
+    # is human, not a planner override -- resolve or finish the naming cards (so
+    # their pin lifts and the lineage becomes reclaimable normally), never quietly
+    # evict a predecessor a live card still needs.
+    #
+    # Membership is keyed on ``pinned_by`` -- every worktree a non-finished card
+    # references as its ``rework_predecessor`` -- NOT on the single displayed
+    # ``protection_reason``. A worktree can be pinned for two reasons at once: if
+    # it is ALSO the live worker of another card its reason reads ``live_worker``,
+    # yet it is still a pinned predecessor holding storage a live card needs.
+    # Keying on the reason string dropped exactly that overlap from the bytes an
+    # operator reads, under-reporting the case most likely to matter; count it
+    # under both instead.
+    pinned_predecessors: list[dict[str, Any]] = []
+    for wt in would_keep:
+        wt_id = str(wt.get("id") or "")
+        if wt_id not in pinned_by:
+            continue
+        pinned_predecessors.append({
+            "id": wt_id,
+            "size_bytes": int(wt.get("size_bytes") or 0),
+            "pinned_by": list(pinned_by.get(wt_id, [])),
+        })
+    pinned_predecessors.sort(key=lambda item: item["id"])
+    pinned_predecessor_bytes = sum(item["size_bytes"] for item in pinned_predecessors)
 
     return {
         "base": scan.get("base"),
@@ -191,6 +300,9 @@ def plan_worktree_reclaim(
         "reclaim_bytes": sum(int(wt.get("size_bytes") or 0) for wt in would_remove),
         "kept_bytes": sum(int(wt.get("size_bytes") or 0) for wt in would_keep),
         "lineage_verified": lineage_verified,
+        "protection_reasons": protection_reasons,
+        "pinned_predecessors": pinned_predecessors,
+        "pinned_predecessor_bytes": pinned_predecessor_bytes,
     }
 
 
@@ -315,6 +427,17 @@ def _preview_payload(repo_root: Path, base: Path, *, now: float | None = None) -
         for item in plan.get("would_remove") or []
     ]
     candidates.sort(key=lambda item: item["id"])
+    protection_reasons = plan.get("protection_reasons") or {}
+    protected = sorted(
+        (
+            {
+                "id": str(wt.get("id") or ""),
+                "reason": protection_reasons.get(str(wt.get("id") or ""), "protected"),
+            }
+            for wt in plan.get("would_keep") or []
+        ),
+        key=lambda item: item["id"],
+    )
     digest_input = {
         "schema_id": SCHEMA_ID,
         "repo_id": _repo_id(repo_root),
@@ -330,6 +453,7 @@ def _preview_payload(repo_root: Path, base: Path, *, now: float | None = None) -
         "ok": True,
         "schema_id": SCHEMA_ID,
         "dry_run": True,
+        "complete": True,
         "repository_scoped": True,
         "policy_days": policy_days,
         "max_bytes": max_bytes,
@@ -346,6 +470,12 @@ def _preview_payload(repo_root: Path, base: Path, *, now: float | None = None) -
         "candidate_count": len(candidates),
         "candidate_bytes": sum(item["size_bytes"] for item in candidates),
         "protected_count": len(plan.get("would_keep") or []),
+        "protected": protected,
+        # In-flight rework lineage held off-limits, reported as its own line so an
+        # operator can see how much storage is pinned and by exactly which cards
+        # (never evicted by the over-cap path; see plan_worktree_reclaim).
+        "pinned_predecessor_bytes": int(plan.get("pinned_predecessor_bytes") or 0),
+        "pinned_predecessors": plan.get("pinned_predecessors") or [],
         "preview_digest": digest,
         "candidates": candidates,
         "registration_health": registrations,
@@ -357,12 +487,307 @@ def _public_preview(value: Mapping[str, Any]) -> dict[str, Any]:
     return {key: item for key, item in value.items() if key != "base"}
 
 
-def preview(
-    repo_root: Path | str, *, base: Path | None = None, now: float | None = None
+# Single-flight coordinator for the expensive footprint walk. EVERY entry
+# point that runs the measurement (``preview`` and ``quarantine``) goes through
+# here, so no call path can run the walk without a finite deadline and repeated
+# timed-out previews can never stack N concurrent filesystem walks -- each
+# holding its own SQLite connection -- and drive unbounded disk I/O. At most one
+# measurement runs per (repository, base, as-of) key: a second caller ATTACHES
+# to the running walk instead of starting another, which bounds the work itself
+# rather than only the caller's wait. The per-file walk lives in
+# ``worktree_storage`` and is measured off the request thread exactly as the
+# already-bounded ``storage_observability`` snapshot does.
+_measure_lock = threading.Lock()
+_measurements: dict[Any, "_Measurement"] = {}
+
+
+class _Measurement:
+    __slots__ = ("done", "value", "error", "succeeded")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.value: Any = None
+        self.error: Exception | None = None
+        # Set True ONLY when ``fn()`` returns a value. Completion (``done``) plus
+        # a falsy ``error`` is NOT proof of success: a control-flow BaseException
+        # propagates out of the worker leaving ``error`` None, and the finally
+        # still sets ``done``. Keying success on this explicit flag -- never on
+        # ``error is None`` -- makes a failed measurement impossible to represent
+        # as a ``(value, True)`` success by any path (see _measure_within_deadline).
+        self.succeeded = False
+
+
+def _require_finite(
+    value: Any,
+    error_code: str,
+    *,
+    minimum: float | None = None,
+    minimum_exclusive: bool = False,
+    maximum: float | None = None,
+) -> float:
+    """The single gate every externally-supplied numeric input to this module
+    passes through -- the preview/quarantine ``deadline_seconds`` and the as-of
+    ``now`` alike -- so no rejection path can leak a raw ``ValueError`` or
+    ``OverflowError`` and no bad value can silently degenerate a bound or the
+    single-flight dedup key.
+
+    ``value`` is rejected with ``StorageRetentionError(error_code)`` when it is:
+
+    * non-numeric or otherwise unconvertible -- ``float()`` raises ``TypeError``
+      or ``ValueError``, or ``OverflowError`` for an integer too large to
+      represent as a float;
+    * NaN or infinite -- a NaN in particular compares unequal to itself, so a
+      NaN ``now`` would hand every caller a distinct ``_measure_key`` and defeat
+      the single-flight dedup, letting concurrent previews each start their own
+      footprint walk (the exact availability failure this module prevents);
+    * outside its permitted range -- below ``minimum`` (or equal to it when
+      ``minimum_exclusive``), or above ``maximum`` -- because a bound a caller
+      can push past what the wait's C timeout can represent is not a bound.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise StorageRetentionError(error_code) from None
+    if not math.isfinite(number):
+        raise StorageRetentionError(error_code)
+    if minimum is not None and (
+        number < minimum or (minimum_exclusive and number == minimum)
+    ):
+        raise StorageRetentionError(error_code)
+    if maximum is not None and number > maximum:
+        raise StorageRetentionError(error_code)
+    return number
+
+
+def _resolve_deadline(deadline_seconds: float | None) -> float:
+    """Return the validated wall-clock bound, which no argument can switch off.
+
+    ``None`` selects :data:`PREVIEW_DEADLINE_SECONDS`. Any explicit value goes
+    through :func:`_require_finite`, so it must be finite, strictly positive,
+    and no greater than :data:`MAX_DEADLINE_SECONDS`: ``float('inf')`` would make
+    ``threading.Event.wait`` block forever; NaN or a non-positive value
+    degenerates the bound; and an absurd-but-finite value like ``1e300`` passes
+    ``math.isfinite`` yet overflows the wait's C timeout and raises
+    ``OverflowError`` -- each silently defeating the documented ceiling. A bound
+    an argument can disable (or crash the wait with) is not a bound, so those
+    are rejected rather than clamped.
+    """
+    if deadline_seconds is None:
+        return PREVIEW_DEADLINE_SECONDS
+    return _require_finite(
+        deadline_seconds,
+        "retention_deadline_invalid",
+        minimum=0.0,
+        minimum_exclusive=True,
+        maximum=MAX_DEADLINE_SECONDS,
+    )
+
+
+def _resolve_now(now: float | None) -> float | None:
+    """Validate a caller-supplied as-of ``now`` through the same gate as the
+    deadline. ``None`` means "measure against the live clock" and passes through
+    untouched; any explicit value must be finite and numeric. NaN is rejected
+    here rather than deeper in :func:`_measure_key`, where it would compare
+    unequal to itself and give every caller a distinct single-flight key.
+    """
+    if now is None:
+        return None
+    return _require_finite(now, "retention_now_invalid")
+
+
+def _measure_worker(key: Any, measurement: "_Measurement", fn: Any) -> None:
+    try:
+        measurement.value = fn()
+        # Reached only on a genuine return: this is the ONE place success is
+        # recorded, so no failure path can leave the measurement looking complete
+        # and successful at once.
+        measurement.succeeded = True
+    except Exception as exc:  # noqa: BLE001 -- re-raised on the caller below
+        # Ordinary errors are captured for precise re-raise. SystemExit,
+        # KeyboardInterrupt and GeneratorExit derive from BaseException, not
+        # Exception, so they propagate out of this worker thread instead of being
+        # stored -- but ``succeeded`` stays False, so the caller still surfaces a
+        # measurement-failed error rather than a ``(None, True)`` partial success.
+        measurement.error = exc
+    finally:
+        # Set the completion event BEFORE evicting the single-flight key. Popping
+        # first would leave a window in which the entry is gone but ``done`` is
+        # not yet set; a concurrent caller arriving there would find no entry,
+        # miss this just-finished result, and launch a duplicate filesystem walk
+        # -- the exact availability failure this single-flight exists to prevent,
+        # arriving through a race. With ``done`` set first, any caller that still
+        # sees the entry attaches to the finished measurement instead.
+        measurement.done.set()
+        with _measure_lock:
+            if _measurements.get(key) is measurement:
+                _measurements.pop(key, None)
+
+
+def _measure_within_deadline(
+    key: Any, fn: Any, deadline_seconds: float
+) -> tuple[Any, bool]:
+    """Run ``fn`` under a shared single-flight walk; return ``(value, True)`` if
+    it finishes within ``deadline_seconds``, else ``(None, False)``.
+
+    Concurrent or repeated callers for the same ``key`` attach to ONE running
+    daemon walk instead of each starting their own, so a stalled measurement can
+    never be amplified into stacked threads and stacked disk I/O. The caller is
+    released at the deadline even while the walk is still running (matching the
+    bounded snapshot path). An ``(None, False)`` result is returned ONLY once the
+    walk is confirmed still in flight -- an honest "still measuring" partial, not
+    a failure. If the walk has already raised by the time the caller is released,
+    that exception is re-raised here rather than being silently discarded and
+    presented as an incomplete ``ok: True`` success. A walk that finished without
+    producing a value (``succeeded`` False -- e.g. a control-flow BaseException
+    tore the worker down, leaving ``error`` None) is likewise raised as a
+    measurement failure, never returned as ``(None, True)``.
+    """
+    with _measure_lock:
+        measurement = _measurements.get(key)
+        start = measurement is None
+        if start:
+            measurement = _Measurement()
+            _measurements[key] = measurement
+
+    if start:
+        threading.Thread(
+            target=_measure_worker,
+            args=(key, measurement, fn),
+            daemon=True,
+            name="aiworkhub-retention-preview",
+        ).start()
+
+    finished = measurement.done.wait(deadline_seconds)
+    if not finished and not measurement.done.is_set():
+        # Genuinely still walking: an honest incomplete result, never a failure
+        # dressed as one -- no error has occurred yet at this point.
+        return None, False
+    # Finished within the deadline, or completed in the instant between the wait
+    # timing out and this check. Either way surface a real error so a genuine
+    # failure is never reported as a partial success.
+    if measurement.error is not None:
+        raise measurement.error
+    if not measurement.succeeded:
+        # Completed (``done`` set) but produced no value: a control-flow
+        # BaseException propagated out of the worker, leaving ``error`` None. That
+        # is a FAILED measurement, not a slow one -- raise rather than hand back a
+        # ``(None, True)`` success that would crash preview with an AttributeError.
+        raise StorageRetentionError("retention_measurement_failed")
+    return measurement.value, True
+
+
+def _measure_key(root: Path, base: Path, now: float | None) -> tuple[str, str, float | None]:
+    """The single-flight identity of one footprint measurement. ``now`` is part
+    of the key so a synthetic as-of injected by one caller can never be served
+    to another caller measuring the live clock."""
+    return (str(root), str(base), None if now is None else float(now))
+
+
+def _incomplete_preview(
+    repo_root: Path, deadline_seconds: float, unmeasured: list[str]
 ) -> dict[str, Any]:
+    """A bounded fail-safe when the on-disk measurement cannot finish in time.
+
+    A partial scan must never be published as a completed footprint: reporting
+    a smaller number than reality would invite an operator to quarantine on
+    incomplete evidence. Every measured byte/candidate field is therefore
+    withheld (``None``/empty), no actionable preview digest is emitted, and the
+    result is explicitly labelled ``complete=False`` naming exactly which
+    measurements did not finish.
+
+    The response keeps the SAME keys the complete payload always emits, so a
+    caller parses one schema whether or not the deadline was hit. The cheap
+    policy fields need no filesystem walk and carry their real values; every
+    field that depends on the unfinished walk -- ``footprint``,
+    ``registration_health`` and every measured byte/candidate/pinned field -- is
+    present but explicitly ``None``/empty and named in ``unmeasured`` rather than
+    being absent (which would silently change the response shape).
+    """
+    policy_days, max_bytes = _policy(repo_root)
+    # Every response field whose value depends on the unfinished walk is both
+    # withheld (None/empty) below AND named here, so the docstring's promise --
+    # a partial scan names exactly what it could not measure -- holds literally
+    # rather than for only two of the fields.
+    withheld_fields = {
+        "current_bytes",
+        "worktree_current_bytes",
+        "footprint",
+        "projected_bytes",
+        "candidate_count",
+        "candidate_bytes",
+        "protected_count",
+        "candidates",
+        "protected",
+        "pinned_predecessor_bytes",
+        "pinned_predecessors",
+        "registration_health",
+        "preview_digest",
+    }
+    return {
+        # ``ok`` tracks ``complete`` so a consumer keying on ``ok`` alone can never
+        # read a partial measurement as a whole one: a completed footprint is
+        # ``ok=True/complete=True``; an unfinished one is ``ok=False/complete=False``
+        # (distinguished from a hard error by ``incomplete=True``).
+        "ok": False,
+        "schema_id": SCHEMA_ID,
+        "dry_run": True,
+        "complete": False,
+        "incomplete": True,
+        "repository_scoped": True,
+        "incomplete_reason": "measurement_deadline_exceeded",
+        "unmeasured": sorted(set(unmeasured) | withheld_fields),
+        "deadline_seconds": deadline_seconds,
+        "policy_days": policy_days,
+        "max_bytes": max_bytes,
+        "current_bytes": None,
+        "worktree_current_bytes": None,
+        "footprint": None,
+        "projected_bytes": None,
+        "candidate_count": None,
+        "candidate_bytes": None,
+        "protected_count": None,
+        "candidates": [],
+        "protected": [],
+        # Pinned-predecessor accounting depends on the same unfinished walk (the
+        # worktree sizes), so it is withheld here rather than reported as zero --
+        # a partial scan must never publish a smaller pinned figure as complete.
+        "pinned_predecessor_bytes": None,
+        "pinned_predecessors": [],
+        "registration_health": None,
+        "preview_digest": "",
+    }
+
+
+def preview(
+    repo_root: Path | str,
+    *,
+    base: Path | None = None,
+    now: float | None = None,
+    deadline_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Bounded, read-only repository-scoped reclaim preview.
+
+    The full footprint measurement runs under a wall-clock deadline
+    (:data:`PREVIEW_DEADLINE_SECONDS` unless overridden) so this never blocks a
+    caller to its own request timeout the way the unbounded path did on a
+    Windows repository with hundreds of worktrees. If the deadline is exceeded
+    the result is labelled incomplete (see :func:`_incomplete_preview`) rather
+    than reporting a truncated -- and therefore smaller -- footprint.
+    """
     root = Path(repo_root).resolve()
     worktree_base = (base or configured_worktree_root(root)).resolve()
-    return _public_preview(_preview_payload(root, worktree_base, now=now))
+    now = _resolve_now(now)
+    deadline = _resolve_deadline(deadline_seconds)
+    payload, complete = _measure_within_deadline(
+        _measure_key(root, worktree_base, now),
+        lambda: _preview_payload(root, worktree_base, now=now),
+        deadline,
+    )
+    if not complete:
+        return _incomplete_preview(
+            root, deadline, ["worktree_footprint_scan", "reclaim_candidates"]
+        )
+    return _public_preview(payload)
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -437,7 +862,20 @@ def quarantine(
         raise StorageRetentionError("explicit_confirmation_required")
     root = Path(repo_root).resolve()
     worktree_base = (base or configured_worktree_root(root)).resolve()
-    current = _preview_payload(root, worktree_base, now=now)
+    now = _resolve_now(now)
+    # The quarantine action re-runs the SAME footprint measurement to reconfirm
+    # the digest, so it acquires the IDENTICAL wall-clock bound and single-flight
+    # walk as ``preview`` -- otherwise the dashboard's quarantine button would
+    # still hang on the exact slow worktree walk this bound exists to cap. If the
+    # measurement cannot finish in time we refuse rather than block: a write must
+    # never proceed on an unverified footprint.
+    current, complete = _measure_within_deadline(
+        _measure_key(root, worktree_base, now),
+        lambda: _preview_payload(root, worktree_base, now=now),
+        _resolve_deadline(None),
+    )
+    if not complete:
+        raise StorageRetentionError("retention_measurement_incomplete")
     if preview_digest != current["preview_digest"]:
         raise StorageRetentionError("retention_preview_stale")
     if not current["candidates"]:
