@@ -3746,9 +3746,18 @@ function renderLiveOutput(payload) {
     return;
   }
   if (info.ok === false) {
-    const reason = info.reason ? `: ${String(info.reason)}` : "";
-    elements.detailLiveOutputState.textContent = `${info.error || "output_unavailable"}${reason}`;
-    elements.detailLiveOutputState.className = "validation-label fail";
+    // "Not there yet" is a transient state, not a terminal error: a task's
+    // live-output file often does not exist until the worker starts streaming
+    // (output_unavailable / no_process_log_record_for_task on a just-launched
+    // task). Show an honest, neutral waiting message -- never the red "fail"
+    // terminal error -- and re-arm the poll chain so streamed output appears
+    // on its own, with no manual re-selection. The re-arm here is the second
+    // terminal outcome of the chain: it must schedule the next poll exactly as
+    // the success path does.
+    const detail = info.reason ? ` (${String(info.reason)})` : "";
+    elements.detailLiveOutputState.textContent = `Waiting for output${detail}...`;
+    elements.detailLiveOutputState.className = "validation-label";
+    scheduleNextLiveOutputPoll(taskId);
     return;
   }
 
@@ -3782,6 +3791,11 @@ if (typeof globalThis !== "undefined") {
     appendLiveOutputText,
     startLiveOutputPolling,
     renderLiveOutput,
+    scheduleNextLiveOutputPoll,
+    requestTaskDetail,
+    clearTaskDetail,
+    applyTaskDetail,
+    renderTaskDetail,
   };
 }
 
@@ -3818,6 +3832,32 @@ function requestTaskDetail(taskId) {
   elements.detailLoading.hidden = false;
   vscode.postMessage({ type: "selectTask", taskId });
   startLiveOutputPolling(taskId);
+}
+
+// Route a taskDetail reply, dropping any that lost its race. state.selectedTaskId
+// is the identity of the current in-flight request: it advances on every
+// requestTaskDetail and is cleared by clearTaskDetail -- for example when a
+// snapshot from another window archives the selected task while its detail call
+// is still outstanding. A reply whose task identity no longer matches the
+// current selection (or that arrives with nothing selected) is stale, so it is
+// dropped before it can render. That keeps a cleared panel cleared and stops the
+// Archive/Restore controls -- bound from renderTaskDetail -- from ever pointing
+// at a phantom task no longer in the snapshot. This mirrors renderLiveOutput's
+// own liveOutputTaskId guard for the sibling poll reply.
+function applyTaskDetail(payload) {
+  const data = payload && typeof payload === "object" ? payload : {};
+  const card = data.task && typeof data.task === "object" ? data.task : {};
+  const replyTaskId = String(card.task_id || data.task_id || "");
+  if (!state.selectedTaskId || (replyTaskId !== "" && replyTaskId !== state.selectedTaskId)) {
+    return;
+  }
+  if (data.ok === false) {
+    elements.detailLoading.hidden = true;
+    elements.detailError.textContent = data.error || "Task detail unavailable";
+    elements.detailError.hidden = false;
+    return;
+  }
+  renderTaskDetail(card);
 }
 
 const FEATURE_LABELS = Object.freeze({
@@ -3981,17 +4021,9 @@ window.addEventListener("message", (event) => {
     case "snapshot":
       renderSnapshot(message.payload);
       break;
-    case "taskDetail": {
-      const payload = message.payload;
-      if (!payload || payload.ok === false) {
-        elements.detailLoading.hidden = true;
-        elements.detailError.textContent = (payload && payload.error) || "Task detail unavailable";
-        elements.detailError.hidden = false;
-        break;
-      }
-      renderTaskDetail(payload.task || {});
+    case "taskDetail":
+      applyTaskDetail(message.payload);
       break;
-    }
     case "offline":
       showOffline(message.reason);
       break;
