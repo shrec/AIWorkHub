@@ -3479,11 +3479,25 @@ class WorkerSemanticEditSession:
             or len(idempotency_key.encode("utf-8")) > 256
         ):
             return _violation(self.ctx, tool, "semantic_edit_apply_input_invalid")
+        new_sha256 = hashlib.sha256(new.encode("utf-8")).hexdigest()
         with self._lock:
             existing = self._receipts.get(idempotency_key)
             target = self._targets.get(target_id)
         if existing is not None:
-            return {**existing, "idempotent_replay": True}
+            # A replay is the SAME operation only when it names the same
+            # prepared target AND the identical replacement bytes.  The cache
+            # is keyed on idempotency_key alone, so a reused key that points at
+            # a different target_id or different content is a caller error --
+            # refuse it explicitly instead of silently discarding the new edit
+            # and answering with the first call's receipt for a different file.
+            if (
+                existing["target_id"] != target_id
+                or existing["new_sha256"] != new_sha256
+            ):
+                return _violation(
+                    self.ctx, tool, "semantic_edit_idempotency_key_conflict"
+                )
+            return {**existing["receipt"], "idempotent_replay": True}
         if target is None:
             return _violation(self.ctx, tool, "semantic_edit_target_unknown")
         try:
@@ -3503,6 +3517,11 @@ class WorkerSemanticEditSession:
                     f"semantic_edit_stale_fragment:{target.path}"
                 )
             file_path = semantic_edit.resolve_existing_file(self.ctx.repo, target.path)
+            # ``mkstemp`` creates the temp file 0600 and ``os.replace`` carries
+            # that mode onto the destination, so capture the file's real mode
+            # first and restore it after the swap -- otherwise every apply
+            # silently rewrites e.g. an executable 0755 script down to 0600.
+            original_mode = os.stat(file_path).st_mode & 0o7777
             _data, current_text = semantic_edit.read_utf8_file(file_path, target.path)
             next_text, metrics = semantic_edit.apply_line_ranges(
                 current_text,
@@ -3521,6 +3540,15 @@ class WorkerSemanticEditSession:
                     os.fsync(handle.fileno())
                 os.close(fd)
                 fd = -1
+                if original_mode != 0o600:
+                    # Restore the destination's real mode (mkstemp made the
+                    # temp 0600).  Best effort: some sandboxed filesystems
+                    # forbid chmod, and the content edit must still land
+                    # atomically even when the mode cannot be carried across.
+                    try:
+                        os.chmod(temp_name, original_mode)
+                    except OSError:
+                        pass
                 os.replace(temp_name, file_path)
             finally:
                 if fd >= 0:
@@ -3545,9 +3573,19 @@ class WorkerSemanticEditSession:
             "file_bytes": target.file_bytes,
             **metrics,
         }
-        with self._lock:
-            self._receipts[idempotency_key] = receipt
-        _append_audit(
+        # The authenticated audit record is part of the apply contract, not a
+        # fire-and-forget side effect: process_launcher counts semantic-edit
+        # runtime evidence from these ledger receipts, so an apply whose record
+        # could not be written must fail closed rather than report ok: True for
+        # a change acceptance can never observe.  This mirrors
+        # quality_review_submit's own fail-closed durability contract.  A ctx
+        # with no ledger bound leaves audit intentionally disabled (the append
+        # is a no-op returning False) and is not a durability failure.
+        audit_configured = (
+            self.ctx.audit_ledger_path is not None
+            and self.ctx.audit_hmac_key_path is not None
+        )
+        appended = _append_audit(
             self.ctx,
             tool=tool,
             ok=True,
@@ -3558,6 +3596,23 @@ class WorkerSemanticEditSession:
             authority_state="deterministic_apply",
             payload=receipt,
         )
+        if audit_configured and not appended:
+            return {
+                "ok": False,
+                "tool": tool,
+                "reason": "semantic_edit_apply_not_durable",
+                "target_id": target_id,
+                "path": target.path,
+            }
+        # Only cache a receipt the ledger actually recorded (or that needed no
+        # ledger); caching a non-durable apply would let a same-key retry
+        # replay a success the ledger never authenticated.
+        with self._lock:
+            self._receipts[idempotency_key] = {
+                "receipt": receipt,
+                "target_id": target_id,
+                "new_sha256": new_sha256,
+            }
         return receipt
 
 

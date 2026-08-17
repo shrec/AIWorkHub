@@ -109,13 +109,19 @@ def test_worker_semantic_edit_is_hash_bound_atomic_and_idempotent(tmp_path: Path
     assert result["file_bytes"] == len("before\ndef target():\n    return 1\nafter\n".encode())
     assert target.read_text(encoding="utf-8") == "before\ndef target():\n    return 2\nafter\n"
 
+    # The idempotency contract requires an identical repeat: same key, same
+    # target AND the same replacement bytes.  A true retry replays the first
+    # receipt without rewriting the file.  (Before the SCAN-E3FF fix a replay
+    # was matched on the key alone, so this call passed "ignored on replay"
+    # and asserted the differing content was silently discarded.)
     replay = session.apply(
         target_id=prepared["target_id"],
-        new="ignored on replay",
+        new="def target():\n    return 2",
         idempotency_key="edit-1",
     )
     assert replay["idempotent_replay"] is True
     assert replay["after_sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
+    assert target.read_text(encoding="utf-8") == "before\ndef target():\n    return 2\nafter\n"
 
 
 def test_worker_semantic_edit_rejects_stale_and_out_of_scope(tmp_path: Path) -> None:
