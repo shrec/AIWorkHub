@@ -1,5 +1,24 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.79 — 2026-08-17
+
+### Fixed
+
+- **A card that changed a generated file could never be reviewed.** If a change
+  touched an eval artifact, a fixture, or anything else Source Graph deliberately
+  does not index, the reviewer never started — the launch reported success and
+  then nothing happened, so the work could never be accepted however complete it
+  was. Prewarm now skips a deliberately excluded path and the reviewer still
+  runs, working from the sealed review packet, which already carries the
+  candidate content. A genuine indexing failure on a file that should be
+  indexable is still refused loudly.
+- **The storage retention preview could not finish measuring.** It timed out
+  after 90 seconds with nothing measured, so no cleanup candidate was ever
+  produced and the footprint only grew. On a 29 GB repository it now completes in
+  under nine seconds and reports what is actually reclaimable. A preview that
+  does hit its deadline now shows the candidates it did establish, marked
+  partial, instead of an empty list that looked like a clean repository.
+
 ## 0.9.78 — 2026-08-16
 
 ### Fixed

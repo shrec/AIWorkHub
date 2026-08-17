@@ -12,6 +12,21 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.79
+
+- **A card that changed a generated file could never be reviewed.** If a change
+  touched an eval artifact or anything else Source Graph deliberately does not
+  index, the reviewer never started — the launch reported success and then
+  nothing happened. Prewarm now skips such a path and the reviewer still runs
+  from the sealed review packet. A genuine indexing failure is still refused
+  loudly.
+- **The storage retention preview could not finish measuring.** It timed out
+  after 90 seconds with nothing measured, so no cleanup candidate was ever
+  produced. On a 29 GB repository it now completes in under nine seconds and
+  reports what is actually reclaimable.
+
+See the packaged **Changelog** for the complete release summary.
+
 ## What's new in 0.9.78
 
 - **On macOS, process identity did not exist.** A pid alone is not an identity —

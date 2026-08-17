@@ -6,6 +6,48 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.79] - 2026-08-17
+
+### Fixed
+
+- **A card that changed a file Source Graph deliberately does not index could
+  never be reviewed, and therefore never accepted.** The reviewer's candidate
+  prewarm walked every changed path and raised when one was excluded by the index
+  glob, so the reviewer process never launched — the launch returned `ok: true`
+  and then nothing happened. Any change touching an eval artifact, a fixture or
+  any generated file became permanently unreviewable however complete it was.
+
+  An excluded file is not an error. Prewarm is an optimisation that makes the
+  reviewer's queries fast; the sealed review packet already carries the candidate
+  content. Prewarm now skips a deliberately excluded path, records the skip and
+  its reason, and the reviewer still launches. When every changed path is
+  excluded the reviewer still launches and records that it worked from the packet
+  alone.
+
+  A genuine indexing failure on a file that should be indexable is still refused
+  loudly, and the classifier that separates the two reads the structured error
+  rather than prose. The message is `<prefix>:<type_name>:<code>:<detail>` and the
+  verdict is anchored to those fields: tolerance requires the type slot to be
+  exactly `SourceGraphError` and the code slot to equal an allowlisted exclusion
+  code. Everything after the second colon is the worker-influenced detail — it can
+  embed the candidate path, including a literal `SourceGraphError:…excluded_glob`
+  — and is never consulted, so it cannot forge a tolerated verdict. Both forgery
+  directions are pinned by regression tests.
+
+- **Retention could not finish measuring what to reclaim.** The storage retention
+  preview returned `measurement_deadline_exceeded` after 90 seconds with
+  candidates, footprint and protected all unmeasured. It was not missing: it
+  could not finish, so no candidate was ever produced, so nothing was ever
+  quarantined, so the footprint grew and the next measurement was slower still.
+  Measured on a live 162-worktree, 29 GB tree, the preview went from a 90-second
+  deadline overrun to **8.9 seconds complete**, returning **36 candidates holding
+  4.9 GB** with 13 protected. The deadline was not raised.
+
+  A partial measurement no longer reads as a clean repository: a preview that
+  hits its deadline returns the candidates it did establish, marked partial with
+  what was not covered — and that now holds for every caller of a shared
+  single-flight measurement, not only the one that started the walk.
+
 ## [0.9.78] - 2026-08-16
 
 ### Fixed
