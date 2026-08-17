@@ -51,6 +51,90 @@ def _tree_size(path: Path) -> tuple[int, int]:
     return total, files
 
 
+def _storage_bounds(
+    *,
+    pinned_predecessor_bytes: int,
+    worktree_current_bytes: int,
+    terminal_unclaimed_count: int,
+    terminal_unclaimed_bytes: int,
+    terminal_empty_eligible_count: int,
+) -> dict[str, Any]:
+    """The report every accumulating store must answer: what bounds it, what
+    happens when the bound is reached, and what an operator does when the
+    automatic path cannot act. A store that cannot answer all three is
+    unbounded -- and unbounded is what put 31 GB on this disk.
+    """
+    return {
+        "worktrees": {
+            "bounds": "retention age (terminal_runs_days) and the worktree_max_bytes cap",
+            "at_bound": (
+                "aged, unprotected, provably-owned worktrees enter reversible "
+                "quarantine; over the cap, the oldest superseded ones are forced first"
+            ),
+            "operator_action": (
+                "storage_retention.recover_stranded_worktrees() re-registers or "
+                "reclaims stranded worktrees the automatic path cannot attribute"
+            ),
+            # In-flight rework lineage (NF-2026-00286 owns the 989 half-archived
+            # rows) is pinned and never evicted; once those pins release the pinned
+            # bytes become reclaimable, so the worktree footprint falls to this.
+            "pinned_predecessor_bytes": int(pinned_predecessor_bytes),
+            "projected_bytes_after_pins_release": max(
+                0, int(worktree_current_bytes) - int(pinned_predecessor_bytes)
+            ),
+        },
+        "terminal_log_quarantine": {
+            "bounds": "7-day undo window per batch, then purge",
+            "at_bound": (
+                "an expired batch is purged by enforce; an empty batch is surfaced "
+                "purge_eligible for the operator; a record-empty batch still holding "
+                "bytes is flagged unclaimed and keeps its window"
+            ),
+            "operator_action": (
+                "terminal_log_retention.purge_empty_batches() collects the empty "
+                "batches; terminal_log_retention.reconcile_unclaimed() adopts "
+                "directories no record claims into a bounded batch"
+            ),
+            "unclaimed_batch_count": int(terminal_unclaimed_count),
+            "unclaimed_bytes": int(terminal_unclaimed_bytes),
+            "empty_purge_eligible_count": int(terminal_empty_eligible_count),
+        },
+        "process_logs": {
+            "bounds": (
+                f"{terminal_log_retention.MAX_PROCESS_LOG_FILE_BYTES} bytes per worker "
+                "log file, plus age-based quarantine of the per-request set"
+            ),
+            "at_bound": (
+                "a terminal run's oversized log is tail-capped (head released, "
+                "diagnostic tail kept); a live run is never touched"
+            ),
+            "operator_action": (
+                "terminal_log_retention.enforce_process_log_bounds() runs the bound "
+                "on demand; a still-live oversized log clears once its run ends"
+            ),
+        },
+        "attempt_artifacts": {
+            "bounds": "retention age (logs_days) once the owning run is terminal",
+            "at_bound": "the aged bundle is moved into a reversible quarantine batch",
+            "operator_action": (
+                "terminal_log_retention.enforce_process_log_bounds(); a bundle whose "
+                "run is not terminal is protected until the run ends"
+            ),
+        },
+        "runtime_generations": {
+            # globalStorage-scoped (outside this repository's .aiworkhub), so it is
+            # bounded by the VS Code extension's operator-invoked action, not here.
+            "bounds": "current + latest three generations kept; older ones are obsolete",
+            "at_bound": "obsolete lease-free generations become quarantine-eligible",
+            "operator_action": (
+                "the dashboard 'Quarantine Runtimes' action (runRuntimeCleanup) moves "
+                "them into 7-day quarantine; it is operator-invoked because a live "
+                "window lease can still pin a generation and consent proves it is free"
+            ),
+        },
+    }
+
+
 def _measure(repo_root: Path) -> dict[str, Any]:
     repo_bytes, repo_files = _tree_size(repo_root / ".aiworkhub")
     components: list[dict[str, Any]] = []
@@ -111,6 +195,7 @@ def _measure(repo_root: Path) -> dict[str, Any]:
     except storage_retention.StorageRetentionError:
         quarantine_batches = []
     quarantine_bytes = sum(int(item.get("bytes") or 0) for item in quarantine_batches)
+    pinned_predecessor_bytes = int(cleanup.get("pinned_predecessor_bytes") or 0)
     try:
         terminal_logs = terminal_log_retention.preview(repo_root, include_candidates=False)
         terminal_log_batches = terminal_log_retention.list_batches(repo_root).get("batches") or []
@@ -176,6 +261,29 @@ def _measure(repo_root: Path) -> dict[str, Any]:
         "terminal_log_quarantine_batches": terminal_log_batches,
         "task_retention": archived_tasks,
         "task_retention_batches": task_retention_batches,
+        # Every accumulating store's bound, what happens at the bound, and the
+        # operator action when the automatic path cannot act (see _storage_bounds).
+        "storage_bounds": _storage_bounds(
+            pinned_predecessor_bytes=pinned_predecessor_bytes,
+            worktree_current_bytes=worker_bytes,
+            terminal_unclaimed_count=sum(
+                1 for item in terminal_log_batches if item.get("unclaimed")
+            ),
+            terminal_unclaimed_bytes=sum(
+                int(item.get("on_disk_bytes") or 0)
+                for item in terminal_log_batches
+                if item.get("unclaimed")
+            ),
+            # Count exactly what ``purge_empty_batches`` -- the trigger named
+            # beside this figure -- will actually reap: batches empty in BOTH
+            # record and on disk (``reapable_empty``). Summing ``purge_eligible``
+            # instead would also count expired-but-still-full batches that the
+            # named collector never takes, promising an operator more than it
+            # drains -- the false-clean shape this release has been removing.
+            terminal_empty_eligible_count=sum(
+                1 for item in terminal_log_batches if item.get("reapable_empty")
+            ),
+        ),
         "errors": [],
     }
 

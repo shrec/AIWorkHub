@@ -47,6 +47,28 @@ MAX_LEDGER_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 DEFAULT_PREVIEW_LIMIT = 50
 MAX_PREVIEW_LIMIT = 200
+# Directory a launcher writes one per-request validation/attempt bundle into,
+# nested inside the same processes root as the owned per-request log files (see
+# process_launcher: ``process_dir / "attempt-artifacts" / request_id``). It had
+# no retention in any module; it is bounded here by the same terminal+age gate
+# the per-request logs use.
+ATTEMPT_ARTIFACTS_DIRNAME = "attempt-artifacts"
+# Per-file ceiling for an individual worker stdout/stderr log. The writer
+# (process_launcher) applies no size cap, and single runs have been observed at
+# 26 MiB, so a directory nothing prunes grows without bound one file at a time.
+# This is the retention-side bound: once a run has reached a terminal state, an
+# oversized log is tail-capped to its last ``MAX_PROCESS_LOG_FILE_BYTES`` -- the
+# exact window the launcher itself reads to diagnose a failure (``_safe_tail``),
+# so the tail an operator needs is always kept while the unbounded head is
+# released. A live or non-terminal run is never touched (fail closed).
+MAX_PROCESS_LOG_FILE_BYTES = 4 * 1024 * 1024
+# Written verbatim at the head of a tail-capped file so the truncation is
+# explicit and the remaining bytes can never be mistaken for the whole run.
+_TAIL_CAP_NOTICE = (
+    b"[aiworkhub-retention] earlier output released by the per-file log bound; "
+    b"the diagnostic tail is preserved below.\n"
+)
+_BOUNDABLE_LOG_SUFFIXES = (".stdout.log", ".stderr.log")
 
 _REQUEST_RE = re.compile(r"^[a-f0-9]{32}$")
 _BATCH_RE = re.compile(r"^l[0-9]{8}T[0-9]{6}-[a-f0-9]{12}$")
@@ -657,13 +679,15 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
     manifest["quarantined_files"] = moved_files
     manifest["quarantined_bytes"] = moved_bytes
     _atomic_json(manifest_path, manifest)
-    if _batch_is_empty(manifest):
+    if _batch_reapable_empty(manifest, batch):
         # The eligible population changed between the digest snapshot and this
         # apply (typically a concurrent sweep in another process moved the
         # files first).  An empty batch holds nothing to restore, so its
         # seven-day undo window protects nothing while the entry sits on the
         # storage panel forever, shape-identical to a real batch.  Reap it now
-        # instead of accumulating operator-visible noise.
+        # instead of accumulating operator-visible noise -- but only when the
+        # directory is also physically empty, so a batch that unexpectedly holds
+        # files is never rmtree'd here on a record that says it is empty.
         shutil.rmtree(batch, ignore_errors=True)
         _append_audit(root, {"schema_id": AUDIT_SCHEMA_ID, "timestamp": now_utc().isoformat(), "action": "quarantine_empty_reaped", "batch_id": batch_id, "files": 0, "bytes": 0})
         return {"ok": True, "batch_id": "", "quarantined": 0, "bytes": 0, "no_op": True}
@@ -689,6 +713,14 @@ def list_batches(repo_root: Path | str) -> dict[str, Any]:
         legacy = value.get("legacy_store")
         if isinstance(legacy, dict):
             states.append(legacy.get("state"))
+        # The truthful on-disk size, so a batch whose manifest under-records what
+        # it physically holds (the stranded-3.68 GB shape) reports its real bytes
+        # and can never read as "0 bytes, nothing here" while gigabytes sit in it.
+        # One walk yields both the byte total and the presence flag.
+        payload_bytes, has_payload = _batch_payload_summary(entry)
+        recorded_bytes = int(value.get("quarantined_bytes") or 0)
+        record_empty = _batch_is_empty(value)
+        unclaimed = record_empty and has_payload
         rows.append({
             "batch_id": entry.name,
             "created_at": str(value.get("created_at") or ""),
@@ -696,12 +728,27 @@ def list_batches(repo_root: Path | str) -> dict[str, Any]:
             "status": str(value.get("status") or "unknown"),
             "quarantined_count": states.count("quarantined"),
             "restored_count": states.count("restored"),
-            "bytes": int(value.get("quarantined_bytes") or 0),
-            # A batch is reapable now if its undo window has expired *or* it is
-            # empty (holds nothing to restore).  This mirrors exactly what
-            # ``purge`` will accept, so the storage panel is truthful about the
-            # empty batches an operator may choose to release.
-            "purge_eligible": now_utc() >= deadline or _batch_is_empty(value),
+            "bytes": max(recorded_bytes, payload_bytes),
+            "recorded_bytes": recorded_bytes,
+            "on_disk_bytes": payload_bytes,
+            # A batch whose record says empty while it still physically holds
+            # files is not reclaimable data an operator can drop -- it is an
+            # unreconciled disagreement between record and disk. Surface it so the
+            # panel names it instead of hiding it as "0 bytes".
+            "unclaimed": unclaimed,
+            # A batch is reapable now only if its undo window has expired *or* it
+            # is empty in BOTH its record and on disk.  This mirrors exactly what
+            # ``purge`` accepts, so the storage panel is truthful about the empty
+            # batches an operator may release and never marks an unreconciled
+            # batch (record-empty but holding bytes) as a harmless purge.
+            "purge_eligible": now_utc() >= deadline or (record_empty and not has_payload),
+            # Exactly the batches ``purge_empty_batches`` collects: empty in BOTH
+            # record and on disk (``_batch_reapable_empty``). ``purge_eligible``
+            # also covers expired-but-still-full batches, which that collector
+            # never takes, so an operator count of what it drains must read this
+            # field -- never ``purge_eligible`` -- to avoid promising more than the
+            # named trigger delivers.
+            "reapable_empty": record_empty and not has_payload,
         })
     return {"ok": True, "batches": rows[:100], "count": len(rows[:100])}
 
@@ -780,6 +827,92 @@ def _batch_is_empty(manifest: Mapping[str, Any]) -> bool:
     return True
 
 
+def _batch_payload_summary(batch_path: Path) -> tuple[int, bool]:
+    """One filesystem walk: ``(non-manifest bytes, any non-manifest file present)``.
+
+    The single source of truth for what a batch actually holds on disk, read
+    from the filesystem rather than trusted from the manifest's item states.
+    ``_batch_is_empty`` answers "does the *record* claim anything to restore";
+    this answers "does the *directory* hold anything at all". They can disagree:
+    a batch whose manifest records every item as ``skipped_identity_changed``
+    (record says empty) can still physically hold gigabytes -- exactly the shape
+    that stranded 3.68 GB behind a "status: empty, bytes: 0" record that no purge
+    would ever act on. The presence flag (not the byte total) is authoritative
+    for emptiness, so a zero-byte file still counts as content a restore could
+    return. Symlinks are never followed and never counted. Both facts come from
+    one walk so ``list_batches`` does not re-walk a large batch three times.
+    """
+    total = 0
+    present = False
+    for directory, dirnames, filenames in os.walk(batch_path, followlinks=False):
+        parent = Path(directory)
+        dirnames[:] = [name for name in dirnames if not (parent / name).is_symlink()]
+        for name in filenames:
+            if name == MANIFEST_NAME and parent == batch_path:
+                continue
+            try:
+                info = (parent / name).lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                continue
+            present = True
+            total += int(info.st_size)
+    return total, present
+
+
+def _batch_payload_bytes(batch_path: Path) -> int:
+    """Bytes of real files physically present under a batch, excluding its manifest."""
+    return _batch_payload_summary(batch_path)[0]
+
+
+def _dir_total_bytes(path: Path) -> int:
+    """Total bytes of every regular file under ``path`` (no manifest exclusion).
+
+    Unlike :func:`_batch_payload_bytes`, this makes no assumption that ``path`` is
+    a batch root, so it correctly measures a moved directory whose own content
+    happens to include a file named ``manifest.json``. Symlinks are never
+    followed or counted.
+    """
+    total = 0
+    for directory, dirnames, filenames in os.walk(path, followlinks=False):
+        parent = Path(directory)
+        dirnames[:] = [name for name in dirnames if not (parent / name).is_symlink()]
+        for name in filenames:
+            try:
+                info = (parent / name).lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                continue
+            total += int(info.st_size)
+    return total
+
+
+def _batch_dir_has_payload(batch_path: Path) -> bool:
+    """True when the batch directory physically holds any non-manifest file.
+
+    A batch is safe to treat as empty (reapable before its deadline) only when
+    both its record says empty AND its directory is physically empty; either one
+    holding content keeps the full undo window. This never follows symlinks.
+    """
+    return _batch_payload_summary(batch_path)[1]
+
+
+def _batch_reapable_empty(manifest: Mapping[str, Any], batch_path: Path) -> bool:
+    """A batch is early-reapable only when its record AND its disk are both empty.
+
+    ``_batch_is_empty`` trusts the manifest item states; on their own they let a
+    batch that physically holds files (whose states drifted to
+    ``skipped_identity_changed``) be purged inside its live undo window or be
+    surfaced as ``purge_eligible`` while holding bytes. Requiring the directory
+    to also be physically empty makes the record-versus-disk disagreement
+    impossible to act on destructively: a batch that still holds files keeps its
+    full deadline and is routed to :func:`reconcile_unclaimed` instead.
+    """
+    return _batch_is_empty(manifest) and not _batch_dir_has_payload(batch_path)
+
+
 def purge(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str, Any]:
     if confirm is not True:
         raise TerminalLogRetentionError("explicit_confirmation_required")
@@ -793,14 +926,518 @@ def purge(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str, A
     # The undo window protects every batch that still holds files a restore
     # could return -- items in any state other than ``skipped_identity_changed``
     # (including ``restore_conflict``, whose files are still physically present
-    # and are more likely to be wanted).  Only a genuinely empty batch, which
-    # holds nothing to restore, is reapable before its deadline expires.
-    if now_utc() < deadline and not _batch_is_empty(manifest):
+    # and are more likely to be wanted).  Only a batch that is empty in BOTH its
+    # record and on disk (``_batch_reapable_empty``) holds nothing to restore and
+    # is reapable before its deadline; a batch whose record reads empty while its
+    # directory still holds bytes keeps its full window and is reconciled, never
+    # purged out from under an operator on a stale record.
+    if now_utc() < deadline and not _batch_reapable_empty(manifest, batch):
         raise TerminalLogRetentionError("retention_undo_window_active")
     released = int(manifest.get("quarantined_bytes") or 0)
     shutil.rmtree(batch)
     _append_audit(root, {"schema_id": AUDIT_SCHEMA_ID, "timestamp": now_utc().isoformat(), "action": "purge_completed", "batch_id": batch_id, "bytes": released})
     return {"ok": True, "batch_id": batch_id, "purged": True, "bytes": released}
+
+
+RECONCILE_SCHEMA_ID = "aiworkhub.terminal_log_reconcile.v1"
+
+
+def _scan_unclaimed(root: Path) -> list[dict[str, Any]]:
+    """Quarantine directories that physically hold files no record truthfully claims.
+
+    Ownership is proved by LOCATION, never by name or age: every entry examined
+    is a direct child of this repository's ``_repo_id``-scoped quarantine root, so
+    a directory found here provably belongs to this repository's own store. A
+    directory is unclaimed when it holds bytes on disk yet either has no readable
+    manifest, or has one that records nothing to restore (``_batch_is_empty``) --
+    the exact record-versus-disk disagreement that stranded 3.68 GB behind a
+    "status: empty, bytes: 0" batch. A healthy in-flight or content-bearing batch
+    (its record claims items) is never listed.
+    """
+    qroot = root / QUARANTINE_RELATIVE_PATH
+    results: list[dict[str, Any]] = []
+    try:
+        info = qroot.lstat()
+    except FileNotFoundError:
+        return results
+    except OSError as exc:
+        raise TerminalLogRetentionError("terminal_log_quarantine_root_invalid") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise TerminalLogRetentionError("terminal_log_quarantine_root_invalid")
+    repo_id = _repo_id(root)
+    for entry in sorted(qroot.iterdir()):
+        try:
+            e_info = entry.lstat()
+        except OSError:
+            continue
+        if stat.S_ISLNK(e_info.st_mode) or not stat.S_ISDIR(e_info.st_mode):
+            continue
+        manifest_path = entry / MANIFEST_NAME
+        reason = ""
+        if not _BATCH_RE.fullmatch(entry.name):
+            reason = "not_a_batch_directory"
+        else:
+            try:
+                manifest = _manifest(manifest_path, repo_id)
+            except TerminalLogRetentionError:
+                reason = "manifest_present_unreadable" if manifest_path.exists() else "manifest_absent"
+            else:
+                if not _batch_is_empty(manifest):
+                    continue  # the record claims content: a healthy batch, left alone
+                reason = "record_empty_disk_nonempty"
+        payload = _batch_payload_bytes(entry)
+        if payload <= 0:
+            # An empty directory with no bytes is the empty-batch collector's job
+            # (see ``purge_empty_batches``); reconcile only ever adopts real bytes.
+            continue
+        results.append({"name": entry.name, "path": entry, "bytes": payload, "reason": reason})
+    return results
+
+
+# Test seam: called with the batch directory after each source subtree is moved
+# into a reconcile batch, so a test can observe the batch mid-construction and
+# prove ``_scan_unclaimed`` never adopts a batch that is still being built. None
+# in production; retention never sets it.
+_RECONCILE_MOVE_OBSERVER: Callable[[Path], None] | None = None
+
+
+def _stage_reconcile_batch(
+    root: Path, sources: list[dict[str, Any]], *, action: str
+) -> dict[str, Any]:
+    """Move a set of provably-owned directories into one fresh, bounded batch.
+
+    Each source directory is moved (same-volume ``os.replace``) into a new batch
+    under this repository's quarantine root, and a reconciliation manifest is
+    written that claims exactly what now sits on disk with a fresh
+    :data:`UNDO_DAYS` window. The bytes then flow through the ordinary
+    ``purge``/``enforce`` expiry like any other batch -- nothing is deleted here.
+    Every item is recorded ``state="reconciled"`` so a restore never tries to
+    replay it into ``processes`` (its origin is unknown) yet the batch is never
+    mistaken for empty. Shared by :func:`reconcile_unclaimed` and the
+    attempt-artifacts bound so both adopt strays through one audited path.
+
+    The manifest is written FIRST, exactly as :func:`quarantine` does before its
+    own move loop: every destination subdir is planned, a manifest whose items
+    already claim content (``state="planned"``, so ``_batch_is_empty`` reads
+    False) is written, and only then is the payload moved in. So from the instant
+    the directory can hold bytes it already carries a record that claims them, and
+    a concurrent :func:`reconcile_unclaimed` or :func:`purge_empty_batches` never
+    observes the batch-shaped-directory-with-payload-but-no-claiming-record
+    signature (``manifest_absent`` / ``record_empty_disk_nonempty``) that
+    ``_scan_unclaimed`` adopts. This ordering is safe on its own and does not rely
+    on any caller holding ``_enforcement_lock``.
+    """
+    now = now_utc()
+    seed = json.dumps(
+        [action] + sorted(str(item["name"]) for item in sources),
+        sort_keys=True,
+    ).encode("utf-8")
+    digest = hashlib.sha256(seed).hexdigest()
+    batch_id = f"l{now.strftime('%Y%m%dT%H%M%S')}-{digest[:12]}"
+    qroot = _quarantine_root(root)
+    batch = qroot / batch_id
+    batch.mkdir(mode=0o700)
+    # Plan every destination subdir BEFORE any move so the manifest can claim real
+    # content up front. Collisions are deduplicated against the names already
+    # planned (never against the half-built directory on disk), so planning never
+    # depends on partial filesystem state.
+    used: set[str] = set()
+    items: list[dict[str, Any]] = []
+    plan: list[tuple[Path, dict[str, Any]]] = []
+    for index, source in enumerate(sources):
+        name = str(source["name"])
+        subname = name if (
+            _REQUEST_RE.fullmatch(name) or _BATCH_RE.fullmatch(name)
+        ) else f"reconciled-{index:04d}"
+        if subname in used:
+            subname = f"reconciled-{index:04d}"
+        used.add(subname)
+        item = {
+            "request_id": name if _REQUEST_RE.fullmatch(name) else "",
+            # "planned" keeps ``_batch_is_empty`` False the moment the manifest
+            # lands, so the batch is never adoptable while payload is arriving.
+            "state": "planned",
+            "source_name": name,
+            "subdir": subname,
+            "size_bytes": 0,
+            "reason": str(source.get("reason") or action),
+        }
+        items.append(item)
+        plan.append((Path(source["path"]), item))
+    manifest = {
+        "schema_id": SCHEMA_ID,
+        "repo_id": _repo_id(root),
+        "batch_id": batch_id,
+        "created_at": now.isoformat(),
+        "restore_deadline": (now + timedelta(days=UNDO_DAYS)).isoformat(),
+        "preview_digest": "reconciled",
+        "status": "reconciling",
+        "reconciled": True,
+        "reconcile_action": action,
+        "items": items,
+        "quarantined_files": 0,
+        "quarantined_bytes": 0,
+    }
+    manifest_path = batch / MANIFEST_NAME
+    # Write the claiming manifest before the first move, mirroring ``quarantine``:
+    # the record is non-empty from here on, so no concurrent scan can classify the
+    # batch as an unclaimed directory while its bytes are still being moved in.
+    _atomic_json(manifest_path, manifest)
+    reconciled_bytes = 0
+    moved = 0
+    for src, item in plan:
+        try:
+            s_info = src.lstat()
+        except OSError:
+            item["state"] = "skipped_source_gone"
+            continue
+        # Re-prove identity immediately before the move: still a real directory,
+        # never a symlink.
+        if stat.S_ISLNK(s_info.st_mode) or not stat.S_ISDIR(s_info.st_mode):
+            item["state"] = "skipped_source_gone"
+            continue
+        destination = batch / str(item["subdir"])
+        os.replace(src, destination)
+        moved_bytes = _dir_total_bytes(destination)
+        reconciled_bytes += moved_bytes
+        moved += 1
+        item["state"] = "reconciled"
+        item["size_bytes"] = moved_bytes
+        if _RECONCILE_MOVE_OBSERVER is not None:
+            _RECONCILE_MOVE_OBSERVER(batch)
+    manifest["status"] = "reconciled"
+    manifest["quarantined_files"] = moved
+    manifest["quarantined_bytes"] = reconciled_bytes
+    _atomic_json(manifest_path, manifest)
+    if not moved:
+        # Nothing actually moved (every source vanished under a race). Do not
+        # leave a phantom batch: it is empty in record and on disk, so reap it.
+        shutil.rmtree(batch, ignore_errors=True)
+        return {"batch_id": "", "count": 0, "bytes": 0}
+    return {"batch_id": batch_id, "count": moved, "bytes": reconciled_bytes}
+
+
+def reconcile_unclaimed(
+    repo_root: Path | str, *, confirm: bool = False, reason: str = ""
+) -> dict[str, Any]:
+    """Operator action: bring quarantine directories no record claims back under a bound.
+
+    A batch directory can physically hold files while its manifest records none
+    of them -- every item skipped, or the manifest missing/corrupt. Record and
+    disk disagree, so no purge ever acts on those bytes and they strand forever
+    (3.68 GB in the canonical store). This scans the repository's own terminal-log
+    quarantine root (ownership proved by location, never inferred from a name or
+    an age), and for every directory holding bytes that no record truthfully
+    claims, moves it into a fresh batch with a 7-day undo window so it flows
+    through the ordinary ``purge``/``enforce`` expiry. Nothing is deleted here.
+
+    ``confirm=False`` (default) is a read-only report of what would be
+    reconciled. ``confirm=True`` requires a non-empty ``reason``, performs the
+    reconciliation, and records the reason in the audit log. It is invoked ONLY
+    by an explicit operator call; it never runs on import, on a read, or as a
+    side effect of any preview/snapshot.
+    """
+    root = Path(repo_root).resolve()
+    unclaimed = _scan_unclaimed(root)
+    report: dict[str, Any] = {
+        "ok": True,
+        "schema_id": RECONCILE_SCHEMA_ID,
+        "dry_run": not confirm,
+        "invoked_from": (
+            "terminal_log_retention.reconcile_unclaimed "
+            "(explicit operator action; never on import or as a read side effect)"
+        ),
+        "reason": str(reason or ""),
+        "unclaimed": [
+            {"batch_id": item["name"], "bytes": item["bytes"], "reason": item["reason"]}
+            for item in unclaimed
+        ],
+        "unclaimed_count": len(unclaimed),
+        "unclaimed_bytes": sum(int(item["bytes"]) for item in unclaimed),
+    }
+    if not confirm:
+        return report
+    if not str(reason or "").strip():
+        raise TerminalLogRetentionError("terminal_log_reconcile_reason_required")
+    staged = (
+        _stage_reconcile_batch(root, unclaimed, action="reconcile_unclaimed")
+        if unclaimed
+        else {"batch_id": "", "count": 0, "bytes": 0}
+    )
+    _append_audit(root, {
+        "schema_id": AUDIT_SCHEMA_ID,
+        "timestamp": now_utc().isoformat(),
+        "action": "reconcile_unclaimed_completed",
+        "reason": str(reason or ""),
+        "batch_id": staged["batch_id"],
+        "reconciled_count": staged["count"],
+        "reconciled_bytes": staged["bytes"],
+    })
+    report.update({
+        "batch_id": staged["batch_id"],
+        "reconciled_count": staged["count"],
+        "reconciled_bytes": staged["bytes"],
+    })
+    report["ok"] = staged["count"] == len(unclaimed)
+    return report
+
+
+def purge_empty_batches(repo_root: Path | str, *, confirm: bool) -> dict[str, Any]:
+    """Operator-invoked collector for empty terminal-log quarantine batches.
+
+    NF-2026-00273 stopped new empty batches being created; the ones already on
+    disk (100 in the canonical store, every one ``purge_eligible`` yet never
+    collected, because ``enforce`` deliberately never sweeps a batch an operator
+    has not asked to release) had no consumer -- an eligible queue with nothing
+    draining it. This is that consumer: one named, operator-reachable trigger
+    that purges every batch empty in BOTH its record and on disk, and only those.
+    A batch holding any file is never touched here -- including an unreconciled
+    record-empty batch that still holds bytes, which is routed to
+    :func:`reconcile_unclaimed` instead of being dropped on a stale record.
+    """
+    if confirm is not True:
+        raise TerminalLogRetentionError("explicit_confirmation_required")
+    root = Path(repo_root).resolve()
+    qroot = root / QUARANTINE_RELATIVE_PATH
+    if not qroot.exists():
+        return {"ok": True, "purged": 0, "batch_ids": [], "bytes": 0}
+    repo_id = _repo_id(root)
+    purged: list[str] = []
+    freed = 0
+    for entry in sorted(qroot.iterdir()):
+        try:
+            e_info = entry.lstat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISLNK(e_info.st_mode)
+            or not stat.S_ISDIR(e_info.st_mode)
+            or not _BATCH_RE.fullmatch(entry.name)
+        ):
+            continue
+        try:
+            manifest = _manifest(entry / MANIFEST_NAME, repo_id)
+        except TerminalLogRetentionError:
+            continue
+        if _batch_reapable_empty(manifest, entry):
+            freed += int(manifest.get("quarantined_bytes") or 0)
+            shutil.rmtree(entry, ignore_errors=True)
+            purged.append(entry.name)
+    if purged:
+        _append_audit(root, {
+            "schema_id": AUDIT_SCHEMA_ID,
+            "timestamp": now_utc().isoformat(),
+            "action": "empty_batches_collected",
+            "count": len(purged),
+            "batch_ids": sorted(purged),
+            "bytes": freed,
+        })
+    return {"ok": True, "purged": len(purged), "batch_ids": sorted(purged), "bytes": freed}
+
+
+def _terminal_request_ids(root: Path) -> set[str]:
+    """Request ids whose owning run reached a terminal ledger state.
+
+    The only runs whose per-file logs or attempt bundles may be bounded: a
+    terminal state means the launcher's writer has stopped, so the file is no
+    longer being appended and its tail is stable. A live/unknown run
+    (non-terminal) fails closed and is never bounded, so the tail an operator is
+    still watching is never disturbed.
+    """
+    return {
+        request_id
+        for request_id, row in _latest_rows(root).items()
+        if str(row.get("state") or "") in _TERMINAL_STATES
+    }
+
+
+def _tail_cap_file(path: Path, size: int) -> int:
+    """Rewrite ``path`` to a truncation notice plus its last bytes; return bytes freed.
+
+    Keeps the tail that fits within :data:`MAX_PROCESS_LOG_FILE_BYTES` once the
+    notice is accounted for -- the exact window the launcher itself reads to
+    diagnose a failure -- discarding the unbounded head.
+    The kept tail is trimmed to the next line boundary so it starts cleanly, and
+    the notice makes the truncation explicit. Written atomically at 0o600.
+    """
+    # Reserve room for the notice so the written payload (notice + tail) never
+    # exceeds the bound; otherwise a just-capped file stays oversized forever and
+    # every enforce pass rewrites the whole 4 MiB again (a permanent fixed point).
+    keep = MAX_PROCESS_LOG_FILE_BYTES - len(_TAIL_CAP_NOTICE)
+    with open(path, "rb") as handle:
+        handle.seek(max(0, size - keep))
+        tail = handle.read()
+    if size > keep:
+        newline = tail.find(b"\n")
+        if 0 <= newline < len(tail) - 1:
+            tail = tail[newline + 1:]
+    payload = _TAIL_CAP_NOTICE + tail
+    fd, name = tempfile.mkstemp(prefix=".process-log-", suffix=".tmp", dir=path.parent)
+    temp = Path(name)
+    try:
+        os.chmod(temp, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        os.chmod(path, 0o600)
+    finally:
+        temp.unlink(missing_ok=True)
+    return max(0, size - len(payload))
+
+
+def _plan_process_log_bounds(root: Path) -> dict[str, Any]:
+    """Read-only split of per-file logs and attempt bundles into boundable vs protected."""
+    process_root = root / PROCESS_FILES_RELATIVE_PATH
+    terminal = _terminal_request_ids(root)
+    cutoff = now_utc() - timedelta(days=_logs_days(root))
+    oversized: list[dict[str, Any]] = []
+    protected_files: list[dict[str, Any]] = []
+    if process_root.is_dir():
+        for path in sorted(process_root.iterdir()):
+            info = _owned_regular_file(path, process_root)
+            if info is None:
+                continue
+            suffix = next(
+                (s for s in _BOUNDABLE_LOG_SUFFIXES if path.name.endswith(s)), ""
+            )
+            if not suffix or int(info.st_size) <= MAX_PROCESS_LOG_FILE_BYTES:
+                continue
+            request_id = path.name[: -len(suffix)]
+            entry = {
+                "name": path.name,
+                "request_id": request_id,
+                "size_bytes": int(info.st_size),
+            }
+            if _REQUEST_RE.fullmatch(request_id) and request_id in terminal:
+                oversized.append(entry)
+            else:
+                # A live or unattributed run: never truncated, so a tail an
+                # operator is still watching is never lost.
+                protected_files.append({**entry, "reason": "run_not_terminal"})
+    bundles_root = process_root / ATTEMPT_ARTIFACTS_DIRNAME
+    aged_bundles: list[dict[str, Any]] = []
+    protected_bundles: list[dict[str, Any]] = []
+    if bundles_root.is_dir() and not bundles_root.is_symlink():
+        for entry in sorted(bundles_root.iterdir()):
+            try:
+                b_info = entry.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(b_info.st_mode) or not stat.S_ISDIR(b_info.st_mode):
+                continue
+            request_id = entry.name
+            newest_ns = 0
+            size_bytes = 0
+            for directory, dirnames, filenames in os.walk(entry, followlinks=False):
+                parent = Path(directory)
+                dirnames[:] = [n for n in dirnames if not (parent / n).is_symlink()]
+                for name in filenames:
+                    try:
+                        item = (parent / name).lstat()
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
+                        continue
+                    size_bytes += int(item.st_size)
+                    newest_ns = max(newest_ns, int(item.st_mtime_ns))
+            newest = datetime.fromtimestamp(newest_ns / 1_000_000_000, timezone.utc) if newest_ns else None
+            record = {"request_id": request_id, "path": entry, "size_bytes": size_bytes}
+            terminal_ok = _REQUEST_RE.fullmatch(request_id) and request_id in terminal
+            aged_ok = newest is not None and newest <= cutoff
+            if terminal_ok and aged_ok:
+                aged_bundles.append({**record, "name": request_id, "reason": "attempt_artifacts_aged"})
+            else:
+                protected_bundles.append({
+                    **record,
+                    "reason": "run_not_terminal" if not terminal_ok else "retention_age_not_met",
+                })
+    return {
+        "oversized_logs": oversized,
+        "protected_logs": protected_files,
+        "aged_bundles": aged_bundles,
+        "protected_bundles": protected_bundles,
+        "max_process_log_file_bytes": MAX_PROCESS_LOG_FILE_BYTES,
+        "logs_days": _logs_days(root),
+    }
+
+
+def process_log_bounds_preview(repo_root: Path | str) -> dict[str, Any]:
+    """Read-only report of what the per-file log bound and attempt-artifacts bound would act on."""
+    root = Path(repo_root).resolve()
+    plan = _plan_process_log_bounds(root)
+    return {
+        "ok": True,
+        "schema_id": "aiworkhub.terminal_log_process_bounds.v1",
+        "dry_run": True,
+        "max_process_log_file_bytes": plan["max_process_log_file_bytes"],
+        "logs_days": plan["logs_days"],
+        "oversized_log_count": len(plan["oversized_logs"]),
+        "oversized_log_bytes": sum(int(item["size_bytes"]) for item in plan["oversized_logs"]),
+        "protected_log_count": len(plan["protected_logs"]),
+        "aged_bundle_count": len(plan["aged_bundles"]),
+        "aged_bundle_bytes": sum(int(item["size_bytes"]) for item in plan["aged_bundles"]),
+        "protected_bundle_count": len(plan["protected_bundles"]),
+        "oversized_logs": [
+            {"name": item["name"], "size_bytes": item["size_bytes"]}
+            for item in plan["oversized_logs"]
+        ],
+        "aged_bundles": [
+            {"request_id": item["request_id"], "size_bytes": item["size_bytes"]}
+            for item in plan["aged_bundles"]
+        ],
+    }
+
+
+def enforce_process_log_bounds(repo_root: Path | str, *, confirm: bool = True) -> dict[str, Any]:
+    """Apply the per-file log bound and the attempt-artifacts bound once.
+
+    Oversized logs of terminal runs are tail-capped in place (head released, tail
+    kept). Attempt-artifacts bundles of terminal runs aged past ``logs_days`` are
+    moved into a reversible quarantine batch (7-day undo, then ordinary purge).
+    A live/non-terminal run is never touched. ``confirm=False`` returns the
+    read-only preview unchanged.
+    """
+    root = Path(repo_root).resolve()
+    if not confirm:
+        return process_log_bounds_preview(root)
+    plan = _plan_process_log_bounds(root)
+    process_root = root / PROCESS_FILES_RELATIVE_PATH
+    capped = 0
+    freed = 0
+    for item in plan["oversized_logs"]:
+        path = process_root / str(item["name"])
+        info = _owned_regular_file(path, process_root)
+        if info is None or int(info.st_size) <= MAX_PROCESS_LOG_FILE_BYTES:
+            continue  # raced away or shrank since the plan; skip
+        freed += _tail_cap_file(path, int(info.st_size))
+        capped += 1
+    staged = (
+        _stage_reconcile_batch(root, plan["aged_bundles"], action="attempt_artifacts_bound")
+        if plan["aged_bundles"]
+        else {"batch_id": "", "count": 0, "bytes": 0}
+    )
+    if capped or staged["count"]:
+        _append_audit(root, {
+            "schema_id": AUDIT_SCHEMA_ID,
+            "timestamp": now_utc().isoformat(),
+            "action": "process_log_bounds_enforced",
+            "logs_capped": capped,
+            "log_bytes_freed": freed,
+            "bundles_quarantined": staged["count"],
+            "bundle_batch_id": staged["batch_id"],
+            "bundle_bytes": staged["bytes"],
+        })
+    return {
+        "ok": True,
+        "repository_scoped": True,
+        "logs_capped": capped,
+        "log_bytes_freed": freed,
+        "bundles_quarantined": staged["count"],
+        "bundle_batch_id": staged["batch_id"],
+        "bundle_bytes": staged["bytes"],
+    }
 
 
 def _dead_owner_temp_gc(root: Path) -> tuple[int, int]:
@@ -886,6 +1523,13 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
             batch_id = str(result.get("batch_id") or "")
 
         temp_gc_count, temp_gc_bytes = _dead_owner_temp_gc(root)
+        # The per-file worker-log bound and the attempt-artifacts bound: an
+        # oversized terminal-run log is tail-capped (head released, diagnostic
+        # tail kept) and an aged terminal-run bundle enters reversible quarantine.
+        # A live/non-terminal run is never touched, so this self-bounds the two
+        # stores that previously grew without limit without ever cutting a tail an
+        # operator still needs.
+        process_bounds = enforce_process_log_bounds(root, confirm=True)
         _append_audit(root, {
             "schema_id": AUDIT_SCHEMA_ID,
             "timestamp": now_utc().isoformat(),
@@ -896,6 +1540,8 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
             "purged_bytes": purged_bytes,
             "temp_gc_count": temp_gc_count,
             "temp_gc_bytes": temp_gc_bytes,
+            "logs_capped": int(process_bounds.get("logs_capped") or 0),
+            "bundles_quarantined": int(process_bounds.get("bundles_quarantined") or 0),
         })
         return {
             "ok": True,
@@ -908,18 +1554,27 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
             "purged_bytes": purged_bytes,
             "temp_gc_count": temp_gc_count,
             "temp_gc_bytes": temp_gc_bytes,
+            "logs_capped": int(process_bounds.get("logs_capped") or 0),
+            "log_bytes_freed": int(process_bounds.get("log_bytes_freed") or 0),
+            "bundles_quarantined": int(process_bounds.get("bundles_quarantined") or 0),
+            "bundle_bytes": int(process_bounds.get("bundle_bytes") or 0),
         }
     finally:
         _enforcement_lock.release()
 
 
 __all__ = [
+    "MAX_PROCESS_LOG_FILE_BYTES",
     "TerminalLogRetentionError",
     "enforce",
+    "enforce_process_log_bounds",
     "list_batches",
     "now_utc",
     "preview",
+    "process_log_bounds_preview",
     "purge",
+    "purge_empty_batches",
     "quarantine",
+    "reconcile_unclaimed",
     "restore",
 ]
