@@ -11,8 +11,15 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 
-CANONICAL_MAX_BYTES = 4100
-PROJECTION_MAX_BYTES = 5200
+# Byte caps for the on-attach contract. NF-2026-00281-V2 added the manager-role
+# section to the shared POLICY (rendered into all three providers) and a role
+# lead-in to CLAUDE_MANAGER_PREAMBLE without cutting any existing protocol rule.
+# The pre-role caps (4100 / 5200) left only 9 bytes of canonical and 8 bytes of
+# CLAUDE.md headroom, so the role could not fit under them. Nothing was removed;
+# the caps are raised to sit just above the measured rendered output:
+#   canonical 5484, AGENTS.md 5582, copilot 5604, CLAUDE.md 7338 bytes.
+CANONICAL_MAX_BYTES = 5600
+PROJECTION_MAX_BYTES = 7500
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
 PROVIDERS = ("AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md")
@@ -20,7 +27,11 @@ PROVIDERS = ("AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md")
 Provider = Literal["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"]
 
 
-CLAUDE_MANAGER_PREAMBLE = """Claude Code manager startup (mandatory when AIWorkHub MCP is available):
+CLAUDE_MANAGER_PREAMBLE = """Claude Code manager role (read before the protocol below):
+- The manager does not write code: it runs the project with the owner, distributes work to workers by difficulty and cost, and reviews what returns; small precise corrections are allowed, building features is the workers' job.
+- Because the manager did not write the code, the manager is the independent reviewer; independence is this role separation, not a different vendor, model or process, so a single-provider install is fully supported and not degraded.
+- Every card that reaches review is closed the same turn: accepted, returned with concrete code-level findings, or blocked with a reason; acceptance is decided by measurement, never by asking the owner to approve a production accept.
+Claude Code manager startup (mandatory when AIWorkHub MCP is available):
 - Before Read, Grep, Glob, Bash or filesystem discovery, call aiworkhub_manager_bootstrap.
 - Continue only when repository identity and manager route are verified.
 - The verified bootstrap/repository_current repository outranks host cwd, workspace_roots and environment_context; on mismatch stop before filesystem access, switch/reload the route and never inspect the hinted repository.
@@ -36,6 +47,7 @@ class ToolPolicy:
     """Structured policy source used by every provider projection."""
 
     title: str
+    role: tuple[str, ...]
     order: tuple[str, ...]
     adaptive: tuple[str, ...]
     source_graph: tuple[str, ...]
@@ -49,6 +61,17 @@ class ToolPolicy:
 
 POLICY = ToolPolicy(
     title="AIWorkHub MCP tool-use policy",
+    role=(
+        "The manager does not write code: it runs the project with the owner, distributes work to workers by difficulty and cost, and reviews what returns; small precise corrections are allowed, building features is the workers' job.",
+        "Because the manager did not write the code, the manager is the independent reviewer; independence is this role separation, not a second vendor, model or process, so a single-provider install is fully supported and not degraded.",
+        "Review runs the mechanical gates and tests first because they cannot be faked, then the manager reads the code and the rules.",
+        "Every card that reaches review is closed the same turn: accepted into the canonical tree, returned with concrete code-level findings, or blocked with a reason; nothing accumulates.",
+        "Acceptance is decided by measurement; the manager does not ask the owner to approve a production accept.",
+        "Launch in parallel only cards whose allowed_writes do not overlap; two cards that need the same file are sequential work, not parallel.",
+        "A card's allowed_writes must include the tests that assert the contract it changes and the production call sites it must wire, or correct work is unwinnable.",
+        "Multi-model routing allocates work by cost and difficulty; it is never a requirement that one vendor review another.",
+        "Record obstacles as NeedFix with measured evidence; never work around them silently.",
+    ),
     order=(
         "validate the injected AIWorkHub Task MCP receipt, identity and scope",
         "consume and acknowledge the injected project-context receipt",
@@ -205,6 +228,8 @@ CONTRACT_CLAUSES: dict[str, tuple[str, ...]] = {
 def _lines(policy: ToolPolicy = POLICY) -> list[str]:
     return [
         f"# {policy.title}",
+        "Manager role:",
+        *[f"- {item}" for item in policy.role],
         "Order:",
         *[f"{idx}. {step}." for idx, step in enumerate(policy.order, start=1)],
         "Adaptive use:",
