@@ -34,6 +34,53 @@ repository is a fully independent instance.
   .sqlite)                                                outbox + lease)
 ```
 
+## Concurrency: multiple cores by default
+
+AIWorkHub is written for multiple cores wherever the work allows it. Work that
+is independent per item -- sizing each worktree in a storage footprint walk,
+indexing each file into the Source Graph, scoring each query in the retrieval
+evaluator -- is done in parallel by default. A sequential path is the
+exception, not the norm, and the code that stays sequential says why in a
+comment. This is a standing project principle, not a per-case decision: it is
+recorded in the generated on-attach rules (`agent_tool_instructions.py`, so
+every model and provider reads it) and here, so the next scan is written for
+the cores the machine actually has rather than the one core habit reaches for.
+
+*Parallel by default.* A 16-core host that walks 162 independent worktrees in
+series leaves fifteen cores idle for no reason anyone chose; nobody decided the
+work should be serial, it simply was never stated that it should be otherwise.
+Stating it makes parallel the default a contributor has to justify departing
+from, rather than an optimization someone has to remember to add.
+
+*The core count is observed, never fixed.* The number of workers derives from
+the core count the process actually sees at runtime, not a constant baked into
+the source. A constant is wrong on every machine except the one it was written
+on: too small on a big host, oversubscribed on a small one. Observing the count
+is the only value that is correct everywhere the same install runs -- Linux,
+WSL, or Windows, laptop or workstation.
+
+*Identical results are non-negotiable.* Parallelism may change only how fast
+the work finishes, never what is measured or produced. A parallel walk must
+return the same footprint, the same candidate set, the same digest as the
+sequential path it replaced; if it does not, it is a bug, not a speedup.
+Ordering, reductions, and floating-point accumulation are made deterministic so
+the result does not depend on which worker finished first.
+
+*Headroom for the interactive server outranks the benchmark.* AIWorkHub runs an
+interactive MCP server that an operator is waiting on. A background scan that
+saturates every core to shave a second off its own runtime is a regression if
+it makes the dashboard stutter or starves a manager's live query. The worker
+count therefore always leaves headroom for that server; protecting interactive
+responsiveness matters more than a benchmark number on the scan itself.
+
+*Threads or processes is a measured choice.* Threads suit IO-bound work that
+releases the GIL (filesystem stats, subprocess waits, SQLite reads); processes
+suit CPU-bound work that does not. Which one a given path uses is chosen from a
+measurement of that path, not a rule of thumb -- and a path left sequential
+after measurement is a valid outcome, because the measurement is what justifies
+it. The actual parallelisation of specific walks is tracked separately
+(NF-2026-00293); this section records the principle those changes answer to.
+
 ## Repository-local authority (`.aiworkhub/`)
 
 `repository_state.py` resolves the active repository root from

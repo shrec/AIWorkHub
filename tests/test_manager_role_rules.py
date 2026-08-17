@@ -44,6 +44,49 @@ ROLE_STATEMENTS = (
 )
 
 
+# NF-2026-00294: the multicore-by-default principle rides the shared POLICY, so
+# it must reach EVERY provider projection (not just the Claude preamble) and
+# cannot silently regress. Each fragment is a distinctive slice of one of the
+# five rendered principle lines.
+MULTICORE_STATEMENTS = (
+    "Multicore by default:",
+    "AIWorkHub is written for multiple cores",
+    "work that is independent per item runs across cores by default",
+    "a sequential path is the exception",
+    "derived from the observed core count, never a hardcoded constant",
+    "leaves headroom so a scan cannot starve the interactive MCP server",
+    "Parallelism changes only how fast, never what is measured or produced",
+    "results stay identical to the sequential path",
+    "Threads for IO-bound work that releases the GIL, processes for CPU-bound work",
+    "chosen from a measurement, not a rule of thumb",
+    "A path left sequential after measurement is a valid outcome",
+)
+
+
+def test_multicore_principle_present_in_every_provider_projection() -> None:
+    """Criterion 7: the multicore-by-default principle cannot regress.
+
+    It lives in the shared POLICY, so AGENTS.md and copilot must carry it just
+    like CLAUDE.md -- the principle applies to any model writing code here, not
+    only Claude.
+    """
+    rendered = instr.render_all()
+    assert tuple(rendered) == instr.PROVIDERS
+    for provider, text in rendered.items():
+        for statement in MULTICORE_STATEMENTS:
+            assert statement in text, f"{provider!r} missing multicore statement: {statement!r}"
+
+
+def test_multicore_principle_is_in_the_shared_canonical_not_claude_only() -> None:
+    """The principle rides the shared canonical body, so it is model-agnostic
+    and is NOT confined to the Claude-specific preamble."""
+    canonical = instr.render_canonical()
+    for statement in MULTICORE_STATEMENTS:
+        assert statement in canonical, statement
+    # It is a shared-policy rule, not a Claude preamble line.
+    assert "Multicore by default:" not in instr.CLAUDE_MANAGER_PREAMBLE
+
+
 def test_role_present_in_every_provider_projection() -> None:
     """Criterion 6: the role cannot silently regress to protocol-only.
 

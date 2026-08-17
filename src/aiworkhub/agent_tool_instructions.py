@@ -16,10 +16,20 @@ from typing import Any, Literal
 # lead-in to CLAUDE_MANAGER_PREAMBLE without cutting any existing protocol rule.
 # The pre-role caps (4100 / 5200) left only 9 bytes of canonical and 8 bytes of
 # CLAUDE.md headroom, so the role could not fit under them. Nothing was removed;
-# the caps are raised to sit just above the measured rendered output:
-#   canonical 5484, AGENTS.md 5582, copilot 5604, CLAUDE.md 7338 bytes.
-CANONICAL_MAX_BYTES = 5600
-PROJECTION_MAX_BYTES = 7500
+# the caps are raised to sit just above the measured rendered output.
+#
+# NF-2026-00294 then added the shared "Multicore by default:" principle to the
+# same canonical POLICY (so AGENTS.md, CLAUDE.md and copilot all carry it, not
+# just the Claude preamble). Again nothing was cut -- the principle is five new
+# lines appended before "Stop at Codex review."; every prior rule renders
+# verbatim. The render measured before/after:
+#   canonical 5484 -> 6211, AGENTS.md 5582 -> 6309, copilot 5604 -> 6331,
+#   CLAUDE.md 7338 -> 8065 bytes.
+# The caps are raised to sit just above the largest measured output, keeping the
+# same modest headroom the role change used (canonical 6300 >= 6211; projection
+# 8200 >= CLAUDE.md 8065). No rule was shortened or dropped to fit.
+CANONICAL_MAX_BYTES = 6300
+PROJECTION_MAX_BYTES = 8200
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
 PROVIDERS = ("AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md")
@@ -56,6 +66,7 @@ class ToolPolicy:
     context_graph: tuple[str, ...]
     memory: tuple[str, ...]
     kb: tuple[str, ...]
+    multicore: tuple[str, ...]
     finish: str
 
 
@@ -123,6 +134,13 @@ POLICY = ToolPolicy(
     kb=(
         "Query authoritative project contracts/docs for unresolved factual context and preserve source identity.",
         "After a zero hit, do not repeat the query unless task scope changes.",
+    ),
+    multicore=(
+        "AIWorkHub is written for multiple cores: work that is independent per item runs across cores by default; a sequential path is the exception, and the code says why in a comment.",
+        "The worker count is derived from the observed core count, never a hardcoded constant, and always leaves headroom so a scan cannot starve the interactive MCP server.",
+        "Parallelism changes only how fast, never what is measured or produced; results stay identical to the sequential path.",
+        "Threads for IO-bound work that releases the GIL, processes for CPU-bound work, chosen from a measurement, not a rule of thumb.",
+        "A path left sequential after measurement is a valid outcome; the recorded measurement is what justifies it.",
     ),
     finish="Stop at Codex review.",
 )
@@ -246,6 +264,8 @@ def _lines(policy: ToolPolicy = POLICY) -> list[str]:
         *[f"- {item}" for item in policy.memory],
         "KB:",
         *[f"- {item}" for item in policy.kb],
+        "Multicore by default:",
+        *[f"- {item}" for item in policy.multicore],
         policy.finish,
     ]
 
