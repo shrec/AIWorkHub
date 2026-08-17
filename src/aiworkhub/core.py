@@ -4572,6 +4572,71 @@ def launch_collision_guard(
     )
 
 
+def _reconcile_task_is_live(root: Path, task_id: str) -> bool:
+    """Verified-liveness probe for archive reconciliation.
+
+    A half-archived row is treated as live only when the repo's one live mux is
+    still driving this task's origin thread -- the same PID-reuse-safe evidence
+    the launch path trusts.  Absent that proof it returns ``False`` (the row is
+    a candidate for repair), never a bare status guess.
+    """
+    try:
+        card = task_store.get_task(root, task_id)
+    except task_store.TaskStoreError:
+        return False
+    if not card:
+        return False
+    origin = str(card.get("origin_thread_id") or "").strip()
+    if not origin:
+        return False
+    try:
+        return _live_mux_active_thread(root, card) == origin
+    except (OSError, RuntimeError, TypeError, ValueError, task_store.TaskStoreError):
+        return False
+
+
+def archive_reconciliation_report(print_json: bool = True) -> dict[str, Any]:
+    """Read-only operator report of rows whose ``archived_at`` and ``status``
+    disagree, with a count and the three reconciliation numbers.
+
+    This is the operator-reachable surface that keeps the half-archived class of
+    drift from ever again being invisible until someone queries SQLite by hand.
+    Pure read; never mutates.
+    """
+    command = ["archive-reconciliation-report"]
+    root = repo_root()
+    try:
+        report = task_store.archive_inconsistency_report(root)
+    except task_store.TaskStoreError as exc:
+        return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    stdout = json.dumps(report, ensure_ascii=False, sort_keys=True) if print_json else ""
+    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+
+
+def repair_archive_inconsistencies(
+    *, actor: str = "operator", print_json: bool = True
+) -> dict[str, Any]:
+    """Operator-reachable, transactional repair of half-archived rows.
+
+    Wraps :func:`task_store.repair_archive_inconsistencies` with the verified
+    process-liveness probe, and reports the non-terminal count, collision-guard
+    holder counts and pinned-worktree bytes before and after so the effect is
+    auditable.  Rows excluded for liveness, rework-predecessor pins or a missing
+    archive event are named, never touched.
+    """
+    command = ["repair-archive-inconsistencies", "--actor", actor]
+    root = repo_root()
+    try:
+        result = task_store.repair_archive_inconsistencies(
+            root,
+            actor=actor,
+            is_task_live=lambda task_id: _reconcile_task_is_live(root, task_id),
+        )
+    except task_store.TaskStoreError as exc:
+        return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    stdout = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str) if print_json else ""
+    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+
 def callback_outbox_status() -> dict[str, Any]:
     """Read-only, redacted-safe callback outbox health (bound/unbound task
     counts, pending/inflight/delivered/dead-letter counts). Sourced from

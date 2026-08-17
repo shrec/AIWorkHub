@@ -200,6 +200,14 @@ def test_detects_and_repairs_half_applied_archive_rows(tmp_path: Path) -> None:
             "UPDATE tasks SET archived_at='2026-08-15T13:13:00+00:00' WHERE task_id=?",
             ("TASK_HALF_ARCHIVED",),
         )
+        # A genuine half-archived row still bears the archive audit event: the
+        # pre-NF-276 bug lost only the terminal status column write, not the
+        # event.  Reconciliation trusts that event as proof the archive happened.
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES ('TASK_HALF_ARCHIVED', 'archived', 'codex', '{}', "
+            "'2026-08-15T13:13:00+00:00')"
+        )
         conn.commit()
     finally:
         conn.close()

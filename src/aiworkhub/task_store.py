@@ -32,7 +32,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .repository_state import (
     HUB_DIRNAME,
@@ -1045,15 +1045,125 @@ def archive_task(
         conn.close()
 
 
-def find_archive_inconsistencies(root: str | Path) -> list[dict[str, str]]:
+_ARCHIVE_AUDIT_EVENTS: frozenset[str] = frozenset({"archived", "superseded"})
+
+# Buckets a *naive* reader assigns from the raw ``status``/``worker_status``
+# columns while ignoring ``archived_at``.  ``canonical_status`` short-circuits
+# to ``archived`` the instant ``archived_at`` is set, so it can never expose a
+# row whose raw ``status`` column still says ``review``/``pending``/
+# ``processing``.  Any consumer that keys off the raw column -- the pre-NF-276
+# collision guard did, and so does hand-written operator SQL -- still counts
+# that stale value as live work.  These sets reproduce exactly that naive view
+# so the reconciliation report can measure the phantom holders a repair removes.
+_NAIVE_ACTIVE_BUCKETS: frozenset[str] = frozenset({"pending", "processing", "review"})
+_NON_TERMINAL_CANONICAL: frozenset[str] = frozenset(
+    {"pending", "processing", "review", "blocked"}
+)
+
+DEFAULT_RECONCILIATION_WATCH_FILES: tuple[str, ...] = (
+    "src/aiworkhub/core.py",
+    "src/aiworkhub/server.py",
+    "src/aiworkhub/worker_workspace.py",
+)
+
+
+def _row_card(raw_card_json: Any) -> dict[str, Any]:
+    """Decode one row's ``card_json`` to a dict, tolerating corruption."""
+    try:
+        card = json.loads(str(raw_card_json or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return card if isinstance(card, dict) else {}
+
+
+def _raw_status_bucket(status: Any, worker_status: Any) -> str:
+    """Lifecycle bucket from the raw columns, deliberately ignoring
+    ``archived_at`` (unlike :func:`canonical_status`).
+
+    A literal ``archived`` in the ``status`` column still maps to ``archived``
+    here, so a row this module has reconciled drops out of the naive-active
+    view; only the *unreconciled* half-archived rows -- whose column still
+    reads ``review``/``pending``/``processing`` -- are counted as live.
+    """
+    st = str(status or "").strip().lower()
+    ws = str(worker_status or "").strip().lower()
+    if st in {"finished", "completed", "stale_already_done"} or ws == "done":
+        return "finished"
+    if st in {"archived", "superseded"} or ws == "superseded":
+        return "archived" if st == "archived" else "superseded"
+    if st.startswith("blocked") or ws.startswith(("blocked", "deferred")):
+        return "blocked"
+    if st in {"review", "ready_for_review", "codex_review", "awaiting_review"} or ws in {
+        "review",
+        "ready_for_review",
+        "codex_review",
+        "awaiting_review",
+    }:
+        return "review"
+    if st in {"processing", "in_progress"} or ws in {"claimed", "in_progress"}:
+        return "processing"
+    return "pending"
+
+
+def _normalize_write_path(path: Any) -> str:
+    return str(path or "").replace("\\", "/").lstrip("./")
+
+
+def _write_path_touches(candidate: str, watched: str) -> bool:
+    """True when an ``allowed_writes`` entry ``candidate`` covers ``watched``.
+
+    Deterministic and repo-local, mirroring the collision guard: exact match or
+    a directory prefix on either side.  Globs fail closed (not expanded here).
+    """
+    if not candidate or not watched:
+        return False
+    if candidate == watched:
+        return True
+    if any(ch in candidate for ch in "*?[]"):
+        return False
+    if candidate.endswith("/") and watched.startswith(candidate):
+        return True
+    if watched.endswith("/") and candidate.startswith(watched):
+        return True
+    return False
+
+
+def _rework_pinned_predecessor_request_ids(conn: sqlite3.Connection) -> set[str]:
+    """``request_id`` values that a still-active card pins as its rework
+    predecessor.
+
+    A rework episode carries ``card["rework_predecessor"]`` with the pinned
+    predecessor's ``request_id`` and worktree.  While that active card exists
+    its predecessor's worktree is owned and must never be reconciled or
+    otherwise touched, even though the predecessor's own row is archived.
+    """
+    pinned: set[str] = set()
+    rows = conn.execute(
+        "SELECT status, worker_status, archived_at, card_json FROM tasks"
+    ).fetchall()
+    for row in rows:
+        if canonical_status(dict(row)) not in {"pending", "processing", "review", "blocked"}:
+            continue
+        card = _row_card(row["card_json"])
+        predecessor = card.get("rework_predecessor")
+        if isinstance(predecessor, dict):
+            request_id = str(predecessor.get("request_id") or "").strip()
+            if request_id:
+                pinned.add(request_id)
+    return pinned
+
+
+def find_archive_inconsistencies(root: str | Path) -> list[dict[str, Any]]:
     """Detect rows whose archive half-applied: ``archived_at`` is set while the
     raw ``status`` column is still non-terminal.  Pure read; never mutates.
 
-    Three such rows exist in this repository right now
-    (``CLAUDE_SONNET5_CLI_QR_NF202_SECURITY_V2``,
-    ``CLAUDE_SONNET5_CLI_QR_NF202_CODE_QUALITY_V2`` and
-    ``GLM52_VSCODE_QR_NF229_POSTRELOAD_CORRECTNESS_20260815_V2``); this is how
-    they are found.
+    Each returned item also carries ``has_archive_event`` -- whether the audit
+    trail holds an ``archived``/``superseded`` event for the row.  That flag is
+    the affirmative proof the archive actually happened: ``archive_task`` writes
+    ``archived_at``, the terminal ``status`` and the archive event in one
+    transaction, so a genuinely half-archived row always still bears the event.
+    A row carrying ``archived_at`` with *no* such event was set by some path
+    other than an archive and must be excluded from repair.
     """
     _readiness, db_path = _require_ready(root)
     conn = _connect(db_path, readonly=True)
@@ -1062,20 +1172,110 @@ def find_archive_inconsistencies(root: str | Path) -> list[dict[str, str]]:
             "SELECT task_id, status, worker_status, archived_at FROM tasks "
             "WHERE COALESCE(archived_at, '') <> ''"
         ).fetchall()
+        events = {
+            str(event_row["task_id"])
+            for event_row in conn.execute(
+                "SELECT DISTINCT task_id FROM task_events "
+                "WHERE event IN ('archived', 'superseded')"
+            ).fetchall()
+        }
     finally:
         conn.close()
-    inconsistent: list[dict[str, str]] = []
+    inconsistent: list[dict[str, Any]] = []
     for row in rows:
-        if str(row["status"] or "").strip().lower() not in _ARCHIVE_TERMINAL_STATUSES:
-            inconsistent.append(
+        if str(row["status"] or "").strip().lower() in _ARCHIVE_TERMINAL_STATUSES:
+            continue
+        task_id = str(row["task_id"])
+        inconsistent.append(
+            {
+                "task_id": task_id,
+                "status": str(row["status"] or ""),
+                "worker_status": str(row["worker_status"] or ""),
+                "archived_at": str(row["archived_at"] or ""),
+                "has_archive_event": task_id in events,
+            }
+        )
+    return inconsistent
+
+
+def archive_inconsistency_report(
+    root: str | Path,
+    *,
+    watch_files: Sequence[str] = DEFAULT_RECONCILIATION_WATCH_FILES,
+) -> dict[str, Any]:
+    """Read-only operator report reconciling the two lifecycle signals.
+
+    Lists every row whose ``archived_at`` is set while its raw ``status`` column
+    is still non-terminal, with a count and per-status breakdown, so this class
+    of drift can never again stay invisible until someone opens SQLite by hand.
+    It also measures the three numbers a repair is meant to move -- reported the
+    same way before and after so the effect is auditable:
+
+    * ``genuinely_open_count`` -- rows with an empty ``archived_at`` and a
+      non-terminal canonical status.  A correct repair leaves these untouched,
+      so the number must not change.
+    * ``collision_holders`` -- per watched file, how many naive-active cards
+      (raw column view) claim overlapping ``allowed_writes``.  The phantom
+      half-archived holders vanish once reconciled.
+    * ``pinned_worktree_bytes`` -- ``card_json`` bytes of half-archived rows a
+      naive-active reader would still treat as pinning a worktree.
+
+    Pure ``SELECT``; never mutates.
+    """
+    _readiness, db_path = _require_ready(root)
+    watched = [_normalize_write_path(name) for name in watch_files]
+    conn = _connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT task_id, status, worker_status, archived_at, card_json, "
+            "LENGTH(card_json) AS card_bytes FROM tasks"
+        ).fetchall()
+    finally:
+        conn.close()
+    disagree: list[dict[str, str]] = []
+    by_status: dict[str, int] = {}
+    genuinely_open = 0
+    holders: dict[str, int] = {name: 0 for name in watched}
+    pinned_worktree_bytes = 0
+    for row in rows:
+        archived = str(row["archived_at"] or "").strip()
+        status_value = str(row["status"] or "")
+        raw_bucket = _raw_status_bucket(status_value, row["worker_status"])
+        naive_active = raw_bucket in _NAIVE_ACTIVE_BUCKETS
+        half_archived = bool(archived) and status_value.strip().lower() not in _ARCHIVE_TERMINAL_STATUSES
+        if half_archived:
+            disagree.append(
                 {
                     "task_id": str(row["task_id"]),
-                    "status": str(row["status"] or ""),
+                    "status": status_value,
                     "worker_status": str(row["worker_status"] or ""),
-                    "archived_at": str(row["archived_at"] or ""),
+                    "archived_at": archived,
                 }
             )
-    return inconsistent
+            label = status_value or "(empty)"
+            by_status[label] = by_status.get(label, 0) + 1
+            if naive_active:
+                pinned_worktree_bytes += int(row["card_bytes"] or 0)
+        elif not archived and canonical_status(dict(row)) in _NON_TERMINAL_CANONICAL:
+            genuinely_open += 1
+        if naive_active and holders:
+            writes = _row_card(row["card_json"]).get("allowed_writes") or []
+            if isinstance(writes, list):
+                normalized = {_normalize_write_path(path) for path in writes}
+                for name in watched:
+                    if any(_write_path_touches(path, name) for path in normalized):
+                        holders[name] += 1
+    return {
+        "schema_id": "aiworkhub.archive_inconsistency_report.v1",
+        "repo": str(root),
+        "count": len(disagree),
+        "half_archived_count": len(disagree),
+        "by_status": by_status,
+        "rows": disagree,
+        "genuinely_open_count": genuinely_open,
+        "collision_holders": holders,
+        "pinned_worktree_bytes": pinned_worktree_bytes,
+    }
 
 
 def repair_archive_inconsistencies(
@@ -1083,32 +1283,102 @@ def repair_archive_inconsistencies(
     *,
     actor: str = "coordinator",
     dry_run: bool = False,
+    is_task_live: Callable[[str], bool] | None = None,
 ) -> dict[str, Any]:
-    """Explicit, logged repair for rows left in the impossible
-    ``archived_at``-set / non-terminal-``status`` state.
+    """Explicit, logged, idempotent repair for rows left in the impossible
+    ``archived_at``-set / non-terminal-``status`` state by the pre-NF-276
+    two-write archive.
 
-    This is never run implicitly on import or initialization; a caller must
-    invoke it deliberately.  Each repaired row completes its interrupted
-    archive by writing the terminal ``status`` column under a preimage guard
-    and records an ``archive_inconsistency_repaired`` audit event carrying the
-    prior status.  ``dry_run`` reports what would be repaired without writing.
+    Never run implicitly on import or initialization; a caller invokes it
+    deliberately.  A row is reconciled only when the archive provably happened
+    -- the audit trail carries an ``archived``/``superseded`` event.  Three
+    classes are excluded and named rather than touched:
+
+    * ``excluded_no_archive_event`` -- ``archived_at`` set with no archive event
+      in the trail, so it was written by some non-archive path; never assumed
+      archived.
+    * ``excluded_live`` -- a live process is working on the row (``is_task_live``
+      is the caller-supplied verified-liveness probe; the operator command wires
+      the real process/mux liveness check).
+    * ``excluded_rework_pinned`` -- another active card pins this row's worktree
+      as its rework predecessor.
+
+    All reconciliations run in one transaction.  Each row's terminal ``status``
+    is written under a preimage ``WHERE`` guard on ``(archived_at set, prior
+    status)``, so a row a concurrent writer changed underneath matches zero rows
+    and is skipped (``skipped_conflict``) rather than overwritten.  After commit
+    every repaired row is re-read: one that no longer reads terminal-and-archived
+    is reported (``reverted``) instead of trusted.  Every repaired row gets an
+    ``archive_inconsistency_repaired`` event carrying ``task_id``, old status,
+    new status, ``archived_at`` and the justifying evidence.  Running a second
+    time finds nothing left to reconcile and is a no-op.  ``dry_run`` classifies
+    without writing.
     """
+    live = is_task_live if callable(is_task_live) else (lambda _task_id: False)
+    metrics_before = archive_inconsistency_report(root)
     detected = find_archive_inconsistencies(root)
-    if dry_run or not detected:
-        return {"detected": detected, "repaired": [], "count": len(detected), "dry_run": dry_run}
+
     _readiness, db_path = _require_ready(root)
-    repaired: list[str] = []
     conn = _connect(db_path)
     try:
+        pinned_request_ids = _rework_pinned_predecessor_request_ids(conn)
+        reconcilable: list[dict[str, Any]] = []
+        excluded_no_archive_event: list[str] = []
+        excluded_live: list[str] = []
+        excluded_rework_pinned: list[str] = []
         for item in detected:
+            task_id = item["task_id"]
+            if not item.get("has_archive_event"):
+                excluded_no_archive_event.append(task_id)
+                continue
+            if live(task_id):
+                excluded_live.append(task_id)
+                continue
+            row = conn.execute(
+                "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            card = _row_card(row["card_json"]) if row is not None else {}
+            request_id = str(card.get("request_id") or "").strip()
+            if request_id and request_id in pinned_request_ids:
+                excluded_rework_pinned.append(task_id)
+                continue
+            operation = str(card.get("archive_operation") or "").strip().lower()
+            target = "superseded" if operation == "superseded" else "archived"
+            reconcilable.append({**item, "target_status": target})
+
+        base = {
+            "detected": detected,
+            "count": len(detected),
+            "reconcilable": [item["task_id"] for item in reconcilable],
+            "excluded_no_archive_event": excluded_no_archive_event,
+            "excluded_live": excluded_live,
+            "excluded_rework_pinned": excluded_rework_pinned,
+            "metrics_before": metrics_before,
+        }
+        if dry_run or not reconcilable:
+            conn.rollback()
+            return {
+                **base,
+                "repaired": [],
+                "verified": [],
+                "reverted": [],
+                "skipped_conflict": [],
+                "dry_run": bool(dry_run),
+                "metrics_after": metrics_before,
+            }
+
+        repaired: list[str] = []
+        skipped_conflict: list[str] = []
+        for item in reconcilable:
             task_id = item["task_id"]
             now = datetime.now(timezone.utc).isoformat()
             cur = conn.execute(
-                "UPDATE tasks SET status='archived', updated_at=? "
+                "UPDATE tasks SET status=?, updated_at=? "
                 "WHERE task_id=? AND COALESCE(archived_at, '') <> '' AND status=?",
-                (now, task_id, item["status"]),
+                (item["target_status"], now, task_id, item["status"]),
             )
             if cur.rowcount != 1:
+                skipped_conflict.append(task_id)
                 continue
             conn.execute(
                 "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
@@ -1117,7 +1387,13 @@ def repair_archive_inconsistencies(
                     task_id,
                     actor,
                     json.dumps(
-                        {"from_status": item["status"], "archived_at": item["archived_at"]},
+                        {
+                            "task_id": task_id,
+                            "from_status": item["status"],
+                            "to_status": item["target_status"],
+                            "archived_at": item["archived_at"],
+                            "evidence": "archive_audit_event_present",
+                        },
                         sort_keys=True,
                     ),
                     now,
@@ -1125,9 +1401,34 @@ def repair_archive_inconsistencies(
             )
             repaired.append(task_id)
         conn.commit()
+
+        verified: list[str] = []
+        reverted: list[str] = []
+        for task_id in repaired:
+            stored = conn.execute(
+                "SELECT status, archived_at FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if (
+                stored is not None
+                and str(stored["archived_at"] or "").strip()
+                and str(stored["status"] or "").strip().lower() in _ARCHIVE_TERMINAL_STATUSES
+            ):
+                verified.append(task_id)
+            else:
+                reverted.append(task_id)
     finally:
         conn.close()
-    return {"detected": detected, "repaired": repaired, "count": len(detected), "dry_run": False}
+
+    metrics_after = archive_inconsistency_report(root)
+    return {
+        **base,
+        "repaired": repaired,
+        "verified": verified,
+        "reverted": reverted,
+        "skipped_conflict": skipped_conflict,
+        "dry_run": False,
+        "metrics_after": metrics_after,
+    }
 
 
 def force_terminalize(
