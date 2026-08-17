@@ -3911,6 +3911,18 @@ def _reviewer_launch_setup(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         process_launcher, "_task_authority_repo", lambda repo, card: repo.resolve()
     )
+    # The reviewer ordering under test is workspace+packet creation, then
+    # authority, then prewarm, then runtime/provider registration -- it is not
+    # host-sandbox selection.  ``_launch_isolated`` resolves the OS sandbox
+    # backend before that ordering, and ``select_sandbox_backend`` legitimately
+    # raises on a host with no bubblewrap/landlock (e.g. macOS CI), aborting the
+    # launch before the ordering runs and leaving ``order`` empty.  Pin a fixed
+    # backend -- an orthogonal dependency like the mocks above -- so the ordering
+    # is exercised identically on every platform, exactly as it already is on
+    # Linux where a real sandbox is present.
+    monkeypatch.setattr(
+        process_launcher, "_sandbox_backend_for_adapter", lambda adapter_id: "bubblewrap"
+    )
     candidate_dir = tmp_path / "candidate"
     candidate_dir.mkdir()
     candidate_home = tmp_path / "candidate_home"

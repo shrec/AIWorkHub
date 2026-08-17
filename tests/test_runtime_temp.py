@@ -115,13 +115,18 @@ def test_owner_alive_live_dead_reused_and_unknown(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(runtime_temp, "_pid_alive", lambda pid: True)
     assert runtime_temp.owner_alive(manifest) is True
 
-    # Dead PID with matching start identity -> dead.
+    # Dead PID with matching start identity -> dead.  The reuse check reads the
+    # current start ticks through the single cross-platform seam
+    # ``process_start_ticks`` (Linux /proc, Darwin sysctl, Windows
+    # GetProcessTimes); mocking the Linux-only ``_proc_stat_starttime`` would
+    # leave that seam live on macOS/Windows, where a fake low PID resolves to a
+    # real or absent process and the assertion becomes platform-dependent.
     monkeypatch.setattr(runtime_temp, "_pid_alive", lambda pid: False)
-    monkeypatch.setattr(runtime_temp, "_proc_stat_starttime", lambda pid: 111)
+    monkeypatch.setattr(runtime_temp, "process_start_ticks", lambda pid: 111)
     assert runtime_temp.owner_alive(manifest) is False
 
     # Dead PID but start identity mismatch (PID reuse) -> fail closed (live).
-    monkeypatch.setattr(runtime_temp, "_proc_stat_starttime", lambda pid: 999)
+    monkeypatch.setattr(runtime_temp, "process_start_ticks", lambda pid: 999)
     assert runtime_temp.owner_alive(manifest) is True
 
     # Unknown owner (no pid) -> never deleted.
@@ -143,7 +148,9 @@ def test_identify_dead_owner_dirs_skips_live_and_unknown(
     unknown.mkdir(parents=True)  # no owner manifest -> never deleted
 
     monkeypatch.setattr(runtime_temp, "_pid_alive", lambda pid: {111: True, 222: False}.get(pid))
-    monkeypatch.setattr(runtime_temp, "_proc_stat_starttime", lambda pid: pid)
+    # Mock the cross-platform identity seam, not the Linux-only /proc reader, so
+    # the reuse check is deterministic on Linux, macOS and Windows alike.
+    monkeypatch.setattr(runtime_temp, "process_start_ticks", lambda pid: pid)
 
     dead_dirs = runtime_temp.identify_dead_owner_dirs(repo)
     paths = {Path(item["path"]) for item in dead_dirs}
@@ -214,7 +221,9 @@ def test_enforce_gc_removes_only_exact_dead_owner_temp_dirs(
     unknown.mkdir(parents=True)
 
     monkeypatch.setattr(runtime_temp, "_pid_alive", lambda pid: {111: True, 222: False}.get(pid))
-    monkeypatch.setattr(runtime_temp, "_proc_stat_starttime", lambda pid: pid)
+    # Mock the cross-platform identity seam, not the Linux-only /proc reader, so
+    # the GC reclaims only provably-dead owners identically on every platform.
+    monkeypatch.setattr(runtime_temp, "process_start_ticks", lambda pid: pid)
 
     result = terminal_log_retention.enforce(repo)
     assert result["ok"] is True
