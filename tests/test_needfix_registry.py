@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import needfix_store, task_store
+from aiworkhub import needfix_ingest, needfix_store, task_store
 
 
 @pytest.fixture
@@ -908,7 +908,7 @@ class TestNeedFixConversionPublicPlanContract:
 
 class TestLinkExistingTask:
     """Explicit manager-only link of a NeedFix to an already-existing,
-    same-repository, manager-accepted, finished canonical task."""
+    same-repository, manager-accepted canonical task (in-flight or landed)."""
 
     def _tasks(self, **tasks):
         store = dict(tasks)
@@ -994,27 +994,113 @@ class TestLinkExistingTask:
                 init_store, r["id"], "totally-fabricated-id", get_task_fn, status_fn
             )
 
-    def test_link_existing_task_unfinished_fails_closed(self, init_store: Path):
+    def test_link_existing_task_processing_is_owned_not_closed(self, init_store: Path):
+        """Moved to the derived-state contract (was ``unfinished_fails_closed``).
+
+        BEFORE: linking to a ``processing`` (unfinished) task raised
+        ``NeedFixConflictError`` and the NeedFix stayed ``accepted``. Refusing
+        to link to anything unfinished was the only guard against a NeedFix
+        that silently looked handled forever when its card never landed.
+
+        NOW: linking to a ``processing`` card succeeds. The record's derived
+        state is OWNED (hidden from the active list) and NOT CLOSED, and
+        cancelling that card returns the record to the active list.
+
+        PROTECTION NOW CARRIED BY:
+        ``test_owned_status_is_hidden`` in tests/test_needfix_store.py (an
+        in-flight card derives to OWNED, not CLOSED), and
+        ``test_active_listing_excludes_owned_and_closed`` /
+        ``test_active_state_is_derived_at_read_time_and_self_heals`` in
+        tests/test_needfix_active_state_derived_from_card.py (owned records are
+        hidden; a cancelled card re-enters the active list).
+        """
         r = self._accepted_needfix(init_store)
         get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "processing"}})
-        with pytest.raises(needfix_store.NeedFixConflictError):
-            needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+        result = needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", get_task_fn, status_fn
+        )
+        assert result["converted_task_id"] == "task-1"
         nr = needfix_store.get_needfix(init_store, r["id"])
-        assert nr["status"] == "accepted"  # compensated back
+        assert nr["status"] == "task_created"
+        assert nr["converted_task_id"] == "task-1"
 
-    def test_link_existing_task_unaccepted_review_fails_closed(self, init_store: Path):
+        derived = needfix_store.list_needfix(
+            init_store, get_task_fn=get_task_fn, canonical_status_fn=status_fn
+        )
+        row = [d for d in derived if d["id"] == r["id"]][0]
+        assert row["derived_state"] == "owned"
+        assert row["derived_state"] != "closed"
+        assert row["active"] is False
+
+        # Cancelling the owning card returns the record to the active list.
+        cancelled_get, cancelled_status = self._tasks(**{"task-1": {"status": "cancelled"}})
+        active = needfix_store.list_active_needfix(
+            init_store, get_task_fn=cancelled_get, canonical_status_fn=cancelled_status
+        )
+        assert r["id"] in {i["id"] for i in active["items"]}
+
+    def test_link_existing_task_review_is_owned_not_closed(self, init_store: Path):
+        """Moved to the derived-state contract (was ``unaccepted_review_fails_closed``).
+
+        BEFORE: linking to a ``review`` (unaccepted) task raised
+        ``NeedFixConflictError``. Same protection as the ``processing`` case:
+        an unfinished card could never be linked, so a NeedFix could not sit
+        silently handled forever.
+
+        NOW: linking to a ``review`` card succeeds and derives OWNED (not
+        CLOSED), so it is hidden from the active list only while the review
+        card is still in flight.
+
+        PROTECTION NOW CARRIED BY:
+        ``test_owned_status_is_hidden`` in tests/test_needfix_store.py and
+        ``test_active_listing_excludes_owned_and_closed`` in
+        tests/test_needfix_active_state_derived_from_card.py.
+        """
         r = self._accepted_needfix(init_store)
         get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "review"}})
-        with pytest.raises(needfix_store.NeedFixConflictError):
-            needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+        result = needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", get_task_fn, status_fn
+        )
+        assert result["converted_task_id"] == "task-1"
 
-    def test_link_existing_task_archived_without_acceptance_fails_closed(self, init_store: Path):
+        derived = needfix_store.list_needfix(
+            init_store, get_task_fn=get_task_fn, canonical_status_fn=status_fn
+        )
+        row = [d for d in derived if d["id"] == r["id"]][0]
+        assert row["derived_state"] == "owned"
+        assert row["derived_state"] != "closed"
+        assert row["active"] is False
+
+    def test_link_existing_task_archived_is_closed(self, init_store: Path):
+        """Moved to the derived-state contract (was ``archived_without_acceptance_fails_closed``).
+
+        BEFORE: linking to an ``archived`` (never-accepted) card raised
+        ``NeedFixConflictError``. The guard was that a card which never landed
+        its fix could not look handled.
+
+        NOW: linking to an ``archived`` card succeeds; the record's derived
+        state is CLOSED (the fix is recorded as landed, so it stays hidden).
+
+        PROTECTION NOW CARRIED BY:
+        ``test_closed_status_is_hidden_as_fixed`` in tests/test_needfix_store.py
+        (archived derives to CLOSED) and
+        ``test_active_listing_excludes_owned_and_closed`` in
+        tests/test_needfix_active_state_derived_from_card.py (closed records
+        are excluded from the active list).
+        """
         r = self._accepted_needfix(init_store)
         get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "archived"}})
-        with pytest.raises(needfix_store.NeedFixConflictError):
-            needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
-        nr = needfix_store.get_needfix(init_store, r["id"])
-        assert nr["status"] == "accepted"  # compensated back
+        result = needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", get_task_fn, status_fn
+        )
+        assert result["converted_task_id"] == "task-1"
+
+        derived = needfix_store.list_needfix(
+            init_store, get_task_fn=get_task_fn, canonical_status_fn=status_fn
+        )
+        row = [d for d in derived if d["id"] == r["id"]][0]
+        assert row["derived_state"] == "closed"
+        assert row["active"] is False
 
     def test_link_existing_task_captured_cannot_link(self, init_store: Path):
         r = needfix_store.capture_proposal(init_store, title="T", description="D")
@@ -1761,3 +1847,115 @@ class TestInitializationIdempotent:
             result = needfix_store.initialize_repository(repo)
             assert result["initialized"] is True
             assert result["existing_count"] == 0
+
+
+class TestActiveListingProductionWiring:
+    """End-to-end: the production entry points derive by DEFAULT.
+
+    These tests go through ``needfix_ingest.list_active`` / ``count_active``
+    exactly as an operator would -- supplying NO hooks -- against a real
+    canonical task store. A test that called ``needfix_store.list_needfix``
+    with hooks already passed on the predecessor and did not catch that the
+    production caller supplied none; this drives the real entry point instead.
+    """
+
+    def _insert_task(self, repo: Path, task_id: str, status: str) -> None:
+        db = task_store.canonical_db_path(repo)
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute(
+                "INSERT INTO tasks (task_id, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, status, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _link(self, repo: Path, title: str, task_id: str) -> str:
+        rec = needfix_store.capture_proposal(repo, title=title, description=title)
+        conn = sqlite3.connect(str(needfix_store._db_path(repo)))
+        try:
+            conn.execute(
+                "UPDATE needfix SET converted_task_id = ?, status = 'task_created' "
+                "WHERE id = ?",
+                (task_id, rec["id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return rec["id"]
+
+    def test_list_active_derives_by_default_through_ingest_entry_point(
+        self, tmp_path: Path
+    ):
+        task_store.initialize_repository(tmp_path)
+        # A landed fix: the linked card is finished -> the record is CLOSED.
+        self._insert_task(tmp_path, "T-fin", "finished")
+        landed = self._link(tmp_path, "already-landed", "T-fin")
+        # A real, current, unowned problem.
+        live = needfix_store.capture_proposal(
+            tmp_path, title="live-problem", description="still open"
+        )["id"]
+
+        report = needfix_ingest.list_active(tmp_path)
+
+        # Derivation ran on the live path without anyone passing hooks.
+        assert report["derived"] is True
+        assert report["underived_reason"] is None
+        ids = {item["id"] for item in report["items"]}
+        # The landed record does NOT appear; the live one does.
+        assert landed not in ids
+        assert live in ids
+        # count agrees with the listed set.
+        assert report["count"] == len(report["items"]) == 1
+
+        # count_active uses the same resolved hooks and agrees with the list.
+        creport = needfix_ingest.count_active(tmp_path)
+        assert creport["derived"] is True
+        assert creport["count"] == report["count"] == 1
+
+    def test_list_and_count_active_agree_under_include_archived_through_ingest(
+        self, tmp_path: Path
+    ):
+        task_store.initialize_repository(tmp_path)
+        self._insert_task(tmp_path, "T-fin", "finished")
+        self._link(tmp_path, "landed-noise", "T-fin")
+        needfix_store.capture_proposal(tmp_path, title="live-1", description="live-1")
+        needfix_store.capture_proposal(tmp_path, title="live-2", description="live-2")
+        needfix_store.add_needfix(
+            tmp_path, title="archived-noise", description="archived", status="archived"
+        )
+
+        for include_archived in (False, True):
+            report = needfix_ingest.list_active(
+                tmp_path, include_archived=include_archived,
+                limit=needfix_store.MAX_LIST_LIMIT,
+            )
+            creport = needfix_ingest.count_active(
+                tmp_path, include_archived=include_archived
+            )
+            # Same set on every axis the listing honours, include_archived too.
+            assert report["derived"] is creport["derived"] is True
+            assert report["count"] == len(report["items"]) == 2, include_archived
+            assert creport["count"] == report["count"], include_archived
+
+    def test_active_listing_is_marked_underived_without_a_task_store(
+        self, tmp_path: Path
+    ):
+        # NeedFix store only; no canonical task store to derive linked-card state.
+        needfix_store.initialize_repository(tmp_path)
+        needfix_store.capture_proposal(tmp_path, title="orphan", description="orphan")
+
+        report = needfix_ingest.list_active(tmp_path)
+        # Explicitly underived: not silently presented as an authoritative set.
+        assert report["derived"] is False
+        assert report["underived_reason"]
+        assert report["count"] is None
+        # The raw rows are still surfaced so the operator is not left blind.
+        assert report["items"]
+
+        creport = needfix_ingest.count_active(tmp_path)
+        assert creport["derived"] is False
+        assert creport["underived_reason"]
+        assert creport["count"] is None

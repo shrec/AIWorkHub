@@ -5920,6 +5920,47 @@ def _needfix_store_module():
     return needfix_store
 
 
+def _needfix_ingest_module():
+    from . import needfix_ingest
+
+    return needfix_ingest
+
+
+class NeedfixListing(list):
+    """A NeedFix listing that also states whether read-time derivation ran.
+
+    Subclasses ``list`` so every existing caller -- the ``needfix_list`` MCP
+    tool typed ``list[dict]`` and the dashboard webview that iterates the rows
+    -- keeps working unchanged, while ``derived``/``underived_reason`` tell a
+    caller when the linked-card active state could NOT be resolved (no ready
+    task store) instead of passing raw stored rows off as an authoritative
+    active set. See ``needfix_store.ACTIVE_STATE_DEFINITION``.
+    """
+
+    __slots__ = ("derived", "underived_reason")
+
+    def __init__(self, items, *, derived: bool, underived_reason: str | None):
+        super().__init__(items)
+        self.derived = bool(derived)
+        self.underived_reason = underived_reason
+
+
+class NeedfixCount(int):
+    """A NeedFix count that also states whether read-time derivation ran.
+
+    Subclasses ``int`` so the ``needfix_count`` MCP tool typed ``-> int`` and
+    every arithmetic caller keep working, while ``derived``/``underived_reason``
+    distinguish a derived active count from a raw fallback total taken when no
+    ready task store could resolve the linked-card state.
+    """
+
+    def __new__(cls, value: int, *, derived: bool, underived_reason: str | None):
+        obj = super().__new__(cls, int(value))
+        obj.derived = bool(derived)
+        obj.underived_reason = underived_reason
+        return obj
+
+
 def needfix_list(
     status: str | None = None,
     kind: str | None = None,
@@ -5929,18 +5970,54 @@ def needfix_list(
     offset: int = 0,
     order_by: str = "created_at",
     order_dir: str = "DESC",
-) -> list[dict[str, Any]]:
-    ns = _needfix_store_module()
-    return ns.list_needfix(
+) -> "NeedfixListing":
+    """Operator-facing NeedFix listing, derived at read time by default.
+
+    Routes through ``needfix_ingest.list_active`` so a record whose linked card
+    has landed (or is owned by an in-flight task) is hidden without any caller
+    remembering to pass task-store hooks -- derivation is the default door, not
+    an opt-in a surface can forget. The return is a ``list`` subclass so the
+    ``needfix_list`` MCP tool and the dashboard webview keep receiving an
+    iterable list of rows, while ``derived``/``underived_reason`` on it say when
+    the active state could not be resolved (no ready task store) rather than
+    silently presenting raw rows as an authoritative active set.
+
+    An explicit ``status``/``kind``/``severity`` filter is a raw field browse
+    (a terminal status is never in the derived active set), so it returns the
+    raw filtered rows marked ``derived=False`` -- not silently, the reason says
+    so -- rather than an empty derived page.
+    """
+    if status is not None or kind is not None or severity is not None:
+        ns = _needfix_store_module()
+        rows = ns.list_needfix(
+            repo_root(),
+            status=status,
+            kind=kind,
+            severity=severity,
+            include_archived=include_archived,
+            limit=limit,
+            offset=offset,
+            order_by=order_by,
+            order_dir=order_dir,
+        )
+        return NeedfixListing(
+            rows,
+            derived=False,
+            underived_reason="explicit_status_kind_severity_filter_returns_raw_rows",
+        )
+    ni = _needfix_ingest_module()
+    report = ni.list_active(
         repo_root(),
-        status=status,
-        kind=kind,
-        severity=severity,
         include_archived=include_archived,
         limit=limit,
         offset=offset,
         order_by=order_by,
         order_dir=order_dir,
+    )
+    return NeedfixListing(
+        report["items"],
+        derived=report.get("derived", False),
+        underived_reason=report.get("underived_reason"),
     )
 
 
@@ -6108,9 +6185,34 @@ def needfix_purge(needfix_id: str, audit_reason: str) -> dict[str, Any]:
     return ns.purge_needfix(repo_root(), needfix_id, audit_reason=audit_reason)
 
 
-def needfix_count(status: str | None = None, kind: str | None = None, severity: str | None = None) -> int:
-    ns = _needfix_store_module()
-    return ns.count_needfix(repo_root(), status=status, kind=kind, severity=severity)
+def needfix_count(status: str | None = None, kind: str | None = None, severity: str | None = None) -> "NeedfixCount":
+    """Operator-facing NeedFix count, derived at read time by default.
+
+    Uses ``needfix_ingest.count_active`` -- the same resolved hooks and default
+    filter as :func:`needfix_list` -- so the derived count and the derived list
+    describe the same active set. An explicit ``status``/``kind``/``severity``
+    filter is a raw field browse and returns the raw count marked
+    ``derived=False``. When no ready task store can resolve the linked-card
+    state the count is the raw total, marked underived (with a reason) so it is
+    never mistaken for an authoritative active count.
+    """
+    if status is not None or kind is not None or severity is not None:
+        ns = _needfix_store_module()
+        raw = ns.count_needfix(repo_root(), status=status, kind=kind, severity=severity)
+        return NeedfixCount(
+            raw,
+            derived=False,
+            underived_reason="explicit_status_kind_severity_filter_returns_raw_rows",
+        )
+    ni = _needfix_ingest_module()
+    report = ni.count_active(repo_root())
+    if report.get("count") is None:
+        return NeedfixCount(
+            report.get("raw_total") or 0,
+            derived=False,
+            underived_reason=report.get("underived_reason"),
+        )
+    return NeedfixCount(report["count"], derived=True, underived_reason=None)
 
 
 def needfix_events(needfix_id: str, limit: int = 100) -> list[dict[str, Any]]:

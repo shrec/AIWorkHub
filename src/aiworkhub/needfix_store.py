@@ -129,6 +129,83 @@ MAX_ID_SEQUENCE = 99999
 # link is recorded once; its exact count drives reopen_generation derivation.
 REOPEN_EVENT = "superseded_task_link_reopened"
 
+# ---------------------------------------------------------------------------
+# Derived ACTIVE state (read-time, never persisted).
+#
+# The NeedFix active view is DERIVED at read time from the linked task card's
+# current canonical status. Nothing here synchronises card status into the
+# NeedFix store: there is deliberately no background daemon, queue or repair
+# step, so the two stores cannot drift apart. A card cancelled at 3am puts its
+# NeedFix back on the active list on the very next read -- self-healing by
+# construction.
+# ---------------------------------------------------------------------------
+
+# --- Inner layer: the linked task CARD's canonical status buckets -----------
+# Canonical card statuses whose task still owns the problem -> hidden (owned).
+OWNED_CARD_STATUSES: frozenset[str] = frozenset(
+    ("pending", "processing", "review", "blocked")
+)
+
+# Canonical card statuses whose fix has landed -> hidden, recorded as fixed.
+CLOSED_CARD_STATUSES: frozenset[str] = frozenset(
+    ("finished", "archived", "accepted", "closed", "done")
+)
+
+# Canonical card statuses whose owning task died -> ACTIVE AGAIN unless a
+# successor landed the fix.
+REOPEN_CARD_STATUSES: frozenset[str] = frozenset(
+    ("superseded", "cancelled", "canceled")
+)
+
+# Card statuses a manager may link an existing NeedFix to after the fact.
+LINKABLE_CARD_STATUSES: frozenset[str] = OWNED_CARD_STATUSES | CLOSED_CARD_STATUSES
+
+# --- Outer layer: the NeedFix's OWN lifecycle status decides first ----------
+# A NeedFix that is itself terminal is a decided non-problem (rejected /
+# duplicate) or an already-recorded closure (resolved / archived). It is never
+# active, regardless of any linked card, and the card lookup NEVER runs for it.
+NEEDFIX_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    ("rejected", "duplicate", "resolved", "archived")
+)
+
+# Every remaining status the table can hold -- including the transient
+# ``converting`` -- defers to the card status buckets above. Enumerated
+# explicitly so that a status nobody thought about is NOT silently treated as
+# ACTIVE: an unrecognised NeedFix status fails closed off the active list.
+NEEDFIX_CARD_DERIVED_STATUSES: frozenset[str] = frozenset(
+    (
+        "captured",
+        "triaged",
+        "accepted",
+        "deferred",
+        "task_planned",
+        "task_created",
+        "converting",
+    )
+)
+
+# Derived states a row may resolve to at read time.
+ACTIVE_STATES: tuple[str, ...] = ("active", "owned", "closed", "reopened", "unknown")
+
+
+def _fmt_statuses(statuses: frozenset[str]) -> str:
+    return ", ".join(sorted(statuses))
+
+
+# ACTIVE_STATE_DEFINITION is DERIVED from the status buckets (not restated), so
+# the human-readable contract cannot drift from the behaviour it describes.
+ACTIVE_STATE_DEFINITION = (
+    "A NeedFix is ACTIVE only when its OWN status is not terminal (terminal: "
+    f"{_fmt_statuses(NEEDFIX_TERMINAL_STATUSES)}) and its linked task card is "
+    "empty, names a card that no longer exists, or names a card whose "
+    "canonical status leaves the problem live. It is OWNED (hidden from the "
+    f"active list) while the card status is one of {_fmt_statuses(OWNED_CARD_STATUSES)}. "
+    "It is CLOSED (hidden, recorded as fixed) while the card status is one of "
+    f"{_fmt_statuses(CLOSED_CARD_STATUSES)}, or was superseded/cancelled with a "
+    "successor that landed. It is ACTIVE AGAIN (reopened) while the card status "
+    f"is one of {_fmt_statuses(REOPEN_CARD_STATUSES)} without a landed successor."
+)
+
 
 class NeedFixError(Exception):
     """Base error for NeedFix registry operations."""
@@ -448,6 +525,150 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _safe_get_task(
+    get_task_fn: Callable[[str], Mapping[str, Any] | None], task_id: str
+) -> Mapping[str, Any] | None:
+    try:
+        return get_task_fn(task_id)
+    except Exception:
+        # A dangling or transient lookup failure must never strand a live
+        # problem; callers treat None as "no longer exists" -> ACTIVE.
+        return None
+
+
+def _superseded_by(task: Mapping[str, Any] | None) -> str:
+    if not isinstance(task, Mapping):
+        return ""
+    return str(task.get("superseded_by") or "").strip()
+
+
+def _successor_landed(
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+    successor_id: str,
+) -> bool:
+    if not successor_id:
+        return False
+    successor = _safe_get_task(get_task_fn, successor_id)
+    if successor is None:
+        return False
+    try:
+        return canonical_status_fn(successor) in CLOSED_CARD_STATUSES
+    except Exception:
+        return False
+
+
+def derive_active_state(
+    needfix_row: Mapping[str, Any],
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+) -> dict[str, Any]:
+    """Derive a NeedFix's ACTIVE state at read time from its linked task card.
+
+    Returns ``{"state": str, "active": bool, "reason": str | None}`` where
+    ``state`` is one of ``active``, ``owned``, ``closed``, ``reopened`` or
+    ``unknown``. See ``ACTIVE_STATE_DEFINITION`` for the exact rule.
+
+    The derivation has two layers, and the NeedFix's OWN status is the OUTER
+    one: a record that is itself terminal (rejected/duplicate/resolved/
+    archived) is never active, whatever any linked card says, and the card
+    lookup does not run for it. Only for a record that is not itself terminal do
+    the linked card's status buckets decide.
+    """
+    needfix_status = str(needfix_row.get("status") or "").strip()
+
+    # OUTER layer: a terminal NeedFix is a decided non-problem -- never active,
+    # regardless of any card, and we do NOT look the card up.
+    if needfix_status in NEEDFIX_TERMINAL_STATUSES:
+        return {
+            "state": "closed",
+            "active": False,
+            "reason": f"needfix own status {needfix_status!r} is terminal",
+        }
+    # A non-empty status that is neither terminal nor explicitly card-derived
+    # must fail closed OFF the active list -- a status nobody thought about is
+    # never silently treated as ACTIVE.
+    if needfix_status and needfix_status not in NEEDFIX_CARD_DERIVED_STATUSES:
+        return {
+            "state": "unknown",
+            "active": False,
+            "reason": (
+                f"needfix own status {needfix_status!r} is not a recognised "
+                "lifecycle status; failing closed off the active list"
+            ),
+        }
+
+    # INNER layer: for a non-terminal record the linked card's status decides.
+    converted_task_id = str(needfix_row.get("converted_task_id") or "").strip()
+    if not converted_task_id:
+        return {"state": "active", "active": True, "reason": None}
+
+    task = _safe_get_task(get_task_fn, converted_task_id)
+    if task is None:
+        return {
+            "state": "active",
+            "active": True,
+            "reason": f"linked task {converted_task_id!r} no longer exists",
+        }
+
+    try:
+        card_status = canonical_status_fn(task)
+    except Exception:
+        card_status = ""
+
+    if card_status in OWNED_CARD_STATUSES:
+        return {
+            "state": "owned",
+            "active": False,
+            "reason": f"owned by {card_status} task {converted_task_id!r}",
+        }
+    if card_status in CLOSED_CARD_STATUSES:
+        return {
+            "state": "closed",
+            "active": False,
+            "reason": f"fixed by {card_status} task {converted_task_id!r}",
+        }
+    if card_status in REOPEN_CARD_STATUSES:
+        successor_id = _superseded_by(task)
+        if _successor_landed(get_task_fn, canonical_status_fn, successor_id):
+            return {
+                "state": "closed",
+                "active": False,
+                "reason": (
+                    f"task {converted_task_id!r} was {card_status}; successor "
+                    f"{successor_id!r} landed the fix"
+                ),
+            }
+        return {
+            "state": "reopened",
+            "active": True,
+            "reason": (
+                f"task {converted_task_id!r} was {card_status} without a "
+                "landed successor; the problem is live again"
+            ),
+        }
+    return {
+        "state": "active",
+        "active": True,
+        "reason": (
+            f"task {converted_task_id!r} has unrecognised canonical status "
+            f"{card_status!r}; failing safe to active"
+        ),
+    }
+
+
+def _decorate_derived(
+    record: dict[str, Any],
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+) -> dict[str, Any]:
+    derived = derive_active_state(record, get_task_fn, canonical_status_fn)
+    record["derived_state"] = derived["state"]
+    record["active"] = derived["active"]
+    record["active_reason"] = derived["reason"]
+    return record
+
+
 def _check_duplicate_cycle(
     conn: sqlite3.Connection, needfix_id: str, proposed_parent_id: str
 ) -> None:
@@ -688,18 +909,37 @@ def list_needfix(
     offset: int = 0,
     order_by: str = "created_at",
     order_dir: str = "DESC",
+    get_task_fn: Callable[[str], Mapping[str, Any] | None] | None = None,
+    canonical_status_fn: Callable[[Mapping[str, Any]], str] | None = None,
+    active_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Bounded list with filters and pagination.
 
     Filters: status, kind, severity, include_archived.
     Pagination: limit (1-500), offset (>= 0).
     Ordering: created_at or updated_at, ASC or DESC.
+
+    Derived ACTIVE state (read-time, never persisted): when both
+    ``get_task_fn`` and ``canonical_status_fn`` are supplied every record is
+    annotated with ``derived_state``, ``active`` and ``active_reason``
+    computed from the linked task card's current canonical status. With
+    ``active_only=True`` only ACTIVE records are returned. The active
+    definition is ``ACTIVE_STATE_DEFINITION``.
     """
     bounded_limit = max(1, min(int(limit), MAX_LIST_LIMIT))
     if order_by not in ("created_at", "updated_at"):
         order_by = "created_at"
     if order_dir.upper() not in ("ASC", "DESC"):
         order_dir = "DESC"
+    derive = get_task_fn is not None and canonical_status_fn is not None
+    if (get_task_fn is None) != (canonical_status_fn is None):
+        raise NeedFixValidationError(
+            "get_task_fn and canonical_status_fn must be supplied together"
+        )
+    if active_only and not derive:
+        raise NeedFixValidationError(
+            "active_only requires both get_task_fn and canonical_status_fn"
+        )
     conn = _connect(repo_root)
     try:
         clauses: list[str] = []
@@ -716,6 +956,39 @@ def list_needfix(
             clauses.append("severity = ?")
             params.append(severity)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        if derive:
+            if active_only:
+                # Active-only cannot be filtered in SQL (active is derived), so
+                # stream rows and decorate lazily, stopping as soon as the page
+                # is full. This bounds the work to finding ``offset + limit``
+                # active records instead of decorating every filtered row.
+                start = max(0, int(offset))
+                needed = start + bounded_limit
+                active_rows: list[dict[str, Any]] = []
+                cursor = conn.execute(
+                    f"SELECT * FROM needfix {where} ORDER BY {order_by} {order_dir}",
+                    params,
+                )
+                for r in cursor:
+                    if len(active_rows) >= needed:
+                        break
+                    decorated = _decorate_derived(
+                        _row_to_dict(r), get_task_fn, canonical_status_fn
+                    )
+                    if decorated["active"]:
+                        active_rows.append(decorated)
+                return active_rows[start:needed]
+            # Pure annotation: paginate in SQL first, then decorate only the
+            # requested page, so the page size bounds the lookups too.
+            rows = conn.execute(
+                f"SELECT * FROM needfix {where} ORDER BY {order_by} {order_dir} "
+                f"LIMIT ? OFFSET ?",
+                (*params, bounded_limit, max(0, int(offset))),
+            ).fetchall()
+            return [
+                _decorate_derived(_row_to_dict(r), get_task_fn, canonical_status_fn)
+                for r in rows
+            ]
         rows = conn.execute(
             f"SELECT * FROM needfix {where} ORDER BY {order_by} {order_dir} LIMIT ? OFFSET ?",
             (*params, bounded_limit, max(0, int(offset))),
@@ -1121,7 +1394,31 @@ def count_needfix(
     status: str | None = None,
     kind: str | None = None,
     severity: str | None = None,
+    include_archived: bool = False,
+    get_task_fn: Callable[[str], Mapping[str, Any] | None] | None = None,
+    canonical_status_fn: Callable[[Mapping[str, Any]], str] | None = None,
+    active_only: bool = False,
 ) -> int:
+    """Count records; agrees with ``list_needfix`` on the ACTIVE definition.
+
+    Without derivation this counts raw store rows exactly as before. With both
+    ``get_task_fn`` and ``canonical_status_fn`` plus ``active_only=True`` it
+    counts only records whose derived state is ACTIVE -- the same set that
+    ``list_needfix(..., active_only=True)`` returns. ``include_archived``
+    mirrors ``list_needfix``'s own filter exactly (honoured only when no
+    explicit ``status`` is given), so the count and the list scan the same
+    candidate set under every filter the listing honours. See
+    ``ACTIVE_STATE_DEFINITION``.
+    """
+    derive = get_task_fn is not None and canonical_status_fn is not None
+    if (get_task_fn is None) != (canonical_status_fn is None):
+        raise NeedFixValidationError(
+            "get_task_fn and canonical_status_fn must be supplied together"
+        )
+    if active_only and not derive:
+        raise NeedFixValidationError(
+            "active_only requires both get_task_fn and canonical_status_fn"
+        )
     conn = _connect(repo_root)
     try:
         clauses: list[str] = []
@@ -1129,7 +1426,7 @@ def count_needfix(
         if status is not None:
             clauses.append("status = ?")
             params.append(status)
-        else:
+        elif not include_archived:
             clauses.append("status != 'archived'")
         if kind is not None:
             clauses.append("kind = ?")
@@ -1138,10 +1435,113 @@ def count_needfix(
             clauses.append("severity = ?")
             params.append(severity)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        if derive and active_only:
+            rows = conn.execute(f"SELECT * FROM needfix {where}", params).fetchall()
+            return sum(
+                1
+                for r in rows
+                if derive_active_state(
+                    _row_to_dict(r), get_task_fn, canonical_status_fn
+                )["active"]
+            )
         row = conn.execute(f"SELECT COUNT(*) AS n FROM needfix {where}", params).fetchone()
         return int(row["n"])
     finally:
         conn.close()
+
+
+def _raw_total_rows(repo_root: str | Path) -> int:
+    """Total rows in the store, including archived -- the pre-fix table size."""
+    conn = _connect(repo_root)
+    try:
+        row = conn.execute("SELECT COUNT(*) AS n FROM needfix").fetchone()
+        return int(row["n"])
+    finally:
+        conn.close()
+
+
+def list_active_needfix(
+    repo_root: str | Path,
+    *,
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+    include_archived: bool = False,
+    limit: int = DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+    order_by: str = "created_at",
+    order_dir: str = "DESC",
+) -> dict[str, Any]:
+    """Read-time ACTIVE view derived from each linked card's current status.
+
+    Returns a report object whose ``definition`` states the active rule,
+    whose ``items`` are the requested bounded page of active records, and
+    whose ``count`` is the full active total computed independently of
+    pagination (equal to ``count_active_needfix`` at every store size). There
+    is no background synchronisation, daemon or repair step: state is
+    re-derived on every read and self-heals when a card status changes.
+    """
+    items = list_needfix(
+        repo_root,
+        include_archived=include_archived,
+        limit=limit,
+        offset=offset,
+        order_by=order_by,
+        order_dir=order_dir,
+        get_task_fn=get_task_fn,
+        canonical_status_fn=canonical_status_fn,
+        active_only=True,
+    )
+    # The count is derived independently of pagination so it agrees with
+    # ``count_active_needfix`` at every store size; ``items`` is the bounded
+    # page, not the full active set. ``include_archived`` is forwarded so the
+    # count honours the exact same filter the items page does -- otherwise the
+    # two would describe different candidate sets under include_archived=True.
+    active_count = count_needfix(
+        repo_root,
+        include_archived=include_archived,
+        get_task_fn=get_task_fn,
+        canonical_status_fn=canonical_status_fn,
+        active_only=True,
+    )
+    return {
+        "definition": ACTIVE_STATE_DEFINITION,
+        "derivation": "read_time_from_linked_card",
+        "no_synchronisation": True,
+        "raw_total": _raw_total_rows(repo_root),
+        "before": count_needfix(repo_root),
+        "after": active_count,
+        "count": active_count,
+        "items": items,
+    }
+
+
+def count_active_needfix(
+    repo_root: str | Path,
+    *,
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+) -> dict[str, Any]:
+    """Count of ACTIVE records, stated with the same definition as the list.
+
+    ``count_needfix`` and ``list_needfix`` agree on this exact definition. The
+    count here is the full total, computed independently of pagination, and
+    equals ``list_active_needfix(...)["count"]`` at every store size.
+    """
+    active_count = count_needfix(
+        repo_root,
+        get_task_fn=get_task_fn,
+        canonical_status_fn=canonical_status_fn,
+        active_only=True,
+    )
+    return {
+        "definition": ACTIVE_STATE_DEFINITION,
+        "derivation": "read_time_from_linked_card",
+        "no_synchronisation": True,
+        "raw_total": _raw_total_rows(repo_root),
+        "before": count_needfix(repo_root),
+        "after": active_count,
+        "count": active_count,
+    }
 
 
 def list_events(
@@ -1623,8 +2023,10 @@ def link_existing_task(
       race or the row is not claimable -- fails closed.
     - The candidate task identity is verified only after the claim, against
       a stable snapshot: missing/foreign/fabricated ids (``get_task_fn``
-      returns ``None``) and ids that are not manager-accepted-and-finished
-      (``canonical_status_fn`` result != ``"finished"``) both fail closed.
+      returns ``None``) and ids whose canonical status is not linkable
+      (``canonical_status_fn`` result not in ``LINKABLE_CARD_STATUSES``)
+      both fail closed. This makes after-the-fact linking possible for tasks
+      created outside ``convert_needfix`` (e.g. via ``task_create`` directly).
     - On any verification failure the claim is compensated back to its
       original status so the NeedFix is never stranded as ``task_created``
       without a real linked task.
@@ -1700,45 +2102,22 @@ def link_existing_task(
                 f"existing task {existing_task_id!r} not found in this repository"
             )
         task_status = canonical_status_fn(task)
-        if task_status != "finished":
+        if task_status not in LINKABLE_CARD_STATUSES:
+            linkable = ", ".join(sorted(LINKABLE_CARD_STATUSES))
             raise NeedFixConflictError(
-                f"existing task {existing_task_id!r} is not manager-accepted "
-                f"and finished (canonical status is {task_status!r})"
+                f"existing task {existing_task_id!r} is not linkable "
+                f"(canonical status is {task_status!r}; linkable statuses are "
+                f"{linkable})"
             )
     except Exception:
-        conn = _connect(repo_root)
-        try:
-            conn.execute(
-                "UPDATE needfix SET status = ?, updated_at = ? "
-                "WHERE id = ? AND status = 'converting'",
-                (prior_status, _utcnow_iso(), needfix_id),
-            )
-            _record_event(
-                conn, needfix_id, "existing_task_link_compensated",
-                {"restored_status": prior_status},
-            )
-        finally:
-            conn.close()
+        # Reuse the shared claim-compensation SQL rather than re-implementing
+        # it -- one code path, so the two conversion routes cannot diverge.
+        _compensate_conversion_claim(repo_root, needfix_id, prior_status)
         raise
 
-    conn = _connect(repo_root)
-    try:
-        conn.execute(
-            "UPDATE needfix SET status = 'task_created', converted_task_id = ?, "
-            "updated_at = ? WHERE id = ? AND status = 'converting'",
-            (existing_task_id, _utcnow_iso(), needfix_id),
-        )
-        _record_event(
-            conn, needfix_id, "existing_task_linked",
-            {"converted_task_id": existing_task_id},
-        )
-        return {
-            "needfix_id": needfix_id,
-            "converted_task_id": existing_task_id,
-            "already_converted": False,
-        }
-    finally:
-        conn.close()
+    # Reuse the shared conversion-commit SQL: identical ``task_created`` +
+    # ``converted_task_id`` transition as ``convert_needfix``.
+    return _commit_conversion(repo_root, needfix_id, existing_task_id)
 
 
 def reopen_superseded_task_link(
@@ -1827,3 +2206,67 @@ def reopen_superseded_task_link(
         return _row_to_dict(updated)
     finally:
         conn.close()
+
+
+def reconcile_unlinked_needfix(
+    repo_root: str | Path,
+    *,
+    list_task_cards_fn: Callable[[], Sequence[Mapping[str, Any]]],
+    include_archived: bool = False,
+) -> dict[str, Any]:
+    """Read-only reconciliation report for unlinked NeedFix records.
+
+    Lists NeedFix records whose ``id`` appears in a task card's ``id``,
+    ``title`` or ``objective`` yet carry no ``converted_task_id``, and
+    PROPOSES the link rather than performing it. A wrong automatic link is
+    worse than a missing one (it silently closes a live problem), so a manager
+    must confirm each candidate before calling ``link_existing_task``.
+    """
+    cards: Sequence[Mapping[str, Any]] = list_task_cards_fn() or ()
+    conn = _connect(repo_root)
+    try:
+        clause = "" if include_archived else " WHERE status != 'archived'"
+        rows = conn.execute(
+            f"SELECT * FROM needfix{clause} ORDER BY created_at ASC"
+        ).fetchall()
+        records = [_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+    candidates: list[dict[str, Any]] = []
+    for record in records:
+        nfid = str(record.get("id") or "").strip()
+        if not nfid:
+            continue
+        if str(record.get("converted_task_id") or "").strip():
+            continue  # already linked -- not a candidate
+        for card in cards:
+            if not isinstance(card, Mapping):
+                continue
+            card_id = str(card.get("id") or "").strip()
+            title = str(card.get("title") or "")
+            objective = str(card.get("objective") or "")
+            for field, text in (("id", card_id), ("title", title), ("objective", objective)):
+                if nfid in text:
+                    candidates.append(
+                        {
+                            "needfix_id": nfid,
+                            "needfix_title": str(record.get("title") or ""),
+                            "proposed_task_id": card_id or None,
+                            "matched_field": field,
+                            "matched_text": text[:200],
+                            "action": "propose_link",
+                            "auto_linked": False,
+                        }
+                    )
+                    break
+    return {
+        "definition": (
+            "Unlinked NeedFix records whose id appears in a task card's id, "
+            "title or objective are reported as link candidates for explicit "
+            "manager confirmation. Nothing is auto-linked."
+        ),
+        "proposes_only": True,
+        "count": len(candidates),
+        "candidates": candidates,
+    }

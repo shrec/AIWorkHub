@@ -26,6 +26,7 @@ from aiworkhub import (
     cost_ledger,
     dashboard_kpis,
     deepseek_credentials,
+    needfix_ingest,
     needfix_store,
     process_launcher,
     repo_policy,
@@ -2326,15 +2327,20 @@ def _needfix_unavailable() -> dict[str, Any]:
 def _build_needfix_snapshot(repo_root: Path) -> dict[str, Any]:
     """Build a bounded NeedFix snapshot from the canonical store.
 
-    Uses ``needfix_store.list_needfix`` with the correct signature and
-    canonical repository root. No direct SQLite duplication. Returns an
-    explicit loading/error state rather than a false zero on any failure.
-    The error is surfaced in the returned object itself, not in the main
-    errors list, so a NeedFix store failure never degrades the whole
-    dashboard snapshot.
+    Routes through ``needfix_ingest.list_active`` -- the derived-by-default
+    operator entry point -- so the panel shows the read-time active set (a
+    landed/owned record is hidden by its linked card's status) instead of the
+    raw stored list. No hooks are passed by hand: the entry point resolves the
+    canonical task-store hooks itself. ``derived``/``underived_reason`` are
+    carried out to the snapshot so a degraded repo with no ready task store is
+    shown as underived rather than having its stale rows swallowed as an
+    authoritative active set. No direct SQLite duplication. Returns an explicit
+    loading/error state rather than a false zero on any failure; the error is
+    surfaced in the returned object itself, not in the main errors list, so a
+    NeedFix store failure never degrades the whole dashboard snapshot.
     """
     try:
-        rows = needfix_store.list_needfix(
+        report = needfix_ingest.list_active(
             repo_root,
             include_archived=False,
             limit=NEEDFIX_SNAPSHOT_LIMIT,
@@ -2346,6 +2352,7 @@ def _build_needfix_snapshot(repo_root: Path) -> dict[str, Any]:
         result["error"] = str(exc)[:500]
         return result
 
+    rows = report["items"]
     total = len(rows)
     truncated = total >= NEEDFIX_SNAPSHOT_LIMIT
     open_count = sum(
@@ -2356,6 +2363,8 @@ def _build_needfix_snapshot(repo_root: Path) -> dict[str, Any]:
         "schema_id": "aiworkhub.needfix_snapshot.v1",
         "available": True,
         "error": None,
+        "derived": bool(report.get("derived")),
+        "underived_reason": report.get("underived_reason"),
         "open": open_count,
         "total": total,
         "items": [

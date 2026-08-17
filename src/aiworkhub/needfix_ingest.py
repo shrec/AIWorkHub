@@ -219,6 +219,15 @@ def _extract(source_file: str, text: str, source_sha256: str) -> list[dict[str, 
 
 
 def _existing_by_fingerprint(repo: Path) -> dict[str, dict[str, Any]]:
+    # Deliberately UNDERIVED: this is a fingerprint dedup index, not the
+    # operator-facing active list. It must see every stored non-archived
+    # record regardless of its derived active state -- a record whose linked
+    # card has already landed (derived CLOSED) is exactly the one intake must
+    # still recognise so the same finding is not re-created as fresh noise.
+    # Deriving/active-filtering here would drop those landed records and
+    # resurface them, the precise defect this feature removes. Operators read
+    # active state through ``list_active``/``count_active`` (derived by
+    # default); this map stays raw on purpose.
     rows = needfix_store.list_needfix(
         repo, include_archived=False, limit=500, order_by="created_at", order_dir="ASC"
     )
@@ -389,6 +398,143 @@ def commit(
     }
 
 
+# ---------------------------------------------------------------------------
+# Production active-NeedFix surface -- derived by DEFAULT.
+#
+# ``list_needfix``/``count_needfix`` only derive when both task-store hooks are
+# supplied; the sole other in-package caller (``_existing_by_fingerprint``) is a
+# raw dedup index by design. These two entry points close that gap: they resolve
+# the canonical task-store read hooks themselves, so an operator listing/counting
+# the live NeedFix set gets read-time derivation from each linked card without
+# anyone remembering to pass hooks. When the repository has no ready canonical
+# task store to derive against, the result is marked ``derived=False`` with a
+# bounded reason instead of silently presenting stale rows as authoritative.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_active_state_hooks(repo: Path):
+    """Bind the canonical task-store read hooks for read-time active derivation.
+
+    Returns ``(get_task_fn, canonical_status_fn, underived_reason)``. Both hooks
+    are real callables bound to ``repo`` when its canonical task store is ready
+    (``underived_reason`` is ``None``). When no ready task store can resolve a
+    linked card, both hooks are ``None`` and a bounded ``underived_reason`` is
+    returned so the caller can state its result is underived rather than treat
+    every linked record as a live problem by default.
+    """
+    from . import task_store  # lazy: no import-time cost, no import cycle
+
+    try:
+        readiness = task_store.storage_readiness(repo)
+        ready = bool(readiness.ready)
+        reason = str(readiness.reason or "")
+    except Exception as exc:  # storeless/unbootstrapped repo -> underived
+        return None, None, f"task_store_unavailable:{type(exc).__name__}"
+    if not ready:
+        return None, None, f"task_store_not_ready:{reason}"
+
+    def get_task_fn(task_id: str):
+        return task_store.get_task(repo, task_id)
+
+    return get_task_fn, task_store.canonical_status, None
+
+
+def list_active(
+    repo_root: str | Path,
+    *,
+    include_archived: bool = False,
+    limit: int = needfix_store.DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+    order_by: str = "created_at",
+    order_dir: str = "DESC",
+) -> dict[str, Any]:
+    """Operator-facing active NeedFix listing, derived at read time by default.
+
+    Resolves the canonical task-store hooks itself and forwards to
+    ``needfix_store.list_active_needfix`` so a NeedFix whose linked card has
+    landed (or is owned by an in-flight task) is hidden here -- derivation is
+    the default, not an opt-in a caller can forget. ``count`` is the full active
+    total (independent of pagination) and agrees with :func:`count_active` under
+    every filter, ``include_archived`` included.
+
+    When the repository has no ready canonical task store the linked-card state
+    cannot be resolved; the report is marked ``derived=False`` with a bounded
+    ``underived_reason`` and carries the raw (non-derived) rows rather than
+    passing them off as an authoritative active set.
+    """
+    repo = Path(repo_root).resolve()
+    get_task_fn, canonical_status_fn, underived_reason = _resolve_active_state_hooks(repo)
+    if underived_reason is not None:
+        rows = needfix_store.list_needfix(
+            repo,
+            include_archived=include_archived,
+            limit=limit,
+            offset=offset,
+            order_by=order_by,
+            order_dir=order_dir,
+        )
+        return {
+            "derived": False,
+            "underived_reason": underived_reason,
+            "definition": needfix_store.ACTIVE_STATE_DEFINITION,
+            "count": None,
+            "items": rows,
+        }
+    report = needfix_store.list_active_needfix(
+        repo,
+        get_task_fn=get_task_fn,
+        canonical_status_fn=canonical_status_fn,
+        include_archived=include_archived,
+        limit=limit,
+        offset=offset,
+        order_by=order_by,
+        order_dir=order_dir,
+    )
+    report["derived"] = True
+    report["underived_reason"] = None
+    return report
+
+
+def count_active(
+    repo_root: str | Path,
+    *,
+    include_archived: bool = False,
+) -> dict[str, Any]:
+    """Operator-facing active NeedFix count, derived at read time by default.
+
+    Uses the exact same resolved hooks and ``include_archived`` filter as
+    :func:`list_active`, so the count and the list describe the same set on
+    every axis (the count/list disagreement this closes). Underived (marked,
+    never silently authoritative) when the repository has no ready task store.
+    """
+    repo = Path(repo_root).resolve()
+    get_task_fn, canonical_status_fn, underived_reason = _resolve_active_state_hooks(repo)
+    if underived_reason is not None:
+        return {
+            "derived": False,
+            "underived_reason": underived_reason,
+            "definition": needfix_store.ACTIVE_STATE_DEFINITION,
+            "count": None,
+            "raw_total": needfix_store.count_needfix(
+                repo, include_archived=include_archived
+            ),
+        }
+    active_count = needfix_store.count_needfix(
+        repo,
+        include_archived=include_archived,
+        get_task_fn=get_task_fn,
+        canonical_status_fn=canonical_status_fn,
+        active_only=True,
+    )
+    return {
+        "derived": True,
+        "underived_reason": None,
+        "definition": needfix_store.ACTIVE_STATE_DEFINITION,
+        "count": active_count,
+    }
+
+
 __all__ = [
-    "DEFAULT_SOURCE_PATHS", "NeedFixIngestError", "SCHEMA_ID", "commit", "preview",
+    "DEFAULT_SOURCE_PATHS", "NeedFixIngestError", "SCHEMA_ID", "commit", "count_active",
+    "list_active", "preview",
 ]
