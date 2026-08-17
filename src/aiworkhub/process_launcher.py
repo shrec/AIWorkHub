@@ -5383,7 +5383,7 @@ class ProcessManager:
         timeout_seconds: int,
         quality_review_binding: dict[str, Any] | None = None,
         reserved_request_id: str | None = None,
-        prewarm_progress: Callable[[str], None] | None = None,
+        prewarm_progress: Callable[..., None] | None = None,
     ) -> dict[str, Any]:
         if not launch_gates_open():
             return self._blocked(
@@ -5549,14 +5549,40 @@ class ProcessManager:
                             authority_repo=authority_repo,
                         )
                     except worker_ai_tools_mcp.WorkerToolError as exc:
+                        # Prewarm prebuilds the reviewer's candidate Source Graph
+                        # overlay only to make its queries fast; it is an
+                        # optimisation, never a correctness precondition, because
+                        # the sealed review packet already carries every
+                        # candidate's content.  A path Source Graph *deliberately*
+                        # does not index -- an eval artifact, a generated fixture,
+                        # an unsupported extension -- is therefore skipped and
+                        # recorded, and the reviewer still launches from the
+                        # packet alone.  Every other prewarm failure (a hash
+                        # mismatch against the sealed packet, an
+                        # unreadable-but-indexable file, a path-safety violation,
+                        # a clone/backup I/O error) is a genuine problem on a file
+                        # that SHOULD be indexable and is re-raised loudly so it
+                        # is never swallowed.
+                        skip = quality_review.classify_prewarm_error(str(exc))
+                        if not skip["tolerated"]:
+                            if prewarm_progress is not None:
+                                prewarm_progress(
+                                    "reviewer_source_graph_prewarm_failed"
+                                )
+                            raise LaunchRejected(
+                                "quality_review_source_graph_prewarm_failed:"
+                                + str(exc)[:240]
+                            ) from exc
                         if prewarm_progress is not None:
-                            prewarm_progress("reviewer_source_graph_prewarm_failed")
-                        raise LaunchRejected(
-                            "quality_review_source_graph_prewarm_failed:"
-                            + str(exc)[:240]
-                        ) from exc
-                    if prewarm_progress is not None:
-                        prewarm_progress("reviewer_source_graph_prewarm_complete")
+                            prewarm_progress(
+                                "reviewer_source_graph_prewarm_skipped_excluded",
+                                skip["reason"],
+                            )
+                    else:
+                        if prewarm_progress is not None:
+                            prewarm_progress(
+                                "reviewer_source_graph_prewarm_complete"
+                            )
                     # Any further exception in this block belongs to worker MCP
                     # runtime registration, not the reviewer Source Graph
                     # prewarm this block just completed -- restore the phase so

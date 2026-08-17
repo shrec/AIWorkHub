@@ -500,8 +500,183 @@ def independence_acceptance_line(rung_record: Mapping[str, Any] | str) -> str:
     return f"Independent review recorded at rung: {rung}"
 
 
+# ---------------------------------------------------------------------------
+# Reviewer Source Graph prewarm error classification.
+#
+# Prewarm prebuilds the reviewer's candidate Source Graph overlay so its queries
+# are fast.  It is an *optimisation* and never a correctness precondition: the
+# sealed review packet already carries every candidate's content, so a reviewer
+# can always fall back to inspecting the packet alone.  Therefore a path Source
+# Graph *deliberately does not index* must never prevent a review.
+#
+# ``worker_ai_tools_mcp.prewarm_quality_review_source_graph`` surfaces such a
+# path as a ``WorkerToolError`` wrapping a ``source_graph.SourceGraphError``
+# whose code names why the single file was refused.  Exactly three of those
+# codes mean "this file is one Source Graph is designed not to index":
+#
+#   * ``source_graph_single_file_excluded_glob``  -- caught by an exclude glob
+#     (for example an ``eval/`` artifact or other generated evidence);
+#   * ``source_graph_single_file_excluded_dir``   -- lives under an excluded
+#     directory;
+#   * ``source_graph_single_file_unsupported_extension`` -- its extension has no
+#     language representation at all, so it can never be indexed.
+#
+# These are *tolerated*: the launcher skips the path, records why, and still
+# launches the reviewer, which proceeds on the sealed packet alone.
+#
+# Every OTHER prewarm failure stays loud and refuses the launch, so real
+# breakage is never swallowed:
+#   * a hash mismatch / missing-expected-hash means the candidate on disk does
+#     not match the sealed packet -- an integrity violation;
+#   * ``unreadable`` / ``path_mismatch`` means an indexable file could not be
+#     read or extracted -- genuine breakage on a file that SHOULD index;
+#   * path-safety codes (absolute / traversal / symlink / outside_repository /
+#     null_byte / not_string / unresolvable) mean a malformed or hostile
+#     candidate path;
+#   * a wrapped ``sqlite3.Error`` / ``OSError`` (clone/backup I/O) is
+#     infrastructure breakage.
+# None of those are deliberate exclusions, so none are tolerated here.
+PREWARM_SKIP_SCHEMA_ID = "aiworkhub.quality_review_prewarm_skip.v1"
+
+PREWARM_TOLERATED_EXCLUSION_CONDITIONS = (
+    "source_graph_single_file_excluded_glob",
+    "source_graph_single_file_excluded_dir",
+    "source_graph_single_file_unsupported_extension",
+)
+
+# ``worker_ai_tools_mcp.prewarm_quality_review_source_graph`` renders a wrapped
+# prewarm failure with a FIXED structure (worker_ai_tools_mcp.py:973-976):
+#
+#     "quality_review_candidate_source_graph_prewarm_error:"
+#     + type(exc).__name__ + ":" + str(exc)[:240]
+#
+# So, reading left to right after the constant prefix, the message is exactly
+# ``<type_name>:<str(exc)>``.  ``type(exc).__name__`` is a Python identifier and
+# can NEVER contain a ``:``; for a ``source_graph.SourceGraphError`` it is exactly
+# ``SourceGraphError`` and ``str(exc)`` is that error's own ``<code>:<detail>``
+# message whose leading segment is the deliberate, machine-set condition code.
+# Therefore the whole message decomposes into positional fields separated by the
+# first two colons after the prefix:
+#
+#     <prefix> : <type_name> : <code> : <detail...>
+#        fixed      slot 0      slot 1   worker-influenced, path-bearing
+#
+# The decision is read from the SLOTS, never by searching the text.  ``<detail>``
+# is worker-influenced (it can embed the candidate path, including a literal
+# ``SourceGraphError:source_graph_single_file_excluded_glob``), so it must never
+# be scanned; the ``[:240]`` truncation only ever clips ``<detail>`` and cannot
+# move ``<type_name>`` or ``<code>`` out of their slots.
+PREWARM_CANDIDATE_ERROR_PREFIX = (
+    "quality_review_candidate_source_graph_prewarm_error:"
+)
+PREWARM_SOURCE_GRAPH_TYPE_NAME = "SourceGraphError"
+
+
+def _prewarm_tolerated_exclusion_code(text: str) -> str | None:
+    """Return the tolerated exclusion code, read from its field, or ``None``.
+
+    The verdict is anchored to the message's fixed structure, not to any
+    substring search.  We require the exact
+    ``quality_review_candidate_source_graph_prewarm_error:`` prefix, then read
+    the two positional fields that follow it -- ``<type_name>`` (slot 0) and
+    ``<code>`` (slot 1) -- because the wrapper always emits
+    ``<prefix>:<type(exc).__name__>:<str(exc)>`` and an exception type name
+    cannot contain a ``:``.  Tolerance requires BOTH that slot 0 is exactly
+    ``SourceGraphError`` (so a wrapped ``OSError`` / ``sqlite3.Error`` /
+    ``WorkerToolError`` can never qualify, whatever its message mentions) AND
+    that slot 1 *equals* an allowlisted exclusion code.  Everything after the
+    second colon is the worker-influenced ``<detail>`` -- it can embed the
+    candidate path, including a literal ``SourceGraphError:...excluded_glob`` --
+    and is never consulted, so it cannot forge a tolerated verdict.  A
+    genuine-failure code (``..._unreadable``, ``..._hash_mismatch``,
+    ``..._traversal`` ...) occupies slot 1 and is refused.
+    """
+
+    if not text.startswith(PREWARM_CANDIDATE_ERROR_PREFIX):
+        # Not a wrapped candidate prewarm error at all (for example a direct
+        # ``quality_review_candidate_path_escapes_workspace`` WorkerToolError, or
+        # an empty message): fail closed, it is not a deliberate exclusion.
+        return None
+    # Split the post-prefix body on its first two colons only.  ``<detail>`` (the
+    # remainder) is deliberately left un-split and never inspected.
+    fields = text[len(PREWARM_CANDIDATE_ERROR_PREFIX):].split(":", 2)
+    if len(fields) < 2:
+        # No code slot present (for example a type name with no ``str(exc)``):
+        # nothing to tolerate.
+        return None
+    type_name = fields[0].strip()
+    code_segment = fields[1].strip()
+    if type_name != PREWARM_SOURCE_GRAPH_TYPE_NAME:
+        # A ``sqlite3.Error`` / ``OSError`` / ``WorkerToolError`` folded into the
+        # same prefix carries its OWN type name in slot 0, not ``SourceGraphError``
+        # -- infrastructure/contract breakage on an indexable file, kept loud even
+        # if its ``<detail>`` path happens to mention an excluded-glob token.
+        return None
+    if code_segment in PREWARM_TOLERATED_EXCLUSION_CONDITIONS:
+        return code_segment
+    return None
+
+
+def classify_prewarm_error(message: str) -> dict[str, Any]:
+    """Decide whether a reviewer prewarm failure is a tolerable exclusion.
+
+    ``tolerated`` is True only for the deliberate-exclusion conditions in
+    :data:`PREWARM_TOLERATED_EXCLUSION_CONDITIONS`; for those the launcher skips
+    the path, records ``reason``, and still launches the reviewer.  For every
+    other failure ``tolerated`` is False and the launch is refused loudly, so a
+    real indexing failure on a file that should be indexable is never swallowed.
+
+    Classification is fail-closed and read from the message's fixed positional
+    structure (``<prefix>:<type_name>:<code>:<detail>``), never by searching the
+    text.  ``<detail>`` is worker-influenced (it can embed the candidate path,
+    including a literal ``SourceGraphError:source_graph_single_file_excluded_glob``),
+    so a genuine indexing failure whose path merely contains that token -- for
+    example a wrapped ``OSError`` at ``eval/SourceGraphError:``
+    ``source_graph_single_file_excluded_glob/module.py``, or a
+    ``source_graph_single_file_unreadable`` on such a path -- must still refuse.
+    :func:`_prewarm_tolerated_exclusion_code` guarantees this by reading the type
+    name from slot 0 and the code from slot 1 and requiring BOTH that slot 0 is
+    exactly ``SourceGraphError`` AND that slot 1 *equals* an allowlisted exclusion
+    code; the path-bearing ``<detail>`` is never consulted.  A ``sqlite3.Error`` /
+    ``OSError`` folded into the same
+    ``quality_review_candidate_source_graph_prewarm_error`` prefix carries its own
+    type name in slot 0, not ``SourceGraphError``, so it can never be tolerated and
+    stays loud.
+    """
+
+    text = str(message or "")
+    condition = _prewarm_tolerated_exclusion_code(text)
+    if condition is not None:
+        return {
+            "schema_id": PREWARM_SKIP_SCHEMA_ID,
+            "tolerated": True,
+            "condition": condition,
+            "reason": (
+                "reviewer_source_graph_prewarm_skipped_excluded_path:"
+                f"{condition}: Source Graph deliberately does not index this "
+                "path, so prewarm skipped it and the candidate Source Graph "
+                "overlay was not built; the reviewer proceeds on the sealed "
+                "review packet alone -- which already carries the candidate "
+                "content -- and still launches. detail=" + text[:200]
+            ),
+        }
+    return {
+        "schema_id": PREWARM_SKIP_SCHEMA_ID,
+        "tolerated": False,
+        "condition": None,
+        "reason": (
+            "reviewer_source_graph_prewarm_failed_indexable_target: a real "
+            "indexing failure on a file that should be indexable is not a "
+            "deliberate exclusion and is not swallowed. detail=" + text[:200]
+        ),
+    }
+
+
 __all__ = [
     "DELIVERY_SCHEMA_ID",
+    "PREWARM_SKIP_SCHEMA_ID",
+    "PREWARM_TOLERATED_EXCLUSION_CONDITIONS",
+    "classify_prewarm_error",
     "AVAILABILITY_SCHEMA_ID",
     "SCOPE_SCHEMA_ID",
     "INDEPENDENCE_SCHEMA_ID",
