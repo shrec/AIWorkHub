@@ -294,6 +294,13 @@ def test_suite_profile_collects_per_test_metrics(tmp_path: Path) -> None:
         repeats=2,
     )
     assert report["per_test_observed"] is True
-    assert report["tests"][0]["nodeid"] == "test_sample.py::test_sample"
+    # pytest reports nodeids relative to ITS rootdir, not to the cwd it was
+    # given.  Under a worker sandbox tmp_path lives inside the repository
+    # (.aiworkhub/temp/validation/...), so pytest finds the repo pyproject.toml
+    # as rootdir and prefixes the path -- and every card whose validation list
+    # included this file failed deterministically.  Assert the identity this
+    # test is actually about (the per-test row is keyed by the sample's nodeid)
+    # without depending on where tmp_path happens to be.
+    assert report["tests"][0]["nodeid"].endswith("test_sample.py::test_sample")
     assert report["tests"][0]["run_count"] == 2
     assert report["tests"][0]["flake_observed"] is False
