@@ -629,6 +629,323 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
     }
 
 
+# ---------------------------------------------------------------------------
+# Worker concurrency capacity.
+#
+# ``AIWORKHUB_MAX_PROCESSES`` is the authoritative cap on how many workers may
+# run at once.  Capping by runner identity instead means a configured cap is
+# not the cap that applies, and two cards that share a runner serialise even
+# when the machine has spare capacity.  ``resolve_workforce_cap`` reports the
+# effective cap from the configured value; ``workforce_admission`` admits a
+# launch by total running count and never by runner serialisation.
+# ---------------------------------------------------------------------------
+WORKFORCE_SCHEMA_ID = "aiworkhub.workforce_capacity.v1"
+MAX_PROCESSES_ENV = "AIWORKHUB_MAX_PROCESSES"
+DEFAULT_MAX_PROCESSES = 4
+MAX_PROCESSES_CEILING = 256
+
+
+def resolve_workforce_cap(env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Resolve the authoritative worker concurrency cap.
+
+    ``AIWORKHUB_MAX_PROCESSES`` decides the cap; the returned ``effective_cap``
+    is what actually applies.  A missing or malformed value falls back to
+    ``DEFAULT_MAX_PROCESSES`` with a named reason, a below-minimum value is
+    clamped up to 1, and an above-ceiling value is clamped down to
+    ``MAX_PROCESSES_CEILING`` -- each stated in ``reason`` rather than silently.
+    """
+
+    source = os.environ if env is None else env
+    raw = source.get(MAX_PROCESSES_ENV)
+    if raw is None or str(raw).strip() == "":
+        return {
+            "schema_id": WORKFORCE_SCHEMA_ID,
+            "effective_cap": DEFAULT_MAX_PROCESSES,
+            "configured": False,
+            "source": "default",
+            "raw_value": None,
+            "reason": "max_processes_unset_default_applied",
+        }
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return {
+            "schema_id": WORKFORCE_SCHEMA_ID,
+            "effective_cap": DEFAULT_MAX_PROCESSES,
+            "configured": False,
+            "source": "default_invalid",
+            "raw_value": str(raw)[:64],
+            "reason": f"max_processes_invalid_default_applied:{str(raw)[:64]}",
+        }
+    if value < 1:
+        return {
+            "schema_id": WORKFORCE_SCHEMA_ID,
+            "effective_cap": 1,
+            "configured": True,
+            "source": "env",
+            "raw_value": str(raw)[:64],
+            "reason": f"max_processes_below_minimum_clamped:{value}->1",
+        }
+    clamped = min(value, MAX_PROCESSES_CEILING)
+    reason = (
+        "max_processes_configured"
+        if clamped == value
+        else f"max_processes_above_ceiling_clamped:{value}->{clamped}"
+    )
+    return {
+        "schema_id": WORKFORCE_SCHEMA_ID,
+        "effective_cap": clamped,
+        "configured": True,
+        "source": "env",
+        "raw_value": str(raw)[:64],
+        "reason": reason,
+    }
+
+
+def workforce_admission(
+    *,
+    running_total: int,
+    runner: str = "",
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Admit a worker launch by configured capacity, never by runner identity.
+
+    Two cards that share a runner are both admissible while the total running
+    worker count is below the authoritative ``AIWORKHUB_MAX_PROCESSES`` cap: a
+    launch is never rejected merely because another worker with the same runner
+    is already running.  ``effective_cap`` is reported so a caller sees the real
+    cap that applied.
+    """
+
+    resolved = resolve_workforce_cap(env)
+    effective = int(resolved["effective_cap"])
+    running = max(0, int(running_total))
+    admit = running < effective
+    return {
+        "schema_id": WORKFORCE_SCHEMA_ID,
+        "admit": bool(admit),
+        "effective_cap": effective,
+        "cap_source": resolved["source"],
+        "cap_reason": resolved["reason"],
+        "running_total": running,
+        "runner": str(runner or ""),
+        "serialised_by_runner": False,
+        "reason": (
+            "workforce_capacity_available"
+            if admit
+            else f"workforce_cap_reached:running={running}>=cap={effective}"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Provider observability.
+#
+# No configured adapter exposes a metered provider-side quota to this control
+# plane, so a blanket ``ready_unknown`` told the manager nothing.  This report
+# states, per configured adapter, what IS observable here (executable install,
+# credential presence, editor host reachability/consent) and NAMES the reason
+# quota is not observable for that adapter family rather than returning a single
+# opaque unknown.  For ``glm_vscode_lm`` it states whether the adapter is
+# reachable in THIS installation, with evidence, before any code claim.
+# ---------------------------------------------------------------------------
+PROVIDER_OBSERVABILITY_SCHEMA_ID = "aiworkhub.provider_observability.v1"
+
+_ROUTE_FAMILY_EDITOR = "editor_hosted_vscode_lm"
+_ROUTE_FAMILY_COPILOT = "copilot_byok_cli"
+_ROUTE_FAMILY_CLAUDE = "claude_cli"
+_ROUTE_FAMILY_CODEX = "codex_cli"
+_ROUTE_FAMILY_UNKNOWN = "unknown"
+
+_QUOTA_UNOBSERVABLE_REASON_BY_FAMILY: Mapping[str, str] = {
+    _ROUTE_FAMILY_EDITOR: (
+        "editor_hosted_route_exposes_host_reachability_and_consent_not_metered_quota"
+    ),
+    _ROUTE_FAMILY_COPILOT: (
+        "copilot_byok_exposes_credential_presence_not_provider_side_quota"
+    ),
+    _ROUTE_FAMILY_CLAUDE: (
+        "claude_cli_exposes_subscription_auth_not_metered_token_quota"
+    ),
+    _ROUTE_FAMILY_CODEX: "codex_cli_exposes_no_quota_endpoint_to_this_host",
+    _ROUTE_FAMILY_UNKNOWN: "adapter_family_unknown_quota_observability_undetermined",
+}
+
+
+def _adapter_route_family(adapter_id: str) -> str:
+    if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
+        return _ROUTE_FAMILY_EDITOR
+    if adapter_id in (
+        runtime_adapters.DEEPSEEK_COPILOT_ADAPTER,
+        runtime_adapters.GLM_COPILOT_ADAPTER,
+    ):
+        return _ROUTE_FAMILY_COPILOT
+    if adapter_id == "claude_cli":
+        return _ROUTE_FAMILY_CLAUDE
+    if adapter_id == "codex_cli":
+        return _ROUTE_FAMILY_CODEX
+    return _ROUTE_FAMILY_UNKNOWN
+
+
+def describe_provider_observability(
+    repo_root: Path | str, adapter_id: str
+) -> dict[str, Any]:
+    """Report what is observable for one adapter here, and quota's named reason.
+
+    Every probe is bounded and guarded: a route is described whether or not it
+    is serviceable in this environment, and ``reachability_evidence`` always
+    states the ground truth (module present/absent, executable resolved,
+    probe outcome) instead of a bare unknown.
+    """
+
+    root = Path(repo_root).resolve()
+    resolution = runtime_adapters.resolve_executable(adapter_id)
+    family = _adapter_route_family(adapter_id)
+    installed = bool(resolution.ok)
+    install_evidence = (
+        f"executable={resolution.executable}"
+        if installed
+        else f"not_installed:{resolution.reason}"
+    )[:200]
+    # Installability is observable for every adapter, installed or not; it is
+    # the one signal that always names a real observation here.
+    observable_signals: list[str] = ["executable_installability"]
+    if installed:
+        observable_signals.append("executable_installed")
+    access_observed = False
+    reachable = installed
+    reachability_evidence = install_evidence
+
+    if family == _ROUTE_FAMILY_EDITOR:
+        if vscode_lm_bridge is None:
+            reachable = False
+            reachability_evidence = (
+                "vscode_lm_bridge_module_unavailable_in_this_installation"
+            )
+        else:
+            observable_signals.append("editor_host_bridge_module_present")
+            if adapter_id == runtime_adapters.GLM_VSCODE_LM_ADAPTER:
+                model: str | None = runtime_adapters.GLM_DEFAULT_MODEL
+            elif adapter_id == runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER:
+                model = runtime_adapters.DEEPSEEK_DEFAULT_MODEL
+            else:
+                model = None
+            readiness: Mapping[str, Any] | None = None
+            try:
+                readiness = vscode_lm_bridge.bridge_readiness(
+                    root, model=model, adapter_id=adapter_id
+                )
+            except Exception as exc:  # bounded probe: never fails the report
+                readiness = None
+                reachable = True  # module present + callable in this install
+                reachability_evidence = (
+                    "bridge_module_present_probe_unavailable_here:"
+                    f"{type(exc).__name__}:{str(exc)[:140]}"
+                )[:200]
+                observable_signals.append("editor_host_bridge_callable")
+            if isinstance(readiness, Mapping):
+                reachable = True
+                access_observed = bool(readiness.get("access_observed"))
+                host_count = int(
+                    readiness.get("host_count")
+                    or readiness.get("live_host_count")
+                    or 0
+                )
+                observable_signals.append("editor_host_reachability")
+                if readiness.get("consent_required") is not None:
+                    observable_signals.append("editor_access_consent_state")
+                reachability_evidence = (
+                    f"bridge_module_present:host_count={host_count}:"
+                    f"launchable={bool(readiness.get('launchable'))}:"
+                    f"access_observed={access_observed}"
+                )[:200]
+    elif family == _ROUTE_FAMILY_COPILOT:
+        creds = (
+            deepseek_credentials
+            if adapter_id == runtime_adapters.DEEPSEEK_COPILOT_ADAPTER
+            else glm_credentials
+        )
+        if creds is None:
+            observable_signals.append("credential_module_unavailable")
+            reachable = False
+            reachability_evidence = (
+                f"{install_evidence}:credential_module_unavailable"
+            )[:200]
+        else:
+            observable_signals.append("credential_module_present")
+            status: Mapping[str, Any] | None = None
+            try:
+                status = creds.credential_status(repo=root)
+            except Exception as exc:  # bounded probe
+                status = None
+                reachability_evidence = (
+                    f"{install_evidence}:credential_probe_error:{type(exc).__name__}"
+                )[:200]
+            if isinstance(status, Mapping):
+                access_observed = bool(
+                    status.get("credential_present")
+                    or status.get("authenticated")
+                    or status.get("launchable")
+                )
+                observable_signals.append("credential_presence")
+                reachability_evidence = (
+                    f"{install_evidence}:credential_present={access_observed}"
+                )[:200]
+    elif family == _ROUTE_FAMILY_CLAUDE and installed:
+        status = None
+        try:
+            status = claude_auth.auth_status(resolution.executable)
+        except Exception:  # bounded probe
+            status = None
+        if isinstance(status, Mapping):
+            access_observed = bool(
+                status.get("authenticated")
+                or status.get("access_observed")
+                or status.get("launchable")
+            )
+            observable_signals.append("subscription_auth_state")
+
+    return {
+        "schema_id": PROVIDER_OBSERVABILITY_SCHEMA_ID,
+        "adapter_id": adapter_id,
+        "route_family": family,
+        "installed": installed,
+        "install_evidence": install_evidence,
+        "reachable": bool(reachable),
+        "reachability_evidence": str(reachability_evidence)[:200],
+        "access_observed": bool(access_observed),
+        "quota_observable": False,
+        "quota_observability_reason": _QUOTA_UNOBSERVABLE_REASON_BY_FAMILY[family],
+        "observable_signals": observable_signals,
+    }
+
+
+def provider_observability_report(repo_root: Path | str) -> dict[str, Any]:
+    """Per-adapter observability across every configured local adapter.
+
+    Each adapter names what is observable here and why its quota is not, so a
+    caller reading this report can distinguish an available provider from an
+    exhausted one where that is observable, and otherwise knows -- by name --
+    exactly why it cannot.
+    """
+
+    root = Path(repo_root).resolve()
+    adapters = [
+        describe_provider_observability(root, name)
+        for name in runtime_adapters.LOCAL_ADAPTERS
+    ]
+    return {
+        "schema_id": PROVIDER_OBSERVABILITY_SCHEMA_ID,
+        "adapters": adapters,
+        "quota_observable_any": any(item["quota_observable"] for item in adapters),
+        "note": (
+            "no configured adapter exposes a metered provider-side quota to this "
+            "control plane; each adapter names what IS observable and the reason "
+            "quota is not, rather than returning a single blanket unknown"
+        ),
+    }
+
+
 __all__ = [
     "DEFAULT_POLICY",
     "POLICY_RELATIVE_PATH",
@@ -638,10 +955,19 @@ __all__ = [
     "READINESS_READY_UNVERIFIED",
     "RepoPolicyError",
     "SCHEMA_ID",
+    "WORKFORCE_SCHEMA_ID",
+    "MAX_PROCESSES_ENV",
+    "DEFAULT_MAX_PROCESSES",
+    "MAX_PROCESSES_CEILING",
+    "PROVIDER_OBSERVABILITY_SCHEMA_ID",
     "build_preflight",
+    "describe_provider_observability",
     "ensure_policy",
     "load_policy",
     "policy_path",
+    "provider_observability_report",
+    "resolve_workforce_cap",
     "validate_launch",
     "validate_policy",
+    "workforce_admission",
 ]

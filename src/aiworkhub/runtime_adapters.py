@@ -8,6 +8,7 @@ process and never accepts or returns an environment mapping.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 from collections.abc import Iterable, Mapping, Sequence
@@ -757,6 +758,217 @@ def build_adapter_command(
     )
 
 
+# ---------------------------------------------------------------------------
+# Provider refusal vs worker crash classification.
+#
+# A launched worker that exits non-zero was, until now, always recorded as
+# ``worker_failed`` exit_code 1 -- so a provider that REFUSED the turn (a 429
+# session limit, a dead balance, an expired credential) was indistinguishable
+# from a genuine crash in the worker's own code.  The operator was then told
+# "the worker failed" when the truth was "the provider would not serve the
+# request", and an exhausted-quota refusal -- which becomes serviceable again
+# the moment its reported reset window elapses -- was treated as a permanent
+# worker bug.
+#
+# ``classify_provider_outcome`` separates the two from the provider's own exit
+# code and message.  A refusal carries the provider's verbatim message, names
+# its shape, and -- for an exhausted quota/session/rate limit -- is marked
+# operationally recoverable and carries the reset window it reported so a retry
+# respects that window instead of hammering a limited endpoint.  A refusal
+# whose window is not reported is still recoverable in principle but is flagged
+# ``reset_reported`` False so a caller never retries immediately without a bound.
+# ---------------------------------------------------------------------------
+PROVIDER_OUTCOME_SCHEMA_ID = "aiworkhub.provider_outcome.v1"
+
+OUTCOME_OK = "ok"
+OUTCOME_PROVIDER_REFUSED = "provider_refused"
+OUTCOME_WORKER_FAILED = "worker_failed"
+
+# Refusal shapes.  ``session_limit``, ``quota_exhausted`` and ``rate_limited``
+# recover once their reported window resets; ``credential_rejected`` is a
+# refusal too but needs a new credential, not merely a wait, so time alone does
+# not recover it; ``provider_unavailable`` is a transient upstream outage.
+REFUSAL_SESSION_LIMIT = "session_limit"
+REFUSAL_QUOTA_EXHAUSTED = "quota_exhausted"
+REFUSAL_RATE_LIMITED = "rate_limited"
+REFUSAL_CREDENTIAL_REJECTED = "credential_rejected"
+REFUSAL_PROVIDER_UNAVAILABLE = "provider_unavailable"
+
+_RECOVERABLE_REFUSALS: frozenset[str] = frozenset(
+    {REFUSAL_SESSION_LIMIT, REFUSAL_QUOTA_EXHAUSTED, REFUSAL_RATE_LIMITED}
+)
+
+_RETRY_AFTER_RE = re.compile(
+    r"retry[\s_-]*after[\s:=]*([0-9]+)\s*(?:s|sec|secs|seconds)?", re.IGNORECASE
+)
+_RESET_IN_RE = re.compile(
+    r"(?:try again in|resets? in|reset in)\s+([0-9]+)\s*(?:s|sec|secs|seconds)?",
+    re.IGNORECASE,
+)
+_RESET_AT_RE = re.compile(
+    r"resets?(?:\s+at)?\s+(\d{4}-\d{2}-\d{2}T[0-9:.+Z-]+)", re.IGNORECASE
+)
+
+
+def _provider_status_code(text: str) -> int | None:
+    """Return the first standalone HTTP 4xx/5xx status token in ``text``."""
+
+    for match in re.finditer(r"\b([0-9]{3})\b", text):
+        code = int(match.group(1))
+        if 400 <= code <= 599:
+            return code
+    return None
+
+
+def _reset_window(text: str) -> tuple[int | None, str | None]:
+    """Extract a reported reset window: ``(retry_after_seconds, reset_at)``."""
+
+    retry_after: int | None = None
+    reset_at: str | None = None
+    after = _RETRY_AFTER_RE.search(text)
+    if after:
+        retry_after = int(after.group(1))
+    if retry_after is None:
+        reset_in = _RESET_IN_RE.search(text)
+        if reset_in:
+            retry_after = int(reset_in.group(1))
+    reset = _RESET_AT_RE.search(text)
+    if reset:
+        reset_at = reset.group(1)
+    return retry_after, reset_at
+
+
+def _refusal_kind(lowered: str, status_code: int | None) -> str | None:
+    """Name the refusal shape from the provider message, or ``None`` if none."""
+
+    if "session limit" in lowered or "session_limit" in lowered:
+        return REFUSAL_SESSION_LIMIT
+    if any(
+        token in lowered
+        for token in (
+            "insufficient_quota",
+            "insufficient quota",
+            "insufficient balance",
+            "out of credit",
+            "out of credits",
+            "billing hard limit",
+            "quota exceeded",
+            "quota_exceeded",
+            "exhausted",
+        )
+    ):
+        return REFUSAL_QUOTA_EXHAUSTED
+    if status_code == 429 or any(
+        token in lowered
+        for token in ("rate limit", "rate_limit", "too many requests")
+    ):
+        return REFUSAL_RATE_LIMITED
+    if status_code in (401, 403) or any(
+        token in lowered
+        for token in (
+            "unauthorized",
+            "invalid api key",
+            "invalid_api_key",
+            "authentication",
+            "credential",
+            "expired token",
+            "expired credential",
+            "permission denied",
+        )
+    ):
+        return REFUSAL_CREDENTIAL_REJECTED
+    if status_code in (500, 502, 503, 529) or any(
+        token in lowered
+        for token in ("overloaded", "service unavailable", "server error")
+    ):
+        return REFUSAL_PROVIDER_UNAVAILABLE
+    return None
+
+
+def classify_provider_outcome(
+    *, exit_code: int, message: str = "", stderr: str = ""
+) -> dict[str, Any]:
+    """Classify a worker exit as provider refusal, worker crash, or clean exit.
+
+    ``message``/``stderr`` are the provider's own text; both are carried
+    verbatim (bounded) as ``provider_message`` so an operator sees the real
+    reason.  A refusal is distinct from a crash: a dead balance, an expired
+    credential and a genuine ``ZeroDivisionError`` no longer collapse into one
+    ``worker_failed`` verdict.  An exhausted-quota / session-limit / rate-limit
+    refusal is ``recoverable`` and carries the reset window it reported
+    (``retry_after_seconds`` / ``reset_at``); ``reset_reported`` is False when
+    the provider named no window, so a caller must not retry without a bound.
+    """
+
+    parts = [part for part in (str(message or ""), str(stderr or "")) if part]
+    text = "\n".join(parts)
+    lowered = text.lower()
+    provider_message = text[:1000]
+    try:
+        code = int(exit_code)
+    except (TypeError, ValueError):
+        code = 1
+
+    if code == 0:
+        return {
+            "schema_id": PROVIDER_OUTCOME_SCHEMA_ID,
+            "outcome": OUTCOME_OK,
+            "refusal": False,
+            "refusal_kind": "",
+            "recoverable": False,
+            "retry_after_seconds": None,
+            "reset_at": None,
+            "reset_reported": False,
+            "provider_message": provider_message,
+            "exit_code": code,
+            "reason": "worker_exited_zero",
+        }
+
+    status_code = _provider_status_code(lowered)
+    kind = _refusal_kind(lowered, status_code)
+    if kind is None:
+        return {
+            "schema_id": PROVIDER_OUTCOME_SCHEMA_ID,
+            "outcome": OUTCOME_WORKER_FAILED,
+            "refusal": False,
+            "refusal_kind": "",
+            "recoverable": False,
+            "retry_after_seconds": None,
+            "reset_at": None,
+            "reset_reported": False,
+            "provider_message": provider_message,
+            "exit_code": code,
+            "status_code": status_code,
+            "reason": "worker_process_failure_no_provider_refusal_signal",
+        }
+
+    recoverable = kind in _RECOVERABLE_REFUSALS
+    retry_after, reset_at = _reset_window(text) if recoverable else (None, None)
+    reset_reported = recoverable and (retry_after is not None or reset_at is not None)
+    if kind == REFUSAL_CREDENTIAL_REJECTED:
+        reason = "provider_refused_credential_rejected_needs_new_credential"
+    elif recoverable and reset_reported:
+        reason = f"provider_refused_{kind}_recoverable_after_reported_window"
+    elif recoverable:
+        reason = f"provider_refused_{kind}_recoverable_but_reset_window_unreported"
+    else:
+        reason = f"provider_refused_{kind}"
+    return {
+        "schema_id": PROVIDER_OUTCOME_SCHEMA_ID,
+        "outcome": OUTCOME_PROVIDER_REFUSED,
+        "refusal": True,
+        "refusal_kind": kind,
+        "recoverable": bool(recoverable),
+        "retry_after_seconds": retry_after,
+        "reset_at": reset_at,
+        "reset_reported": bool(reset_reported),
+        "provider_message": provider_message,
+        "exit_code": code,
+        "status_code": status_code,
+        "reason": reason,
+    }
+
+
 __all__ = [
     "ADAPTER_EXECUTABLES",
     "DEEPSEEK_COPILOT_ADAPTER",
@@ -775,8 +987,18 @@ __all__ = [
     "VSCODE_LM_ADAPTER",
     "ExecutableResolution",
     "RuntimeAdapterPlan",
+    "PROVIDER_OUTCOME_SCHEMA_ID",
+    "OUTCOME_OK",
+    "OUTCOME_PROVIDER_REFUSED",
+    "OUTCOME_WORKER_FAILED",
+    "REFUSAL_SESSION_LIMIT",
+    "REFUSAL_QUOTA_EXHAUSTED",
+    "REFUSAL_RATE_LIMITED",
+    "REFUSAL_CREDENTIAL_REJECTED",
+    "REFUSAL_PROVIDER_UNAVAILABLE",
     "build_adapter_command",
     "build_runtime_command",
+    "classify_provider_outcome",
     "inject_worker_mcp_config",
     "resolve_deepseek_model",
     "resolve_executable",

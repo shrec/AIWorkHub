@@ -672,6 +672,273 @@ def classify_prewarm_error(message: str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Reviewer prewarm/launch truth: read-only open, bounded wait, reservation
+# expiry, preparation-phase stall, and the review_ready launch gate.
+#
+# Measured wedge (six concurrent reviewers): all six stuck in
+# ``reviewer_source_graph_prewarm_started`` with ``pid`` null, ``process_alive``
+# False, the preparation heartbeat frozen at launch time, and
+# ``reservation_expires_at_epoch`` already past with nothing reclaimed, while
+# Source Graph health showed a ``writable_open_recover`` phase failing on
+# ``database is locked``.  Three independent defects, each addressed by a pure
+# decision function below so the launch path can be truthful instead of hanging.
+# ---------------------------------------------------------------------------
+REVIEWER_PREWARM_OPEN_SCHEMA_ID = "aiworkhub.quality_review_prewarm_open.v1"
+REVIEWER_PREWARM_WAIT_SCHEMA_ID = "aiworkhub.quality_review_prewarm_wait.v1"
+REVIEWER_RESERVATION_SCHEMA_ID = "aiworkhub.quality_review_reservation.v1"
+REVIEWER_PREP_STALL_SCHEMA_ID = "aiworkhub.quality_review_preparation_stall.v1"
+REVIEWER_LAUNCH_TARGET_SCHEMA_ID = "aiworkhub.quality_review_launch_target.v1"
+
+REVIEWER_PREWARM_OPEN_MODE_READONLY = "read_only"
+
+# A reviewer prewarm that cannot acquire its read-only index handle within this
+# many seconds fails the launch with a named reason instead of hanging.
+REVIEWER_PREWARM_DEADLINE_SECONDS_DEFAULT = 10.0
+
+# A preparation-phase heartbeat older than this is a stall even though no
+# process exists yet.
+REVIEWER_PREP_HEARTBEAT_STALL_SECONDS_DEFAULT = 20.0
+
+REVIEWER_TARGET_REVIEW_READY = "review_ready"
+
+
+def reviewer_is_read_only(card: Mapping[str, Any] | None) -> bool:
+    """True when a reviewer card declares no writes and forbids repository write.
+
+    A quality reviewer's contract is read-only: its ``allowed_writes`` is empty
+    and its ``forbidden`` list names ``repository_write``.  This is used to
+    confirm a prewarm open plan is consistent with the card it was handed.
+    """
+
+    if not isinstance(card, Mapping):
+        return False
+    allowed = card.get("allowed_writes")
+    forbidden = card.get("forbidden")
+    no_writes = not allowed
+    forbids_write = False
+    if isinstance(forbidden, (list, tuple)):
+        forbids_write = any("repository_write" in str(item) for item in forbidden)
+    return bool(no_writes and forbids_write)
+
+
+def reviewer_prewarm_open_plan(
+    *, reviewer_card: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """State that the reviewer Source Graph prewarm opens the index READ-ONLY.
+
+    A quality reviewer is read-only by contract, so prewarming its candidate
+    overlay never needs -- and must never take -- a WRITABLE open of the Source
+    Graph index.  The measured wedge (six reviewers stuck in
+    ``writable_open_recover`` on ``database is locked``) came from taking a
+    writer lock the reviewer's contract never justified.  This plan makes the
+    read-only open explicit so the prewarm cannot contend for the writer lock.
+    ``contract_consistent`` is False only if a supplied card contradicts the
+    read-only contract; the open mode is read-only regardless.
+    """
+
+    consistent = reviewer_card is None or reviewer_is_read_only(reviewer_card)
+    return {
+        "schema_id": REVIEWER_PREWARM_OPEN_SCHEMA_ID,
+        "open_mode": REVIEWER_PREWARM_OPEN_MODE_READONLY,
+        "writable": False,
+        "requires_writer_lock": False,
+        "contract_consistent": bool(consistent),
+        "reason": "reviewer_read_only_by_contract",
+        "why": (
+            "a quality reviewer declares no allowed_writes and forbids "
+            "repository_write, so its Source Graph prewarm takes a read-only "
+            "index open and never contends for the writable/writer lock"
+        ),
+    }
+
+
+def evaluate_prewarm_wait(
+    *,
+    elapsed_seconds: float,
+    acquired: bool,
+    deadline_seconds: float = REVIEWER_PREWARM_DEADLINE_SECONDS_DEFAULT,
+    phase: str = "",
+    error: str = "",
+) -> dict[str, Any]:
+    """Decide whether a bounded reviewer prewarm succeeds, waits, or fails launch.
+
+    ``acquired`` short-circuits to success.  Otherwise a prewarm that has run
+    for at least ``deadline_seconds`` without acquiring its read-only index
+    handle FAILS the launch (``launch_failed`` True) with a named reason that
+    carries the last observed phase/error, instead of hanging indefinitely.
+    Within the deadline it is still waiting and the launch is not yet failed.
+    """
+
+    elapsed = max(0.0, float(elapsed_seconds))
+    deadline = max(0.0, float(deadline_seconds))
+    if acquired:
+        return {
+            "schema_id": REVIEWER_PREWARM_WAIT_SCHEMA_ID,
+            "state": "acquired",
+            "ok": True,
+            "launch_failed": False,
+            "timed_out": False,
+            "elapsed_seconds": elapsed,
+            "deadline_seconds": deadline,
+            "reason": "reviewer_source_graph_prewarm_acquired",
+        }
+    if elapsed >= deadline:
+        detail = str(error or phase or "").strip()[:200]
+        reason = (
+            "reviewer_source_graph_prewarm_deadline_exceeded:"
+            f"elapsed={elapsed:.3f}s>=deadline={deadline:.3f}s"
+        )
+        if detail:
+            reason = f"{reason}:{detail}"
+        return {
+            "schema_id": REVIEWER_PREWARM_WAIT_SCHEMA_ID,
+            "state": "deadline_exceeded",
+            "ok": False,
+            "launch_failed": True,
+            "timed_out": True,
+            "elapsed_seconds": elapsed,
+            "deadline_seconds": deadline,
+            "reason": reason,
+        }
+    return {
+        "schema_id": REVIEWER_PREWARM_WAIT_SCHEMA_ID,
+        "state": "waiting",
+        "ok": False,
+        "launch_failed": False,
+        "timed_out": False,
+        "elapsed_seconds": elapsed,
+        "deadline_seconds": deadline,
+        "reason": "reviewer_source_graph_prewarm_in_progress",
+    }
+
+
+def evaluate_reservation(
+    *,
+    reservation_expires_at_epoch: float,
+    now_epoch: float,
+    slot_id: str = "",
+    attempt_id: str = "",
+) -> dict[str, Any]:
+    """An expired reservation terminates the attempt and frees its slot.
+
+    Given the reservation's absolute expiry epoch and the current epoch, an
+    already-past expiry means the attempt is abandoned: ``terminate_attempt``
+    and ``free_slot`` are both True with a named reason -- rather than the
+    measured failure where a past ``reservation_expires_at_epoch`` reclaimed
+    nothing and the slot stayed wedged.  An unexpired reservation is active.
+    """
+
+    expires = float(reservation_expires_at_epoch)
+    now = float(now_epoch)
+    remaining = expires - now
+    expired = remaining <= 0.0
+    if expired:
+        reason = f"reviewer_reservation_expired:expired_{-remaining:.3f}s_ago"
+    else:
+        reason = f"reviewer_reservation_active:{remaining:.3f}s_remaining"
+    return {
+        "schema_id": REVIEWER_RESERVATION_SCHEMA_ID,
+        "expired": bool(expired),
+        "terminate_attempt": bool(expired),
+        "free_slot": bool(expired),
+        "slot_id": str(slot_id),
+        "attempt_id": str(attempt_id),
+        "seconds_remaining": remaining,
+        "reason": reason,
+    }
+
+
+def detect_preparation_stall(
+    *,
+    phase: str,
+    heartbeat_epoch: float,
+    now_epoch: float,
+    pid: int | None = None,
+    process_alive: bool = False,
+    stall_after_seconds: float = REVIEWER_PREP_HEARTBEAT_STALL_SECONDS_DEFAULT,
+) -> dict[str, Any]:
+    """A frozen preparation heartbeat is a stall even with no process yet.
+
+    During preparation (e.g. ``reviewer_source_graph_prewarm_started``) there is
+    no spawned process -- ``pid`` is None and ``process_alive`` is False -- yet
+    the attempt still emits a preparation heartbeat.  Stall detection that only
+    watches a RUNNING process is blind to this phase, which is exactly how the
+    measured frozen preparation heartbeat went unreclaimed.  This watches the
+    heartbeat age directly, independent of any process, so a frozen preparation
+    heartbeat is a detectable stall.
+    """
+
+    now = float(now_epoch)
+    heartbeat = float(heartbeat_epoch)
+    age = now - heartbeat
+    bound = max(0.0, float(stall_after_seconds))
+    no_process = pid is None or not process_alive
+    stalled = age >= bound
+    if stalled:
+        reason = (
+            "reviewer_preparation_heartbeat_frozen:"
+            f"phase={str(phase or '')}:age={age:.3f}s>=bound={bound:.3f}s:"
+            f"no_process={no_process}"
+        )
+    else:
+        reason = "reviewer_preparation_heartbeat_fresh"
+    return {
+        "schema_id": REVIEWER_PREP_STALL_SCHEMA_ID,
+        "stalled": bool(stalled),
+        "in_preparation": bool(no_process),
+        "watches_process": False,
+        "heartbeat_age_seconds": age,
+        "stall_after_seconds": bound,
+        "phase": str(phase or ""),
+        "pid": pid,
+        "process_alive": bool(process_alive),
+        "reason": reason,
+    }
+
+
+def _target_review_substatus(target_card: Mapping[str, Any] | None) -> str:
+    if not isinstance(target_card, Mapping):
+        return ""
+    terminal_review = target_card.get("terminal_review")
+    if isinstance(terminal_review, Mapping):
+        return str(terminal_review.get("substatus") or "")
+    return ""
+
+
+def assess_reviewer_launch_target(
+    *,
+    target_card: Mapping[str, Any] | None = None,
+    target_substatus: str = "",
+) -> dict[str, Any]:
+    """Refuse a quality reviewer launch whose target is not ``review_ready``.
+
+    The reviewer resolves its target; if that target is not ``review_ready`` the
+    reviewer refuses and dies.  Returning ``ok`` from the launch and letting the
+    reviewer silently disappear leaves the caller believing a review is running.
+    This gate makes the launch FAIL at launch (``can_launch`` False,
+    ``fails_at_launch`` True), naming the observed target state, so the caller
+    learns immediately instead of waiting on a review that never starts.
+    """
+
+    substatus = str(target_substatus or "")
+    if not substatus and target_card is not None:
+        substatus = _target_review_substatus(target_card)
+    normalized = substatus.strip().lower()
+    ready = normalized == REVIEWER_TARGET_REVIEW_READY
+    if ready:
+        reason = "reviewer_target_review_ready"
+    else:
+        reason = f"reviewer_target_not_review_ready:{normalized or '<none>'}"
+    return {
+        "schema_id": REVIEWER_LAUNCH_TARGET_SCHEMA_ID,
+        "can_launch": bool(ready),
+        "fails_at_launch": not ready,
+        "target_substatus": normalized,
+        "reason": reason,
+    }
+
+
 __all__ = [
     "DELIVERY_SCHEMA_ID",
     "PREWARM_SKIP_SCHEMA_ID",
@@ -707,4 +974,19 @@ __all__ = [
     "assess_reviewer_availability",
     "resolve_independence_rung",
     "independence_acceptance_line",
+    "REVIEWER_PREWARM_OPEN_SCHEMA_ID",
+    "REVIEWER_PREWARM_WAIT_SCHEMA_ID",
+    "REVIEWER_RESERVATION_SCHEMA_ID",
+    "REVIEWER_PREP_STALL_SCHEMA_ID",
+    "REVIEWER_LAUNCH_TARGET_SCHEMA_ID",
+    "REVIEWER_PREWARM_OPEN_MODE_READONLY",
+    "REVIEWER_PREWARM_DEADLINE_SECONDS_DEFAULT",
+    "REVIEWER_PREP_HEARTBEAT_STALL_SECONDS_DEFAULT",
+    "REVIEWER_TARGET_REVIEW_READY",
+    "reviewer_is_read_only",
+    "reviewer_prewarm_open_plan",
+    "evaluate_prewarm_wait",
+    "evaluate_reservation",
+    "detect_preparation_stall",
+    "assess_reviewer_launch_target",
 ]
