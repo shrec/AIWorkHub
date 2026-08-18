@@ -104,7 +104,10 @@ def load_live_cards() -> tuple[list[dict], str, bool]:
     taskctl._load_cards precedence), JSONL fallback otherwise. Returns
     (cards, source, readonly_probe_ok)."""
     if DB_PATH.exists():
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        # ``file:{path}?mode=ro`` is not a read-only open: a '#' in the path
+        # starts a URI fragment that swallows the query, so the database opens
+        # read-write.  ``as_uri()`` percent-encodes it.
+        conn = sqlite3.connect(f"{DB_PATH.resolve().as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute("SELECT card_json FROM tasks").fetchall()
