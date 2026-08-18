@@ -6,6 +6,46 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.85] - 2026-08-18
+
+### Changed
+
+- **Preparing a quality reviewer no longer copies the whole Source Graph index.**
+  A reviewer must query an index that reflects the candidate rather than
+  canonical - querying canonical would show it the old structure of exactly the
+  files under review. That was achieved by cloning the entire canonical database
+  and re-indexing only the changed files: 107,130,880 bytes, 15,104 entities,
+  165,012 edges and 759 files copied per reviewer, per lens, for a candidate
+  that typically changes six files. A reviewer took twenty to thirty minutes to
+  *start*.
+
+  Source Graph now indexes a bounded scope separately and links it to the rest.
+  A **partition** indexes an explicitly declared set of files into its own
+  database and never reads, copies or opens the base. A **composed view** binds
+  one read-only base plus its partitions and answers as a single index, with
+  precedence per file: a file in a partition hides the base rows for that file,
+  an absent file resolves from the base, and a deleted file resolves to nothing.
+  Edges resolve across the boundary in both directions, and the two cases a
+  lexical resolver cannot decide are returned as named limitations rather than
+  guessed.
+
+  Measured against the live index for six changed files: **107,130,880 bytes and
+  ~25 minutes became 5,300,224 bytes and 30.4 seconds** - twenty times fewer
+  bytes, forty times less wall clock. More importantly the dependence on
+  repository size is severed rather than reduced: an index of 1 GB costs the
+  same for the same six files. The regression asserts this on row counts, not
+  bytes, and fails the build if a full rebuild happens at all. (NF-2026-00302)
+
+### Known and not closed by this release
+
+- The same full-index clone still exists on the rework overlay path, so every
+  rework attempt still pays it (NF-2026-00313).
+- A composed view's base fingerprint is size plus mtime_ns with no content hash,
+  so an in-place base replacement preserving both is not detected as a shift.
+  Documented in the module rather than left to be rediscovered.
+- The reservation-expiry and stall-watchdog halves of NF-2026-00302 are separate
+  from the copy cost and remain open.
+
 ## [0.9.84] - 2026-08-18
 
 ### Fixed

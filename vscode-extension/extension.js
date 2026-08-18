@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.84";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.85";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -6466,7 +6466,17 @@ async function ensureCodexCallbackMuxConfigured(context, options = {}) {
  *  processes: the latter reads `.vscode/mcp.json`, so a stale repository
  *  source checkout in PYTHONPATH can fail even while the dashboard is live.
  *  Keep the registration repository-scoped, but make code authority come from
- *  this extension's bundled runtime on every supported host OS. */
+ *  this extension's bundled runtime on every supported host OS.
+ *  NOTE: never emit `${workspaceFolder}` into `command`. VS Code's MCP
+ *  variable substitution only applies to `args`/`env`, not `command`, so the
+ *  literal string reaches spawn() and fails with ENOENT on Copilot.
+ *  Additionally, VS Code's remote MCP spawn has been observed failing with
+ *  ENOENT on repo-local absolute interpreter paths even when the binary
+ *  exists and the extension host itself spawns it fine seconds earlier,
+ *  while a bare interpreter name resolves reliably (the Codex registration
+ *  proves this pattern). Repo-relative venv pythons are therefore flattened
+ *  to their bare name; explicitly configured or external interpreters are
+ *  preserved verbatim. */
 function portableWorkspaceMcpCommand(command, repoRoot) {
   const rawCommand = String(command || "");
   if (!rawCommand || !path.isAbsolute(rawCommand)) return rawCommand;
@@ -6474,7 +6484,8 @@ function portableWorkspaceMcpCommand(command, repoRoot) {
   if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     return rawCommand;
   }
-  return `${"${workspaceFolder}"}/${relative.split(path.sep).join("/")}`;
+  const base = path.basename(rawCommand);
+  return base === "python3" || base === "python" ? base : rawCommand;
 }
 
 function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, python) {

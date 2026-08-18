@@ -1,5 +1,33 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.85 — 2026-08-18
+
+### Changed
+
+- **Starting a quality review used to take twenty to thirty minutes before
+  anything happened.** It now takes about half a minute.
+
+  A reviewer has to see the code as the task changed it, not as it was, so it
+  needs its own copy of the project index. AIWorkHub was making that copy by
+  duplicating the entire index — 107 MB here — for every single reviewer, to
+  change the six files the task actually touched. Ninety-nine percent of the
+  copy was identical to what it was copied from.
+
+  AIWorkHub now indexes just the changed files, separately, and links that small
+  index to the main one when answering questions. Measured on this project:
+  **107 MB and about 25 minutes became 5.3 MB and 30 seconds.**
+
+  The part that matters for bigger projects: the new cost depends on how much
+  changed, not on how large the project is. A project with a 1 GB index pays the
+  same 5 MB and 30 seconds for the same six files. The old design would have
+  meant hours of waiting before a single review could begin.
+
+### Known limitations, stated rather than left to be found
+
+- Retrying a task still makes the old full copy; that path is tracked separately.
+- The link between the small index and the main one is checked by size and
+  timestamp, not by content hash.
+
 ## 0.9.84 — 2026-08-18
 
 ### Fixed

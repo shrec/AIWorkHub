@@ -12,6 +12,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.85
+
+- Starting a quality review took twenty to thirty minutes before anything
+  happened; it now takes about half a minute. A reviewer needs its own copy of
+  the project index to see the code as the task changed it, and AIWorkHub was
+  duplicating the entire 107 MB index for every reviewer in order to change the
+  six files the task actually touched.
+- AIWorkHub now indexes only the changed files and links that small index to the
+  main one. Measured here: 107 MB and ~25 minutes became 5.3 MB and 30 seconds.
+- The new cost depends on how much changed, not on how large the project is — a
+  project with a 1 GB index pays the same for the same six files.
+
 ## What's new in 0.9.84
 
 - The audit trail credited the wrong model for the work: every manager action was
