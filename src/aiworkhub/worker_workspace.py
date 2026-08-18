@@ -278,6 +278,12 @@ class WorkerWorkspace:
     parent_baseline: dict[str, str | None]
     workspace_baseline: dict[str, str | None]
     inherited_rework_paths: tuple[str, ...] = ()
+    # Commit OID the isolated worktree was detached at when it was created.
+    # ``changed_paths`` diffs against this pinned base, not the live symbolic
+    # ``HEAD``, so a worker that commits inside its own worktree cannot make its
+    # work invisible by moving ``HEAD``.  ``None`` only for legacy metadata that
+    # predates the pin, in which case the symbolic ``HEAD`` fallback is used.
+    base_oid: str | None = None
 
     def as_metadata(self) -> dict[str, Any]:
         return {
@@ -289,6 +295,7 @@ class WorkerWorkspace:
             "parent_baseline": dict(self.parent_baseline),
             "workspace_baseline": dict(self.workspace_baseline),
             "inherited_rework_paths": list(self.inherited_rework_paths),
+            "base_oid": self.base_oid,
         }
 
     @classmethod
@@ -310,6 +317,11 @@ class WorkerWorkspace:
             inherited_rework_paths=tuple(
                 _relative_repo_path(v)
                 for v in payload.get("inherited_rework_paths") or ()
+            ),
+            base_oid=(
+                str(payload["base_oid"])
+                if payload.get("base_oid") is not None
+                else None
             ),
         )
 
@@ -380,11 +392,40 @@ def _static_prefix(pattern: str) -> str:
     return pattern[: min(indexes)] if indexes else pattern
 
 
+def _segment_glob_matches(pattern_parts: list[str], path_parts: list[str]) -> bool:
+    """Match repo-relative path segments with per-segment wildcards.
+
+    A single ``*`` (and ``?`` / ``[...]``) is confined to one path segment via
+    :func:`fnmatch.fnmatchcase`; only an explicit ``**`` segment spans zero or
+    more separators.  This mirrors the single-segment semantics that
+    :meth:`pathlib.Path.glob` already applies when the workspace seeds and
+    validates the same patterns, so scope checks cannot admit a nested path a
+    lone ``*`` was never meant to reach (for example ``docs/*.md`` must not
+    match ``docs/private/secret.md``).
+    """
+    if not pattern_parts:
+        return not path_parts
+    head, *tail = pattern_parts
+    if head == "**":
+        for split in range(len(path_parts) + 1):
+            if _segment_glob_matches(tail, path_parts[split:]):
+                return True
+        return False
+    if not path_parts:
+        return False
+    if fnmatch.fnmatchcase(path_parts[0], head):
+        return _segment_glob_matches(tail, path_parts[1:])
+    return False
+
+
 def _matches(path: str, patterns: Iterable[str]) -> bool:
     normalized = _relative_repo_path(path)
+    path_parts = normalized.split("/")
     for raw in patterns:
         pattern = _relative_repo_path(raw)
-        if normalized == pattern or fnmatch.fnmatchcase(normalized, pattern):
+        if normalized == pattern:
+            return True
+        if _segment_glob_matches(pattern.split("/"), path_parts):
             return True
     return False
 
@@ -1284,13 +1325,23 @@ def create_workspace(
         raise WorkspaceError(f"workspace_exists:{request_id}")
     path.parent.mkdir(parents=True, exist_ok=False, mode=0o700)
 
-    result = _run(
-        ["git", "worktree", "add", "--detach", str(path), "HEAD"],
-        cwd=repo,
-        timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
-    )
+    try:
+        result = _run(
+            ["git", "worktree", "add", "--detach", str(path), "HEAD"],
+            cwd=repo,
+            timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        # ``git worktree add`` can raise (for example a timeout that kills git
+        # mid-checkout) after it has already written a partial checkout and a
+        # ``.git/worktrees`` registration.  Remove the directory first, then
+        # prune the now-dangling administrative record so no worktree leaks.
+        shutil.rmtree(path.parent, ignore_errors=True)
+        _run(["git", "worktree", "prune", "--expire", "now"], cwd=repo)
+        raise
     if result.returncode != 0:
         shutil.rmtree(path.parent, ignore_errors=True)
+        _run(["git", "worktree", "prune", "--expire", "now"], cwd=repo)
         # Git reports the actionable cause (for example ENOSPC) at the end,
         # after a long checkout progress stream. Preserve that tail.
         raise WorkspaceError(f"git_worktree_add_failed:{result.stderr[-1000:]}")
@@ -1331,6 +1382,11 @@ def create_workspace(
     if detached.returncode == 0 or top.returncode != 0 or Path(top.stdout.strip()).resolve() != path:
         cleanup_workspace(repo, path, home)
         raise WorkspaceError("worktree_is_not_detached_and_isolated")
+    head = _run(["git", "rev-parse", "HEAD"], cwd=path)
+    base_oid = head.stdout.strip()
+    if head.returncode != 0 or not base_oid:
+        cleanup_workspace(repo, path, home)
+        raise WorkspaceError("worktree_base_oid_unavailable")
     return WorkerWorkspace(
         request_id=request_id,
         repo=repo,
@@ -1340,6 +1396,7 @@ def create_workspace(
         parent_baseline=baseline,
         workspace_baseline=workspace_baseline,
         inherited_rework_paths=tuple(sorted(set(rework_seeded))),
+        base_oid=base_oid,
     )
 
 
@@ -1577,8 +1634,37 @@ def assert_gc_safe_workspace_shape(
 
 
 def changed_paths(workspace: WorkerWorkspace) -> list[str]:
+    # Diff against the OID the worktree was pinned to at creation, never the
+    # live symbolic ``HEAD``.  A worker that commits inside its own detached
+    # worktree moves ``HEAD``; diffing symbolic ``HEAD`` would then report the
+    # committed work as unchanged and it would never be scope-checked or
+    # promoted.  If ``HEAD`` moved to something the pinned base cannot explain
+    # (the base is not an ancestor of the current commit), fail closed rather
+    # than diff against an unrelated tree.
+    diff_ref = workspace.base_oid or "HEAD"
+    if workspace.base_oid:
+        head = _run(["git", "rev-parse", "HEAD"], cwd=workspace.path)
+        if head.returncode != 0:
+            raise WorkspaceError(f"git_rev_parse_head_failed:{head.stderr[:300]}")
+        current_head = head.stdout.strip()
+        if current_head != workspace.base_oid:
+            ancestry = _run(
+                ["git", "merge-base", "--is-ancestor", workspace.base_oid, "HEAD"],
+                cwd=workspace.path,
+            )
+            if ancestry.returncode != 0:
+                raise WorkspaceError(
+                    "worktree_head_moved_unexplained:"
+                    f"{workspace.base_oid}:{current_head}"
+                )
+    # ``--no-renames`` splits a staged rename into an explicit delete of the
+    # source and an add of the destination, so ``git mv src/a.py src/b.py``
+    # records both sides.  With Git's default rename detection, ``--name-only``
+    # would report only the destination and hide the deleted source from the
+    # scope check.
     tracked = _run(
-        ["git", "diff", "--name-only", "-z", "HEAD"], cwd=workspace.path
+        ["git", "diff", "--name-only", "--no-renames", "-z", diff_ref],
+        cwd=workspace.path,
     )
     if tracked.returncode != 0:
         raise WorkspaceError(f"git_diff_failed:{tracked.stderr[:300]}")
