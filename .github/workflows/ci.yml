@@ -223,6 +223,24 @@ jobs:
             vscode-extension/dist/aiworkhub-*.vsix
           if-no-files-found: error
 
+      - name: Upload Windows nt regression report
+        if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@v6
+        with:
+          name: qualification-${{ matrix.name }}-nt
+          path: qualification-${{ matrix.name }}-nt.xml
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload macOS Darwin regression report
+        if: matrix.platform == 'macos'
+        uses: actions/upload-artifact@v6
+        with:
+          name: qualification-${{ matrix.name }}-darwin
+          path: qualification-${{ matrix.name }}-darwin.xml
+          if-no-files-found: error
+          retention-days: 30
+
   python-ci:
     name: Python (3.12–3.14)
     runs-on: ubuntu-latest

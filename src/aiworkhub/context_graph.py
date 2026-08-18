@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from . import feature_settings, storage_registry
+from . import capture_adapters, feature_settings, storage_registry
 
 
 SCHEMA_ID = "aiworkhub.context_graph.v1"
@@ -106,6 +106,21 @@ def _token(value: Any, field: str, *, required: bool = True) -> str:
     return text
 
 
+def is_valid_token(value: Any) -> bool:
+    """Return True when ``value`` satisfies :func:`append_event`'s token rule.
+
+    A caller that batches many records can pre-filter each identifier with this
+    predicate, so a single record whose id violates the strict token charset is
+    skipped rather than raising :class:`ContextGraphError` mid-batch and
+    discarding every good record captured alongside it.
+    """
+    try:
+        _token(value, "token")
+    except ContextGraphError:
+        return False
+    return True
+
+
 def _metadata(value: Mapping[str, Any] | None) -> str:
     if value is None:
         return "{}"
@@ -181,12 +196,8 @@ def status(repo: Path | str) -> dict[str, Any]:
             "ready": True,
             "schema_id": SCHEMA_ID,
             "repo_id": repo_id,
-            "capture_scope": "manager_only",
-            "capture_adapters": {
-                "codex": "final_items",
-                "claude": "not_configured",
-                "copilot": "not_configured",
-            },
+            "capture_scope": capture_adapters.CAPTURE_SCOPE,
+            "capture_adapters": capture_adapters.status_map(),
             "events": counts["conversation_events"],
             "nodes": counts["context_nodes"],
             "edges": counts["context_edges"],
@@ -556,5 +567,5 @@ def related(repo: Path | str, *, node_id: str, limit: int = 20) -> dict[str, Any
 __all__ = [
     "ContextGraphError", "SCHEMA", "SCHEMA_ID", "append_event",
     "append_session_document_in_transaction", "ensure_schema", "get_range",
-    "rebuild_projection", "related", "search", "status",
+    "is_valid_token", "rebuild_projection", "related", "search", "status",
 ]
