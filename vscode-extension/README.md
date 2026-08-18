@@ -12,6 +12,38 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.81
+
+- **The runtime could report itself unavailable on a large repository.** Startup
+  ran a full reconciliation scan of every task and every retained workspace before
+  answering the editor, so the editor gave up and showed "MCP runtime unavailable"
+  against a healthy runtime. Measured here: a 26.7 second startup, 21.6 seconds of
+  it in that scan. It now runs in the background and startup answers in 0.77
+  seconds.
+
+See the packaged **Changelog** for the complete release summary.
+
+## What's new in 0.9.80
+
+- **Live Output stopped polling forever the first time it had nothing to show.**
+  Selecting a task right after launching it returned "output unavailable" and the
+  poll chain was never restarted, so the panel kept showing that error while the
+  worker streamed. It now restarts on every outcome, and a late task-detail reply
+  no longer resurrects a panel you had already left.
+- **An idempotency key could silently swallow another file's edit.** Two semantic
+  edits sent with the same key but different targets counted as a repeat: the
+  second was never written and still reported success, carrying the first file's
+  path. A replay must now match in target as well as key.
+- **Storage grew without a working bound.** Quarantined directories no batch
+  claimed could never be purged, empty batches had no collector, and worker logs
+  had no per-file limit. Each now bounds itself, and an oversized terminal log
+  keeps the diagnostic tail the launcher reads.
+- **Archived tasks stayed live and held their worktrees.** Archiving is now a
+  single guarded write that verifies itself after committing, so a task cannot
+  sit half-archived and pin storage forever.
+
+See the packaged **Changelog** for the complete release summary.
+
 ## What's new in 0.9.79
 
 - **A card that changed a generated file could never be reviewed.** If a change

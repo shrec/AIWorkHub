@@ -1,5 +1,54 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.81 — 2026-08-17
+
+### Fixed
+
+- **The AIWorkHub runtime could report itself unavailable on a large repository.**
+  Startup ran a full reconciliation scan of every task and every retained
+  workspace before answering the editor, which took long enough that the editor
+  gave up and showed "MCP runtime unavailable" even though the runtime was
+  healthy. That scan now runs in the background: startup answers in well under a
+  second and reconciliation converges behind it.
+
+## 0.9.80 — 2026-08-17
+
+### Fixed
+
+- **Live Output stopped polling forever the first time it had nothing to show.**
+  Selecting a task right after launching it — exactly when you want to watch it —
+  returned "output unavailable", and the poll chain was never restarted. Seconds
+  later the worker was streaming and the panel still showed the error, permanently,
+  until you selected the task again by hand. The chain now restarts on every
+  outcome, and a not-there-yet response reads as a transient state that says what it
+  is waiting for.
+
+- **A late task-detail reply could resurrect a panel you had already left.** If a
+  task was archived in another window while its details were still loading, the
+  panel came back when the reply landed and the Archive and Restore buttons bound to
+  a task that was no longer in the table. A reply that lost its race is now dropped.
+
+- **An idempotency key could silently swallow another file's edit.** Two semantic
+  edits sent with the same key but different targets counted as a repeat: the second
+  was never written and still reported success, carrying the first file's path.
+  Workers that derive the key from a task id lost every edit after the first.
+
+- **Storage grew without a working bound.** Quarantined directories that no batch
+  claimed could never be purged, empty batches had no collector, and worker logs and
+  attempt bundles had no per-file limit. Each of those now bounds itself, an
+  oversized terminal log keeps the diagnostic tail the launcher reads, and a live run
+  is never touched.
+
+- **Archived tasks stayed live and held their worktrees.** A row could carry an
+  archive timestamp while its status stayed open, so the task never disappeared and
+  its worktree could never be reclaimed. Archiving is now a single guarded write that
+  verifies itself after committing.
+
+- **The NeedFix list showed records that were already handled.** A rejected entry
+  reappeared and a converted one read as open, because the panel and the tools read
+  the raw store instead of the derived state. They now derive at read time, and say
+  so when they cannot.
+
 ## 0.9.79 — 2026-08-17
 
 ### Fixed

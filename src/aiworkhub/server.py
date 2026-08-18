@@ -2506,6 +2506,20 @@ def _enforce_terminal_retention_safely(root: Path) -> None:
         return
 
 
+def _start_task_reconciler_safely(root: Path) -> None:
+    """Start the task reconciler without ever making MCP unavailable.
+
+    Runs on a daemon thread: reconciliation walks the task store and the
+    retained workspaces, which is measured in tens of seconds on a large
+    repository, and blocking the stdio thread for that long makes `initialize`
+    miss the client's request deadline.  Failure stays diagnosable through the
+    reconciler's own health surface and the next reload retries registration.
+    """
+    try:
+        task_reconciler.ensure_started(root)
+    except Exception:
+        pass
+
 def main() -> None:
     root = core.repo_root()
     # Additive schema migration for repositories created before NeedFix was
@@ -2543,13 +2557,18 @@ def main() -> None:
         name=f"aiworkhub-log-retention-{abs(hash(str(root))) & 0xffff:x}",
         daemon=True,
     ).start()
-    try:
-        task_reconciler.ensure_started(root)
-    except Exception:
-        # As with Source Graph, reconciliation startup must never make MCP
-        # unavailable. Its health remains diagnosable and the next reload can
-        # retry registration.
-        pass
+    # Reconciliation scans every task row and every retained workspace, so on a
+    # large repository it takes tens of seconds.  Run it off the MCP stdio thread
+    # for the same reason retention is: a synchronous call here delays the reply
+    # to `initialize`, and a client whose request deadline is shorter than the
+    # scan reports mcp_initialize_failed:mcp_request_timeout against a server
+    # that is perfectly healthy.
+    threading.Thread(
+        target=_start_task_reconciler_safely,
+        args=(root,),
+        name=f"aiworkhub-task-reconciler-{abs(hash(str(root))) & 0xffff:x}",
+        daemon=True,
+    ).start()
     try:
         mcp.run()
     finally:

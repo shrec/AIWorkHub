@@ -6,6 +6,78 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.81] - 2026-08-17
+
+### Fixed
+
+- **The MCP runtime failed to start on a large repository, reporting a timeout
+  against a server that was perfectly healthy.** `main()` called
+  `task_reconciler.ensure_started()` synchronously before serving, and that scan
+  walks every task row and every retained workspace — measured here at 21.6 s of a
+  26.7 s `initialize` round-trip. Any client whose request deadline is shorter than
+  the scan reported `mcp_initialize_failed:mcp_request_timeout`, so the extension
+  declared the runtime unavailable while nothing was wrong with it. Reconciliation
+  now starts on a daemon thread, for the same reason retention already did.
+  Measured after the change: `initialize` answers in 0.77 s.
+
+## [0.9.80] - 2026-08-17
+
+### Fixed
+
+- **An idempotency key could silently swallow another file's edit.** The semantic
+  edit replay cache was indexed on the key alone, so a second apply with the same
+  key but a different target — different file, different range, different content —
+  counted as a replay: nothing was written, `ok: true` came back, and the receipt
+  carried the first file's path. A worker deriving its key from a task id or a step
+  counter lost every edit after the first, under a success receipt, on the primitive
+  the project relies on to keep edits cheap. A replay must now match in target as
+  well as key; a same-key different-target call is refused explicitly. Also in this
+  area: apply preserves the original file mode instead of leaving every edited file
+  at `0600`, a failed audit-ledger append fails closed as `quality_review_submit` in
+  the same module already did, and the bounded preview cursor is derived from the
+  rows actually returned so paging cannot skip rows.
+
+- **Four storage accumulations had no working bound at all.** The quarantine
+  directory held gigabytes that no batch claimed — the records said nothing was
+  quarantined while hundreds of subdirectories sat on disk, so nothing would ever
+  purge them. That path is closed, unclaimed directories can be reconciled back into
+  the normal expiry path, the empty purge-eligible batches have a named collector,
+  and `process_logs` and attempt-artifacts each have a stated bound. An oversized
+  terminal log is tail-capped to the exact window the launcher itself reads to
+  diagnose a failure; a live or non-terminal run is never touched. Ownership is
+  proved by location rather than inferred from a name or an age, and the destructive
+  paths re-verify emptiness in both record and disk before removing anything.
+
+- **A half-archived row stayed live and pinned its worktree forever.** Rows carried
+  `archived_at` while their status stayed non-terminal, so every archive tool
+  answered `already_archived`, the collision guard still counted them as live, and
+  the worktrees they owned could never be reclaimed. `archive_task` now writes
+  `archived_at` and the terminal status in one preimage-guarded UPDATE with a
+  rowcount guard, and re-reads after commit so a write that did not land reports
+  `archive_not_persisted` instead of success.
+
+- **The NeedFix operator surfaces showed a stale list nobody could trust.** Read-time
+  derivation existed but nothing called it, so the MCP `needfix_list` tool,
+  `needfix_count` and the dashboard panel still went through the raw store: a
+  rejected record resurfaced and a converted one read as open. All three now obtain
+  their rows through the derived entry points, and `derived` / `underived_reason` are
+  carried out to each surface so a caller is told when derivation could not run
+  instead of being shown stale rows that look authoritative.
+
+- **Live Output stopped polling forever the first time it had nothing to show.**
+  Selecting a task right after launch returned `output_unavailable` and the poll
+  chain was never re-armed, so the panel showed that error permanently while the
+  worker streamed. The chain now re-arms on every outcome and a not-there-yet
+  response reads as a transient state. A `taskDetail` reply that lost its race no
+  longer resurrects a cleared panel.
+
+### Changed
+
+- **The multicore principle is stated where models and humans both read it.**
+  Everything that can use more than one core should, and the rule now renders into
+  `AGENTS.md`, `CLAUDE.md` and `.github/copilot-instructions.md` through the shared
+  policy, and is recorded in `docs/ARCHITECTURE.md`.
+
 ## [0.9.79] - 2026-08-17
 
 ### Fixed
