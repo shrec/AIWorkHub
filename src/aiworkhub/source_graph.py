@@ -1384,7 +1384,23 @@ def _resolve_python_imported_calls(
     direct call must name the imported symbol, while an attribute call must
     use the exact local import alias on its recorded source line.  The target
     must map to exactly one Python function in the imported module.
+
+    Like the C++ resolver, recomputing after every build must also clear a
+    binding whose target has disappeared. A Python call edge only fills when
+    its ``dst_qualname`` resolves to a real entity, so any managed edge whose
+    ``dst_qualname`` no longer names an existing entity -- an incremental build
+    renamed/deleted the callee while the caller file was untouched -- is reset
+    to NULL first, then re-resolved below. Without this, a stale binding to a
+    vanished symbol would read as EXTRACTED against an entity that is gone.
     """
+
+    conn.execute(
+        "UPDATE edges SET dst_qualname=NULL "
+        "WHERE extractor=? AND kind='calls' AND dst_qualname IS NOT NULL "
+        "AND evidence_label IN (?, ?) "
+        "AND NOT EXISTS (SELECT 1 FROM entities en WHERE en.qualname = edges.dst_qualname)",
+        (sgast.EXTRACTOR_ID, sgast.EXTRACTED, sgast.INFERRED),
+    )
 
     unresolved = conn.execute(
         "SELECT e.id, e.file_path, e.line, e.dst_name, e.evidence_label "
@@ -2150,12 +2166,56 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
     return [dict(row) for row in rows]
 
 
+# A bodygrep cursor resumes at ``file_path >= after_file`` and skips lines
+# ``<= after_line`` inside ``after_file``. This sentinel means "skip every line
+# of after_file" -- used to resume strictly past a file that was fully scanned
+# (e.g. the last file before the scan-file cap) without re-emitting its matches.
+_BODYGREP_SKIP_ALL_LINES = 1 << 62
+
+
+def _bodygrep_cursor_digest(term: str, target: str, budget: int) -> str:
+    payload = f"{term}\x1f{target}\x1f{budget}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _encode_bodygrep_cursor(
+    after_file: str, after_line: int, *, term: str, target: str, budget: int,
+) -> str:
+    af_hex = after_file.encode("utf-8").hex()
+    return f"{af_hex}-{int(after_line)}-{_bodygrep_cursor_digest(term, target, budget)}"
+
+
+def _decode_bodygrep_cursor(
+    cursor: str | None, *, term: str, target: str, budget: int,
+) -> tuple[str, int] | None:
+    if cursor is None:
+        return None
+    raw = str(cursor).strip()
+    if not raw:
+        return None
+    parts = raw.split("-")
+    if len(parts) != 3:
+        raise SourceGraphError("invalid_cursor")
+    af_hex, after_line_text, digest = parts
+    if (
+        not after_line_text.isdigit()
+        or digest != _bodygrep_cursor_digest(term, target, budget)
+    ):
+        raise SourceGraphError("invalid_cursor")
+    try:
+        after_file = bytes.fromhex(af_hex).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise SourceGraphError("invalid_cursor") from exc
+    return (after_file, int(after_line_text))
+
+
 def bodygrep_query(
     repo_root: Path,
     term: str,
     budget: int = 64,
     *,
     target: str | None = None,
+    cursor: str | None = None,
 ) -> dict[str, Any]:
     """Search literal/body text only inside canonical indexed source files.
 
@@ -2170,7 +2230,8 @@ def bodygrep_query(
         return {
             "mode": "bodygrep", "query": term, "budget": 0, "matches": [],
             "candidate_files": [], "files_scanned": 0, "bytes_scanned": 0,
-            "scan_truncated": False, "truncated": False,
+            "scan_truncated": False, "cursor": cursor, "next_cursor": None,
+            "truncated": False,
         }
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     byte_cap = max(512, budget * 512)
@@ -2188,16 +2249,33 @@ def bodygrep_query(
         ):
             raise SourceGraphError("bodygrep_target_invalid")
 
+    # A cursor resumes the ORDER BY file_path walk at ``file_path >=
+    # resume_file`` and skips lines already returned inside that file, so the
+    # rest of the repository stays reachable across pages instead of the scan
+    # ending forever at the first byte-cap or file-cap overrun. The cursor is
+    # bound to this exact (term, target, budget) tuple.
+    resume = _decode_bodygrep_cursor(
+        cursor, term=term, target=normalized_target, budget=budget,
+    )
+    resume_file = resume[0] if resume else None
+    resume_line = resume[1] if resume else 0
     conn = connect(resolve_db_path(repo_root), read_only=True)
     try:
+        resume_clause = " AND file_path >= ?" if resume_file is not None else ""
+        resume_param: tuple[Any, ...] = (resume_file,) if resume_file is not None else ()
         if normalized_target:
             exact = conn.execute(
                 "SELECT 1 FROM files WHERE file_path=? LIMIT 1",
                 (normalized_target,),
             ).fetchone()
             if exact:
-                query = "SELECT file_path FROM files WHERE file_path=? ORDER BY file_path LIMIT ?"
-                params: tuple[Any, ...] = (normalized_target, scan_file_cap + 1)
+                query = (
+                    "SELECT file_path FROM files WHERE file_path=?" + resume_clause
+                    + " ORDER BY file_path LIMIT ?"
+                )
+                params: tuple[Any, ...] = (
+                    normalized_target, *resume_param, scan_file_cap + 1,
+                )
             else:
                 escaped = (
                     normalized_target.replace("\\", "\\\\")
@@ -2205,13 +2283,15 @@ def bodygrep_query(
                     .replace("_", "\\_")
                 )
                 query = (
-                    "SELECT file_path FROM files WHERE file_path LIKE ? ESCAPE '\\' "
-                    "ORDER BY file_path LIMIT ?"
+                    "SELECT file_path FROM files WHERE file_path LIKE ? ESCAPE '\\'"
+                    + resume_clause
+                    + " ORDER BY file_path LIMIT ?"
                 )
-                params = (f"{escaped}/%", scan_file_cap + 1)
+                params = (f"{escaped}/%", *resume_param, scan_file_cap + 1)
         else:
-            query = "SELECT file_path FROM files ORDER BY file_path LIMIT ?"
-            params = (scan_file_cap + 1,)
+            where = (" WHERE file_path >= ?" if resume_file is not None else "")
+            query = "SELECT file_path FROM files" + where + " ORDER BY file_path LIMIT ?"
+            params = (*resume_param, scan_file_cap + 1)
         paths = [
             str(row["file_path"])
             for row in conn.execute(query, params)
@@ -2226,24 +2306,38 @@ def bodygrep_query(
     matches: list[dict[str, Any]] = []
     files_scanned = 0
     bytes_scanned = 0
+    last_scanned_file: str | None = None
+    next_cursor: str | None = None
     for file_path in paths:
-        target = (repo_root / file_path).resolve()
-        if not target.is_relative_to(repo_root):
+        candidate = (repo_root / file_path).resolve()
+        if not candidate.is_relative_to(repo_root):
             continue
         try:
-            raw = target.read_bytes()
+            raw = candidate.read_bytes()
         except OSError:
             continue
-        if bytes_scanned + len(raw) > scan_byte_cap:
+        # Always scan at least one file per page, even one larger than the byte
+        # cap, so a cursor can still advance past it -- otherwise a single
+        # oversized file would trap the scan on the same offset forever.
+        if files_scanned > 0 and bytes_scanned + len(raw) > scan_byte_cap:
             scan_truncated = True
+            next_cursor = _encode_bodygrep_cursor(
+                file_path, 0, term=term, target=normalized_target, budget=budget,
+            )
             break
         bytes_scanned += len(raw)
         files_scanned += 1
+        last_scanned_file = file_path
+        # Skip lines already returned on a prior page for the resume file.
+        start_after = resume_line if file_path == resume_file else 0
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             continue
+        hit_budget = False
         for line_number, line in enumerate(text.splitlines(), start=1):
+            if line_number <= start_after:
+                continue
             if needle not in line.casefold():
                 continue
             matches.append({
@@ -2259,9 +2353,24 @@ def bodygrep_query(
             })
             if len(matches) >= budget:
                 scan_truncated = True
+                hit_budget = True
+                # Resume inside this same file past the last line returned, so
+                # remaining matches here are not skipped and not duplicated.
+                next_cursor = _encode_bodygrep_cursor(
+                    file_path, line_number,
+                    term=term, target=normalized_target, budget=budget,
+                )
                 break
-        if len(matches) >= budget:
+        if hit_budget:
             break
+    if next_cursor is None and scan_truncated and last_scanned_file is not None:
+        # The scan stopped at the file-count cap with every scanned file
+        # complete. Resume strictly past the last scanned file so the caller
+        # reaches the files the cap cut off.
+        next_cursor = _encode_bodygrep_cursor(
+            last_scanned_file, _BODYGREP_SKIP_ALL_LINES,
+            term=term, target=normalized_target, budget=budget,
+        )
     rows, output_truncated = _bounded_rows(matches, budget, byte_cap)
     payload = {
         "mode": "bodygrep", "query": term, "budget": budget,
@@ -2273,7 +2382,9 @@ def bodygrep_query(
         "scan_byte_cap": scan_byte_cap,
         "scan_truncated": scan_truncated,
         "target": normalized_target or None,
-        "truncated": bool(output_truncated or scan_truncated),
+        "cursor": cursor,
+        "next_cursor": next_cursor,
+        "truncated": bool(output_truncated or scan_truncated or next_cursor is not None),
     }
     return _fit_payload_bytes(payload, byte_cap)
 
@@ -2288,10 +2399,14 @@ def body_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
     finally:
         conn.close()
     matches = [match] if match else []
+    # Top-level freshness is a scalar state; the indexed/on-disk hashes ride on
+    # the match itself (``match["freshness"]``) inside the results container.
+    freshness = str(match["freshness"]["state"]) if match else "no_match"
     return _fit_payload_bytes({
         "mode": "body", "query": name, "budget": budget,
         "matches": matches,
         "candidate_files": _candidate_files(matches, limit=1),
+        "freshness": freshness,
         "truncated": False,
     }, max(512, budget * 512))
 
@@ -2360,16 +2475,26 @@ def function_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, An
 
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     conn = connect(resolve_db_path(repo_root), read_only=True)
+    file_freshness: dict[str, dict[str, Any]] = {}
     try:
         matches = func(conn, name, limit=budget)
         for match in matches:
-            match["source"] = _source_snippet(repo_root, match)
+            file_path = str(match.get("file_path") or "")
+            fresh = file_freshness.get(file_path)
+            if fresh is None:
+                fresh = _file_freshness_state(conn, repo_root, file_path)
+                file_freshness[file_path] = fresh
+            match["freshness"] = fresh
+            match["source"] = _source_snippet(
+                repo_root, match, fresh=fresh["state"] == "fresh",
+            )
     finally:
         conn.close()
     return _fit_payload_bytes({
         "mode": "function", "query": name, "budget": budget,
         "matches": matches,
         "candidate_files": _candidate_files(matches, limit=min(16, budget)),
+        "freshness": _overall_freshness(file_freshness),
         "truncated": len(matches) >= budget,
     }, max(512, budget * 512))
 
@@ -2379,16 +2504,26 @@ def class_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
 
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     conn = connect(resolve_db_path(repo_root), read_only=True)
+    file_freshness: dict[str, dict[str, Any]] = {}
     try:
         matches = struct(conn, name, limit=budget)
         for match in matches:
-            match["source"] = _source_snippet(repo_root, match)
+            file_path = str(match.get("file_path") or "")
+            fresh = file_freshness.get(file_path)
+            if fresh is None:
+                fresh = _file_freshness_state(conn, repo_root, file_path)
+                file_freshness[file_path] = fresh
+            match["freshness"] = fresh
+            match["source"] = _source_snippet(
+                repo_root, match, fresh=fresh["state"] == "fresh",
+            )
     finally:
         conn.close()
     return _fit_payload_bytes({
         "mode": "class", "query": name, "budget": budget,
         "matches": matches,
         "candidate_files": _candidate_files(matches, limit=min(16, budget)),
+        "freshness": _overall_freshness(file_freshness),
         "truncated": len(matches) >= budget,
     }, max(512, budget * 512))
 
@@ -2485,14 +2620,22 @@ def body(conn: sqlite3.Connection, repo_root: Path, name: str) -> dict[str, Any]
     if row is None:
         return None
     result = dict(row)
-    try:
-        target = (repo_root / result["file_path"]).resolve()
-        if not target.is_relative_to(repo_root.resolve()):
-            raise ValueError("path_escape")
-        lines = target.read_text(encoding="utf-8").splitlines()
-        snippet = "\n".join(lines[result["line_start"] - 1: result["line_end"]])
-    except (OSError, ValueError, UnicodeDecodeError):
-        snippet = ""
+    freshness = _file_freshness_state(conn, repo_root, str(result["file_path"]))
+    result["freshness"] = freshness
+    # Only a file whose on-disk sha256 still matches the indexed source_hash may
+    # be sliced with its stored line numbers. A stale/missing/unverifiable file
+    # returns an explicit freshness state and no source, never lines belonging
+    # to a different generation.
+    snippet = ""
+    if freshness["state"] == "fresh":
+        try:
+            target = (repo_root / result["file_path"]).resolve()
+            if not target.is_relative_to(repo_root.resolve()):
+                raise ValueError("path_escape")
+            lines = target.read_text(encoding="utf-8").splitlines()
+            snippet = "\n".join(lines[result["line_start"] - 1: result["line_end"]])
+        except (OSError, ValueError, UnicodeDecodeError):
+            snippet = ""
     result["source"] = snippet
     return result
 
@@ -2715,6 +2858,7 @@ def _fit_payload_bytes(payload: dict[str, Any], byte_cap: int) -> dict[str, Any]
         "coverage",
         "cursor",
         "next_cursor",
+        "freshness",
     }
 
     def encoded_size() -> int:
@@ -2780,7 +2924,88 @@ def _call_edges_for_files(
     return sginsights.call_edges(conn, files, limit=limit)
 
 
-def _source_snippet(repo_root: Path, row: dict[str, Any], *, max_chars: int = 4000) -> str:
+def _disk_source_hash(repo_root: Path, file_path: str) -> str | None:
+    """sha256 of one repository file on disk, or None if unreadable/out of tree."""
+
+    try:
+        root = repo_root.resolve()
+        target = (root / str(file_path)).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
+            return None
+        return sgast.sha256_bytes(target.read_bytes())
+    except (OSError, ValueError):
+        return None
+
+
+def _file_freshness_state(
+    conn: sqlite3.Connection, repo_root: Path, file_path: str,
+) -> dict[str, Any]:
+    """Compare the indexed ``source_hash`` against the file on disk.
+
+    ``state`` is ``fresh`` only when the on-disk sha256 still equals the hash
+    recorded when the file was indexed. ``stale`` means the file changed since
+    indexing (its stored line numbers no longer describe it), ``missing`` that
+    the file is gone/unreadable, and ``unknown`` that the index carries no hash
+    to check against. A caller reads ``state`` to decide whether the indexed
+    line numbers can still be trusted to slice the live file.
+    """
+
+    row = conn.execute(
+        "SELECT source_hash FROM files WHERE file_path=?", (file_path,),
+    ).fetchone()
+    stored = None
+    if row is not None and row["source_hash"] is not None:
+        stored = str(row["source_hash"])
+    disk = _disk_source_hash(repo_root, file_path)
+    if disk is None:
+        state = "missing"
+    elif stored is None:
+        state = "unknown"
+    elif disk == stored:
+        state = "fresh"
+    else:
+        state = "stale"
+    return {
+        "state": state,
+        "indexed_source_hash": stored,
+        "disk_source_hash": disk,
+    }
+
+
+def _overall_freshness(per_file: dict[str, dict[str, Any]]) -> str:
+    """Collapse per-file freshness into one overall state string.
+
+    The top-level ``freshness`` field is a bare string (not a dict) on purpose:
+    a caller reads it directly, and, unlike a nested object, a scalar is never
+    miscounted as graph evidence by a downstream zero-hit/hit-count check -- so
+    carrying it can never flip an honest scoped miss into a false hit. The rich
+    per-file detail (indexed vs on-disk hash) rides on each match/section
+    instead, inside a result container where it is already accounted for.
+
+    ``fresh`` only when every file backing the response is fresh; otherwise the
+    worst observed state (``stale`` over ``missing`` over ``unknown``) so a
+    caller never reads a body-style answer as current when part of it is not.
+    """
+
+    states = [entry["state"] for entry in per_file.values()]
+    if not states:
+        return "unknown"
+    if all(state == "fresh" for state in states):
+        return "fresh"
+    for degraded in ("stale", "missing", "unknown"):
+        if degraded in states:
+            return degraded
+    return "stale"
+
+
+def _source_snippet(
+    repo_root: Path, row: dict[str, Any], *, max_chars: int = 4000, fresh: bool = True,
+) -> str:
+    # A caller that cannot prove the indexed ``source_hash`` still matches the
+    # file on disk must never receive lines sliced with the prior generation's
+    # line numbers: return nothing rather than code from a different generation.
+    if not fresh:
+        return ""
     try:
         target = (repo_root / str(row["file_path"])).resolve()
         if not target.is_relative_to(repo_root.resolve()):
@@ -2855,6 +3080,7 @@ def context_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, An
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     db_path = resolve_db_path(repo_root)
     conn = connect(db_path, read_only=True)
+    file_freshness: dict[str, dict[str, Any]] = {}
     try:
         exact = conn.execute("SELECT 1 FROM files WHERE file_path=?", (query,)).fetchone()
         matches = find(conn, query, limit=budget)
@@ -2863,13 +3089,17 @@ def context_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, An
         remaining = budget
         for path in files[:4]:
             item = context(conn, path)
+            fresh = _file_freshness_state(conn, repo_root, path)
+            file_freshness[path] = fresh
+            item["freshness"] = fresh
             per_file = max(1, min(8, remaining))
             item["entities"] = item["entities"][:per_file]
             item["edges"] = item["edges"][:per_file]
             for entity in item["entities"][: min(4, per_file)]:
                 if entity.get("kind") in {"function", "method", "class", "struct"}:
                     entity["source"] = _source_snippet(
-                        repo_root, {**entity, "file_path": path}, max_chars=800
+                        repo_root, {**entity, "file_path": path}, max_chars=800,
+                        fresh=fresh["state"] == "fresh",
                     )
             contexts.append(item)
             remaining -= len(item["entities"]) + len(item["edges"])
@@ -2884,6 +3114,7 @@ def context_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, An
             "matches": matches[: min(budget, 8)], "contexts": rows,
             "candidate_files": files[:4],
             "insights": insights,
+            "freshness": _overall_freshness(file_freshness),
             "truncated": truncated,
         }, max(4096, budget * 768))
     finally:
@@ -3263,21 +3494,35 @@ def analytics_query(
             # snapshot, not a row page), so a nonzero offset can only come
             # from a forged or stale cursor.
             raise SourceGraphError("invalid_cursor")
-        corpus = find(conn, query, limit=MAX_ANALYTICS_CORPUS_ROWS)
+        # ``find`` re-clamps its own limit to MAX_BUDGET_ROWS, so a find-backed
+        # corpus is really bounded there, not at MAX_ANALYTICS_CORPUS_ROWS. Track
+        # the cap that actually bounded this corpus so ``eligible_capped`` reports
+        # whether the retrieval was truncated, whatever the effective clamp was --
+        # not a MAX_ANALYTICS_CORPUS_ROWS threshold that find() can never reach.
+        find_rows = find(conn, query, limit=MAX_ANALYTICS_CORPUS_ROWS)
+        corpus_cap = min(MAX_ANALYTICS_CORPUS_ROWS, MAX_BUDGET_ROWS)
+        corpus_capped = len(find_rows) >= corpus_cap
         if normalized_target:
             corpus = [
-                row for row in corpus
+                row for row in find_rows
                 if _path_in_analytics_scope(str(row.get("file_path") or ""), normalized_target)
             ]
+        else:
+            corpus = find_rows
         if not corpus:
             corpus = _scoped_entity_rows(
                 conn, normalized_target, limit=MAX_ANALYTICS_CORPUS_ROWS,
             )
-        scanned = len(corpus)
-        if offset and offset >= scanned:
+            # The scoped-entity fallback honours the full MAX_ANALYTICS_CORPUS_ROWS
+            # limit (it does not route through find's tighter clamp).
+            corpus_cap = MAX_ANALYTICS_CORPUS_ROWS
+            corpus_capped = len(corpus) >= corpus_cap
+        total_eligible = len(corpus)
+        if offset and offset >= total_eligible:
             raise SourceGraphError("invalid_cursor")
         page = corpus[offset:offset + budget] if is_pageable_mode else corpus[:budget]
-        pending_next_offset = offset + len(page)
+        page_len = len(page)
+        pending_next_offset = offset + page_len
         if normalized_target and not corpus:
             # An explicit scope with zero eligible rows must stay empty --
             # never let the per-mode analytic's own no-match fallback widen
@@ -3303,15 +3548,15 @@ def analytics_query(
         # assembled, so the reserve uses a same-shape placeholder cursor
         # (an offset no smaller than any real one this call could mint).
         placeholder_cursor = _encode_analytics_cursor(
-            scanned, mode=mode, query=query, target=normalized_target, budget=budget,
+            total_eligible, mode=mode, query=query, target=normalized_target, budget=budget,
         )
         reserve_shell = {
             "cursor": cursor,
             "next_cursor": placeholder_cursor,
             "coverage": {
-                "scanned": scanned,
-                "eligible": scanned,
-                "eligible_capped": scanned >= MAX_ANALYTICS_CORPUS_ROWS,
+                "scanned": total_eligible,
+                "eligible": total_eligible,
+                "eligible_capped": corpus_capped,
                 "returned": 0,
                 "requested_budget": requested_budget,
                 "effective_budget": 0,
@@ -3323,20 +3568,44 @@ def analytics_query(
         payload = _fit_payload_bytes(payload, content_cap)
         byte_trimmed = bool(payload.get("truncated")) and not pre_fit_truncated
         returned = _analytics_result_row_count(mode, payload)
+        analysis = payload.get("analysis") if isinstance(payload, dict) else None
+        # ``scanned`` must equal what the analytic really examined, never the
+        # whole eligible corpus. Every mode is handed only ``page`` (at most
+        # ``budget`` rows sliced from ``corpus`` above), so no single call can
+        # examine more of the corpus than that page. A per-symbol filter mode
+        # reports its own ``analysis.symbols_scanned`` (the exact page rows it
+        # read); every other mode -- the page-sliced tags/hotspots/complexity/
+        # bottlenecks views and the aggregate snapshots alike -- ranks or
+        # aggregates over that same ``page``, so ``page_len`` is the truthful
+        # examined count for all of them.
+        scans_per_symbol = (
+            isinstance(analysis, dict) and isinstance(analysis.get("symbols_scanned"), int)
+        )
+        examined = int(analysis["symbols_scanned"]) if scans_per_symbol else page_len
+        # Mint a cursor only for a mode that genuinely pages the corpus row by
+        # row: a slice mode still emitting rows this page, or a per-symbol
+        # scanner that examined this page (and may find nothing on a clean page
+        # yet still have eligible rows to scan past it). A whole-scope aggregate
+        # returns the same result for every page, so it must never paginate into
+        # a duplicate. The old ``returned > 0`` gate also stopped a clean filter
+        # page, stranding every eligible symbol past it; ``scans_per_symbol``
+        # restores forward progress there while still refusing an aggregate's
+        # duplicate second page. Issuance then follows from eligible rows alone.
+        paginates_corpus = scans_per_symbol or returned > 0
         next_cursor = (
             _encode_analytics_cursor(
                 pending_next_offset, mode=mode, query=query,
                 target=normalized_target, budget=budget,
             )
-            if is_pageable_mode and returned > 0 and pending_next_offset < scanned
+            if is_pageable_mode and paginates_corpus and pending_next_offset < total_eligible
             else None
         )
         payload["cursor"] = cursor
         payload["next_cursor"] = next_cursor
         payload["coverage"] = {
-            "scanned": scanned,
-            "eligible": scanned,
-            "eligible_capped": scanned >= MAX_ANALYTICS_CORPUS_ROWS,
+            "scanned": examined,
+            "eligible": total_eligible,
+            "eligible_capped": corpus_capped,
             "returned": returned,
             "requested_budget": requested_budget,
             "effective_budget": returned,
@@ -3360,6 +3629,7 @@ def bundle(repo_root: Path, bundle_type: str, query: str, max_lines: int = 64) -
         sections: list[dict[str, Any]] = []
         remaining = budget
         seen_files: set[str] = set()
+        file_freshness: dict[str, dict[str, Any]] = {}
         for match in matches:
             if remaining <= 0:
                 break
@@ -3367,11 +3637,15 @@ def bundle(repo_root: Path, bundle_type: str, query: str, max_lines: int = 64) -
                 continue
             seen_files.add(match["file_path"])
             ctx = context(conn, match["file_path"])
+            fresh = _file_freshness_state(conn, repo_root, match["file_path"])
+            file_freshness[match["file_path"]] = fresh
+            ctx["freshness"] = fresh
             ctx["entities"] = ctx["entities"][: max(1, remaining)]
             for entity in ctx["entities"][: min(4, remaining)]:
                 if entity.get("kind") in {"function", "method", "class", "struct"}:
                     entity["source"] = _source_snippet(
                         repo_root, {**entity, "file_path": match["file_path"]}, max_chars=2400,
+                        fresh=fresh["state"] == "fresh",
                     )
             sections.append(ctx)
             remaining -= len(ctx["entities"])
@@ -3396,6 +3670,7 @@ def bundle(repo_root: Path, bundle_type: str, query: str, max_lines: int = 64) -
             "outgoing_calls": outgoing, "incoming_calls": incoming,
             "insights": insights,
             "task_evidence": task_evidence,
+            "freshness": _overall_freshness(file_freshness),
             "truncated": truncated,
         }, byte_cap)
     finally:
@@ -3647,6 +3922,15 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                 inserted_entities, inserted_edges, _dropped = _write_extraction(
                     conn, extraction, file_size=file_size, mtime_ns=mtime_ns,
                 )
+                # Re-run cross-file edge resolution exactly as a full build's
+                # tail does. Re-extracting one file drops its own edges back to
+                # unresolved and can invalidate edges other files aimed at it; a
+                # later incremental build sees changed==0 and skips resolution,
+                # so leaving it unresolved here would strand those edges
+                # permanently. Resolution is idempotent and generation-safe.
+                _resolve_cpp_cross_file_edges(conn)
+                _resolve_python_imported_calls(conn, repo_root)
+                _resolve_javascript_import_bindings(conn)
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('single_file_last_mutation', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

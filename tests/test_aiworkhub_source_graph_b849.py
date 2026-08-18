@@ -1907,13 +1907,23 @@ def test_analytics_query_stats_summary_gaps_never_leak_repository_wide_scope(tmp
         # the per-mode content that existed before coverage was attached.
         assert len(json.dumps(payload).encode("utf-8")) <= byte_cap
         assert payload["target"] == "pkg/inside"
-        # ``pkg/inside`` has exactly 2 scoped entities across 1 file; every
-        # ``files``/``entities`` counter anywhere in the nested payload
-        # (e.g. a per-mode "repository summary" object) must reflect that
-        # scope, never the repository-wide totals (2 files / 5 entities).
-        assert payload["coverage"]["scanned"] == 2
+        # Under the truthful-coverage contract (finding SEVEN) ``scanned``
+        # reports what the analytic actually examined for this budget, not the
+        # whole scoped corpus: budget=1 hands exactly one row to the mode, so
+        # ``scanned`` is 1. It reported 2 (the whole scoped corpus) before this
+        # fix; 2 was the count the tool never actually examined.
+        assert payload["coverage"]["scanned"] == 1
+        # ``eligible`` still reports the honest "how much could have been
+        # scanned": ``pkg/inside`` owns exactly 2 scoped entities, and that
+        # total stays 2 even though only 1 was examined on this page.
+        assert payload["coverage"]["eligible"] == 2
+        # Leak guard (the whole point of this test): every ``files``/
+        # ``entities`` counter anywhere in the nested payload must reflect the
+        # scope (<= 2) and may never surface the repository-wide entity total
+        # (2 files / 5 entities). 1 is not 5, so the scope guard is intact.
         for label, value in _analytics_nested_repo_wide_counts(payload):
             assert value <= 2, f"{mode}.{label} leaked repository-wide count: {value}"
+            assert value != 5, f"{mode}.{label} leaked repository-wide entity total: {value}"
         # ``effective_budget`` must describe what this page actually
         # delivered, not a generic corpus-page length independent of the
         # mode's own (possibly zero) result.
