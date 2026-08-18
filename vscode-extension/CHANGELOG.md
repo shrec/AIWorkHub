@@ -1,5 +1,37 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.84 — 2026-08-18
+
+### Fixed
+
+- **The audit trail credited the wrong model for the work.** Every manager action
+  was recorded as if Codex performed it, including the ones Claude performed, because
+  the runner name was hardcoded rather than taken from whoever actually held the
+  manager seat. If you read the ledger to find out who accepted a change, it told you
+  the wrong thing. Actions now carry the real manager, and an action that cannot be
+  attributed fails instead of guessing.
+- **Rejecting a card left its reviewers stuck in the review queue forever.**
+  Accepting cleaned them up; rejecting did not. Since a quality-gated pipeline rejects
+  by design, the queue filled with three dead entries per rejection until the real
+  work was impossible to find. Fourteen piled up here in one day.
+- **After a window reload, a stale manager session still reported itself as
+  verified.** The identity it named no longer existed, but nothing said so. It now
+  fails loudly instead of quietly answering the wrong question.
+- **A task could be started with a write scope that did not include the file it
+  needed to change.** The worker cannot see this - it only sees permission denied -
+  so it retries variations in the wrong files until its budget runs out. Creating a
+  card now warns, by name, when a file the card's own evidence points at is missing
+  from its scope.
+- **Listing a folder in a task's write scope was accepted, then refused at the
+  end**, discarding a completed run's output. Both ends agree now, and the problem
+  surfaces when it costs nothing.
+- **A database opened "read-only" was writable if its path contained a `#`.** The
+  character silently truncated the read-only flag, so the connection could write -
+  and wrote to a different file than the one named. Fixed everywhere in the package
+  and verified by sweeping the whole repository, not by looking.
+- Three repair tools for half-archived task rows existed but nothing could call
+  them. They work now.
+
 ## 0.9.83 — 2026-08-18
 
 ### Fixed

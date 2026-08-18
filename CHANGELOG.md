@@ -6,6 +6,55 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.84] - 2026-08-18
+
+### Fixed
+
+- **Every manager action in this repository's audit trail said `codex` performed it,
+  including the ones a Claude manager performed.** `reject_review`, recovery and the
+  archive/supersede paths all ran with a hardcoded `--runner codex` regardless of who
+  held the verified manager seat. Actions are now attributed to the verified manager
+  route, and an action that cannot be attributed fails rather than defaulting to a
+  name. (NF-2026-00244)
+- **`reject_review` left the quality reviewers it consumed in the review queue
+  forever.** Only `accept_review` finalized them, so each rejection on a high-risk
+  card added three dead entries pointing at a superseded request. Fourteen
+  accumulated in this repository's own queue in a single day before anyone noticed.
+  (NF-2026-00249)
+- **A manager receipt kept reading as verified after the extension host restart that
+  invalidated it.** An identity check that cannot prove it is current now fails
+  closed and names the staleness. Reported from a Windows 11 install as AWH-OBS-017.
+  (NF-2026-00272)
+- **Three archive-repair exits had no caller anywhere**, so a half-archived row could
+  be prevented but never found or repaired. They are reachable now, and the mutating
+  one is gated by the same coordinator capability check as its siblings.
+  (NF-2026-00280)
+- **A card could be launched with a write scope that did not contain the file holding
+  its bug**, which no worker can detect - it sees only a write denial and retries
+  inside the wrong files until its budget is gone. Card creation now warns by name
+  when a path the card's own evidence references is absent from `allowed_writes`.
+  (NF-2026-00258)
+- **A directory in `allowed_writes` was accepted at creation and refused at
+  promotion**, so a full worker run could produce output that could not be promoted
+  at all. The two ends agree now, and the disagreement is caught when the fix is
+  free. (NF-2026-00266)
+- **A read-only SQLite open was not read-only if the repository path contained
+  `#`.** In URI syntax `#` starts a fragment, which swallowed `?mode=ro` entirely:
+  the database opened read-write with create-if-missing, and against a different
+  file than the caller named. Every read-only open in the package now builds its URI
+  through `Path.resolve().as_uri()`. Verified by a repository-wide sweep, not by
+  inspection. (NF-2026-00261)
+
+### Added
+
+- Launch-truth policy for the reviewer prewarm, provider-refusal classification,
+  workforce admission and per-adapter observability - defined and tested in
+  `quality_review`, `runtime_adapters` and `repo_policy`. **This changes nothing at
+  runtime yet:** the call sites live in `process_launcher.py`, which was outside the
+  card's write scope, so none of NF-2026-00302, 00275, 00270, 00265 or 00262 is
+  closed by this release. The wiring is tracked separately, as is the gate defect
+  that let an unwired candidate pass three lenses (NF-2026-00304).
+
 ## [0.9.83] - 2026-08-18
 
 ### Fixed

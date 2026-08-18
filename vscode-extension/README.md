@@ -12,6 +12,24 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.84
+
+- The audit trail credited the wrong model for the work: every manager action was
+  recorded as if Codex performed it, including the ones Claude performed. Actions
+  now name whoever actually held the manager seat, and an action that cannot be
+  attributed fails rather than guessing.
+- Rejecting a task left its reviewers stuck in the review queue forever, three per
+  rejection, until the real work was impossible to find. Rejection now cleans up
+  exactly as acceptance does.
+- After a window reload, a stale manager session still reported itself verified.
+  It now fails loudly instead of quietly answering the wrong question.
+- A task could be started with a write scope that did not include the file it had
+  to change. The worker sees only permission denied, so it retries in the wrong
+  files until its budget is gone. Creating a task now warns by name.
+- A database opened "read-only" was writable if its path contained a `#`, and wrote
+  to a different file than the one named. Fixed everywhere and verified by sweeping
+  the whole repository.
+
 ## What's new in 0.9.83
 
 - Work that was finished and correct is no longer thrown away because of where it
