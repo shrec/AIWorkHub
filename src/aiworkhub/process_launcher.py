@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import sqlite3
 import stat
@@ -2425,6 +2426,165 @@ def _changed_path_hashes(
     return hashes
 
 
+REVIEW_WORKSPACE_RETENTION_AUDIT_SCHEMA_ID = (
+    "aiworkhub.review_workspace_retention_audit.v1"
+)
+
+
+def review_workspace_retention_audit_path(process_log_path: Path) -> Path:
+    """Sibling append-only ledger recording every review-workspace removal."""
+    return Path(process_log_path).with_name("review_workspace_retention_audit.jsonl")
+
+
+def record_review_workspace_retention_audit(
+    process_log_path: Path,
+    *,
+    request_id: str,
+    task_id: str,
+    card_status: str,
+    reason: str,
+    action: str,
+    moved_to: str | None = None,
+) -> dict[str, Any]:
+    """Durably record one review-workspace removal.
+
+    Quarantine and eventual purge are both removals from the live review
+    surface, and neither may happen without a record naming the request id,
+    card and reason so a manager can account for every worktree that left the
+    tree.  Returns the appended record.
+    """
+
+    record: dict[str, Any] = {
+        "schema_id": REVIEW_WORKSPACE_RETENTION_AUDIT_SCHEMA_ID,
+        "recorded_at": _utcnow(),
+        "request_id": str(request_id),
+        "task_id": str(task_id),
+        "card_status": str(card_status),
+        "action": str(action),
+        "reason": str(reason),
+    }
+    if moved_to is not None:
+        record["moved_to"] = str(moved_to)
+    audit_path = review_workspace_retention_audit_path(process_log_path)
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    with audit_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+    return record
+
+
+def review_workspace_quarantine_root(process_log_path: Path) -> Path:
+    return Path(process_log_path).with_name("review_workspace_quarantine")
+
+
+def quarantine_review_workspace(
+    process_log_path: Path,
+    *,
+    request_id: str,
+    path: Path,
+    home: Path,
+) -> Path:
+    """Move a corrupted review workspace into quarantine instead of deleting it.
+
+    A failed integrity check proves the retained bytes disagree with the sealed
+    hashes; it is not authority to destroy them.  The exact bytes a manager
+    needs to diff against the sealed hashes are relocated under a
+    request-scoped quarantine directory and never unlinked here.  Returns the
+    quarantine directory.
+    """
+
+    root = review_workspace_quarantine_root(process_log_path)
+    root.mkdir(parents=True, exist_ok=True)
+    dest = root / str(request_id)
+    suffix = 0
+    while dest.exists():
+        suffix += 1
+        dest = root / f"{request_id}.{suffix}"
+    dest.mkdir(parents=True)
+    for label, source in (("worktree", Path(path)), ("home", Path(home))):
+        if source.is_symlink() or not source.exists():
+            continue
+        shutil.move(str(source), str(dest / label))
+    return dest
+
+
+def _pid_ticks_to_surface_str(value: Any) -> str | None:
+    """Serialize a pid start-tick counter for a JavaScript consumer.
+
+    ``pid_start_ticks`` is the boot-relative counter that stops a reused pid
+    from being mistaken for a live worker.  On some hosts (observed on Windows
+    11, AWH-OBS-011) it exceeds ``2**53`` where a JavaScript ``Number`` can no
+    longer hold it exactly, so it is carried as a string across every surface a
+    JS consumer reads.  Returns ``None`` when the counter is absent.
+    """
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return str(value)
+
+
+def _decode_ledger_int(value: Any) -> int | None:
+    """Decode one authenticated audit-ledger numeric field, or ``None``.
+
+    A malformed number from the authenticated ledger is a named refusal, never
+    an exception escaping the completion-gate boundary.  ``None`` (absent) reads
+    as ``0`` to preserve the historic ``or 0`` semantics; any non-integral or
+    non-numeric shape is reported as malformed.
+
+    ``int()`` is the predicate, not ``str.isdigit()``: the latter admits shapes
+    ``int()`` rejects (``'--5'``, superscript ``'²'``) and silently accepts
+    non-ASCII digits (``'١٢٣'``) from an authenticated ledger.  We refuse
+    anything but ASCII digits with an optional single leading ``-`` and let
+    ``int()`` make the final decision, so no shape this guard admits can raise
+    past this boundary.
+    """
+
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        body = stripped[1:] if stripped.startswith("-") else stripped
+        if not body.isascii() or not body.isdigit():
+            return None
+        try:
+            return int(stripped)
+        except ValueError:
+            return None
+    return None
+
+
+def pid_identity_surface(event: Mapping[str, Any]) -> dict[str, Any]:
+    """Lossless, JS-safe pid-identity fields shared by every status surface.
+
+    ``task_show`` and ``agent_task_status`` must agree, so both derive their
+    pid-identity view from this one function: the raw integer counters are
+    replaced by string forms that survive a JSON round-trip into a
+    ``Number``-typed JavaScript consumer without rounding.  The source event is
+    never mutated; internal pid comparisons keep reading the exact integer.
+    """
+
+    fields: dict[str, Any] = {}
+    ticks = _pid_ticks_to_surface_str(event.get("pid_start_ticks"))
+    if ticks is not None:
+        fields["pid_start_ticks"] = ticks
+    provider_ticks = _pid_ticks_to_surface_str(
+        event.get("provider_pid_start_ticks")
+    )
+    if provider_ticks is not None:
+        fields["provider_pid_start_ticks"] = provider_ticks
+    return fields
+
+
 def _retained_candidate_identity_evidence(
     workspace: WorkerWorkspace,
     metadata: dict[str, Any],
@@ -2456,6 +2616,71 @@ def _retained_candidate_identity_evidence(
             "topic": str(metadata["topic"]),
         },
     }
+
+
+DELTA_RETAINING_TERMINAL_STATES = frozenset({"validation_failed", "timed_out"})
+
+
+def _is_rework_attempt(metadata: Mapping[str, Any]) -> bool:
+    """Whether this attempt is a rework materialized from a predecessor delta."""
+
+    predecessor = metadata.get("rework_predecessor")
+    return isinstance(predecessor, dict) and bool(predecessor)
+
+
+def retained_rework_candidate_evidence(
+    terminal_state: str,
+    workspace: WorkerWorkspace,
+    metadata: dict[str, Any],
+    request_id: str,
+    changed: list[str],
+    claim_state: str,
+) -> dict[str, Any]:
+    """Rework-predecessor evidence for a terminal state that left a delta.
+
+    A timed-out worker's partial delta is as recoverable as a validation
+    failure's; pinning it lets the successor start from the work instead of
+    from nothing.  A terminal state that never produces a usable delta, or an
+    empty change set, retains nothing.
+    """
+
+    if terminal_state not in DELTA_RETAINING_TERMINAL_STATES or not changed:
+        return {}
+    try:
+        return _retained_candidate_identity_evidence(
+            workspace, metadata, request_id, changed, claim_state,
+        )
+    except WorkspaceError:
+        return {}
+
+
+def _release_launch_request_resources(
+    *,
+    bridge_request: "vscode_lm_bridge.BridgeRequest | None",
+    workspace: WorkerWorkspace | None,
+    cancel: Callable[[Any], Any] = vscode_lm_bridge.cancel_request,
+    cleanup: Callable[..., Any] = cleanup_workspace,
+) -> list[str]:
+    """Release a failed launch's resources, claim before workspace.
+
+    A VS Code LM claim refers to the request workspace, so the claim must be
+    cancelled BEFORE that workspace is deleted -- otherwise the claim outlives
+    the workspace it names.  Returns the ordered release errors (empty when
+    clean); a claim-cancel failure never prevents the workspace cleanup.
+    """
+
+    errors: list[str] = []
+    if bridge_request is not None:
+        try:
+            cancel(bridge_request)
+        except vscode_lm_bridge.BridgeError as exc:
+            errors.append(f"bridge_cancel_failed:{exc}")
+    if workspace is not None:
+        try:
+            cleanup(workspace.repo, workspace.path, workspace.home)
+        except WorkspaceError as exc:
+            errors.append(f"cleanup_failed:{exc}")
+    return errors
 
 
 def _path_manifest(base: Path, declared: list[str]) -> dict[str, dict[str, Any]]:
@@ -2910,16 +3135,69 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     result["verification"] = {k: v for k, v in verification.items() if k != "schema_id"}
     result["telemetry_observed"] = bool(verification.get("ok"))
     result["telemetry_reason"] = str(verification.get("reason") or "")
-    policy_violations = int(verification.get("policy_violations") or 0)
+    # Authenticated-ledger numeric decoding fails closed with a named refusal:
+    # a malformed count is never an exception escaping this gate boundary.
+    policy_violations = _decode_ledger_int(verification.get("policy_violations"))
+    live_source_graph_calls = _decode_ledger_int(
+        verification.get("live_source_graph_calls")
+    )
+    successful_raw = verification.get("successful_call_count_by_tool")
+    if successful_raw is None:
+        successful_raw = {}
+    successful: dict[str, int] = {}
+    ledger_decode_failure = ""
+    if policy_violations is None:
+        ledger_decode_failure = "policy_violations"
+    elif live_source_graph_calls is None:
+        ledger_decode_failure = "live_source_graph_calls"
+    elif not isinstance(successful_raw, dict):
+        ledger_decode_failure = "successful_call_count_by_tool"
+    else:
+        for tool_name, raw_count in successful_raw.items():
+            decoded_count = _decode_ledger_int(raw_count)
+            if decoded_count is None:
+                ledger_decode_failure = (
+                    "successful_call_count_by_tool:" + str(tool_name)
+                )
+                break
+            successful[str(tool_name)] = decoded_count
+    if ledger_decode_failure:
+        result["gated"] = True
+        result["satisfied"] = False
+        result["reason"] = (
+            "audit_ledger_numeric_decode_failed:" + ledger_decode_failure
+        )
+        return result
     result["policy_warning"] = policy_violations > 0
     result["policy_warning_count"] = policy_violations
     if policy_violations:
         result["warnings"] = [
             f"denied_aiworkhub_tool_requests_recovered:{policy_violations}"
         ]
+    # A receipt that declares itself blocking is authority to refuse, not a
+    # cosmetic flag.  Consult it directly so acceptance can never promote a
+    # card over a self-declared-blocking audit receipt, and surface the exact
+    # blocker so a manager sees why.  A field asserting authority it does not
+    # have is worse than none.
+    receipt_conformance = verification.get("receipt_conformance")
+    if isinstance(receipt_conformance, dict) and receipt_conformance.get("blocking"):
+        blockers = [
+            str(item)
+            for item in (receipt_conformance.get("blockers") or [])
+            if str(item)
+        ]
+        result["gated"] = True
+        result["satisfied"] = False
+        result["receipt_conformance_blocking"] = True
+        result["reason"] = (
+            "receipt_conformance_blocking:" + ",".join(blockers)
+            if blockers
+            else "receipt_conformance_blocking"
+        )
+        return result
     if not gated:
         return result
-    successful = verification.get("successful_call_count_by_tool") or {}
+    # ``successful`` was decoded above with fail-closed numeric handling.
     # Injected context accelerates startup but does not prove continuous tool
     # use.  In particular, Source Graph must have a fresh authenticated worker
     # call during execution; an initial hash-receipted bundle alone can never
@@ -2933,7 +3211,7 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     # hit_count/zero_hit_calls and may guide re-query/review, but it must not be
     # rewritten into "the tool was never called".  Cached-only, failed,
     # non-authoritative and unverified activity remains fail-closed.
-    if verification.get("live_source_graph_calls", 0) > 0:
+    if live_source_graph_calls > 0:
         satisfaction_by_tool["source_graph"] = "live_worker_call"
     elif injected_acknowledged and "source_graph" in injected_tools:
         satisfaction_by_tool["source_graph"] = "injected_only_not_sufficient"
@@ -2943,6 +3221,7 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         stale.append("source_graph")
     else:
         missing.append("source_graph")
+    rework_attempt = _is_rework_attempt(metadata)
     for tool in required_tools:
         if tool == "source_graph":
             continue
@@ -2950,6 +3229,14 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             satisfaction_by_tool[tool] = "live_worker_call"
         elif injected_acknowledged and tool in injected_tools:
             satisfaction_by_tool[tool] = "injected_receipt"
+        elif rework_attempt:
+            # A rework is a validation-only replay of an already-green
+            # predecessor delta; it structurally does not re-issue the context
+            # tool calls the predecessor already made.  Honor the predecessor's
+            # receipts here instead of discarding green work over a context
+            # call this rework path never makes.  Source Graph freshness above
+            # is still enforced per attempt.
+            satisfaction_by_tool[tool] = "rework_predecessor_receipt"
         else:
             missing.append(tool)
     result["missing_tools"] = missing
@@ -6207,17 +6494,17 @@ class ProcessManager:
                     reason += ":launch_blocker_record_failed:" + str(
                         blocker_result.get("stderr") or ""
                     )[:200]
-            if workspace is not None:
-                try:
-                    cleanup_workspace(workspace.repo, workspace.path, workspace.home)
-                except WorkspaceError as cleanup_exc:
-                    reason += f":cleanup_failed:{cleanup_exc}"
+            # Cancel the VS Code LM claim BEFORE deleting the request workspace
+            # it refers to, so a claim never outlives its workspace.
+            for release_error in _release_launch_request_resources(
+                bridge_request=bridge_request,
+                workspace=workspace,
+            ):
+                reason += ":" + release_error
             if spec_path is not None:
                 unlink_if_regular(spec_path)
             if authority_path is not None:
                 unlink_if_regular(authority_path)
-            if bridge_request is not None:
-                vscode_lm_bridge.cancel_request(bridge_request)
             return self._blocked(
                 task_id,
                 runner,
@@ -7642,8 +7929,81 @@ class ProcessManager:
                             + str(transition.get("stderr") or "unknown")
                         )[:200],
                     }
+                # The "still in review" guard protects verified bytes that
+                # EXIST; a workspace that is already gone has nothing to
+                # preserve and must not stay unreclaimable forever.  The card is
+                # now blocked, so reclaim the retained record through the
+                # ordinary idempotent cleanup path.  A cleanup failure stays
+                # truthfully retained for a later retry instead of reporting a
+                # phantom success, and the removal is recorded in the audit.
+                if integrity_reason == "review_workspace_missing":
+                    try:
+                        cleanup_workspace(repo, path, home)
+                    except WorkspaceError as exc:
+                        self._append_event({
+                            "request_id": request_id,
+                            "task_id": task_id,
+                            "runner": runner,
+                            "topic": latest.get("topic"),
+                            "adapter_id": latest.get("adapter_id"),
+                            "state": "finalize_failed",
+                            "error": f"retained_workspace_cleanup_failed:{exc}"[:500],
+                            "workspace_retained": True,
+                            "workspace_gc": False,
+                            "workspace_gc_at": _utcnow(),
+                            "workspace_gc_reason": integrity_reason,
+                            "review_transition_ok": True,
+                            "callback_enqueued": bool(
+                                transition.get("callback_enqueued")
+                            ),
+                        })
+                        return {
+                            "request_id": request_id,
+                            "gc": False,
+                            "reason": f"retained_workspace_cleanup_failed:{exc}"[:200],
+                        }
+                    record_review_workspace_retention_audit(
+                        self.process_log_path,
+                        request_id=request_id,
+                        task_id=task_id,
+                        card_status=_canonical_task_status(card),
+                        reason=integrity_reason,
+                        action="purge",
+                    )
+                    self._append_event({
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "runner": runner,
+                        "topic": latest.get("topic"),
+                        "adapter_id": latest.get("adapter_id"),
+                        "state": "finalize_failed",
+                        "error": f"retained_workspace_missing_reclaimed:{integrity_reason}"[:500],
+                        "workspace_retained": False,
+                        "workspace_gc": True,
+                        "workspace_gc_at": _utcnow(),
+                        "workspace_gc_reason": integrity_reason,
+                        "review_transition_ok": True,
+                        "callback_enqueued": bool(
+                            transition.get("callback_enqueued")
+                        ),
+                    })
+                    return {
+                        "request_id": request_id,
+                        "gc": True,
+                        "reason": integrity_reason,
+                    }
+                # A failed integrity check on bytes that still EXIST is not
+                # authority to destroy verified work.  Quarantine the workspace
+                # so a manager can diff it against the sealed hashes and decide;
+                # the card is already blocked with this reason.  Every removal
+                # from the live tree is recorded in the retention audit.
                 try:
-                    cleanup_workspace(repo, path, home)
+                    quarantine_dir = quarantine_review_workspace(
+                        self.process_log_path,
+                        request_id=request_id,
+                        path=path,
+                        home=home,
+                    )
                 except (OSError, WorkspaceError) as exc:
                     self._append_event({
                         "request_id": request_id,
@@ -7652,7 +8012,7 @@ class ProcessManager:
                         "topic": latest.get("topic"),
                         "adapter_id": latest.get("adapter_id"),
                         "state": "finalize_failed",
-                        "error": f"retained_workspace_cleanup_failed:{exc}"[:500],
+                        "error": f"review_workspace_quarantine_failed:{exc}"[:500],
                         "workspace_retained": True,
                         "workspace_gc": False,
                         "workspace_gc_at": _utcnow(),
@@ -7665,8 +8025,17 @@ class ProcessManager:
                     return {
                         "request_id": request_id,
                         "gc": False,
-                        "reason": f"cleanup_failed:{exc}"[:200],
+                        "reason": f"quarantine_failed:{exc}"[:200],
                     }
+                record_review_workspace_retention_audit(
+                    self.process_log_path,
+                    request_id=request_id,
+                    task_id=task_id,
+                    card_status=_canonical_task_status(card),
+                    reason=integrity_reason,
+                    action="quarantine",
+                    moved_to=str(quarantine_dir),
+                )
                 self._append_event({
                     "request_id": request_id,
                     "task_id": task_id,
@@ -7674,9 +8043,11 @@ class ProcessManager:
                     "topic": latest.get("topic"),
                     "adapter_id": latest.get("adapter_id"),
                     "state": "finalize_failed",
-                    "error": f"retained_workspace_unavailable:{integrity_reason}"[:500],
+                    "error": f"retained_workspace_quarantined:{integrity_reason}"[:500],
                     "workspace_retained": False,
-                    "workspace_gc": True,
+                    "workspace_gc": False,
+                    "workspace_quarantined": True,
+                    "workspace_quarantine_path": str(quarantine_dir),
                     "workspace_gc_at": _utcnow(),
                     "workspace_gc_reason": integrity_reason,
                     "review_transition_ok": True,
@@ -7684,7 +8055,8 @@ class ProcessManager:
                 })
                 return {
                     "request_id": request_id,
-                    "gc": True,
+                    "gc": False,
+                    "quarantined": True,
                     "reason": integrity_reason,
                 }
 
@@ -7709,6 +8081,14 @@ class ProcessManager:
                     "reason": f"cleanup_failed:{exc}"[:200],
                 }
 
+            record_review_workspace_retention_audit(
+                self.process_log_path,
+                request_id=request_id,
+                task_id=task_id,
+                card_status=_canonical_task_status(card),
+                reason=disposition,
+                action="purge",
+            )
             self._append_event({
                 "request_id": request_id,
                 "task_id": task_id,
@@ -8048,6 +8428,34 @@ class ProcessManager:
                             "output_budget": supervisor_status.get("output_budget"),
                             **_declared_failure_denominators(metadata),
                         }
+                        # A timed-out worker may still have produced a partial
+                        # delta.  Pin it as a rework predecessor so the
+                        # successor starts from the work instead of nothing.
+                        # This is best-effort evidence enrichment only: it must
+                        # never override the true terminal outcome.  A claim
+                        # that already moved on (an archived/superseded card, a
+                        # lost claim) or a workspace that is gone yields no
+                        # predecessor, never a finalize_failed that relabels a
+                        # genuine timed_out as a finalization problem.
+                        if terminal_state in DELTA_RETAINING_TERMINAL_STATES:
+                            timeout_changed: list[str] = []
+                            retained: dict[str, Any] = {}
+                            try:
+                                timeout_changed = enforce_scope(workspace)
+                                retained = retained_rework_candidate_evidence(
+                                    terminal_state,
+                                    workspace,
+                                    metadata,
+                                    request_id,
+                                    timeout_changed,
+                                    self._exact_claim_state(metadata),
+                                )
+                            except Exception:
+                                timeout_changed = []
+                                retained = {}
+                            if retained:
+                                failure_evidence.update(retained)
+                                failure_evidence["changed_paths"] = timeout_changed
                         release_result = self._terminal_failure_exact(
                             metadata,
                             terminal_state,
@@ -8833,7 +9241,9 @@ class ProcessManager:
             "task_state": core._lifecycle_state(card) if card else "unknown",
             "task_card": card,
             "event_count": len(events),
-            "latest_event": latest,
+            # A JS consumer reads pid_start_ticks off latest_event; carry it as
+            # a lossless string so a >2**53 counter is not silently rounded.
+            "latest_event": {**latest, **pid_identity_surface(latest)},
             "liveness": self._liveness_snapshot(latest),
         }
 
@@ -9275,6 +9685,9 @@ class ProcessManager:
         )
         card_summary = {key: card.get(key) for key in card_fields if key in card}
         event_summary = {key: latest.get(key) for key in event_fields if key in latest}
+        # pid_start_ticks is JS-unsafe above 2**53; expose the same lossless
+        # string form the status() surface uses so the two surfaces agree.
+        event_summary.update(pid_identity_surface(latest))
         changed_paths = latest.get("changed_paths")
         if isinstance(changed_paths, list):
             event_summary["changed_paths"] = changed_paths[:64]

@@ -201,6 +201,32 @@ def _validation_receipt_passed(receipt: Mapping[str, Any]) -> bool:
     )
 
 
+def _merge_stdout_windows(head: str, tail: str) -> str:
+    """Reconstruct one non-truncated stdout from its head and tail windows.
+
+    When a capture is not truncated the head and tail windows describe the same
+    complete output and may overlap.  Naive concatenation would then repeat the
+    overlapping region -- and any metric line inside it -- producing a false
+    "receipt_invalid" rejection from the exactly-one-candidate rule below.
+    Merge on the longest suffix of ``head`` that is a prefix of ``tail`` so each
+    line is contributed exactly once; genuinely disjoint windows still join.
+    """
+
+    if not tail or head == tail:
+        return head or tail
+    if not head:
+        return tail
+    if tail in head:
+        return head
+    if head in tail:
+        return tail
+    max_overlap = min(len(head), len(tail))
+    for size in range(max_overlap, 0, -1):
+        if head[-size:] == tail[:size]:
+            return head + tail[size:]
+    return head + "\n" + tail
+
+
 def _performance_metric(receipt: Mapping[str, Any]) -> dict[str, Any]:
     """Extract one bounded machine-readable metric from validation stdout."""
 
@@ -208,7 +234,7 @@ def _performance_metric(receipt: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("performance_metric_stdout_truncated")
     head = str(receipt.get("stdout_head") or "")
     tail = str(receipt.get("stdout_tail") or "")
-    text = head if head == tail else head + "\n" + tail
+    text = _merge_stdout_windows(head, tail)
     candidates = []
     for raw_line in text.splitlines():
         line = raw_line.strip()

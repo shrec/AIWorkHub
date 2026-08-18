@@ -291,6 +291,67 @@ def current_claim_episode(conn: sqlite3.Connection, task_id: str) -> str:
     return str(card.get("claim_epoch") or 0)
 
 
+def _callback_outbox_row_defect(
+    task_id: str, transition: str, event_id: str, request_id: str,
+) -> str:
+    """Named structural defect for an outbox row, or '' when well-formed.
+
+    A malformed row is dead-lettered rather than enqueued so it stays visible
+    for audited recovery instead of being silently written as pending work a
+    delivery worker can never route (a blank task id) or trust."""
+    if not str(task_id or "").strip():
+        return "task_id_blank"
+    for label, value in (
+        ("task_id", task_id),
+        ("transition", transition),
+        ("event_id", event_id),
+        ("request_id", request_id),
+    ):
+        if "\x00" in str(value or ""):
+            return f"{label}_control_character"
+    if len(str(task_id)) > 512:
+        return "task_id_too_long"
+    return ""
+
+
+def _dead_letter_malformed_outbox_row(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    provider: str,
+    origin_thread_id: str,
+    transition: str,
+    episode_id: str,
+    event_id: str,
+    request_id: str,
+    error: str,
+) -> None:
+    """Record a malformed outbox row as dead_letter instead of enqueuing it."""
+    now = utc_now()
+    try:
+        conn.execute(
+            """
+            INSERT INTO callback_outbox(
+              task_id, provider, origin_thread_id, transition, episode_id, event_id,
+              request_id, state, created_at, updated_at, last_error
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, 'dead_letter', ?, ?, ?)
+            """,
+            (
+                task_id, provider, origin_thread_id, transition, episode_id,
+                event_id, request_id, now, now, str(error)[:500],
+            ),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        # This function owns the transaction it started on the caller's
+        # shared connection. If the dead-letter insert fails, never return
+        # or raise with that connection still holding an aborted or open
+        # write transaction -- the next writer would inherit it. This is the
+        # identical invariant ``enqueue_callback`` states for its own insert.
+        conn.rollback()
+        raise
+
+
 def enqueue_callback(
     conn: sqlite3.Connection,
     task_id: str,
@@ -317,6 +378,22 @@ def enqueue_callback(
     if not validated_thread:
         return False
     _ensure_callback_outbox_table(conn)
+    # Validate the outbox schema before enqueue; a malformed row is
+    # dead-lettered for audited recovery, never written as pending work.
+    defect = _callback_outbox_row_defect(task_id, transition, event_id, request_id)
+    if defect:
+        _dead_letter_malformed_outbox_row(
+            conn,
+            task_id=str(task_id or ""),
+            provider=validated_provider,
+            origin_thread_id=validated_thread,
+            transition=transition,
+            episode_id=str(episode_id if episode_id is not None else "0"),
+            event_id=event_id,
+            request_id=request_id,
+            error="malformed_callback_outbox_row:" + defect,
+        )
+        return False
     resolved_episode = episode_id if episode_id is not None else current_claim_episode(conn, task_id)
     now = utc_now()
     try:
