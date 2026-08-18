@@ -1293,7 +1293,14 @@ def test_validation_pythonpath_override_is_scoped_to_one_subprocess(
     )
     try:
         backend = worker_workspace.select_sandbox_backend()
-        approved_site = Path(worker_workspace.site.getusersitepackages()).resolve()
+        # The production guard requires the approved user site to exist on disk.
+        # Under a worker sandbox HOME points at the throwaway workspace home, so
+        # that directory is absent and every card whose validation list includes
+        # this file failed deterministically.  Provision the precondition instead
+        # of asserting the host happens to have it.
+        approved_site = Path(worker_workspace.site.getusersitepackages())
+        approved_site.mkdir(parents=True, exist_ok=True)
+        approved_site = approved_site.resolve()
         components = (str(approved_site), ".", "read")
         expected = worker_workspace.resolve_validation_pythonpath(
             workspace, backend, components
