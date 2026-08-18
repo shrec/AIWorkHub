@@ -567,6 +567,16 @@ def test_direct_launch_injects_key_into_child_env_and_cancels(monkeypatch, tmp_p
     reason="GitHub hosted runners cannot complete nested Landlock execution",
 )
 def test_isolated_launch_claims_and_passes_key_through_sandbox(monkeypatch, tmp_path, repo):
+    # This test launches a real worker under Landlock.  A card's declared
+    # validation already runs inside a Landlock worker sandbox, and a nested
+    # ruleset cannot grant what the outer one denies, so the child never
+    # becomes terminal and the test times out after 15 s - reporting
+    # validation_failed on green code.  The same reason the GITHUB_ACTIONS
+    # skip above exists; that guard just never covered our own sandbox.
+    if any(
+        part.startswith("aiworkhub_validation_exec_") for part in tmp_path.parts
+    ):
+        pytest.skip("nested Landlock execution inside a worker validation sandbox")
     monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
     monkeypatch.setenv(worker_workspace.SANDBOX_BACKEND_ENV, "landlock")
