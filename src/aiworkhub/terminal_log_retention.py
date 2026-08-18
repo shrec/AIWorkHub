@@ -18,6 +18,8 @@ import shutil
 import stat
 import tempfile
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -297,7 +299,151 @@ def backfill_usage_capture(repo_root: Path | str, *, confirm: bool) -> dict[str,
     }
 
 
-def _candidate_payload(root: Path) -> dict[str, Any]:
+def _task_status_map(root: Path) -> dict[str, str]:
+    """Return ``{task_id: status}`` for every task in one bounded query.
+
+    ``_candidate_payload`` needs only each owning task's status to decide
+    authority.  Calling :func:`task_store.get_task` once per terminal request was
+    an N+1 query that reopened the (60 MB) task DB thousands of times: on the
+    canonical repository that was 2121 lookups at ~26 ms each, ~55 s -- the
+    entire cost of :func:`preview`.  :func:`task_store.list_tasks` returns the
+    identical ``status`` for every task in a single query (verified byte-for-byte
+    against ``get_task`` across 1416 task ids, zero mismatches), so the join runs
+    in memory and the task population is read exactly once.
+
+    A task id absent from the map is treated as ``"unknown"`` by the caller,
+    matching :func:`task_store.get_task` returning ``None`` for a missing task, so
+    a run whose task cannot be proved finished/archived still fails closed.
+    """
+
+    try:
+        total = sum(task_store.exact_status_counts(root).values())
+        # ``exact_status_counts`` and ``list_tasks`` read the same ``tasks`` table,
+        # so ``total`` is the exact row count; the buffer absorbs any concurrent
+        # insert between the two reads so a growing store never silently truncates
+        # the map.
+        rows = task_store.list_tasks(root, limit=total + 1024)
+    except task_store.TaskStoreError:
+        # Storage telemetry runs before a repository has been initialized too (the
+        # dashboard measures a not-yet-ready store), and ``StorageNotReadyError``
+        # is a ``TaskStoreError``.  No task store means no provable status, so
+        # return an empty map: every task id falls to ``"unknown"`` in the caller
+        # and its run stays protected (fail closed), exactly as
+        # :func:`_usage_capture_request_ids` handles the same not-ready store and
+        # as :func:`task_store.get_task` returning ``None`` for a missing task.
+        # This must never escape as a bare ``TaskStoreError``: the enclosing
+        # measurement classifies only :class:`TerminalLogRetentionError` as a
+        # handled telemetry failure, so a raw one here turns a not-ready store into
+        # a hard background-scan ``error`` instead of a clean empty result.
+        return {}
+    return {
+        str(row.get("task_id") or ""): str(row.get("status") or "unknown")
+        for row in rows
+        if row.get("task_id")
+    }
+
+
+# Below this many per-request entries the directory stat runs single-threaded: a
+# small walk finishes faster than a thread pool costs to start, so parallelism is
+# never added where it would only be contention.  Measured warm on the canonical
+# repository the whole 8320-file walk is 24 ms, so the sequential path already
+# dominates there; the parallel path exists for the cold-cache / high-load
+# operator machine the card describes, where each ``lstat`` blocks on disk I/O and
+# the calls overlap across threads.
+_PARALLEL_STAT_THRESHOLD = 512
+
+
+def _scan_worker_count(path_count: int) -> int:
+    """Threads for the I/O-bound directory stat, derived from the observed cores.
+
+    ``lstat`` releases the GIL, so overlapping the per-file syscalls across
+    threads is the right shape for this walk.  The count is derived from
+    :func:`os.cpu_count` -- never a constant -- and never every core: two cores are
+    always left free so a scan can never starve the interactive MCP server that
+    shares this host or the dashboard's own request thread.  A walk below
+    :data:`_PARALLEL_STAT_THRESHOLD` stays single-threaded.
+    """
+    if path_count < _PARALLEL_STAT_THRESHOLD:
+        return 1
+    cores = os.cpu_count() or 1
+    # ``cores - 2`` leaves the interactive MCP server and the dashboard thread a
+    # core each; capped at the path count so a just-over-threshold walk never
+    # spawns idle workers.
+    return max(1, min(path_count, cores - 2))
+
+
+def _stat_owned_entries(
+    entries: list[Path], process_root: Path
+) -> list[tuple[str, dict[str, Any]]]:
+    """Stat one contiguous slice of directory entries into ``(request_id, file)``.
+
+    Pure and order-preserving: it reads only the filesystem and returns its slice
+    in input order, so concatenating the per-worker results reproduces the exact
+    sequential walk regardless of how the entries were partitioned.  Ownership is
+    proved by :func:`_owned_regular_file` (same-parent regular file, never a
+    symlink) exactly as the sequential walk did.
+    """
+    owned: list[tuple[str, dict[str, Any]]] = []
+    for path in entries:
+        info = _owned_regular_file(path, process_root)
+        if info is None:
+            continue
+        request_id = next(
+            (
+                path.name[: -len(suffix)]
+                for suffix in _OWNED_SUFFIXES
+                if path.name.endswith(suffix)
+            ),
+            "",
+        )
+        if not _REQUEST_RE.fullmatch(request_id):
+            continue
+        owned.append((request_id, {
+            "name": path.name,
+            "size_bytes": int(info.st_size),
+            "mtime_ns": int(info.st_mtime_ns),
+        }))
+    return owned
+
+
+def _build_inventory(
+    process_root: Path, *, workers: int | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    """Group owned per-request files by request id, optionally in parallel.
+
+    The result is byte-for-byte identical to the sequential walk: workers each
+    process a contiguous slice and the slices are recombined in order, so both the
+    set of request ids and the per-request file order match exactly what one
+    thread iterating :func:`Path.iterdir` would produce.  Only *how fast* the stat
+    runs changes, never *what* it measures.  ``workers`` overrides the derived
+    count (tests pin the parallel and sequential paths against each other); by
+    default the count comes from :func:`_scan_worker_count`.
+    """
+    inventory: dict[str, list[dict[str, Any]]] = {}
+    if not process_root.is_dir():
+        return inventory
+    entries = list(process_root.iterdir())
+    total = len(entries)
+    count = _scan_worker_count(total) if workers is None else max(1, int(workers))
+    if count <= 1 or total <= 1:
+        slices_owned = [_stat_owned_entries(entries, process_root)]
+    else:
+        # Contiguous slices, one per worker: the blocking ``lstat`` calls overlap
+        # while each worker's own loop stays cheap, so pool submission is O(workers)
+        # not O(files) and the warm walk is never slower than sequential.
+        span = (total + count - 1) // count
+        chunks = [entries[i:i + span] for i in range(0, total, span)]
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            slices_owned = list(
+                pool.map(lambda slice_: _stat_owned_entries(slice_, process_root), chunks)
+            )
+    for slice_owned in slices_owned:
+        for request_id, entry in slice_owned:
+            inventory.setdefault(request_id, []).append(entry)
+    return inventory
+
+
+def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str, Any]:
     process_root = root / PROCESS_FILES_RELATIVE_PATH
     if process_root.exists():
         info = process_root.lstat()
@@ -306,27 +452,11 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
     cutoff = now_utc() - timedelta(days=_logs_days(root))
     protected: list[dict[str, Any]] = []
     eligible_by_task: dict[str, list[dict[str, Any]]] = {}
-    inventory: dict[str, list[dict[str, Any]]] = {}
-    if process_root.is_dir():
-        for path in process_root.iterdir():
-            info = _owned_regular_file(path, process_root)
-            if info is None:
-                continue
-            request_id = next(
-                (
-                    path.name[: -len(suffix)]
-                    for suffix in _OWNED_SUFFIXES
-                    if path.name.endswith(suffix)
-                ),
-                "",
-            )
-            if not _REQUEST_RE.fullmatch(request_id):
-                continue
-            inventory.setdefault(request_id, []).append({
-                "name": path.name,
-                "size_bytes": int(info.st_size),
-                "mtime_ns": int(info.st_mtime_ns),
-            })
+    # One directory stat of every owned per-request file.  IO-bound (``lstat``
+    # releases the GIL), so it overlaps across a core-derived worker count on a
+    # large store while a small one stays sequential -- identical result either
+    # way (same request ids, same per-request file order; see _build_inventory).
+    inventory = _build_inventory(process_root)
     process_file_bytes = sum(
         int(item["size_bytes"])
         for files in inventory.values()
@@ -339,7 +469,17 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
     )
     latest_rows = _latest_rows(root)
     usage_capture_ids = _usage_capture_request_ids(root)
+    # One bulk read of every task status, replacing a per-request ``get_task``
+    # N+1 that was the whole 55 s cost of this measurement (see _task_status_map).
+    task_status_by_id = _task_status_map(root)
+    # True only when a supplied ``deadline`` cut the classification short.  A
+    # completed measurement always reports ``partial`` False; a cut-short one
+    # reports True so a caller can never read an incomplete scan as a whole one.
+    partial = False
     for request_id, row in latest_rows.items():
+        if deadline is not None and time.monotonic() >= deadline:
+            partial = True
+            break
         task_id = str(row.get("task_id") or "")
         files = sorted(inventory.pop(request_id, []), key=lambda item: item["name"])
         if not files:
@@ -347,8 +487,7 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
         newest_ns = max(item["mtime_ns"] for item in files)
         newest_at = datetime.fromtimestamp(newest_ns / 1_000_000_000, timezone.utc)
         state = str(row.get("state") or "")
-        task = task_store.get_task(root, task_id) if task_id else None
-        task_status = str((task or {}).get("status") or "unknown")
+        task_status = task_status_by_id.get(task_id, "unknown") if task_id else "unknown"
         item = {
             "request_id": request_id,
             "task_id": task_id,
@@ -470,6 +609,9 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
         "schema_id": SCHEMA_ID,
         "dry_run": True,
         "repository_scoped": True,
+        # False for a complete population; True when a ``deadline`` cut the walk
+        # short, so a partial measurement never reads as a whole (or clean) one.
+        "partial": partial,
         "logs_days": _logs_days(root),
         "keep_last_per_task": KEEP_LAST_PER_TASK,
         "current_bytes": observed_current_bytes,
@@ -497,12 +639,26 @@ def preview(
     cursor: int = 0,
     limit: int = DEFAULT_PREVIEW_LIMIT,
     include_candidates: bool = True,
+    deadline_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Return one bounded page while hashing the full eligible population."""
+    """Return one bounded page while hashing the full eligible population.
+
+    ``deadline_seconds`` bounds the wall-clock of the classification: when it is
+    exceeded the result is returned with ``partial=True`` rather than blocking.
+    ``None`` (the default) measures the whole population and always reports
+    ``partial=False``.  The measurement itself is fast -- the per-task authority
+    lookup is a single bulk query, not a per-request one -- so the dashboard runs
+    it without a deadline and gets a complete result in about a second.
+    """
 
     start = max(0, int(cursor))
     page_limit = max(1, min(MAX_PREVIEW_LIMIT, int(limit)))
-    result = _candidate_payload(Path(repo_root).resolve())
+    deadline = (
+        None
+        if deadline_seconds is None
+        else time.monotonic() + max(0.0, float(deadline_seconds))
+    )
+    result = _candidate_payload(Path(repo_root).resolve(), deadline=deadline)
     candidates = list(result.pop("candidates", []))
     total = len(candidates)
     end = min(total, start + page_limit)
