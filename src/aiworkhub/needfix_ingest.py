@@ -412,15 +412,31 @@ def commit(
 # ---------------------------------------------------------------------------
 
 
+# Upper bound on the task cards a read-time reconcile will scan for the
+# explicit-reference link route. It matches the dashboard's operator-board card
+# bound (``task_store.list_task_cards(..., limit=5000)``): the same cards an
+# operator already loads, and ``task_store.list_task_cards`` clamps to it. The
+# store consults this at most once per read and only when an unlinked, accepted
+# record did not bind by its deterministic id, so a fully-linked read scans no
+# cards. A card beyond the cap simply leaves its record as reported residue --
+# ``get_task`` still verifies every candidate, so a cap can never force a wrong
+# link, only defer a correct one to a later read.
+_RECONCILE_CARD_SCAN_LIMIT: int = 5000
+
+
 def _resolve_active_state_hooks(repo: Path):
     """Bind the canonical task-store read hooks for read-time active derivation.
 
-    Returns ``(get_task_fn, canonical_status_fn, underived_reason)``. Both hooks
-    are real callables bound to ``repo`` when its canonical task store is ready
-    (``underived_reason`` is ``None``). When no ready task store can resolve a
-    linked card, both hooks are ``None`` and a bounded ``underived_reason`` is
-    returned so the caller can state its result is underived rather than treat
-    every linked record as a live problem by default.
+    Returns ``(get_task_fn, canonical_status_fn, list_task_cards_fn,
+    underived_reason)``. All three hooks are real callables bound to ``repo``
+    when its canonical task store is ready (``underived_reason`` is ``None``).
+    When no ready task store can resolve a linked card, every hook is ``None``
+    and a bounded ``underived_reason`` is returned so the caller can state its
+    result is underived rather than treat every linked record as a live problem
+    by default. ``list_task_cards_fn`` powers the explicit-reference link route
+    for directly created merge/multi-finding cards; it is bounded (see
+    ``_RECONCILE_CARD_SCAN_LIMIT``) because it runs on the read an operator
+    waits on.
     """
     from . import task_store  # lazy: no import-time cost, no import cycle
 
@@ -429,14 +445,59 @@ def _resolve_active_state_hooks(repo: Path):
         ready = bool(readiness.ready)
         reason = str(readiness.reason or "")
     except Exception as exc:  # storeless/unbootstrapped repo -> underived
-        return None, None, f"task_store_unavailable:{type(exc).__name__}"
+        return None, None, None, f"task_store_unavailable:{type(exc).__name__}"
     if not ready:
-        return None, None, f"task_store_not_ready:{reason}"
+        return None, None, None, f"task_store_not_ready:{reason}"
 
     def get_task_fn(task_id: str):
         return task_store.get_task(repo, task_id)
 
-    return get_task_fn, task_store.canonical_status, None
+    def list_task_cards_fn():
+        # Bounded, single-snapshot card read; the store calls this lazily and at
+        # most once per reconcile, only to reach the explicit-reference route.
+        return task_store.list_task_cards(repo, limit=_RECONCILE_CARD_SCAN_LIMIT)
+
+    return get_task_fn, task_store.canonical_status, list_task_cards_fn, None
+
+
+def _reconcile_links_on_read(
+    repo: Path,
+    get_task_fn,
+    canonical_status_fn,
+    list_task_cards_fn,
+    *,
+    include_archived: bool,
+) -> None:
+    """Bind unlinked NeedFix records to their card before deriving the view.
+
+    Runs the store's verifiable, idempotent reconciliation on the same read the
+    operator waits on, so a NeedFix whose card exists is linked (and, when that
+    card is finished, hidden) without any manager step -- the binding is done by
+    the system, not remembered by a person.
+
+    Both verifiable link routes are reachable here, not just one. The
+    deterministic ``needfix-{NF-ID}`` id needs no card scan. The explicit
+    reference a directly created merge/multi-finding card carries is reached
+    through ``list_task_cards_fn``, which the store consults lazily -- at most
+    once per read, and only when an unlinked, accepted record did not bind by
+    its deterministic id. A fully-linked read therefore scans no cards and,
+    after the first reconciling read, performs no further writes. The scan is
+    bounded (``_RECONCILE_CARD_SCAN_LIMIT``) because this is a read an operator
+    waits on. Best-effort: a reconcile failure must never break the listing,
+    which self-heals on the next read.
+    """
+    try:
+        needfix_store.reconcile_unlinked_needfix(
+            repo,
+            get_task_fn=get_task_fn,
+            canonical_status_fn=canonical_status_fn,
+            list_task_cards_fn=list_task_cards_fn,
+            include_archived=include_archived,
+        )
+    except Exception:
+        # The active view is derived; an unreconciled record simply stays
+        # visible rather than corrupting the read. Never raise into a listing.
+        pass
 
 
 def list_active(
@@ -463,7 +524,9 @@ def list_active(
     passing them off as an authoritative active set.
     """
     repo = Path(repo_root).resolve()
-    get_task_fn, canonical_status_fn, underived_reason = _resolve_active_state_hooks(repo)
+    get_task_fn, canonical_status_fn, list_task_cards_fn, underived_reason = (
+        _resolve_active_state_hooks(repo)
+    )
     if underived_reason is not None:
         rows = needfix_store.list_needfix(
             repo,
@@ -480,6 +543,13 @@ def list_active(
             "count": None,
             "items": rows,
         }
+    _reconcile_links_on_read(
+        repo,
+        get_task_fn,
+        canonical_status_fn,
+        list_task_cards_fn,
+        include_archived=include_archived,
+    )
     report = needfix_store.list_active_needfix(
         repo,
         get_task_fn=get_task_fn,
@@ -508,7 +578,9 @@ def count_active(
     never silently authoritative) when the repository has no ready task store.
     """
     repo = Path(repo_root).resolve()
-    get_task_fn, canonical_status_fn, underived_reason = _resolve_active_state_hooks(repo)
+    get_task_fn, canonical_status_fn, list_task_cards_fn, underived_reason = (
+        _resolve_active_state_hooks(repo)
+    )
     if underived_reason is not None:
         return {
             "derived": False,
@@ -519,6 +591,13 @@ def count_active(
                 repo, include_archived=include_archived
             ),
         }
+    _reconcile_links_on_read(
+        repo,
+        get_task_fn,
+        canonical_status_fn,
+        list_task_cards_fn,
+        include_archived=include_archived,
+    )
     active_count = needfix_store.count_needfix(
         repo,
         include_archived=include_archived,

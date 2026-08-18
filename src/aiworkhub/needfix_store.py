@@ -2208,21 +2208,100 @@ def reopen_superseded_task_link(
         conn.close()
 
 
+# The only NeedFix own-statuses ``link_existing_task`` will claim from. Gating on
+# these before any card lookup keeps reconciliation cheap on the hot read path
+# (captured/unverified, terminal and already-linked records are skipped without
+# a task-store round trip) and mirrors the store's own claim guard exactly.
+_LINK_ELIGIBLE_NEEDFIX_STATUSES: frozenset[str] = frozenset(
+    ("accepted", "task_planned")
+)
+
+_EXPLICIT_NEEDFIX_REF_KEYS: tuple[str, ...] = (
+    "needfix_id",
+    "needfix_ids",
+    "source_needfix_id",
+    "source_needfix_ids",
+    "needfix",
+)
+
+
+def _card_explicit_needfix_refs(card: Mapping[str, Any]) -> set[str]:
+    """NeedFix ids a card names in a DEDICATED reference field.
+
+    Reads only the explicit reference keys a manager fills in on purpose (see
+    ``_EXPLICIT_NEEDFIX_REF_KEYS``). A match on ``title``, ``objective`` or a
+    file/timestamp coincidence is deliberately NOT evidence here, so a stray
+    substring can never establish a link.
+    """
+    refs: set[str] = set()
+    for key in _EXPLICIT_NEEDFIX_REF_KEYS:
+        value = card.get(key)
+        if isinstance(value, str):
+            token = value.strip()
+            if token:
+                refs.add(token)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    refs.add(item.strip())
+    return refs
+
+
+def _deterministic_task_id_for(record: Mapping[str, Any]) -> str | None:
+    """The collision-free ``needfix-{NF-ID}`` (``-rN``) id for a record.
+
+    This is the only id ``convert_needfix`` ever mints, so a card carrying it
+    is proof the store can verify. Returns ``None`` for a record without a
+    usable id.
+    """
+    nfid = str(record.get("id") or "").strip()
+    if not nfid:
+        return None
+    generation = record.get("reopen_generation")
+    if not isinstance(generation, int) or generation < 0:
+        generation = 0
+    return successor_task_id(nfid, generation)
+
+
 def reconcile_unlinked_needfix(
     repo_root: str | Path,
     *,
-    list_task_cards_fn: Callable[[], Sequence[Mapping[str, Any]]],
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+    list_task_cards_fn: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
     include_archived: bool = False,
 ) -> dict[str, Any]:
-    """Read-only reconciliation report for unlinked NeedFix records.
+    """Bind unlinked NeedFix records to their fixing card, from the SYSTEM.
 
-    Lists NeedFix records whose ``id`` appears in a task card's ``id``,
-    ``title`` or ``objective`` yet carry no ``converted_task_id``, and
-    PROPOSES the link rather than performing it. A wrong automatic link is
-    worse than a missing one (it silently closes a live problem), so a manager
-    must confirm each candidate before calling ``link_existing_task``.
+    A NeedFix loses its open status only through a linked card whose status
+    derives it closed. ``convert_needfix`` links atomically, but a card created
+    directly -- because its scope spans several findings, or because it merges
+    two records -- leaves the NeedFix unlinked forever, so the open count never
+    falls. This closes that gap without any manager step: every unlinked,
+    acceptable record is bound to its card here, idempotently, so a record whose
+    card exists becomes linked and a record whose card is finished then
+    disappears from the active view on its own.
+
+    A link is established ONLY on evidence the store can verify:
+
+    * the deterministic ``needfix-{NF-ID}`` (``-rN`` after N reopens) task id,
+      confirmed to exist via ``get_task_fn``; or
+    * an explicit NeedFix reference the card itself carries in a dedicated field
+      (:func:`_card_explicit_needfix_refs`) resolving to exactly one live card.
+
+    A similar title, an overlapping file scope or a close timestamp NEVER
+    establish a link: a wrong link silently closes a live defect, which is worse
+    than leaving it open. The write reuses :func:`link_existing_task`, so its
+    guards hold -- captured/unverified records and non-linkable cards fail closed
+    and are reported as residue, never forced.
+
+    Idempotent: an already-linked record is skipped, so a second run links
+    nothing. The deterministic path needs no card scan; ``list_task_cards_fn`` is
+    consulted only for the explicit-reference path and may be omitted on the hot
+    read path. Returns before/after linked counts and a verifiable reason for
+    every record left unlinked, so a number that cannot be reconciled is
+    reported rather than forced.
     """
-    cards: Sequence[Mapping[str, Any]] = list_task_cards_fn() or ()
     conn = _connect(repo_root)
     try:
         clause = "" if include_archived else " WHERE status != 'archived'"
@@ -2233,40 +2312,129 @@ def reconcile_unlinked_needfix(
     finally:
         conn.close()
 
-    candidates: list[dict[str, Any]] = []
+    # Index explicit references at most once, and ONLY when a record actually
+    # reaches the explicit-reference fallback below (its deterministic id did
+    # not resolve). The deterministic path needs no card scan, so a fully-linked
+    # read -- and every read whose unlinked records all bind deterministically --
+    # lists no cards at all. Bounded: one ``list_task_cards_fn`` call per
+    # reconcile, never one per record; the caller caps how many cards it returns.
+    # A canonical task_store card names its id in ``task_id``; a test fake may use
+    # ``id`` -- accept either so the same store code serves both.
+    _explicit_ref_index: dict[str, set[str]] | None = None
+
+    def _explicit_card_refs(target_nfid: str) -> set[str]:
+        nonlocal _explicit_ref_index
+        if _explicit_ref_index is None:
+            index: dict[str, set[str]] = {}
+            cards = (list_task_cards_fn() or ()) if list_task_cards_fn is not None else ()
+            for card in cards:
+                if not isinstance(card, Mapping):
+                    continue
+                card_id = str(card.get("task_id") or card.get("id") or "").strip()
+                if not card_id:
+                    continue
+                for ref_nfid in _card_explicit_needfix_refs(card):
+                    index.setdefault(ref_nfid, set()).add(card_id)
+            _explicit_ref_index = index
+        return _explicit_ref_index.get(target_nfid, set())
+
+    before_linked = 0
+    newly_linked: list[dict[str, Any]] = []
+    residue: list[dict[str, Any]] = []
     for record in records:
         nfid = str(record.get("id") or "").strip()
         if not nfid:
             continue
         if str(record.get("converted_task_id") or "").strip():
-            continue  # already linked -- not a candidate
-        for card in cards:
-            if not isinstance(card, Mapping):
+            before_linked += 1
+            continue  # already linked -- idempotent no-op
+
+        own_status = str(record.get("status") or "").strip()
+        if own_status not in _LINK_ELIGIBLE_NEEDFIX_STATUSES:
+            # Captured/unverified, deferred, transient and terminal records are
+            # not claimable; skip the card lookup entirely and report the reason.
+            residue.append(
+                {
+                    "needfix_id": nfid,
+                    "reason": (
+                        f"record status {own_status!r} is not yet linkable "
+                        "(a manager must accept it first)"
+                    ),
+                }
+            )
+            continue
+
+        candidate: str | None = None
+        evidence: str | None = None
+        deterministic_id = _deterministic_task_id_for(record)
+        if deterministic_id and _safe_get_task(get_task_fn, deterministic_id) is not None:
+            candidate, evidence = deterministic_id, "deterministic_id"
+        else:
+            live_refs = sorted(
+                cid
+                for cid in _explicit_card_refs(nfid)
+                if _safe_get_task(get_task_fn, cid) is not None
+            )
+            if len(live_refs) == 1:
+                candidate, evidence = live_refs[0], "explicit_reference"
+            elif len(live_refs) > 1:
+                residue.append(
+                    {
+                        "needfix_id": nfid,
+                        "reason": (
+                            f"ambiguous: {len(live_refs)} live cards carry an "
+                            "explicit reference; refusing to guess"
+                        ),
+                    }
+                )
                 continue
-            card_id = str(card.get("id") or "").strip()
-            title = str(card.get("title") or "")
-            objective = str(card.get("objective") or "")
-            for field, text in (("id", card_id), ("title", title), ("objective", objective)):
-                if nfid in text:
-                    candidates.append(
-                        {
-                            "needfix_id": nfid,
-                            "needfix_title": str(record.get("title") or ""),
-                            "proposed_task_id": card_id or None,
-                            "matched_field": field,
-                            "matched_text": text[:200],
-                            "action": "propose_link",
-                            "auto_linked": False,
-                        }
-                    )
-                    break
+
+        if candidate is None:
+            residue.append(
+                {
+                    "needfix_id": nfid,
+                    "reason": (
+                        "no card carries the deterministic needfix id or an "
+                        "explicit needfix reference"
+                    ),
+                }
+            )
+            continue
+
+        try:
+            link_existing_task(
+                repo_root, nfid, candidate, get_task_fn, canonical_status_fn
+            )
+        except NeedFixError as exc:
+            residue.append(
+                {
+                    "needfix_id": nfid,
+                    "reason": f"card {candidate!r} found but not linkable: {exc}",
+                }
+            )
+            continue
+        newly_linked.append(
+            {
+                "needfix_id": nfid,
+                "converted_task_id": candidate,
+                "evidence": evidence,
+            }
+        )
+
     return {
         "definition": (
-            "Unlinked NeedFix records whose id appears in a task card's id, "
-            "title or objective are reported as link candidates for explicit "
-            "manager confirmation. Nothing is auto-linked."
+            "Unlinked NeedFix records are bound to a card only on evidence the "
+            "store can verify: the deterministic needfix-{NF-ID} task id or an "
+            "explicit needfix reference the card carries. Title, file-scope and "
+            "timestamp similarity never establish a link. Idempotent and "
+            "read-path safe."
         ),
-        "proposes_only": True,
-        "count": len(candidates),
-        "candidates": candidates,
+        "auto_links": True,
+        "total_records": len(records),
+        "before_linked": before_linked,
+        "after_linked": before_linked + len(newly_linked),
+        "newly_linked": newly_linked,
+        "newly_linked_count": len(newly_linked),
+        "unlinked_remaining": residue,
+        "unlinked_remaining_count": len(residue),
     }

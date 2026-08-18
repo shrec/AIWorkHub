@@ -9,8 +9,9 @@ Covers the eight task-contract acceptance criteria:
    background synchronisation/daemon/repair was added.
 5. count_needfix and list_needfix agree on "active" and both state the
    definition; before/after numbers demonstrated.
-6. reconcile_unlinked_needfix proposes (never performs) links for NeedFix ids
-   that appear in a task card's id/title/objective without converted_task_id.
+6. reconcile_unlinked_needfix PERFORMS links from the system, but only on
+   verifiable evidence (the deterministic needfix-{NF-ID} id or an explicit
+   card reference) -- never on a title/objective/id coincidence.
 7. Archived and closed records remain queryable with their reasons intact.
 """
 
@@ -343,45 +344,64 @@ def test_list_active_only_bounds_lookups_to_page(init_store: Path):
     assert calls["n"] < total
 
 
-# --- 6. Reconciliation report proposes rather than performs the link ---------
+# --- 6. Reconciliation performs verifiable links and refuses to guess --------
 
-def test_reconcile_unlinked_needfix_proposes_links(init_store: Path):
-    rec_id = needfix_store.capture_proposal(
-        init_store, title="orphan", description="orphan"
+def test_reconcile_unlinked_needfix_links_only_on_verifiable_evidence(init_store: Path):
+    """The old contract PROPOSED links from id/title/objective substrings and
+    performed none. The new contract PERFORMS the link itself, but only on
+    evidence the store can verify -- so a lookalike id, a title substring and an
+    objective mention (all of which the old report surfaced as candidates) now
+    establish NO link at all."""
+    # Accepted record whose deterministic needfix-{NF-ID} card exists -> linked.
+    bindable = needfix_store.add_needfix(
+        init_store, title="bindable", description="d", status="accepted"
     )["id"]
-    rec_title = needfix_store.capture_proposal(
-        init_store, title="title-match", description="title-match"
-    )["id"]
-    rec_obj = needfix_store.capture_proposal(
-        init_store, title="objective-match", description="objective-match"
-    )["id"]
-    already = needfix_store.capture_proposal(
-        init_store, title="already-linked", description="already-linked"
-    )
-    _set_converted(init_store, already["id"], "T-already")
+    det = f"needfix-{bindable}"
 
-    cards = [
-        {"id": "T-already", "title": "unrelated", "objective": "unrelated"},
-        {"id": f"card-{rec_id}", "title": "unrelated", "objective": "unrelated"},
-        {"id": "T-title", "title": f"Please fix {rec_title} now", "objective": "x"},
-        {"id": "T-objective", "title": "x", "objective": f"Objective mentions {rec_obj}"},
-    ]
+    # Accepted records that only RESEMBLE a card must never be linked: a title
+    # substring, an objective mention and a lookalike card id are not evidence.
+    title_only = needfix_store.add_needfix(
+        init_store, title="title-match", description="d", status="accepted"
+    )["id"]
+    obj_only = needfix_store.add_needfix(
+        init_store, title="objective-match", description="d", status="accepted"
+    )["id"]
+
+    # An already-linked record is left untouched (idempotent).
+    already = needfix_store.add_needfix(
+        init_store, title="already-linked", description="d", status="accepted"
+    )["id"]
+    _set_converted(init_store, already, "T-already")
+
+    cards = {
+        det: _card(det, "processing"),
+        "T-title": {"id": "T-title", "title": f"Please fix {title_only} now",
+                    "objective": "x", "status": "processing"},
+        "T-objective": {"id": "T-objective", "title": "x",
+                        "objective": f"Objective mentions {obj_only}",
+                        "status": "processing"},
+        f"card-{title_only}": _card(f"card-{title_only}", "processing"),
+        "T-already": _card("T-already", "finished"),
+    }
 
     report = needfix_store.reconcile_unlinked_needfix(
-        init_store, list_task_cards_fn=lambda: cards
+        init_store,
+        get_task_fn=_get_task_fn(cards),
+        canonical_status_fn=_canonical_status_fn(),
+        list_task_cards_fn=lambda: list(cards.values()),
     )
 
-    assert report["proposes_only"] is True
-    proposed = {(c["needfix_id"], c["proposed_task_id"]) for c in report["candidates"]}
-    assert (rec_id, f"card-{rec_id}") in proposed
-    assert (rec_title, "T-title") in proposed
-    assert (rec_obj, "T-objective") in proposed
-    assert all(
-        c["action"] == "propose_link" and c["auto_linked"] is False
-        for c in report["candidates"]
-    )
-    for nfid in (rec_id, rec_title, rec_obj):
+    # Only the deterministic-id record is linked; the coincidences are not.
+    assert needfix_store.get_needfix(init_store, bindable)["converted_task_id"] == det
+    assert {e["needfix_id"] for e in report["newly_linked"]} == {bindable}
+    assert report["before_linked"] == 1  # the already-linked record
+    for nfid in (title_only, obj_only):
         assert needfix_store.get_needfix(init_store, nfid)["converted_task_id"] is None
+    # The already-linked record is not repointed.
+    assert (
+        needfix_store.get_needfix(init_store, already)["converted_task_id"]
+        == "T-already"
+    )
 
 
 # --- 7. Archived and closed records stay queryable with reasons --------------
