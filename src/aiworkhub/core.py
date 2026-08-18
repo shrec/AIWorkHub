@@ -3867,6 +3867,76 @@ def reject_review(
     if pred_error:
         return _lifecycle_error(pred_error)
 
+    # NF-2026-00249: a rejection supersedes the request under review, so every
+    # quality-review child bound to *that exact request* is now stranded.
+    # accept_review already finalizes the reviewers it consumes; reject_review
+    # historically did not, leaving them review_ready forever pointing at a
+    # request id that no longer exists.  Resolve the exact rejected request now,
+    # before begin_claim_episode() clears terminal_review, then reuse the shared
+    # disposition_reviewer_children primitive to finalize only the reviewers
+    # bound to it.  A rework relaunch carries a *different* request id, so its
+    # reviewers never match this (task_id, request_id) filter and survive.
+    if resolved_predecessor is not None:
+        rejected_request_id = str(resolved_predecessor["request_id"] or "").strip()
+    else:
+        _review = card.get("terminal_review")
+        _review_evidence = _review.get("evidence") if isinstance(_review, dict) else None
+        _review_identity = (
+            _review_evidence.get("request_identity")
+            if isinstance(_review_evidence, dict)
+            else None
+        )
+        rejected_request_id = (
+            str(_review_identity.get("request_id") or "").strip()
+            if isinstance(_review_identity, dict)
+            else ""
+        )
+
+    def _finalize_bound_reviewers() -> list[dict[str, Any]]:
+        """Supersede every quality-review child bound to the rejected request.
+
+        Returns rows matching accept_review's ``reviewer_finalization`` shape
+        (``task_id`` / ``finished`` / ``cleanup_error``) so a manager reading
+        either receipt sees the same thing.  An empty verified set is passed:
+        on rejection no reviewer is accepted, so each bound child is superseded
+        out of the review queue.  A reviewer still *running* when the rejection
+        lands is superseded too, deliberately -- its verdict would target a
+        candidate that has just been rejected, and leaving it ``review_ready``
+        would recreate the exact queue noise this fix removes.
+        """
+        if not rejected_request_id:
+            return []
+        from . import task_engine  # local import: core <-> task_engine cycle-safe
+
+        outcome = task_engine.disposition_reviewer_children(
+            repo_root(),
+            task_id,
+            verified_reviewer_task_ids=[],
+            parent_request_id=rejected_request_id,
+            disposition="rejected",
+        )
+        try:
+            payload = json.loads(str(outcome.get("stdout") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        finalized = {str(tid) for tid in (payload.get("finalized") or [])}
+        superseded = {str(tid) for tid in (payload.get("superseded") or [])}
+        skipped = {str(tid) for tid in (payload.get("skipped") or [])}
+        errored: dict[str, str] = {}
+        for entry in payload.get("errors") or []:
+            reviewer_id, _, message = str(entry).partition(":")
+            errored[reviewer_id] = message
+        rows: list[dict[str, Any]] = []
+        for reviewer_task_id in sorted(finalized | superseded | skipped | set(errored)):
+            rows.append({
+                "task_id": reviewer_task_id,
+                "finished": reviewer_task_id in finalized
+                or reviewer_task_id in superseded
+                or reviewer_task_id in skipped,
+                "cleanup_error": errored.get(reviewer_task_id, ""),
+            })
+        return rows
+
     raw_reason = str(reason or "")
     reason_bytes = raw_reason.encode("utf-8")
     bounded_reason, reason_truncated = _bounded_utf8_prefix(
@@ -3908,9 +3978,11 @@ def reject_review(
             )
         card2 = task_store.get_task(repo_root(), task_id)
         stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
-        return _reconcile_retained_workspaces(
+        result = _reconcile_retained_workspaces(
             _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
         )
+        result["reviewer_finalization"] = _finalize_bound_reviewers()
+        return result
 
     now = datetime.now(timezone.utc).isoformat()
     # A pending disposition means "rework this exact candidate", not "throw
@@ -4037,9 +4109,11 @@ def reject_review(
         conn.close()
     card2 = task_store.get_task(repo_root(), task_id)
     stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
-    return _reconcile_retained_workspaces(
+    result = _reconcile_retained_workspaces(
         _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
     )
+    result["reviewer_finalization"] = _finalize_bound_reviewers()
+    return result
 
 
 def recover_blocked_rework(
