@@ -1,5 +1,47 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.83 — 2026-08-18
+
+### Fixed
+
+- **Work that was finished and correct kept being thrown away for reasons that had
+  nothing to do with the code.** Four tests depended on where they happened to be
+  run - a home directory the sandbox does not have, a temporary path that changes
+  how pytest names tests, a file permission the sandbox refuses, and a nested
+  launch it cannot complete. Any card whose checks touched one of them was marked
+  failed, and that particular failure cannot be retried, so the only way out was
+  to throw the card away and start again. All four are fixed and each was proved
+  in both directions before being changed.
+
+- **A task that finished and was then blocked never told anyone.** The
+  notification was suppressed as a duplicate of the earlier one, so the task sat
+  blocked with nobody informed. Recovery of a lost notification also poisoned
+  itself and could only ever be attempted once. The delivery thread had no
+  protection: a single unexpected error killed it for the whole repository while
+  the health panel still showed green.
+
+- **Asking about an archived task crashed the status tool.** Archiving is often
+  the only way to close a stuck task, so this was not a rare corner. A replaced
+  task also still showed as waiting work, creating a task that already existed
+  handed back a dead one as if it were usable, and one blocked task at the front
+  of the queue stopped every ready task behind it from starting.
+
+- **A task could lower the bar it was being judged against.** Emptying its own
+  quality settings weakened its own review; a repository asking for a stricter
+  minimum produced a block that could never be cleared; a test report with zero
+  tests counted as a pass on one path and a failure on the other; and diagnostics
+  sent to a retry were being mangled in a way nothing could detect.
+
+- **Cleaning up old files could lose them.** If the cleanup was interrupted
+  part-way, files were moved with no record of where they came from and nothing
+  could put them back. Cleanup also reported "0 bytes freed" for exactly the case
+  holding gigabytes, and the recovery action the Storage panel tells you to run
+  had no button anywhere.
+
+- **NeedFix counts did not fall when the work behind them was finished.** The code
+  that links a NeedFix to the task fixing it was never given what it needed, so
+  that path never ran outside tests.
+
 ## 0.9.82 — 2026-08-18
 
 ### Fixed

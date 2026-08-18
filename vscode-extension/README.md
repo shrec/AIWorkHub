@@ -12,6 +12,25 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.83
+
+- Work that was finished and correct is no longer thrown away because of where it
+  ran. Four checks depended on a home directory, a temporary path, a file
+  permission or a nested launch the sandbox does not provide; any task touching
+  one of them was marked failed in a way that could not be retried.
+- A task that finished and was then blocked now tells you. The notification was
+  being suppressed as a duplicate, and the delivery thread could be killed by a
+  single unexpected error while health still showed green.
+- Asking about an archived task no longer crashes the status tool, a replaced task
+  no longer shows as waiting work, and one blocked task at the front of the queue
+  no longer stops everything behind it.
+- A task can no longer lower the bar it is judged against by changing its own
+  quality settings, and a report with zero tests no longer counts as a pass.
+- Cleaning up old files can no longer lose them when interrupted, reports the
+  bytes it actually freed, and the recovery action the Storage panel recommends
+  now exists.
+- NeedFix counts fall when the work behind them finishes.
+
 ## What's new in 0.9.82
 
 - **Source Graph could stop a search a third of the way through and still report

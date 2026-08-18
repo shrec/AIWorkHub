@@ -6,6 +6,89 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.83] - 2026-08-18
+
+### Fixed
+
+- **Four tests made the sandbox report failure on green code, and each one cost a
+  worker round.** None of it was flakiness; every one was deterministic and only
+  looked random because it depended on where the run happened.
+  `test_validation_pythonpath_override_is_scoped_to_one_subprocess` required
+  `site.getusersitepackages()` to exist, and under a worker sandbox `HOME` points
+  at a throwaway workspace home where it does not.
+  `test_suite_profile_collects_per_test_metrics` asserted an exact pytest nodeid,
+  and pytest resolves its rootdir to the repository when `tmp_path` sits inside
+  it, so the nodeid arrives prefixed. `test_review_evidence_audit_recomputes_hash_and_size`
+  ran an unguarded setuid `chmod` that Landlock refuses with EPERM.
+  `test_isolated_launch_claims_and_passes_key_through_sandbox` launches a real
+  worker under Landlock and waits for it, which a nested ruleset cannot satisfy —
+  the file already skipped it on GitHub runners for that exact reason and simply
+  never covered our own sandbox. Each was reproduced in both directions before
+  being changed.
+
+  This mattered out of proportion to its size: `validation_failed` is a
+  non-operational terminal substatus, so `accept_review`, `mark_done` and
+  `retry_terminal` all refuse it and the only way out is to archive the card and
+  reissue it. Green work was repeatedly thrown away for an environment it never
+  touched.
+
+- **A card that reached review and then blocked in one episode never woke
+  anybody.** The outbox idempotency predicate keyed on task, provider, route and
+  episode while omitting the transition, so the second enqueue matched the first
+  row and returned False — the card sat blocked and no callback was delivered.
+  `seed_missing_review_callbacks` could not rescue it because its lookup was
+  transition-blind in the same way. Terminal recovery also left the old
+  transition on the row it recovered, so the next claim superseded it again and
+  its single recovery budget was already spent, losing the wake permanently on a
+  stable route. The delivery daemon called `_process_batch` bare while that
+  method caught only two exception types, so anything else killed the
+  repository's one delivery thread and left the batch inflight for a full lease —
+  while dispatcher health still reported `ok`.
+
+- **The supervisor surface raised `KeyError` on every archived card.** The
+  lifecycle map had no `archived` entry although `_lifecycle_state` returns it,
+  and the index was unguarded — so a read-only status tool died on the one state
+  the control plane most needs to report. Archiving is also the only closure
+  available for a card wedged in a non-operational terminal substatus, which
+  makes archived cards common rather than exotic. A superseded card additionally
+  read as `pending`, so replaced work kept appearing as still waiting;
+  `create_task` handed back finished, archived and superseded cards as if they
+  were usable; and `auto_pickup` stopped at the first colliding candidate, so one
+  blocked card at the head of the queue starved every ready card behind it.
+
+- **The quality gate could be weakened by the candidate it was judging.** A
+  candidate that emptied or removed its own quality policy lowered its own
+  acceptance bar; the combined-tree fold ran at low tier, so a repository
+  declaring `minimum_risk: medium` produced a permanent `risk_below_minimum`
+  blocker that no rework could clear; a zero-test JUnit report satisfied a
+  mandatory check on one fold path while the other blocked on the same line; the
+  ratchet failed open on an unreadable baseline, indistinguishable from never
+  configured; `runtime_coverage_for_paths` raised on a shape-invalid document and
+  reported `available` on zero matches; stall recovery was unreachable while the
+  supervisor process still existed; and the crash-retry packet ran an HTML
+  sanitiser over diagnostics that are embedded as JSON, hashing the unsanitised
+  bytes so the corruption could not be detected.
+
+- **An interrupted quarantine left moved files with no record of where they came
+  from.** The stage-and-move batch wrote its manifest after the moves, so a crash
+  between the first move and the write left files relocated and unrecoverable —
+  while the sibling `quarantine()` in the same module writes its manifest first,
+  which is what shows this was an omission rather than a design. `purge` also
+  reported zero bytes freed for exactly the stranded shape that holds gigabytes,
+  because the accounting walked the record instead of the disk; two permanently
+  dead recovery paths read as coverage that did not exist; the stranded-worktree
+  recovery the dashboard tells operators to run had no runnable entry point
+  anywhere; and a restored review task whose retained workspace was gone reported
+  hash drift, sending the operator looking for tampering instead of for a swept
+  directory.
+
+- **The NeedFix explicit-reference link path could never run in production.**
+  `reconcile_unlinked_needfix` accepts a card lister so it can link a NeedFix to a
+  card that names it, and two branches depend on that argument — but the only
+  production caller never passed it, so those branches were dead everywhere
+  except in tests that supplied it directly. That is why counts on the NeedFix
+  surfaces did not fall when the work behind them finished.
+
 ## [0.9.82] - 2026-08-18
 
 ### Fixed
