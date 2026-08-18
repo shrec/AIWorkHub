@@ -1728,67 +1728,88 @@ def auto_pickup(runner: str, topic: str | None = None) -> dict[str, Any]:
         return _canonical_result(
             ok=False, returncode=1, stderr=f"no_eligible_task:runner={runner}:topic={topic}", command=command
         )
-    task_id = str(eligible[0]["task_id"])
     now = datetime.now(timezone.utc).isoformat()
     try:
         conn = _canonical_connect()
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    # One colliding candidate at the head of the queue must not starve the ready
+    # cards behind it. Scan every eligible candidate in order, skipping any whose
+    # atomic claim loses the unclaimed+pending guard (already claimed, blocked,
+    # or retired since the snapshot was taken), and report what was shadowed so
+    # the operator can see the queue was not empty -- it was shadowed.
+    skipped: list[dict[str, Any]] = []
+    claimed_task_id: str | None = None
     try:
-        row = conn.execute("SELECT card_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-        try:
-            stored_card = json.loads(row["card_json"] or "{}") if row is not None else {}
-        except (TypeError, json.JSONDecodeError):
-            stored_card = {}
-        if not isinstance(stored_card, dict):
-            stored_card = {}
-        try:
-            claim_epoch = int(stored_card.get("claim_epoch") or 0) + 1
-        except (TypeError, ValueError):
-            claim_epoch = 1
-        prior_episode = task_store.begin_claim_episode(stored_card)
-        stored_card.update(
-            claim_epoch=claim_epoch,
-            status="processing",
-            worker_status="claimed",
-            claimed_by=runner,
-        )
-        cur = conn.execute(
-            "UPDATE tasks SET card_json=?, worker_status='claimed', status='processing', claimed_by=?, "
-            "claimed_at=?, started_at=?, completed_at=NULL, updated_at=? "
-            "WHERE task_id=? AND worker_status='unclaimed' AND status='pending'",
-            (json.dumps(stored_card, ensure_ascii=False), runner, now, now, now, task_id),
-        )
-        if cur.rowcount != 1:
-            conn.rollback()
-            return _canonical_result(
-                ok=False, returncode=1, stderr=f"claim_race_lost:task_id={task_id}", command=command
+        for candidate in eligible:
+            task_id = str(candidate["task_id"])
+            row = conn.execute("SELECT card_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            try:
+                stored_card = json.loads(row["card_json"] or "{}") if row is not None else {}
+            except (TypeError, json.JSONDecodeError):
+                stored_card = {}
+            if not isinstance(stored_card, dict):
+                stored_card = {}
+            try:
+                claim_epoch = int(stored_card.get("claim_epoch") or 0) + 1
+            except (TypeError, ValueError):
+                claim_epoch = 1
+            prior_episode = task_store.begin_claim_episode(stored_card)
+            stored_card.update(
+                claim_epoch=claim_epoch,
+                status="processing",
+                worker_status="claimed",
+                claimed_by=runner,
             )
-        conn.execute(
-            "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
-            (
-                task_id,
-                "auto_pickup",
-                runner,
-                json.dumps(
-                    {
-                        "runner": runner,
-                        "topic": topic,
-                        "claim_epoch": claim_epoch,
-                        "prior_episode": prior_episode,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
+            cur = conn.execute(
+                "UPDATE tasks SET card_json=?, worker_status='claimed', status='processing', claimed_by=?, "
+                "claimed_at=?, started_at=?, completed_at=NULL, updated_at=? "
+                "WHERE task_id=? AND worker_status='unclaimed' AND status='pending'",
+                (json.dumps(stored_card, ensure_ascii=False), runner, now, now, now, task_id),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                skipped.append({"task_id": task_id, "reason": "claim_conflict"})
+                continue
+            conn.execute(
+                "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
+                (
+                    task_id,
+                    "auto_pickup",
+                    runner,
+                    json.dumps(
+                        {
+                            "runner": runner,
+                            "topic": topic,
+                            "claim_epoch": claim_epoch,
+                            "prior_episode": prior_episode,
+                            "skipped_candidates": skipped,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
                 ),
-                now,
-            ),
-        )
-        conn.commit()
+            )
+            conn.commit()
+            claimed_task_id = task_id
+            break
     finally:
         conn.close()
-    card = task_store.get_task(repo_root(), task_id)
+    if claimed_task_id is None:
+        result = _canonical_result(
+            ok=False,
+            returncode=1,
+            stderr=f"no_claimable_task:runner={runner}:topic={topic}",
+            command=command,
+        )
+        result["skipped_candidates"] = skipped
+        return result
+    card = task_store.get_task(repo_root(), claimed_task_id)
     stdout = json.dumps(card, ensure_ascii=False, default=str) if card else ""
-    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result = _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result["skipped_candidates"] = skipped
+    return result
 
 
 def claim_start_exact(
@@ -1915,6 +1936,12 @@ def _lifecycle_state(card: dict[str, Any]) -> str:
         return "review"
     if status in {"processing", "in_progress"} or worker_status in {"claimed", "in_progress"}:
         return "processing"
+    # Mirror ``task_store.canonical_status`` (task_store.py:611): a reviewer-
+    # declared ``superseded`` card is closed -- its successor carries the work --
+    # not fresh pending work. Folding it into ``pending`` (the drift this fixes)
+    # made a replaced card reappear on planning surfaces as work still waiting.
+    if status == "superseded" or worker_status == "superseded":
+        return "superseded"
     return "pending"
 
 
@@ -3132,6 +3159,27 @@ def create_task(
             existing_card = {}
         if not isinstance(existing_card, dict):
             existing_card = {}
+        # A retry landing on a LIVE row is the lost-response recovery path and
+        # must still hand back that card (the contract depends on it). But a
+        # finished/archived/superseded row is closed: reconciling it returns a
+        # card the caller cannot use and does not know is dead. Return a receipt
+        # naming the terminal state instead of pretending a usable card exists.
+        existing_lifecycle = _lifecycle_state(existing_card)
+        if existing_lifecycle in {"finished", "archived", "superseded"}:
+            result = _canonical_result(
+                ok=False,
+                returncode=1,
+                stderr=f"task_terminal:{existing_lifecycle}:{task_id}",
+                command=["add-card", task_id],
+            )
+            result.update({
+                "task_id": task_id,
+                "created": False,
+                "reconciled": False,
+                "receipt_state": "existing_terminal",
+                "terminal_state": existing_lifecycle,
+            })
+            return result
         existing_context = existing_card.get("project_context")
         if not isinstance(existing_context, dict):
             existing_context = {}
@@ -4984,6 +5032,13 @@ LIFECYCLE_TO_SUPERVISOR_STATE: dict[str, str] = {
     "review": "worker_review_ready",
     "finished": "codex_reviewed",
     "blocked": "blocked",
+    # Terminal retirements the lifecycle itself produces. Archiving is the only
+    # closure available for a card wedged in a non-operational terminal
+    # substatus, so archived cards are common; a superseded card was explicitly
+    # replaced by its successor. A read-only status surface must name these,
+    # never raise on a state the system itself emits.
+    "archived": "archived",
+    "superseded": "superseded",
 }
 
 
@@ -5157,7 +5212,12 @@ def supervisor_loop_status(
     # Step 7: clean_mapping
     base["state"] = "planned"
     base["error"] = None
-    base["supervisor_state"] = LIFECYCLE_TO_SUPERVISOR_STATE[_lifecycle_state(card)]
+    lifecycle = _lifecycle_state(card)
+    # A lifecycle the map has not been taught degrades to a named unknown rather
+    # than raising KeyError on this read-only surface (the archived-card bug).
+    base["supervisor_state"] = LIFECYCLE_TO_SUPERVISOR_STATE.get(
+        lifecycle, f"unknown:{lifecycle}"
+    )
     return base
 
 
@@ -5566,8 +5626,16 @@ def claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
                 provider="claude",
                 origin_thread_id=identity["session_id"],
             )
+            # Claim at route level, not just provider level: pass this verified
+            # manager's own session identity through so a second manager on the
+            # same repository can never lease (and then park) a batch belonging
+            # to another route. The store's ``origin_thread_id`` scope is exactly
+            # this guarantee; passing only ``provider`` left it unused.
             batch = callback_store.claim_pending_callback_batch(
-                conn, lease_seconds=max(120, timeout + 30), provider="claude"
+                conn,
+                lease_seconds=max(120, timeout + 30),
+                provider="claude",
+                origin_thread_id=identity["session_id"],
             )
         finally:
             conn.close()
