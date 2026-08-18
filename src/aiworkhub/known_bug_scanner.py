@@ -390,28 +390,130 @@ def _python_code_lines(text: str) -> list[str]:
     return ["".join(line) for line in masked]
 
 
-def scan_file(root: Path, relative: str) -> list[dict]:
+def _generic_code_lines(text: str) -> list[str]:
+    """Mask comments and string literals for non-Python source.
+
+    A single offset-preserving scan blanks ``//`` and ``#`` line comments,
+    ``/* */`` block comments, and single/double quoted strings, so a dangerous
+    pattern inside a string literal is not reported and a block-comment
+    continuation line beginning with ``*`` is masked to whitespace instead of
+    being pattern-matched.  Every consumed character maps to exactly one output
+    character, so column offsets stay accurate.
+    """
+
+    out: list[str] = []
+    state: str | None = None  # None | "line" | "block" | "sq" | "dq"
+    length = len(text)
+    index = 0
+    while index < length:
+        char = text[index]
+        nxt = text[index + 1] if index + 1 < length else ""
+        if state is None:
+            if char == "/" and nxt == "/":
+                state, index = "line", index + 2
+                out.append("  ")
+            elif char == "#":
+                state, index = "line", index + 1
+                out.append(" ")
+            elif char == "/" and nxt == "*":
+                state, index = "block", index + 2
+                out.append("  ")
+            elif char == '"':
+                state, index = "dq", index + 1
+                out.append(" ")
+            elif char == "'":
+                state, index = "sq", index + 1
+                out.append(" ")
+            else:
+                out.append(char)
+                index += 1
+        elif state == "line":
+            if char == "\n":
+                state = None
+                out.append("\n")
+            else:
+                out.append(" ")
+            index += 1
+        elif state == "block":
+            if char == "*" and nxt == "/":
+                state, index = None, index + 2
+                out.append("  ")
+            else:
+                out.append("\n" if char == "\n" else " ")
+                index += 1
+        else:  # inside a single/double quoted string
+            quote = "'" if state == "sq" else '"'
+            if char == "\\" and index + 1 < length:
+                # A backslash-newline is a legal string line continuation: keep
+                # the newline so downstream line indexing stays aligned. Every
+                # other escaped char still maps to a single blanking space.
+                out.append(" \n" if nxt == "\n" else "  ")
+                index += 2
+            elif char == "\n":
+                # An unterminated literal never crosses a physical line here.
+                state = None
+                out.append("\n")
+                index += 1
+            elif char == quote:
+                state = None
+                out.append(" ")
+                index += 1
+            else:
+                out.append(" ")
+                index += 1
+    return "".join(out).splitlines()
+
+
+def _masked_code_lines(text: str, suffix: str) -> list[str]:
+    """Return per-line source with comments and string literals blanked."""
+
+    if suffix == ".py":
+        return _python_code_lines(text)
+    return _generic_code_lines(text)
+
+
+def _scan_path(root: Path, relative: str) -> tuple[list[dict], dict | None]:
+    """Scan one path, returning its findings and an optional skip record.
+
+    A skip record names why the file was not scanned (for example, it exceeds
+    ``MAX_FILE_BYTES``) so an unscanned file is never silently reported as
+    clean.
+    """
+
     path = (root / relative).resolve(strict=False)
     if (path != root and root not in path.parents) or path.is_symlink() or not path.is_file():
-        return []
-    if path.stat().st_size > MAX_FILE_BYTES:
-        return []
+        return [], None
+    size = path.stat().st_size
+    if size > MAX_FILE_BYTES:
+        return [], {
+            "path": relative,
+            "reason": "file_exceeds_max_bytes",
+            "size_bytes": size,
+            "max_bytes": MAX_FILE_BYTES,
+        }
     suffix = path.suffix.lower()
     rules = [rule for rule in RULES if suffix in rule.suffixes]
     if not rules and suffix not in {".cu", ".cuh"}:
-        return []
+        return [], None
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
-    code_lines = _python_code_lines(text) if suffix == ".py" else lines
-    crypto = bool(CRYPTO_CONTEXT.search(relative))
+    code_lines = _masked_code_lines(text, suffix)
+    # Crypto context is a property of the whole file, not of the lines above the
+    # offending one: compute it once so a crypto_only rule fires regardless of
+    # whether the crypto keyword sits above or below the match.
+    crypto = bool(CRYPTO_CONTEXT.search(relative)) or any(
+        CRYPTO_CONTEXT.search(line) for line in code_lines
+    )
     findings = []
     released: dict[str, int] = {}
     for number, raw in enumerate(lines, 1):
-        source = code_lines[number - 1] if suffix == ".py" else raw.split("//", 1)[0]
+        source = code_lines[number - 1] if number - 1 < len(code_lines) else ""
         stripped = source.strip()
-        if not stripped or stripped.startswith(("//", "/*", "*", "#")):
+        # Comments and string literals are already blanked, so an empty masked
+        # line is the only skip condition; a code line beginning with ``*`` (a C
+        # pointer dereference) is no longer skipped as a block-comment body.
+        if not stripped:
             continue
-        crypto = crypto or bool(CRYPTO_CONTEXT.search(source))
         if suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cu", ".cuh"}:
             for name in tuple(released):
                 if re.search(rf"\b{re.escape(name)}\s*=(?!=)", source):
@@ -452,15 +554,25 @@ def scan_file(root: Path, relative: str) -> list[dict]:
                     findings.append(_finding(rule, relative, number, match.start() + 1, raw))
         if len(findings) >= MAX_FINDINGS:
             break
-    return findings[:MAX_FINDINGS]
+    return findings[:MAX_FINDINGS], None
+
+
+def scan_file(root: Path, relative: str) -> list[dict]:
+    """Return the findings for one path (skip records are report-level)."""
+
+    return _scan_path(root, relative)[0]
 
 
 def scan_changed_paths(repo_root: Path | str, changed_paths: Iterable[str]) -> dict:
     root = Path(repo_root).resolve()
     paths = tuple(sorted(dict.fromkeys(map(str, changed_paths))))[:MAX_PATHS]
     findings = []
+    skipped_paths: list[dict] = []
     for relative in paths:
-        findings.extend(scan_file(root, relative))
+        file_findings, skip = _scan_path(root, relative)
+        if skip is not None:
+            skipped_paths.append(skip)
+        findings.extend(file_findings)
         if len(findings) >= MAX_FINDINGS:
             break
     errors = sum(row["severity"] == "error" for row in findings)
@@ -468,9 +580,13 @@ def scan_changed_paths(repo_root: Path | str, changed_paths: Iterable[str]) -> d
     unique_root_causes = len({
         row["root_cause_fingerprint"] for row in retained
     })
-    return {"schema_id": SCHEMA_ID, "passed": errors == 0, "errors": errors,
+    # A file skipped for size was not inspected, so it cannot be counted as
+    # clean: ``passed`` must reflect the skip alongside any error findings.
+    return {"schema_id": SCHEMA_ID,
+            "passed": errors == 0 and not skipped_paths, "errors": errors,
             "warnings": sum(row["severity"] == "warning" for row in findings),
             "paths_considered": len(paths), "findings": retained,
+            "skipped_paths": skipped_paths,
             "source_revision_sha256": _source_revision_sha256(root, paths),
             "source_revision_scope": "exact_paths_and_bytes",
             "truncated": len(findings) > MAX_FINDINGS,

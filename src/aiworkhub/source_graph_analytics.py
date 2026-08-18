@@ -65,7 +65,124 @@ _NULL_DEREF_RE = re.compile(r"\b([A-Za-z_]\w*)\s*->")
 _ALLOC_RE = re.compile(r"\b(?:new|malloc|calloc|realloc)\b")
 _FREE_RE = re.compile(r"\b(?:delete|free)\b")
 _INFINITE_LOOP_RE = re.compile(r"\bwhile\s*\(\s*(?:true|1)\s*\)|\bfor\s*\(\s*;\s*;\s*\)")
-_DIVISION_RE = re.compile(r"(?<!/)\/(?![/=*])\s*([A-Za-z_]\w*)")
+# A division requires a left operand (identifier, digit, or a closing bracket)
+# before the slash, so a bare path separator inside a string or comment can no
+# longer masquerade as ``x / y``.  ``/{1,2}`` keeps Python floor division
+# (``//``) while ``(?!=)`` still excludes the ``/=`` augmented assignment.  The
+# operand requirement is not sufficient on its own (``a/b`` inside a path string
+# still looks like division), so callers mask string and comment content first.
+_DIVISION_RE = re.compile(r"[)\]\w]\s*/{1,2}(?!=)\s*([A-Za-z_]\w*)")
+
+# Language families used to decide detector applicability.  These lexical
+# detectors are ported from a C/C++ Source Graph; on a language they cannot
+# structurally match they must report ``not_applicable`` rather than an empty
+# ``available`` result that reads as "analysed and clean".
+_C_FAMILY_SUFFIXES: frozenset[str] = frozenset({
+    ".c", ".cc", ".cpp", ".cxx", ".c++", ".cu", ".cuh",
+    ".h", ".hh", ".hpp", ".hxx", ".h++", ".ipp", ".inl",
+})
+_PYTHON_SUFFIXES: frozenset[str] = frozenset({".py", ".pyi"})
+
+# Only the C family exposes the lexical shapes these detectors match: an
+# always-true C ``while``/``for`` header, an arrow dereference, raw pointer
+# declarations, and C++ casts.  ``crashes`` (division / explicit termination)
+# is meaningful in Python too once its guard and operand handling are
+# language-aware, so it is applicable to both.  Modes absent from this map
+# (``deadmethods``, ``duplicates``) are graph/normalisation based and apply to
+# every language.
+_C_ONLY: frozenset[str] = frozenset({"c_family"})
+_RISK_MODE_LANGUAGES: dict[str, frozenset[str]] = {
+    "leaks": _C_ONLY,
+    "rawptrs": _C_ONLY,
+    "casts": _C_ONLY,
+    "looprisks": _C_ONLY,
+    "nullrisks": _C_ONLY,
+    "crashes": frozenset({"c_family", "python"}),
+}
+
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
+_TRIPLE_STRING_RE = re.compile(
+    r'"""(?:\\.|[^\\])*?"""|\'\'\'(?:\\.|[^\\])*?\'\'\'', re.S
+)
+_STRING_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'')
+_PY_LINE_COMMENT_RE = re.compile(r"#[^\n]*")
+_C_LINE_COMMENT_RE = re.compile(r"(?://|#)[^\n]*")
+
+# Common builtins that saturate the low-confidence ``gaps`` edge set: a call to
+# one of these is expected to be unresolved and is never the missing evidence a
+# caller is asking about.
+_GAPS_BUILTIN_CALLEES: frozenset[str] = frozenset({
+    "print", "len", "range", "int", "str", "float", "bool", "bytes", "list",
+    "dict", "set", "tuple", "frozenset", "type", "id", "repr", "format",
+    "isinstance", "issubclass", "getattr", "setattr", "hasattr", "delattr",
+    "enumerate", "zip", "map", "filter", "sorted", "reversed", "min", "max",
+    "sum", "abs", "round", "any", "all", "next", "iter", "open", "super",
+    "hash", "ord", "chr", "vars", "dir", "callable", "staticmethod",
+    "classmethod", "property", "sizeof", "memcpy", "memset", "printf",
+})
+
+
+def _language_family(file_path: Any) -> str:
+    """Return a coarse language family from a file path suffix."""
+
+    suffix = Path(str(file_path or "")).suffix.lower()
+    if suffix in _C_FAMILY_SUFFIXES:
+        return "c_family"
+    if suffix in _PYTHON_SUFFIXES:
+        return "python"
+    return suffix.lstrip(".") or "unknown"
+
+
+def _mask_literals_and_comments(source: str, language: str) -> str:
+    """Blank string and comment content so lexical patterns cannot match it.
+
+    Block comments span lines; line comments stop at their newline.  Python
+    keeps ``//`` (floor division), while the C family treats ``//`` as a line
+    comment.  Offsets are not preserved because risk findings report the symbol
+    line, not a column.
+    """
+
+    masked = _BLOCK_COMMENT_RE.sub(" ", source)
+    masked = _TRIPLE_STRING_RE.sub(" ", masked)
+    masked = _STRING_LITERAL_RE.sub(" ", masked)
+    if language == "python":
+        return _PY_LINE_COMMENT_RE.sub(" ", masked)
+    return _C_LINE_COMMENT_RE.sub(" ", masked)
+
+
+def _mask_comments_only(source: str, language: str) -> str:
+    """Blank only comments (not string literals) for duplicate normalisation.
+
+    A line comment must reach the end of its line and no further: the previous
+    ``re.S`` flag let ``#``/``//`` swallow the rest of the symbol body, so two
+    different functions sharing a prefix and a comment collapsed to one digest.
+    """
+
+    masked = _BLOCK_COMMENT_RE.sub(" ", source)
+    if language == "python":
+        return _PY_LINE_COMMENT_RE.sub(" ", masked)
+    return _C_LINE_COMMENT_RE.sub(" ", masked)
+
+
+def _is_guarded(source: str, name: str) -> bool:
+    """True when ``name`` appears in a preceding guard in either language form.
+
+    Recognises the C/parenthesised form (``if (name)`` / ``assert(name)``) and
+    the Python colon form (``if name:`` / ``while name > 0:`` / ``assert name``),
+    so a truthiness guard on a divisor or pointer is no longer missed merely
+    because it was written without parentheses.
+    """
+
+    escaped = re.escape(name)
+    if re.search(
+        rf"(?:if|elif|while|assert)\s*\([^\n)]*\b{escaped}\b[^\n)]*\)", source
+    ):
+        return True
+    if re.search(rf"(?:if|elif|while)\b[^\n:]*\b{escaped}\b[^\n:]*:", source):
+        return True
+    if re.search(rf"\bassert\b[^\n]*\b{escaped}\b", source):
+        return True
+    return False
 
 
 def _entity_rows(conn: sqlite3.Connection, *, limit: int) -> list[dict[str, Any]]:
@@ -220,48 +337,55 @@ def _risk_views(
 ) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     duplicate_groups: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    applicable_languages = _RISK_MODE_LANGUAGES.get(mode)
     scanned = 0
+    candidate_symbols = 0
+    applicable_candidates = 0
+    skipped_by_language: Counter[str] = Counter()
     for row in rows:
         if str(row.get("kind") or "") not in {"function", "method", "class", "struct"}:
             continue
+        candidate_symbols += 1
+        language = _language_family(row.get("file_path"))
+        if applicable_languages is not None and language not in applicable_languages:
+            # This detector cannot structurally fire on this language, so the
+            # symbol is never "checked" by it and must not inflate coverage.
+            skipped_by_language[language] += 1
+            continue
+        applicable_candidates += 1
         source = _symbol_source(repo_root, row)
         if not source:
             continue
         scanned += 1
+        masked = _mask_literals_and_comments(source, language)
         reasons: list[str] = []
-        if mode == "leaks" and len(_ALLOC_RE.findall(source)) > len(_FREE_RE.findall(source)):
+        if mode == "leaks" and len(_ALLOC_RE.findall(masked)) > len(_FREE_RE.findall(masked)):
             reasons.append("allocation_release_imbalance")
-        elif mode == "rawptrs" and _RAW_PTR_RE.search(source):
+        elif mode == "rawptrs" and _RAW_PTR_RE.search(masked):
             reasons.append("raw_pointer_declaration")
-        elif mode == "casts" and _UNSAFE_CAST_RE.search(source):
+        elif mode == "casts" and _UNSAFE_CAST_RE.search(masked):
             reasons.append("unsafe_cast_candidate")
         elif mode == "looprisks":
-            for match in _INFINITE_LOOP_RE.finditer(source):
-                tail = source[match.end():]
+            for match in _INFINITE_LOOP_RE.finditer(masked):
+                tail = masked[match.end():]
                 close = tail.find("}")
                 loop_body = tail[:close] if close >= 0 else tail[:4000]
                 if not re.search(r"\b(?:break|return|throw|co_await|await)\b", loop_body):
                     reasons.append("unbounded_loop_without_lexical_exit")
                     break
         elif mode == "nullrisks":
-            dereferenced = set(_NULL_DEREF_RE.findall(source))
-            for name in dereferenced:
-                guarded = re.search(
-                    rf"(?:if|assert)\s*\([^\n)]*\b{re.escape(name)}\b[^\n)]*\)", source,
-                )
-                if not guarded:
+            dereferenced = set(_NULL_DEREF_RE.findall(masked))
+            for name in sorted(dereferenced):
+                if not _is_guarded(masked, name):
                     reasons.append(f"unguarded_pointer_dereference:{name}")
                     break
         elif mode == "crashes":
-            divisors = set(_DIVISION_RE.findall(source))
-            for name in divisors:
-                guarded = re.search(
-                    rf"(?:if|assert)\s*\([^\n)]*\b{re.escape(name)}\b[^\n)]*\)", source,
-                )
-                if not guarded:
+            divisors = set(_DIVISION_RE.findall(masked))
+            for name in sorted(divisors):
+                if not _is_guarded(masked, name):
                     reasons.append(f"unchecked_divisor:{name}")
                     break
-            if re.search(r"\b(?:abort|std::terminate)\s*\(", source):
+            if re.search(r"\b(?:abort|std::terminate)\s*\(", masked):
                 reasons.append("explicit_process_termination")
         elif mode == "deadmethods":
             qualname = str(row.get("qualname") or "")
@@ -270,9 +394,11 @@ def _risk_views(
             ).fetchone()[0])
             name = str(row.get("name") or "")
             if incoming == 0 and name not in {"main", "__init__", "activate", "deactivate"}:
-                reasons.append("zero_resolved_incoming_calls")
+                reasons.append("no_resolved_incoming_calls_dynamic_dispatch_unobserved")
         elif mode == "duplicates":
-            normalized = re.sub(r"\s+", " ", re.sub(r"//.*|/\*.*?\*/|#.*", "", source, flags=re.S)).strip()
+            normalized = re.sub(
+                r"\s+", " ", _mask_comments_only(source, language)
+            ).strip()
             if len(normalized) >= 80:
                 duplicate_groups[hashlib.sha256(normalized.encode()).hexdigest()].append(row)
         if reasons:
@@ -298,13 +424,40 @@ def _risk_views(
             for digest, group in duplicate_groups.items()
             if len(group) > 1
         ][:budget]
-    return {
-        "status": "available" if scanned else "not_available",
-        "reason": None if scanned else "semantic_symbol_bodies_unavailable_for_scope",
+    if (
+        applicable_languages is not None
+        and applicable_candidates == 0
+        and candidate_symbols > 0
+    ):
+        status = "not_applicable"
+        reason = (
+            f"{mode}_detector_analyses_only_{'/'.join(sorted(applicable_languages))}"
+            f"_but_scope_holds_only_{'/'.join(sorted(skipped_by_language)) or 'other'}"
+        )
+    elif scanned:
+        status = "available"
+        reason = None
+    else:
+        status = "not_available"
+        reason = "semantic_symbol_bodies_unavailable_for_scope"
+    result: dict[str, Any] = {
+        "status": status,
+        "reason": reason,
         "symbols_scanned": scanned,
         "findings": findings[:budget],
         "blocking": False,
     }
+    if applicable_languages is not None:
+        result["applicable_languages"] = sorted(applicable_languages)
+        result["symbols_skipped_by_language"] = dict(sorted(skipped_by_language.items()))
+    if mode == "deadmethods":
+        # Incoming edges are resolved static calls only: a symbol reached solely
+        # through MCP or CLI dispatch has no resolved edge and must not be
+        # called dead without this caveat stated plainly.
+        result["incoming_edge_evidence"] = (
+            "resolved_static_call_edges_only_excludes_mcp_and_cli_dispatch"
+        )
+    return result
 
 
 def _summary(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -484,12 +637,30 @@ def query(
 
     if mode == "gaps":
         tests = _test_map(conn, repo_root, files, matches or scoped_matches, budget=min(budget, 40))
+        # Scope and the builtin exclusion are pushed INTO the SQL so the LIMIT
+        # applies to real, in-scope low-confidence edges.  Previously the query
+        # took the globally-lowest-confidence rows first (0.4 builtins always
+        # won) and any scope filter ran after the LIMIT, so a target with many
+        # low-confidence rows returned nothing.
+        clauses = ["confidence < 1.0"]
+        params: list[Any] = []
+        if files:
+            placeholders = ",".join("?" for _ in files)
+            clauses.append(f"file_path IN ({placeholders})")
+            params.extend(files)
+        builtin_placeholders = ",".join("?" for _ in _GAPS_BUILTIN_CALLEES)
+        clauses.append(
+            f"(dst_name IS NULL OR dst_name NOT IN ({builtin_placeholders}))"
+        )
+        params.extend(sorted(_GAPS_BUILTIN_CALLEES))
+        params.append(budget)
         low_confidence = [
             dict(row) for row in conn.execute(
                 "SELECT file_path, kind, src_qualname, dst_name, dst_qualname, line, "
-                "evidence_label, confidence FROM edges WHERE confidence < 1.0 "
-                "ORDER BY confidence, file_path, line LIMIT ?",
-                (budget,),
+                "evidence_label, confidence FROM edges WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY confidence, file_path, line LIMIT ?",
+                params,
             )
         ]
         return {

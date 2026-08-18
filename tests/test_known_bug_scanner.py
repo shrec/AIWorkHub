@@ -297,6 +297,98 @@ def test_runtime_receipt_requires_matching_exit_semantics(tmp_path: Path):
         )
 
 
+def test_non_python_string_literal_is_not_a_finding(tmp_path: Path):
+    # Defect 7. Before: non-Python files were only truncated at the first
+    # ``//``, so ``system(cmd)`` inside a string literal became a finding.
+    # After: string literals are masked, so only the real gets() call fires.
+    (tmp_path / "s.c").write_text(
+        'const char *msg = "system(cmd)";\n'
+        "int deref(int *p){ *p = gets(buf); return 0; }\n",
+        encoding="utf-8",
+    )
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["s.c"])
+    rule_ids = {row["rule_id"] for row in report["findings"]}
+    assert "cpp.process_shell" not in rule_ids
+    assert "cpp.dangerous_gets" in rule_ids
+
+
+def test_star_prefixed_c_line_is_scanned_not_skipped(tmp_path: Path):
+    # Defect 7. Before: any line starting with ``*`` was skipped as a
+    # block-comment continuation, hiding a real dereference-assignment.
+    # After: masking removes real comments, so a ``*out = ...`` line is scanned.
+    (tmp_path / "star.c").write_text(
+        "int f(char *buf){\n*out = gets(buf);\nreturn 0;\n}\n",
+        encoding="utf-8",
+    )
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["star.c"])
+    assert any(row["rule_id"] == "cpp.dangerous_gets" for row in report["findings"])
+
+
+def test_crypto_only_rule_fires_regardless_of_keyword_order(tmp_path: Path):
+    # Defect 6. Before: the crypto flag accumulated line by line, so a
+    # crypto_only rule fired only when the crypto keyword appeared *above* the
+    # offending line. After: crypto context is a whole-file property.
+    (tmp_path / "below.c").write_text(
+        "int gen(void){ return rand(); }\nint key_material = 1;\n", encoding="utf-8"
+    )
+    (tmp_path / "above.c").write_text(
+        "int key_material = 1;\nint gen(void){ return rand(); }\n", encoding="utf-8"
+    )
+    below = known_bug_scanner.scan_changed_paths(tmp_path, ["below.c"])
+    above = known_bug_scanner.scan_changed_paths(tmp_path, ["above.c"])
+    assert any(row["rule_id"] == "crypto.weak_c_rng" for row in below["findings"])
+    assert any(row["rule_id"] == "crypto.weak_c_rng" for row in above["findings"])
+
+
+def test_oversized_file_is_recorded_as_skipped_not_clean(tmp_path: Path):
+    # Defect 8. Before: a file over MAX_FILE_BYTES returned no findings, was
+    # counted in paths_considered, and could still leave passed=True. After: it
+    # appears in skipped_paths with a reason and passed reflects the skip.
+    oversized = tmp_path / "big.py"
+    oversized.write_text("x = 1\n" * (known_bug_scanner.MAX_FILE_BYTES // 2), encoding="utf-8")
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["big.py"])
+    assert report["passed"] is False
+    assert report["skipped_paths"] == [{
+        "path": "big.py",
+        "reason": "file_exceeds_max_bytes",
+        "size_bytes": oversized.stat().st_size,
+        "max_bytes": known_bug_scanner.MAX_FILE_BYTES,
+    }]
+    assert report["findings"] == []
+
+
+def test_small_clean_file_has_no_skips_and_passes(tmp_path: Path):
+    # The skip machinery must not regress the clean path: a small, clean file
+    # is still passed with an empty skipped_paths list.
+    (tmp_path / "ok.py").write_text("value = 1\n", encoding="utf-8")
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["ok.py"])
+    assert report["passed"] is True
+    assert report["skipped_paths"] == []
+
+
+def test_non_python_string_continuation_preserves_line_numbers(tmp_path: Path):
+    # Rework defect 1. Before: a backslash-newline continuation inside a C
+    # string literal consumed the newline too, so ``_generic_code_lines``
+    # returned one fewer line than the source and every later finding drifted
+    # onto the wrong line. After: the continuation newline is preserved, the
+    # masked line count matches ``splitlines()`` and gets() lands on line 3.
+    text = (
+        'const char *msg = "part one \\\n'
+        'part two";\n'
+        "int f(char *buf){ return gets(buf); }\n"
+    )
+    masked = known_bug_scanner._masked_code_lines(text, ".c")
+    assert len(masked) == len(text.splitlines())
+    (tmp_path / "cont.c").write_text(text, encoding="utf-8")
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["cont.c"])
+    finding = next(
+        row for row in report["findings"] if row["rule_id"] == "cpp.dangerous_gets"
+    )
+    assert finding["line"] == 3
+    # The masked string content is not itself a finding.
+    assert "cpp.process_shell" not in {row["rule_id"] for row in report["findings"]}
+
+
 def test_source_revision_changes_with_exact_scanned_bytes(tmp_path: Path):
     path = tmp_path / "runner.py"
     path.write_text("subprocess.run(value, shell=True)\n", encoding="utf-8")
