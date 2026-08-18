@@ -33,6 +33,7 @@ from aiworkhub import (
     repository_bootstrap,
     shared_router,
     source_graph,
+    sqlite_readonly,
     storage_observability,
     storage_registry,
     storage_retention,
@@ -492,7 +493,10 @@ def memory_view(limit: int = 100) -> dict[str, Any]:
         root = core.repo_root()
         registry = storage_registry.load_storage_registry(root)
         db_path = storage_registry.resolve_database_path(registry, "memory")
-        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        # NF-2026-00261: route read-only opens through the canonical helper so
+        # the URI is percent-encoded (a '#' in the repo path stays '%23' instead
+        # of truncating the '?mode=ro' query) and query_only is enforced.
+        connection = sqlite_readonly.connect_readonly(db_path)
         connection.row_factory = sqlite3.Row
         try:
             columns = {
@@ -570,7 +574,10 @@ def session_view(limit: int = 100) -> dict[str, Any]:
         root = core.repo_root()
         registry = storage_registry.load_storage_registry(root)
         db_path = storage_registry.resolve_database_path(registry, "transcript")
-        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        # NF-2026-00261: route read-only opens through the canonical helper so
+        # the URI is percent-encoded (a '#' in the repo path stays '%23' instead
+        # of truncating the '?mode=ro' query) and query_only is enforced.
+        connection = sqlite_readonly.connect_readonly(db_path)
         connection.row_factory = sqlite3.Row
         try:
             total = int(connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
@@ -618,7 +625,10 @@ def kb_view(limit: int = 100) -> dict[str, Any]:
         root = core.repo_root()
         registry = storage_registry.load_storage_registry(root)
         db_path = storage_registry.resolve_database_path(registry, "kb")
-        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        # NF-2026-00261: route read-only opens through the canonical helper so
+        # the URI is percent-encoded (a '#' in the repo path stays '%23' instead
+        # of truncating the '?mode=ro' query) and query_only is enforced.
+        connection = sqlite_readonly.connect_readonly(db_path)
         connection.row_factory = sqlite3.Row
         try:
             total = int(connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0])

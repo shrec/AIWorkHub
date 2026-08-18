@@ -1034,6 +1034,30 @@ from .runner_topic_policy import (
     check_runner_topic_allowlist,
 )
 
+# NF-2026-00244: a coordinator/manager action must be attributed to the
+# verified manager route, never to a hardcoded ``codex`` runner name. Every
+# archive/reject/supersede/recover/done/release/retry receipt historically
+# stamped ``--runner codex`` and ``actor=codex`` even when the live, verified
+# manager route was Claude, so the audit trail said codex did work a Claude
+# manager actually did.
+CLAUDE_MANAGER_RUNNER = "claude"
+
+
+def _verified_manager_actor() -> str:
+    """Resolve the audit actor for a coordinator action from the manager route.
+
+    A verified live Claude manager route attributes to ``claude``; a verified
+    Codex manager route -- or the repo-owner coordinator-token seat, which is
+    the Codex coordinator by construction -- attributes to ``codex``. Callers
+    reach this only after ``_verify_coordinator_capability`` has already granted
+    the action, so the result is always an attributable, verified route: an
+    action with no verifiable capability fails earlier in the write gate rather
+    than defaulting to a name here.
+    """
+    if _claude_manager_identity() is not None:
+        return CLAUDE_MANAGER_RUNNER
+    return CODEX_RUNNER
+
 
 @dataclass(frozen=True)
 class TaskCtlResult:
@@ -1483,6 +1507,35 @@ def run_taskctl(
             return _as_result(collision_guard(print_json="--print" in args or "--json" in args))
         if cmd == "callback-outbox-status":
             return _as_result(callback_outbox_status())
+        # NF-2026-00280: the half-archived reconciliation report and the
+        # transactional repair were operator surfaces added by NF-2026-00276 but
+        # never wired to any reachable path, so their coverage did not exist.
+        # Route them through the taskctl-compat dispatcher (the report is a pure
+        # read; the repair mutates and so runs behind the write gate).
+        if cmd == "archive-reconciliation-report":
+            return _as_result(archive_reconciliation_report(print_json=True))
+        if cmd == "repair-archive-inconsistencies":
+            # NF-2026-00280 wired this repair to the dispatcher; the NF-2026-00244
+            # rework closes the door it left open. A repair mutates archive and
+            # task-store state, so -- exactly like its mutating siblings (done,
+            # reject-review, release-launch, archive, restore) -- it must clear
+            # _verify_coordinator_capability, not merely the AIWORKHUB_ALLOW_WRITES
+            # safety catch. The capability is required unconditionally
+            # (coordinator_capability=True, not the caller-supplied flag the
+            # sibling *dispatch* rows thread through): there is no legitimate
+            # non-coordinator caller, so the environment switch alone can never
+            # authorize the write.
+            blocked = _canonical_write_gate(
+                "repair-archive-inconsistencies",
+                runner=_value("--runner", runner),
+                topic=_value("--topic", topic),
+                coordinator_capability=True,
+            )
+            if blocked is not None:
+                return _as_result({**blocked, "command": command})
+            return _as_result(repair_archive_inconsistencies(
+                actor=_value("--actor", runner) or "operator", print_json=True
+            ))
         if cmd == "usage-report":
             return _as_result(usage_report(runner=_value("--runner", runner), topic=_value("--topic", topic), status=_value("--status")))
         if cmd == "usage":
@@ -2643,6 +2696,69 @@ def task_card_path_conflicts(card: dict[str, Any]) -> list[dict[str, str]]:
     return conflicts
 
 
+_OBJECTIVE_PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9_]+")
+# A ``scheme://host/a/b.py`` link in objective prose is never an in-repo path,
+# yet its host+path tail (``host/a/b.py``) matches the path-token regex above and
+# would surface as a bogus missing-scope warning. Strip whole URLs before token
+# extraction so a referenced link can never masquerade as a repository path.
+_OBJECTIVE_URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.\-]*://\S+")
+
+
+def card_scope_warnings(card: dict[str, Any]) -> list[str]:
+    """Evidence-referenced paths that no ``allowed_writes`` entry covers.
+
+    NF-2026-00258: a card whose ``allowed_writes`` omits the very file its own
+    evidence (``scope_files`` and the repo-relative paths named in the
+    ``objective``) says holds the bug is unwinnable, yet nothing warned at
+    creation -- the manager only discovered it when the worker reported it could
+    not write the file. Cross-check the declared scope against that evidence and
+    return, by name, the referenced paths that are absent from ``allowed_writes``.
+
+    This is advisory only. It is a WARNING the manager may override (a card may
+    legitimately reference a read-only path), never a refusal.
+    """
+    writes = [
+        path
+        for path in (_task_contract_path(v) for v in card.get("allowed_writes") or [])
+        if path
+    ]
+    # Paths the card explicitly declares as read-only evidence are meant to sit
+    # outside allowed_writes, so they are never a missing-scope warning.
+    read_only_evidence: set[str] = set()
+    for field in ("read_first", "immutable_inputs", "forbidden"):
+        for value in card.get(field) or []:
+            declared = _task_contract_path(value)
+            if declared:
+                read_only_evidence.add(declared)
+    referenced: list[str] = []
+    for value in card.get("scope_files") or []:
+        declared = _task_contract_path(value)
+        if declared:
+            referenced.append(declared)
+    objective = str(card.get("objective") or "").replace("\\", "/")
+    objective = _OBJECTIVE_URL_RE.sub(" ", objective)
+    for token in _OBJECTIVE_PATH_TOKEN_RE.findall(objective):
+        if "/" not in token:
+            # Bare basenames in prose are too ambiguous to treat as a declared
+            # scope path; only warn on genuine repo-relative references.
+            continue
+        declared = _task_contract_path(token)
+        if declared:
+            referenced.append(declared)
+    warnings: list[str] = []
+    seen: set[str] = set()
+    for declared in referenced:
+        if declared in seen:
+            continue
+        seen.add(declared)
+        if declared in read_only_evidence:
+            continue
+        if any(_task_contract_paths_overlap(declared, allowed) for allowed in writes):
+            continue
+        warnings.append(declared)
+    return sorted(warnings)
+
+
 _CONTEXT_QUERY_STOPWORDS = frozenset({
     "aiworkhub", "task", "worker", "review", "audit", "repair", "implement",
     "validate", "validation", "code", "source", "graph", "model", "manager",
@@ -2994,6 +3110,14 @@ def create_task(
         path = Path(item)
         if path.is_absolute() or ".." in path.parts:
             return _lifecycle_error("invalid_allowed_write_path", 2)
+        # NF-2026-00266: a directory in allowed_writes passes creation but cannot
+        # be promoted -- promotion materializes exact declared files, so a
+        # directory scope silently discards the worker's work at the end. Reject
+        # it at creation with the reason instead of carrying it to promotion.
+        if item.endswith("/") or (repo_root() / path).is_dir():
+            result = _lifecycle_error("allowed_write_is_directory", 2)
+            result["allowed_write"] = item[:240]
+            return result
     conflicts = task_card_path_conflicts({
         "objective": objective,
         "validation": validation2,
@@ -3344,6 +3468,9 @@ def create_task(
         "created": True,
         "reconciled": False,
         "receipt_state": "created",
+        # NF-2026-00258: advisory-only; a non-empty list names evidence paths the
+        # declared allowed_writes does not cover. Never blocks creation.
+        "scope_warnings": card_scope_warnings(card),
     })
     return result
 
@@ -3434,6 +3561,7 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
         return _lifecycle_error(
             f"coordinator runner mismatch expected={CODEX_RUNNER} got={runner}"
         )
+    actor = _verified_manager_actor()
     card, error = _live_card(task_id)
     if error:
         return error
@@ -3450,7 +3578,7 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
         # afterwards.  Finished is an idempotent success, not another attempt
         # to bypass promotion, and must be recognized before the retained
         # terminal-review receipt triggers the candidate gate below.
-        command = ["done", task_id, "--runner", CODEX_RUNNER, "--topic", str(live_topic)]
+        command = ["done", task_id, "--runner", actor, "--topic", str(live_topic)]
         result = _canonical_result(
             ok=True,
             returncode=0,
@@ -3488,7 +3616,7 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
         if isinstance(verification, dict) and verification.get("applicable"):
             if not verification.get("pass"):
                 return _lifecycle_error("done_deterministic_verification_failed")
-    command = ["done", task_id, "--runner", CODEX_RUNNER, "--topic", str(live_topic)]
+    command = ["done", task_id, "--runner", actor, "--topic", str(live_topic)]
     blocked = _canonical_write_gate(
         "done", runner=CODEX_RUNNER, topic=str(live_topic), coordinator_capability=True
     )
@@ -3512,7 +3640,7 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
             )
         conn.execute(
             "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
-            (task_id, "done", CODEX_RUNNER, json.dumps({"topic": live_topic}, ensure_ascii=False), now),
+            (task_id, "done", actor, json.dumps({"topic": live_topic}, ensure_ascii=False), now),
         )
         conn.commit()
     finally:
@@ -3749,8 +3877,9 @@ def reject_review(
         "sha256": hashlib.sha256(reason_bytes).hexdigest(),
         "truncated": reason_truncated,
     }
+    actor = _verified_manager_actor()
     command = [
-        "reject-review", task_id, "--runner", CODEX_RUNNER, "--topic", str(live_topic),
+        "reject-review", task_id, "--runner", actor, "--topic", str(live_topic),
         "--reason", bounded_reason, "--to", disposition,
     ]
     blocked = _canonical_write_gate(
@@ -3769,7 +3898,7 @@ def reject_review(
             )
         ok, state = task_store.archive_task(
             repo_root(), task_id,
-            actor=CODEX_RUNNER, reason=f"reject_review:{reason}"[:200],
+            actor=actor, reason=f"reject_review:{reason}"[:200],
             allow_processing=(disposition == "superseded"),
             operation=disposition,
         )
@@ -3888,7 +4017,7 @@ def reject_review(
             (
                 task_id,
                 "reject_review",
-                CODEX_RUNNER,
+                actor,
                 json.dumps(
                     {
                         "topic": live_topic,
@@ -3935,11 +4064,12 @@ def recover_blocked_rework(
     bounded_feedback, _truncated = _bounded_utf8_prefix(
         str(feedback_reason or "").strip(), _MAX_REWORK_FEEDBACK_BYTES
     )
+    actor = _verified_manager_actor()
     command = [
         "recover-blocked-rework",
         task_id,
         "--runner",
-        CODEX_RUNNER,
+        actor,
         "--topic",
         str(live_topic),
     ]
@@ -3956,7 +4086,7 @@ def recover_blocked_rework(
         ok, state = task_store.recover_blocked_rework(
             repo_root(),
             task_id,
-            actor=CODEX_RUNNER,
+            actor=actor,
             feedback_reason=bounded_feedback,
             validation_only_replay=bool(validation_only_replay),
             clean_root_if_predecessor_missing=bool(
@@ -4082,6 +4212,7 @@ def retry_terminal_task(
         "--terminal-substatus",
         terminal_substatus,
     ]
+    actor = _verified_manager_actor()
     gate = _canonical_write_gate(
         "retry-terminal",
         runner=CODEX_RUNNER,
@@ -4167,7 +4298,7 @@ def retry_terminal_task(
             (
                 task_id,
                 "retry_terminal",
-                CODEX_RUNNER,
+                actor,
                 json.dumps(
                     {
                         "topic": live_topic,
@@ -4210,14 +4341,15 @@ def archive_task(task_id: str, reason: str = "", topic: str | None = None) -> di
     live_topic = str(card.get("topic") or "")
     if topic is not None and topic != live_topic:
         return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
-    command = ["archive", task_id, "--runner", CODEX_RUNNER, "--reason", reason]
+    actor = _verified_manager_actor()
+    command = ["archive", task_id, "--runner", actor, "--reason", reason]
     gate = _canonical_write_gate(
         "archive", runner=CODEX_RUNNER, topic=live_topic, coordinator_capability=True
     )
     if gate is not None:
         return gate
     ok, state = task_store.archive_task(
-        repo_root(), task_id, actor=CODEX_RUNNER, reason=str(reason)[:200], operation="archived"
+        repo_root(), task_id, actor=actor, reason=str(reason)[:200], operation="archived"
     )
     if not ok:
         return _canonical_result(ok=False, returncode=1, stderr=f"archive_failed:{state}", command=command)
@@ -4245,7 +4377,8 @@ def supersede_task(
     if topic is not None and topic != live_topic:
         return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
     by = str(by or "").strip()
-    command = ["supersede", task_id, "--runner", CODEX_RUNNER, "--reason", reason]
+    actor = _verified_manager_actor()
+    command = ["supersede", task_id, "--runner", actor, "--reason", reason]
     if by:
         command += ["--by", by]
         try:
@@ -4289,7 +4422,7 @@ def supersede_task(
         return gate
     full_reason = (f"superseded_by:{by}; {reason}" if by else str(reason))[:200]
     ok, state = task_store.archive_task(
-        repo_root(), task_id, actor=CODEX_RUNNER, reason=full_reason,
+        repo_root(), task_id, actor=actor, reason=full_reason,
         allow_processing=True, operation="superseded", superseded_by=by,
     )
     if not ok:
@@ -4316,8 +4449,9 @@ def release_launch(
         return _lifecycle_error("task has no exact topic identity")
     if topic is not None and topic != live_topic:
         return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+    actor = _verified_manager_actor()
     command = [
-        "release-launch", task_id, "--runner", CODEX_RUNNER, "--topic", str(live_topic),
+        "release-launch", task_id, "--runner", actor, "--topic", str(live_topic),
         "--claimed-by", claimed_by, "--reason", reason,
     ]
     blocked = _canonical_write_gate(
@@ -4358,7 +4492,7 @@ def release_launch(
             (
                 task_id,
                 "terminal_review",
-                CODEX_RUNNER,
+                actor,
                 json.dumps(
                     {
                         "topic": live_topic,
