@@ -40,8 +40,18 @@ def test_review_evidence_audit_recomputes_hash_and_size(tmp_path: Path) -> None:
         }],
     )
     assert manifest_token["status"] == "pass"
+    # A sandboxed filesystem refuses the setuid bit outright (landlock returns
+    # EPERM) and a nosuid mount drops it silently, so a card whose validation
+    # ran this file failed on green code.  Assert the round-trip only when the
+    # bit is actually on disk, and keep the coverage everywhere it can run.
+    setuid_applied = False
     if os.name != "nt":
-        path.chmod(0o4755)
+        try:
+            path.chmod(0o4755)
+        except OSError:
+            pass
+        setuid_applied = stat.S_IMODE(path.stat().st_mode) == 0o4755
+    if setuid_applied:
         executable_token = evidence.review_evidence_audit(
             tmp_path,
             candidate,
