@@ -283,6 +283,14 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
         conn = connect_readonly(db_path, timeout=30.0)
         conn.execute("PRAGMA query_only=ON")
+        # A partition database carries a composed-view marker naming its base
+        # index; a read-only open of it attaches that base (read-only) and
+        # installs precedence views so the reviewer queries a candidate-accurate
+        # composed index without any full-index clone. An ordinary Source Graph
+        # database has no marker and is left exactly as connect_readonly opened
+        # it. A missing/shifted base fails closed rather than serving a partial.
+        from . import source_graph_partition as _sgp
+        _sgp.attach_composed_base_if_marked(conn, db_path)
     else:
         conn = sqlite3.connect(str(db_path), timeout=30.0)
         conn.execute("PRAGMA busy_timeout=30000")
@@ -2124,6 +2132,13 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
     if not term:
         return []
     limit = max(1, min(int(limit), MAX_BUDGET_ROWS))
+    # A composed view unions two independent entity-id spaces, so the FTS
+    # id-join below cannot run against its ``entities`` view. When a base index
+    # is attached, delegate to the composed finder, which runs the same FTS
+    # expressions per schema with partition-wins precedence.
+    from . import source_graph_partition as _sgp
+    if _sgp.is_composed(conn):
+        return _sgp.composed_find(conn, term, limit=limit)
     rows = []
     expressions = [_fts_phrase(term)]
     if len(_query_tokens(term)) > 1:

@@ -837,22 +837,26 @@ def prewarm_quality_review_source_graph(
     This is the only path that ever prepares a reviewer candidate Source
     Graph index, and it never calls ``build_index``: the launcher calls it
     after the review packet is materialized and before the reviewer provider
-    is launched.  The overlay is a clone of the already-verified canonical
-    generation (via SQLite's native backup API), reconciled only for this
-    packet's ``changed_paths`` through the exact-file ``index_file``/
-    ``remove_file`` primitives -- never a full rebuild.  This function always
+    is launched.  The candidate is NO LONGER a clone of the canonical
+    database.  Instead :func:`source_graph_partition.build_partition` indexes
+    this packet's ``changed_paths`` ALONE into a fresh partition and records the
+    canonical base (opened read-only) so a later reviewer query composes the two
+    without ever copying the base -- preparation cost now scales with the changed
+    set, not repository size.  Reconciliation still runs through the same
+    exact-file ``index_file``/``remove_file`` primitives.  This function always
     re-derives the canonical binding from ``authority_repo`` itself via
     :func:`verify_quality_review_prewarm_authority`, so a forged or stale
     binding can never be smuggled in by a caller.  Runtime reviewer Source
     Graph calls remain query-only and never invoke ``build_index`` either.
-    ``build_index`` is bound context-locally through
+    The partition build is bound context-locally through
     ``source_graph.database_path_override`` (a ``ContextVar``), so distinct
     candidate DBs build concurrently without any process-global lock.  Only
     callers for the same packet-bound ``db_path`` single-flight, so the
-    overlay is verified and published exactly once.
+    candidate is verified and published exactly once.
     """
 
     from . import source_graph as _source_graph_mod
+    from . import source_graph_partition as _source_graph_partition
 
     canonical = verify_quality_review_prewarm_authority(authority_repo)
 
@@ -894,42 +898,24 @@ def prewarm_quality_review_source_graph(
     try:
         temporary = db_path.parent / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
         try:
-            source_conn = _source_graph_mod.connect(canonical.db_path, read_only=True)
-            destination_conn = sqlite3.connect(temporary)
+            # The full-index clone is gone. Instead of cloning the canonical
+            # database and reconciling changed files back onto it -- cost
+            # proportional to repository size -- build a PARTITION over this
+            # packet's changed paths alone, and record the base (opened
+            # read-only) so a later reviewer query composes the two without any
+            # copy. Cost now scales with the changed set, not the base index.
+            # ``build_partition`` reconciles each indexable path through the same
+            # exact-file ``index_file``/``remove_file`` primitives as before, so
+            # a Source Graph contract failure still surfaces as a
+            # ``SourceGraphError`` normalized by the handler below; a path-safety
+            # violation keeps its existing WorkerToolError identity.
             try:
-                source_conn.backup(destination_conn)
-                destination_conn.commit()
-            finally:
-                destination_conn.close()
-                source_conn.close()
-            with _with_source_graph_db(_source_graph_mod, temporary):
-                for changed in changed_paths:
-                    relative = str(changed.get("path") or "")
-                    expected_hash = str(changed.get("sha256") or "")
-                    candidate = (repo / relative).resolve(strict=False)
-                    if not candidate.is_relative_to(repo.resolve()):
-                        raise WorkerToolError(
-                            f"quality_review_candidate_path_escapes_workspace:{relative}"
-                        )
-                    if candidate.is_symlink():
-                        raise WorkerToolError(
-                            f"quality_review_candidate_path_symlink:{relative}"
-                        )
-                    if candidate.is_file():
-                        if not _is_indexable_changed_path(relative):
-                            # Source Graph has no representation for this
-                            # extension (for example ``.txt``/``.csv``): it can
-                            # never be indexed or hash-verified, so it must not
-                            # abort an otherwise valid prewarm.  Indexable
-                            # paths below this line remain exact hash-bound.
-                            continue
-                        _source_graph_mod.index_file(repo, relative, expected_hash)
-                    elif candidate.exists():
-                        raise WorkerToolError(
-                            f"quality_review_candidate_path_not_file:{relative}"
-                        )
-                    else:
-                        _source_graph_mod.remove_file(repo, relative)
+                _source_graph_partition.build_partition(
+                    repo, changed_paths, temporary,
+                    base_db_path=canonical.db_path,
+                )
+            except _source_graph_partition.PartitionError as exc:
+                raise WorkerToolError(str(exc)) from exc
             _write_candidate_db_marker(
                 temporary, packet_sha256, target_request_id, target_task_id,
             )
@@ -963,7 +949,7 @@ def prewarm_quality_review_source_graph(
         raise
     except (_source_graph_mod.SourceGraphError, sqlite3.Error, OSError) as exc:
         # These are prewarm-owned Source Graph/candidate-DB contract and data
-        # failures (clone/backup I/O, extraction, hash/schema mismatch) --
+        # failures (partition build I/O, extraction, hash/schema mismatch) --
         # never a provider process launch anomaly.  Wrapping them in
         # WorkerToolError lets the launcher's existing WorkerToolError catch
         # classify them truthfully as
