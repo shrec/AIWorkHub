@@ -77,6 +77,28 @@ def _git(cwd: Path, *args: str) -> tuple[int, str]:
     return result.returncode, result.stdout.strip()
 
 
+def _git_stdin(cwd: Path, stdin_text: str, *args: str) -> tuple[int, str]:
+    """Run a git command in ``cwd`` feeding ``stdin_text`` on standard input.
+
+    The sibling of :func:`_git` for the one batched query that must pass an
+    unbounded ref list (``git rev-list --stdin``) without ever hitting a
+    command-line length limit -- so a repository with hundreds of worktrees still
+    costs ONE spawn, not one per chunk. Never raises: a missing binary or timeout
+    resolves to a non-zero return code the caller treats as fail-closed.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            input=stdin_text,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+    return result.returncode, result.stdout.strip()
+
+
 def directory_size_bytes(path: Path, *, exclude=None) -> int:
     """Apparent size of ``path`` in bytes (symlinks never followed).
 
@@ -295,6 +317,149 @@ def _classify(git_state: dict[str, Any]) -> str:
     return CLASS_REMOVABLE_SAFE
 
 
+def _classify_deferred(git_state: dict[str, Any]) -> str:
+    """Classify a worktree whose ``dirty`` state was DEFERRED in preview.
+
+    Orphaned is still provable from ``git_ok`` alone (the ``.git`` pointer is
+    missing or its parent no longer resolves it). But a git-ok worktree cannot be
+    proven ``removable_safe`` -- that requires proving it CLEAN, and the clean
+    check is the one per-worktree spawn the preview deliberately does not pay
+    (see :func:`_batch_repo_worktree_states`). Rather than risk presenting an
+    unproven-clean worktree as removable, it is conservatively ``retained_unsaved``
+    here; the reclaim planner selects candidates from the canonical task lineage
+    and the quarantine action re-verifies the exact per-worktree git state before
+    it moves anything.
+    """
+    if not git_state["git_ok"]:
+        return CLASS_ORPHANED
+    return CLASS_RETAINED_UNSAVED
+
+
+def _norm_path(path: str | Path) -> str:
+    """A canonical key for comparing a filesystem path to git's own output.
+
+    ``git worktree list`` prints each checkout's absolute path; the scan holds
+    the same checkout as ``<base>/<id>/worktree``. Both are reduced to a
+    real-path + ``normcase`` key so the two always match regardless of a symlink
+    on the temp/base path or case folding on Windows -- attribution by exact
+    identity, never by name.
+    """
+    try:
+        resolved = os.path.realpath(str(path))
+    except OSError:
+        resolved = os.path.abspath(str(path))
+    return os.path.normcase(resolved)
+
+
+def _repo_registered_worktrees(repo_root: Path) -> dict[str, str]:
+    """Map every checkout THIS repository has registered to its HEAD, from ONE
+    ``git worktree list --porcelain -z`` spawn.
+
+    Keyed by :func:`_norm_path` of the checkout so membership answers, in a
+    single query for all worktrees at once, both "does this repository own the
+    worktree" (the attribution the per-worktree ``git-common-dir`` spawn used to
+    answer) and "what is its HEAD" (the per-worktree ``rev-parse HEAD`` spawn).
+    """
+    rc, raw = _git(repo_root, "worktree", "list", "--porcelain", "-z")
+    if rc != 0 or not raw:
+        return {}
+    mapping: dict[str, str] = {}
+    for record in _parse_worktree_porcelain(raw):
+        raw_path = record.get("worktree", "")
+        if not raw_path:
+            continue
+        mapping[_norm_path(raw_path)] = str(record.get("HEAD") or "").strip()
+    return mapping
+
+
+def _unpushed_heads(repo_root: Path, heads: set[str]) -> set[str]:
+    """The subset of ``heads`` not reachable from any remote-tracking ref, from
+    ONE ``git rev-list --stdin --not --remotes`` spawn.
+
+    ``--stdin`` is consumed at its position on the command line -- BEFORE the
+    ``--not`` that follows it -- so the piped HEADs are the positive set and
+    ``--not --remotes`` excludes everything reachable from a remote (the standard
+    ``rev-list --stdin --not --all`` idiom). A given HEAD therefore appears in the
+    output exactly when it is not on any remote, i.e. unpushed. Any failure fails
+    closed -- every head is treated as unpushed -- so an unproven commit is never
+    presented as already saved.
+    """
+    real_heads = {head for head in heads if head}
+    if not real_heads:
+        return set()
+    stdin_text = "\n".join(sorted(real_heads)) + "\n"
+    rc, out = _git_stdin(repo_root, stdin_text, "rev-list", "--stdin", "--not", "--remotes")
+    if rc != 0:
+        return set(real_heads)
+    reachable = {line.strip() for line in out.splitlines() if line.strip()}
+    return {head for head in real_heads if head in reachable}
+
+
+def _batch_repo_worktree_states(
+    repo_root: Path, repo_common_dir: str, entries: list[Path]
+) -> dict[str, dict[str, Any]]:
+    """Resolve every retained worktree's git safety state with a spawn count that
+    does NOT grow with the number of worktrees.
+
+    :func:`_worktree_git_state` pays FIVE git subprocesses per worktree
+    (``rev-parse HEAD``, ``config --get remote.origin.url``, ``status
+    --porcelain``, ``rev-list --count HEAD --not --remotes`` and the
+    ``git-common-dir`` ``rev-parse``). On Windows -- no ``fork``, so every
+    ``CreateProcess`` is far dearer than a Linux ``fork``+``exec`` and every git
+    binary open is scanned by real-time AV -- that per-worktree spawn cost is
+    what drives the retention preview past its deadline on a repository with
+    hundreds of worktrees. The 0.9.79 change collapsed three full worktree walks
+    into one but never touched this residual per-worktree cost.
+
+    This replaces the per-worktree spawns with a FIXED set of repository-level
+    queries and answers all worktrees from them:
+
+    * one ``git worktree list --porcelain -z`` -> each registered checkout's HEAD
+      and its attribution to this repository;
+    * one ``git config --get remote.origin.url`` -> the origin shared by every
+      worktree of this repository;
+    * one ``git rev-list --stdin --not --remotes`` -> the unpushed HEAD set.
+
+    The single field that genuinely cannot be answered without entering each
+    worktree -- ``dirty`` (an uncommitted change is local to that checkout's
+    working tree, with no repository-level batch equivalent) -- is DEFERRED and
+    marked ``dirty_deferred`` rather than paid as a per-worktree ``git status``
+    spawn. The complete counts, footprint and protected/candidate sets the
+    preview reports do not depend on ``dirty``: candidates are established from
+    the canonical task lineage, and the quarantine action re-verifies the exact
+    per-worktree git state at the point of actual removal.
+    """
+    registered = _repo_registered_worktrees(repo_root)
+    _rc, repo_origin = _git(repo_root, "config", "--get", "remote.origin.url")
+    owned_head: dict[str, str] = {}
+    heads: set[str] = set()
+    for entry in entries:
+        checkout = entry / "worktree"
+        head = registered.get(_norm_path(checkout), "")
+        if head and checkout.is_dir():
+            owned_head[entry.name] = head
+            heads.add(head)
+        else:
+            owned_head[entry.name] = ""
+    unpushed = _unpushed_heads(repo_root, heads)
+    states: dict[str, dict[str, Any]] = {}
+    for name, head in owned_head.items():
+        git_ok = bool(head)
+        states[name] = {
+            "git_ok": git_ok,
+            "origin": repo_origin if git_ok else "",
+            "head": head,
+            # Deferred: measuring an uncommitted working-tree change would cost a
+            # per-worktree ``git status`` spawn. Left False but flagged so no
+            # consumer reads it as a proven-clean signal.
+            "dirty": False,
+            "dirty_deferred": True,
+            "unpushed": bool(git_ok and head in unpushed),
+            "parent_git_dir": repo_common_dir if git_ok else "",
+        }
+    return states
+
+
 def scan_worktrees(
     base: Path | None = None,
     *,
@@ -313,9 +478,18 @@ def scan_worktrees(
     the foreign/orphaned entries once and returns their aggregate as
     ``global_summary`` -- so the footprint measurement obtains both the
     repo-scoped and the global figures from ONE pass instead of two full walks
-    that each re-ran per-worktree git state over every entry. Eliminating that
-    duplicated walk (and its ~5 git subprocesses per worktree) is a primary
-    reason the measurement can now finish inside its deadline.
+    that each re-ran per-worktree git state over every entry.
+
+    When ``repo_root`` is given the per-worktree git state is ALSO resolved in a
+    fixed, repository-level batch (:func:`_batch_repo_worktree_states`) rather
+    than by ~5 git subprocesses per worktree: the git subprocess spawn count of
+    this scan no longer grows with the number of worktrees. That residual
+    per-worktree spawn cost -- cheap on Linux, an order of magnitude dearer on
+    Windows where every ``CreateProcess`` is AV-scanned and there is no ``fork``
+    -- is the reason the preview overran its deadline on a Windows repository with
+    hundreds of worktrees. The ``dirty`` field is deferred by that batch (see
+    :func:`_classify_deferred`); the ``repo_root=None`` path keeps the exact,
+    per-worktree ``git status`` classification the CLI cleanup relies on.
 
     ``progress`` is an optional sink notified as each worktree is fully measured
     (``begin`` with the id list, then ``observe`` per worktree). It lets a
@@ -337,14 +511,28 @@ def scan_worktrees(
                 progress.begin([entry.name for entry in entries])
             except Exception:  # noqa: BLE001 -- progress is best-effort telemetry
                 pass
+        # Repository-scoped scans resolve git state in a fixed repository-level
+        # batch whose spawn count does not grow with the number of worktrees; the
+        # global (``repo_root=None``) path keeps the exact per-worktree
+        # classification the CLI cleanup deletes on.
+        batched_states = (
+            _batch_repo_worktree_states(Path(repo_root).resolve(), repo_common_dir, entries)
+            if repo_root is not None
+            else None
+        )
         for entry in entries:
             worktree_dir = entry / "worktree"
-            git_state = (
-                _worktree_git_state(worktree_dir)
-                if worktree_dir.is_dir()
-                else {"git_ok": False, "origin": "", "head": "", "dirty": False,
-                      "unpushed": False, "parent_git_dir": ""}
-            )
+            if batched_states is not None:
+                git_state = batched_states[entry.name]
+                worktree_class = _classify_deferred(git_state)
+            else:
+                git_state = (
+                    _worktree_git_state(worktree_dir)
+                    if worktree_dir.is_dir()
+                    else {"git_ok": False, "origin": "", "head": "", "dirty": False,
+                          "unpushed": False, "parent_git_dir": ""}
+                )
+                worktree_class = _classify(git_state)
             try:
                 modified_at = entry.stat().st_mtime
             except OSError:
@@ -358,11 +546,15 @@ def scan_worktrees(
                 "head": git_state["head"],
                 "git_ok": git_state["git_ok"],
                 "dirty": git_state["dirty"],
+                # True only on the repository-scoped preview path, where the
+                # per-worktree ``git status`` spawn is deferred: ``dirty`` is then
+                # unmeasured, so it must never be read as a proven-clean signal.
+                "dirty_deferred": bool(git_state.get("dirty_deferred", False)),
                 "unpushed": git_state["unpushed"],
                 "parent_git_dir": git_state["parent_git_dir"],
                 "modified_at_epoch": modified_at,
                 "age_seconds": max(0.0, time.time() - modified_at),
-                "class": _classify(git_state),
+                "class": worktree_class,
             }
             all_worktrees.append(worktree)
             in_repo = repo_root is None or (
