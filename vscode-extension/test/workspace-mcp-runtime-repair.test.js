@@ -107,7 +107,7 @@ const {
   assert.strictEqual(result.changed, true);
   assert.strictEqual(result.document.servers.Perplexity, untouched);
   assert.deepStrictEqual(result.document.servers.AIWorkHub.args, ["-m", "aiworkhub.server"]);
-  assert.strictEqual(result.document.servers.AIWorkHub.command, "${workspaceFolder}/.venv/bin/python");
+  assert.strictEqual(result.document.servers.AIWorkHub.command, "python");
   assert.strictEqual(result.document.servers.AIWorkHub.env.PYTHONPATH, "/extensions/shrec.aiworkhub-0.6.49/runtime");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_REPO, "/repo/current");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_REPO_ROOT, "/repo/current");
@@ -117,14 +117,21 @@ const {
 }
 
 {
+  // Repo-local venv interpreter paths flatten to the bare interpreter name:
+  // VS Code's remote MCP spawn has been observed failing with ENOENT on
+  // repo-local absolute interpreter paths even when the binary exists, while
+  // bare names resolve via PATH reliably. External/configured interpreters
+  // and literals like ${workspaceFolder}-style placeholders never appear here.
   assert.strictEqual(
     portableWorkspaceMcpCommand("/repo/current/.venv/bin/python3", "/repo/current"),
-    "${workspaceFolder}/.venv/bin/python3",
+    "python3",
   );
   assert.strictEqual(
     portableWorkspaceMcpCommand("/opt/shared/python3", "/repo/current"),
     "/opt/shared/python3",
   );
+  assert.strictEqual(portableWorkspaceMcpCommand("", "/repo/current"), "");
+  assert.strictEqual(portableWorkspaceMcpCommand("python3", "/repo/current"), "python3");
 }
 
 {
