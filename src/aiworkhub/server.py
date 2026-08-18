@@ -396,13 +396,28 @@ except ModuleNotFoundError:
                     })
                     continue
                 if "id" not in message:
-                    # Notifications have no response and are intentionally
-                    # cheap; preserve their input order before later calls.
+                    # A JSON-RPC message with no id is a notification: no
+                    # response, and side-effect free beyond lifecycle.  Anything
+                    # that requires a response -- tools/call above all -- is a
+                    # malformed request when it omits its id and must never reach
+                    # _stdio_dispatch: under the stdlib backend an id-less
+                    # tools/call for a launch tool would start a worker
+                    # synchronously inside the read loop and return nothing,
+                    # blocking every later request.  Dispatch only genuine
+                    # notifications; refuse everything else with an explicit
+                    # error so no launch runs.
+                    method = message.get("method")
+                    if not (isinstance(method, str) and method.startswith("notifications/")):
+                        write({
+                            "jsonrpc": "2.0", "id": None,
+                            "error": {"code": -32600, "message": "id_required"},
+                        })
+                        continue
                     try:
                         _stdio_dispatch(
                             name,
                             tools,
-                            message.get("method"),
+                            method,
                             message.get("params"),
                             instructions,
                             None,
@@ -410,7 +425,7 @@ except ModuleNotFoundError:
                     except Exception as exc:
                         _stdio_log(
                             "notification_failed",
-                            method=message.get("method"),
+                            method=method,
                             error_type=type(exc).__name__,
                         )
                     continue
@@ -460,6 +475,7 @@ from . import process_launcher
 from . import review_summarizer
 from . import stale_recovery
 from . import task_engine
+from . import task_plan
 from . import task_reconciler
 from . import terminal_log_retention
 from . import worker_ai_tools_mcp
@@ -1073,76 +1089,29 @@ def aiworkhub_task_create(
     )
 
 
-_PLAN_SUMMARY_FIELDS = (
-    "ready",
-    "ready_capacity",
-    "active_count",
-    "blocked_count",
-    "blocked_task_ids",
-    "dependency_blocked_count",
-    "dependency_blocked_task_ids",
-    "lifecycle_blocked_count",
-    "lifecycle_blocked_task_ids",
-    "operational_blockers",
-    "operational_blocked_task_ids",
-    "operational_blocked_count",
-    "explicit_retry_task_ids",
-    "explicit_retry_count",
-    "orphaned_processing",
-    "orphaned_processing_count",
-    "invalid_depends_on",
-    "write_scope_overlaps",
-    "critical_path",
-    "critical_path_length",
-    "edge_count",
-    "dag_valid",
-    "cycle_nodes",
-)
-
-
 def _compact_task_plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
-    """Keep current planning truth without replaying the historical DAG.
+    """Project a full Plan-DAG snapshot through the canonical summariser.
 
-    The full plan is useful for the visual DAG and exact dependency audits, but
-    managers normally need only ready work, live blockers, collisions and
-    malformed/orphaned state.  Finished cards remain counted while their
-    per-node lifecycle/dependency/dependent entries stay behind ``full=True``.
+    The projection is owned by ``task_plan.summarize_task_plan_snapshot`` so the
+    MCP surface can never drift from the pure-plan field list.  A private field
+    list here previously dropped every write-scope collision field
+    (``global_collision_*``/``card_collision_*``), so the default receipt could
+    report a card ready and collision-free while ``full=true`` reported it in a
+    global collision -- the exact failure this tool exists to prevent, since a
+    manager reads the default receipt before launching cards in parallel.
+
+    ``omitted_fields`` is derived from the difference between the full snapshot
+    and this projection, so it always names every field actually dropped instead
+    of a hand-maintained literal that silently under-declares.  In particular a
+    dropped ``dependency_resolution_errors`` (the archived-dependency-not-
+    superseded reason) can no longer hide behind an empty ``invalid_depends_on``.
     """
 
-    lifecycle = snapshot.get("lifecycle")
-    lifecycle_map = dict(lifecycle) if isinstance(lifecycle, Mapping) else {}
-    actionable_lifecycle = {
-        str(task_id): str(state)
-        for task_id, state in lifecycle_map.items()
-        if str(state).strip().lower() not in {"finished", "archived"}
-    }
-    task_ids = snapshot.get("task_ids")
-    task_count = len(task_ids) if isinstance(task_ids, list) else len(lifecycle_map)
-    terminal_task_count = max(0, task_count - len(actionable_lifecycle))
-    layers = snapshot.get("layers")
-
-    result: dict[str, Any] = {
-        "ok": bool(snapshot.get("ok", True)),
-        "schema_id": snapshot.get("schema_id", "aiworkhub.task_plan_snapshot.v1"),
-        "snapshot_mode": "summary",
-        "full_snapshot_available": True,
-        "task_count": task_count,
-        "actionable_task_count": len(actionable_lifecycle),
-        "terminal_task_count": terminal_task_count,
-        "actionable_lifecycle": actionable_lifecycle,
-        "layer_count": len(layers) if isinstance(layers, list) else 0,
-    }
-    for field in _PLAN_SUMMARY_FIELDS:
-        if field in snapshot:
-            result[field] = snapshot[field]
-    result["omitted_fields"] = [
-        "dependencies",
-        "dependents",
-        "layers",
-        "lifecycle",
-        "task_ids",
-    ]
-    return result
+    summary = task_plan.summarize_task_plan_snapshot(snapshot)
+    summary["omitted_fields"] = sorted(
+        key for key in snapshot if key not in summary
+    )
+    return summary
 
 
 @mcp.tool()
@@ -1825,14 +1794,22 @@ def aiworkhub_task_cost_ledger(
 
     aggregates = result.get("aggregates")
     aggregate_map = dict(aggregates) if isinstance(aggregates, Mapping) else {}
+    summary_dimensions = ("by_model", "by_provider", "by_day")
     result["aggregates"] = {
         key: aggregate_map.get(key, {})
-        for key in ("by_model", "by_provider", "by_day")
+        for key in summary_dimensions
     }
     result.update({
         "snapshot_mode": "summary",
         "full_snapshot_available": True,
-        "omitted_dimensions": ["by_topic", "by_runner"],
+        # Derive the omission receipt from the real aggregate map instead of a
+        # hand-maintained literal.  build_cost_ledger produces six dimensions
+        # (by_topic/by_runner/by_model/by_provider/by_role/by_day); the summary
+        # keeps three.  A hardcoded list named only by_topic/by_runner and so
+        # dropped by_role -- worker vs reviewer spend -- with no trace.
+        "omitted_dimensions": sorted(
+            key for key in aggregate_map if key not in summary_dimensions
+        ),
         "detail_request": {"full": True},
     })
     return result
