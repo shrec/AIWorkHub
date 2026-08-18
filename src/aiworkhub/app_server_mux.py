@@ -91,6 +91,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import hashlib
 import hmac
 import json
@@ -137,7 +138,16 @@ def _default_sideband_dir() -> Path:
     try:
         home = Path.home()
     except RuntimeError:
-        home = Path(tempfile.gettempdir())
+        # No resolvable home. Fall back under the temp dir, but scope the root
+        # by uid so a shared, world-writable /tmp cannot host one predictable
+        # path a different local user could pre-create (as a symlink to
+        # chmod-hijack, or as their own directory to deny this startup).
+        # ensure_private_dir still fails closed if what lands there is not our
+        # own non-symlink 0700 directory.
+        getuid = getattr(os, "getuid", None)
+        uid = getuid() if callable(getuid) else None
+        leaf = f"app_server_mux-{uid}" if uid is not None else "app_server_mux"
+        return Path(tempfile.gettempdir()) / ".aiworkhub" / leaf
     return home / ".aiworkhub" / "app_server_mux"
 
 
@@ -267,6 +277,23 @@ SIDEBAND_OWNER_LEASE_SECONDS = 90.0
 SIDEBAND_OWNER_HEARTBEAT_SECONDS = 15.0
 SIDEBAND_INSTANCE_ID_RE = re.compile(
     rf"^[0-9a-f]{{{SIDEBAND_INSTANCE_ID_BYTES * 2}}}$"
+)
+
+# accept(2) errors that must NOT tear down the sideband listener: a single
+# aborted/interrupted connection, or a transient resource shortage the loop
+# should ride out. Anything else (a broken/closed listener -- EBADF, EINVAL,
+# ENOTSOCK) means this instance can no longer serve and must stop advertising
+# ready (see ``AppServerMux._accept_loop_failed``).
+_RECOVERABLE_ACCEPT_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, name, None)
+        for name in (
+            "EINTR", "ECONNABORTED", "EMFILE", "ENFILE",
+            "ENOBUFS", "ENOMEM", "EPROTO", "EAGAIN", "EWOULDBLOCK",
+        )
+    )
+    if code is not None
 )
 
 
@@ -560,17 +587,43 @@ def default_sideband_dir() -> Path:
     return Path(override) if override else DEFAULT_SIDEBAND_DIR
 
 
+def _chmod_dir_nofollow(path: Path, mode: int) -> None:
+    """chmod a directory through an ``O_NOFOLLOW|O_DIRECTORY`` descriptor so a
+    symlink swapped in at ``path`` can never redirect the mode change onto its
+    target. Best-effort: hosts without ``fchmod`` (Windows) simply no-op."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(path), flags)
+    try:
+        chmod_fd(fd, mode)
+    finally:
+        os.close(fd)
+
+
 def ensure_private_dir(path: Path) -> None:
     """Owner-only (0700) private directory. Mode is set at creation time
     (the ``mkdir`` syscall's own mode argument, masked only by umask) so
     this works even in sandboxes that reject a standalone ``chmod``
     syscall; the trailing ``chmod`` is defense-in-depth for a path that
-    pre-existed with looser permissions on a host where chmod IS
-    available."""
+    pre-existed with looser permissions on a host where chmod IS available.
+    That defense-in-depth chmod runs ONLY after ``lstat`` has confirmed the
+    path is a real, self-owned directory (never a symlink), and goes through
+    an ``O_NOFOLLOW`` descriptor, so it can neither follow nor be redirected
+    by a symlink an attacker slipped into ``path``."""
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        os.chmod(path, 0o700)
+    # Validate with lstat BEFORE changing any mode: a symlink left in our place
+    # has S_ISLNK set (S_ISDIR false) and fails closed here instead of getting
+    # its target chmod'd through the link.
     st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or not _owned_by_current_user(st):
+        raise PermissionError("sideband directory is not owner-controlled mode 0700")
+    if not _private_mode(st, 0o700):
+        with contextlib.suppress(OSError):
+            _chmod_dir_nofollow(path, 0o700)
+        st = os.lstat(path)
     if (
         not stat.S_ISDIR(st.st_mode)
         or not _owned_by_current_user(st)
@@ -598,22 +651,27 @@ def _write_owner_only_file(path: Path, data: bytes, *, max_bytes: int) -> None:
         flags |= os.O_NOFOLLOW
     fd = os.open(str(tmp), flags, 0o600)
     try:
-        with contextlib.suppress(OSError):
-            chmod_fd(fd, 0o600)
-        os.write(fd, data)
-        os.fsync(fd)
-        st = os.fstat(fd)
-        if (
-            not stat.S_ISREG(st.st_mode)
-            or not _owned_by_current_user(st)
-            or not _private_mode(st, 0o600)
-        ):
-            raise PermissionError(f"{path.name} is not owner-controlled mode 0600")
-    finally:
-        os.close(fd)
-    try:
+        try:
+            with contextlib.suppress(OSError):
+                chmod_fd(fd, 0o600)
+            os.write(fd, data)
+            os.fsync(fd)
+            st = os.fstat(fd)
+            if (
+                not stat.S_ISREG(st.st_mode)
+                or not _owned_by_current_user(st)
+                or not _private_mode(st, 0o600)
+            ):
+                raise PermissionError(f"{path.name} is not owner-controlled mode 0600")
+        finally:
+            os.close(fd)
         os.replace(tmp, path)
     except BaseException:
+        # Any failure in the write/fsync/verify/replace steps must remove the
+        # exclusive-create temp file. Its name is fixed by pid+thread ident, so
+        # a leaked temp would make every subsequent O_EXCL open fail with
+        # FileExistsError forever -- freezing this instance's heartbeat (and,
+        # 90s later, its owner freshness) on a single transient ENOSPC/EIO.
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
@@ -1707,12 +1765,27 @@ class AppServerMux:
                 self._write_registry()
 
     def _write_to_child(self, raw_line: bytes) -> None:
+        # A failed write must surface, not be silently swallowed: the sideband
+        # owner path relies on it to clear the pending record and return a JSON
+        # error, and the extension pump treats it as end-of-stream. Callers that
+        # tolerate a dead child (``_pump_extension_to_child``) already catch
+        # OSError around their loop.
         if self._child is None or self._child.stdin is None:
-            return
+            raise BrokenPipeError("child app server stdin is unavailable")
         with self._child_write_lock:
-            with contextlib.suppress(BrokenPipeError, OSError):
+            try:
                 self._child.stdin.write(raw_line)
                 self._child.stdin.flush()
+            except ValueError as exc:
+                # A stdin descriptor closed by ``_shutdown_child_stdin`` (e.g.
+                # after extension EOF while the child process is still alive)
+                # makes the unbuffered ``io.FileIO`` raise
+                # ValueError("I/O operation on closed file"), not OSError.
+                # Normalise it here to a single OSError-family failure so every
+                # caller -- the sideband owner's ``except OSError`` and the
+                # extension pump's ``except (OSError, ValueError)`` alike --
+                # sees one failure type and no second handler can drift apart.
+                raise BrokenPipeError("child app server stdin is closed") from exc
 
     def _write_to_extension(self, raw_line: bytes) -> None:
         with contextlib.suppress(BrokenPipeError, OSError):
@@ -1797,9 +1870,15 @@ class AppServerMux:
         with self._pending_lock:
             self._pending_by_id[wire_id] = waiter
         payload = (json.dumps({"id": wire_id, "method": method, "params": params}, ensure_ascii=False) + "\n").encode("utf-8")
-        self._write_to_child(payload)
         try:
+            self._write_to_child(payload)
             arrived = waiter.event.wait(SIDEBAND_REQUEST_DEADLINE_SECONDS)
+        except OSError as exc:
+            # A failed child write must clear this flight's pending record (the
+            # finally below) and surface as a routable JSON error, rather than
+            # leaking the record and dropping the client with a bare connection
+            # close.
+            raise SidebandNotReady(f"child_write_failed:{type(exc).__name__}") from exc
         finally:
             with self._pending_lock:
                 self._pending_by_id.pop(wire_id, None)
@@ -1868,9 +1947,37 @@ class AppServerMux:
                 conn, _addr = srv.accept()
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as exc:
+                if self._stop_event.is_set():
+                    break
+                if exc.errno in _RECOVERABLE_ACCEPT_ERRNOS:
+                    # A single connection was aborted (ECONNABORTED and kin) or
+                    # a transient resource shortage (EMFILE/ENFILE/ENOBUFS/...)
+                    # hit accept(); the listener is still valid. Back off briefly
+                    # so a persistent shortage cannot busy-spin, then keep
+                    # serving instead of going dead-but-ready.
+                    self._stop_event.wait(SIDEBAND_ACCEPT_POLL_SECONDS)
+                    continue
+                # The listener itself can no longer accept. Stop advertising a
+                # readiness this instance can no longer honour.
+                self._accept_loop_failed()
                 break
             threading.Thread(target=self._handle_sideband_conn, args=(conn,), daemon=True).start()
+
+    def _accept_loop_failed(self) -> None:
+        """The sideband listener can no longer accept new connections. Clear
+        readiness and close the dead listener so callers get a hard refusal
+        (and durably park) instead of connecting into a backlog nothing
+        drains, and so this instance stops advertising a capability it cannot
+        honour. The extension<->child stdio proxy is untouched: Codex keeps
+        running; only the auxiliary sideband capability is retired."""
+        self._ready_event.clear()
+        srv = self._server_socket
+        if srv is not None:
+            with contextlib.suppress(OSError):
+                srv.close()
+        with contextlib.suppress(OSError, PermissionError):
+            self._write_registry()
 
     def _peer_uid_ok(self, conn: socket.socket) -> bool:
         peercred = getattr(socket, "SO_PEERCRED", None)
@@ -1884,10 +1991,20 @@ class AppServerMux:
         current_uid = _current_uid()
         return current_uid is None or uid == current_uid
 
-    def _read_bounded_line(self, conn: socket.socket) -> tuple[bytes | None, bool]:
+    def _read_bounded_line(self, conn: socket.socket, deadline: float) -> tuple[bytes | None, bool]:
+        """Read one bounded newline-terminated frame under a real end-to-end
+        deadline. ``deadline`` is an absolute ``time.monotonic()`` value that
+        bounds the WHOLE request, not each ``recv`` -- a client that never
+        sends a newline (or never sends at all) is dropped once the deadline
+        passes, releasing its thread and descriptor, instead of resetting the
+        timeout on every recv and living for days."""
         chunks: list[bytes] = []
         total = 0
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("sideband request deadline exceeded")
+            conn.settimeout(remaining)
             chunk = conn.recv(4096)
             if not chunk:
                 break
@@ -1906,26 +2023,41 @@ class AppServerMux:
         payload = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
         if len(payload) > SIDEBAND_RESPONSE_MAX_BYTES:
             payload = (json.dumps({"ok": False, "error": "response_too_large"}) + "\n").encode("utf-8")
+        # Every reply -- authorized, unauthorized, or overflow -- is sent under
+        # the full response budget, never the near-zero timeout that
+        # _read_bounded_line leaves behind as the request deadline is approached.
+        # A single reset on the one path every reply passes through cannot drift
+        # apart from a per-branch reset, so no early return can starve sendall
+        # into a bare connection close.
+        with contextlib.suppress(OSError):
+            conn.settimeout(SIDEBAND_REQUEST_DEADLINE_SECONDS)
         with contextlib.suppress(OSError):
             conn.sendall(payload)
 
     def _handle_sideband_conn(self, conn: socket.socket) -> None:
         try:
-            conn.settimeout(SIDEBAND_REQUEST_DEADLINE_SECONDS)
+            # A real end-to-end deadline for reading the request frame: this is
+            # an absolute instant, not a per-recv timeout, so a silent or
+            # dribbling client is dropped within SIDEBAND_REQUEST_DEADLINE_SECONDS
+            # rather than resetting the clock on every recv (formerly ~34 days).
+            deadline = time.monotonic() + SIDEBAND_REQUEST_DEADLINE_SECONDS
             if not self._peer_uid_ok(conn):
                 # A TCP peer that is closed while request bytes remain unread
                 # is reset by Winsock, which can discard this bounded error
                 # response. Drain one bounded frame before replying; AF_UNIX
                 # behavior and the authorization decision remain unchanged.
-                self._read_bounded_line(conn)
+                self._read_bounded_line(conn, deadline)
                 self._send_json(conn, {"ok": False, "error": "unauthorized_peer"})
                 return
-            raw, overflowed = self._read_bounded_line(conn)
+            raw, overflowed = self._read_bounded_line(conn, deadline)
             if overflowed:
                 self._send_json(conn, {"ok": False, "error": "request_too_large"})
                 return
             if not raw:
                 return
+            # The recv deadline no longer applies; every reply below is sent
+            # under the full response budget by _send_json itself, so no branch
+            # needs its own reset.
             try:
                 request = json.loads(raw.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError):
