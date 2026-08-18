@@ -6,6 +6,72 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.82] - 2026-08-18
+
+### Fixed
+
+- **Source Graph answered with more confidence than it had earned.** It is the
+  discovery surface every agent is told to use before reading files, and seven
+  defects made it assert things it had not established. A clean page ended
+  pagination forever, because the cursor was conditioned on findings returned
+  rather than rows processed: measured with 129 eligible symbols and a budget of
+  40, the first clean page produced no cursor and the remaining 89 became
+  unreachable, while the answer looked like a completed clean scan. `body`,
+  `function`, `class` and `context` sliced the live file with the line numbers of
+  the indexed generation and no freshness check, so prepending twenty comment
+  lines made the tool return those comments as the symbol's code. The analytics
+  corpus was silently truncated while its capped flag stayed false; indexing one
+  file destroyed resolved cross-file edges that the next incremental build
+  skipped repairing; a renamed target left callers pointing at an entity that no
+  longer exists, still labelled as extracted evidence; repository-wide `bodygrep`
+  stopped a third of the way through and reported no hits; and `coverage.scanned`
+  claimed the whole corpus when only one page had been examined.
+
+- **The analyzers reported clean on languages they cannot read.** Five C-family
+  detectors ran against Python with no language filter, so they could never fire
+  and still returned "available" with no findings across 395 files, which reads
+  as analysed and clean. They now return `not_applicable` with a reason. The
+  division detector matched every path separator, so a string like
+  `"src/aiworkhub/service"` produced four bogus findings; guard detection required
+  parentheses so a Python guard was never recognised; duplicate detection ate the
+  rest of a symbol after a line comment and merged different functions; the gaps
+  query was saturated by builtins and scoped after its limit; and an oversized
+  file was silently counted as considered.
+
+- **A worker that committed inside its own worktree lost the work silently.** The
+  change set was diffed against the symbolic HEAD, so a commit moved HEAD and
+  every change vanished - never scope-checked, never promoted, destroyed with the
+  worktree - while `required_outputs` still validated because it checks the file
+  on disk. The diff is now taken against the OID pinned at workspace creation and
+  fails closed when HEAD moves unexplained. A staged rename no longer hides the
+  deleted source path, a single `*` in `allowed_writes` no longer crosses a
+  directory separator, and a failed worktree creation no longer leaves a checkout
+  behind.
+
+- **The manager MCP surface dropped the collision evidence it exists to provide.**
+  The default plan snapshot kept a private field list that had drifted from the
+  canonical one, so all eight write-scope collision fields were missing: the
+  default receipt showed a card as collision-free while the full one reported two
+  collisions including that card. The omission receipt is now derived from the
+  projection instead of a hardcoded list that under-declared twelve dropped
+  fields, the cost ledger no longer loses its per-role split, and an id-less
+  `tools/call` on the stdio fallback no longer launches a worker and blocks the
+  read loop.
+
+- **A dead mux kept advertising itself as ready.** One transient write error
+  wedged the registry heartbeat permanently, because the failed write left its
+  temp file behind under a fixed name and every later write failed silently - so
+  a full disk was enough to remove a healthy instance from routing. The sideband
+  accept loop died on any error while nothing cleared `ready`, so requests were
+  accepted into the backlog and lost. The request deadline was a per-recv timeout
+  on a loop, allowing a connection to hold a thread and descriptor for weeks.
+
+- **Storage "Calculating" took eighty seconds.** Measured on a 17 GB repository:
+  80.21 s for the full measurement, 54.77 s of it inside one quarantine scan,
+  against 3.09 s for worktree retention and 0.18 s for sizing all 53 worktree
+  directories. The scan is bounded now, and a measurement cut short reports
+  itself partial instead of looking complete.
+
 ## [0.9.81] - 2026-08-17
 
 ### Fixed

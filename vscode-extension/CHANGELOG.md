@@ -1,5 +1,39 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.82 — 2026-08-18
+
+### Fixed
+
+- **Source Graph could answer a search as finished when it had stopped a third of
+  the way through, and could return the wrong lines for a symbol.** A page with
+  nothing wrong ended the scan permanently, so a clean result could mean "nothing
+  found" or "we stopped early" with no way to tell. Reading a symbol used the line
+  numbers from the last index rather than the file as it is now, so edits made
+  after indexing could return the wrong code. Both are fixed, and every read now
+  says how fresh it is.
+
+- **The bug analyzers reported "clean" for languages they cannot read.** Five
+  detectors are C-family only, ran against Python anyway, and reported no findings
+  across 395 files - which reads as checked and clean. They now say plainly that
+  they do not apply.
+
+- **A worker that committed inside its own worktree lost the work.** The change
+  set was compared against a moving reference, so committed work disappeared and
+  the task still reported its required outputs as validated. Nothing is lost now,
+  and an unexplained move fails loudly.
+
+- **The manager could launch conflicting tasks in parallel.** The default plan
+  view was missing every write-conflict field, so it showed a task as safe while
+  the full view reported real conflicts.
+
+- **A stalled runtime kept advertising itself as available.** One transient write
+  error - a full disk is enough - could wedge the heartbeat permanently and remove
+  a healthy runtime from routing, while dropped requests waited for a timeout.
+
+- **Storage "Calculating" took eighty seconds** on a 17 GB repository, fifty-five
+  of them in a single scan. It is bounded now, and a measurement that is cut short
+  says so instead of looking complete.
+
 ## 0.9.81 — 2026-08-17
 
 ### Fixed

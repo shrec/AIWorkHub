@@ -12,6 +12,25 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.82
+
+- **Source Graph could stop a search a third of the way through and still report
+  it as finished, and could return the wrong lines for a symbol.** A page with
+  nothing wrong ended the scan permanently, and reads used the line numbers from
+  the last index rather than the file as it is now. Both fixed; every read reports
+  its freshness.
+- **The bug analyzers reported "clean" for languages they cannot read** - five
+  C-family detectors ran against 395 Python files and returned no findings. They
+  now say they do not apply.
+- **A worker that committed inside its own worktree lost the work**, while the
+  task still reported its required outputs as validated.
+- **The manager could launch conflicting tasks in parallel**, because the default
+  plan view was missing every write-conflict field.
+- **A stalled runtime kept advertising itself as available**, and storage
+  "Calculating" took eighty seconds on a 17 GB repository. Both bounded now.
+
+See the packaged **Changelog** for the complete release summary.
+
 ## What's new in 0.9.81
 
 - **The runtime could report itself unavailable on a large repository.** Startup
