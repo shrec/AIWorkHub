@@ -46,6 +46,22 @@ include automatic NeedFix closure and TTL cleanup, provider controls, CPU-aware
 parallelism, richer evidence visualization and quality-calibrated release
 automation.
 
+## Continuous Audit as a Service (CAAS)
+
+**CAAS** stands for **Continuous Audit as a Service** — AIWorkHub audits its own
+repositories continuously, as a service of the normal lifecycle rather than a
+step someone remembers to run. The canonical protocol is
+[docs/CAAS_PROTOCOL.md](docs/CAAS_PROTOCOL.md). `aiworkhub.caas_enforcement`
+checks the protocol's automatically-enforceable properties on every guarded
+lifecycle transition, so a repository cannot drift out of compliance silently;
+`aiworkhub.audit_system` runs read-only, narrow-scope review passes that emit
+structured findings into NeedFix with provenance.
+
+> **Naming correction.** The expansion "Continuous Automated Assurance System"
+> is wrong; the owner-canonical expansion is **Continuous Audit as a Service**.
+> That incorrect wording lives in the separate **UltrafastSecp256k1** README and
+> cannot be fixed from this repository — it must be corrected in that repository.
+
 ## What's new in 0.9.40
 
 - Required semantic-edit creates reject literal placeholder output, including
