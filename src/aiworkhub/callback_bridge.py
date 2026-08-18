@@ -1900,6 +1900,33 @@ class CallbackBridge:
                 state["last_error"] = error_msg
                 self._write_state(state)
                 return False
+            except Exception as exc:
+                # Neither a busy-thread deferral nor a typed transport failure:
+                # a ValueError from deliver_or_defer / the sideband repo-id
+                # validation, an OSError from a state write on a full disk, a
+                # sqlite3.OperationalError, etc. Two things must hold: the batch
+                # must NOT sit inflight for the whole lease (release it onto the
+                # bounded transient-failure path, best-effort so a failing DB
+                # cannot re-raise here), and this must NEVER escape to kill the
+                # repository's single delivery thread. Surface it in durable
+                # state, never swallow it silently.
+                error_msg = f"{type(exc).__name__}: {exc}"[:500]
+                if self._transport == "subprocess" and self._client is not None:
+                    # Guarded: a raising stop() must not skip the batch release
+                    # below, which is the whole point of this handler.
+                    with contextlib.suppress(Exception):
+                        self._client.stop()
+                    self._client = None
+                with contextlib.suppress(Exception):
+                    self._callback_store.fail_batch_transient(
+                        conn, batch.batch_id, error_msg, batch.lease_id,
+                        max_retries=DEFAULT_MAX_RETRIES, delay_seconds=backoff_delay,
+                    )
+                with contextlib.suppress(Exception):
+                    state = self._read_state()
+                    state["last_error"] = error_msg
+                    self._write_state(state)
+                return False
         finally:
             conn.close()
 
@@ -2078,13 +2105,34 @@ class CallbackBridge:
                 self._stop_event.wait(sleep_time)
             else:
                 consecutive_empty = 0
-                self._process_batch(_batch_from_claim_result(claimed))
+                try:
+                    self._process_batch(_batch_from_claim_result(claimed))
+                except Exception as exc:
+                    # Backstop: a single batch's processing must never kill the
+                    # one delivery thread for this repository. _process_batch
+                    # already releases the batch and records last_error on the
+                    # paths it owns; this covers anything that still escaped
+                    # (batch-object formation, or its own error handling itself
+                    # raising). Surface it, then keep polling.
+                    self._record_daemon_delivery_error(exc)
             iterations += 1
             if max_iterations is not None and iterations >= max_iterations:
                 break
         if self._client is not None:
             self._client.stop()
             self._client = None
+
+    def _record_daemon_delivery_error(self, exc: BaseException) -> None:
+        """Record (never swallow) a delivery-loop exception that escaped
+        ``_process_batch`` so it surfaces in ``health()``'s
+        ``last_delivery_error`` instead of silently killing the delivery
+        thread."""
+        error_msg = f"daemon_delivery_error:{type(exc).__name__}: {exc}"[:500]
+        with contextlib.suppress(Exception):
+            state = self._read_state()
+            state["last_error"] = error_msg
+            state["last_daemon_error_at"] = _utcnow()
+            self._write_state(state)
 
     def stop_daemon(self) -> None:
         self._stop_event.set()
@@ -2298,8 +2346,14 @@ class CallbackDispatcher:
             problems.append(f"unsupported_provider:{self.provider or 'unset'}")
         elif self._start_error:
             problems.append(f"start_error:{self._start_error}")
+        elif not running:
+            # Supported and constructed without error, but the single delivery
+            # thread is not alive -- never started, stopped, or died on an
+            # unguarded exception. Health must not read "ok" while no thread is
+            # delivering this repository's callbacks.
+            problems.append("delivery_thread_not_running")
         out: dict[str, Any] = {
-            "ok": self.supported and not self._start_error,
+            "ok": self.supported and not self._start_error and running,
             "dispatcher_running": running,
             "provider": self.provider,
             "provider_supported": self.supported,

@@ -302,7 +302,12 @@ def enqueue_callback(
     event_id: str = "",
     request_id: str = "",
 ) -> bool:
-    """Enqueue one durable outbox entry, exactly once per route and episode."""
+    """Enqueue one durable outbox entry, exactly once per route, transition,
+    and episode. Two DIFFERENT eligible transitions for the same task/route
+    within a single claim episode (e.g. review_ready, then blocked when the
+    reconciler damages the review workspace without bumping claim_epoch) are
+    each their own wake and must each enqueue -- the dedup keys on transition
+    too, never only (task, provider, route, episode)."""
     if transition not in CALLBACK_ELIGIBLE_TRANSITIONS:
         return False
     validated_thread = str(origin_thread_id or "").strip()
@@ -325,13 +330,13 @@ def enqueue_callback(
              WHERE NOT EXISTS (
                SELECT 1 FROM callback_outbox
                 WHERE task_id=? AND provider=? AND origin_thread_id=?
-                  AND episode_id=?
+                  AND transition=? AND episode_id=?
              )
             """,
             (
                 task_id, validated_provider, validated_thread, transition,
                 resolved_episode, event_id, request_id, now, now,
-                task_id, validated_provider, validated_thread, resolved_episode,
+                task_id, validated_provider, validated_thread, transition, resolved_episode,
             ),
         )
         if cur.rowcount != 1:
@@ -997,17 +1002,66 @@ def seed_missing_review_callbacks(
         callback_origin = route_origin or str(row["origin_thread_id"] or card.get("origin_thread_id") or "").strip()
         if not callback_origin:
             continue
+        def _recover_terminal_row(existing_row) -> None:
+            # Recovery re-points the row at the transition the task is in
+            # RIGHT NOW (``transition``), never leaving the old one. A row
+            # recovered with a stale transition is superseded again by the
+            # very next claim (its transition no longer matches the task's
+            # live terminal state) and, its single recovery budget already
+            # burned here, could then never be recovered again -- the wake
+            # would be lost forever on an otherwise stable manager route.
+            batch_id = str(existing_row["batch_id"] or "")
+            now = utc_now()
+            prior_state = str(existing_row["state"] or "")
+            if batch_id:
+                conn.execute(
+                    "UPDATE callback_batches SET state='superseded', updated_at=? "
+                    "WHERE batch_id=? AND state IN ('dead_letter','superseded')",
+                    (now, batch_id),
+                )
+            conn.execute(
+                "UPDATE callback_outbox SET state='pending', batch_id='', "
+                "lease_id='', lease_expires_at='', attempts=0, "
+                "transition=?, last_error=?, "
+                "recovery_count=recovery_count+1, updated_at=? "
+                "WHERE outbox_id=? AND state=? AND recovery_count=0",
+                (
+                    transition,
+                    f"verified_route_{prior_state}_recovery",
+                    now,
+                    existing_row["outbox_id"],
+                    prior_state,
+                ),
+            )
+            conn.commit()
+            append_event(
+                conn,
+                task_id,
+                "callback_terminal_recovered_on_verified_route",
+                "",
+                {
+                    "transition": transition,
+                    "episode_id": episode_id,
+                    "prior_state": prior_state,
+                },
+            )
+
+        # The dedup lookup keys on ``transition`` too: a task that already
+        # has a review_ready row but is now (same episode) blocked has NO
+        # wake for its CURRENT transition, and a transition-blind lookup
+        # would wrongly treat the review_ready row as "already handled" and
+        # skip the gap -- the exact way the direct enqueue predicate did.
         if route_origin:
             existing = conn.execute(
                 "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox WHERE task_id=? AND provider=? "
-                "AND origin_thread_id=? AND episode_id=? LIMIT 1",
-                (task_id, provider, callback_origin, episode_id),
+                "AND origin_thread_id=? AND transition=? AND episode_id=? LIMIT 1",
+                (task_id, provider, callback_origin, transition, episode_id),
             ).fetchone()
         else:
             existing = conn.execute(
                 "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox WHERE task_id=? AND provider=? "
-                "AND episode_id=? LIMIT 1",
-                (task_id, provider, episode_id),
+                "AND transition=? AND episode_id=? LIMIT 1",
+                (task_id, provider, transition, episode_id),
             ).fetchone()
         if existing is not None:
             if (
@@ -1018,42 +1072,29 @@ def seed_missing_review_callbacks(
                     conn, task_id, transition, episode_id
                 )
             ):
-                batch_id = str(existing["batch_id"] or "")
-                now = utc_now()
-                prior_state = str(existing["state"] or "")
-                if batch_id:
-                    conn.execute(
-                        "UPDATE callback_batches SET state='superseded', updated_at=? "
-                        "WHERE batch_id=? AND state IN ('dead_letter','superseded')",
-                        (now, batch_id),
-                    )
-                conn.execute(
-                    "UPDATE callback_outbox SET state='pending', batch_id='', "
-                    "lease_id='', lease_expires_at='', attempts=0, "
-                    "last_error=?, "
-                    "recovery_count=recovery_count+1, updated_at=? "
-                    "WHERE outbox_id=? AND state=? AND recovery_count=0",
-                    (
-                        f"verified_route_{prior_state}_recovery",
-                        now,
-                        existing["outbox_id"],
-                        prior_state,
-                    ),
-                )
-                conn.commit()
-                append_event(
-                    conn,
-                    task_id,
-                    "callback_terminal_recovered_on_verified_route",
-                    "",
-                    {
-                        "transition": transition,
-                        "episode_id": episode_id,
-                        "prior_state": prior_state,
-                    },
-                )
+                _recover_terminal_row(existing)
                 seeded += 1
             continue
+        # No wake exists for the transition the task is in right now. On a
+        # verified route, prefer recovering a dead-letter/superseded row this
+        # task stranded under a DIFFERENT transition in the SAME episode and
+        # re-pointing that single recoverable row at the current transition,
+        # over leaving it stranded and never producing the owed wake. (A
+        # review_ready row superseded when the same card was moved to blocked
+        # in-episode is exactly this case.)
+        if route_origin:
+            stranded = conn.execute(
+                "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox "
+                "WHERE task_id=? AND provider=? AND origin_thread_id=? AND episode_id=? "
+                "AND state IN ('dead_letter','superseded') AND recovery_count=0 LIMIT 1",
+                (task_id, provider, callback_origin, episode_id),
+            ).fetchone()
+            if stranded is not None and _task_still_in_matching_terminal_state(
+                conn, task_id, transition, episode_id
+            ):
+                _recover_terminal_row(stranded)
+                seeded += 1
+                continue
         if enqueue_callback(
             conn,
             task_id,
