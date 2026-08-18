@@ -481,10 +481,23 @@ def quality_gate_ratchet(
     """Fail only on new identities and configured no-net-growth overflow."""
 
     root = Path(repo_root).resolve()
+    # Resolve the relative path first: an invalid/escaping path is a
+    # misconfiguration, not a corrupted baseline, and stays not_configured.
+    try:
+        candidate = _regular(root, baseline_path, must_exist=False)
+    except EvidenceInstrumentError as exc:
+        return {"schema_id": "aiworkhub.quality_gate_ratchet.v1", "status": "not_configured", "blocking": False, "reason": f"baseline_path_invalid:{exc}"}
+    # An absent baseline declares the ratchet unconfigured (non-blocking). A
+    # present-but-unreadable or shape-invalid baseline must fail closed: a
+    # corrupt or oversized file can no longer silently erase the ratchet.
+    if not candidate.exists() and not candidate.is_symlink():
+        return {"schema_id": "aiworkhub.quality_gate_ratchet.v1", "status": "not_configured", "blocking": False, "reason": "baseline_absent"}
     try:
         baseline = json.loads(_regular(root, baseline_path).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, EvidenceInstrumentError) as exc:
-        return {"schema_id": "aiworkhub.quality_gate_ratchet.v1", "status": "not_configured", "blocking": False, "reason": str(exc)}
+        return {"schema_id": "aiworkhub.quality_gate_ratchet.v1", "status": "error", "blocking": True, "reason": f"baseline_unreadable:{exc}"}
+    if not isinstance(baseline, Mapping):
+        return {"schema_id": "aiworkhub.quality_gate_ratchet.v1", "status": "error", "blocking": True, "reason": "baseline_shape_invalid"}
     known = {str(value) for value in baseline.get("violation_ids") or []}
     observed = {
         str(row.get("id") or "") for row in violations
@@ -750,8 +763,31 @@ def runtime_coverage_for_paths(repo_root: Path | str, paths: Iterable[str]) -> d
             "branch_coverage": None,
             "reason": "runtime_coverage_projection_invalid",
         }
+    # A document that is not a Mapping, or whose "files" is not a list, is a
+    # shape-invalid projection -- report it, never raise on bad input.
+    files = document.get("files") if isinstance(document, Mapping) else None
+    if not isinstance(files, list):
+        return {
+            "status": "unavailable",
+            "line_coverage": None,
+            "branch_coverage": None,
+            "reason": "runtime_coverage_projection_shape_invalid",
+        }
     wanted = {str(path).replace("\\", "/") for path in paths}
-    rows = [row for row in document.get("files") or [] if str(row.get("file_path") or "") in wanted]
+    rows = [
+        row for row in files
+        if isinstance(row, Mapping) and str(row.get("file_path") or "") in wanted
+    ]
+    # Zero matched rows is unmeasured, never "available": an unmeasured path
+    # must not masquerade as measured.
+    if not rows:
+        return {
+            "status": "not_available",
+            "line_coverage": None,
+            "branch_coverage": None,
+            "reason": "no_runtime_coverage_for_requested_paths",
+            "matched_files": 0,
+        }
     total_covered = sum(int(row.get("covered_lines") or 0) for row in rows)
     total_missing = sum(int(row.get("missing_lines") or 0) for row in rows)
     denominator = total_covered + total_missing

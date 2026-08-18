@@ -143,7 +143,12 @@ _RISK_SIGNAL_FLOORS = {
     "schema_migration": RISK_HIGH,
     "security_sensitive": RISK_HIGH,
     "release": RISK_CRITICAL,
+    # A candidate that weakens its own declared quality policy cannot thereby
+    # lower its own acceptance bar: the observed weakening floors the tier high.
+    "quality_policy_self_weakened": RISK_HIGH,
 }
+
+QUALITY_POLICY_SELF_WEAKENED_SIGNAL = "quality_policy_self_weakened"
 
 _SOURCE_CODE_SUFFIXES = frozenset({
     ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js",
@@ -1233,6 +1238,67 @@ def repo_config_status(repo_root: Path | str) -> dict[str, Any]:
     }
 
 
+def assess_quality_policy_authority(
+    canonical_root: Path | str,
+    candidate_root: Path | str,
+) -> dict[str, Any]:
+    """Detect a candidate weakening its own declared quality policy.
+
+    A candidate cannot lower its own acceptance bar by emptying or deleting
+    ``.aiworkhub/quality.json``. When the candidate declares strictly fewer
+    checks than the canonical tree (removal counts as zero), the weakening is
+    an observed signal that escalates the risk tier -- it does not block the
+    gate outright, but the escalated tier (medium+) then demands combined-tree
+    and reviewer evidence the bare candidate cannot fabricate.
+
+    A malformed candidate config is not this function's concern: the completion
+    gate already fails closed on it via ``config_error``. This assessment reads
+    only the declared check counts and never executes a command.
+    """
+
+    def _count(root: Path | str) -> tuple[int, bool]:
+        try:
+            config = load_repo_config(root)
+        except MalformedConfigError:
+            return 0, False
+        return len(config.get("checks") or []), True
+
+    canonical_count, canonical_ok = _count(canonical_root)
+    candidate_count, candidate_ok = _count(candidate_root)
+    # Only a candidate that parses cleanly yet declares fewer checks than the
+    # canonical tree is "self-weakened" here; a malformed candidate is handled
+    # as a config_error blocker elsewhere and must not be double-counted.
+    weakened = (
+        canonical_ok
+        and candidate_ok
+        and canonical_count > 0
+        and candidate_count < canonical_count
+    )
+    if weakened:
+        action = "escalate_risk_tier"
+        reason = (
+            "quality_policy_self_weakened:canonical_checks="
+            f"{canonical_count}>candidate_checks={candidate_count}"
+        )
+        signal = QUALITY_POLICY_SELF_WEAKENED_SIGNAL
+    else:
+        action = "none"
+        reason = ""
+        signal = ""
+    return {
+        "schema_id": "aiworkhub.quality_policy_authority.v1",
+        "weakened": bool(weakened),
+        "action": action,
+        "reason": reason,
+        "escalation_signal": signal,
+        "blocks_gate": False,
+        "canonical_declared_checks": canonical_count,
+        "candidate_declared_checks": candidate_count,
+        "canonical_config_readable": bool(canonical_ok),
+        "candidate_config_readable": bool(candidate_ok),
+    }
+
+
 def _validate_declared_check(entry: Any) -> None:
     if not isinstance(entry, dict):
         raise MalformedConfigError("each declared check must be a JSON object")
@@ -1908,6 +1974,7 @@ def run_completion_quality_gate(
     combined_tree_checks: Iterable[EvidenceCheck | Mapping[str, Any]] = (),
     worker_provider: str = "",
     human_approval: bool = False,
+    combined_tree_scope: bool = False,
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
 
@@ -1930,6 +1997,23 @@ def run_completion_quality_gate(
         }
     try:
         risk_profile = resolve_risk_profile(requested_risk_tier, signals=risk_signals)
+        if combined_tree_scope:
+            # The combined-tree validation must carry the parent fold's exact
+            # risk tier and signals so a declared check with ``minimum_risk``
+            # medium runs here too (otherwise it is skipped as
+            # ``risk_below_minimum`` and re-blocks in the parent as a permanent
+            # ``combined_tree`` blocker). But the sub-gate must NOT recursively
+            # demand its own combined tree, independent reviewers, or human
+            # approval: those meta-gates are enforced once, by the parent fold.
+            # Stripping them keeps the low-tier behavior the sub-gate always had
+            # while adding the correct declared-check applicability tier.
+            risk_profile = {
+                **risk_profile,
+                "combined_tree_required": False,
+                "cross_provider_required": False,
+                "explicit_human_approval_required": False,
+                "required_reviewer_lenses": [],
+            }
         checks = run_builtin_static_checks(root, changed_paths=affected)
         declared = run_declared_checks(
             root,
@@ -2154,8 +2238,14 @@ def adapt_junit_xml(check_id: str, junit_text: str) -> EvidenceCheck:
                 classname = case.attrib.get("classname", "")
                 if classname:
                     affected.append(classname)
+    junit_error = ""
     if total_tests == 0:
-        status = STATUS_SKIPPED
+        # A report that ran but exercised no tests is the absence of evidence,
+        # not a pass. STATUS_NOT_AVAILABLE blocks a mandatory test check on both
+        # the declared-check and the combined-tree fold paths; STATUS_SKIPPED
+        # blocked on only one, so the two paths disagreed.
+        status = STATUS_NOT_AVAILABLE
+        junit_error = "junit_zero_tests"
     elif total_failures or total_errors:
         status = STATUS_FAILED
     else:
@@ -2167,6 +2257,7 @@ def adapt_junit_xml(check_id: str, junit_text: str) -> EvidenceCheck:
         affected_paths=tuple(dict.fromkeys(affected)),
         summary=f"{total_tests} test(s), {total_failures} failure(s), {total_errors} error(s)",
         provenance="adapter:junit_xml",
+        error=junit_error,
     )
 
 

@@ -2712,10 +2712,13 @@ def _materialize_crash_retry_packet(
         return None, None
     stdout_path = process_dir / f"{request_id}.stdout.log"
     stderr_path = process_dir / f"{request_id}.stderr.log"
-    stdout_raw = _safe_tail(stdout_path, MAX_CRASH_RETRY_STREAM_BYTES)
-    stderr_raw = _safe_tail(stderr_path, MAX_CRASH_RETRY_STREAM_BYTES)
-    stdout_tail = _sanitize_live_output_text(stdout_raw)
-    stderr_tail = _sanitize_live_output_text(stderr_raw)
+    # The packet is JSON, so JSON encoding already neutralises every
+    # metacharacter. The HTML-oriented live-output sanitiser escaped and
+    # redacted bytes the successor needs verbatim, so carry the predecessor's
+    # diagnostics unescaped and unredacted; the tail hashes below then cover
+    # exactly the bytes delivered rather than a pre-sanitised original.
+    stdout_tail = _safe_tail(stdout_path, MAX_CRASH_RETRY_STREAM_BYTES)
+    stderr_tail = _safe_tail(stderr_path, MAX_CRASH_RETRY_STREAM_BYTES)
     error = str(status.get("error") or "")[:500]
     if not (stdout_tail or stderr_tail or error or state):
         return None, None
@@ -2771,8 +2774,8 @@ def _materialize_crash_retry_packet(
         "predecessor_error": error,
         "stdout_tail": stdout_tail,
         "stderr_tail": stderr_tail,
-        "stdout_tail_sha256": hashlib.sha256(stdout_raw.encode("utf-8")).hexdigest(),
-        "stderr_tail_sha256": hashlib.sha256(stderr_raw.encode("utf-8")).hexdigest(),
+        "stdout_tail_sha256": hashlib.sha256(stdout_tail.encode("utf-8")).hexdigest(),
+        "stderr_tail_sha256": hashlib.sha256(stderr_tail.encode("utf-8")).hexdigest(),
         "rework_overlay_sha256": str(
             rework_overlay_packet.get("canonical_digest") or ""
         ),
@@ -7369,6 +7372,34 @@ class ProcessManager:
             if verdict is PidIdentityVerdict.UNKNOWN:
                 continue
             if verdict is PidIdentityVerdict.MATCH:
+                # The passive watcher only finalizes once the PID identity stops
+                # matching, so a heartbeat-lost or stalled but still-alive worker
+                # would stay "processing" forever. Give the durable escalation
+                # path a chance to run while the process still exists: if it
+                # returns a terminal state (stall/liveness-lost detected and
+                # finalized) count it finalized; otherwise fall through to the
+                # watcher unchanged. A healthy worker returns non-terminal here
+                # and produces no durable side effect.
+                with self._lock:
+                    already_tracked = (
+                        request_id in self._watching or request_id in self._live
+                    )
+                if (
+                    not already_tracked
+                    and str(event.get("supervisor_status_path") or "") not in {"", "."}
+                ):
+                    try:
+                        escalated = self._finalize_after_process_exit(
+                            request_id, lock_blocking=False
+                        )
+                    except Exception:  # noqa: BLE001 - never break the scan
+                        escalated = None
+                    if (
+                        escalated is not None
+                        and escalated.get("state") in TERMINAL_PROCESS_STATES
+                    ):
+                        finalized += 1
+                        continue
                 with self._lock:
                     if request_id in self._watching or request_id in self._live:
                         continue
@@ -8493,9 +8524,27 @@ class ProcessManager:
                     ),
                     {},
                 )
-                usage = dict(prior_usage_event.get("usage") or {})
-                usage_recorded = bool(prior_usage_event.get("usage_recorded"))
-                usage_error = "finalization_retry_reused_prior_usage"
+                if prior_usage_event.get("usage_recorded"):
+                    usage = dict(prior_usage_event.get("usage") or {})
+                    usage_recorded = True
+                    usage_error = "finalization_retry_reused_prior_usage"
+                else:
+                    # A release_pending predecessor is a finalization-pending
+                    # state, so it never recorded provider spend: the provider
+                    # already ran and spent tokens, but usage recording was
+                    # deferred with the release transition. Record it now --
+                    # ``_record_usage`` is idempotent per request_id, so this
+                    # can never double-count -- rather than lose the spend.
+                    usage, usage_recorded, usage_error = self._record_usage(
+                        request_id,
+                        str(metadata["task_id"]),
+                        str(metadata["runner"]),
+                        str(metadata["adapter_id"]),
+                        str(metadata.get("model") or metadata["adapter_id"]),
+                        stdout_path,
+                        topic=str(metadata["topic"]),
+                        execution_mode=str(metadata.get("execution_mode") or ""),
+                    )
             elif terminal_state not in FINALIZATION_PENDING_STATES:
                 usage, usage_recorded, usage_error = self._record_usage(
                     request_id,
@@ -10398,6 +10447,22 @@ class ProcessManager:
                 )
                 effective_risk_signals.extend(risk_signals or [])
                 effective_risk_signals = sorted(dict.fromkeys(effective_risk_signals))
+                # A candidate that empties or removes its own quality policy must
+                # not thereby weaken its own acceptance. The weakening is an
+                # observed signal that escalates the tier (medium+ then demands
+                # combined-tree and reviewer evidence); it does not silently pass.
+                policy_authority = quality_evidence.assess_quality_policy_authority(
+                    self.repo, workspace.path
+                )
+                if policy_authority["weakened"] and policy_authority["escalation_signal"]:
+                    effective_risk_signals = sorted(
+                        dict.fromkeys(
+                            [
+                                *effective_risk_signals,
+                                str(policy_authority["escalation_signal"]),
+                            ]
+                        )
+                    )
                 risk_profile = quality_evidence.resolve_risk_profile(
                     requested_risk_tier,
                     signals=effective_risk_signals,
@@ -10417,6 +10482,9 @@ class ProcessManager:
                         union_quality = quality_evidence.run_completion_quality_gate(
                             union_workspace.path,
                             changed_paths=changed,
+                            requested_risk_tier=requested_risk_tier,
+                            risk_signals=effective_risk_signals,
+                            combined_tree_scope=True,
                         )
                         if not union_quality.get("passed"):
                             union_blockers = union_quality.get("blocking_checks") or []
@@ -10561,6 +10629,7 @@ class ProcessManager:
                     human_approval=confirm_high_risk,
                 )
                 quality_gate["combined_tree"] = combined_tree
+                quality_gate["quality_policy_authority"] = policy_authority
                 if not quality_gate.get("passed"):
                     blockers = quality_gate.get("blocking_checks") or []
                     reason = quality_gate.get("config_error") or ",".join(str(v) for v in blockers)

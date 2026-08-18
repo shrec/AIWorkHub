@@ -4113,3 +4113,213 @@ def test_quality_review_launch_isolated_classifies_prewarm_data_failure_truthful
     )
     assert "unexpected_launch_error" not in reason
     assert "diagnostic" not in result
+
+
+def test_crash_retry_packet_carries_unsanitized_diagnostics_and_hashes_delivered(
+    tmp_path: Path,
+) -> None:
+    """fix #4: the predecessor diagnostics are embedded in a JSON packet, so
+    JSON encoding already neutralises every metacharacter. The HTML-oriented
+    live-output sanitiser must not run: it escaped and redacted bytes the
+    successor needs verbatim, and the tail hashes were computed over the
+    unsanitised bytes, so the corruption was undetectable. Carry the bytes
+    unescaped/unredacted and hash exactly the bytes delivered."""
+
+    repo = tmp_path / "repo"
+    process_dir = tmp_path / "processes"
+    worktree = tmp_path / "succ" / "worktree"
+    home = tmp_path / "succ" / "home"
+    for directory in (repo, process_dir, worktree, home):
+        directory.mkdir(parents=True)
+    workspace = process_launcher.WorkerWorkspace(
+        request_id="7" * 32,
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    predecessor = "8" * 32
+    process_launcher.write_json_0600(
+        process_dir / f"{predecessor}.request.json",
+        {"request_id": predecessor, "task_id": "TASK_SAME", "workspace": {"repo": str(repo)}},
+    )
+    process_launcher.write_json_0600(
+        process_dir / f"{predecessor}.supervisor.json",
+        {"state": "supervisor_error", "exit_code": 1, "error": "boom"},
+    )
+    # HTML metacharacters plus a long opaque token the live-output sanitiser
+    # would escape/redact. Kept short so the whole stream is the delivered tail.
+    long_token = "SECRET" + "x" * 80
+    stdout_text = f"<step> a & b {long_token}\n"
+    stderr_text = f'trace <b>"boom"</b> {long_token}\n'
+    (process_dir / f"{predecessor}.stdout.log").write_text(stdout_text, encoding="utf-8")
+    (process_dir / f"{predecessor}.stderr.log").write_text(stderr_text, encoding="utf-8")
+    overlay = {
+        "predecessor_request_id": predecessor,
+        "predecessor_task_id": "TASK_SAME",
+        "canonical_digest": "c" * 64,
+    }
+
+    _path, packet = process_launcher._materialize_crash_retry_packet(
+        process_dir,
+        workspace,
+        task_id="TASK_SAME",
+        card={"rework_predecessor": {"request_id": predecessor}},
+        rework_overlay_packet=overlay,
+    )
+
+    assert packet is not None
+    # Verbatim: no HTML escaping and no long-token redaction.
+    assert packet["stdout_tail"] == stdout_text
+    assert packet["stderr_tail"] == stderr_text
+    assert long_token in packet["stdout_tail"]
+    assert "&amp;" not in packet["stdout_tail"]
+    assert "&quot;" not in packet["stderr_tail"]
+    # The tail hashes cover exactly the bytes delivered in the packet.
+    assert (
+        packet["stdout_tail_sha256"]
+        == hashlib.sha256(packet["stdout_tail"].encode("utf-8")).hexdigest()
+    )
+    assert (
+        packet["stderr_tail_sha256"]
+        == hashlib.sha256(packet["stderr_tail"].encode("utf-8")).hexdigest()
+    )
+
+
+def _finalize_retry_manager(tmp_path: Path):
+    from aiworkhub import worker_workspace
+
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="review")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "f" * 32
+    worktree = tmp_path / "ws"
+    home = tmp_path / "ws-home"
+    worktree.mkdir()
+    home.mkdir()
+    workspace = process_launcher.WorkerWorkspace(
+        request_id=request_id,
+        repo=manager.repo,
+        path=worktree,
+        home=home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    stdout_path = tmp_path / f"{request_id}.stdout.log"
+    stderr_path = tmp_path / f"{request_id}.stderr.log"
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+    status_path = manager.process_dir / f"{request_id}.supervisor.json"
+    metadata_path = manager.process_dir / f"{request_id}.request.json"
+    # A non-exited terminal state takes the light failure finalization path,
+    # which still runs the shared usage-recording block being exercised here.
+    worker_workspace.write_json_0600(status_path, {"state": "cancelled"})
+    metadata = {
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "model": "claude_cli",
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "supervisor_status_path": str(status_path),
+        "cancel_path": str(tmp_path / f"{request_id}.cancel.json"),
+        "workspace": workspace.as_metadata(),
+    }
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    return manager, request_id, metadata_path, status_path
+
+
+def test_release_pending_retry_records_provider_token_spend(monkeypatch, tmp_path):
+    """fix #8: a release_pending predecessor is a finalization-pending state
+    that never recorded provider spend. On the retry the spend must be recorded,
+    not lost by reusing an empty prior-usage record."""
+
+    manager, request_id, metadata_path, status_path = _finalize_retry_manager(tmp_path)
+    # A release_pending predecessor carried NO recorded usage, then a retry
+    # appended its ``finalizing`` event (as retry_finalization does).
+    common = {
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+        "pid": 999_999_999,
+        "pid_start_ticks": 1,
+    }
+    manager._append_event({**common, "state": "release_pending"})
+    manager._append_event(
+        {**common, "state": "finalizing", "finalization_retry": True}
+    )
+
+    recorded: list[str] = []
+
+    def fake_record_usage(request_id_arg, *_args, **_kwargs):
+        recorded.append(request_id_arg)
+        return {"input_tokens": 123, "output_tokens": 45}, True, ""
+
+    monkeypatch.setattr(manager, "_record_usage", fake_record_usage)
+    monkeypatch.setattr(
+        manager, "_terminal_failure_exact", lambda *a, **k: {"ok": True, "stderr": ""}
+    )
+    monkeypatch.setattr(manager, "_persist_attempt_artifacts", lambda *a, **k: None)
+
+    event = manager._finalize_isolated_request(request_id, 0)
+
+    assert recorded == [request_id]
+    assert event["usage_recorded"] is True
+    assert event["usage"]["input_tokens"] == 123
+
+
+def test_finalization_retry_reuses_prior_recorded_usage(monkeypatch, tmp_path):
+    """A retry whose predecessor already recorded usage must reuse it (no
+    double count), never re-record."""
+
+    manager, request_id, metadata_path, status_path = _finalize_retry_manager(tmp_path)
+    common = {
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+        "pid": 999_999_999,
+        "pid_start_ticks": 1,
+    }
+    manager._append_event(
+        {
+            **common,
+            "state": "finalize_failed",
+            "usage": {"input_tokens": 7},
+            "usage_recorded": True,
+        }
+    )
+    manager._append_event(
+        {**common, "state": "finalizing", "finalization_retry": True}
+    )
+
+    monkeypatch.setattr(
+        manager,
+        "_record_usage",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not re-record already-recorded usage")
+        ),
+    )
+    monkeypatch.setattr(
+        manager, "_terminal_failure_exact", lambda *a, **k: {"ok": True, "stderr": ""}
+    )
+    monkeypatch.setattr(manager, "_persist_attempt_artifacts", lambda *a, **k: None)
+
+    event = manager._finalize_isolated_request(request_id, 0)
+
+    assert event["usage_recorded"] is True
+    assert event["usage"]["input_tokens"] == 7

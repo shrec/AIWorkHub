@@ -314,3 +314,79 @@ def test_suite_profile_collects_per_test_metrics(tmp_path: Path) -> None:
     assert report["tests"][0]["nodeid"].endswith("test_sample.py::test_sample")
     assert report["tests"][0]["run_count"] == 2
     assert report["tests"][0]["flake_observed"] is False
+
+
+def test_quality_gate_ratchet_distinguishes_absent_unreadable_and_shape_invalid(
+    tmp_path: Path,
+) -> None:
+    # Absent baseline: not_configured, never blocking.
+    absent = evidence.quality_gate_ratchet(tmp_path, violations=[])
+    assert absent["status"] == "not_configured"
+    assert absent["blocking"] is False
+    assert absent["reason"] == "baseline_absent"
+
+    config = tmp_path / ".aiworkhub" / "quality-ratchet.json"
+    config.parent.mkdir()
+
+    # Present but unreadable (corrupt/oversized): blocking error, distinguishable
+    # reason -- a corrupt baseline can no longer silently erase the ratchet.
+    config.write_text("{ not json", encoding="utf-8")
+    unreadable = evidence.quality_gate_ratchet(tmp_path, violations=[])
+    assert unreadable["status"] == "error"
+    assert unreadable["blocking"] is True
+    assert unreadable["reason"].startswith("baseline_unreadable:")
+
+    # Parses but is not a Mapping: blocking, shape-invalid reason.
+    config.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    shape = evidence.quality_gate_ratchet(tmp_path, violations=[])
+    assert shape["status"] == "error"
+    assert shape["blocking"] is True
+    assert shape["reason"] == "baseline_shape_invalid"
+
+    # An invalid/escaping path is a misconfiguration, not a corrupt baseline.
+    bad_path = evidence.quality_gate_ratchet(
+        tmp_path, violations=[], baseline_path="../escape.json"
+    )
+    assert bad_path["status"] == "not_configured"
+    assert bad_path["blocking"] is False
+    assert bad_path["reason"].startswith("baseline_path_invalid:")
+
+
+def test_runtime_coverage_shape_invalid_and_zero_matches(tmp_path: Path) -> None:
+    target = tmp_path / ".aiworkhub" / "source_graph" / "runtime_coverage.json"
+    target.parent.mkdir(parents=True)
+
+    # A non-Mapping document is shape-invalid, never an exception.
+    target.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    doc_shape = evidence.runtime_coverage_for_paths(tmp_path, ["a.py"])
+    assert doc_shape["reason"] == "runtime_coverage_projection_shape_invalid"
+    assert doc_shape["status"] != "available"
+
+    # "files" that is not a list is likewise shape-invalid.
+    target.write_text(json.dumps({"files": {"a.py": {}}}), encoding="utf-8")
+    files_shape = evidence.runtime_coverage_for_paths(tmp_path, ["a.py"])
+    assert files_shape["reason"] == "runtime_coverage_projection_shape_invalid"
+    assert files_shape["status"] != "available"
+
+    # Zero matched rows is not_available with matched_files 0 -- never
+    # "available", so an unmeasured path cannot masquerade as measured.
+    target.write_text(
+        json.dumps({"files": [{"file_path": "other.py", "covered_lines": 1, "missing_lines": 0}]}),
+        encoding="utf-8",
+    )
+    zero = evidence.runtime_coverage_for_paths(tmp_path, ["a.py"])
+    assert zero["status"] == "not_available"
+    assert zero["reason"] == "no_runtime_coverage_for_requested_paths"
+    assert zero["matched_files"] == 0
+
+    # Non-Mapping rows are filtered; a real match still measures.
+    target.write_text(
+        json.dumps(
+            {"files": ["garbage", {"file_path": "a.py", "covered_lines": 3, "missing_lines": 1}]}
+        ),
+        encoding="utf-8",
+    )
+    matched = evidence.runtime_coverage_for_paths(tmp_path, ["a.py"])
+    assert matched["status"] == "available"
+    assert matched["matched_files"] == 1
+    assert matched["line_coverage"] == 75.0

@@ -295,10 +295,35 @@ def test_adapt_junit_xml_malformed_is_failed():
     assert check.status == qe.STATUS_FAILED
 
 
-def test_adapt_junit_xml_zero_tests_is_skipped():
+def test_adapt_junit_xml_zero_tests_is_not_available_not_skipped():
+    # A report that ran but exercised no tests is the absence of evidence, not
+    # a pass. STATUS_NOT_AVAILABLE blocks a mandatory test check on both fold
+    # paths; the old STATUS_SKIPPED blocked on only one, so they disagreed.
     xml = '<testsuite tests="0" failures="0" errors="0"></testsuite>'
     check = qe.adapt_junit_xml("junit-check", xml)
-    assert check.status == qe.STATUS_SKIPPED
+    assert check.status == qe.STATUS_NOT_AVAILABLE
+    assert check.status != qe.STATUS_SKIPPED
+    assert check.error == "junit_zero_tests"
+
+
+def test_junit_zero_tests_blocks_on_both_fold_paths():
+    # A zero-test report must satisfy no mandatory test check: NOT_AVAILABLE
+    # blocks on the main declared-check path AND on the combined-tree path, so
+    # the two paths agree on blocking (STATUS_SKIPPED blocked on only one).
+    zero = qe.adapt_junit_xml(
+        "suite", '<testsuite tests="0" failures="0" errors="0"></testsuite>'
+    )
+    mechanical = qe.fold_quality_verdict(
+        [zero], risk_profile=qe.resolve_risk_profile("low")
+    )
+    assert "suite" in mechanical["blocking_evidence"]
+    assert mechanical["passed"] is False
+    combined = qe.fold_quality_verdict(
+        [],
+        risk_profile=qe.resolve_risk_profile("medium"),
+        combined_tree_checks=[zero],
+    )
+    assert "combined_tree:suite" in combined["blocking_evidence"]
 
 
 def test_adapt_coverage_summary_passes_threshold():
