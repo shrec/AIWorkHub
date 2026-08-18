@@ -2471,6 +2471,30 @@ def aiworkhub_environment_preflight(adapter_id: str | None = None) -> dict[str, 
     return repo_policy.build_preflight(core.repo_root(), adapter_id=adapter_id)
 
 
+@mcp.tool()
+def aiworkhub_storage_recover_stranded_worktrees(
+    confirm: bool = False, reason: str = ""
+) -> dict[str, Any]:
+    """Recover retained worktrees stranded outside every reclamation path.
+
+    NF-2026-00279: the storage observability surface recommends this recovery,
+    but it had no tool/MCP/CLI entry point, so an operator was told to run
+    something they could not. This exposes it as a real action.
+
+    READ-ONLY first: ``confirm=False`` (the default) returns a report of the
+    worktrees that would be re-registered and those that are orphaned-but-
+    reclaimable, mutating nothing. ``confirm=True`` requires a non-empty
+    ``reason``, reinstates the provably-owned registrations, and records the
+    reason in the audit log.
+    """
+
+    from . import storage_retention
+
+    return storage_retention.recover_stranded_worktrees(
+        core.repo_root(), confirm=confirm, reason=reason
+    )
+
+
 def _enforce_terminal_retention_safely(root: Path) -> None:
     """Apply retention without ever crashing or polluting MCP stdio startup."""
 

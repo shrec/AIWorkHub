@@ -72,8 +72,9 @@ def _storage_bounds(
                 "quarantine; over the cap, the oldest superseded ones are forced first"
             ),
             "operator_action": (
-                "storage_retention.recover_stranded_worktrees() re-registers or "
-                "reclaims stranded worktrees the automatic path cannot attribute"
+                "storage_retention.recover_stranded_worktrees() -- exposed as the "
+                "aiworkhub_storage_recover_stranded_worktrees MCP tool -- re-registers "
+                "or reclaims stranded worktrees the automatic path cannot attribute"
             ),
             # In-flight rework lineage (NF-2026-00286 owns the 989 half-archived
             # rows) is pinned and never evicted; once those pins release the pinned

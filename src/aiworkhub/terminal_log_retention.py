@@ -507,7 +507,6 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
         eligible_by_task.setdefault(task_id, []).append(item)
 
     orphan_file_bytes = 0
-    orphan_candidates: list[dict[str, Any]] = []
     for request_id, files in sorted(inventory.items()):
         if not files:
             continue
@@ -546,7 +545,13 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
                 protected.append({**item, "reason": "retention_age_not_met"})
             else:
                 candidates.append(item)
-    candidates.extend(orphan_candidates)
+    # NF-2026-00286: an orphan (a per-request file set with no ledger row) can
+    # never be proved to belong to a finished/archived task, so it is always
+    # protected above and fails closed -- it is never a quarantine candidate.
+    # The former ``candidates.extend(orphan_candidates)`` consumed a list that
+    # nothing ever appended to; wiring it would sweep unattributable files and
+    # break that fail-closed guarantee, so the dead path is removed rather than
+    # wired.
     candidates.sort(key=lambda item: item["request_id"])
     digest_source = {
         "schema_id": SCHEMA_ID,
@@ -570,6 +575,16 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
         if legacy_identity["newest_mtime_ns"]
         else None
     )
+    # NF-2026-00286: the legacy ``logs/`` tree is always protected (fail closed),
+    # reported by age -- it is never a quarantine candidate. ``legacy_candidate``
+    # was a dead producer: it only ever stayed ``None``, yet a downstream
+    # ``if legacy_candidate is not None`` digest recompute and two
+    # ``... if legacy_candidate else ...`` accumulators consumed it, reading as a
+    # legacy-quarantine path that could never run -- coverage that was not there.
+    # Wiring it would contradict ``test_aged_legacy_store_is_protected_without_
+    # usage_receipts`` (which pins ``legacy_candidate is None``) and would widen
+    # the eventual-deletion path, so the dead consumers are removed and
+    # ``legacy_candidate`` is a fixed ``None``.
     legacy_candidate = None
     if legacy_current_bytes and legacy_modified is not None and legacy_modified <= cutoff:
         protected.append({
@@ -595,15 +610,8 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
             "files": [],
             "reason": "legacy_retention_age_not_met",
         })
-    if legacy_candidate is not None:
-        digest_source["legacy_candidate"] = legacy_candidate
-        digest = hashlib.sha256(
-            json.dumps(digest_source, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
     observed_current_bytes = canonical_current_bytes + legacy_current_bytes
-    total_candidate_bytes = candidate_bytes + (
-        int(legacy_candidate["size_bytes"]) if legacy_candidate else 0
-    )
+    total_candidate_bytes = candidate_bytes
     return {
         "ok": True,
         "schema_id": SCHEMA_ID,
@@ -622,9 +630,10 @@ def _candidate_payload(root: Path, *, deadline: float | None = None) -> dict[str
         "orphan_file_count": sum(len(files) for files in inventory.values()),
         "orphan_file_bytes": orphan_file_bytes,
         "legacy_status": "present_unmanaged" if legacy_current_bytes else "absent_or_empty",
+        # Always ``None``: the legacy store is never a candidate (see above).
         "legacy_candidate": legacy_candidate,
         "projected_bytes": max(0, observed_current_bytes - total_candidate_bytes),
-        "candidate_count": len(candidates) + (1 if legacy_candidate else 0),
+        "candidate_count": len(candidates),
         "candidate_bytes": total_candidate_bytes,
         "protected_count": len(protected),
         "protected": protected,
@@ -752,7 +761,13 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
     if not current["candidates"] and not current.get("legacy_candidate"):
         return {"ok": True, "quarantined": 0, "bytes": 0, "batch_id": "", "no_op": True}
     now = now_utc()
-    batch_id = f"l{now.strftime('%Y%m%dT%H%M%S')}-{preview_digest[:12]}"
+    # NF-2026-00296: a per-batch unique suffix, never ``preview_digest[:12]``. Two
+    # enforce passes in separate processes compute the SAME digest for the SAME
+    # eligible population within the SAME second, so a digest-derived id collided
+    # on ``batch.mkdir`` (FileExistsError) and one pass crashed. A random 12-hex
+    # suffix (still matching ``_BATCH_RE``) makes each pass stage into its own
+    # directory; the preview digest is retained in the manifest, not the id.
+    batch_id = f"l{now.strftime('%Y%m%dT%H%M%S')}-{os.urandom(6).hex()}"
     batch = _quarantine_root(root) / batch_id
     batch.mkdir(mode=0o700)
     manifest = {
@@ -920,12 +935,34 @@ def restore(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str,
     process_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     restored = 0
     for item in manifest.get("items") or []:
-        if not isinstance(item, dict) or item.get("state") != "quarantined":
+        if not isinstance(item, dict):
+            continue
+        state = item.get("state")
+        # NF-2026-00296: recover from the manifest, not from a state flag alone.
+        # ``quarantine`` moves an item's files, then commits ``state="quarantined"``
+        # in a following manifest write; a crash between the move and that commit
+        # leaves the files physically in the batch while the item still reads
+        # ``planned``. Restoring only ``quarantined`` items stranded those files
+        # with no way back. An item is restorable when its recorded files sit in
+        # the batch: a committed ``quarantined`` item, or a ``planned`` item whose
+        # files are physically present (the interrupted case).
+        if state not in ("quarantined", "planned"):
             continue
         request_id = str(item.get("request_id") or "")
         source_root = batch / request_id
         expected = item.get("files") or []
-        if not _REQUEST_RE.fullmatch(request_id) or any((process_root / str(entry.get("name") or "")).exists() for entry in expected):
+        if not _REQUEST_RE.fullmatch(request_id):
+            continue
+        present = any(
+            (source_root / str(entry.get("name") or "")).is_file() for entry in expected
+        )
+        if state == "planned" and not present:
+            # An interrupted item whose files never moved: they are still in
+            # ``processes`` where they started, so there is nothing in the batch to
+            # restore. Leave it untouched (the identity re-check on a later apply
+            # handles it) rather than marking it acted on.
+            continue
+        if any((process_root / str(entry.get("name") or "")).exists() for entry in expected):
             item["state"] = "restore_conflict"
             _atomic_json(manifest_path, manifest)
             continue
@@ -1089,7 +1126,15 @@ def purge(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str, A
     # purged out from under an operator on a stale record.
     if now_utc() < deadline and not _batch_reapable_empty(manifest, batch):
         raise TerminalLogRetentionError("retention_undo_window_active")
-    released = int(manifest.get("quarantined_bytes") or 0)
+    # NF-2026-00287: report the bytes actually reclaimed from disk, not the
+    # record's ``quarantined_bytes``. A batch whose files exist on disk but are
+    # unclaimed in the record (every item ``skipped_identity_changed`` ->
+    # ``quarantined_bytes`` 0) still physically holds gigabytes; trusting the
+    # record reported "0 bytes reclaimed" while ``rmtree`` freed them all. Measure
+    # the physical non-manifest payload before removal and report the larger of the
+    # two, so a truthful batch is unchanged while the stranded/unclaimed shape
+    # reports what it truly reclaims.
+    released = max(int(manifest.get("quarantined_bytes") or 0), _batch_payload_bytes(batch))
     shutil.rmtree(batch)
     _append_audit(root, {"schema_id": AUDIT_SCHEMA_ID, "timestamp": now_utc().isoformat(), "action": "purge_completed", "batch_id": batch_id, "bytes": released})
     return {"ok": True, "batch_id": batch_id, "purged": True, "bytes": released}
@@ -1184,12 +1229,12 @@ def _stage_reconcile_batch(
     on any caller holding ``_enforcement_lock``.
     """
     now = now_utc()
-    seed = json.dumps(
-        [action] + sorted(str(item["name"]) for item in sources),
-        sort_keys=True,
-    ).encode("utf-8")
-    digest = hashlib.sha256(seed).hexdigest()
-    batch_id = f"l{now.strftime('%Y%m%dT%H%M%S')}-{digest[:12]}"
+    # NF-2026-00296: a per-batch unique suffix, never derived from ``action`` +
+    # the source names. Two enforce passes in separate processes that observed the
+    # same strays within the same second computed an identical id and collided on
+    # ``batch.mkdir`` (FileExistsError), crashing one pass. A random 12-hex suffix
+    # (still matching ``_BATCH_RE``) gives each pass its own staging directory.
+    batch_id = f"l{now.strftime('%Y%m%dT%H%M%S')}-{os.urandom(6).hex()}"
     qroot = _quarantine_root(root)
     batch = qroot / batch_id
     batch.mkdir(mode=0o700)

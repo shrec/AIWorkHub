@@ -1449,6 +1449,7 @@ def restore(
     restored = 0
     reinstated: list[str] = []
     registration_lost: list[str] = []
+    workspace_absent: list[str] = []
     for item in manifest["items"]:
         if not isinstance(item, dict) or item.get("state") != "quarantined":
             continue
@@ -1463,6 +1464,19 @@ def restore(
             continue
         os.replace(source, destination)
         restored += 1
+        checkout = destination / "worktree"
+        if not checkout.is_dir() or checkout.is_symlink():
+            # NF-2026-00162: the retained workspace itself is gone (swept), not
+            # merely dis-registered. Reinstating the registration would fail its
+            # git-identity check and surface as ``restored_registration_lost`` /
+            # ``retention_restore_registration_failed`` -- a hash/identity drift
+            # that sends the operator hunting for tampering instead of for a swept
+            # directory. Name the absence directly and skip the registration path,
+            # whose comparison assumes the checkout is present.
+            item["state"] = "restored_workspace_absent"
+            workspace_absent.append(item_id)
+            _atomic_json(manifest_path, manifest)
+            continue
         # Moving the checkout back is only half the round trip: the git worktree
         # registration the quarantine move orphaned must be reinstated too, or the
         # restored directory is attributed to nobody and every reclamation path
@@ -1473,7 +1487,6 @@ def restore(
             _reinstate_registration(root, worktree_base, item, repo_common_dir)
         except StorageRetentionError:
             pass
-        checkout = destination / "worktree"
         if repo_common_dir and worktree_storage._git_common_dir(checkout) == repo_common_dir:
             item["state"] = "restored"
             reinstated.append(item_id)
@@ -1487,6 +1500,7 @@ def restore(
     manifest["status"] = "restored" if restored else manifest.get("status", "quarantined")
     manifest["restored_count"] = len(reinstated)
     manifest["registration_lost"] = sorted(registration_lost)
+    manifest["workspace_absent"] = sorted(workspace_absent)
     _atomic_json(manifest_path, manifest)
     _append_audit(root, {
         "schema_id": "aiworkhub.storage_retention_audit.v1",
@@ -1496,7 +1510,15 @@ def restore(
         "count": restored,
         "reinstated": len(reinstated),
         "registration_lost": sorted(registration_lost),
+        "workspace_absent": sorted(workspace_absent),
     })
+    if workspace_absent:
+        # Named ahead of any registration failure: a swept retained workspace is a
+        # distinct condition from a registration/identity drift, and reporting it
+        # as the latter is exactly the misdirection NF-2026-00162 removes.
+        raise StorageRetentionError(
+            "retention_restore_workspace_absent:" + ",".join(sorted(workspace_absent))
+        )
     if registration_lost:
         # A restore that returns the files but not their registration is worse
         # than a failed restore: it looks like success while permanently
