@@ -2790,3 +2790,228 @@ def test_validation_permission_failure_does_not_obscure_candidate_failure(
     assert results[0]["failure_receipt"]["failure_class"] == "permission_denied"
     assert results[1]["returncode"] == 1
     assert results[1]["failure_receipt"]["failure_class"] == "nonzero_exit"
+    # NF-WAVE-SANDBOX-TRUTH: a genuine gate failure in the batch keeps the
+    # terminal state ``validation_failed`` even though an environment restriction
+    # (the refused spawn) is also present. The recoverable, supersede-free
+    # environment-blocked state is claimed ONLY when EVERY failure is
+    # environmental, so validation_failed is never weakened. Before this change
+    # the batch was simply ``validation_failed`` with no terminal_state field;
+    # after, it is still validation_failed and explicitly not reclassified.
+    assert not isinstance(caught.value, worker_workspace.ValidationEnvironmentBlocked)
+    assert caught.value.terminal_state == "validation_failed"
+    assert caught.value.requires_supersede is True
+
+
+# ── NF-2026-00285: create/promote consistency window ───────────────────────
+
+
+def test_create_workspace_refuses_to_seed_during_promotion_in_flight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+    )
+    # Model a promotion writing into the parent tree: an in-flight marker for
+    # some other request exists while a create is attempted.
+    inflight = worker_workspace._promotion_inflight_dir(repo)
+    inflight.mkdir(parents=True, exist_ok=True)
+    marker = inflight / "other-request"
+    marker.write_text("", encoding="utf-8")
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="worktree_seed_refused_promotion_in_flight",
+    ):
+        worker_workspace.create_workspace(
+            repo,
+            "req-during-promo",
+            {"allowed_writes": ["out/result.txt"], "read_first": ["read/input.txt"]},
+            "validation",
+        )
+
+    # Once the promotion completes and the marker is gone, seeding succeeds and
+    # sees a consistent tree.
+    marker.unlink()
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "req-after-promo",
+        {"allowed_writes": ["out/result.txt"], "read_first": ["read/input.txt"]},
+        "validation",
+    )
+    try:
+        assert workspace.path.is_dir()
+        assert (workspace.path / "read" / "input.txt").read_bytes() == b"input-v1\n"
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_promote_marks_and_clears_the_in_flight_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "promo-window")
+    marker = worker_workspace._promotion_inflight_dir(repo) / workspace.request_id
+    observed = {"during_write": None}
+    try:
+        (workspace.path / "out" / "result.txt").write_bytes(b"result-v2\n")
+
+        real_copyfile = worker_workspace.shutil.copyfile
+
+        def _spy_copyfile(source, destination, *args, **kwargs):
+            observed["during_write"] = marker.exists()
+            return real_copyfile(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(worker_workspace.shutil, "copyfile", _spy_copyfile)
+
+        promoted = worker_workspace.promote(workspace, ["out/result.txt"])
+
+        assert promoted == ["out/result.txt"]
+        # The marker existed WHILE the parent tree was being written...
+        assert observed["during_write"] is True
+        # ...and was cleared once promotion finished, so later creates are not
+        # blocked forever.
+        assert not marker.exists()
+        assert (repo / "out" / "result.txt").read_bytes() == b"result-v2\n"
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_create_workspace_rechecks_promotion_marker_appearing_during_seed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    # NF-2026-00285 check-then-act closure: the up-front guard passes (no marker
+    # yet), then a promotion begins WHILE the new worktree is still copying the
+    # declared inputs from the live parent tree -- the exact window a single
+    # up-front check cannot see. The seed must be refused with the named reason,
+    # not returned as a half-promoted, inconsistent tree.
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+    )
+    inflight = worker_workspace._promotion_inflight_dir(repo)
+    real_copy_one = worker_workspace._copy_one
+    planted = {"done": False}
+
+    def _plant_marker_mid_seed(source, destination):
+        if not planted["done"]:
+            inflight.mkdir(parents=True, exist_ok=True)
+            (inflight / "concurrent-promotion").write_text("", encoding="utf-8")
+            planted["done"] = True
+        return real_copy_one(source, destination)
+
+    monkeypatch.setattr(worker_workspace, "_copy_one", _plant_marker_mid_seed)
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="worktree_seed_refused_promotion_in_flight",
+    ):
+        worker_workspace.create_workspace(
+            repo,
+            "req-marker-mid-seed",
+            {"allowed_writes": ["out/result.txt"], "read_first": ["read/input.txt"]},
+            "validation",
+        )
+
+    # The up-front check ran before any copy (so it saw no marker)...
+    assert planted["done"] is True
+    # ...and the half-seeded worktree was cleaned up rather than handed back.
+    assert not (tmp_path / "worktrees" / "req-marker-mid-seed").exists()
+
+
+# ── NF-WAVE-SANDBOX-TRUTH (rework, HIGH SECURITY): the host validator probe
+# must never execute candidate-authored code ───────────────────────────────
+
+
+def test_host_probe_pythonpath_drops_candidate_writable_components(
+    tmp_path: Path,
+) -> None:
+    """Only trusted host-absolute validator roots may reach the probe's
+    sys.path; every candidate-writable (``.``/relative) component is dropped."""
+    worktree = tmp_path / "worktree"
+    (worktree / "sub").mkdir(parents=True)
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="host-probe-drop",
+        repo=tmp_path,
+        path=worktree,
+        home=tmp_path / "home",
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    trusted = tmp_path / "trusted-site"
+    trusted.mkdir()
+    result = worker_workspace._host_probe_pythonpath(
+        workspace, (str(trusted), ".", "sub")
+    )
+    parts = result.split(os.pathsep) if result else []
+    # The trusted absolute root survives; no candidate-writable path is on it.
+    assert parts == [str(trusted)]
+    assert str(worktree) not in result
+    assert str(worktree / "sub") not in result
+
+
+def test_validator_probe_never_executes_candidate_sitecustomize(
+    tmp_path: Path,
+) -> None:
+    """The probe runs on the HOST. A candidate that plants ``sitecustomize.py``
+    in its worktree root must never get it executed by the probe interpreter's
+    site initialization (arbitrary code execution as the coordinator user)."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    marker = tmp_path / "SITECUSTOMIZE_EXECUTED"
+    (worktree / "sitecustomize.py").write_text(
+        "import pathlib\n"
+        f"pathlib.Path({str(marker)!r}).write_text('rce', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="probe-sitecustomize",
+        repo=tmp_path,
+        path=worktree,
+        home=tmp_path / "home",
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+
+    # Control: prove the planted sitecustomize IS functional -- with the worktree
+    # on PYTHONPATH and ordinary site processing, it executes and writes the
+    # marker. Otherwise this regression could pass vacuously.
+    control = dict(os.environ)
+    control["PYTHONPATH"] = str(worktree)
+    control.pop("PYTHONSAFEPATH", None)
+    control.pop("PYTHONNOUSERSITE", None)
+    subprocess.run(
+        [sys.executable, "-c", "pass"],
+        env=control,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert marker.exists(), "planted sitecustomize is inert; the test would be vacuous"
+    marker.unlink()
+
+    # The real probe: the candidate-writable "." component is dropped from the
+    # probe PYTHONPATH and PYTHONSAFEPATH suppresses the implicit cwd entry, so
+    # the worktree is never on sys.path and sitecustomize never runs.
+    worker_workspace._probe_absent_validator_modules(
+        workspace, ["python3", "-m", "pytest"], (".",)
+    )
+    assert not marker.exists(), (
+        "candidate sitecustomize.py executed on the host during the validator probe"
+    )
+
+
+def test_terminal_state_literals_match_validation_runner() -> None:
+    # worker_workspace.py re-states VALIDATION_FAILED / VALIDATION_ENVIRONMENT_BLOCKED
+    # as bare literals because it must load as a direct Landlock-wrapper script with
+    # no package context (see the comment above the constants and
+    # tests/test_runtime_temp.py::test_worker_workspace_direct_script_resolves_sibling_runtime_temp,
+    # which catches a sibling-import fallback failing in that mode). This guard
+    # enforces the promise made in that comment: the duplication must never drift
+    # from validation_runner's authoritative source of truth.
+    from aiworkhub import validation_runner
+
+    assert worker_workspace.VALIDATION_FAILED == validation_runner.VALIDATION_FAILED
+    assert (
+        worker_workspace.VALIDATION_ENVIRONMENT_BLOCKED
+        == validation_runner.VALIDATION_ENVIRONMENT_BLOCKED
+    )

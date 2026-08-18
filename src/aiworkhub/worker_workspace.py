@@ -60,6 +60,29 @@ except ImportError:  # direct-script Landlock entrypoint
         return (platform_name or os.name) != "nt"
 
 
+# ``VALIDATION_FAILED`` / ``VALIDATION_ENVIRONMENT_BLOCKED`` name the two terminal
+# states this module's ``ValidationRunError`` hierarchy carries at class-definition
+# time.  ``validation_runner`` is their authoritative source of truth, but this
+# module MUST also load as a BARE SCRIPT: it is executed directly as the Landlock
+# wrapper (``<python> src/aiworkhub/worker_workspace.py --landlock-exec ...``),
+# loaded by file location with NO package context, so ``from .validation_runner
+# import ...`` has no package to resolve AND ``from validation_runner import ...``
+# has no sys.path entry for the sibling either (the module's own directory is not
+# on sys.path in that mode -- exactly what
+# ``tests/test_runtime_temp.py::test_worker_workspace_direct_script_resolves_sibling_runtime_temp``
+# reproduces, which caught the previous sibling-import fallback).  Unlike
+# ``runtime_temp`` -- a whole module resolved by file location because its
+# behaviour is needed -- only these two immutable string constants are needed here,
+# so a sibling-import dependency that cannot exist in bare-script mode is avoided
+# entirely by re-stating the literals.  ``tests/test_worker_workspace.py`` asserts
+# they stay byte-identical to ``validation_runner``'s definitions, so this
+# deliberate duplication cannot silently drift.  The live classifier
+# (``classify_validation_results``) is imported package-relatively at its one call
+# site below, which only runs under the package-imported entrypoint.
+VALIDATION_FAILED = "validation_failed"
+VALIDATION_ENVIRONMENT_BLOCKED = "validation_environment_blocked"
+
+
 def _load_runtime_temp():
     """Resolve the runtime_temp authority module deterministically.
 
@@ -261,11 +284,57 @@ class WorkspaceError(RuntimeError):
 
 
 class ValidationRunError(WorkspaceError):
-    """A bounded validation batch failed with structured rows retained."""
+    """A bounded validation batch failed with structured rows retained.
+
+    The default terminal disposition is ``validation_failed``: the candidate
+    failed its gate and must not be accepted. ``retry_terminal``/``accept_review``
+    /``mark_done`` refuse it (a supersede is the only way out), which is the
+    correct, unchanged behaviour for a genuine failure.
+    """
+
+    # Single source of truth for the terminal state a caught ValidationRunError
+    # maps to. A subclass overrides it; the finalizer should read
+    # ``getattr(exc, "terminal_state", ...)`` rather than hardcoding the string.
+    terminal_state: str = VALIDATION_FAILED
+    recoverable: bool = False
+    requires_supersede: bool = True
+    restriction: str | None = None
 
     def __init__(self, message: str, results: list[dict[str, Any]]) -> None:
         super().__init__(message)
         self.results = [dict(row) for row in results]
+
+
+class ValidationEnvironmentBlocked(ValidationRunError):
+    """The validation command could not run in this sandbox (NF-2026-00271/298).
+
+    A distinct, *additional* terminal state -- never a relabelling of a real
+    failure. It names the exact restriction (a forbidden spawn, a refused
+    chmod, an absent interpreter, a missing validator package) and is
+    operationally recoverable: re-running in a corrected environment clears it,
+    so unlike ``validation_failed`` it does not require a supersede.
+
+    Subclasses ``ValidationRunError`` on purpose: existing ``except
+    ValidationRunError`` finalizer paths still catch it (they never crash), but
+    a finalizer that reads ``terminal_state`` routes it to the recoverable
+    state instead of the acceptance-blocking one.
+    """
+
+    terminal_state = VALIDATION_ENVIRONMENT_BLOCKED
+    recoverable = True
+    requires_supersede = False
+
+    def __init__(
+        self,
+        message: str,
+        results: list[dict[str, Any]],
+        *,
+        restriction: str,
+        restrictions: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message, results)
+        self.restriction = restriction
+        self.restrictions = restrictions or (restriction,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1317,6 +1386,13 @@ def create_workspace(
         raise WorkspaceError(f"worktree_root_inside_parent_repo:{root}")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     chmod_path(root, 0o700)
+    # NF-2026-00285: never seed while a promotion is mutating the parent tree.
+    # This up-front check alone is check-then-act: a promotion whose in-flight
+    # marker appears AFTER it but during the seed window below would be missed
+    # (raised on review). The seed is re-checked once more after it completes
+    # (see below), so a promotion overlapping the window is caught rather than
+    # returned as a half-promoted, inconsistent tree.
+    _refuse_if_promotion_in_flight(repo)
     path = root / request_id / "worktree"
     home = root / request_id / "home"
     if (path == repo or repo in path.parents) and root != canonical_repo_root:
@@ -1374,6 +1450,15 @@ def create_workspace(
         }
         _credential_home(home, adapter_id, repo)
         provision_isolated_task_queue_db(repo, home)
+        # NF-2026-00285 (check-then-act closure): re-check at the end of the seed
+        # window. The declared inputs were just copied from the LIVE parent tree;
+        # if a promotion began writing into that tree at any point during the
+        # copy loop above and is still in flight now, this seed may have captured
+        # a half-promoted mix, so refuse it (and clean up via the except below)
+        # rather than hand back an inconsistent tree. ``promote`` holds its
+        # marker across its entire parent-write loop, so an overlapping promotion
+        # is still marked here.
+        _refuse_if_promotion_in_flight(repo)
     except Exception:
         cleanup_workspace(repo, path, home)
         raise
@@ -1879,6 +1964,68 @@ def validate_required_outputs(
     return records
 
 
+def _promotion_inflight_dir(repo: Path) -> Path:
+    """Directory of per-request markers for promotions writing into the parent
+    working tree right now (NF-2026-00285)."""
+    return configured_worktree_root(repo) / ".promotion_inflight"
+
+
+def _promotion_begin(workspace: "WorkerWorkspace") -> Path | None:
+    """Mark this request's promotion in flight; return the marker path.
+
+    ``promote`` writes into the parent working tree BEFORE the coordinator
+    commits. A worktree seeded from git ``HEAD`` in that window sees a tree that
+    mixes pre-promotion committed content (everything outside the promoted
+    scope) with the just-promoted files -- an inconsistent snapshot of no single
+    point in time. ``create_workspace`` refuses to seed while any marker exists,
+    so a concurrent create is turned away with a named reason rather than handed
+    the inconsistent tree.
+
+    Best-effort: if the marker cannot be created (a read-only root, say) the
+    promotion itself must never be blocked, so this returns ``None`` and
+    promotion proceeds exactly as before -- the guard only ever ADDS protection.
+    """
+    try:
+        directory = _promotion_inflight_dir(workspace.repo)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker = directory / workspace.request_id
+        # O_CREAT (no O_EXCL): a same-request re-promotion reuses its marker
+        # instead of failing, and the finally-block removal keeps it bounded.
+        fd = os.open(marker, os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(fd)
+        return marker
+    except OSError:
+        return None
+
+
+def _promotion_end(marker: Path | None) -> None:
+    if marker is not None:
+        unlink_if_regular(marker)
+
+
+def _refuse_if_promotion_in_flight(repo: Path) -> None:
+    """Refuse to seed a new worktree while a promotion is writing into the
+    parent working tree (NF-2026-00285), naming the in-flight requests.
+
+    Choosing refusal over a best-effort "consistent" seed is deliberate: the
+    declared read_first/allowed inputs are copied from the LIVE parent tree
+    (which may hold untracked/gitignored artifacts and prior uncommitted
+    promotions), so there is no single committed base that reproduces them --
+    the only consistent options are "seed outside the write window" or "refuse".
+    """
+    directory = _promotion_inflight_dir(repo)
+    try:
+        entries = sorted(
+            name for name in os.listdir(directory) if not name.startswith(".")
+        )
+    except OSError:
+        return
+    if entries:
+        raise WorkspaceError(
+            f"worktree_seed_refused_promotion_in_flight:{repo}:{entries[:8]}"
+        )
+
+
 def promote(workspace: WorkerWorkspace, changed: Iterable[str]) -> list[str]:
     """Copy each declared-changed path from the isolated worktree into the
     parent repo, hash-guarded against concurrent parent edits.
@@ -1919,36 +2066,42 @@ def promote(workspace: WorkerWorkspace, changed: Iterable[str]) -> list[str]:
         if current not in {expected, source_hash}:
             raise WorkspaceError(f"parent_changed_since_launch:{relative}")
 
+    # Mark the parent-tree write window so a concurrent ``create_workspace``
+    # refuses to seed rather than capturing a half-promoted, inconsistent tree.
+    marker = _promotion_begin(workspace)
     promoted: list[str] = []
-    for relative in paths:
-        parent = workspace.repo / relative
-        source = workspace.path / relative
-        expected = workspace.parent_baseline.get(relative)
-        current = _hash_path(parent)
-        if current == desired[relative]:
+    try:
+        for relative in paths:
+            parent = workspace.repo / relative
+            source = workspace.path / relative
+            expected = workspace.parent_baseline.get(relative)
+            current = _hash_path(parent)
+            if current == desired[relative]:
+                promoted.append(relative)
+                continue
+            if current != expected:
+                raise WorkspaceError(f"parent_changed_during_promotion:{relative}")
+            if not source.exists() and not source.is_symlink():
+                if parent.exists() or parent.is_symlink():
+                    parent.unlink()
+                promoted.append(relative)
+                continue
+            if source.is_symlink() or not source.is_file():
+                raise WorkspaceError(f"invalid_promotion_source:{relative}")
+            parent.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(prefix=f".{parent.name}.", dir=parent.parent)
+            os.close(fd)
+            temp = Path(temp_name)
+            try:
+                shutil.copyfile(source, temp)
+                mode = stat.S_IMODE(source.stat().st_mode) & 0o777
+                chmod_path(temp, mode or 0o644)
+                os.replace(temp, parent)
+            finally:
+                temp.unlink(missing_ok=True)
             promoted.append(relative)
-            continue
-        if current != expected:
-            raise WorkspaceError(f"parent_changed_during_promotion:{relative}")
-        if not source.exists() and not source.is_symlink():
-            if parent.exists() or parent.is_symlink():
-                parent.unlink()
-            promoted.append(relative)
-            continue
-        if source.is_symlink() or not source.is_file():
-            raise WorkspaceError(f"invalid_promotion_source:{relative}")
-        parent.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=f".{parent.name}.", dir=parent.parent)
-        os.close(fd)
-        temp = Path(temp_name)
-        try:
-            shutil.copyfile(source, temp)
-            mode = stat.S_IMODE(source.stat().st_mode) & 0o777
-            chmod_path(temp, mode or 0o644)
-            os.replace(temp, parent)
-        finally:
-            temp.unlink(missing_ok=True)
-        promoted.append(relative)
+    finally:
+        _promotion_end(marker)
     return promoted
 
 
@@ -4509,6 +4662,142 @@ def validation_failure_delta_packet(
     return packet
 
 
+# A minimal child that reports which of the named modules are NOT importable, so
+# the terminal state is DECIDED by a real import in the invoked interpreter
+# rather than by matching a message in the candidate's own output.
+_VALIDATOR_MODULE_PROBE = (
+    "import importlib.util, sys\n"
+    "sys.stdout.write(chr(10).join("
+    "n for n in sys.argv[1:] if importlib.util.find_spec(n) is None))\n"
+)
+
+
+def _validator_probe_interpreter(tokens: list[str]) -> str | None:
+    if not tokens:
+        return None
+    head = str(tokens[0])
+    if Path(head).name.startswith("python"):
+        if os.path.isabs(head) and Path(head).exists():
+            return head
+        return shutil.which(head) or sys.executable
+    # ``pytest``-console-script commands are normalized to ``sys.executable -m
+    # pytest`` before this point, so the invoked interpreter is the trusted
+    # coordinator interpreter.
+    return sys.executable
+
+
+def _host_probe_pythonpath(
+    workspace: WorkerWorkspace, components: tuple[str, ...]
+) -> str:
+    """Host-side PYTHONPATH for the validator-import probe, with every
+    candidate-writable component removed (NF-WAVE-SANDBOX-TRUTH security fix).
+
+    The probe runs on the HOST -- in the coordinator process, NOT inside the
+    sandbox -- to decide whether a ``-m``-invoked validator is importable. It
+    must therefore never place a candidate-writable directory on the probe
+    interpreter's ``sys.path``: CPython's site initialization imports
+    ``sitecustomize`` (and, absent ``PYTHONNOUSERSITE``, ``usercustomize``) from
+    ANY ``sys.path`` entry, so a candidate that dropped a ``sitecustomize.py``
+    into its worktree root would gain arbitrary code execution in the
+    coordinator as soon as the probe interpreter started. ``PYTHONNOUSERSITE``
+    only disables the user site and ``usercustomize`` -- it does nothing about a
+    ``sitecustomize`` reached through a PYTHONPATH entry.
+
+    Only the trusted, host-absolute validator roots in ``components`` (the
+    approved user-site / pytest runtime root, already identity-checked by
+    ``_approved_pythonpath_site`` / ``resolve_trusted_pytest_runtime_root``) are
+    kept. Every workspace-relative component -- ``.`` (the worktree root) and any
+    ``sub/dir`` beneath it, all candidate-writable -- is dropped. This never
+    causes a false "absent": a genuine validator (pytest/ruff/mypy/coverage) is
+    never shipped by the candidate through a relative component -- it resolves via
+    a trusted absolute root or the interpreter's own site-packages, both still on
+    the probe path -- so the probe still cannot report an importable validator as
+    absent, while the code-execution vector is closed.
+    """
+    parts: list[str] = []
+    for component in components:
+        if component == "." or not os.path.isabs(component):
+            # A workspace-relative (candidate-writable) component -- never placed
+            # on the host probe's sys.path.
+            continue
+        parts.append(component)
+    return os.pathsep.join(parts)
+
+
+def _probe_absent_validator_modules(
+    workspace: WorkerWorkspace,
+    tokens: list[str],
+    components: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return the ``-m``-invoked validator modules genuinely absent from the
+    interpreter that ran the command (NF-WAVE-SANDBOX-TRUTH).
+
+    ``validation_runner.row_restriction`` DECIDES ``missing_package`` from this
+    result alone, so it must be authored here by a real import probe -- never
+    from candidate output text. Fail-closed toward the strict state: any probe
+    that cannot run (no interpreter, OSError, timeout, or a nonzero probe exit)
+    returns ``()`` so a genuine gate failure is never mis-downgraded; only a
+    validator the runner positively proved absent is reported.
+
+    Which ``-m <module>`` is python's module selector (and which is pytest's own
+    ``-m <marker>``) is decided by the SAME shared pytest argument model the
+    create-time preflight uses (``validation_runner.dash_m_validator_modules``),
+    so ``pytest -m coverage`` never probes a module named ``coverage``. Imported
+    lazily: this function only runs under the package-imported ``run_validations``
+    entrypoint, never the bare-script Landlock wrapper.
+    """
+    from . import validation_runner
+
+    modules = validation_runner.dash_m_validator_modules(tokens)
+    if not modules:
+        return ()
+    interpreter = _validator_probe_interpreter(tokens)
+    if interpreter is None:
+        return ()
+    probe_env = {
+        key: os.environ[key]
+        for key in ("PATH", "SYSTEMROOT", "SystemRoot", "WINDIR", "LANG", "LC_ALL")
+        if key in os.environ
+    }
+    # Mirror the real validation run's import surface: ``sanitized_env`` gives the
+    # command an isolated HOME with no ``~/.local`` user site, binding validators
+    # only through the trusted roots carried in ``components``. Suppress user site
+    # here too so the probe cannot "find" a validator via the coordinator user's
+    # ~/.local that the sandboxed command could never import -- which would
+    # falsely mark it present.
+    probe_env["PYTHONNOUSERSITE"] = "1"
+    # Security (NF-WAVE-SANDBOX-TRUTH): the probe runs on the HOST, so it must
+    # never load a candidate-authored ``sitecustomize``. Two independent
+    # ``sys.path`` entries could reach one: a PYTHONPATH component (closed by
+    # ``_host_probe_pythonpath``, which drops every candidate-writable component)
+    # and the implicit ``-c`` cwd/empty entry (closed here by PYTHONSAFEPATH,
+    # honoured on 3.11+ and inert earlier -- equivalent to ``-P``, and unlike
+    # ``-I``/``-E`` it does NOT ignore PYTHONPATH, so the trusted validator roots
+    # the probe genuinely needs stay visible).
+    probe_env["PYTHONSAFEPATH"] = "1"
+    pythonpath = _host_probe_pythonpath(workspace, components)
+    if pythonpath:
+        probe_env["PYTHONPATH"] = pythonpath
+    try:
+        probe = subprocess.run(
+            [interpreter, "-c", _VALIDATOR_MODULE_PROBE, *modules],
+            env=probe_env,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    if probe.returncode != 0:
+        return ()
+    reported = {line.strip() for line in (probe.stdout or "").splitlines() if line.strip()}
+    return tuple(name for name in modules if name in reported)
+
+
 def run_validations(
     workspace: WorkerWorkspace,
     commands: Iterable[str],
@@ -4788,6 +5077,15 @@ def run_validations(
                 "stderr_truncated": len(stderr) > 8_192,
             }
             if result.returncode != 0:
+                # NF-WAVE-SANDBOX-TRUTH: prove any missing *validator* module by
+                # importing it in the SAME interpreter that ran the command, so
+                # the terminal state is decided by a structural probe rather than
+                # by "No module named ..." text the candidate can author.
+                absent_modules = _probe_absent_validator_modules(
+                    workspace, tokens, effective_components
+                )
+                if absent_modules:
+                    record["absent_validator_modules"] = list(absent_modules)
                 record["failure_receipt"] = _validation_failure_receipt(record)
                 if record["failure_receipt"].get("failure_class") == "type_check_internal_error":
                     record["internal_error"] = {
@@ -4802,6 +5100,28 @@ def run_validations(
         ]
         if failed:
             first = failed[0]
+            # NF-2026-00271/298: separate "the candidate failed its gate" from
+            # "this command could not run here". ``classify_validation_results``
+            # returns environment-blocked ONLY when every failing command is an
+            # environment restriction -- if any is a genuine gate failure the
+            # batch stays ``validation_failed``, so a broken candidate is never
+            # let through as merely blocked.
+            from . import validation_runner
+
+            terminal = validation_runner.classify_validation_results(results)
+            if terminal.state == validation_runner.VALIDATION_ENVIRONMENT_BLOCKED:
+                stderr_detail = str(first.get("stderr_tail") or "")[-1_000:].replace("\n", "\\n")
+                reason = (
+                    f"{terminal.state}:{terminal.restriction}:"
+                    f"{first.get('command')}:restrictions="
+                    f"{','.join(terminal.restrictions)}:stderr={stderr_detail}"
+                )
+                raise ValidationEnvironmentBlocked(
+                    reason,
+                    results,
+                    restriction=terminal.restriction or "",
+                    restrictions=terminal.restrictions,
+                )
             if first.get("timed_out"):
                 reason = (
                     f"validation_timeout:{first.get('command')}:"
@@ -4868,6 +5188,8 @@ __all__ = [
     "SANDBOX_PACKAGE_IMPORT_ROOT",
     "SANDBOX_WORKSPACE",
     "TASK_QUEUE_ISOLATED_RELATIVE",
+    "ValidationEnvironmentBlocked",
+    "ValidationRunError",
     "WorkerWorkspace",
     "WorkspaceError",
     "assert_gc_safe_workspace_shape",
