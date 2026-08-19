@@ -38,7 +38,22 @@ STATUS_FAILED = "failed"
 STATUS_NOT_AVAILABLE = "not_available"
 STATUS_SKIPPED = "skipped"
 STATUS_REVIEWER_COULD_NOT_INSPECT = "reviewer_could_not_inspect"
-VALID_STATUSES = frozenset({STATUS_PASSED, STATUS_FAILED, STATUS_NOT_AVAILABLE, STATUS_SKIPPED})
+# Every status the deterministic fold can write into a lens row is enumerated
+# here once, and VALID_STATUSES is derived from that single tuple. The fold
+# assigns reviewer_could_not_inspect to a lens whose dispatched reviewer was
+# blind (see fold_quality_verdict); omitting it from VALID_STATUSES -- as the
+# hand-written set did -- made the module reject a row its own verdict
+# legitimately produced. Deriving the set from LENS_STATUSES keeps the validity
+# vocabulary and the fold's writable vocabulary from drifting apart again, and
+# quality_verdict_contract() publishes this exact set rather than a second copy.
+LENS_STATUSES = (
+    STATUS_SKIPPED,
+    STATUS_PASSED,
+    STATUS_FAILED,
+    STATUS_NOT_AVAILABLE,
+    STATUS_REVIEWER_COULD_NOT_INSPECT,
+)
+VALID_STATUSES = frozenset(LENS_STATUSES)
 
 LENS_CORRECTNESS = "correctness"
 LENS_DOES_IT_RUN = "does_it_run"
@@ -966,27 +981,22 @@ def reviewer_report_could_not_inspect(report: Mapping[str, Any]) -> bool:
     return False
 
 
-def _reviewer_model_for(
-    raw_reports: list[Mapping[str, Any]], lens: str, provider: str
-) -> str:
-    """Recover a reviewer's declared model from the raw report for (lens, provider).
+def _reviewer_model_for(report: Mapping[str, Any]) -> str:
+    """Recover a reviewer's declared model from the raw report it describes.
 
-    The normalized report intentionally carries no ``model`` key (its shape is a
-    fixed five-key contract), so the fold reads the model -- when a receipt
-    supplies one -- straight from the raw report. Absent/non-string is a bounded
-    ``""``, which resolves to the same_model rung against a same-provider worker.
+    The rung is derived from the report ITSELF, never by searching the report
+    list for the first ``(lens, provider)`` match: two reviewers for the same
+    lens and provider on different models must resolve to their OWN models, not
+    both to the first one found. The normalized report intentionally carries no
+    ``model`` key (its shape is a fixed five-key contract), so the model is read
+    straight from the raw report. Absent/non-string is a bounded ``""``, which
+    resolves to the same_model rung against a same-model worker.
     """
 
-    for report in raw_reports:
-        if not isinstance(report, Mapping):
-            continue
-        if report.get("lens") != lens:
-            continue
-        raw_provider = report.get("provider")
-        if isinstance(raw_provider, str) and raw_provider.strip() == provider:
-            model = report.get("model")
-            return model.strip() if isinstance(model, str) else ""
-    return ""
+    if not isinstance(report, Mapping):
+        return ""
+    model = report.get("model")
+    return model.strip() if isinstance(model, str) else ""
 
 
 def _best_independence_rung(
@@ -1001,25 +1011,36 @@ def _best_independence_rung(
 
     Independence is the recorded ladder resolved by
     :func:`quality_review.resolve_independence_rung`, never a vendor comparison.
-    Only the validated normalized ``provider`` is trusted for identity; the
-    reviewer model is recovered from the raw report. When a lens has several
-    reports the best (lowest ``rung_index``, i.e. most independent) rung is the
-    one recorded. ``reports`` is non-empty by construction, so a rung is always
-    returned.
+    Each rung is derived from the RAW report it describes -- that report's own
+    provider and its own model -- so a second reviewer for the same lens and
+    provider on a different model is no longer invisible, and a same-model review
+    can no longer be recorded at a cross-model rung. Only reports carrying the
+    validated read-only reviewer shape and a non-empty string provider are
+    counted. ``reports`` is non-empty by construction, so at least one matching
+    raw report exists and a rung is always returned. When a lens has several
+    reports the best (lowest ``rung_index``, i.e. most independent) rung is kept.
     """
 
     best: dict[str, Any] | None = None
-    for report in reports:
-        provider = str(report.get("provider") or "")
+    for report in raw_reports:
+        if not isinstance(report, Mapping) or report.get("lens") != lens:
+            continue
+        if report.get("read_only") is not True or report.get("can_mutate_repo") is not False:
+            continue
+        provider = report.get("provider")
+        if not isinstance(provider, str) or not provider.strip():
+            continue
         record = quality_review.resolve_independence_rung(
             worker_provider=worker_provider,
-            reviewer_provider=provider,
+            reviewer_provider=provider.strip(),
             worker_model=worker_model,
-            reviewer_model=_reviewer_model_for(raw_reports, lens, provider),
+            reviewer_model=_reviewer_model_for(report),
         )
         if best is None or record["rung_index"] < best["rung_index"]:
             best = record
-    assert best is not None  # reports is non-empty by construction
+    # A normalized report for this lens implies a matching raw one, so the
+    # loop always found at least one report and ``best`` is set.
+    assert reports and best is not None
     return best
 
 
@@ -1199,9 +1220,9 @@ def fold_quality_verdict(
             for row in combined_rows:
                 if row["status"] == STATUS_PASSED:
                     continue
-                if (
-                    row["status"] == STATUS_SKIPPED
-                    and row.get("summary") == "changed_paths_not_applicable"
+                if row["status"] == STATUS_SKIPPED and _combined_tree_skip_exempt(
+                    str(row.get("summary") or ""),
+                    parent_tier=str(profile.get("effective_tier") or RISK_LOW),
                 ):
                     continue
                 blockers.append(f"combined_tree:{row['check_id']}")
@@ -1567,6 +1588,69 @@ def _validate_declared_check(entry: Any) -> None:
                 )
 
 
+# The applicability skip reasons a combined-tree check may carry without
+# blocking the parent fold, matched by explicit reason KIND -- the token before
+# the first ':'. ``risk_below_minimum`` interpolates the tiers into its reason,
+# so a fixed-string equality recognised only ``changed_paths_not_applicable``
+# and silently missed its sibling: a check with ``minimum_risk`` critical on a
+# high-tier card was then skipped for a reason the exemption could not match and
+# became a permanent combined-tree blocker no tier could clear. Comparing the
+# kind exactly -- never a prefix or a substring of the whole formatted string --
+# also keeps a future reason that merely shares a prefix from being mistaken for
+# an exempt one.
+APPLICABILITY_SKIP_CHANGED_PATHS = "changed_paths_not_applicable"
+APPLICABILITY_SKIP_RISK_BELOW_MINIMUM = "risk_below_minimum"
+COMBINED_TREE_EXEMPT_SKIP_KINDS = frozenset(
+    {APPLICABILITY_SKIP_CHANGED_PATHS, APPLICABILITY_SKIP_RISK_BELOW_MINIMUM}
+)
+
+
+def _applicability_skip_kind(summary: str) -> str:
+    """Return the explicit reason KIND of a declared-check applicability skip.
+
+    The kind is the token before the first ':' -- ``risk_below_minimum`` for the
+    tier-interpolated reason and the whole string for
+    ``changed_paths_not_applicable``. Callers compare it against the exact
+    :data:`COMBINED_TREE_EXEMPT_SKIP_KINDS` set, so a formatted-value tail can
+    never make an exempt reason look non-exempt (or a non-exempt reason exempt).
+    """
+
+    return summary.split(":", 1)[0]
+
+
+def _combined_tree_skip_exempt(summary: str, *, parent_tier: str) -> bool:
+    """Whether a skipped combined-tree check may pass without blocking the fold.
+
+    ``changed_paths_not_applicable`` is unconditionally exempt: the check did not
+    apply to this change at any tier.
+
+    ``risk_below_minimum`` is exempt ONLY when the PARENT fold's own tier is also
+    below the check's minimum. The distinction is the whole point:
+
+    * parent high, check minimum critical -- no sub-gate tier could ever have run
+      it, so blocking is unclearable and the check is exempt.
+    * parent medium, check minimum medium, skipped because the sub-gate ran at
+      low -- the check SHOULD have run and the sub-gate was mis-scoped. Blocking
+      is the guarantee that a combined tree carries the parent's tier, and
+      exempting it here would silently discard that guarantee.
+
+    A malformed or unparseable reason is NOT exempt: an applicability claim that
+    cannot be read is not an applicability claim.
+    """
+
+    kind = _applicability_skip_kind(summary)
+    if kind == APPLICABILITY_SKIP_CHANGED_PATHS:
+        return True
+    if kind != APPLICABILITY_SKIP_RISK_BELOW_MINIMUM:
+        return False
+    _, _, tiers = summary.partition(":")
+    _, _, minimum_risk = tiers.partition("<")
+    minimum_risk = minimum_risk.strip()
+    if minimum_risk not in _RISK_RANK or parent_tier not in _RISK_RANK:
+        return False
+    return _RISK_RANK[parent_tier] < _RISK_RANK[minimum_risk]
+
+
 def _declared_check_applicability(
     entry: Mapping[str, Any],
     *,
@@ -1582,7 +1666,10 @@ def _declared_check_applicability(
 
     minimum_risk = str(entry.get("minimum_risk") or RISK_LOW)
     if _RISK_RANK[effective_risk_tier] < _RISK_RANK[minimum_risk]:
-        return False, f"risk_below_minimum:{effective_risk_tier}<{minimum_risk}"
+        return (
+            False,
+            f"{APPLICABILITY_SKIP_RISK_BELOW_MINIMUM}:{effective_risk_tier}<{minimum_risk}",
+        )
     patterns = tuple(
         str(pattern).strip().replace("\\", "/")
         for pattern in (entry.get("paths") or ())
@@ -1593,7 +1680,7 @@ def _declared_check_applicability(
         normalized = relative.replace("\\", "/")
         if any(fnmatch.fnmatchcase(normalized, pattern) for pattern in patterns):
             return True, ""
-    return False, "changed_paths_not_applicable"
+    return False, APPLICABILITY_SKIP_CHANGED_PATHS
 
 
 def _windows_noncanonical_path_alias(value: str) -> bool:
@@ -2629,6 +2716,11 @@ def quality_verdict_contract() -> dict[str, Any]:
         "verdict_owner": "pure_deterministic_fold",
         "model_verdict_accepted": False,
         "quality_lenses": list(QUALITY_LENSES),
+        # The lens status vocabulary a consumer must validate a row against,
+        # published straight from VALID_STATUSES -- the same constant the fold
+        # writes and validates against -- so a consumer can learn that
+        # reviewer_could_not_inspect exists without a second hand-written list.
+        "lens_statuses": sorted(VALID_STATUSES),
         "blocking_severities": sorted(BLOCKING_SEVERITIES),
         "risk_tiers": list(RISK_TIERS),
         "risk_signal_floors": dict(sorted(_RISK_SIGNAL_FLOORS.items())),

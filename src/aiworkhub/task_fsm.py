@@ -249,9 +249,22 @@ def evidence_verdict(
         r for r in required_output_records if _required_output_missing(r)
     ]
 
-    passed = not failed_validations and not missing_required_outputs
+    # Nothing measured is not the same as nothing wrong. With no validation and
+    # no required-output evidence there is nothing that proves a pass, so an
+    # empty verdict must not read as passed: ``passed`` stays False and
+    # ``nothing_measured`` says which of the two -- a vacuum, or a clean run --
+    # this is. deterministic_verification's no_gates_recorded guard is correct
+    # and unchanged; this fixes the exported field that is otherwise copied,
+    # green, straight into a terminal record as evidence_verdict.passed.
+    nothing_measured = not validations and not required_output_records
+    passed = (
+        not nothing_measured
+        and not failed_validations
+        and not missing_required_outputs
+    )
     return {
         "passed": passed,
+        "nothing_measured": nothing_measured,
         "validation_count": len(validations),
         "failed_validation_count": len(failed_validations),
         "required_output_count": len(required_output_records),
