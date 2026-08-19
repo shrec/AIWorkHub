@@ -1623,20 +1623,9 @@ def force_terminalize(
         conn.close()
 
 
-_ATOMIC_CALLBACK_TRANSITIONS: frozenset[str] = frozenset(
-    {
-        "review_ready",
-        "blocked",
-        "launch_failed",
-        "worker_failed",
-        "validation_failed",
-        "scope_rejected",
-        "timed_out",
-        "token_budget_exceeded",
-        "output_budget_exceeded",
-        "cancelled",
-    }
-)
+# The canonical callback-delivery classes an atomic terminal enqueue may write.
+# Owned by ``task_fsm``; imported here rather than restated (NF-2026-00339).
+_ATOMIC_CALLBACK_TRANSITIONS: frozenset[str] = task_fsm.TERMINAL_CALLBACK_CLASSES
 
 
 def _enqueue_terminal_callback_row(
@@ -2068,6 +2057,12 @@ def mark_launch_failed(
         conn.close()
 
 
+# Post-launch failure substatuses this function accepts, routed to the
+# canonical ``blocked`` bucket. Owned by ``task_fsm``; imported here rather than
+# restated (NF-2026-00339).
+MARK_TERMINAL_FAILURE_SUBSTATUSES: frozenset[str] = task_fsm.MARK_TERMINAL_FAILURE_SUBSTATUSES
+
+
 def mark_terminal_failure(
     root: str | Path,
     task_id: str,
@@ -2084,15 +2079,7 @@ def mark_terminal_failure(
     emit a truthful terminal substatus, and end in the canonical ``blocked``
     bucket instead of fabricating ``status=review``.
     """
-    allowed = {
-        "timed_out",
-        "token_budget_exceeded",
-        "output_budget_exceeded",
-        "worker_failed",
-        "finalize_failed",
-        "cancelled",
-        "liveness_lost",
-    }
+    allowed = MARK_TERMINAL_FAILURE_SUBSTATUSES
     substatus = str(substatus or "").strip()
     if substatus not in allowed:
         return False, f"unsupported_terminal_failure:{substatus}"

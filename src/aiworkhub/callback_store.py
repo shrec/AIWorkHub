@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from . import task_fsm
 from . import task_store
 
 SCHEMA_ID = "aiworkhub.callback_store.v1"
@@ -36,19 +37,10 @@ SCHEMA_ID = "aiworkhub.callback_store.v1"
 # separate turns/dead letters).
 DEFAULT_CALLBACK_BATCH_MAX_MEMBERS = 25
 
-# Canonical callback payload states. Unknown values remain ineligible.
-CALLBACK_ELIGIBLE_TRANSITIONS: frozenset[str] = frozenset({
-    "review_ready",
-    "blocked",
-    "launch_failed",
-    "worker_failed",
-    "validation_failed",
-    "scope_rejected",
-    "timed_out",
-    "token_budget_exceeded",
-    "output_budget_exceeded",
-    "cancelled",
-})
+# Canonical callback delivery classes eligible for enqueue/delivery. Unknown
+# values remain ineligible. Owned by ``task_fsm``; imported here rather than
+# restated (NF-2026-00339).
+CALLBACK_ELIGIBLE_TRANSITIONS: frozenset[str] = task_fsm.TERMINAL_CALLBACK_CLASSES
 
 CALLBACK_OUTBOX_STATES: tuple[str, ...] = (
     "pending", "inflight", "delivered", "dead_letter", "superseded",
@@ -498,39 +490,31 @@ def _task_still_in_matching_terminal_state(
     return current_status == "review"
 
 
-_CALLBACK_TRANSITION_MAP: dict[str, str] = {
+# Input-spelling aliases the callback layer accepts on top of the canonical
+# substatus->class map ``task_fsm`` owns: coarse status-column values and legacy
+# spellings that are NOT themselves terminal substatuses (so they do not belong
+# in the owner vocabulary), but that a raw status/substatus string can arrive
+# as. ``review``/``ready_for_review``/``codex_review``/``awaiting_review`` are
+# review-status spellings; ``deferred`` is a blocked-status spelling; ``canceled``
+# is the single-L spelling of ``cancelled``.
+_CALLBACK_STATUS_ALIASES: dict[str, str] = {
     "review": "review_ready",
-    "review_ready": "review_ready",
     "ready_for_review": "review_ready",
     "codex_review": "review_ready",
     "awaiting_review": "review_ready",
-    "blocked": "blocked",
     "deferred": "blocked",
-    "promotion_conflict": "blocked",
-    "finalize_failed": "blocked",
-    "monitor_error": "blocked",
-    "process_lost": "blocked",
-    "stale": "blocked",
-    # dependency_blocked / liveness_lost do not start with "blocked", so without
-    # an explicit mapping they used to fall through to the review_ready fallback
-    # (B921 substatus-truth: a blocked outcome must never be delivered as
-    # review_ready). Map them to their real failure class.
-    "dependency_blocked": "blocked",
-    "liveness_lost": "blocked",
-    "launch_failed": "launch_failed",
-    # A provider/adapter that never starts is launch_failed.  A started worker
-    # whose supervisor exits unsuccessfully is a distinct worker_failed
-    # outcome and must remain distinct in callbacks/UI diagnostics.
-    "worker_failed": "worker_failed",
-    "exited_without_review": "launch_failed",
-    "validation_failed": "validation_failed",
-    "required_output_unchanged": "validation_failed",
-    "scope_rejected": "scope_rejected",
-    "timed_out": "timed_out",
-    "token_budget_exceeded": "token_budget_exceeded",
-    "output_budget_exceeded": "output_budget_exceeded",
-    "cancelled": "cancelled",
     "canceled": "cancelled",
+}
+
+# The substatus->callback-class truth is owned by ``task_fsm``
+# (``TERMINAL_SUBSTATUS_TO_CALLBACK_CLASS``); this site imports it and layers
+# only the input-spelling aliases above. Because every real terminal substatus
+# (including ``exited``, ``finalize_abandoned`` and every blocked-class outcome)
+# is now mapped by the owner, a blocked-class outcome can never silently fall
+# through to a ``review_ready`` fallback here (B921 / NF-2026-00340).
+_CALLBACK_TRANSITION_MAP: dict[str, str] = {
+    **task_fsm.TERMINAL_SUBSTATUS_TO_CALLBACK_CLASS,
+    **_CALLBACK_STATUS_ALIASES,
 }
 
 
@@ -559,15 +543,23 @@ def normalize_callback_transition(raw_state: str | None) -> str | None:
 
 
 def resolve_callback_transition(raw_state: str | None) -> str:
-    """``normalize_callback_transition`` with the one fallback every real
-    caller needs: a substatus with no explicit failure-class mapping (e.g.
-    a plain successful ``"exited"``, which was never added to
-    ``_CALLBACK_TRANSITION_MAP``) resolves to ``"review_ready"`` rather than
-    ``None``. This is the single source of truth BOTH the enqueue side
-    (``task_engine.mark_terminal_review``) and the delivery-eligibility
-    recheck (``_task_still_in_matching_terminal_state``) must call so they
-    can never diverge again the way B921 found them diverged."""
-    return _normalize_callback_transition(raw_state) or "review_ready"
+    """``normalize_callback_transition`` with a fail-CLOSED fallback: an
+    unrecognized substatus resolves to the ``"blocked"`` callback class, NEVER
+    to ``"review_ready"`` (NF-2026-00340 / B921).
+
+    Delivering ``review_ready`` for an outcome this layer does not recognize is
+    the worst available shape -- it tells a manager unreviewed/failed work is
+    ready to inspect. An unknown substatus is therefore surfaced as ``blocked``
+    (a real failure class a manager must look at) and signals that the terminal
+    vocabulary owned by ``task_fsm`` is incomplete for this value. Known success
+    outcomes (``exited``/``review_ready``) resolve to ``review_ready`` EXPLICITLY
+    via ``task_fsm.TERMINAL_SUBSTATUS_TO_CALLBACK_CLASS``, not via this fallback.
+
+    This is still the single source of truth BOTH the enqueue side
+    (``task_engine.mark_terminal_review``) and the delivery-eligibility recheck
+    (``_task_still_in_matching_terminal_state``) call, so they can never diverge
+    again the way B921 found them diverged."""
+    return _normalize_callback_transition(raw_state) or "blocked"
 
 
 # --- Batched delivery ---------------------------------------------------
@@ -1075,7 +1067,16 @@ def seed_missing_review_callbacks(
             if transition not in CALLBACK_ELIGIBLE_TRANSITIONS:
                 continue
         else:
-            transition = resolve_callback_transition(raw_terminal or "review_ready")
+            # A canonical review row is, by definition, ready for review: its
+            # substatus is a success spelling (review_ready/exited). An
+            # unfamiliar future/legacy SUCCESS spelling still recovers as
+            # review_ready here so it cannot strand the review. This is the only
+            # place a review-status row defaults to review_ready -- and it does
+            # so explicitly for a known-review row, NOT via
+            # resolve_callback_transition, which is now fail-closed (unknown ->
+            # blocked) so a failure substatus can never be delivered as
+            # review_ready anywhere (NF-2026-00340).
+            transition = normalize_callback_transition(raw_terminal) or "review_ready"
         callback_origin = route_origin or str(row["origin_thread_id"] or card.get("origin_thread_id") or "").strip()
         if not callback_origin:
             continue

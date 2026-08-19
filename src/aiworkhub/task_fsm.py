@@ -18,6 +18,7 @@ auditable ``task_events`` row.
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Mapping
 
 # A terminal-review transition is legal only from a task that is still
@@ -27,11 +28,30 @@ from typing import Mapping
 # a new terminal outcome against a task already in ``review``, ``finished``,
 # ``archived``, or ``blocked`` would silently clobber a coordinator decision
 # (or another worker's terminal record) and must fail closed instead.
+#
+# ``blocked`` is a real, legal TERMINAL outcome (see ``KNOWN_TERMINAL_SUBSTATUSES``),
+# not a trap (NF-2026-00341). Refusing it as a *source* here does not strand a
+# card: re-terminalizing an already-terminal card is never the way out of
+# ``blocked``. The defined exit is the coordinator's own recovery instrument
+# ``task_store.recover_blocked_rework`` (rework-eligible outcomes -> back to a
+# legal ``pending`` source status, from which terminal review is legal again)
+# or the accept/reject/archive APIs. So ``blocked`` is legal to enter AND has a
+# defined transition out; it is simply a different transition than the one this
+# pure function guards.
 LEGAL_SOURCE_STATUSES_FOR_TERMINAL_REVIEW: frozenset[str] = frozenset({"pending", "processing"})
 
-# Bounded, known terminal substatus vocabulary. Not exhaustive-enforced (new
-# adapters may add outcomes), but empty/oversized/malformed substatus is
-# always illegal regardless of source status.
+# The single, authoritative terminal-substatus vocabulary for AIWorkHub. This
+# module OWNS it; every other site (``task_store``, ``callback_store``,
+# ``process_launcher``) imports the names below rather than restating a literal
+# copy. Three hand-copied duplicates had already drifted (NF-2026-00339)
+# precisely because agreement was maintained by comments instead of by import.
+#
+# It is exhaustive and fail-closed: an empty/oversized/malformed or otherwise
+# unrecognized substatus is always illegal, and ``check_terminal_review_transition``
+# refuses it regardless of source status. A NEW terminal outcome is added HERE
+# (and, when it is a producible launcher state, to ``LAUNCHER_TERMINAL_SUBSTATUSES``
+# below) -- never invented at the site that produces it, which is exactly how
+# outcomes ended up validated in one place and produced in another.
 KNOWN_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset(
     {
         "exited",
@@ -50,6 +70,110 @@ KNOWN_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset(
         "blocked",
         "dependency_blocked",
         "liveness_lost",
+        # Launcher-produced outcomes (``process_launcher.TERMINAL_PROCESS_STATES``).
+        # These were emitted by the launcher but omitted from this vocabulary,
+        # so ``check_terminal_review_transition`` called them illegal even though
+        # the callback layer supports them end to end (NF-2026-00339). The
+        # barrier now holds by contract, not by which routing call happens to
+        # run for them.
+        "exited_without_review",
+        "finalize_abandoned",
+        "monitor_error",
+        "token_budget_exceeded",
+        "output_budget_exceeded",
+    }
+)
+
+# The exact subset of ``KNOWN_TERMINAL_SUBSTATUSES`` that ``process_launcher``
+# can actually emit as a terminal process state. A named subset of the owner
+# vocabulary, not a second copy: ``process_launcher.TERMINAL_PROCESS_STATES``
+# IS this object.
+LAUNCHER_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset(
+    {
+        "review_ready",
+        "exited",
+        "exited_without_review",
+        "timed_out",
+        "token_budget_exceeded",
+        "output_budget_exceeded",
+        "cancelled",
+        "launch_failed",
+        "worker_failed",
+        "scope_rejected",
+        "validation_failed",
+        "promotion_conflict",
+        "finalize_failed",
+        "finalize_abandoned",
+        "monitor_error",
+        "blocked",
+    }
+)
+
+# The subset of terminal substatuses ``task_store.mark_terminal_failure``
+# accepts as post-launch failures routed to the canonical ``blocked`` bucket.
+# A named policy subset of the owner vocabulary; ``task_store`` references this
+# object instead of restating it.
+MARK_TERMINAL_FAILURE_SUBSTATUSES: frozenset[str] = frozenset(
+    {
+        "timed_out",
+        "token_budget_exceeded",
+        "output_budget_exceeded",
+        "worker_failed",
+        "finalize_failed",
+        "cancelled",
+        "liveness_lost",
+    }
+)
+
+# The canonical callback-delivery transition classes. Every terminal substatus
+# collapses onto exactly one of these coarse classes for delivery/eligibility:
+# ``callback_store.CALLBACK_ELIGIBLE_TRANSITIONS`` and
+# ``task_store._ATOMIC_CALLBACK_TRANSITIONS`` ARE this object. Every class is
+# itself a member of ``KNOWN_TERMINAL_SUBSTATUSES``.
+TERMINAL_CALLBACK_CLASSES: frozenset[str] = frozenset(
+    {
+        "review_ready",
+        "blocked",
+        "launch_failed",
+        "worker_failed",
+        "validation_failed",
+        "scope_rejected",
+        "timed_out",
+        "token_budget_exceeded",
+        "output_budget_exceeded",
+        "cancelled",
+    }
+)
+
+# The authoritative map from a terminal substatus to its canonical callback
+# class. ``callback_store`` layers only its own input-spelling aliases (e.g.
+# ``"review"``, ``"deferred"``) on top of this; the substatus->class truth lives
+# HERE so a blocked-class outcome can never be delivered as ``review_ready``
+# (B921 / NF-2026-00340). Every key is a ``KNOWN_TERMINAL_SUBSTATUSES`` member
+# and every value is a ``TERMINAL_CALLBACK_CLASSES`` member.
+TERMINAL_SUBSTATUS_TO_CALLBACK_CLASS: Mapping[str, str] = MappingProxyType(
+    {
+        "review_ready": "review_ready",
+        "exited": "review_ready",
+        "blocked": "blocked",
+        "dependency_blocked": "blocked",
+        "liveness_lost": "blocked",
+        "promotion_conflict": "blocked",
+        "finalize_failed": "blocked",
+        "finalize_abandoned": "blocked",
+        "monitor_error": "blocked",
+        "process_lost": "blocked",
+        "stale": "blocked",
+        "launch_failed": "launch_failed",
+        "exited_without_review": "launch_failed",
+        "worker_failed": "worker_failed",
+        "validation_failed": "validation_failed",
+        "required_output_unchanged": "validation_failed",
+        "scope_rejected": "scope_rejected",
+        "timed_out": "timed_out",
+        "token_budget_exceeded": "token_budget_exceeded",
+        "output_budget_exceeded": "output_budget_exceeded",
+        "cancelled": "cancelled",
     }
 )
 
@@ -207,7 +331,11 @@ def deterministic_verification(
 
 __all__ = [
     "KNOWN_TERMINAL_SUBSTATUSES",
+    "LAUNCHER_TERMINAL_SUBSTATUSES",
     "LEGAL_SOURCE_STATUSES_FOR_TERMINAL_REVIEW",
+    "MARK_TERMINAL_FAILURE_SUBSTATUSES",
+    "TERMINAL_CALLBACK_CLASSES",
+    "TERMINAL_SUBSTATUS_TO_CALLBACK_CLASS",
     "check_terminal_review_transition",
     "deterministic_verification",
     "evidence_verdict",

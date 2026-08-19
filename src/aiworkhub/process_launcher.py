@@ -59,6 +59,7 @@ from . import repo_policy
 from . import read_efficiency
 from . import runtime_temp
 from . import task_engine
+from . import task_fsm
 from . import task_store
 try:
     from . import project_context
@@ -231,24 +232,10 @@ _PERSISTED_WATCH_UNKNOWN_MAX_CONSECUTIVE = 3
 FINALIZATION_PENDING_STATES = {
     "finalizing", "release_pending", "review_pending", "reconcile_pending",
 }
-TERMINAL_PROCESS_STATES = {
-    "review_ready",
-    "exited",
-    "exited_without_review",
-    "timed_out",
-    "token_budget_exceeded",
-    "output_budget_exceeded",
-    "cancelled",
-    "launch_failed",
-    "worker_failed",
-    "scope_rejected",
-    "validation_failed",
-    "promotion_conflict",
-    "finalize_failed",
-    "finalize_abandoned",
-    "monitor_error",
-    "blocked",
-}
+# The terminal process states the launcher can emit. Owned by ``task_fsm``
+# (``LAUNCHER_TERMINAL_SUBSTATUSES``, a named subset of the single terminal
+# vocabulary); imported here rather than restated (NF-2026-00339).
+TERMINAL_PROCESS_STATES = task_fsm.LAUNCHER_TERMINAL_SUBSTATUSES
 
 
 # Terminal-transition failures that prove the target card is no longer in a
