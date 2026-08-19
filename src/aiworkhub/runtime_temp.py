@@ -39,6 +39,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+# ``worker_supervisor`` runs as a DIRECT SCRIPT, not as a package module, and it
+# imports this module through the same fallback below.  In that mode this module
+# is itself top-level, so a relative import here fails and takes the supervisor
+# down with it - the one process whose job is to stop workers being orphaned.
+# Mirror the supervisor's own pattern rather than assuming package context.
+try:
+    from .platform_io import process_is_alive
+except ImportError:  # direct-script entrypoint (see worker_supervisor)
+    from platform_io import process_is_alive  # type: ignore[no-redef]
+
 TEMP_RELATIVE_PATH = Path(".aiworkhub/temp")
 TEMP_ROOT_ENV = "AIWORKHUB_TEMP_ROOT"
 SCHEMA_ID = "aiworkhub.runtime_temp.v1"
@@ -373,19 +383,12 @@ def read_owner_manifest(directory: Path) -> dict[str, Any] | None:
     return value
 
 
-def _pid_alive(pid: int) -> bool | None:
-    """True if alive, False if dead, None if undeterminable (fail-closed live)."""
-    if pid <= 1:
-        return None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return None
-    return True
+# Liveness is one function, imported -- never a private copy. This module used
+# to keep its own probe that answered ``None`` for PID 1 (a third answer to the
+# one question). ``platform_io.process_is_alive`` is the shared implementation
+# (EPERM == alive). Bound to ``_pid_alive`` so ``owner_alive`` and the tests
+# that monkeypatch this name resolve to the shared function.
+_pid_alive = process_is_alive
 
 
 def owner_alive(manifest: Mapping[str, Any]) -> bool:
@@ -407,11 +410,11 @@ def owner_alive(manifest: Mapping[str, Any]) -> bool:
         return True
     if pid <= 0:
         return True  # no identifiable owner -> fail closed, never delete
-    alive = _pid_alive(pid)
-    if alive is True:
+    # Only a definitive ``False`` (provably dead) may reclaim; alive and every
+    # undeterminable answer fail closed to alive so a live or unknown owner is
+    # never deleted. (A monkeypatched probe may still return None.)
+    if _pid_alive(pid) is not False:
         return True
-    if alive is None:
-        return True  # undeterminable owner -> never delete
     # The PID is currently dead.  If we can still read a start-time for a
     # recycled PID that differs from ours, treat the directory as foreign.
     current = process_start_ticks(pid)

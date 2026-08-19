@@ -9,14 +9,13 @@ lets a manager see which VS Code windows/repositories are alive.
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from pathlib import Path
 from typing import Any
 
 from . import repository_state
-from .platform_io import windows_pid_is_alive
+from .platform_io import process_is_alive
 
 
 SCHEMA_ID = "aiworkhub.shared_repo_route.v1"
@@ -41,18 +40,6 @@ def _read_manifest_repo_id(root: Path) -> str:
     if not isinstance(payload, dict):
         return ""
     return str(payload.get("repo_id") or "")
-
-
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        return windows_pid_is_alive(pid)
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
 
 
 def _bounded_record(path: Path, *, now: float) -> dict[str, Any]:
@@ -100,7 +87,10 @@ def _bounded_record(path: Path, *, now: float) -> dict[str, Any]:
     expires_at = str(payload.get("lease_expires_at") or "")
     mtime_age_seconds = max(0.0, now - stat.st_mtime)
     stale = mtime_age_seconds > DEFAULT_TTL_SECONDS
-    pid = int(payload.get("extension_host_pid") or 0)
+    try:
+        pid = int(payload.get("extension_host_pid") or 0)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "extension_host_pid_invalid", "path": path.name, "repo_id": repo_id}
     return {
         "ok": True,
         "schema_id": SCHEMA_ID,
@@ -109,7 +99,7 @@ def _bounded_record(path: Path, *, now: float) -> dict[str, Any]:
         "repo_root": str(root),
         "window_id": str(payload.get("window_id") or ""),
         "extension_host_pid": pid,
-        "extension_host_alive": _pid_alive(pid),
+        "extension_host_alive": process_is_alive(pid),
         "selected_provider": str(payload.get("selected_provider") or ""),
         "targets": payload.get("targets") if isinstance(payload.get("targets"), dict) else {},
         "updated_at": updated_at,

@@ -41,7 +41,7 @@ def test_blocking_lock_retries_instead_of_using_lk_lock(monkeypatch):
             raise OSError(errno.EDEADLOCK, "Resource deadlock avoided")
 
     monkeypatch.setattr(msvcrt, "locking", fake_locking)
-    monkeypatch.setattr(platform_io, "WINDOWS_LOCK_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(platform_io, "ADVISORY_LOCK_POLL_SECONDS", 0.0)
 
     with tempfile.TemporaryDirectory() as tmp:
         fd = os.open(Path(tmp) / "a.lock", os.O_CREAT | os.O_RDWR, 0o600)
@@ -68,8 +68,8 @@ def test_blocking_lock_gives_up_instead_of_hanging_forever(monkeypatch):
         raise OSError(errno.EDEADLOCK, "Resource deadlock avoided")
 
     monkeypatch.setattr(msvcrt, "locking", always_contended)
-    monkeypatch.setattr(platform_io, "WINDOWS_LOCK_POLL_SECONDS", 0.0)
-    monkeypatch.setattr(platform_io, "WINDOWS_LOCK_MAX_WAIT_SECONDS", 0.15)
+    monkeypatch.setattr(platform_io, "ADVISORY_LOCK_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(platform_io, "ADVISORY_LOCK_MAX_WAIT_SECONDS", 0.15)
 
     with tempfile.TemporaryDirectory() as tmp:
         fd = os.open(Path(tmp) / "stuck.lock", os.O_CREAT | os.O_RDWR, 0o600)

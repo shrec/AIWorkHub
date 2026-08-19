@@ -130,7 +130,7 @@ def test_windows_blocking_lock_timeout_is_classified_as_contention(
     )
     monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
     monkeypatch.setattr(platform_io.os, "name", "nt")
-    monkeypatch.setattr(platform_io, "WINDOWS_LOCK_MAX_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(platform_io, "ADVISORY_LOCK_MAX_WAIT_SECONDS", 0.0)
     monkeypatch.setattr(platform_io.time, "monotonic", lambda: 10.0)
 
     path = tmp_path / "contended-windows-runtime.lock"

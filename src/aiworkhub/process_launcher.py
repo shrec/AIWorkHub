@@ -49,6 +49,7 @@ from .platform_io import (
     chmod_fd,
     chmod_path,
     lock_fd,
+    process_is_alive,
     unlock_fd,
 )
 from . import quality_evidence
@@ -11908,23 +11909,13 @@ class ProcessManager:
         }
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-        if handle:
-            kernel32.CloseHandle(handle)
-            return True
-        return getattr(ctypes, "get_last_error")() == 5  # access denied proves liveness
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        return False
-    return True
+# Liveness is one function, imported -- never a private copy. The launcher's
+# old POSIX branch read EPERM as DEAD, so a worker under another uid was
+# declared dead and terminalized while its Windows branch read access-denied as
+# ALIVE. ``platform_io.process_is_alive`` gives every entry point the one honest
+# answer (EPERM == alive). Kept bound to ``_pid_alive`` so callers and tests
+# that reference the launcher's name resolve to the shared implementation.
+_pid_alive = process_is_alive
 
 
 def _pid_start_ticks(pid: int) -> int | None:
@@ -12252,6 +12243,30 @@ def _process_proven_dead(pid: int, ticks: Any) -> bool:
     return evidence.verdict is PidIdentityVerdict.MISMATCH
 
 
+def _process_group_alive(pgid: int) -> bool:
+    """True while ANY member of the POSIX process group still exists.
+
+    ``_terminate_process_group`` signals the whole group (``killpg``); verifying
+    only the leader let a child outlive its already-dead leader and satisfy the
+    early-return, so the SIGKILL escalation never ran -- a narrow check gating a
+    wide action. ``killpg(pgid, 0)`` probes the group itself: ``ESRCH`` means the
+    group is empty (all members gone), ``EPERM`` means a member exists we may not
+    signal, and any other ambiguity fails closed to alive so escalation still
+    runs.
+    """
+    if pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
 def _terminate_process_group(pid: int, grace_seconds: float) -> None:
     if os.name == "nt":
         # Windows has no killpg(). taskkill /T addresses the exact process
@@ -12280,9 +12295,11 @@ def _terminate_process_group(pid: int, grace_seconds: float) -> None:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
         return
+    # Verify the GROUP we signalled, not just the leader: a surviving child
+    # keeps the group alive and must still force the SIGKILL escalation below.
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
-        if not _pid_alive(pid):
+        if not _process_group_alive(pid):
             return
         time.sleep(0.05)
     try:

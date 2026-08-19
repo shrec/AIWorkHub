@@ -417,8 +417,8 @@ def test_duplicate_finalizer_lock_contention_defers_for_owner(
         except BaseException as exc:  # surfaced on the main test thread below
             owner_errors.append(exc)
 
-    monkeypatch.setattr(platform_io, "WINDOWS_LOCK_MAX_WAIT_SECONDS", 0.01)
-    monkeypatch.setattr(platform_io, "WINDOWS_LOCK_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(platform_io, "ADVISORY_LOCK_MAX_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(platform_io, "ADVISORY_LOCK_POLL_SECONDS", 0.001)
     monkeypatch.setattr(
         process_launcher.task_engine,
         "mark_terminal_failure",

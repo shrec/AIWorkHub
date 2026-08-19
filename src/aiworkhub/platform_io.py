@@ -13,13 +13,16 @@ import time
 
 
 WINDOWS_REPLACE_RETRY_SECONDS = 1.0
-WINDOWS_LOCK_POLL_SECONDS = 0.02
-# Windows byte-range locks conflict between two open handles even inside one
-# process, so a lock this process already holds on another handle can never be
-# satisfied by waiting. POSIX ``flock`` callers can afford to block forever;
-# here an unbounded wait would freeze whatever the caller is serving -- a
-# dashboard snapshot, for instance -- with no way out. Fail loudly instead.
-WINDOWS_LOCK_MAX_WAIT_SECONDS = 20.0
+# One bounded advisory-lock wait shared by every platform -- not a second
+# constant beside a Windows one. A blocking ``lock_fd`` still waits for a
+# genuine holder to release, but it stops meaning *forever*: an unbounded wait
+# freezes whatever the caller is serving -- a dashboard snapshot, a
+# reconciliation monitor -- with no way out, and on Windows a byte-range lock
+# this process already holds on another handle can never be satisfied by
+# waiting at all. Both platforms poll the non-blocking primitive and, on this
+# one shared deadline, raise :class:`AdvisoryLockTimeout`.
+ADVISORY_LOCK_POLL_SECONDS = 0.02
+ADVISORY_LOCK_MAX_WAIT_SECONDS = 20.0
 # msvcrt.locking() reports a contended byte range as EDEADLOCK ("resource
 # deadlock avoided") and, on some hosts, EACCES. Neither is a real error for
 # a caller that asked to wait; anything else is.
@@ -33,6 +36,9 @@ def _deadlock_errno(errno_module: object = errno) -> int:
 
 
 _WINDOWS_LOCK_CONTENDED_ERRNOS = frozenset({_deadlock_errno(), errno.EACCES})
+# POSIX ``flock(LOCK_NB)`` reports a lock held elsewhere as EWOULDBLOCK (== EAGAIN
+# on Linux). That is contention to wait through, not a real error.
+_POSIX_LOCK_CONTENDED_ERRNOS = frozenset({errno.EAGAIN, errno.EWOULDBLOCK})
 
 
 class AdvisoryLockTimeout(TimeoutError):
@@ -74,6 +80,34 @@ def windows_pid_is_alive(pid: int) -> bool:
         return exit_code.value == 259  # STILL_ACTIVE
     finally:
         close_handle(handle)
+
+
+def process_is_alive(pid: int) -> bool:
+    """The single liveness answer for the whole runtime: alive unless proven dead.
+
+    Every liveness caller -- the launcher, the shared route registry, and the
+    temp-owner GC -- imports this one function so they can never disagree. A
+    signal refused with ``EPERM`` proves the process *exists* (we simply may not
+    signal it), so it reads as ALIVE, not dead: a worker running under another
+    uid is still running. Only an explicit "no such process" is death; every
+    other ambiguity fails closed to alive so a live process is never
+    terminalized. Windows liveness routes through :func:`windows_pid_is_alive`,
+    which never signals the target.
+    """
+
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if os.name == "nt":
+        return windows_pid_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # EPERM: the process exists, we just may not signal it
+    except OSError:
+        return True  # undeterminable -> fail closed to alive
+    return True
 
 
 def chmod_fd(fd: int, mode: int) -> None:
@@ -162,7 +196,7 @@ def lock_fd(fd: int, *, blocking: bool) -> None:
         # ``flock``, a Windows byte-range lock can be blocked by this very
         # process holding another handle, which no amount of waiting can
         # clear. Waiting forever there would hang the caller outright.
-        deadline = time.monotonic() + WINDOWS_LOCK_MAX_WAIT_SECONDS
+        deadline = time.monotonic() + ADVISORY_LOCK_MAX_WAIT_SECONDS
         while True:
             try:
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
@@ -173,19 +207,39 @@ def lock_fd(fd: int, *, blocking: bool) -> None:
                 if time.monotonic() >= deadline:
                     raise AdvisoryLockTimeout(
                         "windows_advisory_lock_timeout after "
-                        f"{WINDOWS_LOCK_MAX_WAIT_SECONDS:g}s"
+                        f"{ADVISORY_LOCK_MAX_WAIT_SECONDS:g}s"
                     ) from exc
-                time.sleep(WINDOWS_LOCK_POLL_SECONDS)
+                time.sleep(ADVISORY_LOCK_POLL_SECONDS)
                 # locking() leaves the file pointer where it found it, but a
                 # failed attempt must still start from the same lock byte.
                 os.lseek(fd, 0, os.SEEK_SET)
 
     import fcntl
 
-    operation = fcntl.LOCK_EX
     if not blocking:
-        operation |= fcntl.LOCK_NB
-    fcntl.flock(fd, operation)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    # ``flock(LOCK_EX)`` blocks forever, which parks a monitor thread with no
+    # way out when a holder never releases -- and left the AdvisoryLockTimeout
+    # recovery unreachable on the platform we actually run on. Poll the
+    # non-blocking primitive on the one shared bound instead: blocking still
+    # waits for a real holder, but a genuinely stuck lock raises
+    # ``AdvisoryLockTimeout`` -- the same recognized signal the Windows branch
+    # raises and the launcher already recovers from.
+    deadline = time.monotonic() + ADVISORY_LOCK_MAX_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in _POSIX_LOCK_CONTENDED_ERRNOS:
+                raise
+            if time.monotonic() >= deadline:
+                raise AdvisoryLockTimeout(
+                    "posix_advisory_lock_timeout after "
+                    f"{ADVISORY_LOCK_MAX_WAIT_SECONDS:g}s"
+                ) from exc
+            time.sleep(ADVISORY_LOCK_POLL_SECONDS)
 
 
 def unlock_fd(fd: int) -> None:
