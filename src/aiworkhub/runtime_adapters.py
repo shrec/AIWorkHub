@@ -785,18 +785,151 @@ OUTCOME_PROVIDER_REFUSED = "provider_refused"
 OUTCOME_WORKER_FAILED = "worker_failed"
 
 # Refusal shapes.  ``session_limit``, ``quota_exhausted`` and ``rate_limited``
-# recover once their reported window resets; ``credential_rejected`` is a
-# refusal too but needs a new credential, not merely a wait, so time alone does
-# not recover it; ``provider_unavailable`` is a transient upstream outage.
+# recover once their reported window resets; ``balance_exhausted`` is a dead
+# account -- an HTTP 402 or an ``insufficient_balance`` body -- and needs credit,
+# not a wait, so time alone never recovers it and it is emphatically NOT rate
+# limiting or usage-quota exhaustion (NF-2026-00275 rework); ``credential_rejected``
+# is a refusal too but needs a new credential; ``provider_unavailable`` is a
+# transient upstream outage.
 REFUSAL_SESSION_LIMIT = "session_limit"
 REFUSAL_QUOTA_EXHAUSTED = "quota_exhausted"
+REFUSAL_BALANCE_EXHAUSTED = "balance_exhausted"
 REFUSAL_RATE_LIMITED = "rate_limited"
 REFUSAL_CREDENTIAL_REJECTED = "credential_rejected"
 REFUSAL_PROVIDER_UNAVAILABLE = "provider_unavailable"
+# A bare 401/403 whose body names no cause: authentication, quota and rate
+# limiting are indistinguishable from the status code alone, so the classifier
+# records that the cause was not distinguished rather than guessing one of them.
+# This is the honest verdict for the NF-2026-00326 case -- a credential that
+# launched nine workers, then hit an HTTP 401 with an empty body, then cleared
+# on its own is a quota/rate condition, not a bad key, and the status code can
+# never prove which.
+REFUSAL_CAUSE_NOT_DISTINGUISHED = "cause_not_distinguished"
 
 _RECOVERABLE_REFUSALS: frozenset[str] = frozenset(
     {REFUSAL_SESSION_LIMIT, REFUSAL_QUOTA_EXHAUSTED, REFUSAL_RATE_LIMITED}
 )
+
+# HTTP 402 PAYMENT REQUIRED is never a recoverable wait, whatever the body
+# says: only added credit clears it, never elapsed time.  This is enforced as a
+# status-level invariant so the "wait, it will clear" verdict can never attach
+# to a dead account even if a future body token would otherwise pull a 402 into
+# a recoverable kind -- token membership has been wrong about this twice, so the
+# guard no longer depends on it (NF-2026-00275 rework round four).
+_NEVER_RECOVERABLE_STATUSES: frozenset[int] = frozenset({402})
+
+# Body tokens that name a concrete cause.  These are matched against the
+# provider's OWN response body -- which, at the launch boundary, is the
+# provider's machine error code (e.g. ``insufficient_balance``) rather than
+# prose.  Tokens are therefore written in a single canonical space form and the
+# text under test is normalised (``_`` and ``-`` -> space) before matching, so a
+# machine code and a prose message that mean the same thing match the same
+# token.  This is what keeps the launch-time detector and this classifier on ONE
+# vocabulary: the detector reuses ``provider_body_names_cause`` below rather than
+# maintaining a parallel token list that could drift (NF-2026-00275 rework).  The
+# HTTP status code alone is deliberately NOT treated as a credential signal,
+# because a dead key, an expired token and a transient rate/quota condition can
+# all surface as an identical bare 401.
+#
+# ``balance`` is split out from ``quota``: a dead account (HTTP 402, an
+# ``insufficient_balance`` code, ``out of credit``) is recovered by adding
+# credit, never by waiting, so it must NOT be lumped with usage-quota exhaustion
+# or reported as a recoverable rate limit.  Balance is checked before quota and
+# rate so that a body naming a balance condition classifies as balance even when
+# the status code says 429.
+_BALANCE_TOKENS: tuple[str, ...] = (
+    "insufficient balance",
+    "insufficient funds",
+    "insufficient credit",
+    "insufficient credits",
+    "out of credit",
+    "out of credits",
+    "balance exhausted",
+    "credit exhausted",
+    "credits exhausted",
+    "billing hard limit",
+    "payment required",
+)
+# ``exhausted`` is deliberately NOT a bare quota token: quota, balance, credits
+# and sessions can all be "exhausted", so on its own it names nothing and would
+# capture whichever branch reached it first -- which is how a 402/429 body
+# saying ``balance_exhausted`` was once mis-reported as a recoverable quota wait
+# (NF-2026-00275 rework round four).  The balance phrasings above carry the
+# ``exhausted`` forms that DO name a dead account; quota keeps only the tokens
+# that name usage-quota specifically.
+_QUOTA_TOKENS: tuple[str, ...] = (
+    "insufficient quota",
+    "quota exceeded",
+    "quota exhausted",
+)
+_RATE_TOKENS: tuple[str, ...] = (
+    "rate limit",
+    "too many requests",
+)
+# Concrete credential defects only -- a named bad/expired/revoked key or token.
+# The bare HTTP reason phrase ("unauthorized") and generic "authentication"
+# boilerplate are intentionally excluded: they accompany every 401 regardless of
+# the real cause and so distinguish nothing.
+_CREDENTIAL_TOKENS: tuple[str, ...] = (
+    "invalid api key",
+    "invalid x-api-key",
+    "api key not valid",
+    "api key is invalid",
+    "no api key",
+    "missing api key",
+    "api key expired",
+    "expired token",
+    "expired credential",
+    "credential expired",
+    "token expired",
+    "revoked",
+)
+_UNAVAILABLE_TOKENS: tuple[str, ...] = (
+    "overloaded",
+    "service unavailable",
+    "server error",
+)
+
+# The launch-refusal cause families the detector forwards to the classifier.
+# Provider-unavailable (5xx / "overloaded") is deliberately excluded: a transient
+# upstream outage is left to the worker path, not treated as a launch refusal.
+_LAUNCH_REFUSAL_BODY_TOKENS: tuple[str, ...] = (
+    _BALANCE_TOKENS + _QUOTA_TOKENS + _RATE_TOKENS + _CREDENTIAL_TOKENS
+    + ("session limit",)
+)
+
+# Provider-owned HTTP refusal statuses and the refusal kind each names.  The
+# launch-time detector forwards exactly these statuses, and every one of them
+# resolves to a kind here, so a status can never be forwarded and then land on
+# ``worker_failed`` for lack of a branch (the NF-2026-00275 rework defect: 402
+# was forwarded but unnamed).  402 is PAYMENT REQUIRED -> balance, not quota and
+# not rate limiting.
+_STATUS_REFUSAL_KIND: dict[int, str] = {
+    401: REFUSAL_CAUSE_NOT_DISTINGUISHED,
+    402: REFUSAL_BALANCE_EXHAUSTED,
+    403: REFUSAL_CAUSE_NOT_DISTINGUISHED,
+    429: REFUSAL_RATE_LIMITED,
+}
+PROVIDER_REFUSAL_STATUSES: frozenset[int] = frozenset(_STATUS_REFUSAL_KIND)
+
+
+def _normalize_cause_text(text: str) -> str:
+    """Lower-case and fold ``_``/``-`` to spaces so machine codes match tokens."""
+
+    return text.lower().replace("_", " ").replace("-", " ")
+
+
+def provider_body_names_cause(text: str) -> bool:
+    """True when the provider's own body/machine code names a launch-refusal cause.
+
+    Shared with ``process_launcher``'s launch-time detector so the gate that
+    decides whether to forward a body to :func:`classify_provider_outcome` and
+    the classifier that names it draw on ONE vocabulary and cannot drift onto
+    different token forms again (NF-2026-00275 rework).
+    """
+
+    normalized = _normalize_cause_text(text)
+    return any(token in normalized for token in _LAUNCH_REFUSAL_BODY_TOKENS)
 
 _RETRY_AFTER_RE = re.compile(
     r"retry[\s_-]*after[\s:=]*([0-9]+)\s*(?:s|sec|secs|seconds)?", re.IGNORECASE
@@ -839,49 +972,42 @@ def _reset_window(text: str) -> tuple[int | None, str | None]:
 
 
 def _refusal_kind(lowered: str, status_code: int | None) -> str | None:
-    """Name the refusal shape from the provider message, or ``None`` if none."""
+    """Name the refusal shape from the provider's body, or ``None`` if none.
 
-    if "session limit" in lowered or "session_limit" in lowered:
+    Body-derived signals are authoritative: the provider's own words name the
+    cause, so they are checked first and BEAT the status code -- an
+    ``insufficient_balance`` body is a dead account even when the status is 429,
+    because the body is more specific than the status.  Balance is checked before
+    quota and rate for the same reason a dead account must never be reported as a
+    recoverable wait.  The HTTP status code is only a fallback, and 401/403 alone
+    is deliberately NOT allowed to name ``credential_rejected`` -- a dead key, an
+    expired token and a transient rate/quota condition are indistinguishable from
+    a bare 401, so such a refusal is reported as ``cause_not_distinguished``
+    rather than guessed (NF-2026-00326).  Token matching runs on ``_``/``-``
+    normalised text so a machine error code matches the same token as its prose
+    form (NF-2026-00275 rework).
+    """
+
+    normalized = _normalize_cause_text(lowered)
+    if "session limit" in normalized:
         return REFUSAL_SESSION_LIMIT
-    if any(
-        token in lowered
-        for token in (
-            "insufficient_quota",
-            "insufficient quota",
-            "insufficient balance",
-            "out of credit",
-            "out of credits",
-            "billing hard limit",
-            "quota exceeded",
-            "quota_exceeded",
-            "exhausted",
-        )
-    ):
+    if any(token in normalized for token in _BALANCE_TOKENS):
+        return REFUSAL_BALANCE_EXHAUSTED
+    if any(token in normalized for token in _QUOTA_TOKENS):
         return REFUSAL_QUOTA_EXHAUSTED
-    if status_code == 429 or any(
-        token in lowered
-        for token in ("rate limit", "rate_limit", "too many requests")
-    ):
+    if any(token in normalized for token in _RATE_TOKENS):
         return REFUSAL_RATE_LIMITED
-    if status_code in (401, 403) or any(
-        token in lowered
-        for token in (
-            "unauthorized",
-            "invalid api key",
-            "invalid_api_key",
-            "authentication",
-            "credential",
-            "expired token",
-            "expired credential",
-            "permission denied",
-        )
-    ):
+    if any(token in normalized for token in _CREDENTIAL_TOKENS):
         return REFUSAL_CREDENTIAL_REJECTED
-    if status_code in (500, 502, 503, 529) or any(
-        token in lowered
-        for token in ("overloaded", "service unavailable", "server error")
-    ):
+    if any(token in normalized for token in _UNAVAILABLE_TOKENS):
         return REFUSAL_PROVIDER_UNAVAILABLE
+    # Status-code fallbacks, used only where the body named no cause.  Every
+    # provider-owned refusal status resolves through the shared status map, so a
+    # status the detector forwards can never fall through to ``worker_failed``.
+    if status_code in (500, 502, 503, 529):
+        return REFUSAL_PROVIDER_UNAVAILABLE
+    if status_code in _STATUS_REFUSAL_KIND:
+        return _STATUS_REFUSAL_KIND[status_code]
     return None
 
 
@@ -942,10 +1068,21 @@ def classify_provider_outcome(
             "reason": "worker_process_failure_no_provider_refusal_signal",
         }
 
-    recoverable = kind in _RECOVERABLE_REFUSALS
+    recoverable = (
+        kind in _RECOVERABLE_REFUSALS
+        and status_code not in _NEVER_RECOVERABLE_STATUSES
+    )
     retry_after, reset_at = _reset_window(text) if recoverable else (None, None)
     reset_reported = recoverable and (retry_after is not None or reset_at is not None)
-    if kind == REFUSAL_CREDENTIAL_REJECTED:
+    if kind == REFUSAL_CAUSE_NOT_DISTINGUISHED:
+        # A bare 401/403: name the status and say explicitly that the response
+        # did not distinguish authentication from quota or rate limiting, rather
+        # than picking one of them as if it were established (NF-2026-00326).
+        reason = (
+            f"provider_refused:http_status={status_code}"
+            ":cause_not_distinguished_by_response"
+        )
+    elif kind == REFUSAL_CREDENTIAL_REJECTED:
         reason = "provider_refused_credential_rejected_needs_new_credential"
     elif recoverable and reset_reported:
         reason = f"provider_refused_{kind}_recoverable_after_reported_window"
@@ -993,12 +1130,16 @@ __all__ = [
     "OUTCOME_WORKER_FAILED",
     "REFUSAL_SESSION_LIMIT",
     "REFUSAL_QUOTA_EXHAUSTED",
+    "REFUSAL_BALANCE_EXHAUSTED",
     "REFUSAL_RATE_LIMITED",
     "REFUSAL_CREDENTIAL_REJECTED",
     "REFUSAL_PROVIDER_UNAVAILABLE",
+    "REFUSAL_CAUSE_NOT_DISTINGUISHED",
+    "PROVIDER_REFUSAL_STATUSES",
     "build_adapter_command",
     "build_runtime_command",
     "classify_provider_outcome",
+    "provider_body_names_cause",
     "inject_worker_mcp_config",
     "resolve_deepseek_model",
     "resolve_executable",

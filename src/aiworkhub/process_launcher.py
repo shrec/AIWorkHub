@@ -2250,11 +2250,22 @@ def _strip_project_context_receipt_prefix(text: str) -> str:
 
 
 def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
-    """Return bounded, structured provider-auth evidence without secret text.
+    """Return a bounded, body-classified provider-refusal record, no secret text.
 
     Only provider-owned JSONL fields are authoritative. Model prose and raw
     error bodies are deliberately ignored so an agent cannot spoof a launch
     failure or leak credentials into durable task state.
+
+    When a provider-owned ``api_error`` names an HTTP refusal status, its own
+    status and machine error code -- never model prose -- are handed to
+    ``runtime_adapters.classify_provider_outcome`` so the recorded reason is
+    derived from the response body at the boundary where it is still in hand.
+    A quota or rate refusal is therefore named as such instead of collapsing
+    into ``worker_failed`` downstream (NF-2026-00275), and a bare 401/403 whose
+    body distinguishes nothing is recorded as ``cause_not_distinguished`` rather
+    than guessed as an authentication failure (NF-2026-00326). The detection was
+    widened from 401/403 alone to every refusal status/code so the quota case
+    that item one measured is no longer lost before classification.
     """
 
     try:
@@ -2271,6 +2282,15 @@ def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
         text = _read_byte_range(path, 0, half) + "\n" + _read_byte_range(
             path, size - half, half
         )
+    # Provider-owned HTTP refusal statuses: authentication (401/403), payment
+    # required / balance (402) and rate/quota (429). 5xx is left to the worker
+    # path unchanged -- a transient upstream outage is not a launch refusal here.
+    # The status set and the machine-code vocabulary are OWNED by
+    # ``runtime_adapters`` and reused here so the gate that forwards a body and
+    # the classifier that names it can never drift onto different statuses or
+    # token forms again (NF-2026-00275 rework: a forwarded 402 that the
+    # classifier could not name collapsed back into ``worker_failed``).
+    refusal_statuses = runtime_adapters.PROVIDER_REFUSAL_STATUSES
     for raw_line in text.splitlines():
         try:
             event = json.loads(raw_line)
@@ -2287,24 +2307,68 @@ def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
             "unauthorized",
             "invalid_api_key",
         }
+        # A provider-owned refusal is present when the status is a refusal code
+        # OR the machine error code itself names a quota/rate/credential cause.
+        status_refusal = status in refusal_statuses
+        code_refusal = structured_auth_error or runtime_adapters.provider_body_names_cause(
+            error_code
+        )
         structured_result_error = (
             event.get("type") == "result"
             and event.get("is_error") is True
             and str(event.get("terminal_reason") or "").strip().lower() == "api_error"
-            and status in {401, 403}
+            and (status_refusal or code_refusal)
         )
         structured_retry_error = (
             event.get("type") == "system"
             and subtype == "api_retry"
-            and status in {401, 403}
-            and structured_auth_error
+            and (status_refusal or code_refusal)
         )
-        if structured_result_error or structured_retry_error:
+        if not (structured_result_error or structured_retry_error):
+            continue
+        # Hand the provider's OWN status and machine error code to the classifier
+        # -- never the ``result``/message prose, which an agent could author.
+        provider_body = f"http_status={status} {error_code}".strip()
+        outcome = runtime_adapters.classify_provider_outcome(
+            exit_code=1, message=provider_body
+        )
+        if outcome.get("outcome") != runtime_adapters.OUTCOME_PROVIDER_REFUSED:
+            # The launch-time detector ESTABLISHED a provider refusal above -- a
+            # refusal status, or a body/machine code that named an auth cause --
+            # yet the classifier could not name WHICH cause from the forwarded
+            # status and code alone (e.g. a status-less generic ``unauthorized``:
+            # http_status=0 carrying no distinguishing token).  Returning the
+            # classifier's ``worker_failed`` verdict here would record a provider
+            # refusal that the detector matched BECAUSE it named an auth cause as
+            # a worker crash -- exactly the NF-2026-00275 invariant this card
+            # exists to hold, and specifically the dead-credential case where an
+            # operator must re-authenticate and would instead be told their code
+            # failed.  The honest verdict is that a refusal occurred whose cause
+            # the response did not distinguish, so emit ``cause_not_distinguished``
+            # -- the same reason the classifier uses for a bare 401 -- rather than
+            # collapse back onto the worker path.  ``structured_auth_error`` and
+            # the classifier's cause vocabulary are two lists that legitimately
+            # disagree about a status-less ``unauthorized`` (the detector treats
+            # it as an auth signal; the classifier excludes it because it names
+            # nothing); this branch reconciles that disagreement honestly instead
+            # of letting a matched refusal fall through to ``worker_failed``.
             return {
                 "schema_id": "aiworkhub.provider_launch_failure.v1",
-                "reason": "provider_authentication_failed",
+                "reason": (
+                    f"provider_refused:http_status={status}"
+                    ":cause_not_distinguished_by_response"
+                ),
+                "refusal_kind": runtime_adapters.REFUSAL_CAUSE_NOT_DISTINGUISHED,
+                "recoverable": False,
                 "http_status": status,
             }
+        return {
+            "schema_id": "aiworkhub.provider_launch_failure.v1",
+            "reason": str(outcome.get("reason") or "provider_refused"),
+            "refusal_kind": str(outcome.get("refusal_kind") or ""),
+            "recoverable": bool(outcome.get("recoverable")),
+            "http_status": status,
+        }
     return None
 
 
@@ -8865,15 +8929,24 @@ class ProcessManager:
                         provider_output_path
                     )
                 if provider_launch_failure is not None:
-                    if str(metadata.get("adapter_id") or "") == "claude_cli":
+                    http_status = int(provider_launch_failure["http_status"])
+                    # The auth-readiness circuit is a claim about the credential,
+                    # so it only trips on an authentication-shaped status (401/
+                    # 403). A rate/quota refusal is not evidence of a bad key and
+                    # must not re-authenticate the route (NF-2026-00326).
+                    if (
+                        str(metadata.get("adapter_id") or "") == "claude_cli"
+                        and http_status in (401, 403)
+                    ):
                         claude_auth.record_runtime_auth_failure(
-                            http_status=int(provider_launch_failure["http_status"])
+                            http_status=http_status
                         )
                     terminal_state = "launch_failed"
-                    error = (
-                        "provider_authentication_failed:http_status="
-                        + str(provider_launch_failure["http_status"])
-                    )
+                    # The recorded blocker reason is the classifier's verdict,
+                    # derived from the provider's OWN response body here where it
+                    # is still in hand -- not a status-only guess and not the
+                    # downstream exit_code=1 (NF-2026-00275, NF-2026-00326).
+                    error = str(provider_launch_failure["reason"])
 
             changed: list[str] = []
             promoted: list[str] = []

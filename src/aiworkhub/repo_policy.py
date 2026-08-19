@@ -590,6 +590,11 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         },
         "workspace_hygiene": hygiene_status,
         "providers": providers,
+        # Per-route observability so this surface reports, route by route, which
+        # routes can never have quota verified here and the named reason why --
+        # rather than leaving the universal ready_unverified an unexplained
+        # blanket (NF-2026-00270).
+        "provider_observability": provider_observability_report(root),
         "provider_summary": {
             "route_count": len(providers),
             "eligible_route_count": len(eligible_routes),
@@ -802,16 +807,23 @@ def describe_provider_observability(
     resolution = runtime_adapters.resolve_executable(adapter_id)
     family = _adapter_route_family(adapter_id)
     installed = bool(resolution.ok)
+    # The evidence names WHETHER the binary resolved, never WHERE.  An absolute
+    # host path is machine-specific, and tests/test_repo_policy.py asserts the
+    # preflight report is portable -- it bans both host paths AND the word
+    # "executable", so the vocabulary here says "binary" and carries only the
+    # basename.  The guard is deliberately stronger than "no host paths":
+    # keeping it that way is cheaper than re-deciding it every time a new
+    # field is added to this report.
     install_evidence = (
-        f"executable={resolution.executable}"
+        f"binary_resolved:{Path(str(resolution.executable)).name}"
         if installed
         else f"not_installed:{resolution.reason}"
     )[:200]
     # Installability is observable for every adapter, installed or not; it is
     # the one signal that always names a real observation here.
-    observable_signals: list[str] = ["executable_installability"]
+    observable_signals: list[str] = ["binary_installability"]
     if installed:
-        observable_signals.append("executable_installed")
+        observable_signals.append("binary_installed")
     access_observed = False
     reachable = installed
     reachability_evidence = install_evidence

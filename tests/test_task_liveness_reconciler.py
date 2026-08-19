@@ -943,13 +943,21 @@ def test_structured_provider_auth_failure_blocks_without_review_candidate(
 
     assert result["state"] == "launch_failed"
     assert result["workspace_retained"] is False
-    assert result["error"] == "provider_authentication_failed:http_status=401"
+    # NF-2026-00326 inverted this assertion. A bare 401 with no body naming a
+    # cause used to be reported as provider_authentication_failed, which sends
+    # an operator to re-authenticate a credential that may be perfectly valid.
+    # The refusal is now recorded honestly: the provider refused, and the
+    # response did not say why.
+    assert (
+        result["error"]
+        == "provider_refused:http_status=401:cause_not_distinguished_by_response"
+    )
     assert "secret-bearing" not in json.dumps(result)
     assert blocked_calls == [
         (
             card["task_id"],
             card["runner"],
-            "provider_authentication_failed:http_status=401",
+            "provider_refused:http_status=401:cause_not_distinguished_by_response",
             request_id,
         )
     ]
