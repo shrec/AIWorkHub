@@ -1,10 +1,18 @@
 """Deterministic, bounded source-fragment editing.
 
 The model selects a small line range from Source Graph evidence and emits only
-the replacement text.  The trusted local runtime verifies the complete file
-preimage, applies non-overlapping ranges, and returns accounting facts.  This
-module deliberately makes no token-savings claim: it reports bytes exposed and
-bytes emitted so an ablation can measure provider-level effects separately.
+the replacement text.  ``prepare_line_target`` binds both the whole-file and the
+range-fragment sha256 of that range.  Verification is split across two layers:
+the applier layer (above this module) enforces the whole-file preimage before it
+mutates the tree, while this module verifies the range-fragment preimage on each
+edit.  ``apply_line_ranges`` is handed ``(current_text, ranges)`` and no
+whole-file hash, so it cannot check the whole-file preimage here: it compares the
+fragment hash when one is supplied, refuses on a mismatch, and -- when no hash is
+supplied -- applies the range but reports in the returned accounting how many
+ranges went unverified, so an unchecked write is never mistaken for a checked
+one.  This module deliberately makes no token-savings claim: it reports bytes
+exposed and bytes emitted so an ablation can measure provider-level effects
+separately.
 """
 
 from __future__ import annotations
@@ -167,6 +175,24 @@ def prepare_line_target(
     )
 
 
+def _line_terminator(fragment: str) -> str:
+    """Return the exact line terminator ``fragment`` ends with (``""`` if none).
+
+    Derived from what ``fragment`` actually ends with -- via ``str.splitlines``,
+    the same splitter ``apply_line_ranges`` uses -- so every terminator that
+    splitter can produce (CRLF, bare LF, bare CR and the other Unicode line
+    breaks) round-trips through a range edit.  A hand-written ladder that only
+    names a couple of cases silently drops the terminators it forgot and glues
+    the following line onto the replacement; deriving it cannot.
+    """
+    if not fragment:
+        return ""
+    last_line = fragment.splitlines(keepends=True)[-1]
+    without_terminator = last_line.splitlines(keepends=False)
+    body = without_terminator[0] if without_terminator else ""
+    return last_line[len(body):]
+
+
 def apply_line_ranges(
     current_text: str,
     ranges: list[dict[str, Any]],
@@ -174,7 +200,7 @@ def apply_line_ranges(
     if not ranges or len(ranges) > MAX_RANGES_PER_FILE:
         raise SemanticEditError("semantic_edit_ranges_invalid")
     lines = current_text.splitlines(keepends=True)
-    normalized: list[tuple[int, int, str, int, int]] = []
+    normalized: list[tuple[int, int, str, int, int, bool]] = []
     for index, item in enumerate(ranges):
         if not isinstance(item, dict):
             raise SemanticEditError(f"semantic_edit_range_invalid:{index}")
@@ -188,20 +214,43 @@ def apply_line_ranges(
             raise SemanticEditError(f"semantic_edit_replacement_too_large:{index}")
         _unused, old = _line_slice(current_text, start, end)
         old_bytes = old.encode("utf-8")
+        # The range-fragment preimage is verified only when a hash is supplied,
+        # and a mismatch always raises.  A missing hash (``None``, ``""`` or an
+        # absent key) is NOT silently treated as verified: the range is applied
+        # but recorded as unverified, and the accounting below reports how many
+        # ranges skipped the check so a caller can never mistake an unchecked
+        # write for a checked one.  (This layer receives ``(current_text,
+        # ranges)`` and no whole-file hash, so it cannot verify the whole-file
+        # preimage -- that gate lives in the applier layer, above this one.)
         expected_fragment_sha256 = item.get("fragment_sha256")
-        if expected_fragment_sha256 not in (None, "") and (
+        if expected_fragment_sha256 in (None, ""):
+            preimage_verified = False
+        elif (
             not isinstance(expected_fragment_sha256, str)
             or hashlib.sha256(old_bytes).hexdigest() != expected_fragment_sha256
         ):
             raise SemanticEditError(f"semantic_edit_fragment_hash_mismatch:{index}")
+        else:
+            preimage_verified = True
         preserve = item.get("preserve_trailing_newline", True)
         if not isinstance(preserve, bool):
             raise SemanticEditError(f"semantic_edit_newline_policy_invalid:{index}")
-        if preserve and replacement and old.endswith("\r\n") and not replacement.endswith(("\n", "\r")):
-            replacement += "\r\n"
-        elif preserve and replacement and old.endswith("\n") and not replacement.endswith(("\n", "\r")):
-            replacement += "\n"
-        normalized.append((start, end, replacement, len(old_bytes), len(replacement.encode("utf-8"))))
+        # Restore whatever terminator ``old`` actually ended with rather than a
+        # two-case ladder that only knew CRLF and LF; ``_line_terminator``
+        # covers every terminator ``splitlines`` can produce, so a bare-CR (or
+        # any other line-break) file keeps its line structure.
+        if preserve and replacement and not replacement.endswith(("\n", "\r")):
+            replacement += _line_terminator(old)
+        normalized.append(
+            (
+                start,
+                end,
+                replacement,
+                len(old_bytes),
+                len(replacement.encode("utf-8")),
+                preimage_verified,
+            )
+        )
 
     ordered = sorted(normalized, key=lambda value: (value[0], value[1]))
     for previous, current in zip(ordered, ordered[1:]):
@@ -210,7 +259,7 @@ def apply_line_ranges(
                 f"semantic_edit_ranges_overlap:{previous[0]}-{previous[1]}:{current[0]}-{current[1]}"
             )
 
-    for start, end, replacement, _old_bytes, _new_bytes in reversed(ordered):
+    for start, end, replacement, _old_bytes, _new_bytes, _verified in reversed(ordered):
         lines[start - 1 : end] = [replacement]
     next_text = "".join(lines)
     next_bytes = len(next_text.encode("utf-8"))
@@ -218,6 +267,7 @@ def apply_line_ranges(
         raise SemanticEditError("semantic_edit_result_too_large")
     old_region_bytes = sum(item[3] for item in normalized)
     replacement_bytes = sum(item[4] for item in normalized)
+    unverified_range_count = sum(1 for item in normalized if not item[5])
     return next_text, {
         "range_count": len(normalized),
         "old_region_bytes": old_region_bytes,
@@ -225,4 +275,7 @@ def apply_line_ranges(
         "model_reemitted_old_bytes": 0,
         "whole_file_output_required": False,
         "token_savings_claimed": False,
+        "preimage_verified_range_count": len(normalized) - unverified_range_count,
+        "preimage_unverified_range_count": unverified_range_count,
+        "preimage_verified": unverified_range_count == 0,
     }
