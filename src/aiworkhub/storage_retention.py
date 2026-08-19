@@ -1135,6 +1135,70 @@ def _load_manifest(path: Path, repo_id: str) -> dict[str, Any]:
     return value
 
 
+# The states a worktree quarantine item ends in when nothing was moved into the
+# batch for it: its on-disk identity changed between the digest snapshot and the
+# move, so no worktree directory sits under the batch. A batch whose every item
+# is one of these -- and which physically holds no files -- has nothing to
+# restore. This mirrors the terminal-log retention empty-batch definition so both
+# quarantine subsystems agree on "holds nothing to restore".
+_EMPTY_BATCH_ITEM_STATES = frozenset({
+    "skipped_invalid_id",
+    "skipped_identity_changed",
+    "skipped_missing",
+    "skipped_git_state_changed",
+})
+
+
+def _batch_is_empty(manifest: Mapping[str, Any]) -> bool:
+    """True when the record shows nothing was ever moved into the batch.
+
+    Every item must be in a pre-move skipped state -- never ``quarantined``
+    (whose worktree sits in the batch) nor ``restored``/``restore_conflict``
+    (which an operator may still rely on). An item in any other state keeps the
+    batch's full undo window.
+    """
+    for item in manifest.get("items") or []:
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("state") or "") not in _EMPTY_BATCH_ITEM_STATES:
+            return False
+    return True
+
+
+def _batch_dir_has_payload(batch_path: Path) -> bool:
+    """True when the batch physically holds any non-manifest regular file.
+
+    Read from disk, never trusted from the manifest item states: a batch whose
+    record reads empty can still hold bytes (a record-versus-disk disagreement),
+    and such a batch must never be reaped on a stale "empty" record. Symlinks are
+    never followed or counted.
+    """
+    for directory, dirnames, filenames in os.walk(batch_path, followlinks=False):
+        parent = Path(directory)
+        dirnames[:] = [name for name in dirnames if not (parent / name).is_symlink()]
+        for name in filenames:
+            if name == MANIFEST_NAME and parent == batch_path:
+                continue
+            try:
+                info = (parent / name).lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                continue
+            return True
+    return False
+
+
+def _batch_reapable_empty(manifest: Mapping[str, Any], batch_path: Path) -> bool:
+    """A batch is early-reapable only when its record AND its disk are both empty.
+
+    Requiring the directory to be physically empty too makes a record-versus-disk
+    disagreement impossible to act on destructively: a batch that still holds
+    files keeps its full deadline regardless of what its item states say.
+    """
+    return _batch_is_empty(manifest) and not _batch_dir_has_payload(batch_path)
+
+
 def quarantine(
     repo_root: Path | str,
     *,
@@ -1234,6 +1298,25 @@ def quarantine(
     manifest["quarantined_count"] = moved
     manifest["quarantined_bytes"] = moved_bytes
     _atomic_json(manifest_path, manifest)
+    if _batch_reapable_empty(manifest, batch):
+        # Every candidate's identity changed between the digest snapshot and the
+        # move (typically a concurrent sweep quarantined them first), so this pass
+        # moved nothing. An empty batch holds nothing to restore, yet its seven-day
+        # undo window would keep it on the storage panel forever, shape-identical to
+        # a real batch -- the exact accumulation the terminal-log side already
+        # closes. Reap it now, but only when the directory is also physically empty
+        # so a batch that unexpectedly holds files is never rmtree'd here on a stale
+        # "empty" record.
+        shutil.rmtree(batch, ignore_errors=True)
+        _append_audit(root, {
+            "schema_id": "aiworkhub.storage_retention_audit.v1",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": "quarantine_empty_reaped",
+            "batch_id": batch_id,
+            "count": 0,
+            "bytes": 0,
+        })
+        return {"ok": True, "batch_id": "", "quarantined": 0, "bytes": 0, "no_op": True}
     _append_audit(root, {
         "schema_id": "aiworkhub.storage_retention_audit.v1",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1327,9 +1410,14 @@ def list_batches(repo_root: Path | str, *, base: Path | None = None) -> dict[str
             )
             deadline = str(value.get("restore_deadline") or "")
             try:
-                purge_eligible = datetime.now(timezone.utc) >= datetime.fromisoformat(deadline)
+                expired = datetime.now(timezone.utc) >= datetime.fromisoformat(deadline)
             except ValueError:
-                purge_eligible = False
+                expired = False
+            # A batch is reapable now if its undo window has expired OR it is empty
+            # in BOTH its record and on disk -- exactly what ``purge`` accepts. An
+            # empty batch is surfaced purge_eligible even inside a live window so it
+            # never sits on the storage panel forever protecting nothing.
+            reapable_empty = _batch_reapable_empty(value, entry)
             rows.append({
                 "batch_id": value["batch_id"],
                 "created_at": str(value.get("created_at") or ""),
@@ -1338,7 +1426,12 @@ def list_batches(repo_root: Path | str, *, base: Path | None = None) -> dict[str
                 "quarantined_count": states.count("quarantined"),
                 "restored_count": states.count("restored"),
                 "bytes": quarantined_bytes,
-                "purge_eligible": purge_eligible,
+                "purge_eligible": expired or reapable_empty,
+                # Exactly the batches ``purge_empty_batches`` collects: empty in
+                # BOTH record and on disk. Distinct from ``purge_eligible``, which
+                # also covers expired-but-still-full batches that collector never
+                # takes.
+                "reapable_empty": reapable_empty,
             })
     return {"ok": True, "batches": rows[:100], "count": len(rows[:100])}
 
@@ -1551,7 +1644,11 @@ def purge(
         deadline = datetime.fromisoformat(str(manifest.get("restore_deadline") or ""))
     except ValueError as exc:
         raise StorageRetentionError("retention_deadline_invalid") from exc
-    if datetime.now(timezone.utc) < deadline:
+    # The undo window protects every batch that still holds a worktree a restore
+    # could return. A batch empty in BOTH its record and on disk holds nothing to
+    # restore, so it is reapable before its deadline; a batch whose record reads
+    # empty while its directory still holds bytes keeps its full window.
+    if datetime.now(timezone.utc) < deadline and not _batch_reapable_empty(manifest, batch):
         raise StorageRetentionError("retention_undo_window_active")
     shutil.rmtree(batch)
     # The worktree registrations deliberately remain intact during the undo
@@ -1566,6 +1663,51 @@ def purge(
         "bytes": int(manifest.get("quarantined_bytes") or 0),
     })
     return {"ok": True, "batch_id": batch_id, "purged": True, "bytes": int(manifest.get("quarantined_bytes") or 0)}
+
+
+def purge_empty_batches(
+    repo_root: Path | str, *, confirm: bool, base: Path | None = None
+) -> dict[str, Any]:
+    """Operator-invoked collector for empty worktree quarantine batches.
+
+    ``quarantine`` now reaps an empty batch at the moment it opens one, so new
+    empty batches never accumulate at the source. This is the consumer for any
+    that already exist (created before that self-reap, or by an older build): one
+    named, operator-reachable trigger that removes every batch empty in BOTH its
+    record and on disk, and only those. A batch holding any file -- including a
+    record-empty batch that still physically holds bytes -- is never touched here;
+    it keeps its full undo window and is handled by the ordinary restore/purge
+    path. Mirrors ``terminal_log_retention.purge_empty_batches``.
+    """
+    if not confirm:
+        raise StorageRetentionError("explicit_confirmation_required")
+    root = Path(repo_root).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
+    qroot = _read_quarantine_root(root, worktree_base)
+    if qroot is None:
+        return {"ok": True, "purged": 0, "batch_ids": [], "bytes": 0}
+    repo_id = _repo_id(root)
+    purged: list[str] = []
+    for entry in sorted(qroot.iterdir()):
+        if not entry.is_dir() or entry.is_symlink() or not _ID_RE.fullmatch(entry.name):
+            continue
+        try:
+            manifest = _load_manifest(entry / MANIFEST_NAME, repo_id)
+        except StorageRetentionError:
+            continue
+        if _batch_reapable_empty(manifest, entry):
+            shutil.rmtree(entry, ignore_errors=True)
+            purged.append(entry.name)
+    if purged:
+        _append_audit(root, {
+            "schema_id": "aiworkhub.storage_retention_audit.v1",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": "empty_batches_collected",
+            "count": len(purged),
+            "batch_ids": sorted(purged),
+            "bytes": 0,
+        })
+    return {"ok": True, "purged": len(purged), "batch_ids": sorted(purged), "bytes": 0}
 
 
 def _recorded_heads(root: Path, worktree_base: Path) -> dict[str, str]:
@@ -1728,6 +1870,7 @@ __all__ = [
     "preview",
     "prune_stale_registrations",
     "purge",
+    "purge_empty_batches",
     "quarantine",
     "recover_stranded_worktrees",
     "restore",

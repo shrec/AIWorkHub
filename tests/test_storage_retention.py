@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from aiworkhub import storage_retention, task_store
+from aiworkhub import storage_retention, task_store, worktree_storage
 
 # terminal_runs_days defaults to 30; 31 real days pushes a worktree past the
 # default policy threshold without ever touching its on-disk mtime. Age is
@@ -244,6 +245,165 @@ def test_foreign_stale_registration_blocks_repository_wide_prune(retained, tmp_p
             confirm=True,
             base=retained["base"],
         )
+
+
+# --- AWH-OBS-013: empty worktree quarantine batches -------------------------
+# The terminal-log quarantine already self-reaps an empty batch and offers a
+# purge_empty_batches reaper (see tests/test_terminal_log_retention_empty_batches.py).
+# The worktree quarantine here previously did neither: an all-skipped batch was
+# left on disk holding a live seven-day deadline, and there was no reaper for it.
+# These prove both halves are now closed for the worktree subsystem too.
+
+
+def _repo_id(repo: Path) -> str:
+    return task_store.storage_readiness(repo).repo_id
+
+
+def _write_empty_batch(
+    base: Path, repo_id: str, batch_id: str, *, item_states, with_payload: bool = False
+) -> Path:
+    """Materialise a worktree quarantine batch directory with a valid manifest.
+
+    A ``quarantined`` item gets a real file under ``<batch>/<id>/worktree`` so a
+    test can prove a content-bearing batch is never reaped; every skipped item
+    leaves no directory, mirroring a batch that moved nothing.
+    """
+    qroot = base / storage_retention.QUARANTINE_DIRNAME / repo_id
+    qroot.mkdir(parents=True, exist_ok=True)
+    batch = qroot / batch_id
+    batch.mkdir()
+    items = []
+    for index, state in enumerate(item_states):
+        item_id = f"request-{index:03d}"
+        if with_payload and state == "quarantined":
+            (batch / item_id / "worktree").mkdir(parents=True)
+            (batch / item_id / "worktree" / "f.txt").write_text("x", encoding="utf-8")
+        items.append({
+            "id": item_id,
+            "head": "0" * 40,
+            "size_bytes": 1,
+            "modified_at_epoch": 1,
+            "state": state,
+        })
+    manifest = {
+        "schema_id": storage_retention.SCHEMA_ID,
+        "repo_id": repo_id,
+        "batch_id": batch_id,
+        "created_at": "2035-01-01T00:00:00+00:00",
+        # A deadline far in the future: any reap is because the batch is empty,
+        # not because the undo window expired.
+        "restore_deadline": "2040-01-01T00:00:00+00:00",
+        "preview_digest": "0" * 64,
+        "status": "empty" if all(s in storage_retention._EMPTY_BATCH_ITEM_STATES for s in item_states) else "quarantined",
+        "items": items,
+        "quarantined_count": sum(1 for s in item_states if s == "quarantined"),
+        "quarantined_bytes": sum(1 for s in item_states if s == "quarantined"),
+    }
+    storage_retention._atomic_json(batch / storage_retention.MANIFEST_NAME, manifest)
+    return batch
+
+
+def test_quarantine_self_reaps_a_batch_that_can_never_hold_anything(
+    retained, monkeypatch
+) -> None:
+    # A batch whose sole candidate is skipped during the move (its git identity
+    # changed after the digest was reconfirmed) moves nothing. It must be reaped
+    # at the source, not left behind empty holding a live undo window.
+    aged_now = _aged_now()
+    preview = storage_retention.preview(retained["repo"], base=retained["base"], now=aged_now)
+    assert preview["candidate_count"] == 1
+
+    real_state = worktree_storage._worktree_git_state
+
+    # quarantine reconfirms the digest by re-running the FULL footprint
+    # measurement -- a fresh single-flight walk, because the preview() above
+    # already completed and evicted its own. Both that re-measurement and the
+    # preview() above resolve git state on the OFF-thread daemon walk (thread
+    # name "aiworkhub-retention-preview"); the sole MAIN-thread _worktree_git_state
+    # call is quarantine's move-loop identity recheck (storage_retention.py:1282).
+    # So discriminate by thread, never by a call counter: a counter miscounts
+    # because the head is read once per measurement (here: the explicit preview,
+    # then quarantine's re-measurement) BEFORE the move loop is ever reached, so a
+    # ">= 2nd call" rule corrupts quarantine's digest reconfirmation and raises
+    # retention_preview_stale instead of exercising the self-reap. Threading it
+    # keeps the head stable through both measurements (digest reconfirms clean)
+    # and changes it only at the move -- exactly "identity changed between the
+    # digest snapshot and the move", so the sole candidate becomes
+    # skipped_git_state_changed, nothing moves, and the empty batch self-reaps.
+    def _flaky_state(worktree_dir):
+        state = dict(real_state(worktree_dir))
+        on_measurement_thread = (
+            threading.current_thread().name == "aiworkhub-retention-preview"
+        )
+        if not on_measurement_thread and state.get("head"):
+            head = state["head"]
+            state["head"] = ("b" if head[0] != "b" else "c") + head[1:]
+        return state
+
+    monkeypatch.setattr(worktree_storage, "_worktree_git_state", _flaky_state)
+
+    result = storage_retention.quarantine(
+        retained["repo"],
+        preview_digest=preview["preview_digest"],
+        confirm=True,
+        base=retained["base"],
+        now=aged_now,
+    )
+
+    assert result["no_op"] is True
+    assert result["batch_id"] == ""
+    assert result["quarantined"] == 0
+    # No empty batch was left on disk and none is listed.
+    assert storage_retention.list_batches(retained["repo"], base=retained["base"])["count"] == 0
+    qroot = retained["base"] / storage_retention.QUARANTINE_DIRNAME
+    assert not qroot.exists() or list(qroot.rglob(storage_retention.MANIFEST_NAME)) == []
+
+
+def test_purge_empty_batches_reaps_preexisting_empty_but_spares_content(retained) -> None:
+    repo_id = _repo_id(retained["repo"])
+    empty = _write_empty_batch(
+        retained["base"], repo_id, "q20260816T101142-000000000001",
+        item_states=("skipped_identity_changed", "skipped_git_state_changed"),
+    )
+    full = _write_empty_batch(
+        retained["base"], repo_id, "q20260816T101142-0000000000ff",
+        item_states=("quarantined",), with_payload=True,
+    )
+    # Surfaced as reapable_empty vs not, even though both deadlines are live.
+    listed = {b["batch_id"]: b for b in storage_retention.list_batches(
+        retained["repo"], base=retained["base"])["batches"]}
+    assert listed[empty.name]["reapable_empty"] is True
+    assert listed[full.name]["reapable_empty"] is False
+
+    result = storage_retention.purge_empty_batches(
+        retained["repo"], confirm=True, base=retained["base"]
+    )
+    assert result["batch_ids"] == [empty.name]
+    assert not empty.exists()
+    assert full.exists()  # a content-bearing batch is never touched by the reaper
+
+
+def test_purge_empty_batches_requires_confirmation(retained) -> None:
+    with pytest.raises(storage_retention.StorageRetentionError, match="explicit_confirmation_required"):
+        storage_retention.purge_empty_batches(
+            retained["repo"], confirm=False, base=retained["base"]
+        )
+
+
+def test_purge_reaps_reapable_empty_batch_inside_live_undo_window(retained) -> None:
+    # An empty batch holds nothing to restore, so an explicit purge reaps it even
+    # before its deadline -- while a content-bearing batch still fails closed
+    # (covered by test_stale_preview_and_early_purge_fail_closed).
+    repo_id = _repo_id(retained["repo"])
+    empty = _write_empty_batch(
+        retained["base"], repo_id, "q20260816T101142-000000000002",
+        item_states=("skipped_identity_changed",),
+    )
+    result = storage_retention.purge(
+        retained["repo"], batch_id=empty.name, confirm=True, base=retained["base"]
+    )
+    assert result["purged"] is True
+    assert not empty.exists()
 
 
 def test_registration_candidate_overflow_blocks_repository_wide_prune(tmp_path, monkeypatch) -> None:
