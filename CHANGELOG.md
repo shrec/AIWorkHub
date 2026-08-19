@@ -6,6 +6,64 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.90] - 2026-08-19
+
+One card, three NeedFix records, on the layer that tells an operator why a run
+died.
+
+### Fixed
+
+- **A dead balance, an exhausted quota and broken code are no longer the same
+  error.** A provider refusal arrived as `worker_failed:exit_code=1`; twenty-six
+  of fifty-two blocked cards carry exactly that string, so a dead balance, an
+  exhausted weekly limit, a revoked key and a genuine crash were indistinguishable
+  from each other. One such refusal discarded 2.6M tokens of completed work while
+  the record pointed at the worker. The classifier that separates them existed
+  and had ZERO production callers - it was on the orphan list measured under
+  NF-2026-00304. It is now wired at the launch-failure detector, which classifies
+  where the provider's own response is still in hand rather than downstream where
+  only an exit code survives, and it is handed the provider's machine fields
+  only - never the result prose, which an agent could author. (NF-2026-00275,
+  first of three defects; the attempt-accounting and circuit-breaker halves stay
+  open on that record.)
+- **A bare 401 no longer claims the credential is bad.** Nine launches succeeded
+  on one credential, three failed with `provider_authentication_failed`, and it
+  cleared by itself ten minutes later - a quota condition wearing an
+  authentication label, and the two demand opposite responses. A refusal whose
+  body names no cause now records
+  `provider_refused:http_status=NNN:cause_not_distinguished_by_response`.
+  (NF-2026-00326)
+- **Every route now states whether its quota is observable, and why not.**
+  `provider_observability_report` was also an orphan; it is wired into the
+  preflight. `ready_unverified` remains the honest answer for every route because
+  no adapter exposes quota - but it is now a stated conclusion per route rather
+  than one generic string shared by all of them. (NF-2026-00270, partial)
+
+### Notes
+
+Four rejection rounds, each on a live defect in this card's own central
+invariant, each found by a lens before the manager and each measured by running
+the code: both entry points shipped unwired and reported as "already exists and
+is correct"; a 402 PAYMENT REQUIRED collapsed to `worker_failed`; bare
+`"exhausted"` pulled a dead balance into the quota family and marked it
+RECOVERABLE, telling an operator to wait for a condition that only clears when
+someone adds credit; and a status-less `unauthorized` was recorded as
+`no_provider_refusal_signal` - a refusal the detector itself had matched.
+
+The classifier is now verified across twelve bodies and the detector across five
+events. Balance beats status. 402 is never recoverable at the STATUS level,
+independent of token membership, so no future vocabulary edit can reintroduce
+the class.
+
+This release also carries 0.9.87, 0.9.88 and 0.9.89, which were committed and
+CI-verified but never tagged, so no GitHub Release was ever produced for them.
+Their entries below stand; this is the tag that publishes them.
+
+Recorded rather than fixed: NF-2026-00332 (`_provider_status_code` reads any
+400-599 number anywhere in provider text as an HTTP status, so a crash traceback
+containing "line 429" would classify as a recoverable rate limit - latent behind
+today's only caller, which builds a controlled body).
+
 ## [0.9.89] - 2026-08-19
 
 One card, two NeedFix records, both on the gate that is supposed to be the last

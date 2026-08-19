@@ -12,6 +12,17 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.90
+
+- AIWorkHub can now tell you why a run died. A provider refusing a task — no
+  balance, exhausted quota, rejected key — used to be reported as "the task
+  failed", the same message used for broken code, and half of all blocked tasks
+  carried it. Refusals are now named for what they are.
+- A refusal that arrives without a stated cause says so, instead of telling you
+  to re-authenticate a credential that may be perfectly fine.
+- Each provider states whether its remaining quota is observable at all, and why
+  not, instead of every provider showing the same unhelpful status.
+
 ## What's new in 0.9.89
 
 - Work that changes nothing can no longer pass review silently: a task once added

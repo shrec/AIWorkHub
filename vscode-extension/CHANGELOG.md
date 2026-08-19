@@ -1,5 +1,28 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.90 — 2026-08-19
+
+### Fixed
+
+- **AIWorkHub can now tell you why a run died.** When a provider refused a task —
+  no balance, an exhausted quota, a rejected key — AIWorkHub reported it as
+  "the task failed", the same message it uses for broken code. Half of all
+  blocked tasks carried that one message, so a problem you could fix in a minute
+  looked identical to a bug. Refusals are now named for what they are.
+- **A rejected key is no longer assumed.** A refusal that arrives without a
+  stated cause now says the provider refused and did not say why, instead of
+  telling you to re-authenticate a credential that may be perfectly fine.
+- **Each provider now says whether its remaining quota can be seen at all**, and
+  why not, rather than every provider showing the same unhelpful status.
+
+### Notes
+
+This release also publishes 0.9.87, 0.9.88 and 0.9.89 — the dashboard font
+scale, the MCP config Claude Code could not read, the reasoning output that made
+a working task look dead, the failure reasons that were missing or cut off, and
+the review checks that now catch unreachable code and a stale version. They were
+built and verified but never tagged, so no release was produced for them.
+
 ## 0.9.89 — 2026-08-19
 
 Two fixes to AIWorkHub's own safety checks.
