@@ -44,7 +44,19 @@ def _manager_context(*, topic: str = "management", target: str | None = None) ->
         request_id=session_id,
         repo=root,
         authority_repo=root,
-        source_graph_targets=(str(target),) if target else (),
+        # A manager query's ``target`` is a QUERY SCOPE, not a security
+        # allowlist, and the two must not be conflated.  Passing it through as
+        # ``source_graph_targets`` made the manager's own selector its only
+        # permitted path: a ``body``/``function`` target is a QUALNAME, the
+        # resolved symbol's FILE never equals it, and the selector enforcement
+        # then refused the manager's primary discovery surface with
+        # ``symbol_out_of_scope`` -- the same qualname-as-path confusion
+        # NF-2026-00348 removed one level down.  The scope still reaches the
+        # engine through ``source_graph_query(target=...)``; what it must not do
+        # is narrow the authority of a role that has repository-wide authority
+        # by definition.  Task-scoped allowlists belong to WORKERS, which is
+        # where they are still enforced.
+        source_graph_targets=(),
         session_topic=str(topic or "management")[:128],
         audit_ledger_path=None,
         audit_hmac_key_path=None,
