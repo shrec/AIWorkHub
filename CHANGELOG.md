@@ -6,6 +6,53 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.93] - 2026-08-19
+
+Source Graph, and the models the editor already had.
+
+### Fixed
+
+- **A symbol target was filtered as a path prefix, so `body` and `function`
+  returned nothing for symbols the index holds.** The engine resolved the symbol
+  and the wrapper then dropped it, because a file path never starts with a
+  qualname. `freshness: "fresh"` with zero matches is impossible from the engine
+  - the scalar survived while the rows were removed, which is the fingerprint of
+  a filter applied after retrieval. `focus` emits qualnames in its own
+  `recommended_next_steps`, so a caller following the tool's advice got nothing
+  and fell back to reading files: the ~60x token saving abandoned on every such
+  call. `slice` had been exempted years earlier with a comment stating exactly
+  this reasoning; `body` and `function` never got it. The distinction is now
+  named once and drives both the engine call and the filter. A symbol outside the
+  task allowlist is refused BY NAME rather than returned as an empty result that
+  reads as "no such symbol". (NF-2026-00348)
+- **A security lens closed the last piece**: two boundary paths answered the same
+  question oppositely - one fail-open, one fail-closed - on a match with no
+  attributable file. Not reachable through the current schema, and closed anyway.
+
+### Added
+
+- **AIWorkHub asks VS Code which models exist instead of keeping a list nobody
+  maintains.** The same list had been written out four times and every copy knew
+  one model, while the owner's endpoint exposed six. `vscode.lm.selectChatModels`
+  is the authority now: the catalog fans out one row per discovered model, and a
+  model the endpoint starts offering is usable with no code change and no hand
+  edit. Gating is the provider family plus the shared name regex - nothing in the
+  running path enumerates a model name. The filters that exclude entries which
+  measurably fail are unchanged, and a name the editor never reported is refused
+  by name.
+
+### Notes
+
+Two audits of Source Graph were accepted alongside this. One, run on GLM-5.2
+through the very path being fixed, independently found the `function`-mode defect
+above as its own F2 and added a `focus` ranking finding. The other found that a
+payload preview labelled `structure_aware_priority_preserving` truncates lists
+positionally - so a high-priority row at index 5 is dropped - and that the cache
+replay branch returns a `content_sha256` that does not hash its own `content`.
+Both are recorded, neither is fixed here.
+
+Canonical: 4730 passed, 38 skipped, ruff clean, npm test 38 files.
+
 ## [0.9.92] - 2026-08-19
 
 The release that unblocks the loop. One failed Source Graph call was enough to

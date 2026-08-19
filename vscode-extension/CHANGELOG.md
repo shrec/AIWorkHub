@@ -1,5 +1,25 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.93 — 2026-08-19
+
+### Fixed
+
+- **Asking for a specific function or class by name returned nothing**, even when
+  AIWorkHub had it indexed. It found the symbol and then discarded it on the way
+  back. Because the tool's own suggestions use exactly that form, following its
+  advice led nowhere and the work fell back to reading whole files — which is the
+  cost this feature exists to avoid.
+- A request for something outside a task's permitted files now says so by name,
+  instead of returning an empty result that reads as "no such symbol".
+
+### Added
+
+- **AIWorkHub now asks the editor which models are available instead of carrying
+  its own list.** That list had been written out in four places and knew one
+  model while six were configured and working. A model your endpoint starts
+  offering now appears on its own — no update, nothing to type. Names the editor
+  does not report are still refused, and by name.
+
 ## 0.9.92 — 2026-08-19
 
 Work that was finished and correct could not be accepted. This release fixes that

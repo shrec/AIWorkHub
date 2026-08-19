@@ -12,6 +12,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.93
+
+- Asking for a function or class by name returned nothing even when it was
+  indexed — found, then discarded on the way back. The tool's own suggestions use
+  that form, so following its advice led nowhere and work fell back to reading
+  whole files.
+- AIWorkHub now asks the editor which models are available instead of carrying
+  its own list, which knew one model while six were configured and working. A
+  newly offered model appears on its own, with nothing to type.
+- A request outside a task's permitted files is refused by name, not returned as
+  an empty result.
+
 ## What's new in 0.9.92
 
 - A single failed internal lookup was enough to reject finished, correct work,
