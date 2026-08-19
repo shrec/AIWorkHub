@@ -6488,7 +6488,67 @@ function portableWorkspaceMcpCommand(command, repoRoot) {
   return base === "python3" || base === "python" ? base : rawCommand;
 }
 
-function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, python) {
+// VS Code substitutes these ${...} variables when IT reads a configuration
+// file (settings.json, .vscode/mcp.json, tasks.json). Any consumer that reads
+// the file directly instead -- Claude Code reading `.mcp.json`, or a launcher
+// exec'ing the `command` string -- receives the literal token, so the MCP
+// server fails to start naming a token (`${workspaceFolder}`) where a directory
+// belongs (NF-2026-00243). Match the documented VS Code variable forms,
+// including the `namespace:arg` families, so we can detect one before it is
+// written into a file consumed outside VS Code.
+const VSCODE_VARIABLE_PATTERN = /\$\{(?:(?:env|config|command|input):[^}]+|workspaceFolder|workspaceFolderBasename|workspaceRoot|userHome|cwd|pathSeparator|execPath|fileWorkspaceFolder|relativeFileDirname|relativeFile|fileDirnameBasename|fileDirname|fileBasenameNoExtension|fileBasename|fileExtname|lineNumber|selectedText|file)\}/;
+
+function containsUnexpandedVsCodeVariable(value) {
+  return VSCODE_VARIABLE_PATTERN.test(String(value === undefined || value === null ? "" : value));
+}
+
+// Depth/breadth-bounded walk that reports every string in a config document
+// still carrying an unexpanded VS Code variable, with a JSON path for the log.
+function findUnexpandedVsCodeVariables(node, trail = "$", depth = 0) {
+  const hits = [];
+  if (depth > 8) {
+    return hits;
+  }
+  if (typeof node === "string") {
+    if (containsUnexpandedVsCodeVariable(node)) {
+      hits.push({ path: trail, value: node });
+    }
+    return hits;
+  }
+  if (Array.isArray(node)) {
+    node.slice(0, 200).forEach((item, index) => {
+      hits.push(...findUnexpandedVsCodeVariables(item, `${trail}[${index}]`, depth + 1));
+    });
+    return hits;
+  }
+  if (node && typeof node === "object") {
+    for (const [key, val] of Object.entries(node)) {
+      hits.push(...findUnexpandedVsCodeVariables(val, `${trail}.${key}`, depth + 1));
+    }
+  }
+  return hits;
+}
+
+// The check that refuses to persist a config a downstream consumer cannot use.
+// A file consumed outside VS Code (`vscodeVariables: false`) must never carry
+// an unexpanded VS Code variable; a VS-Code-consumed file is exempt because VS
+// Code performs the substitution before any consumer observes the value.
+function assertMcpConfigConsumable(document, options = {}) {
+  if (options.vscodeVariables !== false) {
+    return { ok: true, reason: "" };
+  }
+  const offending = findUnexpandedVsCodeVariables(document);
+  if (!offending.length) {
+    return { ok: true, reason: "" };
+  }
+  const detail = offending.map((hit) => `${hit.path}=${hit.value}`).join(", ");
+  return {
+    ok: false,
+    reason: `unexpanded VS Code variable(s) a non-VS-Code consumer cannot resolve: ${detail}`,
+  };
+}
+
+function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, python, options = {}) {
   if (!document || typeof document !== "object" || Array.isArray(document)) {
     return { document, changed: false };
   }
@@ -6496,7 +6556,14 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
     document[containerKey] = {};
   }
   const servers = document[containerKey];
-  const portableCommand = portableWorkspaceMcpCommand(python.command, repoRoot);
+  // VS-Code-consumed configs (.vscode/mcp.json) keep the machine-neutral
+  // ${workspaceFolder} form because VS Code expands it. A config consumed
+  // outside VS Code (.mcp.json, read directly by Claude Code) must instead
+  // carry the resolved absolute command exactly as found -- never a variable a
+  // direct reader cannot expand (NF-2026-00243).
+  const portableCommand = options.vscodeVariables === false
+    ? String(python.command || "")
+    : portableWorkspaceMcpCommand(python.command, repoRoot);
   let changed = false;
   let found = false;
   for (const [name, value] of Object.entries(servers)) {
@@ -6549,7 +6616,9 @@ function repairWorkspaceMcpConfigObject(document, runtimeDir, repoRoot, python) 
 }
 
 function repairClaudeMcpConfigObject(document, runtimeDir, repoRoot, python) {
-  return repairMcpConfigObject(document, "mcpServers", runtimeDir, repoRoot, python);
+  // Claude Code reads .mcp.json directly and cannot expand VS Code variables,
+  // so this config must carry the resolved absolute command, not a token.
+  return repairMcpConfigObject(document, "mcpServers", runtimeDir, repoRoot, python, { vscodeVariables: false });
 }
 
 function ensureWorkspaceMcpConfigsRepaired(context) {
@@ -6560,8 +6629,8 @@ function ensureWorkspaceMcpConfigsRepaired(context) {
     const repoRoot = canonicalRepositoryRoot(folder.uri.fsPath);
     const python = findPythonCommand(repoRoot, { preflight: false });
     for (const spec of [
-      { configPath: path.join(repoRoot, ".vscode", "mcp.json"), container: "servers", label: "VS Code/Copilot" },
-      { configPath: path.join(repoRoot, ".mcp.json"), container: "mcpServers", label: "Claude Code" },
+      { configPath: path.join(repoRoot, ".vscode", "mcp.json"), container: "servers", label: "VS Code/Copilot", vscodeVariables: true },
+      { configPath: path.join(repoRoot, ".mcp.json"), container: "mcpServers", label: "Claude Code", vscodeVariables: false },
     ]) {
       let document = {};
       try {
@@ -6572,8 +6641,17 @@ function ensureWorkspaceMcpConfigsRepaired(context) {
           continue;
         }
       }
-      const result = repairMcpConfigObject(document, spec.container, runtimeDir, repoRoot, python);
+      const result = repairMcpConfigObject(document, spec.container, runtimeDir, repoRoot, python, { vscodeVariables: spec.vscodeVariables });
       if (!result.changed) continue;
+      // Refuse to persist a config a downstream consumer cannot use: a file
+      // read outside VS Code must never carry an unexpanded VS Code variable
+      // (NF-2026-00243). Log the named reason and skip rather than write a
+      // command that names a token where a directory belongs.
+      const consumable = assertMcpConfigConsumable(result.document, { vscodeVariables: spec.vscodeVariables });
+      if (!consumable.ok) {
+        outputChannel.appendLine(`[mcp] refused to register ${spec.label} MCP: ${consumable.reason}`);
+        continue;
+      }
       try {
         fs.mkdirSync(path.dirname(spec.configPath), { recursive: true });
         fs.writeFileSync(spec.configPath, `${JSON.stringify(result.document, null, 2)}\n`, "utf8");
@@ -9287,6 +9365,9 @@ module.exports = {
     repairWorkspaceMcpConfigObject,
     repairClaudeMcpConfigObject,
     portableWorkspaceMcpCommand,
+    containsUnexpandedVsCodeVariable,
+    findUnexpandedVsCodeVariables,
+    assertMcpConfigConsumable,
     ensureWorkspaceMcpConfigsRepaired,
     ensureCodexMcpRegistrationTomlText,
     ensureCodexMcpRegistered,

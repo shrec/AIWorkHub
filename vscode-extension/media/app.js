@@ -3171,6 +3171,20 @@ function scheduleNextLiveOutputPoll(taskId) {
   if (state.liveOutputTaskId !== taskId) {
     return;
   }
+  // Single-owner invariant (NF-2026-00224): the server
+  // (aiworkhub.process_launcher.read_live_output_for_task) is the sole
+  // generator of a task's live output; this poll chain is its sole consumer.
+  // start/stop already collapse to one timer, but the re-arm point did not --
+  // two liveOutput responses for the same task (e.g. the initial request plus a
+  // manual refresh) would each arm a timer, leaking a second concurrent poll
+  // chain that both post requestLiveOutput forever. Clear any pending poll
+  // before arming so at most one ever exists. This EXTENDS the re-arm-on-every-
+  // outcome guarantee (NF-2026-00297): the chain still always re-arms on both
+  // the ok:false and success terminal outcomes -- just never into a duplicate.
+  if (state.liveOutputTimer !== null) {
+    window.clearTimeout(state.liveOutputTimer);
+    state.liveOutputTimer = null;
+  }
   state.liveOutputTimer = window.setTimeout(() => {
     state.liveOutputTimer = null;
     if (state.liveOutputTaskId === taskId) {
@@ -3559,6 +3573,73 @@ function claudeStreamMessageDeltaEvent(event, rawLine) {
   };
 }
 
+// Provider reasoning/thinking deltas. GitHub Copilot CLI, Codex and Claude all
+// stream incremental "reasoning" text while the model is working but before any
+// visible assistant text or tool call. The renderer dropped every one of these
+// shapes, so the panel stayed blank while a healthy worker was producing output
+// normally -- an operator watching it concluded the run was wedged and killed it
+// (NF-2026-00182). We RENDER them as an explicit, redacted "Reasoning" row
+// rather than stating "reasoning not shown": the defect is silence that reads as
+// death, and a visible reasoning row is the direct cure. delta.type values are
+// matched broadly because the exact spelling differs across providers.
+const REASONING_DELTA_TYPES = new Set([
+  "reasoning_delta",
+  "reasoning_text_delta",
+  "reasoning_summary_delta",
+  "reasoning_summary_text_delta",
+  "thinking_delta",
+]);
+
+function reasoningRow(text, rawLine) {
+  return {
+    kind: "event",
+    title: "Reasoning",
+    label: "reasoning",
+    state: "running",
+    message: redactDisplayText(firstText(text), 180) || "(model reasoning in progress)",
+    metrics: [],
+    raw: safeRawEvent(rawLine),
+  };
+}
+
+function reasoningTimelineEvent(event, rawLine) {
+  // Shape 1: a Claude/Codex/Copilot stream_event content_block_delta whose
+  // delta.type is a reasoning/thinking delta (delta carries .thinking/.text).
+  const streamDelta = claudeStreamContentBlockDelta(event);
+  if (streamDelta && REASONING_DELTA_TYPES.has(String(streamDelta.type || ""))) {
+    return reasoningRow(
+      firstText(streamDelta.thinking, streamDelta.text, streamDelta.reasoning, streamDelta.summary_text),
+      rawLine,
+    );
+  }
+  // Shape 2: a top-level reasoning event or item -- the Copilot CLI / Codex item
+  // stream names it via type/item.type "reasoning", or the object carries a
+  // dedicated reasoning field. Without this the generic fallback rendered a
+  // contentless "stream event / Structured event: type, event" row and dropped
+  // the reasoning text entirely.
+  const type = String(firstText(event.type, event.event, event.kind, event.subtype) || "").toLowerCase();
+  const item = event.item && typeof event.item === "object" ? event.item : {};
+  const itemType = String(firstText(item.type, item.kind) || "").toLowerCase();
+  const delta = event.delta && typeof event.delta === "object" ? event.delta : {};
+  const looksLikeReasoning = type.includes("reasoning") || itemType.includes("reasoning")
+    || event.reasoning !== undefined || item.reasoning !== undefined
+    || REASONING_DELTA_TYPES.has(String(delta.type || ""));
+  if (!looksLikeReasoning) {
+    return null;
+  }
+  return reasoningRow(
+    firstText(
+      event.reasoning, item.reasoning,
+      delta.text, delta.reasoning, delta.thinking,
+      event.text, item.text,
+      event.summary, item.summary,
+      typeof item.content === "string" ? item.content : "",
+      typeof event.content === "string" ? event.content : "",
+    ),
+    rawLine,
+  );
+}
+
 function timelineEventFromObject(event, rawLine) {
   if (claudeStreamNoopEvent(event)) {
     return null;
@@ -3587,6 +3668,10 @@ function timelineEventFromObject(event, rawLine) {
       metrics: [],
       raw: safeRawEvent(rawLine),
     };
+  }
+  const reasoningEvent = reasoningTimelineEvent(event, rawLine);
+  if (reasoningEvent) {
+    return reasoningEvent;
   }
   const toolResultEvent = toolResultEventFromUserMessage(event, rawLine);
   if (toolResultEvent) {
@@ -3652,13 +3737,20 @@ function timelineEventsFromText(decoded) {
     } catch (_error) {
       // Malformed provider output degrades to a text-only row.
     }
+    // A line that failed JSON.parse but still looks structured is a malformed
+    // or partially-buffered provider event. Degrade it to a readable raw
+    // rendering with a named reason (the row title) -- never a blank panel and
+    // never an "unsupported" label. Valid JSON never reaches here: an object
+    // parses above and is rendered by timelineEventFromObject, whose generic
+    // branch summarizes any unrecognised-but-valid shape instead of calling it
+    // unsupported (NF-2026-00282 / NF-2026-00183).
     const looksStructured = /^[\s]*[\[{]/.test(line) || /\\"(?:type|event|result)\\"\s*:/.test(line);
     events.push({
       kind: "text",
-      title: looksStructured ? "Unrecognized event" : "Output",
-      label: looksStructured ? "structured output" : "plain text",
+      title: looksStructured ? "Unparsed provider line" : "Output",
+      label: looksStructured ? "unparsed structured output" : "plain text",
       state: "line",
-      message: looksStructured ? "Provider emitted an unsupported event shape; open Raw event for details." : redactDisplayText(line, 220),
+      message: redactDisplayText(line, 220) || (looksStructured ? "(empty structured line)" : "(empty line)"),
       metrics: [],
       raw: safeRawEvent(line),
     });

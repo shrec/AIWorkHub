@@ -383,4 +383,96 @@ function lines(...events) {
   assert(container.textContent.includes("<img src=x"));
 }
 
+{
+  // NF-2026-00182: live provider reasoning deltas are RENDERED, never dropped.
+  // Before: a Copilot CLI / Codex / Claude reasoning delta was dropped (Claude's
+  // stream_event content_block_delta reasoning shapes fell through to a
+  // contentless "stream event / Structured event: type, event" generic row, and
+  // the reasoning text was discarded) -- so a healthy, actively-reasoning worker
+  // showed nothing and looked dead. After: each reasoning shape renders one
+  // explicit "Reasoning" row carrying the (redacted) reasoning text.
+  // Chosen behaviour: RENDER (not "reasoning not shown"), because silence that
+  // reads as death is the defect.
+
+  // Anthropic thinking_delta.
+  const thinking = api.timelineEventsFromText(lines(
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Checking the mcp config path" } } },
+  ));
+  assert.strictEqual(thinking.length, 1, "thinking_delta renders one row, never dropped");
+  assert.strictEqual(thinking[0].title, "Reasoning");
+  assert.strictEqual(thinking[0].state, "running");
+  assert(thinking[0].message.includes("Checking the mcp config path"));
+
+  // OpenAI/Copilot-style reasoning_delta on a content_block_delta.
+  const reasoningDelta = api.timelineEventsFromText(lines(
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "reasoning_delta", text: "Weighing the two candidate fixes" } } },
+  ));
+  assert.strictEqual(reasoningDelta.length, 1);
+  assert.strictEqual(reasoningDelta[0].title, "Reasoning");
+  assert(reasoningDelta[0].message.includes("Weighing the two candidate fixes"));
+
+  // Copilot CLI item-stream reasoning: the reasoning text must surface, not a
+  // contentless generic summary.
+  const itemReasoning = api.timelineEventsFromText(lines(
+    { type: "item.started", item: { type: "reasoning", text: "Analyzing the failing test" } },
+  ));
+  assert.strictEqual(itemReasoning.length, 1);
+  assert.strictEqual(itemReasoning[0].title, "Reasoning");
+  assert(itemReasoning[0].message.includes("Analyzing the failing test"));
+  assert(!itemReasoning[0].message.includes("Structured event"));
+
+  // Redaction still applies to reasoning text (paths/tokens scrubbed).
+  const secretReasoning = api.timelineEventsFromText(lines(
+    { type: "reasoning", reasoning: "reading /tmp/worktree/secret/keys.txt token sk_test_abcdefghijklmnopqrstuvwxyz" },
+  ));
+  assert.strictEqual(secretReasoning.length, 1);
+  assert.strictEqual(secretReasoning[0].title, "Reasoning");
+  assert(!secretReasoning[0].message.includes("/tmp/worktree"));
+  assert(!secretReasoning[0].message.includes("sk_test"));
+
+  // A reasoning delta renders visibly in the formatted feed -- no blank panel.
+  api.renderFormattedLiveOutput(lines(
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "reasoning_delta", text: "Deciding the launcher path" } } },
+  ));
+  const rendered = document.querySelector("#detail-live-output-container").textContent;
+  assert(rendered.includes("Reasoning"));
+  assert(rendered.includes("Deciding the launcher path"));
+}
+
+{
+  // NF-2026-00224: single live-output poll owner. The server
+  // (aiworkhub.process_launcher.read_live_output_for_task) is the sole generator
+  // of a task's live output; this poll chain is its sole consumer. Two liveOutput
+  // responses for the same selected task (e.g. the initial request plus a manual
+  // refresh) must collapse to exactly one pending poll, never two concurrent
+  // re-armed chains both posting requestLiveOutput. Instrument the timer to count
+  // live poll owners.
+  let nextHandle = 1;
+  const liveTimers = new Set();
+  const priorSetTimeout = global.window.setTimeout;
+  const priorClearTimeout = global.window.clearTimeout;
+  global.window.setTimeout = () => { const handle = nextHandle; nextHandle += 1; liveTimers.add(handle); return handle; };
+  global.window.clearTimeout = (handle) => { liveTimers.delete(handle); };
+  try {
+    api.startLiveOutputPolling("owner-task");
+    const payload = {
+      ok: true,
+      task_id: "owner-task",
+      output: lines({ type: "item.started", item: { type: "command_execution", command: "echo owner" } }) + "\n",
+      next_cursor: 7,
+      liveness_state: "running",
+    };
+    api.renderLiveOutput(payload); // first terminal outcome -> arms poll #1
+    api.renderLiveOutput(payload); // second response -> must re-use the single owner
+    assert.strictEqual(liveTimers.size, 1, "exactly one live-output poll owner after two responses");
+    // The ok:false terminal outcome also re-arms (NF-2026-00297) without leaking
+    // a second owner.
+    api.renderLiveOutput({ ok: false, task_id: "owner-task", reason: "output_unavailable" });
+    assert.strictEqual(liveTimers.size, 1, "ok:false re-arm stays single-owner");
+  } finally {
+    global.window.setTimeout = priorSetTimeout;
+    global.window.clearTimeout = priorClearTimeout;
+  }
+}
+
 console.log("live-output-formatting.test.js: ok");
