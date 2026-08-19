@@ -6,6 +6,48 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.89] - 2026-08-19
+
+One card, two NeedFix records, both on the gate that is supposed to be the last
+thing standing between a candidate and canonical.
+
+### Fixed
+
+- **The gate now sees code nothing calls.** All three quality lenses had passed a
+  candidate whose new code had no caller anywhere - 1,197 insertions across three
+  production modules, every line correct, every behaviour tested, and nothing
+  changed at runtime. Green tests do not prove reachability: a test can call a
+  function directly and pass while no production path ever does. The gate walks
+  call and reference edges transitively from the entry points the repository
+  already recognises, names each unreachable addition individually, and reports
+  rather than refuses - some additions are legitimately unreferenced, and a gate
+  that cries wolf gets disabled. (NF-2026-00304)
+- **Promotion refuses a write that would undo a release.** A candidate cut before
+  a release still carries the old version constant, so promoting it silently
+  reverts `_version.py` and every projection derived from it. It happened twice:
+  one candidate carried `EXPECTED_MCP_PACKAGE_VERSION` 0.9.82 against a canonical
+  at 0.9.84, its successor 0.9.85 against 0.9.87 - which would have broken every
+  extension preflight. Both were caught by hand. Promotion now refuses a backwards
+  version write with a named reason carrying the file and both values, at the sole
+  promotion write seam and before a single byte is written. Equal is silent, ahead
+  is allowed, unparseable fails closed. (NF-2026-00315)
+
+### Notes
+
+The card was rejected once for reproducing the exact defect it exists to detect:
+round one built both checks correctly and shipped them unreachable - each had one
+reference in the whole tree, its own definition - while its tests called them
+directly and passed. The report said so plainly: "not threaded into
+accept_review's write loop to keep the change minimal." Naming an omission does
+not wire it, and a guard that is not on the path guards nothing while making the
+next reader believe the boundary is covered.
+
+Recorded rather than fixed: NF-2026-00328 (the reachability seam labels every
+symbol in a changed file "modified" and can surface an untouched neighbour as an
+unreachable addition - two lenses found it independently), NF-2026-00329 (the
+refusal exception escapes `accept_review` past its only handler, so the guard's
+success case arrives as an unhandled error rather than a structured refusal).
+
 ## [0.9.88] - 2026-08-19
 
 Eight NeedFix records across three accepted cards, plus one regression the

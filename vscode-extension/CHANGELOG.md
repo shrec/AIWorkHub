@@ -1,5 +1,23 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.89 — 2026-08-19
+
+Two fixes to AIWorkHub's own safety checks.
+
+### Fixed
+
+- **Work that changes nothing can no longer pass review silently.** A task once
+  added 1,197 lines of correct, fully tested code that nothing in the running
+  system ever called — and all three reviewers passed it, because tests call new
+  code directly and that is what makes them green. The review now checks whether
+  new code is actually reachable and names anything that is not.
+- **Finishing an old task can no longer undo a newer release.** If a task was
+  started before an update and finished after it, accepting the work quietly put
+  the old version number back, which stops the extension from connecting to its
+  own server. That has now happened twice and was caught by hand both times.
+  Accepting such work is now refused, with the file and both version numbers
+  named, before anything is written.
+
 ## 0.9.88 — 2026-08-19
 
 Eight fixes. Two of them had been broken since 0.9.43 and 0.9.44.

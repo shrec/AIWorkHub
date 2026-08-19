@@ -12,6 +12,16 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.89
+
+- Work that changes nothing can no longer pass review silently: a task once added
+  1,197 lines of correct, tested code that nothing ever called, and all three
+  reviewers passed it. Review now checks reachability and names what is not.
+- Finishing an old task can no longer undo a newer release. Work started before
+  an update and accepted after it used to put the old version number back, which
+  stops the extension connecting to its own server. It is now refused, with both
+  versions named, before anything is written.
+
 ## What's new in 0.9.88
 
 - The dashboard now follows your editor's font size. Most text was hard-coded at
