@@ -1177,14 +1177,71 @@ def verify_quality_review_prewarm_authority(authority_repo: Path) -> AuthorityBi
     return _canonical_source_graph_binding_for_repo(authority_repo)
 
 
+_REWORK_OVERLAY_SNAPSHOT_META_KEY = "rework_overlay_snapshot"
+
+
+def _rework_overlay_snapshot_digest(db_path: Path) -> str | None:
+    """Return the overlay snapshot digest recorded in a rework partition.
+
+    ``None`` when the marker is absent or the database is unreadable; the caller
+    treats that as not-ready and rebuilds the packet-scoped partition.  The
+    digest fingerprints the workspace bytes the partition was last built from,
+    so a later worker edit of a retained path no longer matches and forces a
+    rebuild -- without ever reading or copying the base.
+    """
+
+    try:
+        conn = sqlite3.connect(
+            f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True
+        )
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (_REWORK_OVERLAY_SNAPSHOT_META_KEY,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return None
+    return str(row[0]) if row is not None else None
+
+
+def _write_rework_overlay_snapshot_digest(
+    db_path: Path, snapshot_digest: str
+) -> None:
+    """Persist the overlay snapshot digest in the rework partition ``meta``.
+
+    ``build_partition`` always creates the ``meta`` table (and writes the
+    composed-view marker into it), so this only adds the overlay's own
+    change-detection key beside it.
+    """
+
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    try:
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_REWORK_OVERLAY_SNAPSHOT_META_KEY, snapshot_digest),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _rework_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding | None:
     """Return a request-local graph with retained predecessor paths overlaid.
 
-    The durable graph remains the sole canonical authority.  This private DB
-    is a copy-on-first-query view for one immutable request: canonical rows
-    are copied, then only the packet-bound retained paths are reconciled from
-    the isolated workspace.  Later edits to those same paths are re-indexed
-    on the next query, so a worker never falls back to stale canonical bytes.
+    The durable canonical graph remains the sole authority and is NEVER copied.
+    This request-scoped view is a PARTITION over the packet's retained paths
+    alone, composed against the canonical base opened read-only -- the same
+    primitive the reviewer prewarm uses
+    (:func:`source_graph_partition.build_partition`).  Preparation cost scales
+    with the packet, not with repository size, because the base index is never
+    read, copied, or opened here.  The overlay stays keyed on the packet
+    ``canonical_digest``.  A later worker edit of a retained path changes the
+    observed workspace snapshot, so the packet-scoped partition is rebuilt on
+    the next query and the worker never falls back to stale canonical bytes --
+    still without copying the base.
     """
 
     packet = ctx.rework_overlay_packet
@@ -1194,7 +1251,7 @@ def _rework_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding | N
     if packet_path is None:
         raise WorkerToolError("rework_overlay_packet_path_missing")
 
-    from . import source_graph as _source_graph_mod
+    from . import source_graph_partition as _source_graph_partition
 
     canonical = _canonical_source_graph_binding(ctx)
     runtime_dir = packet_path.parent.resolve()
@@ -1205,64 +1262,40 @@ def _rework_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding | N
         raise WorkerToolError("rework_overlay_digest_invalid")
     db_path = runtime_dir / f"rework_source_graph_{packet_digest[:16]}.sqlite"
 
+    # Resolve the packet's retained paths against the isolated workspace ONCE,
+    # deriving both the partition's ``changed_paths`` input and the binding
+    # snapshot.  The path-safety and symlink refusals keep their original
+    # ``rework_overlay_*`` identities and fire before any build side effect;
+    # ``build_partition`` re-checks the same invariants against the base's
+    # admission policy.  ``changed_paths`` is the packet-shaped
+    # ``[{"path", "sha256"}]`` list the partition consumes -- the rework packet
+    # carries extra ``content_base64`` used by the separate in-memory overlay,
+    # which the partition simply ignores, so no shape is loosened at the seam.
+    repo_root = ctx.repo.resolve()
+    changed_paths: list[dict[str, str]] = []
     snapshot_rows: list[dict[str, Any]] = []
-    with _SOURCE_GRAPH_DB_OVERRIDE_LOCK:
-        if db_path.is_symlink():
-            raise WorkerToolError("rework_overlay_source_graph_symlink")
-        if not db_path.is_file() or db_path.stat().st_size <= 0:
-            temporary = runtime_dir / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
-            try:
-                source_conn = _source_graph_mod.connect(
-                    canonical.db_path, read_only=True
-                )
-                destination_conn = sqlite3.connect(temporary)
-                try:
-                    source_conn.backup(destination_conn)
-                    destination_conn.commit()
-                finally:
-                    destination_conn.close()
-                    source_conn.close()
-                os.replace(temporary, db_path)
-            finally:
-                temporary.unlink(missing_ok=True)
-
-        with _with_source_graph_db(_source_graph_mod, db_path):
-            for entry in packet["files"]:
-                relative = str(entry["path"])
-                candidate = (ctx.repo / relative).resolve(strict=False)
-                if not candidate.is_relative_to(ctx.repo.resolve()):
-                    raise WorkerToolError(
-                        f"rework_overlay_path_escapes_workspace:{relative}"
-                    )
-                if candidate.is_symlink():
-                    raise WorkerToolError(
-                        f"rework_overlay_path_symlink:{relative}"
-                    )
-                if candidate.is_file():
-                    observed_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
-                    check_conn = _source_graph_mod.connect(db_path, read_only=True)
-                    try:
-                        row = check_conn.execute(
-                            "SELECT source_hash FROM files WHERE file_path=?",
-                            (relative,),
-                        ).fetchone()
-                    finally:
-                        check_conn.close()
-                    indexed_hash = str(row[0]) if row is not None else ""
-                    if indexed_hash != observed_hash:
-                        _source_graph_mod.index_file(
-                            ctx.repo, relative, observed_hash
-                        )
-                    snapshot_rows.append(
-                        {"path": relative, "sha256": observed_hash}
-                    )
-                elif candidate.exists():
-                    raise WorkerToolError(
-                        f"rework_overlay_path_not_file:{relative}"
-                    )
-                else:
-                    _source_graph_mod.remove_file(ctx.repo, relative)
-                    snapshot_rows.append({"path": relative, "deleted": True})
+    for entry in packet["files"]:
+        relative = str(entry["path"])
+        raw = ctx.repo / relative
+        candidate = raw.resolve(strict=False)
+        if not candidate.is_relative_to(repo_root):
+            raise WorkerToolError(
+                f"rework_overlay_path_escapes_workspace:{relative}"
+            )
+        # ``resolve`` canonicalizes the final component, so a symlink must be
+        # tested on the UNRESOLVED path (as the partition primitive does on its
+        # own candidates); a post-resolve ``is_symlink`` can never fire.
+        if raw.is_symlink():
+            raise WorkerToolError(f"rework_overlay_path_symlink:{relative}")
+        if candidate.is_file():
+            observed_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            changed_paths.append({"path": relative, "sha256": observed_hash})
+            snapshot_rows.append({"path": relative, "sha256": observed_hash})
+        elif candidate.exists():
+            raise WorkerToolError(f"rework_overlay_path_not_file:{relative}")
+        else:
+            changed_paths.append({"path": relative, "sha256": ""})
+            snapshot_rows.append({"path": relative, "deleted": True})
 
     snapshot_digest = hashlib.sha256(
         json.dumps(
@@ -1271,6 +1304,37 @@ def _rework_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding | N
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()
+
+    with _SOURCE_GRAPH_DB_OVERRIDE_LOCK:
+        if db_path.is_symlink():
+            raise WorkerToolError("rework_overlay_source_graph_symlink")
+        # Readiness stays "the overlay DB exists and is non-empty"; an edited
+        # workspace snapshot (a later worker edit of a retained path) is treated
+        # as not-ready so the packet-scoped partition is rebuilt -- never the
+        # base.  ``build_partition`` writes the composed-view marker itself, so
+        # a later read-only open composes the two indexes without any copy.
+        ready = (
+            db_path.is_file()
+            and db_path.stat().st_size > 0
+            and _rework_overlay_snapshot_digest(db_path) == snapshot_digest
+        )
+        if not ready:
+            temporary = runtime_dir / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
+            try:
+                try:
+                    _source_graph_partition.build_partition(
+                        ctx.repo,
+                        changed_paths,
+                        temporary,
+                        base_db_path=canonical.db_path,
+                    )
+                except _source_graph_partition.PartitionError as exc:
+                    raise WorkerToolError(str(exc)) from exc
+                _write_rework_overlay_snapshot_digest(temporary, snapshot_digest)
+                os.replace(temporary, db_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
     return AuthorityBinding(
         db_path=db_path,
         authority_source="rework_overlay",

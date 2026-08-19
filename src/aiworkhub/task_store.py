@@ -266,6 +266,12 @@ class InitializationRefusedError(TaskStoreError):
     """Initialization was refused (repo-id/path mismatch, invalid state)."""
 
 
+class TaskQueueContended(TaskStoreError):
+    """The canonical task queue could not be read within its bounded window
+    because a writer holds it. Names the contended store instead of a bare
+    ``database is locked`` that misdirects diagnosis to an innocent database."""
+
+
 @dataclass(frozen=True, slots=True)
 class StorageReadiness:
     ready: bool
@@ -282,16 +288,19 @@ class StorageReadiness:
         }
 
 
-def _connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
+def _connect(
+    path: Path, *, readonly: bool = False, busy_timeout_ms: int = 5000
+) -> sqlite3.Connection:
+    bounded_busy = max(0, int(busy_timeout_ms))
     if not readonly:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(path), timeout=5.0)
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={bounded_busy}")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
     else:
         conn = connect_readonly(path, timeout=5.0)
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={bounded_busy}")
         conn.execute("PRAGMA query_only=ON")
     conn.row_factory = sqlite3.Row
     return conn
@@ -789,6 +798,63 @@ def get_task(root: str | Path, task_id: str) -> dict[str, Any] | None:
     conn = _connect(db_path, readonly=True)
     try:
         row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return _decode_task_card(row)
+
+
+def is_task_queue_lock_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a SQLite busy/locked error from the task queue."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    text = str(exc).lower()
+    return "database is locked" in text or "database is busy" in text
+
+
+def task_queue_contention_reason(root: str | Path, exc: BaseException) -> str:
+    """Name the exact contended task-queue store for a bounded read failure."""
+    store = "task_queue.sqlite"
+    try:
+        _readiness, db_path = _require_ready(root)
+        store = Path(db_path).name
+    except Exception:  # noqa: BLE001 -- naming must never mask the contention
+        pass
+    return f"task_queue_contended:{store}:{exc}"[:500]
+
+
+def read_target_card(
+    root: str | Path,
+    task_id: str,
+    *,
+    contention_timeout_ms: int = 2000,
+) -> dict[str, Any] | None:
+    """Read exactly one launch-target card, naming task-queue contention.
+
+    The launch path must tell "the target card is genuinely invalid" apart
+    from "a finalizer writer storm on task_queue.sqlite starved this read". A
+    bare ``sqlite3.OperationalError: database is locked`` read as the former
+    while it was really the latter, sending an operator hunting the Source
+    Graph index for two hours. Bound the read and, when it loses to a live
+    writer, raise :class:`TaskQueueContended` naming the exact contended store
+    rather than widening the timeout to hide the storm.
+    """
+    _readiness, db_path = _require_ready(root)
+    try:
+        conn = _connect(db_path, readonly=True, busy_timeout_ms=contention_timeout_ms)
+    except sqlite3.OperationalError as exc:
+        if is_task_queue_lock_error(exc):
+            raise TaskQueueContended(task_queue_contention_reason(root, exc)) from exc
+        raise
+    try:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if is_task_queue_lock_error(exc):
+            raise TaskQueueContended(task_queue_contention_reason(root, exc)) from exc
+        raise
     finally:
         conn.close()
     if row is None:

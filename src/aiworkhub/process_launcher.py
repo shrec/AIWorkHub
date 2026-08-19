@@ -58,6 +58,7 @@ from . import repo_policy
 from . import read_efficiency
 from . import runtime_temp
 from . import task_engine
+from . import task_store
 try:
     from . import project_context
 except ImportError:
@@ -243,9 +244,37 @@ TERMINAL_PROCESS_STATES = {
     "validation_failed",
     "promotion_conflict",
     "finalize_failed",
+    "finalize_abandoned",
     "monitor_error",
     "blocked",
 }
+
+
+# Terminal-transition failures that prove the target card is no longer in a
+# processing state this finalizer can move. When ``mark_terminal_failure``
+# reports one of these the card was archived, deleted, or reclaimed, so
+# retrying is futile forever: the finalizer must abandon with a named cause
+# instead of re-arming on every reconcile round. Any other reason may still be
+# a live processing card whose legitimate retry must survive.
+_FINALIZER_CARD_NOT_PROCESSING_REASONS = (
+    "not_processing",
+    "not_claimed",
+    "task_not_found",
+    "claim_owner_mismatch",
+    "runner_mismatch",
+    "launch_request_mismatch",
+)
+
+
+def _finalizer_card_not_processing(reason: str) -> str | None:
+    """Return the named cause when a failed terminal transition proves the
+    target card is no longer processing (archived/gone/reclaimed), else None
+    so the finalizer keeps ``reconcile_pending`` and its retry survives."""
+    reason = (reason or "").strip()
+    for token in _FINALIZER_CARD_NOT_PROCESSING_REASONS:
+        if reason == token or reason.startswith(token + ":"):
+            return token
+    return None
 
 
 class _BridgeCancellationDeferred(RuntimeError):
@@ -4936,7 +4965,19 @@ class ProcessManager:
             }
         mark("target_events_loaded")
         try:
-            card = _parse_card(self._show_task(target_task_id), target_task_id)
+            try:
+                target_envelope = self._show_task(target_task_id)
+            except sqlite3.OperationalError as exc:
+                # A launch-target read that loses to a finalization writer storm
+                # must name the contended task queue, not surface a bare
+                # "database is locked" that sends an operator hunting an
+                # innocent database (the Source Graph index) for hours.
+                if task_store.is_task_queue_lock_error(exc):
+                    raise task_store.TaskQueueContended(
+                        task_store.task_queue_contention_reason(self.repo, exc)
+                    ) from exc
+                raise
+            card = _parse_card(target_envelope, target_task_id)
             terminal = card.get("terminal_review") or {}
             evidence = terminal.get("evidence") or {}
             workspace = WorkerWorkspace.from_metadata(dict(evidence["workspace"]))
@@ -4997,6 +5038,10 @@ class ProcessManager:
                 source_evidence=source_evidence,
                 scoped_audits=scoped_audits,
             )
+        except task_store.TaskQueueContended as exc:
+            # Distinct from ``quality_review_target_invalid``: the target card is
+            # not invalid, the task queue was write-locked by finalization.
+            return {"ok": False, "error": f"quality_review_target_contended:{exc}"}
         except (
             KeyError,
             TypeError,
@@ -7605,29 +7650,52 @@ class ProcessManager:
                 },
                 request_id=request_id,
             )
-        terminal_state = "finalize_failed" if release_result.get("ok") else "reconcile_pending"
+        transition_reason = str(
+            release_result.get("stderr") or release_result.get("stdout") or ""
+        )
+        # "retries exhausted" must mean the attempt is over, not that the next
+        # reconcile round begins. When the terminal transition fails because the
+        # target card is no longer processing -- archived, deleted, or reclaimed
+        # -- no future reconcile can move it, so terminalize as
+        # ``finalize_abandoned`` (a terminal, non-re-arming state) with a named
+        # cause an operator can count. Only a card that may still be processing
+        # keeps ``reconcile_pending`` so its legitimate retry survives.
+        abandon_cause = (
+            None
+            if release_result.get("ok")
+            else _finalizer_card_not_processing(transition_reason)
+        )
         if release_result.get("ok"):
+            terminal_state = "finalize_failed"
+            error_detail = error
             unlink_if_regular(self._terminal_authority_grant_path(request_id))
+        elif abandon_cause is not None:
+            terminal_state = "finalize_abandoned"
+            error_detail = (
+                error + ":finalize_abandoned:" + abandon_cause + ":" + transition_reason
+            )
+        else:
+            terminal_state = "reconcile_pending"
+            error_detail = error + ":terminal_transition_failed:" + transition_reason
         return self._append_event({
             **event_identity,
             "request_id": request_id,
             "state": terminal_state,
-            "worker_terminal_state": "finalize_failed",
+            "worker_terminal_state": (
+                "finalize_abandoned"
+                if terminal_state == "finalize_abandoned"
+                else "finalize_failed"
+            ),
             "exit_code": supervisor_returncode,
             "finished_at": _utcnow(),
             "workspace_retained": True,
+            "finalizer_abandoned": terminal_state == "finalize_abandoned",
             "release_transition_ok": bool(release_result.get("ok")),
             "callback_enqueued": bool(release_result.get("callback_enqueued")),
             "finalization_duration_ms": round(
                 (time.monotonic() - finalization_started) * 1000.0, 3
             ),
-            "error": (
-                error
-                if release_result.get("ok")
-                else error + ":terminal_transition_failed:" + str(
-                    release_result.get("stderr") or release_result.get("stdout") or ""
-                )
-            )[:500],
+            "error": error_detail[:500],
         })
 
     def _reconcile_persisted_requests(self) -> dict[str, int]:
@@ -7712,6 +7780,27 @@ class ProcessManager:
         result = self._reconcile_persisted_requests()
         gc_result = self._gc_finalized_workspaces()
         return {"ok": True, **result, **gc_result}
+
+    def abandoned_finalizations(self) -> list[dict[str, Any]]:
+        """Operator view of finalizers that terminally gave up.
+
+        Each entry is one request whose retained finalizer reached the terminal
+        ``finalize_abandoned`` state because its target card was archived or
+        otherwise no longer processing. Counting these lets an operator see how
+        many finalizers stopped, and why, instead of watching a
+        re-finalization timestamp climb on every poll.
+        """
+        abandoned: list[dict[str, Any]] = []
+        for request_id, event in self._latest_by_request().items():
+            if event.get("state") != "finalize_abandoned":
+                continue
+            abandoned.append({
+                "request_id": request_id,
+                "task_id": str(event.get("task_id") or ""),
+                "reason": str(event.get("error") or ""),
+                "finished_at": event.get("finished_at"),
+            })
+        return abandoned
 
     def _gc_finalized_workspaces(self) -> dict[str, int]:
         """Run one idempotent, fail-closed sweep of retained workspaces."""
