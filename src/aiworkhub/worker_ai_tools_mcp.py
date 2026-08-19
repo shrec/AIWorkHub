@@ -1621,6 +1621,7 @@ def verify_audit_ledger(
         "source_graph_stage_counts": {},
         "source_graph_stage_sequence": [],
         "source_graph_mode_stage_counts": {},
+        "source_graph_mode_attributed_calls": 0,
         "source_graph_stage_attributed_calls": 0,
         "source_graph_latency": {
             "count": 0, "total_ms": 0.0, "min_ms": None, "max_ms": None,
@@ -1696,12 +1697,24 @@ def verify_audit_ledger(
                 result["source_graph_zero_hit_calls"] += 1
             if not entry.get("ok"):
                 result["source_graph_failed_calls"] += 1
+            # Both sequences describe the SAME calls, so both must record one
+            # element per call -- ``receipt_conformance_report`` refuses on a
+            # length difference. A FAILED source_graph call carries no usable
+            # payload mode, and appending only when the mode was recognised made
+            # the mode sequence shorter than the stage sequence by exactly the
+            # number of failed calls, which read as a worker labelling fault and
+            # was AIWorkHub's own bookkeeping. Mirror the stage recorder: an
+            # unrecognised mode is ``unspecified`` and still occupies its slot.
             mode = str(payload.get("mode") or "") if isinstance(payload, dict) else ""
-            if mode in SOURCE_GRAPH_MODES:
-                mode_counts = result["source_graph_mode_counts"]
-                mode_counts[mode] = int(mode_counts.get(mode) or 0) + 1
-                if len(result["source_graph_mode_sequence"]) < 64:
-                    result["source_graph_mode_sequence"].append(mode)
+            mode_recognised = mode in SOURCE_GRAPH_MODES
+            if not mode_recognised:
+                mode = "unspecified"
+            mode_counts = result["source_graph_mode_counts"]
+            mode_counts[mode] = int(mode_counts.get(mode) or 0) + 1
+            if mode_recognised:
+                result["source_graph_mode_attributed_calls"] += 1
+            if len(result["source_graph_mode_sequence"]) < 64:
+                result["source_graph_mode_sequence"].append(mode)
             query_sha256 = (
                 str(payload.get("query_sha256") or "")
                 if isinstance(payload, dict) else ""
@@ -1724,7 +1737,7 @@ def verify_audit_ledger(
                 result["source_graph_stage_attributed_calls"] += 1
             if len(result["source_graph_stage_sequence"]) < 64:
                 result["source_graph_stage_sequence"].append(stage)
-            if mode in SOURCE_GRAPH_MODES:
+            if mode_recognised:
                 mode_stage = result["source_graph_mode_stage_counts"].setdefault(stage, {})
                 mode_stage[mode] = int(mode_stage.get(mode) or 0) + 1
             latency = payload.get("latency_ms") if isinstance(payload, dict) else None
