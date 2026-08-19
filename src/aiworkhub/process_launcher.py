@@ -8,6 +8,7 @@ never selects a task by keywords and it never invokes a shell.
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import ctypes
 import difflib
@@ -723,6 +724,344 @@ class _ReviewerReservationTerminalized(RuntimeError):
     terminalized by the bounded launch owner or reconcile.  It must never be
     raised once a real provider process exists.
     """
+
+
+class PromotionVersionRegression(RuntimeError):
+    """Promotion would move a version constant/projection BACKWARDS (NF-2026-00315).
+
+    Raised at the promotion boundary when a candidate -- typically one whose
+    worktree was cut BEFORE a release landed -- still carries an OLDER version
+    constant or release-metadata projection than canonical.  Promoting it would
+    silently revert ``src/aiworkhub/_version.py`` and every projection derived
+    from it (the extension's ``EXPECTED_MCP_PACKAGE_VERSION`` runtime-compat
+    check, ``vscode-extension/package.json``/``package-lock.json``), which would
+    break every extension preflight.  The message names each offending file with
+    both its candidate value and the canonical value it would clobber.
+    """
+
+
+PROMOTION_VERSION_REGRESSION_SCHEMA_ID = "aiworkhub.promotion_version_regression.v1"
+
+VERSION_ORDER_REGRESSED = "regressed"
+VERSION_ORDER_EQUAL = "equal"
+VERSION_ORDER_AHEAD = "ahead"
+VERSION_ORDER_UNVERIFIABLE = "unverifiable"
+
+# Semantic-version core: ``MAJOR.MINOR.PATCH`` with an optional pre-release/build
+# suffix, matching ``scripts/release_metadata.py``'s ``VALID_VERSION`` shape.
+_RELEASE_VERSION_CORE_RE = re.compile(
+    r"^\s*v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+][0-9A-Za-z.-]+)?\s*$"
+)
+
+
+def _release_version_tuple(value: Any) -> tuple[int, int, int] | None:
+    match = _RELEASE_VERSION_CORE_RE.match(str(value or ""))
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+
+def _promotion_version_fields(projection: Mapping[str, Any]) -> tuple[str, str, str]:
+    file = str(projection.get("file") or projection.get("path") or "")
+    candidate = projection.get("candidate_version", projection.get("candidate"))
+    canonical = projection.get("canonical_version", projection.get("canonical"))
+    return (
+        file,
+        "" if candidate is None else str(candidate),
+        "" if canonical is None else str(canonical),
+    )
+
+
+def evaluate_promotion_version_regression(
+    projections: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Classify each release-version projection a promotion is about to write.
+
+    For every ``{file, candidate_version, canonical_version}`` projection the
+    candidate value the promotion would WRITE is compared against the canonical
+    value already on disk:
+
+    * candidate BEHIND canonical  -> ``regressed`` (a named refusal reason);
+    * candidate EQUAL to canonical -> ``equal`` (the normal case -- silent, no
+      reason, nothing to refuse);
+    * candidate AHEAD of canonical -> ``ahead`` (the release moved forward; the
+      write is allowed);
+    * either value unparseable -> ``unverifiable`` (fail-closed: a promotion
+      that cannot prove it is not a regression is refused, naming the file).
+
+    The returned record lists every regressed/unverifiable projection with both
+    values, so the caller can refuse and name exactly which file, which
+    candidate value and which canonical value.
+    """
+
+    checked: list[dict[str, Any]] = []
+    regressions: list[dict[str, Any]] = []
+    for projection in projections or ():
+        if not isinstance(projection, Mapping):
+            continue
+        file, candidate, canonical = _promotion_version_fields(projection)
+        cand_tuple = _release_version_tuple(candidate)
+        canon_tuple = _release_version_tuple(canonical)
+        if cand_tuple is None or canon_tuple is None:
+            order = VERSION_ORDER_UNVERIFIABLE
+            reason = (
+                f"promotion_version_unverifiable:{file}:candidate={candidate!r}:"
+                f"canonical={canonical!r} -- a release version could not be "
+                "parsed, so the promotion cannot prove it is not a regression"
+            )
+        elif cand_tuple < canon_tuple:
+            order = VERSION_ORDER_REGRESSED
+            reason = (
+                f"promotion_version_regression:{file}:candidate={candidate}:"
+                f"canonical={canonical} -- promoting would move this version "
+                "BACKWARDS relative to canonical and silently revert the release"
+            )
+        elif cand_tuple == canon_tuple:
+            order = VERSION_ORDER_EQUAL
+            reason = ""
+        else:
+            order = VERSION_ORDER_AHEAD
+            reason = ""
+        record = {
+            "file": file,
+            "candidate_version": candidate,
+            "canonical_version": canonical,
+            "order": order,
+            "reason": reason,
+        }
+        checked.append(record)
+        if order in (VERSION_ORDER_REGRESSED, VERSION_ORDER_UNVERIFIABLE):
+            regressions.append(record)
+    return {
+        "schema_id": PROMOTION_VERSION_REGRESSION_SCHEMA_ID,
+        "ok": not regressions,
+        "refused": bool(regressions),
+        "checked": checked,
+        "regressions": regressions,
+        "reasons": [record["reason"] for record in regressions],
+    }
+
+
+def refuse_version_regression(
+    projections: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Promotion-boundary guard: raise when any version projection regresses.
+
+    This is the check NF-2026-00315 was missing.  It belongs at the promotion
+    boundary -- where both the candidate value about to be written and the
+    canonical value already on disk are visible -- not in the worker, which
+    cannot know what landed while it was running, and not in the card's
+    ``forbidden`` list, which already barred those files and did not help
+    because the reversion comes from a stale BASE, not from an edit.
+
+    When the candidate equals canonical (the normal case) it is silent and
+    returns the evaluation; when the candidate is ahead it allows the write;
+    when any projection moves backwards (or cannot be verified) it raises
+    :class:`PromotionVersionRegression`, whose message names every offending
+    file with its candidate and canonical value -- a refusal, not a logged
+    warning.
+    """
+
+    report = evaluate_promotion_version_regression(projections)
+    if report["refused"]:
+        raise PromotionVersionRegression("; ".join(report["reasons"]))
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Promotion-boundary version projections (NF-2026-00315).
+#
+# ``refuse_version_regression`` compares candidate-vs-canonical version values,
+# but that comparison is only possible once the values are READ off disk at the
+# promotion boundary: the candidate value about to be written lives in the
+# candidate worktree, the canonical value already on disk lives in the manager
+# repository.  These helpers extract each recognised release-version file's
+# value from raw file bytes and assemble the projections the guard classifies,
+# so a stale-base candidate still carrying an OLDER version cannot silently
+# revert the release when promoted.
+# ---------------------------------------------------------------------------
+_VERSION_PROJECTION_FILES: tuple[str, ...] = (
+    "src/aiworkhub/_version.py",
+    "vscode-extension/extension.js",
+    "vscode-extension/package.json",
+    "vscode-extension/package-lock.json",
+)
+_VERSION_PY_LITERAL_RE = re.compile(
+    r'^__version__\s*=\s*["\']([^"\']+)["\']\s*$', re.MULTILINE
+)
+_RUNTIME_LITERAL_RE = re.compile(
+    r'EXPECTED_MCP_PACKAGE_VERSION\s*=\s*["\']([^"\']+)["\']'
+)
+
+
+def _extract_projection_version(relative: str, text: str) -> str | None:
+    """Read one recognised release-version file's value from its raw bytes."""
+
+    if relative == "src/aiworkhub/_version.py":
+        match = _VERSION_PY_LITERAL_RE.search(text)
+        return match.group(1) if match else None
+    if relative == "vscode-extension/extension.js":
+        match = _RUNTIME_LITERAL_RE.search(text)
+        return match.group(1) if match else None
+    if relative in (
+        "vscode-extension/package.json",
+        "vscode-extension/package-lock.json",
+    ):
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(data, Mapping):
+            return None
+        value = data.get("version")
+        return None if value is None else str(value)
+    return None
+
+
+def _promotion_version_projections(
+    repo_root: Path, workspace_root: Path, changed: Iterable[str]
+) -> list[dict[str, Any]]:
+    """Build ``{file, candidate_version, canonical_version}`` projections.
+
+    Only the files a promotion is ABOUT to write (``changed``) are inspected,
+    and only those that are recognised release-version files whose CANONICAL
+    copy currently carries a version -- so there is a release value on disk that
+    a regression could revert.  The candidate value is read from the candidate
+    worktree (the exact bytes ``promote`` would write); an unreadable or
+    unparseable candidate value for such a file is left empty so the guard fails
+    closed (``unverifiable``) rather than promoting a version it cannot verify.
+    """
+
+    repo_root = Path(repo_root)
+    workspace_root = Path(workspace_root)
+    projections: list[dict[str, Any]] = []
+    for raw in changed or ():
+        relative = str(raw).replace("\\", "/")
+        if relative not in _VERSION_PROJECTION_FILES:
+            continue
+        try:
+            canonical_text = (repo_root / relative).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            # Canonical carries no such file: no release value on disk for a
+            # promotion to move backwards, so there is nothing to guard here.
+            continue
+        canonical_version = _extract_projection_version(relative, canonical_text)
+        if canonical_version is None:
+            continue
+        try:
+            candidate_text = (workspace_root / relative).read_text(encoding="utf-8")
+            candidate_version = _extract_projection_version(relative, candidate_text)
+        except (OSError, UnicodeError):
+            candidate_version = None
+        projections.append(
+            {
+                "file": relative,
+                "candidate_version": (
+                    "" if candidate_version is None else candidate_version
+                ),
+                "canonical_version": canonical_version,
+            }
+        )
+    return projections
+
+
+# ---------------------------------------------------------------------------
+# Candidate reachability inputs (NF-2026-00304).
+#
+# The reachability gate in ``quality_evidence.run_completion_quality_gate``
+# reports every candidate addition no recognised entry point can reach.  It
+# needs three things Source Graph already carries: the symbols the candidate
+# defines in its changed files, the call/reference edges among them, and the
+# recognised entry points.  These helpers read them from the CANDIDATE's own
+# Source Graph index (the worker built it while running) -- the only index that
+# carries edges INTO the candidate's new symbols -- and normalise everything to
+# short symbol names so an unresolved edge target still matches its definition.
+# Everything is best-effort and never raises: reachability is a non-blocking
+# observation and must never break a promotion.
+# ---------------------------------------------------------------------------
+_REACHABILITY_MAX_EDGE_ROWS = 200_000
+
+
+def _candidate_changed_symbols(
+    workspace_root: Path, changed_py: Iterable[str]
+) -> list[dict[str, Any]]:
+    """Enumerate the symbols the candidate defines in its changed Python files.
+
+    This is symbol ENUMERATION over the candidate source (top-level functions,
+    classes and their methods), not a call-graph analyser: the call/reference
+    edges that decide reachability come from Source Graph.
+    """
+
+    symbols: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(name: str, relative: str) -> None:
+        key = (relative, name)
+        if name and key not in seen:
+            seen.add(key)
+            symbols.append(
+                {"symbol": name, "file": relative, "change": quality_review.CHANGE_MODIFIED}
+            )
+
+    for relative in changed_py:
+        try:
+            source = (workspace_root / relative).read_text(encoding="utf-8")
+            tree = ast.parse(source)
+        except (OSError, UnicodeError, SyntaxError, ValueError):
+            continue
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _add(node.name, relative)
+            elif isinstance(node, ast.ClassDef):
+                _add(node.name, relative)
+                for sub in node.body:
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        _add(sub.name, relative)
+    return symbols
+
+
+def _read_candidate_short_name_edges(
+    db_path: Path,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]] | None:
+    """Read call/reference edges from the candidate Source Graph, short-named.
+
+    Returns ``(call_edges, reference_edges)`` or ``None`` when the index cannot
+    be read.  Endpoints are reduced to their short symbol name so an unresolved
+    edge target (recorded only as ``dst_name``) still matches a candidate
+    definition; short-name collisions bias toward reporting a symbol as reached
+    (quiet), never toward a false unreachable finding that would cry wolf.
+    """
+
+    try:
+        connection = sqlite3.connect(
+            f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True
+        )
+    except (OSError, sqlite3.Error):
+        return None
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        rows = connection.execute(
+            "SELECT kind, src_qualname, dst_qualname, dst_name FROM edges LIMIT ?",
+            (_REACHABILITY_MAX_EDGE_ROWS,),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+
+    call_edges: list[dict[str, str]] = []
+    reference_edges: list[dict[str, str]] = []
+    for kind, src_qualname, dst_qualname, dst_name in rows:
+        src = str(src_qualname or "").rsplit(".", 1)[-1]
+        dst = str(dst_name or dst_qualname or "").rsplit(".", 1)[-1]
+        if not src or not dst:
+            continue
+        edge = {"src": src, "dst": dst}
+        if str(kind or "") == "call":
+            call_edges.append(edge)
+        else:
+            reference_edges.append(edge)
+    return call_edges, reference_edges
 
 
 def _utcnow() -> str:
@@ -10275,6 +10614,94 @@ class ProcessManager:
             "error": event.get("error") or "",
         }
 
+    def _candidate_reachability_inputs(
+        self, workspace: Any, changed: Iterable[str]
+    ) -> dict[str, Any] | None:
+        """Best-effort reachability inputs from the candidate's Source Graph.
+
+        Returns the ``changed_symbols``/``call_edges``/``reference_edges``/
+        ``entry_points`` the reachability gate consumes, or ``None`` when the
+        candidate index is unavailable so the gate records reachability as
+        not-evaluated rather than fabricating a verdict.  Never raises:
+        reachability is a non-blocking observation (NF-2026-00304) and must
+        never break a promotion.
+        """
+
+        try:
+            workspace_root = Path(workspace.path)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        changed_py = [
+            str(rel).replace("\\", "/")
+            for rel in (changed or ())
+            if str(rel).replace("\\", "/").endswith(".py")
+        ]
+        if not changed_py:
+            return None
+        changed_symbols = _candidate_changed_symbols(workspace_root, changed_py)
+        if not changed_symbols:
+            return None
+        try:
+            from . import source_graph as _source_graph_mod
+
+            db_path = Path(_source_graph_mod.resolve_db_path(workspace_root))
+        except Exception:  # noqa: BLE001 -- reachability never breaks promotion
+            return None
+        try:
+            if not db_path.is_file():
+                return None
+        except OSError:
+            return None
+        edges = _read_candidate_short_name_edges(db_path)
+        if edges is None:
+            return None
+        call_edges, reference_edges = edges
+        changed_names = {row["symbol"] for row in changed_symbols}
+        entry_points = sorted(
+            {
+                edge["src"]
+                for edge in (*call_edges, *reference_edges)
+                if edge["src"] and edge["src"] not in changed_names
+            }
+        )
+        return {
+            "changed_symbols": changed_symbols,
+            "call_edges": call_edges,
+            "reference_edges": reference_edges,
+            "entry_points": entry_points,
+        }
+
+    def _refuse_backwards_version_promotion(
+        self, workspace: Any, changed: Iterable[str]
+    ) -> dict[str, Any]:
+        """Refuse a promotion that would move a version projection backwards.
+
+        Runs at the promotion boundary (NF-2026-00315), BEFORE any file is
+        written, comparing every recognised release-version file the promotion
+        is about to write against the canonical value already on disk.  Equal is
+        silent, ahead is allowed; a backwards (or unverifiable) value raises
+        :class:`PromotionVersionRegression` naming the file and both versions.
+        """
+
+        projections = _promotion_version_projections(
+            self.repo, Path(workspace.path), changed
+        )
+        return refuse_version_regression(projections)
+
+    def _promote_accepted_candidate(
+        self, workspace: Any, changed: list[str]
+    ) -> list[str]:
+        """Promote the sealed candidate, refusing a backwards version first.
+
+        This is the sole promotion write seam in :meth:`accept_review`: the
+        version-regression guard runs BEFORE ``promote`` writes a single byte,
+        so a stale-base candidate carrying an older version constant is refused
+        rather than promoted and then noticed by hand (NF-2026-00315).
+        """
+
+        self._refuse_backwards_version_promotion(workspace, changed)
+        return promote(workspace, changed)
+
     def accept_review(
         self,
         request_id: str,
@@ -11212,6 +11639,9 @@ class ProcessManager:
                     combined_tree_checks=combined_tree_checks,
                     worker_provider=str(latest.get("adapter_id") or runner),
                     human_approval=confirm_high_risk,
+                    reachability_inputs=self._candidate_reachability_inputs(
+                        workspace, changed
+                    ),
                 )
                 quality_gate["combined_tree"] = combined_tree
                 quality_gate["quality_policy_authority"] = policy_authority
@@ -11242,7 +11672,7 @@ class ProcessManager:
                     "task_id": task_id,
                 }
 
-            promoted = promote(workspace, changed)
+            promoted = self._promote_accepted_candidate(workspace, changed)
 
             acceptance_evidence_record = self._canonical_outcome_evidence(
                 request_id,

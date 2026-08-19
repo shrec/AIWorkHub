@@ -2034,6 +2034,44 @@ def run_builtin_static_checks(
     return checks
 
 
+def _reachability_record(
+    reachability_inputs: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Report candidate additions no recognised entry point can reach.
+
+    Runs as part of :func:`run_completion_quality_gate` so its findings appear
+    in the evidence a manager reads (NF-2026-00304), rather than only when
+    someone calls :func:`quality_review.analyze_candidate_reachability` on
+    purpose.  Reachability is a non-blocking observation: an unreachable
+    addition is NAMED for a manager to dispose of, never a gate failure, and it
+    never affects ``passed``.  When no Source Graph reachability inputs are
+    available the record says so explicitly (``evaluated`` False) rather than
+    silently reading as "all reachable".
+    """
+
+    if not reachability_inputs:
+        return {
+            "schema_id": quality_review.REACHABILITY_SCHEMA_ID,
+            "evaluated": False,
+            "reason": "reachability_inputs_unavailable",
+            "all_reachable": None,
+            "blocking": False,
+            "gate_action": quality_review.REACHABILITY_GATE_ACTION,
+            "entry_point_count": 0,
+            "changed_symbol_count": 0,
+            "unreachable_additions": [],
+            "findings": [],
+        }
+    record = quality_review.analyze_candidate_reachability(
+        changed_symbols=reachability_inputs.get("changed_symbols") or (),
+        call_edges=reachability_inputs.get("call_edges") or (),
+        reference_edges=reachability_inputs.get("reference_edges") or (),
+        entry_points=reachability_inputs.get("entry_points") or (),
+    )
+    record["evaluated"] = True
+    return record
+
+
 def run_completion_quality_gate(
     repo_root: Path | str,
     *,
@@ -2044,6 +2082,7 @@ def run_completion_quality_gate(
     combined_tree_checks: Iterable[EvidenceCheck | Mapping[str, Any]] = (),
     worker_provider: str = "",
     human_approval: bool = False,
+    reachability_inputs: Mapping[str, Any] | None = None,
     combined_tree_scope: bool = False,
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
@@ -2137,6 +2176,7 @@ def run_completion_quality_gate(
         "risk_profile": risk_profile,
         "quality_verdict": verdict,
         "repository_quality_policy": config_status,
+        "reachability": _reachability_record(reachability_inputs),
         "verification_scope": (
             "repository_policy"
             if config_status["status"] == "configured"

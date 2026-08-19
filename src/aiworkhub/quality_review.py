@@ -939,6 +939,182 @@ def assess_reviewer_launch_target(
     }
 
 
+# ---------------------------------------------------------------------------
+# Candidate reachability gate (NF-2026-00304).
+#
+# All three quality lenses once passed a candidate whose new code had no caller
+# anywhere: the card existed to add code that no production path ever reached,
+# and every lens stayed green because reachability is not a judgement a lens
+# makes -- a test can call a function directly and pass while nothing in
+# production ever does.  This is the gate's most expensive blind spot, because
+# everything else it checks is downstream of the code actually running.
+#
+# So reachability is decided HERE, mechanically, from edges Source Graph
+# ALREADY carries -- its ``calls`` and reference edges -- rather than from a new
+# static analyser.  For every symbol a candidate ADDED or MODIFIED, we establish
+# whether a path exists to it from an entry point the repository already
+# recognises.
+#
+# The result is REPORTED, never silently enforced.  Some additions are
+# legitimately unreferenced -- a new public API, a CLI entry point, a test
+# helper -- so an unreachable addition is NAMED as a non-blocking finding a
+# manager disposes of (``disposition="observation"``, ``blocking=False``),
+# rather than either failing the card outright (a gate that cries wolf gets
+# disabled) or, as before, saying nothing at all.
+# ---------------------------------------------------------------------------
+REACHABILITY_SCHEMA_ID = "aiworkhub.quality_review_reachability.v1"
+
+# An unreachable addition is surfaced for a manager to dispose of; it never
+# blocks the card on its own.  ``observation`` matches the quality-evidence
+# finding-disposition vocabulary (reported, non-blocking).
+REACHABILITY_DISPOSITION = "observation"
+REACHABILITY_GATE_ACTION = "surface_for_manager_disposition"
+
+CHANGE_ADDED = "added"
+CHANGE_MODIFIED = "modified"
+
+
+def _reachability_symbol_identity(record: Any) -> tuple[str, str, str]:
+    """Normalise one added/modified symbol record to ``(symbol, file, change)``."""
+
+    if isinstance(record, Mapping):
+        symbol = str(
+            record.get("qualname")
+            or record.get("symbol")
+            or record.get("name")
+            or ""
+        )
+        file = str(record.get("file") or record.get("file_path") or "")
+        change = str(
+            record.get("change") or record.get("change_kind") or CHANGE_ADDED
+        ).lower()
+    else:
+        symbol, file, change = str(record or ""), "", CHANGE_ADDED
+    if change not in (CHANGE_ADDED, CHANGE_MODIFIED):
+        change = CHANGE_ADDED
+    return symbol, file, change
+
+
+def _reachability_edge_endpoints(edge: Any) -> tuple[str, str]:
+    """Normalise a Source Graph call/reference edge to ``(src, dst)``.
+
+    An edge means ``src`` calls or references ``dst`` -- so reachability flows
+    from ``src`` to ``dst``.  Both the raw Source Graph edge shape
+    (``src_qualname``/``dst_qualname``) and a caller/callee mapping are accepted.
+    """
+
+    if isinstance(edge, Mapping):
+        src = str(
+            edge.get("src")
+            or edge.get("caller")
+            or edge.get("src_qualname")
+            or edge.get("from")
+            or ""
+        )
+        dst = str(
+            edge.get("dst")
+            or edge.get("callee")
+            or edge.get("dst_qualname")
+            or edge.get("to")
+            or edge.get("name")
+            or ""
+        )
+    elif isinstance(edge, (tuple, list)) and len(edge) >= 2:
+        src, dst = str(edge[0] or ""), str(edge[1] or "")
+    else:
+        src, dst = "", ""
+    return src, dst
+
+
+def _reachable_from_entry_points(
+    entry_points: Iterable[str], edges: Iterable[Any]
+) -> set[str]:
+    """Set of symbols reachable by following call/reference edges from entries."""
+
+    adjacency: dict[str, set[str]] = {}
+    for edge in edges:
+        src, dst = _reachability_edge_endpoints(edge)
+        if src and dst:
+            adjacency.setdefault(src, set()).add(dst)
+    reached = {str(ep) for ep in entry_points if str(ep)}
+    frontier = list(reached)
+    while frontier:
+        node = frontier.pop()
+        for nxt in adjacency.get(node, ()):  # node (src) -> nxt (dst)
+            if nxt not in reached:
+                reached.add(nxt)
+                frontier.append(nxt)
+    return reached
+
+
+def analyze_candidate_reachability(
+    *,
+    changed_symbols: Iterable[Any],
+    call_edges: Iterable[Any] = (),
+    reference_edges: Iterable[Any] = (),
+    entry_points: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Report every candidate addition no recognised entry point can reach.
+
+    For each symbol the candidate ADDED or MODIFIED, a path is sought from an
+    entry point the repository already recognises, following the ``calls`` and
+    reference edges Source Graph already carries (no new analyser).  A symbol
+    with such a path stays quiet; a symbol without one is NAMED as a finding.
+
+    The gate never fails the card on an unreachable addition: some additions are
+    legitimately unreferenced -- a new public API, a CLI entry point, a test
+    helper -- so each unreachable addition is emitted as a non-blocking finding
+    (``disposition="observation"``, ``blocking=False``,
+    ``gate_action="surface_for_manager_disposition"``) that names the exact
+    symbol, its file and whether it was added or modified, for a manager to
+    dispose of.  ``all_reachable`` is True and ``findings`` empty when every
+    candidate symbol is reached.
+    """
+
+    entry = [str(ep) for ep in (entry_points or ()) if str(ep)]
+    edges = list(call_edges or ()) + list(reference_edges or ())
+    reached = _reachable_from_entry_points(entry, edges)
+
+    findings: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in changed_symbols or ():
+        symbol, file, change = _reachability_symbol_identity(record)
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        if symbol in reached:
+            continue
+        findings.append(
+            {
+                "schema_id": REACHABILITY_SCHEMA_ID,
+                "symbol": symbol,
+                "file": file,
+                "change": change,
+                "disposition": REACHABILITY_DISPOSITION,
+                "blocking": False,
+                "reason": (
+                    f"unreachable_candidate_{change}:{symbol} has no path from "
+                    f"any of the {len(entry)} entry point(s) the repository "
+                    "already recognises; a manager must dispose of this finding "
+                    "-- it may be a legitimately unreferenced addition such as a "
+                    "new public API, a CLI entry point or a test helper, or it "
+                    "may be code the card added that nothing ever reaches"
+                ),
+            }
+        )
+    findings.sort(key=lambda item: (item["file"], item["symbol"]))
+    return {
+        "schema_id": REACHABILITY_SCHEMA_ID,
+        "entry_point_count": len(entry),
+        "changed_symbol_count": len(seen),
+        "all_reachable": not findings,
+        "blocking": False,
+        "gate_action": REACHABILITY_GATE_ACTION,
+        "unreachable_additions": [item["symbol"] for item in findings],
+        "findings": findings,
+    }
+
+
 __all__ = [
     "DELIVERY_SCHEMA_ID",
     "PREWARM_SKIP_SCHEMA_ID",
@@ -989,4 +1165,10 @@ __all__ = [
     "evaluate_reservation",
     "detect_preparation_stall",
     "assess_reviewer_launch_target",
+    "REACHABILITY_SCHEMA_ID",
+    "REACHABILITY_DISPOSITION",
+    "REACHABILITY_GATE_ACTION",
+    "CHANGE_ADDED",
+    "CHANGE_MODIFIED",
+    "analyze_candidate_reachability",
 ]
