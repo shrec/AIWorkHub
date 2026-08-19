@@ -316,14 +316,19 @@ def test_awh_obs_014_every_configured_adapter_is_accounted_for() -> None:
 
 
 def test_awh_obs_015_artifact_invalid_conflates_absence_with_malformed(tmp_path: Path) -> None:
+    # This test documented the defect; NF-2026-00322 fixed it, so the assertion
+    # is inverted rather than deleted. What it now proves is the property the
+    # record asked for: absence and malformation are DIFFERENT reason codes.
     # Resolve so the module's root-containment check compares like for like even
     # when the temp base is itself reached through a symlink.
     root = tmp_path.resolve()
 
-    # False positive: a merely-ABSENT required artifact is reported artifact_invalid
-    # (Path.is_file() returns False without raising), not artifact_missing.
+    # A merely-ABSENT required artifact now reports artifact_missing, adopting
+    # the vocabulary aiworkhub_source_graph_retrieval_eval already used, so an
+    # operator is no longer sent hunting for corruption in a file that is simply
+    # not there.
     with pytest.raises(
-        evidence_instruments.EvidenceInstrumentError, match=r"^artifact_invalid:missing\.json$"
+        evidence_instruments.EvidenceInstrumentError, match=r"^artifact_missing:missing\.json$"
     ):
         evidence_instruments._regular(root, "missing.json")
 

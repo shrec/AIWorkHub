@@ -1497,6 +1497,35 @@ def repair_archive_inconsistencies(
     }
 
 
+# The single boundary that guarantees every card written to a blocked or
+# terminal state carries a NAMED cause. A blocked card with no reason starts
+# recovery blind (measured: 20 of 52 blocked cards carried none -- 38% of
+# failures), so the blocked-writers below route their reason through here
+# instead of each remembering to. When a caller genuinely cannot determine the
+# cause the card still records a name that says exactly that and identifies the
+# writing path -- never an empty string and never a placeholder that reads as a
+# real diagnosis while informing no one.
+_UNDETERMINED_BLOCKER_PREFIX = "cause_undetermined"
+
+
+def blocker_reason_or_named_gap(reason: Any, *, path: str, fallback: str = "") -> str:
+    """Return a bounded, non-empty blocker reason for a blocked/terminal card.
+
+    ``reason`` wins when it carries text; otherwise ``fallback`` (a caller's
+    own known cause, e.g. a terminal substatus) is used. When neither is
+    present the reason becomes ``cause_undetermined:<path>`` so an operator can
+    tell an established diagnosis from a path that could not establish one.
+    """
+
+    text = str(reason or "").strip()
+    if text:
+        return text[:500]
+    fallback_text = str(fallback or "").strip()
+    if fallback_text:
+        return fallback_text[:500]
+    return f"{_UNDETERMINED_BLOCKER_PREFIX}:{path}"[:500]
+
+
 def force_terminalize(
     root: str | Path,
     task_id: str,
@@ -1531,6 +1560,7 @@ def force_terminalize(
         source_status = str(row["status"] or "")
         source_worker = str(row["worker_status"] or "")
         now = datetime.now(timezone.utc).isoformat()
+        reason = blocker_reason_or_named_gap(reason, path="force_terminalize")
         try:
             card = json.loads(str(row["card_json"] or "{}"))
         except json.JSONDecodeError:
@@ -1881,7 +1911,10 @@ def mark_review_workspace_missing(
             return False, "review_request_identity_mismatch"
 
         now = datetime.now(timezone.utc).isoformat()
-        bounded_reason = str(reason or "retained_workspace_unavailable")[:500]
+        bounded_reason = blocker_reason_or_named_gap(
+            reason, path="mark_review_workspace_missing",
+            fallback="retained_workspace_unavailable",
+        )
         card.update(
             status="blocked",
             worker_status="finalize_failed",
@@ -1983,7 +2016,7 @@ def mark_launch_failed(
             return False, "launch_request_id_required"
 
         now = datetime.now(timezone.utc).isoformat()
-        bounded_reason = reason[:500]
+        bounded_reason = blocker_reason_or_named_gap(reason, path="mark_launch_failed")
         card.update(
             status="blocked",
             worker_status="launch_failed",
@@ -2119,7 +2152,11 @@ def mark_terminal_failure(
             terminal_substatus=substatus,
             terminal_failure=terminal,
             deterministic_verification=deterministic_verification,
-            blocker_reason=str(evidence_payload.get("error") or substatus)[:500],
+            blocker_reason=blocker_reason_or_named_gap(
+                evidence_payload.get("error"),
+                path="mark_terminal_failure",
+                fallback=substatus,
+            ),
             blocked_at=now,
             blocked_by=runner,
         )

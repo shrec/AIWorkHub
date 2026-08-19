@@ -563,6 +563,50 @@ DESTRUCTIVE_MAX_RETAINED_RATIO = 0.50
 DESTRUCTIVE_MIN_PUBLIC_SYMBOLS = 4
 DESTRUCTIVE_MAX_RETAINED_SYMBOL_RATIO = 0.50
 
+# When an evidence summary exceeds the cap it must SAY it was cut, and a
+# FAILING check must keep the TAIL of its output: test runners print the
+# passing lines first and the one line that says what broke last, so a
+# head-only cut discards exactly the cause. The retained window for a failure
+# is head+tail with a marked elision (the tail is always preserved); a
+# non-failing summary keeps the head. Either way the field carries an explicit
+# notice so a reader can tell short output from cut output.
+SUMMARY_TRUNCATION_MARKER = "AIWORKHUB_SUMMARY_TRUNCATED"
+
+
+def _bounded_summary(text: str, *, status: str = "") -> str:
+    """Bound a summary to ``MAX_SUMMARY_CHARS``, always marking a real cut.
+
+    A failing check keeps the tail so the line that says what broke survives;
+    any truncated result carries :data:`SUMMARY_TRUNCATION_MARKER`, so a reader
+    can never mistake cut output for short output.
+    """
+
+    if len(text) <= MAX_SUMMARY_CHARS:
+        return text
+    if status == STATUS_FAILED:
+        dropped = len(text) - MAX_SUMMARY_CHARS
+        head_len = tail_len = 0
+        note = ""
+        # The total length is exactly ``MAX_SUMMARY_CHARS`` regardless of
+        # convergence; the loop only refines the reported ``dropped`` count.
+        for _ in range(4):
+            note = (
+                f"\n[{SUMMARY_TRUNCATION_MARKER}: {dropped} characters elided; "
+                "tail retained]\n"
+            )
+            available = max(0, MAX_SUMMARY_CHARS - len(note))
+            head_len = available // 4
+            tail_len = available - head_len
+            recomputed = len(text) - head_len - tail_len
+            if recomputed == dropped:
+                break
+            dropped = recomputed
+        tail = text[len(text) - tail_len:] if tail_len else ""
+        return text[:head_len] + note + tail
+    note = f"\n[{SUMMARY_TRUNCATION_MARKER}: head retained]"
+    available = max(0, MAX_SUMMARY_CHARS - len(note))
+    return text[:available] + note
+
 # Repository-declared checks are intentionally broader than ordinary CI
 # labels.  This lets a repository make CodeQL/Semgrep/SAST, dependency,
 # secret, memory-safety and robustness checks first-class completion gates
@@ -662,7 +706,7 @@ class EvidenceCheck:
             "command_resolution": self.command_resolution,
             "duration_seconds": round(self.duration_seconds, 6),
             "affected_paths": list(self.affected_paths[:MAX_AFFECTED_PATHS]),
-            "summary": self.summary[:MAX_SUMMARY_CHARS],
+            "summary": _bounded_summary(self.summary, status=self.status),
             "provenance": self.provenance,
             "error": self.error,
         }
@@ -722,7 +766,7 @@ def _check_payload(check: EvidenceCheck | Mapping[str, Any]) -> dict[str, Any]:
         "check_id": check_id,
         "kind": kind,
         "status": status,
-        "summary": str(check.get("summary") or "")[:MAX_SUMMARY_CHARS],
+        "summary": _bounded_summary(str(check.get("summary") or ""), status=str(status)),
         "provenance": str(check.get("provenance") or "")[:MAX_SUMMARY_CHARS],
     }
 

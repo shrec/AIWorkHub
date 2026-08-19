@@ -510,6 +510,14 @@ DEFAULT_QUIET_WARNING_SECONDS = 1800.0
 # group is terminated by the reconciler.
 DEFAULT_LOST_RECOVERY_GRACE_SECONDS = 120.0
 DEFAULT_STALL_GRACE_SECONDS = 600.0
+# Bounded threshold past which a preparation heartbeat that stops advancing is
+# treated as a stall. Before the provider process exists a launch has no pid to
+# read liveness from; the preparation heartbeat epoch it republishes as it
+# advances through phases is the only progress signal. When it stops advancing
+# the launch is stuck and must fail with a named reason instead of sitting in a
+# pid-null reservation until the reservation window merely expires.
+PREPARATION_STALL_ENV = "AIWORKHUB_PREPARATION_STALL_SECONDS"
+DEFAULT_PREPARATION_STALL_SECONDS = 180.0
 LIVENESS_STATES = ("alive", "quiet", "unresponsive", "lost")
 
 
@@ -542,6 +550,12 @@ def lost_recovery_grace_seconds() -> float:
 def stall_grace_seconds() -> float:
     return _bounded_float_env(
         STALL_GRACE_ENV, DEFAULT_STALL_GRACE_SECONDS, minimum=30.0, maximum=86_400.0
+    )
+
+
+def preparation_stall_seconds() -> float:
+    return _bounded_float_env(
+        PREPARATION_STALL_ENV, DEFAULT_PREPARATION_STALL_SECONDS, minimum=30.0, maximum=3600.0
     )
 
 
@@ -611,6 +625,47 @@ def derive_liveness_state(
         "heartbeat_lease_seconds": lease,
         "quiet_warning_seconds": warning,
         "lost_recovery_grace_seconds": grace,
+    }
+
+
+def derive_preparation_stall(
+    *,
+    now_epoch: float,
+    preparation_heartbeat_epoch: float | None,
+    preparation_phase: str | None = None,
+    stall_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Pure detection of a frozen preparation heartbeat -- WITHOUT any pid.
+
+    A launch that never spawned a process has no pid, so liveness here comes
+    only from the preparation heartbeat epoch the launcher republishes as it
+    advances. When that epoch stops advancing past the bounded stall threshold
+    the launch is stuck; the returned ``reason`` names the stall and the exact
+    frozen phase so recovery does not depend on someone cancelling pid-null
+    reservations by hand. A heartbeat that has not landed yet (``None``) is not
+    a stall -- there is nothing that could have stopped advancing.
+    """
+
+    threshold = (
+        stall_seconds if stall_seconds is not None else preparation_stall_seconds()
+    )
+    age = (
+        max(0.0, now_epoch - float(preparation_heartbeat_epoch))
+        if preparation_heartbeat_epoch is not None
+        else None
+    )
+    stalled = age is not None and age > threshold
+    phase = str(preparation_phase or "unknown_preparation_phase")
+    return {
+        "preparation_stalled": stalled,
+        "preparation_heartbeat_age_seconds": age,
+        "preparation_stall_seconds": threshold,
+        "preparation_phase": phase,
+        "reason": (
+            f"preparation_heartbeat_stalled:{phase}:age={age:.1f}s>{threshold:.0f}s"
+            if stalled
+            else ""
+        ),
     }
 
 
@@ -4168,6 +4223,34 @@ class ProcessManager:
                 # A live owned prewarm keeps extending its own liveness; the
                 # bounded reservation epoch alone is never terminal authority
                 # while the exact owner is still building the Source Graph.
+                continue
+            preparation_stall = derive_preparation_stall(
+                now_epoch=now,
+                preparation_heartbeat_epoch=event.get("preparation_heartbeat_epoch"),
+                preparation_phase=event.get("preparation_phase"),
+            )
+            if preparation_stall["preparation_stalled"]:
+                # A frozen preparation heartbeat is invisible to pid-based
+                # liveness because a launch that never spawned has no pid. Fail
+                # it here with a named reason instead of holding the pid-null
+                # reservation alive until its window merely expires.
+                self._append_event({
+                    "request_id": request_id,
+                    "task_id": event.get("task_id"),
+                    "runner": event.get("runner"),
+                    "topic": event.get("topic"),
+                    "adapter_id": event.get("adapter_id"),
+                    "state": "blocked",
+                    "blocked_reason": preparation_stall["reason"],
+                    "preparation_phase": event.get("preparation_phase"),
+                    "preparation_heartbeat_epoch": event.get(
+                        "preparation_heartbeat_epoch"
+                    ),
+                    "reservation_expires_at_epoch": event.get(
+                        "reservation_expires_at_epoch"
+                    ),
+                })
+                reconciled += 1
                 continue
             if float(event.get("reservation_expires_at_epoch") or 0.0) >= now:
                 continue

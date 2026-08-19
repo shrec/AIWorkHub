@@ -50,6 +50,14 @@ def _regular(root: Path, relative: str, *, must_exist: bool = True) -> Path:
         raise EvidenceInstrumentError("path_escape")
     if must_exist:
         try:
+            # Absent is not invalid. A file that merely does not exist gets a
+            # distinct ``artifact_missing`` code -- the same ``*_missing``
+            # vocabulary ``source_graph_retrieval_eval`` already uses for its
+            # absent registry -- so a reader can tell a gone artifact from a
+            # corrupt one. A symlink, non-regular, or oversized file that DOES
+            # exist is still ``artifact_invalid``.
+            if not path.exists() and not path.is_symlink():
+                raise EvidenceInstrumentError(f"artifact_missing:{relative}")
             if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_ARTIFACT_BYTES:
                 raise EvidenceInstrumentError(f"artifact_invalid:{relative}")
         except OSError as exc:

@@ -390,3 +390,45 @@ def test_runtime_coverage_shape_invalid_and_zero_matches(tmp_path: Path) -> None
     assert matched["status"] == "available"
     assert matched["matched_files"] == 1
     assert matched["line_coverage"] == 75.0
+
+
+# --- NF-2026-00322: absent is not invalid --------------------------------
+
+
+def test_absent_artifact_is_missing_not_invalid(tmp_path: Path) -> None:
+    # risk_mode_precision_bench and prompt_bundle_ab_report both read through
+    # _regular; an absent artifact must report a distinct *_missing code, not
+    # the artifact_invalid a corrupt one reports.
+    missing = evidence.risk_mode_precision_bench(tmp_path)
+    assert missing["measured"] is False
+    assert missing["reason"].startswith("artifact_missing:")
+
+    ab_missing = evidence.prompt_bundle_ab_report(tmp_path)
+    assert ab_missing["reason"].startswith("artifact_missing:")
+
+    # A corrupt artifact -- present but not a regular file (a directory here) --
+    # reports artifact_invalid. Missing and corrupt therefore differ, in both
+    # the full string and its reason code.
+    corrupt = tmp_path / ".aiworkhub" / "risk-mode-adjudication.jsonl"
+    corrupt.parent.mkdir(parents=True)
+    corrupt.mkdir()
+    corrupt_report = evidence.risk_mode_precision_bench(tmp_path)
+    assert corrupt_report["reason"].startswith("artifact_invalid:")
+
+    assert missing["reason"] != corrupt_report["reason"]
+    assert missing["reason"].split(":", 1)[0] != corrupt_report["reason"].split(":", 1)[0]
+
+
+def test_missing_adopts_the_sibling_retrieval_eval_vocabulary(tmp_path: Path) -> None:
+    # The absent-registry sibling already names absence with a *_missing code;
+    # the generic artifact path adopts the same vocabulary instead of inventing
+    # a second one.
+    def _never_called(**_kwargs: object) -> dict[str, object]:
+        raise AssertionError("query_fn must not run when the registry is absent")
+
+    sibling = evidence.source_graph_retrieval_eval(tmp_path, query_fn=_never_called)
+    assert sibling["reason"].startswith("retrieval_registry_missing:")
+
+    missing = evidence.risk_mode_precision_bench(tmp_path)
+    assert missing["reason"].split(":", 1)[0].endswith("_missing")
+    assert sibling["reason"].split(":", 1)[0].endswith("_missing")
