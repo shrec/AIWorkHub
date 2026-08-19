@@ -6,6 +6,75 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.86] - 2026-08-18
+
+Nineteen NeedFix records across five accepted cards. Two of the defects below
+were introduced by candidates during this work and caught by review rather than
+by tests; both are recorded here because that is the point.
+
+### Fixed
+
+- **A review workspace failing its integrity check was DELETED.** Detection was
+  correct; the response was the worst available one. At 06:29:27 today a hash
+  mismatch was detected on this repository and the worktree went with it, taking
+  264 insertions of verified work - no warning, no quarantine, and no entry in
+  the retention audit. A failing workspace is now quarantined with the card
+  marked blocked and the reason named, every removal is recorded with request id
+  and reason, and a workspace whose card is still in review cannot be reclaimed
+  by a background sweep. (NF-2026-00300)
+- **A validator probe could execute candidate code on the host.** It ran
+  `subprocess.run` outside the sandbox with the candidate's own worktree on
+  `PYTHONPATH` and no `-S`/`-I`/`-E`; CPython imports `sitecustomize` from any
+  `sys.path` entry, so a candidate writing `sitecustomize.py` into its worktree
+  would have run arbitrary code as the coordinator. Closed twice over.
+- **A candidate could forge its own terminal state.** The classifier trusted
+  returncodes 126 and 127 as structural, assuming pytest never exits with them -
+  but `os._exit(126)` in a test body does exactly that, so a real gate failure
+  could relabel itself recoverable. Only the exception type captured at spawn
+  decides now. (NF-2026-00271, NF-2026-00298, NF-2026-00299, NF-2026-00267)
+- **Process identity lost its last digit above 2^53**, and the two status
+  surfaces disagreed by one tick - so a live worker could be judged foreign, or a
+  reused pid accepted as the original. Carried as strings now, from one shared
+  surface. Reported from Windows as AWH-OBS-011. (NF-2026-00254)
+- **Audit-ledger decoding raised out of its own fail-closed boundary.**
+  `str.isdigit()` is not the predicate "int() will succeed": `'--5'` and `'²'`
+  pass it and `int()` then raises, while non-ASCII digits were silently accepted
+  from an authenticated ledger. (NF-2026-00219)
+- **The Context Graph never captured the Claude manager.** On a Claude-only
+  installation it recorded nothing from the seat holding the manager role, and
+  reported `not_configured` rather than failing - so every continuation and
+  compaction recovery was empty and nobody noticed. (NF-2026-00256)
+- **Rejecting a card left its quality reviewers in the queue forever.** Three per
+  rejection; the queue reached 29 entries of which 27 were consumed reviewers.
+  (NF-2026-00249)
+- Also: malformed callback rows dead-lettered rather than enqueued
+  (NF-2026-00220), VS Code LM claims cancelled before their workspace is deleted
+  (NF-2026-00221), timed-out worker deltas retained as rework predecessors
+  (NF-2026-00138), rework attempts no longer discarding green work over receipts
+  the rework path never made (NF-2026-00246), read-only diagnostics naming the
+  real reason instead of `unknown_adapter` (NF-2026-00274), CI uploading the
+  Windows and macOS junit reports it was already writing (NF-2026-00242), and
+  eight orphan symbols decided rather than commented (NF-2026-00173).
+
+### Added
+
+- **CAAS is enforced by the lifecycle**, not by a step someone remembers, and the
+  canonical expansion - Continuous Audit as a Service - is corrected wherever
+  this repository controls the wording. The **AuditSystem** lands as a running
+  vertical slice: one narrow scope, one read-only pass, structured findings
+  written to NeedFix with provenance. (NF-2026-00253, NF-2026-00251)
+
+### Known and recorded rather than claimed fixed
+
+- Only CAAS-P1 is independently observed; P2-P6 read self-reported booleans, so
+  "by construction" means something weaker for those five (NF-2026-00317).
+- The sandbox-unrunnable preflight splits only on a bare `&&`, so a full suite
+  chained with `;` or `||` still escapes it (NF-2026-00316).
+- The Context Graph `skipped` counter cannot distinguish "not a manager message"
+  from "a manager message we failed to record" (NF-2026-00314).
+- A candidate cut before a release silently reverts the version constant when
+  promoted, and nothing refuses it (NF-2026-00315).
+
 ## [0.9.85] - 2026-08-18
 
 ### Changed

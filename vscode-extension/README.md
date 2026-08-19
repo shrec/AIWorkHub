@@ -12,6 +12,24 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.86
+
+- Work under review could be deleted. When a task's saved work failed its
+  integrity check, AIWorkHub deleted the whole workspace rather than preserving
+  it — it happened here this morning and took 264 lines of finished work with it,
+  silently. Failing work is now quarantined and every removal is audited.
+- A task's own code could run outside its sandbox, with AIWorkHub's permissions,
+  through a helper that checked whether the test tools were installed.
+- A task could declare its own result: certain exit codes were trusted as "could
+  not run here" when a test can produce them deliberately.
+- Process identity lost a digit above a certain size, and two screens disagreed
+  by one — that number is what tells a live worker from a recycled process id.
+- AIWorkHub recorded nothing from Claude into its context history, and reported
+  "not configured" instead of failing.
+- Rejecting a task left its reviewers in the queue forever, three per rejection.
+- Continuous Audit as a Service is now upheld by the system rather than by
+  remembering to check, and the audit layer runs its first real pass.
+
 ## What's new in 0.9.85
 
 - Starting a quality review took twenty to thirty minutes before anything

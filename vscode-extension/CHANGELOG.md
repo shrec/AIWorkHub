@@ -1,5 +1,51 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.86 — 2026-08-18
+
+Nineteen fixes across five accepted tasks.
+
+### Fixed
+
+- **Work under review could be deleted.** When a task's saved work failed its
+  integrity check, AIWorkHub deleted the whole workspace. That is the worst
+  possible answer to "this might have been tampered with" - it destroys the only
+  thing anyone could look at to find out. It happened here this morning and took
+  264 lines of finished, verified work with it, silently. Failing work is now
+  quarantined, the task is marked blocked with the reason, and every removal is
+  written to the audit log.
+- **A task's code could run outside its sandbox.** A helper that checks whether
+  the test tools are installed ran on the host machine with the task's own files
+  on the import path, so a task could have placed a file there and had it
+  executed with AIWorkHub's own permissions. Closed two independent ways.
+- **A task could declare its own result.** The system trusted certain exit codes
+  as proof that a command "could not run here" rather than "failed" - but a test
+  can produce those exit codes deliberately, so a genuine failure could present
+  itself as a recoverable environment problem.
+- **Process identity lost a digit**, and two screens disagreed about it by one.
+  That number is what distinguishes a live worker from a recycled process id, so
+  a running worker could be judged foreign or a dead one accepted as alive.
+  Reported from a Windows install.
+- **AIWorkHub recorded nothing from Claude.** On a Claude-only setup the context
+  history was empty, and the status simply said "not configured" instead of
+  failing - so every conversation recovery had nothing to recover from.
+- **Rejecting a task left its reviewers in the queue forever**, three at a time,
+  until the real work was impossible to find among them.
+
+### Added
+
+- Continuous Audit as a Service is now upheld by the system itself rather than by
+  remembering to check, and the audit layer runs its first real pass: one narrow
+  scope, read-only, with findings recorded and traceable to the pass that found
+  them.
+
+### Stated, not hidden
+
+Four known limits are written into the release notes rather than left to be
+discovered: which compliance properties are actually observed versus
+self-reported, a command-line check that only handles one chaining operator, a
+counter that conflates two different situations, and a task cut before a release
+that can silently carry an old version number forward.
+
 ## 0.9.85 — 2026-08-18
 
 ### Changed
