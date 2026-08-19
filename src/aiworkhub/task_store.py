@@ -1005,6 +1005,45 @@ def database_identity(root: str | Path) -> dict[str, Any]:
 _ARCHIVE_TERMINAL_STATUSES: frozenset[str] = frozenset({"archived", "superseded", "finished"})
 
 
+def _launch_reservation_held(
+    row: Mapping[str, Any], card: Mapping[str, Any]
+) -> bool:
+    """True while a launch reservation is committed but has not yet started.
+
+    A quality-reviewer launch reserves an attempt -- minting a
+    ``launch_request_id`` that is attached to the card -- before any process is
+    spawned.  For the minutes between that reservation and the moment the
+    reviewer actually starts, the row exists and the launch is committed and
+    preparing, yet no process is alive and ``started_at`` is still NULL.
+    Disposing of the row in that window destroys a reviewer that is about to
+    run -- the measured defect this guards.
+
+    The signal is the RESERVATION, never ``started_at`` alone.  ``started_at``
+    is written at CLAIM time, not at reservation time, so a reserved,
+    preparing reviewer has ``started_at`` NULL for minutes while it is about to
+    run; a guard that read that NULL as "blocked before start" would dispose of
+    exactly that reviewer.  A launch is disposable only when nothing has been
+    committed on its behalf, so a reservation counts as *held* only when BOTH a
+    reservation id is present AND the launch has not started, and only while the
+    row is still in a live pre-terminal state (``pending``/``processing``).
+    Once the reservation is released -- the attempt is terminalized out of those
+    states, or its id is cleared -- or the launch has actually started, nothing
+    is *merely reserved* here and the ordinary disposal rules apply.
+
+    No pid is consulted.  The tasks table has no ``pid`` column, so a live
+    process is never inferred from a stored pid; a started launch is read from
+    ``started_at`` and canonical status, and a reserved-not-started launch from
+    its reservation id.
+    """
+
+    reservation_id = str(card.get("launch_request_id") or "").strip()
+    if not reservation_id:
+        return False
+    if str(row.get("started_at") or "").strip():
+        return False
+    return canonical_status(dict(row)) in {"pending", "processing"}
+
+
 def archive_task(
     root: str | Path,
     task_id: str,
@@ -1025,21 +1064,50 @@ def archive_task(
     untouched.  After commit the row is re-read and the reported outcome
     reflects what is actually stored, so a write that did not persist reports
     failure rather than the value it merely intended to write.
+
+    Disposal is refused for a live launch, but no pid is ever read to decide
+    that: the tasks table has no ``pid`` column, so "is something running?" is
+    answered from canonical status, a held launch reservation
+    (:func:`_launch_reservation_held`) and ``started_at`` -- never from a
+    stored process id.  A held reservation is a commitment and is refused even
+    before the row reaches ``processing``; a launch that committed nothing (no
+    reservation held and never started) is disposable, and the ``reason`` is
+    recorded on the card and in the audit event.
     """
     _readiness, db_path = _require_ready(root)
     terminal_status = "superseded" if operation == "superseded" else "archived"
     conn = _connect(db_path)
     try:
         row = conn.execute(
-            "SELECT status, worker_status, archived_at, card_json FROM tasks WHERE task_id=?",
+            "SELECT status, worker_status, archived_at, card_json, started_at "
+            "FROM tasks WHERE task_id=?",
             (task_id,),
         ).fetchone()
         if row is None:
             return False, "task_not_found"
         if str(row["archived_at"] or "").strip():
             return True, "already_archived"
-        if canonical_status(dict(row)) == "processing" and not allow_processing:
-            return False, "archive_processing_forbidden"
+        if not allow_processing:
+            try:
+                guard_card = json.loads(str(row["card_json"] or "{}"))
+            except json.JSONDecodeError:
+                guard_card = {}
+            if not isinstance(guard_card, dict):
+                guard_card = {}
+            # A held launch reservation is a commitment, so a reviewer that is
+            # reserved and preparing -- but has not started -- must not be
+            # disposed of even before its row reaches ``processing``.  This is
+            # keyed on the RESERVATION, never on ``started_at`` alone: see
+            # ``_launch_reservation_held`` for why ``started_at`` NULL cannot
+            # stand in for "nothing committed".
+            if _launch_reservation_held(dict(row), guard_card):
+                return False, "archive_processing_forbidden"
+            # A genuinely running worker (canonical ``processing``, i.e. a live
+            # started/claimed process) is likewise refused.  No pid is read to
+            # decide this -- the tasks table has no pid column -- so liveness is
+            # taken from canonical status, never a stored pid.
+            if canonical_status(dict(row)) == "processing":
+                return False, "archive_processing_forbidden"
         source_status = str(row["status"] or "")
         now = datetime.now(timezone.utc).isoformat()
         try:

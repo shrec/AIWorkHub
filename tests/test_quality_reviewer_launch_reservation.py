@@ -7,6 +7,7 @@ invariant that a live provider is never classified by elapsed or quiet time.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -95,6 +96,46 @@ def _prepared_result(worker_adapter_id: str = "independent_adapter") -> dict:
             },
         },
     }
+
+
+REVIEW_READY_TARGET_TASK_IDS = ("TARGET_TASK", "TARGET_A", "TARGET_B")
+
+
+@pytest.fixture(autouse=True)
+def _review_ready_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every launch in this module a target that CAN be reviewed.
+
+    ``launch_quality_reviewer`` now refuses before the reservation when the
+    target is not ``review_ready`` (NF-2026-00265/NF-2026-00331): the caller
+    learns ``ok:false`` immediately instead of holding a success receipt for a
+    reviewer that would resolve its target on the background thread and die.
+
+    These tests pin the reservation boundary, which sits DOWNSTREAM of that
+    check, and they never stubbed the target lookup because the old code never
+    performed one.  On a fresh empty repo the lookup fails, the launch refuses,
+    and the receipt carries no ``request_id`` -- so the fixtures, not the
+    contract, are what needs to change.  Anything the tests deliberately drive
+    through the refusal path overrides this by stubbing ``_show_task`` itself.
+    """
+
+    def _show_review_ready_target(_self, task_id: str) -> dict[str, object]:
+        return {
+            "returncode": 0,
+            "stdout": json.dumps({
+                "task_id": task_id,
+                "terminal_review": {"substatus": "review_ready"},
+            }),
+            "stderr": "",
+        }
+
+    # ``_show_task`` is an INSTANCE attribute assigned in ``__init__``
+    # (``show_task or self._default_show_task``), so the class-level default is
+    # what a manager built without an explicit ``show_task`` falls back to.
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_default_show_task",
+        _show_review_ready_target,
+    )
 
 
 def _running_spy(
@@ -748,13 +789,6 @@ def test_status_read_bounded_and_reports_phase_while_prep_blocks(
         return _prepared_result()
 
     monkeypatch.setattr(manager, "_build_quality_review_packet", blocked_build)
-    monkeypatch.setattr(
-        manager,
-        "_show_task",
-        lambda *_a, **_k: pytest.fail(
-            "status must not read the task card for a pid-null starting reservation"
-        ),
-    )
 
     launch_calls: list = []
     monkeypatch.setattr(manager, "_launch_isolated", _running_spy(manager, launch_calls))
@@ -769,6 +803,21 @@ def test_status_read_bounded_and_reports_phase_while_prep_blocks(
     )
     request_id = receipt["request_id"]
     assert prep_started.wait(timeout=5)
+
+    # The invariant under test belongs to ``status``, not to the launch: a
+    # pid-null starting reservation must be described from the reservation
+    # itself and never by reading the task card.  The launch now performs ONE
+    # deliberate target lookup before reserving (it refuses a target that is not
+    # ``review_ready`` rather than handing back a success receipt), so the trap
+    # is armed AFTER the launch -- otherwise it fires on a read the contract
+    # requires and says nothing about ``status`` at all.
+    monkeypatch.setattr(
+        manager,
+        "_show_task",
+        lambda *_a, **_k: pytest.fail(
+            "status must not read the task card for a pid-null starting reservation"
+        ),
+    )
 
     status = manager.status(request_id)
     assert status["ok"] is True

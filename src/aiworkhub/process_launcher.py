@@ -6131,6 +6131,34 @@ class ProcessManager:
         existing = self._live_reviewer_receipt(reviewer_task_id)
         if existing is not None:
             return existing
+        # Refuse before the deferred return when the target cannot be reviewed.
+        # ``assess_reviewer_launch_target`` is the decidable part of the launch:
+        # a target that is not ``review_ready`` makes the review impossible, so
+        # the caller learns ``ok:false`` now -- carrying the named reason --
+        # instead of holding a success receipt for a reviewer that would resolve
+        # its target on the background thread, refuse and die (the receipt would
+        # otherwise say only that a thread was started, not that a review is
+        # running).  Deferring the heavy prewarm/preparation is still correct;
+        # only this already-decidable target verdict is pulled ahead of the
+        # reservation and the deferred return, so the return carries only what
+        # has actually been established.
+        try:
+            _target_card: dict[str, Any] | None = _parse_card(
+                self._show_task(target_task_id), target_task_id
+            )
+        except LaunchRejected:
+            _target_card = None
+        _target_verdict = quality_review.assess_reviewer_launch_target(
+            target_card=_target_card
+        )
+        if not _target_verdict.get("can_launch"):
+            return {
+                "ok": False,
+                "error": "quality_review_target_not_review_ready",
+                "reason": _target_verdict.get("reason"),
+                "target_substatus": _target_verdict.get("target_substatus"),
+                "fails_at_launch": True,
+            }
         reservation = self._reserve_quality_reviewer_attempt(
             reviewer_task_id=reviewer_task_id,
             runner=runner,
