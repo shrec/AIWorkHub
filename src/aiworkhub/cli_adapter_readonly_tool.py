@@ -129,9 +129,23 @@ def _authority_flags() -> dict[str, bool]:
 _COLLISION_CARDS_ENV = "AIWORKHUB_COLLISION_CARDS_PATH"
 _COLLISION_CARDS_LEGACY_ENV = "BITNN_TASK_CARDS_PATH"
 
-# The active lifecycle buckets that count as a live claim -- the EXACT set the
-# production collision guard uses (see core._active_cards_for_collision_guard).
+# The active lifecycle buckets used to report ``active_card_count`` -- the EXACT
+# set the production guard uses (see core._active_cards_for_collision_guard).
+# NOTE: active-bucket membership is NOT a held claim. Whether a card HOLDS a
+# claim is claim truth (``claimed_by``), decided by :func:`_claim_is_held`, not
+# by this status set; substituting the bucket for the claim -- counting a pending
+# card as a held claim -- is the defect NF-2026-00335 removes.
 _ACTIVE_STATUSES = frozenset({"pending", "processing", "review"})
+
+# This preflight answers a RUNNER-IDENTITY question -- does an active CLAIM
+# already exist for this exact ``task_id``, or does the same ``runner`` already
+# HOLD another active claim -- which is a DIFFERENT question from the write-scope
+# / file collision the live ``core._scan_aiworkhub_collisions`` guard answers.
+# ``condition_kind`` names which question this surface answers and ``runner_busy``
+# names the "this runner already holds another active claim" state, so a caller
+# can tell a busy runner from a file collision from the returned value alone and
+# never conflate the two under the single word "collision".
+_CONDITION_KIND = "runner_identity"
 
 
 def _explicit_cards_source() -> tuple[str | None, str | None]:
@@ -244,13 +258,35 @@ def _active_cards_for_repo(repo: Any) -> list[dict[str, Any]]:
     return active
 
 
+def _claim_is_held(card: dict[str, Any]) -> bool:
+    """Claim truth: a card holds a claim only when the store COMMITTED one.
+
+    The exact-claim path (``core`` auto-pickup / claim-start) sets
+    ``claimed_by=<runner>`` (with ``worker_status='claimed'``) and persists it
+    into ``card_json``; a created-but-unlaunched card stays ``pending`` /
+    ``unclaimed`` with an EMPTY ``claimed_by`` and therefore holds nothing -- no
+    claim, no lock, no worker, no worktree. Membership in an active STATUS bucket
+    (pending/processing/review) is NOT a held claim: substituting that bucket for
+    the claim is exactly the NF-2026-00335 defect (twelve stale PENDING orphans
+    reported a collision for every launch). The answer is derived from the
+    committed claim field, never from the status list.
+    """
+    return bool(str(card.get("claimed_by") or "").strip())
+
+
 def _classify_collision(
     active_cards: list[dict[str, Any]], *, task_id: str, runner: str
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    same_task = [c for c in active_cards if str(c.get("task_id", "")) == task_id]
+    # Count a card ONLY when a claim is actually HELD for it (claim truth), never
+    # merely because it sits in an active status bucket. ``same_runner`` matches
+    # on ``claimed_by`` -- the runner that HOLDS the claim -- so a pending card
+    # assigned to the runner but claimed by nobody contributes nothing.
+    held = [c for c in active_cards if _claim_is_held(c)]
+    same_task = [c for c in held if str(c.get("task_id", "")) == task_id]
     same_runner_other_task = [
-        c for c in active_cards
-        if str(c.get("runner", "")) == runner and str(c.get("task_id", "")) != task_id
+        c for c in held
+        if str(c.get("claimed_by") or "").strip() == runner
+        and str(c.get("task_id", "")) != task_id
     ]
     reasons: list[str] = []
     if same_task:
@@ -273,6 +309,12 @@ def _resolved_preflight(
     )
     return {
         "would_collide": bool(reasons),
+        # This surface answers a runner-identity question, NOT a write-scope/file
+        # collision (that is core._scan_aiworkhub_collisions). ``runner_busy`` is
+        # the field that tells a caller the runner merely already holds another
+        # active claim -- a busy runner, not a file collision.
+        "condition_kind": _CONDITION_KIND,
+        "runner_busy": bool(same_runner_other_task),
         "read_only": True,
         "mutated_state": False,
         "lock_acquired": False,
@@ -299,6 +341,11 @@ def _unresolved_preflight(*, cards_source: str, unresolved_reason: str) -> dict[
     """
     return {
         "would_collide": None,
+        # Named on EVERY branch so a caller can always tell which question this
+        # surface answers; ``runner_busy`` is None because a source that could not
+        # be read yields no confident claim answer (never a comfortable False).
+        "condition_kind": _CONDITION_KIND,
+        "runner_busy": None,
         "read_only": True,
         "mutated_state": False,
         "lock_acquired": False,
@@ -325,9 +372,16 @@ def collision_preflight(
     """READ-ONLY: would this task_id/runner collide with an active claim?
 
     No lock is acquired, no claim is written, and no queue/audit state is
-    mutated. ``would_collide`` is true when an ACTIVE (pending/processing/
-    review) card already claims this exact ``task_id``, or when the same
-    ``runner`` already holds a different active task.
+    mutated. ``would_collide`` is true when a HELD claim already exists for this
+    exact ``task_id``, or when the same ``runner`` already HOLDS a different
+    active claim. A held claim is claim truth (``claimed_by`` committed by the
+    exact-claim path), NOT active-status-bucket membership: a created-but-
+    unlaunched ``pending`` card holds nothing and contributes to no count (see
+    :func:`_claim_is_held`). This is a RUNNER-IDENTITY question, named
+    ``condition_kind`` / ``runner_busy`` in the result, and is a DIFFERENT
+    question from the write-scope/file collision the live
+    ``core._scan_aiworkhub_collisions`` guard answers -- the two are named so a
+    caller can never mistake a busy runner for a file collision.
 
     ``repo`` SCOPES the canonical scan to a named repository -- the same
     parameter ``plan_dryrun`` honours -- so the two sibling surfaces answer

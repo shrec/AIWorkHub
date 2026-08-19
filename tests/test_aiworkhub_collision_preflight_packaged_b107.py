@@ -92,13 +92,17 @@ def test_preflight_explicit_missing_source_is_unresolved_not_a_confident_zero(
 
 
 def test_preflight_detects_task_and_runner_collisions(tmp_path, monkeypatch) -> None:
+    # A held claim is claim truth (``claimed_by`` committed by the exact-claim
+    # path), not status-bucket membership. A genuinely processing/review card is
+    # claimed BY the runner, so it carries ``claimed_by`` -- that is what makes it
+    # count. A pending/unclaimed card (no ``claimed_by``) would hold nothing.
     cards = tmp_path / "cards.jsonl"
     cards.write_text(
         "\n".join(
             [
-                json.dumps({"task_id": "T1", "runner": "claude_opus48", "status": "processing"}),
+                json.dumps({"task_id": "T1", "runner": "claude_opus48", "status": "processing", "worker_status": "claimed", "claimed_by": "claude_opus48"}),
                 json.dumps({"task_id": "T2", "runner": "claude_opus48", "status": "finished"}),
-                json.dumps({"task_id": "T3", "runner": "claude_opus48", "status": "review"}),
+                json.dumps({"task_id": "T3", "runner": "claude_opus48", "status": "review", "worker_status": "claimed", "claimed_by": "claude_opus48"}),
                 "   ",                       # blank -> skipped
                 "{not valid json",          # malformed -> skipped
                 json.dumps(["not", "dict"]),  # non-object -> skipped
@@ -115,6 +119,10 @@ def test_preflight_detects_task_and_runner_collisions(tmp_path, monkeypatch) -> 
     assert result["same_runner_other_active_claims"] == 1
     assert "active_claim_exists_for_task_id" in result["collision_reasons"]
     assert "runner_already_claims_other_active_task" in result["collision_reasons"]
+    # The runner-identity condition is named distinctly from a write-scope
+    # collision: a caller reads it from the value without reading either impl.
+    assert result["condition_kind"] == "runner_identity"
+    assert result["runner_busy"] is True
 
 
 def test_preflight_no_collision_when_only_terminal_cards(tmp_path, monkeypatch) -> None:
