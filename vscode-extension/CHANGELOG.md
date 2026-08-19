@@ -1,5 +1,39 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.88 — 2026-08-19
+
+Eight fixes. Two of them had been broken since 0.9.43 and 0.9.44.
+
+### Fixed
+
+- **The panel now follows your editor's font size.** Most of the dashboard text
+  was hard-coded at 8-11px and ignored the font size you had already chosen in
+  VS Code — raising it changed nothing. Every size now derives from your setting:
+  the smallest text is about 11px at the default and grows with you.
+- **AIWorkHub could not start its own server for Claude Code.** The config file
+  Claude Code reads was written with a VS Code placeholder in it, which Claude
+  Code cannot expand, so the connection failed with a message naming a token
+  instead of a folder — and every update rewrote the file and broke it again.
+  It now writes a real path, and refuses to save a config a reader cannot use.
+- **A working task looked dead.** The panel dropped the model's live "thinking"
+  output, so a task producing output normally showed an empty screen. People
+  killed healthy runs because of it.
+- **Valid output was labelled "unsupported".** An unfamiliar event now shows as
+  readable raw output with a reason, never a blank panel and never an
+  "unsupported" tag on output that was perfectly valid. Reselecting a task also
+  can no longer leave two update loops running at once.
+- **A failed task often could not tell you why.** Twenty of fifty-two blocked
+  tasks carried no reason at all, so recovery was guesswork for more than a third
+  of failures. A task can no longer be blocked without a recorded cause.
+- **A failed check cut off its own explanation.** Test output was trimmed from
+  the wrong end, keeping the passing lines and discarding the failing one, with
+  nothing to say it had been trimmed. Failures now keep the part that explains
+  them.
+- **A missing file was reported as a corrupt file**, sending you looking for
+  damage in something that was simply not there.
+- **A task that hung before it ever started was invisible** to the health check,
+  because that check looked for a running process and there wasn't one yet.
+
 ## 0.9.87 — 2026-08-19
 
 Four fixes. Two of them are about waiting for something that should never have

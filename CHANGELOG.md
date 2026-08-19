@@ -6,6 +6,86 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.88] - 2026-08-19
+
+Eight NeedFix records across three accepted cards, plus one regression the
+manager caused and caught before pushing. Two of the eight had been reproducing
+since 0.9.43 and 0.9.44.
+
+### Fixed
+
+- **The extension wrote a VS Code variable into the config Claude Code reads.**
+  `${workspaceFolder}` reached `.mcp.json`, which Claude Code parses directly and
+  cannot expand, so the MCP server failed to start naming a token where a
+  directory belongs - and every version bump regenerated the file and re-broke
+  it. `.mcp.json` now carries the resolved absolute command, and a check REFUSES
+  to persist a config a non-VS-Code consumer cannot resolve: a failed check skips
+  the write with a named reason rather than writing it and logging. The two files
+  differ deliberately and both are asserted - `.vscode/mcp.json` keeps the bare
+  interpreter name, because VS Code does not substitute variables in `command`
+  and its remote spawn is ENOENT-prone on repo-local absolute paths.
+  (NF-2026-00243)
+- **A healthy worker looked dead.** Live reasoning deltas were dropped by the
+  renderer, so a worker producing output normally showed an empty panel; an
+  operator watching that kills the run. Measured on the original report:
+  heartbeat age 4s, 11.3 MB of stdout, and nothing on screen for 33 minutes.
+  (NF-2026-00182)
+- **Valid provider JSON was labelled unsupported.** An unrecognised shape now
+  degrades to a readable raw rendering with a named reason, never a blank panel
+  and never an "unsupported" label on valid JSON. Live-output generation
+  ownership is established with a test rather than assumed, and the poll chain
+  clears any pending timer before arming so reselecting a task cannot leave two
+  loops alive. (NF-2026-00183, NF-2026-00224)
+- **The dashboard now follows the editor's font size instead of overriding it.**
+  89 of 112 font-size rules were 11px or smaller and 38 were 9px or smaller,
+  while exactly ONE rule read `var(--vscode-font-size)`. That is the defect: the
+  user had already told VS Code what size they read at and the panel discarded
+  the answer everywhere. A type scale rooted at that variable now drives all 112
+  declarations with zero pixel literals remaining; the smallest rendered size is
+  11.05px at the 13px default and 13.6px at 16px. Larger text was absorbed with
+  layout, never by shrinking back. (NF-2026-00311)
+- **Twenty of fifty-two blocked cards carried no terminal reason at all** - 38
+  percent of failures where recovery starts blind. A single bounding boundary now
+  carries the reason and all four blocked/terminal writers route through it;
+  `mark_launch_failed` was the path persisting the empty reason. A path that
+  cannot determine the cause records `cause_undetermined:<path>`, naming the path
+  rather than hiding behind a placeholder. The backfill of the existing twenty
+  rows is not done and that record stays open. (NF-2026-00307)
+- **A failing quality-gate check cut off its own explanation.** The summary
+  truncated at exactly 2000 characters, head-first, while `error` was empty -
+  and a test runner prints failures AFTER the passing output, so the capture kept
+  twenty passing lines and discarded the one that said what broke. Failing checks
+  now keep the TAIL with a marked elision; every cut says it was cut. The cap was
+  not raised: what was wrong is which end it kept. (NF-2026-00321)
+- **An absent artifact reported `artifact_invalid`**, sending an operator to hunt
+  for corruption in a file that does not exist, while a sibling surface already
+  said "missing" for the same condition. Absent and malformed are now different
+  reason codes. (NF-2026-00322, external AWH-OBS-015)
+- **A frozen preparation heartbeat was invisible to stall detection**, because
+  the watchdog read liveness from a pid and a launch that never spawned has none
+   - so the one case that most needed a watchdog was the one it could not see.
+  Six reviewer launches sat twelve minutes with `pid: null` and a frozen
+  heartbeat and no stall was ever reported. Detection is now pid-free.
+  (NF-2026-00320)
+
+### Notes
+
+One regression here was the manager's, caught before pushing rather than by CI: a
+contract test asserted that the "unsupported event shape" label was still present
+in `app.js`, which is precisely the defect NF-2026-00183 removed, and the card's
+write scope did not include that file so the worker could not have fixed it. The
+same shape appeared a second time on the absent-vs-invalid split. Both guards
+were updated to assert the new contract rather than deleted.
+
+Recorded rather than fixed: NF-2026-00323 (the reasoning shape predicate is too
+narrow and too eager at once), NF-2026-00324 (a comment tells the next reader to
+write the variable NF-2026-00243 removes), NF-2026-00325 (the typography guard
+reads the `font-size` longhand only), NF-2026-00326 (every reviewer launch
+returned `provider_authentication_failed:http_status=401` minutes after identical
+workers succeeded, which is almost certainly a quota condition wearing an
+authentication label), NF-2026-00327 (`provenance` truncates without a marker
+while `summary` beside it is marked).
+
 ## [0.9.87] - 2026-08-19
 
 Three NeedFix records and one of the owner's Windows observability items. Two of

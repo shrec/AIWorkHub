@@ -12,6 +12,20 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.88
+
+- The dashboard now follows your editor's font size. Most text was hard-coded at
+  8-11px and ignored the size you had already chosen in VS Code; every size now
+  derives from that setting, with the smallest around 11px at the default.
+- AIWorkHub could not start its own server for Claude Code: the config file it
+  wrote carried a VS Code placeholder Claude Code cannot expand, and every update
+  rewrote it. It now writes a real path and refuses to save an unusable config.
+- A working task looked dead — the panel dropped the model's live thinking output
+  — and valid output was sometimes labelled "unsupported".
+- A failed task can no longer be blocked without a recorded reason, a failed
+  check keeps the part of its output that explains the failure, and a missing
+  file is no longer reported as a corrupt one.
+
 ## What's new in 0.9.87
 
 - AIWorkHub no longer copies its whole code index before a retry. Rework is the
