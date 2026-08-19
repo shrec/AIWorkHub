@@ -12,6 +12,21 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.94
+
+- AIWorkHub could stop responding until you reloaded the window: two operations
+  competing for one file left one waiting forever on Linux, and the recovery for
+  it only ran on Windows. Reviews that seemed to start and never did were this.
+- A running worker could be declared dead and its task closed, because "is this
+  process alive?" was answered in three places and answered wrongly on Linux for
+  a process we are not permitted to signal.
+- Stopping a task could leave a child running — the stop signalled the group but
+  checked only the parent.
+- A surgical edit could be applied without checking the file was unchanged, in
+  silence. Unverified edits are now reported as such.
+- The MCP server never started in Copilot: the configuration named the
+  interpreter by a path Copilot could not resolve remotely.
+
 ## What's new in 0.9.93
 
 - Asking for a function or class by name returned nothing even when it was

@@ -6,6 +6,58 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.94] - 2026-08-19
+
+The OS boundary. Every defect below was measured by running the code, and the
+first one had been dressed up as a rule of thumb for weeks.
+
+### Fixed
+
+- **A blocking lock on Linux waited forever, and its recovery was written for an
+  OS we do not run on.** `platform_io` promised "the same repository-local
+  locking contract on Linux, macOS, and Windows"; Windows had a deadline and
+  raised `AdvisoryLockTimeout`, POSIX called `flock(LOCK_EX)` and never returned.
+  The one place that catches that exception has a careful deferral - and on Linux
+  it was unreachable, so contention parked a monitor thread instead. This is the
+  defect behind the operating note "reviewer launches must be serialised; only an
+  MCP server restart clears it". It was never a law of the system. POSIX now
+  shares the bound and the exception. (NF-2026-00350)
+- **Liveness had three answers to one question.** Measured against PID 1, which
+  is unambiguously alive: `os.kill(1, 0)` raises EPERM, and the probes answered
+  False, False and None. Two adjacent lines of one function disagreed - the
+  Windows branch read access-denied as alive, the POSIX branch as dead - so on
+  Linux a worker running under another uid was declared dead and its live card
+  terminalized. One function now, and EPERM means alive.
+- **The group terminator signalled a process group and then waited only on its
+  leader**, so a wrapper exiting while its worker ran satisfied the check and the
+  SIGKILL escalation never fired.
+- **The semantic-edit preimage check was optional and silent.** A range edit
+  without a fragment hash was applied with nothing recorded; the module docstring
+  meanwhile promised a verified complete-file preimage that this layer never had
+  a parameter for. Unverified edits are still possible and are now reported.
+  Separately, a bare-CR file lost its line terminator - lines 1 and 2 were
+  silently glued - because the preserving branches knew `\r\n` and `\n` and not
+  `\r`. (NF-2026-00351)
+- **Copilot's MCP server never started.** The extension wrote a repo-local
+  absolute interpreter path into root `.mcp.json`, and VS Code's remote spawn -
+  which resolves on the server side - failed with ENOENT on it, three times over
+  three days, while the extension host spawned the same binary successfully in
+  the same minute. Both configs now carry the bare interpreter name, which
+  satisfies Claude Code (not a variable) and the remote spawn (resolves via
+  PATH); an interpreter configured outside the repository is left alone. This
+  reinstates, on evidence, the change backed out of 0.9.92.
+  (NF-2026-00352, NF-2026-00347)
+
+### Notes
+
+Promoting the platform fix turned canonical red with 16 failures:
+`worker_supervisor` runs as a direct script, and a new relative import broke its
+fallback chain one level deeper - in the one process whose job is to stop workers
+being orphaned. Corrected here. The defect also blocked its own review three
+times, which is the clearest evidence for it in this changelog.
+
+Canonical: 4763 passed, 38 skipped, ruff clean, npm test 39 files.
+
 ## [0.9.93] - 2026-08-19
 
 Source Graph, and the models the editor already had.

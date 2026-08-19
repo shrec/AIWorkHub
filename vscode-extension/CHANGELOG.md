@@ -1,5 +1,26 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.94 — 2026-08-19
+
+### Fixed
+
+- **AIWorkHub could stop responding until you reloaded the window.** Two
+  operations competing for the same file could leave one waiting forever on
+  Linux, with no timeout and no way back — the recovery for it existed but only
+  ran on Windows. Reviews that appeared to start and then never did were this.
+- **A running worker could be declared dead and its task closed**, because the
+  check for "is this process alive?" answered differently in three places, and
+  the answer for "running but not ours to signal" was wrong on Linux.
+- **Stopping a task could leave a child process running.** The stop signalled the
+  whole group but only checked the parent, so the forceful second stage never
+  ran.
+- **A surgical edit could be applied without checking the file had not changed**,
+  and nothing said so. Unverified edits are now reported as unverified. Files
+  using classic Mac line endings also lost a line break on edit.
+- **The MCP server never started in Copilot.** The configuration written for it
+  named the interpreter by a path Copilot could not resolve remotely, failing
+  every time while the same program started fine elsewhere.
+
 ## 0.9.93 — 2026-08-19
 
 ### Fixed
