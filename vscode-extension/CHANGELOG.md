@@ -1,5 +1,32 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.87 — 2026-08-19
+
+Four fixes. Two of them are about waiting for something that should never have
+been slow.
+
+### Fixed
+
+- **AIWorkHub no longer copies its whole code index before a retry.** Every time
+  a task was sent back for rework, the system duplicated its entire 107 MB index
+  of your repository first — and rework is the thing that happens most often. It
+  now builds a small index of just the files that changed. On this repository
+  that is 5 MB instead of 107 MB, and the wait no longer grows as your project
+  does: a project with a 1 GB index costs exactly the same as one with 100 MB.
+- **A cleanup job with no ending was locking the task database.** Ten of them
+  were retrying every fifteen seconds against tasks that had been archived hours
+  earlier, each holding the database long enough that no new review could start.
+  Every review launch failed with "database is locked" — pointing at the wrong
+  database. Cleanup for an archived task now stops, with the reason recorded.
+- **Empty storage batches piled up instead of being cleaned.** A Windows install
+  had 100 batches reporting "empty, 0 bytes" while the folder actually held
+  3.68 GB. Empty batches are now collected when they appear, and only when the
+  record and the disk agree that there is nothing there — so nothing is deleted
+  on a stale claim.
+- Reported and left visible rather than quietly assumed safe: three smaller
+  issues found while accepting this work are written down in the project's fix
+  list instead of being folded into these notes.
+
 ## 0.9.86 — 2026-08-18
 
 Nineteen fixes across five accepted tasks.

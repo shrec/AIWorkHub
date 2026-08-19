@@ -12,6 +12,20 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.87
+
+- AIWorkHub no longer copies its whole code index before a retry. Rework is the
+  thing that happens most often, and each one duplicated a 107 MB index first;
+  it now indexes only the files that changed — 5 MB here — and that wait no
+  longer grows as your project does.
+- A cleanup job with no ending was locking the task database. Ten of them
+  retried every fifteen seconds against tasks archived hours earlier, so every
+  review launch failed with "database is locked" while pointing at the wrong
+  database.
+- Empty storage batches piled up instead of being cleaned: a Windows install had
+  100 batches reporting "empty, 0 bytes" while the folder held 3.68 GB. They are
+  collected now, and only when the record and the disk agree.
+
 ## What's new in 0.9.86
 
 - Work under review could be deleted. When a task's saved work failed its

@@ -6,6 +6,61 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.87] - 2026-08-19
+
+Three NeedFix records and one of the owner's Windows observability items. Two of
+these are about a cost that scales with the repository rather than with the
+change, and about a retry that had no ending - both self-inflicted limits this
+project has been paying every day.
+
+### Fixed
+
+- **Nothing in AIWorkHub copies the Source Graph index any more.** 954306c
+  removed the full-index clone from the reviewer prewarm but left the identical
+  `source_conn.backup` on the rework overlay path, so every rework attempt still
+  copied 107,130,880 bytes - and reworks are the most frequent operation in this
+  pipeline. `build_partition` is now the only path at both call sites, and
+  `source_conn.backup` no longer exists in the codebase. The cost of preparing a
+  worker's view is proportional to the changed set, not to repository size: an
+  index at 1 GB costs the same as one at 100 MB for the same six files.
+  (NF-2026-00313)
+- **A finalizer whose card was archived retried forever, and the retry storm was
+  the database lock.** Ten reviewer requests sat permanently in
+  `reconcile_pending`, each re-running its finalizer every fifteen seconds and
+  each failing identically with `terminal_transition_failed:not_processing`.
+  "Retries exhausted" was not terminal - archiving a card does not stop its
+  finalizer, so it kept trying to move a row with no processing state and
+  rescheduled itself. Ten writers each holding `task_queue.sqlite` for fourteen
+  to seventeen seconds left no window for any launch to read its target card,
+  which is why every reviewer launch in that window failed with a bare "database
+  is locked" that named the wrong database entirely. A finalizer whose card is
+  archived or not processing now terminates with a named reason, and a
+  target-card read starved by finalization writers says what actually contended.
+  (NF-2026-00305)
+- **Empty quarantine batches stopped accumulating at the source.** Measured on
+  the owner's Windows 11 install: 100 batches reporting status empty and 0 bytes
+  while the directory held 3.68 GB, one batch holding 3.66 GB of it. `quarantine`
+  now reaps an empty batch at the moment it opens one and `purge_empty_batches`
+  collects any that predate that - both guarded by a record-AND-disk check, so a
+  manifest that disagrees with what is physically on disk keeps its full undo
+  window rather than being removed on a stale "empty" claim. (AWH-OBS-013)
+
+### Notes
+
+Both fixed cards were first rejected by the MCP receipt-conformance gate rather
+than by any test: their code was green - 4548 and 4551 passing - and the gate
+refused on `source_graph_mode_stage_sequence_mismatch`. That field had declared
+`blocking:true` for months while acceptance ignored it, until NF-2026-00247
+closed the hole in 0.9.86. The first two cards it stopped were the manager's own,
+and both were reworked rather than routed around.
+
+Recorded rather than fixed, so the next reader inherits the measurement:
+NF-2026-00318 (finalizer termination depends on an unversioned stderr string),
+NF-2026-00319 (`quarantine_review_workspace` builds its destination from an
+unvalidated `request_id`), NF-2026-00320 (a frozen preparation heartbeat is
+invisible to stall detection, because the watchdog only watches launches that
+already spawned).
+
 ## [0.9.86] - 2026-08-18
 
 Nineteen NeedFix records across five accepted cards. Two of the defects below
