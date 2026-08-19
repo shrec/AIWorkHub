@@ -235,6 +235,12 @@ def test_webview_normalizer_handles_nested_provider_json_without_visible_raw_dum
     ).read_text(encoding="utf-8")
     assert "function parseNestedJson(" in app_source
     assert "const parsed = parseNestedJson(line);" in app_source
-    assert "Provider emitted an unsupported event shape" in app_source
+    # NF-2026-00183 inverted this assertion. The formatter used to label an
+    # unrecognised-but-valid event "Provider emitted an unsupported event
+    # shape", which is the defect: valid JSON reported as unsupported. The
+    # fallback now names the actual condition instead, so the guard asserts
+    # both halves - the old label is gone, and the named degradation is here.
+    assert "Provider emitted an unsupported event shape" not in app_source
+    assert "Unparsed provider line" in app_source
     assert "for (const event of events.slice(-200).reverse())" in app_source
     assert "raw: safeRawEvent(" in app_source
