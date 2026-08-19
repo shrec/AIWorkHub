@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.91";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.92";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -6560,10 +6560,12 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
   // ${workspaceFolder} form because VS Code expands it. A config consumed
   // outside VS Code (.mcp.json, read directly by Claude Code) must instead
   // carry the resolved absolute command exactly as found -- never a variable a
-  // direct reader cannot expand (NF-2026-00243).
-  const portableCommand = options.vscodeVariables === false
-    ? String(python.command || "")
-    : portableWorkspaceMcpCommand(python.command, repoRoot);
+  // direct reader cannot expand (NF-2026-00243). Repo-local venv interpreter
+  // paths are flattened to the bare interpreter name in BOTH branches: remote
+  // VS Code MCP spawns (Copilot on Remote-SSH reads .mcp.json too) fail with
+  // ENOENT on repo-local absolute interpreter paths even when the binary
+  // exists, while bare names resolve via PATH for every consumer.
+  const portableCommand = portableWorkspaceMcpCommand(python.command, repoRoot);
   let changed = false;
   let found = false;
   for (const [name, value] of Object.entries(servers)) {
@@ -6617,7 +6619,10 @@ function repairWorkspaceMcpConfigObject(document, runtimeDir, repoRoot, python) 
 
 function repairClaudeMcpConfigObject(document, runtimeDir, repoRoot, python) {
   // Claude Code reads .mcp.json directly and cannot expand VS Code variables,
-  // so this config must carry the resolved absolute command, not a token.
+  // so this config must never carry an unexpanded token. Repo-local absolute
+  // interpreter paths are flattened to the bare name because remote VS Code
+  // MCP spawns (Copilot on Remote-SSH) read this same file and fail with
+  // ENOENT on absolute repo-local interpreter commands.
   return repairMcpConfigObject(document, "mcpServers", runtimeDir, repoRoot, python, { vscodeVariables: false });
 }
 

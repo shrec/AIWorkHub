@@ -12,6 +12,19 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.92
+
+- A single failed internal lookup was enough to reject finished, correct work,
+  and a rejected task could only be redone rather than accepted. This is the fix
+  that unblocks the loop.
+- A task waiting in the queue was counted as one already running, so the launch
+  check reported a conflict for practically every launch.
+- Starting a review reported success before anything that could refuse it had
+  run; eight tasks were found listed as running with nothing behind them, the
+  oldest for fifteen hours.
+- The review verdict used a status its own list of valid statuses did not
+  contain, and an empty verdict read as a pass.
+
 ## What's new in 0.9.91
 
 - A reviewer that read nothing could still mark work as passed. At the middle

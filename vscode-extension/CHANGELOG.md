@@ -1,5 +1,32 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.92 — 2026-08-19
+
+Work that was finished and correct could not be accepted. This release fixes that
+and three related faults.
+
+### Fixed
+
+- **A single failed internal lookup was enough to reject finished work.** The
+  check that guards a task's records compared two counts that had drifted apart
+  for a reason that had nothing to do with the work itself, and once rejected a
+  task could only be redone, never accepted. Around ten tasks were lost to it
+  before it was found.
+- **A task waiting in the queue was counted as one already running**, so the
+  check that decides whether new work can start reported a conflict for
+  practically every launch — while the other check, looking at the same tasks,
+  reported none.
+- **Starting a review reported success before anything that could refuse it had
+  run.** Eight tasks were found listed as running with nothing behind them, the
+  oldest for fifteen hours. The refusal now happens before the task is committed
+  to, and a review that was genuinely under way is no longer at risk of being
+  discarded.
+- **The review verdict used a status its own list of valid statuses did not
+  contain** — introduced in the previous release while fixing a reviewer that
+  could pass without reading anything. Related: an empty verdict no longer reads
+  as a pass, and how independent a review was is now recorded from that review
+  rather than from another one.
+
 ## 0.9.91 — 2026-08-19
 
 Six fixes to AIWorkHub's own safety checks, found by an independent audit that

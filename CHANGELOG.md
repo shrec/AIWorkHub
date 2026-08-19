@@ -6,6 +6,61 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.92] - 2026-08-19
+
+The release that unblocks the loop. One failed Source Graph call was enough to
+make a green card permanently unacceptable, and around ten cards died on it
+before it was measured rather than read.
+
+### Fixed
+
+- **A single failed Source Graph call refused the card.** `receipt_conformance`
+  compares the lengths of two sequences that describe the same calls; the stage
+  was recorded for every call and the mode only when it was recognised, and a
+  failed call carries no mode. Measured across three cards refused the same day,
+  the difference equalled the failed-call count exactly - 5/5, 1/1, 6/6. The
+  refusal then ends the card in `validation_failed`, which is non-operational, so
+  correct work could only be relaunched and never accepted. Fixed by the manager
+  rather than a card, because the gate blocked its own repair. The check is
+  aligned, not weakened: a genuine length difference still blocks. What remains
+  open is the blocker's NAME, which describes a workflow_stage discipline failure
+  and tests arithmetic - it cost two rounds of correct work being returned with
+  the wrong instruction. (NF-2026-00346)
+- **A pending card was counted as a held claim.** The launch preflight and the
+  live guard gave opposite answers about one card list at one moment - 19 claims
+  against collision_free - because membership in a status bucket stood in for a
+  held claim. Twelve orphan reviewer cards were enough to report a collision for
+  every launch on the primary runner. Counting follows `claimed_by` now, and the
+  two surfaces stop sharing one word for two questions: `condition_kind` and
+  `runner_busy` distinguish a busy runner from a write-scope collision.
+  (NF-2026-00335, AWH-OBS-012b)
+- **A reviewer launch returned success before anything that could refuse it had
+  run**, so every later failure was invisible at the call site. Eight cards were
+  found sitting in processing with no process alive, the oldest for 15.1 hours,
+  each reserved and marked processing and never spawned. The refusal now happens
+  before the reservation and the thread. The disposal guard keys on the
+  reservation rather than on `started_at`, which is written minutes later at
+  claim time - a DeepSeek reviewer found that trade. (NF-2026-00265,
+  NF-2026-00331, NF-2026-00330)
+- **The verdict wrote a lens status its own validity set rejected** - a
+  regression 0.9.91 introduced while correctly stopping a blind reviewer from
+  reading `passed`. The contract now publishes the status vocabulary,
+  `evidence_verdict([], [])` no longer reports `passed` on a vacuum, and the
+  independence rung is derived from the report it describes instead of the first
+  match. The combined-tree exemption matches by reason kind - narrowed after
+  promotion so a check that SHOULD have run still blocks, and only a minimum no
+  tier can reach is exempt. (NF-2026-00339..344 residue)
+
+### Notes
+
+Twenty-one ghost cards were cleared by hand: eight processing with no process,
+thirteen orphan pending reviewers. Nothing in the system would have cleared them
+- `stale_processing` reported 0, seven of the eight had no process record at all,
+and `cancel` returned success while the card never moved. Recorded as
+NF-2026-00345.
+
+Canonical: 4712 passed, 38 skipped, ruff clean.
+
 ## [0.9.91] - 2026-08-19
 
 Six defects from an independent empirical audit of 0.9.90, plus a blocking
