@@ -156,6 +156,28 @@ SOURCE_GRAPH_ANALYTIC_MODES: frozenset[str] = frozenset({
     "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes",
     "looprisks", "deadmethods", "duplicates", "gaps",
 })
+# ``target`` means two incompatible things across modes, and the wrapper used
+# to encode that split in two places -- which term the engine searched, and
+# which modes were re-filtered by a path prefix -- that could, and did, drift
+# apart.  State the distinction ONCE here so the engine call and the post-
+# retrieval filter are both driven from the same set.  For a SELECTOR mode
+# ``target`` is an exact symbol selector (a bare name or a ``<file>.<symbol>``
+# qualname, e.g. the qualnames ``focus.recommended_next_steps`` emits): it is
+# resolved by the engine and its result is never re-filtered by a path prefix,
+# because a file path never starts with a qualname and that filter would drop
+# every resolved symbol.  For every other non-analytic mode ``target`` is a
+# PATH SCOPE applied as a prefix filter over the returned payload.  Analytic
+# modes are neither -- ``analytics_query`` consumes ``target``/``cursor`` inside
+# the engine (see ``SOURCE_GRAPH_ANALYTIC_MODES`` above).
+SOURCE_GRAPH_SELECTOR_MODES: frozenset[str] = frozenset({"slice", "body", "function"})
+# The selector modes whose resolved symbol must additionally honour the file
+# allowlist: an out-of-scope symbol is refused BY NAME, never emptied.  ``slice``
+# returns its resolved dependency neighbourhood verbatim (behaviour unchanged),
+# so it is derived out of the file re-check here rather than maintained as a
+# separate hand-written list.
+SOURCE_GRAPH_SYMBOL_SELECTOR_MODES: frozenset[str] = (
+    SOURCE_GRAPH_SELECTOR_MODES - {"slice"}
+)
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
     "bugfix", "feature", "refactor", "audit", "optimize", "explore",
 )
@@ -2134,6 +2156,135 @@ def _filter_by_scope(value: Any, scope: str) -> Any:
     return value
 
 
+def _selector_forms(selector: str) -> list[str]:
+    """Exact engine-resolvable forms of a symbol selector.
+
+    ``source_graph.body`` resolves a bare name OR a qualname; ``source_graph.func``
+    resolves the bare name only.  Offering the ``<file>.<symbol>`` qualname and
+    its bare tail lets one selector resolve through either resolver without the
+    wrapper hard-coding which resolver matches which form.  A file-path target
+    (whose tail is a bare extension like ``py``) names no symbol under either
+    form, so it falls through to the path-scope branch untouched.
+    """
+
+    forms = [selector]
+    tail = selector.rsplit(".", 1)[-1]
+    if tail and tail != selector:
+        forms.append(tail)
+    return forms
+
+
+def _resolve_symbol_selector(engine_fn, repo, selector: str, budget: int) -> dict[str, Any]:
+    """Resolve an exact symbol selector, returning the first non-empty payload.
+
+    Returns the last (honestly empty) payload when the selector names no indexed
+    symbol; the caller then treats ``target`` as a path scope instead.
+    """
+
+    payload: dict[str, Any] = {}
+    for candidate in _selector_forms(selector):
+        payload = engine_fn(repo, candidate, budget)
+        if _json_hit_count(payload) > 0:
+            return payload
+    return payload
+
+
+def _selector_scoped_payload(
+    engine_fn, repo, scope: str | None, bounded_query: str, budget: int,
+) -> tuple[dict[str, Any], bool]:
+    """Selector-first resolution for a symbol-selector mode.
+
+    Returns ``(payload, selector_resolved)``.  When ``scope`` names an indexed
+    symbol the resolved payload is returned and the path-prefix filter is
+    skipped downstream; otherwise ``scope`` is a path scope, the free-text query
+    is searched, and the existing prefix filter/rescue applies to the result.
+    """
+
+    if scope is None:
+        return engine_fn(repo, bounded_query, budget), False
+    resolved = _resolve_symbol_selector(engine_fn, repo, scope, budget)
+    if _json_hit_count(resolved) > 0:
+        return resolved, True
+    return engine_fn(repo, bounded_query, budget), False
+
+
+def _selector_match_in_scope(file_path: str, targets: Any) -> bool:
+    """The ONE rule every selector-scope boundary obeys for a single match.
+
+    A resolved selector match is in scope only when it carries an attributable
+    ``file_path`` AND that file is covered by the coordinator's allowlist.  A
+    match with no attributable path is OUT of scope -- refused by name like any
+    other, never returned, because it could not be attributed.  Stated once here
+    so the enforcement gate and the declared-target fallback drive their in/out
+    decision from the same statement and cannot silently disagree on the
+    empty-path case the way they did before (one fail-open, one fail-closed on
+    the same boundary in the same file).
+
+    The unrestricted "no target allowlist configured" grant is NOT decided here:
+    an empty ``targets`` authorizes nothing at this per-match check (``targets``
+    reaches ``path_is_allowed`` which returns ``False`` for a missing/empty
+    allowlist).  The grant is applied once by the caller that needs it
+    (``_enforce_selector_allowlist``), mirroring the ``target_not_allowed`` gate,
+    so the per-match rule stays uniformly fail-closed.
+    """
+
+    if not file_path:
+        return False
+    return semantic_edit.path_is_allowed(file_path, targets)
+
+
+def _enforce_selector_allowlist(
+    ctx: WorkerToolContext, tool: str, payload: Any, targets: Any,
+) -> tuple[dict[str, Any] | None, Any]:
+    """Constrain a resolved symbol selector to the file allowlist.
+
+    Returns ``(violation, payload)``.  When every resolved match lies outside
+    the allowlist the symbol is refused BY NAME -- the caller learns the symbol
+    exists and is out of scope, never an empty ``no such symbol`` result.  When
+    only some matches are out of scope, those rows are dropped and the rest are
+    returned.  The unrestricted "no target allowlist configured" grant is applied
+    once here (nothing to enforce), mirroring the ``target_not_allowed`` gate; the
+    per-match decision then defers wholly to ``_selector_match_in_scope`` so an
+    unattributable match is refused by name rather than kept (the fail-open path
+    this boundary used to take while its sibling fallback dropped it).
+    """
+
+    if not isinstance(payload, dict):
+        return None, payload
+    if not targets:
+        return None, payload
+    matches = payload.get("matches")
+    if not isinstance(matches, list) or not matches:
+        return None, payload
+    in_scope: list[Any] = []
+    out_of_scope: list[dict[str, Any]] = []
+    for match in matches:
+        file_path = (
+            str(match.get("file_path") or match.get("file") or "")
+            if isinstance(match, dict) else ""
+        )
+        if _selector_match_in_scope(file_path, targets):
+            in_scope.append(match)
+        else:
+            out_of_scope.append(match)
+    if not in_scope:
+        first = out_of_scope[0]
+        name = str(first.get("qualname") or first.get("name") or "")
+        file_path = str(first.get("file_path") or first.get("file") or "")
+        reason = f"symbol_out_of_scope:{name or file_path}@{file_path}"
+        return _violation(ctx, tool, reason[:160]), payload
+    if len(in_scope) == len(matches):
+        return None, payload
+    scoped = dict(payload)
+    scoped["matches"] = in_scope
+    scoped["candidate_files"] = sorted({
+        str(match.get("file_path") or match.get("file") or "")
+        for match in in_scope
+        if isinstance(match, dict) and (match.get("file_path") or match.get("file"))
+    })
+    return None, scoped
+
+
 def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> dict[str, Any] | None:
     """Return a bounded exact-file receipt from the isolated worker tree.
 
@@ -2226,15 +2377,22 @@ def source_graph_query(
 ) -> dict[str, Any]:
     """Bounded Source Graph discovery and repository analytics.
 
-    ``query`` is ALWAYS the semantic search term passed to Source Graph --
-    omitting ``target`` never silently substitutes ``targets[0]`` for it
-    (B834 repair: the B833 candidate discarded ``query`` whenever the
-    coordinator had declared any targets at all). ``target``, when given,
-    must be one of the coordinator-declared allowlist entries and constrains
-    the RETURNED scope: matching file-path-bearing entries in the response
+    ``target`` means one of two things, decided once by
+    ``SOURCE_GRAPH_SELECTOR_MODES`` so the engine call and the response filter
+    can never disagree. For a SELECTOR mode (``slice``/``body``/``function``)
+    ``target`` is an exact symbol selector (a bare name or a ``<file>.<symbol>``
+    qualname, e.g. the qualnames ``focus.recommended_next_steps`` emits): it is
+    resolved by the engine in place of the free-text ``query`` and its result is
+    never re-filtered by a path prefix. A resolved ``body``/``function`` symbol
+    still honours the file allowlist -- one whose file is out of scope is refused
+    BY NAME, not returned empty. When a ``body``/``function`` target names no
+    indexed symbol it is treated as a PATH SCOPE instead (below). For every other
+    non-analytic mode ``query`` is ALWAYS the semantic search term (B834 repair:
+    the B833 candidate discarded ``query`` whenever any target was declared) and
+    ``target`` constrains the RETURNED scope: matching file-path-bearing entries
     are kept, everything else is dropped. In ``file`` mode an indexed exact
-    target is also the requested file authority; directory targets fall back
-    to the query path. Omitting ``target`` returns the unscoped query result.
+    target is also the requested file authority; directory targets fall back to
+    the query path. Omitting ``target`` returns the unscoped query result.
 
     For analytic modes (``sganalytics.ANALYTIC_MODES``), ``target`` and
     ``cursor`` are instead applied INSIDE the engine (``analytics_query``):
@@ -2273,6 +2431,9 @@ def source_graph_query(
         return _violation(ctx, tool, "invalid_budget")
 
     is_analytic_mode = mode in SOURCE_GRAPH_ANALYTIC_MODES
+    # Set by the symbol-selector engine dispatch below when ``target`` resolved
+    # to an indexed symbol; drives the selector-vs-path decision in the filter.
+    selector_resolved = False
     if cursor is not None:
         if not is_analytic_mode:
             return _violation(ctx, tool, "cursor_not_supported_for_mode")
@@ -2385,11 +2546,15 @@ def source_graph_query(
                 ):
                     payload = _source_graph_mod.file_query(query_repo, bounded_query, budget)
             elif mode == "function":
-                payload = _source_graph_mod.function_query(query_repo, bounded_query, budget)
+                payload, selector_resolved = _selector_scoped_payload(
+                    _source_graph_mod.function_query, query_repo, scope, bounded_query, budget,
+                )
             elif mode == "class":
                 payload = _source_graph_mod.class_query(query_repo, bounded_query, budget)
             elif mode == "body":
-                payload = _source_graph_mod.body_query(query_repo, bounded_query, budget)
+                payload, selector_resolved = _selector_scoped_payload(
+                    _source_graph_mod.body_query, query_repo, scope, bounded_query, budget,
+                )
             elif mode == "bodygrep":
                 payload = _source_graph_mod.bodygrep_query(
                     query_repo, bounded_query, budget, target=scope,
@@ -2417,14 +2582,28 @@ def source_graph_query(
         exact_payload = _declared_input_file_payload(ctx, scope)
         if exact_payload is not None:
             payload = exact_payload
-    if scope is not None and mode == "slice":
-        # ``slice`` target is an exact selector (often a qualname emitted by
-        # focus.recommended_next_steps), not a file-prefix response filter.
-        # It was already validated against the immutable task allowlist and
-        # resolved by the engine above; its dependency neighborhood is the
-        # intended bounded result.
+    selector_scoped = scope is not None and (
+        mode == "slice"
+        or (mode in SOURCE_GRAPH_SYMBOL_SELECTOR_MODES and selector_resolved)
+    )
+    if selector_scoped:
+        # A selector-mode ``target`` is an exact symbol selector (often a
+        # qualname emitted by focus.recommended_next_steps), not a file-prefix
+        # response filter -- a file path never starts with a qualname, so the
+        # prefix filter would drop every resolved symbol.  ``slice`` returns its
+        # resolved dependency neighborhood verbatim (already validated against
+        # the immutable task allowlist above).  A resolved body/function symbol
+        # must still honour the file allowlist: one whose file is out of scope is
+        # refused BY NAME so the caller learns it exists and is out of scope,
+        # never an empty result that reads as "no such symbol".
+        if mode in SOURCE_GRAPH_SYMBOL_SELECTOR_MODES:
+            refusal, payload = _enforce_selector_allowlist(
+                ctx, tool, payload, ctx.source_graph_targets,
+            )
+            if refusal is not None:
+                return refusal
         if isinstance(payload, dict):
-            payload["scope"] = "target_selector"
+            payload.setdefault("scope", "target_selector")
     elif scope is not None and is_analytic_mode:
         # ``analytics_query`` already applied ``target``/``cursor`` as the
         # sole in-engine authority (scoping, pagination, coverage truth).
@@ -2469,9 +2648,10 @@ def source_graph_query(
                 if not isinstance(match, dict):
                     continue
                 file_path = str(match.get("file_path") or match.get("file") or "")
-                if file_path and semantic_edit.path_is_allowed(
-                    file_path, ctx.source_graph_targets
-                ):
+                # Same statement as the enforcement gate: an unattributable match
+                # is out of scope, never broadened in.  Both boundaries read
+                # ``_selector_match_in_scope`` so they cannot diverge again.
+                if _selector_match_in_scope(file_path, ctx.source_graph_targets):
                     permitted_matches.append(match)
             if permitted_matches:
                 bounded_matches = permitted_matches[:budget]

@@ -73,7 +73,12 @@ def normalize_relative_path(raw: Any) -> str:
     return path.as_posix()
 
 
-def path_is_allowed(relative: str, patterns: Iterable[str]) -> bool:
+def path_is_allowed(relative: str, patterns: Iterable[str] | None) -> bool:
+    # A missing allowlist (``None``) or an empty one authorizes nothing rather
+    # than raising ``TypeError`` on ``for ... in None``: callers that carry an
+    # optional allowlist can ask the question without first guarding for it.
+    if not patterns:
+        return False
     return any(
         relative == str(pattern).replace("\\", "/")
         or fnmatch.fnmatchcase(relative, str(pattern).replace("\\", "/"))
