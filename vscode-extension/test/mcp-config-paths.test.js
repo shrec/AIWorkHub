@@ -1,13 +1,23 @@
 "use strict";
 
-// NF-2026-00243: the extension must write a resolved absolute path into
-// .mcp.json (read directly by Claude Code, which cannot expand VS Code
-// variables), never an unexpanded ${workspaceFolder}. .vscode/mcp.json (read by
-// VS Code) flattens a repo-relative venv python to its bare interpreter name --
-// VS Code does not substitute variables in `command` and its remote spawn is
-// ENOENT-prone on repo-local absolute paths, so neither file carries an
-// unexpanded variable in `command`. A check refuses to persist an unexpanded VS
-// Code variable into any file consumed outside VS Code.
+// NF-2026-00243 bought ONE guarantee that still holds: no unexpanded VS Code
+// variable (e.g. ${workspaceFolder}) may ever reach .mcp.json, which Claude Code
+// reads directly and cannot expand. This file still asserts exactly that.
+//
+// NF-2026-00352 CHANGED the OTHER half. The original NF-2026-00243 reader
+// concluded Claude Code was .mcp.json's only consumer and wrote the RESOLVED
+// ABSOLUTE path there. It is not the only consumer: Copilot on Remote-SSH reads
+// the ROOT .mcp.json too, and VS Code's remote MCP spawn resolves `command` on
+// the SERVER side, where a repo-local absolute interpreter path ENOENTs even
+// though the binary exists (the extension host spawned that same binary the same
+// minute). So .mcp.json now flattens a REPO-LOCAL venv python to its bare name
+// as well -- a bare name is not a variable (Claude Code still fine) and resolves
+// via PATH (the remote spawn works). This test was updated from asserting the
+// absolute path to asserting the bare name for that reason. An interpreter
+// configured OUTSIDE the repository is still preserved verbatim. .vscode/mcp.json
+// (read by VS Code) already flattened repo-local venv pythons for the same
+// ENOENT reason. A check still refuses any unexpanded VS Code variable in a file
+// consumed outside VS Code.
 
 const assert = require("assert");
 const Module = require("module");
@@ -54,24 +64,47 @@ const {
   assertMcpConfigConsumable,
 } = extensionModule.__testInternals;
 
-const ABSOLUTE_PYTHON = "/repo/current/.venv/bin/python3";
+// A REPO-LOCAL venv interpreter (findPythonCommand returns this when a repo
+// .venv is present). Constructed explicitly so the test does not depend on this
+// machine's .mcp.json, which is masked by an aiworkhub.pythonPath=python3 pin.
+const REPO_LOCAL_PYTHON = "/repo/current/.venv/bin/python3";
 
-// Claude Code's .mcp.json gets the RESOLVED ABSOLUTE path, never a variable.
+// NF-2026-00352: Claude Code's .mcp.json now flattens a REPO-LOCAL venv python
+// to its bare name -- previously this asserted REPO_LOCAL_PYTHON verbatim, but
+// Copilot's remote spawn ENOENTs on that absolute path (see the file header).
+// The unchanged guarantee: still never a variable.
 {
   const result = repairClaudeMcpConfigObject(
     {},
     "/extensions/shrec.aiworkhub/runtime",
     "/repo/current",
-    { command: ABSOLUTE_PYTHON, argsPrefix: [] },
+    { command: REPO_LOCAL_PYTHON, argsPrefix: [] },
   );
   assert.strictEqual(result.changed, true);
   const command = result.document.mcpServers.AIWorkHub.command;
-  assert.strictEqual(command, ABSOLUTE_PYTHON, ".mcp.json carries the resolved absolute path");
+  assert.strictEqual(command, "python3", ".mcp.json flattens the repo-local venv python to its bare name");
   assert(!command.includes("${"), "no unexpanded VS Code variable in the Claude command");
   assert.strictEqual(
     findUnexpandedVsCodeVariables(result.document).length,
     0,
     "the whole Claude document is free of VS Code variables",
+  );
+}
+
+// An interpreter configured OUTSIDE the repository is the operator's choice; the
+// repo-relocation hazard does not apply, so .mcp.json preserves it verbatim.
+{
+  const result = repairClaudeMcpConfigObject(
+    {},
+    "/extensions/shrec.aiworkhub/runtime",
+    "/repo/current",
+    { command: "/opt/shared/python3", argsPrefix: [] },
+  );
+  assert.strictEqual(result.changed, true);
+  assert.strictEqual(
+    result.document.mcpServers.AIWorkHub.command,
+    "/opt/shared/python3",
+    ".mcp.json preserves an interpreter configured outside the repository",
   );
 }
 
@@ -88,7 +121,7 @@ const ABSOLUTE_PYTHON = "/repo/current/.venv/bin/python3";
     {},
     "/extensions/shrec.aiworkhub/runtime",
     "/repo/current",
-    { command: ABSOLUTE_PYTHON, argsPrefix: [] },
+    { command: REPO_LOCAL_PYTHON, argsPrefix: [] },
   );
   assert.strictEqual(result.changed, true);
   assert.strictEqual(
@@ -147,13 +180,13 @@ const ABSOLUTE_PYTHON = "/repo/current/.venv/bin/python3";
   );
 }
 
-// The absolute-path Claude document produced by the repair passes the check.
+// The bare-name Claude document produced by the repair passes the check.
 {
   const result = repairClaudeMcpConfigObject(
     {},
     "/extensions/shrec.aiworkhub/runtime",
     "/repo/current",
-    { command: ABSOLUTE_PYTHON, argsPrefix: [] },
+    { command: REPO_LOCAL_PYTHON, argsPrefix: [] },
   );
   assert.strictEqual(assertMcpConfigConsumable(result.document, { vscodeVariables: false }).ok, true);
 }

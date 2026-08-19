@@ -6584,14 +6584,27 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
     document[containerKey] = {};
   }
   const servers = document[containerKey];
-  // VS-Code-consumed configs (.vscode/mcp.json) keep the machine-neutral
-  // ${workspaceFolder} form because VS Code expands it. A config consumed
-  // outside VS Code (.mcp.json, read directly by Claude Code) must instead
-  // carry the resolved absolute command exactly as found -- never a variable a
-  // direct reader cannot expand (NF-2026-00243).
-  const portableCommand = options.vscodeVariables === false
-    ? String(python.command || "")
-    : portableWorkspaceMcpCommand(python.command, repoRoot);
+  // ONE command string; TWO independent consumer processes read it, and a bare
+  // interpreter name serves BOTH:
+  //   * Claude Code reads .mcp.json (mcpServers) DIRECTLY and cannot expand a
+  //     VS Code variable, so the command must never be a ${...} token
+  //     (NF-2026-00243).
+  //   * VS Code's MCP child -- Copilot on Remote-SSH reads the ROOT .mcp.json,
+  //     the local host reads .vscode/mcp.json -- resolves command/cwd on the
+  //     SERVER side and has been observed ENOENT-ing on a repo-local absolute
+  //     interpreter path even while the extension host spawned that identical
+  //     binary successfully the same minute (NF-2026-00352).
+  // A bare name satisfies both: it is not a variable, so Claude Code's
+  // requirement holds, and it resolves via PATH on whichever host performs the
+  // spawn, so the remote spawn works. An absolute path satisfies only Claude
+  // Code, and only when the resolver is local -- which is exactly why writing it
+  // verbatim into .mcp.json regressed Copilot. So flatten a REPO-LOCAL absolute
+  // interpreter to its bare name for EVERY consumer, regardless of
+  // options.vscodeVariables. An interpreter configured OUTSIDE the repository is
+  // the operator's choice and the repo-relocation hazard does not apply to it,
+  // so portableWorkspaceMcpCommand preserves it verbatim. options.vscodeVariables
+  // still governs the downstream assertMcpConfigConsumable gate, not the command.
+  const portableCommand = portableWorkspaceMcpCommand(python.command, repoRoot);
   let changed = false;
   let found = false;
   for (const [name, value] of Object.entries(servers)) {

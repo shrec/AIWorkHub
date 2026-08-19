@@ -66,6 +66,57 @@ const {
 }
 
 {
+  // NF-2026-00352: command-shape assertions for the ROOT .mcp.json branch,
+  // mirroring the .vscode/mcp.json block below. Their ABSENCE from this file is
+  // why the regression shipped: only the VS-Code-consumed config had them, so a
+  // repo-local absolute interpreter reaching Copilot's .mcp.json went unguarded.
+  const untouched = { command: "node", args: ["server.js"], type: "stdio" };
+  const document = {
+    mcpServers: {
+      Perplexity: untouched,
+      AIWorkHub: {
+        command: "/usr/bin/python3",
+        args: ["-m", "aiworkhub.server"],
+        env: {
+          PYTHONPATH: "/repo/tools/geoai-task-mcp/src",
+          AIWORKHUB_REPO: "/wrong/repo",
+          AIWORKHUB_ALLOW_WRITES: "1",
+        },
+        type: "stdio",
+      },
+    },
+  };
+  const result = repairClaudeMcpConfigObject(
+    document,
+    "/extensions/shrec.aiworkhub-0.6.49/runtime",
+    "/repo/current",
+    { command: "/repo/current/.venv/bin/python", argsPrefix: [] },
+  );
+  assert.strictEqual(result.changed, true);
+  assert.strictEqual(result.document.mcpServers.Perplexity, untouched);
+  assert.deepStrictEqual(result.document.mcpServers.AIWorkHub.args, ["-m", "aiworkhub.server"]);
+  // Repo-local venv interpreter flattens to its bare name here too.
+  assert.strictEqual(result.document.mcpServers.AIWorkHub.command, "python");
+  assert.strictEqual(result.document.mcpServers.AIWorkHub.env.PYTHONPATH, "/extensions/shrec.aiworkhub-0.6.49/runtime");
+  assert.strictEqual(result.document.mcpServers.AIWorkHub.env.AIWORKHUB_REPO, "/repo/current");
+  assert.strictEqual(result.document.mcpServers.AIWorkHub.env.AIWORKHUB_REPO_ROOT, "/repo/current");
+  assert.strictEqual(result.document.mcpServers.AIWorkHub.env.AIWORKHUB_ALLOW_WRITES, "1");
+  assert.strictEqual(result.document.mcpServers.AIWorkHub.env.AIWORKHUB_ALLOW_LAUNCH, "1");
+  assert.strictEqual(result.document.mcpServers.AIWorkHub.env.AIWORKHUB_MCP_STDIO_BACKEND, "stdlib");
+}
+
+{
+  // An interpreter configured OUTSIDE the repository is preserved unchanged in
+  // the root .mcp.json branch -- the operator's choice, no relocation hazard.
+  const result = repairClaudeMcpConfigObject(
+    {}, "/extensions/shrec.aiworkhub/runtime", "/repo/current",
+    { command: "/opt/shared/python3", argsPrefix: [] },
+  );
+  assert.strictEqual(result.changed, true);
+  assert.strictEqual(result.document.mcpServers.AIWorkHub.command, "/opt/shared/python3");
+}
+
+{
   const result = ensureCodexMcpRegistrationTomlText(
     'model = "gpt-5.5"\n',
     "/extensions/shrec.aiworkhub/runtime",
