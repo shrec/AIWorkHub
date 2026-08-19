@@ -23,7 +23,21 @@
   --archived-soft: color-mix(in srgb, var(--archived) 18%, var(--canvas));
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   font-family: var(--vscode-font-family, system-ui, sans-serif);
-  font-size: var(--vscode-font-size, 13px);
+
+  /* Type scale. Every font size in this panel derives from the editor's
+     own font size (--vscode-font-size) so the dashboard follows the user's
+     VS Code setting instead of hard-coding pixels. The fallback (13px, the
+     VS Code editor default) lives in this single var() call. The smallest
+     step is 0.85x the base, so nothing renders below base x 0.85. */
+  --fs-base: var(--vscode-font-size, 13px);
+  --fs-2xs: calc(var(--fs-base) * 0.85);
+  --fs-xs: calc(var(--fs-base) * 0.92);
+  --fs-sm: var(--fs-base);
+  --fs-md: calc(var(--fs-base) * 1.15);
+  --fs-lg: calc(var(--fs-base) * 1.4);
+  --fs-xl: calc(var(--fs-base) * 1.6);
+
+  font-size: var(--fs-base);
 }
 
 * {
@@ -86,7 +100,7 @@ body {
 .live-output-section h4 {
   margin: 0 0 6px;
   color: var(--ink-soft);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   letter-spacing: .04em;
   text-transform: uppercase;
 }
@@ -96,7 +110,7 @@ body {
   margin: 0;
   color: var(--ink);
   font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -119,7 +133,7 @@ body {
 
 .live-output-metric span {
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   text-transform: uppercase;
 }
 
@@ -130,7 +144,7 @@ body {
 
 .live-output-raw summary {
   cursor: pointer;
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 .live-output-raw pre,
@@ -253,7 +267,7 @@ select:focus-visible,
 .brand-block h1 {
   margin: 0;
   overflow: hidden;
-  font-size: 14px;
+  font-size: var(--fs-md);
   font-weight: 700;
   line-height: 1.2;
   text-overflow: ellipsis;
@@ -263,7 +277,7 @@ select:focus-visible,
 .brand-block p {
   margin: 2px 0 0;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
 }
 
 .readonly-badge {
@@ -273,7 +287,7 @@ select:focus-visible,
   background: var(--surface-subtle);
   border: 1px solid var(--line);
   border-radius: 4px;
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   text-transform: uppercase;
 }
@@ -284,7 +298,7 @@ select:focus-visible,
   gap: 1px;
   min-width: 120px;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   line-height: 1.2;
 }
 
@@ -331,7 +345,7 @@ select:focus-visible,
 .telemetry-section-title {
   margin: 14px 0 7px;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   letter-spacing: .08em;
   text-transform: uppercase;
@@ -353,7 +367,7 @@ select:focus-visible,
   border-radius: 999px;
   color: var(--muted);
   background: color-mix(in srgb, var(--surface-subtle) 86%, var(--accent) 14%);
-  font-size: 10px;
+  font-size: var(--fs-xs);
 }
 
 .telemetry-mode-badge strong {
@@ -374,7 +388,7 @@ select:focus-visible,
   border: 1px solid var(--line);
   border-radius: 4px;
   font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 10px;
+  font-size: var(--fs-xs);
 }
 
 .telemetry-note.is-warning {
@@ -391,13 +405,13 @@ select:focus-visible,
 .kpi-title,
 .kpi-chart-title {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 
 .kpi-subtitle {
   margin: 2px 0 0;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
 }
 
 .kpi-grid {
@@ -422,9 +436,9 @@ select:focus-visible,
 .kpi-card.bad { border-top-color: var(--blocked); }
 .kpi-card.accent { border-top-color: var(--processing); }
 .kpi-card-label,
-.kpi-card-detail { color: var(--muted); font-size: 9px; }
+.kpi-card-detail { color: var(--muted); font-size: var(--fs-2xs); }
 .kpi-card-label { font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
-.kpi-card-value { font-size: 18px; font-variant-numeric: tabular-nums; }
+.kpi-card-value { font-size: var(--fs-lg); font-variant-numeric: tabular-nums; }
 
 .kpi-chart-grid {
   display: grid;
@@ -475,9 +489,9 @@ select:focus-visible,
 .kpi-day-segment.good { background: var(--review); }
 .kpi-day-segment.bad { background: var(--blocked); }
 .kpi-day-segment.neutral { background: var(--processing); opacity: .45; }
-.kpi-day-label { overflow: hidden; color: var(--muted); font-size: 8px; text-align: center; white-space: nowrap; }
+.kpi-day-label { overflow: hidden; color: var(--muted); font-size: var(--fs-2xs); text-align: center; white-space: nowrap; }
 
-.kpi-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; color: var(--muted); font-size: 9px; }
+.kpi-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; color: var(--muted); font-size: var(--fs-2xs); }
 .kpi-legend-item { display: inline-flex; align-items: center; gap: 4px; }
 .kpi-legend-item i { width: 7px; height: 7px; background: var(--processing); border-radius: 2px; }
 .kpi-legend-item i.good { background: var(--review); }
@@ -486,8 +500,8 @@ select:focus-visible,
 
 .kpi-bar-row { display: grid; gap: 4px; margin-bottom: 9px; }
 .kpi-bar-heading { display: flex; min-width: 0; align-items: baseline; justify-content: space-between; gap: 8px; }
-.kpi-bar-label { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.kpi-bar-value { color: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.kpi-bar-label { overflow: hidden; font-size: var(--fs-xs); text-overflow: ellipsis; white-space: nowrap; }
+.kpi-bar-value { color: var(--muted); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .kpi-bar-track { height: 6px; overflow: hidden; background: color-mix(in srgb, var(--line) 55%, transparent); border-radius: 999px; }
 .kpi-bar-fill { display: block; height: 100%; background: var(--muted); border-radius: inherit; }
 .kpi-bar-fill.good { background: var(--review); }
@@ -500,7 +514,7 @@ select:focus-visible,
   color: var(--muted);
   background: var(--surface-subtle);
   border-left: 3px solid var(--processing);
-  font-size: 10px;
+  font-size: var(--fs-xs);
 }
 
 .kpi-disclosure.warning { border-left-color: var(--pending); }
@@ -515,14 +529,14 @@ select:focus-visible,
 
 .header-tool-use strong,
 .header-insight-card strong {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
 }
 
 .telemetry-note {
   color: var(--vscode-descriptionForeground);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   line-height: 1.45;
   padding: 0 2px 8px;
 }
@@ -546,7 +560,7 @@ select:focus-visible,
 
 .plan-layer-title {
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   margin: 0 0 6px;
   text-transform: uppercase;
 }
@@ -565,10 +579,10 @@ select:focus-visible,
 .plan-node.ready { border-left-color: var(--processing); }
 .plan-node.blocked { border-left-color: var(--blocked); }
 .plan-node.critical { box-shadow: inset 0 0 0 1px var(--review); }
-.plan-node-id { font-size: 11px; overflow-wrap: anywhere; }
+.plan-node-id { font-size: var(--fs-sm); overflow-wrap: anywhere; }
 .plan-node-state,
 .plan-node-deps,
-.plan-node-blockers { color: var(--muted); font-size: 9px; overflow-wrap: anywhere; }
+.plan-node-blockers { color: var(--muted); font-size: var(--fs-2xs); overflow-wrap: anywhere; }
 .plan-node-blockers { color: var(--blocked); }
 
 .plan-alert {
@@ -583,27 +597,27 @@ select:focus-visible,
 #header-source-graph-detail,
 .header-insight-detail {
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
 }
 
 .header-storage-label {
   color: var(--muted);
-  font-size: 8px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   letter-spacing: .04em;
   text-transform: uppercase;
 }
 
 .header-storage strong {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-variant-numeric: tabular-nums;
 }
 
 #header-storage-free {
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
 }
@@ -611,7 +625,7 @@ select:focus-visible,
 .connection-state {
   gap: 6px;
   color: var(--ink-soft);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 600;
 }
 
@@ -641,7 +655,7 @@ select:focus-visible,
   max-width: 130px;
   overflow: hidden;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -649,7 +663,7 @@ select:focus-visible,
 .switch-control {
   gap: 6px;
   color: var(--ink-soft);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   cursor: pointer;
   user-select: none;
 }
@@ -703,7 +717,7 @@ select:focus-visible,
   background: var(--vscode-dropdown-background, var(--surface));
   color: var(--vscode-dropdown-foreground, var(--ink));
   border: 1px solid var(--vscode-dropdown-border, var(--line-strong));
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 .primary-button {
@@ -711,7 +725,7 @@ select:focus-visible,
   color: var(--vscode-button-foreground);
   background: var(--vscode-button-background);
   border: 1px solid var(--vscode-button-border, transparent);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 650;
 }
 
@@ -761,7 +775,7 @@ main {
   display: block;
   overflow: hidden;
   margin-top: 3px;
-  font-size: 20px;
+  font-size: var(--fs-xl);
   font-variant-numeric: tabular-nums;
   line-height: 1.1;
   text-overflow: ellipsis;
@@ -771,7 +785,7 @@ main {
 .summary-label,
 .summary-note {
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 650;
 }
 
@@ -798,7 +812,7 @@ main {
   color: var(--stale);
   background: var(--stale-soft);
   border-bottom: 1px solid var(--stale);
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 .source-alert.offline-alert {
@@ -839,7 +853,7 @@ main {
   padding: 1px 7px;
   border: 1px solid currentColor;
   border-radius: 999px;
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   line-height: 1;
   white-space: nowrap;
@@ -908,7 +922,7 @@ main {
 .identity-info-panel > strong {
   display: block;
   margin-bottom: 7px;
-  font-size: 10px;
+  font-size: var(--fs-xs);
 }
 
 .identity-info-panel dl {
@@ -920,7 +934,7 @@ main {
 
 .identity-info-panel dt {
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
 }
 
@@ -928,7 +942,7 @@ main {
   margin: 0;
   overflow-wrap: anywhere;
   font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   user-select: text;
 }
 
@@ -952,7 +966,7 @@ main {
   padding: 8px 14px;
   background: var(--surface);
   border-bottom: 1px solid var(--line);
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 .target-selector span {
@@ -966,7 +980,7 @@ main {
   color: var(--ink-soft);
   background: var(--surface-subtle);
   border: 1px solid var(--line);
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 .target-selector button.is-active {
@@ -978,7 +992,7 @@ main {
 .target-selector strong {
   min-width: 160px;
   color: var(--ink-soft);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 650;
 }
 
@@ -990,7 +1004,7 @@ main {
   padding: 7px 14px;
   background: var(--surface);
   border-bottom: 1px solid var(--line);
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 .repo-router > span {
@@ -1078,14 +1092,14 @@ main {
 .section-heading h2,
 .panel-heading h2 {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 700;
   line-height: 1.3;
 }
 
 .section-count {
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
 }
 
@@ -1104,7 +1118,7 @@ main {
   color: var(--ink-soft);
   background: transparent;
   border: 1px solid transparent;
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 650;
 }
 
@@ -1142,7 +1156,7 @@ main {
   background: var(--vscode-input-background, var(--surface));
   color: var(--vscode-input-foreground, var(--ink));
   border: 1px solid var(--vscode-input-border, var(--line-strong));
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 .search-field {
@@ -1176,7 +1190,7 @@ th {
   padding: 0 8px;
   color: var(--muted);
   border-bottom: 1px solid var(--line-strong);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   text-align: left;
   text-transform: uppercase;
@@ -1196,7 +1210,7 @@ td {
   overflow: hidden;
   border-bottom: 1px solid var(--line);
   color: var(--ink-soft);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1224,7 +1238,7 @@ tbody tr.is-selected td:first-child {
   overflow: hidden;
   border: 1px solid transparent;
   border-radius: 4px;
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   line-height: 1.3;
   text-overflow: ellipsis;
@@ -1248,7 +1262,7 @@ tbody tr.is-selected td:first-child {
   background: transparent;
   border: 0;
   font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 650;
   text-align: left;
   text-overflow: ellipsis;
@@ -1270,19 +1284,19 @@ tbody tr.is-selected td:first-child {
 
 .cell-primary {
   color: var(--ink);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 600;
 }
 
 .cell-secondary {
   margin-top: 1px;
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
 .activity-cell {
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
 }
 
@@ -1307,7 +1321,7 @@ tbody tr.is-selected td:first-child {
   min-height: 220px;
   place-items: center;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 .inspector {
@@ -1343,7 +1357,7 @@ tbody tr.is-selected td:first-child {
   display: block;
   margin-bottom: 2px;
   color: var(--muted);
-  font-size: 8px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   text-transform: uppercase;
 }
@@ -1355,7 +1369,7 @@ tbody tr.is-selected td:first-child {
   place-items: center;
   padding: 18px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   text-align: center;
 }
 
@@ -1375,7 +1389,7 @@ tbody tr.is-selected td:first-child {
   padding: 10px;
   color: var(--ink);
   border-bottom: 1px solid var(--line);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 550;
   overflow-wrap: anywhere;
 }
@@ -1400,7 +1414,7 @@ tbody tr.is-selected td:first-child {
 
 .metadata-grid dt {
   color: var(--muted);
-  font-size: 8px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   text-transform: uppercase;
 }
@@ -1409,7 +1423,7 @@ tbody tr.is-selected td:first-child {
   margin: 2px 0 0;
   overflow: hidden;
   color: var(--ink-soft);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1426,7 +1440,7 @@ tbody tr.is-selected td:first-child {
 .result-block h3 {
   margin: 0 0 6px;
   color: var(--ink-soft);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   text-transform: uppercase;
 }
@@ -1438,7 +1452,7 @@ tbody tr.is-selected td:first-child {
 
 .validation-label {
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   text-transform: uppercase;
 }
@@ -1456,7 +1470,7 @@ tbody tr.is-selected td:first-child {
   border: 1px solid var(--line);
   border-radius: 4px;
   font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   line-height: 1.5;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -1475,7 +1489,7 @@ tbody tr.is-selected td:first-child {
   overflow-wrap: anywhere;
   color: var(--ink-soft);
   font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
 .review-evidence {
@@ -1497,7 +1511,7 @@ tbody tr.is-selected td:first-child {
 .review-evidence-section h4 {
   margin: 0 0 8px;
   color: var(--vscode-descriptionForeground);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
@@ -1577,14 +1591,14 @@ tbody tr.is-selected td:first-child {
 .workforce-heading span,
 .workforce-metrics {
   color: var(--vscode-descriptionForeground);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   overflow-wrap: anywhere;
 }
 
 .workforce-score {
   align-self: center;
   color: var(--vscode-charts-blue);
-  font-size: 18px;
+  font-size: var(--fs-lg);
 }
 
 .workforce-metrics {
@@ -1614,7 +1628,7 @@ tbody tr.is-selected td:first-child {
   background: transparent;
   border: 0;
   border-bottom: 2px solid transparent;
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1656,7 +1670,7 @@ tbody tr.is-selected td:first-child {
   gap: 12px;
   padding: 6px 10px;
   border-bottom: 1px solid var(--line);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
 .storage-label,
@@ -1675,14 +1689,14 @@ tbody tr.is-selected td:first-child {
 
 .storage-scan-state {
   padding: 7px 10px;
-  font-size: 8px;
+  font-size: var(--fs-2xs);
 }
 
 .storage-section-title {
   padding: 8px 10px 4px;
   border-bottom: 1px solid var(--line);
   color: var(--ink);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -1710,7 +1724,7 @@ tbody tr.is-selected td:first-child {
   color: var(--ink);
   background: var(--vscode-button-secondaryBackground);
   cursor: pointer;
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
 .storage-batch-row {
@@ -1727,7 +1741,7 @@ tbody tr.is-selected td:first-child {
   min-width: 0;
   gap: 2px;
   overflow-wrap: anywhere;
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
 .storage-batch-actions {
@@ -1752,7 +1766,7 @@ tbody tr.is-selected td:first-child {
   border-bottom: 1px solid var(--line);
   background: var(--surface-subtle);
   color: var(--muted);
-  font-size: 8px;
+  font-size: var(--fs-2xs);
 }
 
 .system-log-toolbar button {
@@ -1771,12 +1785,12 @@ tbody tr.is-selected td:first-child {
   background: var(--vscode-terminal-background, #101010);
   color: var(--vscode-terminal-foreground, #d4d4d4);
   font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
 .system-log-row {
   display: grid;
-  grid-template-columns: 66px 46px 60px minmax(0, 1fr);
+  grid-template-columns: minmax(74px, max-content) minmax(52px, max-content) minmax(66px, max-content) minmax(0, 1fr);
   gap: 7px;
   padding: 4px 8px;
   border-bottom: 1px solid color-mix(in srgb, var(--line) 45%, transparent);
@@ -1815,7 +1829,7 @@ tbody tr.is-selected td:first-child {
   padding: 4px 10px;
   border-bottom: 1px solid var(--line);
   background: var(--surface-subtle);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
 .callback-observability {
@@ -1834,8 +1848,8 @@ tbody tr.is-selected td:first-child {
 }
 
 .callback-observability > span:last-child { border-right: 0; }
-.callback-observability small { color: var(--muted); font-size: 8px; text-transform: uppercase; }
-.callback-observability strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.callback-observability small { color: var(--muted); font-size: var(--fs-2xs); text-transform: uppercase; }
+.callback-observability strong { overflow: hidden; font-size: var(--fs-xs); text-overflow: ellipsis; white-space: nowrap; }
 .callback-observability.is-degraded strong:last-child { color: var(--blocked); }
 
 .return-toolbar {
@@ -1859,10 +1873,10 @@ tbody tr.is-selected td:first-child {
   color: var(--ink);
   background: var(--surface);
   border: 1px solid var(--line);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
-.return-pagination { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 9px; white-space: nowrap; }
+.return-pagination { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: var(--fs-2xs); white-space: nowrap; }
 .return-pagination button:disabled { cursor: default; opacity: .45; }
 
 @media (max-width: 720px) {
@@ -1970,7 +1984,7 @@ tbody tr.is-selected td:first-child {
 
 .operations-dialog .operations-heading-row span {
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
 .operations-dialog .tab-panel:not([hidden]) {
@@ -1994,13 +2008,13 @@ tbody tr.is-selected td:first-child {
 
 .dialog-heading h2 {
   margin: 0 0 2px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 
 .dialog-heading span,
 .memory-meta {
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
 .diagnostic-dialog .system-log-terminal {
@@ -2048,7 +2062,7 @@ tbody tr.is-selected td:first-child {
   display: grid;
   gap: 4px;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
 }
 
 .needfix-capture-form input,
@@ -2144,7 +2158,7 @@ tbody tr.is-selected td:first-child {
 .needfix-list-meta,
 .needfix-detail-heading > div {
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   overflow-wrap: anywhere;
 }
 
@@ -2280,14 +2294,14 @@ tbody tr.is-selected td:first-child {
 
 .json-field-key {
   color: var(--ink-soft);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
 }
 
 .json-field-value {
   color: var(--ink);
   font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -2305,7 +2319,7 @@ tbody tr.is-selected td:first-child {
 
 .json-tree-group > summary {
   color: var(--ink);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   cursor: pointer;
 }
@@ -2345,7 +2359,7 @@ tbody tr.is-selected td:first-child {
 
 .needfix-event-heading time {
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   text-align: right;
 }
 
@@ -2429,8 +2443,8 @@ tbody tr.is-selected td:first-child {
   background: var(--surface-subtle);
 }
 
-.settings-metric-card strong { font-size: 15px; }
-.settings-metric-card small { color: var(--muted); font-size: 9px; }
+.settings-metric-card strong { font-size: var(--fs-md); }
+.settings-metric-card small { color: var(--muted); font-size: var(--fs-2xs); }
 
 .settings-row {
   display: flex;
@@ -2454,7 +2468,7 @@ tbody tr.is-selected td:first-child {
 
 .settings-group-heading small {
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   line-height: 1.45;
 }
 
@@ -2476,13 +2490,13 @@ tbody tr.is-selected td:first-child {
 
 .settings-copy strong {
   color: var(--ink);
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 .settings-copy small,
 .settings-footnote {
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   line-height: 1.45;
 }
 
@@ -2518,12 +2532,12 @@ tbody tr.is-selected td:first-child {
 
 .memory-key {
   overflow-wrap: anywhere;
-  font-size: 10px;
+  font-size: var(--fs-xs);
 }
 
 .memory-scope {
   color: var(--accent);
-  font-size: 8px;
+  font-size: var(--fs-2xs);
   text-transform: uppercase;
 }
 
@@ -2532,7 +2546,7 @@ tbody tr.is-selected td:first-child {
   overflow-wrap: anywhere;
   color: var(--ink);
   font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   line-height: 1.45;
   white-space: pre-wrap;
 }
@@ -2557,7 +2571,7 @@ tbody tr.is-selected td:first-child {
 
 .usage-label {
   color: var(--muted);
-  font-size: 8px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   text-transform: uppercase;
 }
@@ -2565,13 +2579,13 @@ tbody tr.is-selected td:first-child {
 .usage-metric strong {
   margin-top: 2px;
   color: var(--ink);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
 }
 
 .stat-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 36px;
+  grid-template-columns: minmax(0, 1fr) minmax(48px, max-content);
   gap: 8px;
   min-height: 40px;
   align-items: center;
@@ -2598,7 +2612,7 @@ tbody tr.is-selected td:first-child {
 .stat-name {
   overflow: hidden;
   color: var(--ink-soft);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2607,7 +2621,7 @@ tbody tr.is-selected td:first-child {
 .stat-breakdown {
   flex: 0 0 auto;
   color: var(--muted);
-  font-size: 8px;
+  font-size: var(--fs-2xs);
   white-space: nowrap;
 }
 
@@ -2628,7 +2642,7 @@ tbody tr.is-selected td:first-child {
 
 .stat-total {
   color: var(--ink);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   text-align: right;
@@ -2675,7 +2689,7 @@ tbody tr.is-selected td:first-child {
   overflow: hidden;
   color: var(--ink);
   font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2686,7 +2700,7 @@ tbody tr.is-selected td:first-child {
   display: block;
   margin-top: 3px;
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   overflow-wrap: anywhere;
 }
 
@@ -2700,7 +2714,7 @@ tbody tr.is-selected td:first-child {
   place-items: center;
   padding: 18px;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   text-align: center;
 }
 
@@ -2730,7 +2744,7 @@ tbody tr.is-selected td:first-child {
   display: block;
   overflow: hidden;
   color: var(--muted);
-  font-size: 10px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   text-overflow: ellipsis;
   text-transform: uppercase;
@@ -2755,7 +2769,7 @@ tbody tr.is-selected td:first-child {
   border: 1px solid var(--line-strong);
   border-radius: 5px;
   box-shadow: var(--shadow);
-  font-size: 11px;
+  font-size: var(--fs-sm);
 }
 
 @media (max-width: 900px) {
@@ -2825,7 +2839,7 @@ tbody tr.is-selected td:first-child {
 .live-output-timeline {
   display: grid;
   gap: 8px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 
 .live-output-row {
@@ -2866,7 +2880,7 @@ tbody tr.is-selected td:first-child {
 
 .live-output-row-state {
   color: var(--vscode-descriptionForeground, #8b949e);
-  font-size: 11px;
+  font-size: var(--fs-sm);
   text-transform: uppercase;
 }
 
