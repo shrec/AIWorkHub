@@ -68,11 +68,103 @@ DEEPSEEK_SECRET_ENV_VAR = "COPILOT_PROVIDER_API_KEY"
 
 GLM_COPILOT_ADAPTER = "glm_copilot_cli"
 GLM_VSCODE_LM_ADAPTER = "glm_vscode_lm"
+# GLM_SUPPORTED_MODELS is the Copilot BYOK *credential* surface for the
+# open.bigmodel.cn endpoint (see glm_credentials.py); it is NOT the editor's
+# callable catalog. The set of GLM models AIWorkHub can drive through the
+# editor is discovered from vscode.lm at runtime (see the editor model
+# vocabulary below), never enumerated here.
 GLM_SUPPORTED_MODELS: tuple[str, ...] = ("glm-5.2",)
 GLM_DEFAULT_MODEL = "glm-5.2"
 GLM_SECRET_ENV_VAR = "COPILOT_PROVIDER_API_KEY"
 VSCODE_LM_ADAPTER = "vscode_lm"
 WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER = "windows_native_cli_requires_appcontainer_sandbox"
+
+# ── Editor model vocabulary ────────────────────────────────────────────────
+# THE single declaration of how a VS Code-reported model is judged callable.
+# vscode_lm_bridge, workforce_catalog and the VS Code extension all consume
+# these rules; tests/test_lm_model_discovery.py fails if any consumer drifts
+# (the extension mirror is checked against these literals).
+#
+# This is deliberately NOT an enumeration of model names. The callable model
+# names are read from ``vscode.lm.selectChatModels`` at runtime and surfaced
+# into the config from that discovery -- never typed by hand. The only GLM name
+# in this module is the SINGLE cold-start fallback below, which a running system
+# never consults once a live editor host has reported a catalog.
+#
+# The non-callable filters below are measured exclusions, not an allowlist of
+# names: ``copilotcli``/``claude-code`` picker entries return empty streams when
+# invoked through the public LM API, and ``copilot-utility*`` entries have no
+# tokenizer (``Unknown tokenizer: undefined`` on sendRequest).
+EDITOR_NONCALLABLE_VENDORS: frozenset[str] = frozenset({"copilotcli", "claude-code"})
+EDITOR_NONCALLABLE_ID_PREFIXES: tuple[str, ...] = ("copilot-utility",)
+EDITOR_REQUESTED_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}$")
+# Cold-start ONLY: used when no editor host has reported a callable catalog yet
+# so a first launch is not dead. A running system consults the discovered
+# catalog (bridge readiness / workforce catalog), never this constant.
+GLM_COLD_START_FALLBACK_MODEL = "glm-5.2"
+
+
+def _normalize_editor_token(value: Any) -> str:
+    """Lower-case and fold non-alphanumeric runs to ``-``.
+
+    Mirrors the extension's ``normalizedVscodeLmModelName`` so both sides agree
+    on model identity when applying the non-callable filters.
+    """
+
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
+def editor_requested_name_ok(name: Any) -> bool:
+    """True when ``name`` is a well-formed requested/reported model id."""
+
+    return bool(EDITOR_REQUESTED_MODEL_RE.fullmatch(str(name or "").strip()))
+
+
+def editor_model_is_callable(
+    *, vendor: Any = "", model_id: Any = "", family: Any = "",
+) -> bool:
+    """Apply the measured non-callable provider filters to one reported model.
+
+    A measured exclusion, never an allowlist of names: an excluded entry is one
+    that demonstrably returns empty streams or has no tokenizer.
+    """
+
+    if _normalize_editor_token(vendor) in EDITOR_NONCALLABLE_VENDORS:
+        return False
+    id_n = _normalize_editor_token(model_id)
+    family_n = _normalize_editor_token(family)
+    return not any(
+        id_n.startswith(prefix) or family_n.startswith(prefix)
+        for prefix in EDITOR_NONCALLABLE_ID_PREFIXES
+    )
+
+
+def discover_callable_model_names(
+    reported: Iterable[Mapping[str, Any]],
+) -> list[str]:
+    """Return the de-duplicated callable model names from a raw editor report.
+
+    ``reported`` is the ``vscode.lm.selectChatModels`` result (each entry an
+    id/family/vendor mapping). Non-callable providers are excluded and only
+    regex-valid ids and families survive. No name is enumerated here: the set is
+    exactly what the editor reported minus what measurement excludes.
+    """
+
+    names: list[str] = []
+    for entry in reported:
+        if not isinstance(entry, Mapping):
+            continue
+        if not editor_model_is_callable(
+            vendor=entry.get("vendor"),
+            model_id=entry.get("id"),
+            family=entry.get("family"),
+        ):
+            continue
+        for field in ("id", "family"):
+            raw = str(entry.get(field) or "").strip()
+            if raw and editor_requested_name_ok(raw) and raw not in names:
+                names.append(raw)
+    return names
 
 # Codex normally keeps its own workspace-write sandbox.  When Task MCP already
 # places the whole worker under an outer Landlock/bubblewrap filesystem sandbox,
@@ -394,25 +486,47 @@ def resolve_deepseek_model(model: str | None) -> tuple[str | None, str | None]:
     return candidate, None
 
 
-def resolve_glm_model(model: str | None) -> tuple[str | None, str | None]:
-    """Resolve and guard a GLM model selection.
+def _is_glm_family(name: str) -> bool:
+    """True when ``name`` normalizes into the GLM provider family."""
 
-    Only the explicit production model ``glm-5.2`` is supported.  A GLM-labeled
-    task must never fall through to a GitHub-hosted Claude/GPT model or to a
-    different GLM family.
+    return _normalize_editor_token(name).startswith("glm")
+
+
+def resolve_glm_model(
+    model: str | None,
+    observed_models: Iterable[str] | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve and guard a GLM model selection against the editor-discovered set.
+
+    ``observed_models`` is the set of models the editor actually reported (a
+    discovery result). When it is provided, ONLY a reported model resolves; any
+    other name is refused BY NAME together with the reported catalog -- never
+    silently accepted and never silently dropped. When it is ``None`` -- a
+    cold start, or a route with no editor catalog such as Copilot BYOK -- any
+    well-formed GLM-family id is accepted so the route's own authoritative gate
+    (bridge readiness or the credential layer) can confirm it, and a missing
+    selection defaults to the single named cold-start fallback. No enumerated
+    list of GLM names gates this: the vocabulary is family shape + discovery.
     """
     if model is None:
-        return GLM_DEFAULT_MODEL, None
-    if not isinstance(model, str) or not model.strip():
-        return None, "model must be a nonempty string when provided"
-    if "\x00" in model:
-        return None, "model contains a NUL character"
-    candidate = model.strip()
-    if candidate not in GLM_SUPPORTED_MODELS:
-        return None, (
-            "unsupported_glm_model:"
-            f"{candidate}:allowed={'|'.join(GLM_SUPPORTED_MODELS)}"
-        )
+        candidate = GLM_COLD_START_FALLBACK_MODEL
+    else:
+        if not isinstance(model, str) or not model.strip():
+            return None, "model must be a nonempty string when provided"
+        if "\x00" in model:
+            return None, "model contains a NUL character"
+        candidate = model.strip()
+    if observed_models is not None:
+        observed = [str(value).strip() for value in observed_models if str(value).strip()]
+        if candidate not in observed:
+            catalog = "|".join(sorted(set(observed))) or "none"
+            return None, (
+                "unsupported_glm_model:"
+                f"{candidate}:not_reported_by_editor:observed={catalog}"
+            )
+        return candidate, None
+    if not editor_requested_name_ok(candidate) or not _is_glm_family(candidate):
+        return None, f"unsupported_glm_model:{candidate}:not_glm_family_or_malformed"
     return candidate, None
 
 
@@ -1116,8 +1230,15 @@ __all__ = [
     "GLM_COPILOT_ADAPTER",
     "GLM_VSCODE_LM_ADAPTER",
     "GLM_DEFAULT_MODEL",
+    "GLM_COLD_START_FALLBACK_MODEL",
     "GLM_SECRET_ENV_VAR",
     "GLM_SUPPORTED_MODELS",
+    "EDITOR_NONCALLABLE_VENDORS",
+    "EDITOR_NONCALLABLE_ID_PREFIXES",
+    "EDITOR_REQUESTED_MODEL_RE",
+    "editor_requested_name_ok",
+    "editor_model_is_callable",
+    "discover_callable_model_names",
     "LOCAL_ADAPTERS",
     "MANUAL_ONLY_ADAPTERS",
     "SUPPORTED_ADAPTERS",

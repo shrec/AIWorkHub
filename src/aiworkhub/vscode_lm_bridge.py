@@ -23,6 +23,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import repository_state
+from .runtime_adapters import (  # the ONE editor model vocabulary declaration
+    EDITOR_REQUESTED_MODEL_RE,
+    GLM_COLD_START_FALLBACK_MODEL,
+    discover_callable_model_names,
+)
 from .source_graph import SOURCE_GRAPH_MODES
 try:
     from .platform_io import chmod_fd, chmod_path, posix_path_modes_supported
@@ -252,12 +257,32 @@ def _repo_id(repo: Path) -> str:
     return state.manifest.repo_id
 
 
+def discover_editor_models(reported: Iterable[Any]) -> list[str]:
+    """Callable model names from a raw ``selectChatModels`` report.
+
+    Thin wrapper over the single editor model vocabulary so every Python
+    consumer of a raw editor report goes through one discovery implementation.
+    """
+
+    return discover_callable_model_names(reported)
+
+
 def resolve_editor_model_alias(model: str | None, observed_models: Iterable[str]) -> str | None:
-    """Resolve one requested model only to an editor-observed same-provider alias."""
+    """Resolve one requested model only to an editor-observed same-provider alias.
+
+    The requested name and every observed candidate are held to the shared
+    requested-name regex, so a malformed entry can never resolve. A model the
+    editor never reported resolves to ``None`` (the caller then refuses it by
+    name), never to an unreported guess.
+    """
     if model is None:
         return None
     requested = str(model).strip()
-    observed = [str(value).strip() for value in observed_models if str(value).strip()]
+    observed = [
+        str(value).strip()
+        for value in observed_models
+        if str(value).strip() and EDITOR_REQUESTED_MODEL_RE.fullmatch(str(value).strip())
+    ]
     if requested in observed:
         return requested
     aliases = EDITOR_MODEL_ALIASES.get(requested, (requested,))
@@ -428,8 +453,9 @@ def _atomic_json_once(
 def bridge_readiness(
     repo: Path,
     *,
-    model: str | None = "glm-5.2",
+    model: str | None = GLM_COLD_START_FALLBACK_MODEL,
     adapter_id: str = "glm_vscode_lm",
+    now: float | None = None,
 ) -> dict[str, Any]:
     """Return a secret-free, fail-closed editor-host bridge status.
 
@@ -440,11 +466,16 @@ def bridge_readiness(
     latter two into ``vscode_lm_model_not_visible``; after a reload that made a
     healthy Windows/Remote-SSH authorization look like a model entitlement
     failure merely because a stale JSON file still existed.
+
+    ``now`` overrides the wall clock used to age host heartbeats.  It exists so
+    staleness can be exercised as an injected value rather than by back-dating a
+    host file's mtime, which the worker sandbox forbids; production leaves it
+    ``None`` and reads ``time.time()``.
     """
     repo = repo.resolve()
     repo_id = _repo_id(repo)
     hosts_dir = bridge_root() / "hosts" / repo_id
-    now = time.time()
+    now = time.time() if now is None else float(now)
     candidates: list[dict[str, Any]] = []
     try:
         paths = list(hosts_dir.glob("*.json"))

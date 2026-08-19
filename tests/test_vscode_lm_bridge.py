@@ -751,10 +751,13 @@ def test_readiness_distinguishes_stale_host_from_missing_model(
     assert missing["blocker_reason"] == "vscode_lm_model_not_visible"
     assert missing["live_host_count"] == 1
 
-    stale_at = vscode_lm_bridge.time.time() - vscode_lm_bridge.HOST_TTL_SECONDS - 5
-    os.utime(host, (stale_at, stale_at))
+    # Age the same fresh host past its TTL by advancing the observed clock,
+    # not by back-dating the file's mtime: os.utime is denied inside the worker
+    # sandbox (PermissionError), and a staleness contract should be constructed
+    # as a value rather than by making the filesystem lie about time.
+    observed_now = vscode_lm_bridge.time.time() + vscode_lm_bridge.HOST_TTL_SECONDS + 5
     stale = vscode_lm_bridge.bridge_readiness(
-        repo, model="deepseek-v4-pro", adapter_id="deepseek_vscode_lm"
+        repo, model="deepseek-v4-pro", adapter_id="deepseek_vscode_lm", now=observed_now
     )
     assert stale["launchable"] is False
     assert stale["blocker_reason"] == "vscode_lm_host_stale"

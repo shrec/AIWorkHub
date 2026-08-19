@@ -282,7 +282,14 @@ const VSCODE_LM_CANCEL_DECISION_SCHEMA = "aiworkhub.vscode_lm.response.v1";
 const VSCODE_LM_PROGRESS_PHASES = Object.freeze([
   "request_accepted", "provider_response", "tool_turn", "final_edit", "terminal_error",
 ]);
+// Cold-start fallback ONLY. The callable model catalog is DISCOVERED from
+// vscode.lm.selectChatModels at runtime (see vscodeLmDiscoverCallableNames);
+// this single name is never what a running host publishes -- it is a default
+// so a first request before discovery is not dead.
 const VSCODE_LM_MODEL = "glm-5.2";
+// Request-name NORMALIZATION aliases, NOT a discovery allowlist. They only let
+// a requested model match a differently-spelled provider entry; the set of
+// callable models is discovered, never intersected with this list.
 const VSCODE_LM_SUPPORTED_MODELS = Object.freeze(["glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash", "claude-sonnet-4.6"]);
 const VSCODE_LM_MODEL_ALIASES = Object.freeze({
   "glm-5.2": Object.freeze(["glm-5-2", "glm52", "glm-52"]),
@@ -290,6 +297,9 @@ const VSCODE_LM_MODEL_ALIASES = Object.freeze({
   "deepseek-v4-flash": Object.freeze(["deepseek-v4flash", "deepseek-4-flash", "deepseek-v4-flash"]),
   "claude-sonnet-4.6": Object.freeze(["claude-sonnet-46", "sonnet-4-6", "claude-sonnet-4-6"]),
 });
+// The requested-name regex. Kept identical to
+// runtime_adapters.EDITOR_REQUESTED_MODEL_RE; tests/test_lm_model_discovery.py
+// fails if the two drift.
 const VSCODE_LM_REQUESTED_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:+\/-]{0,127}$/;
 const VSCODE_LM_POLL_MS = 500;
 const VSCODE_LM_CANCEL_POLL_MS = 50;
@@ -2548,6 +2558,30 @@ function isCallableVscodeLmProvider(model) {
 
 function normalizedVscodeLmModelName(value) {
   return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+// Discovery is the ONLY source of the callable model catalog. Given the raw
+// vscode.lm.selectChatModels result, exclude the measured non-callable
+// providers (isCallableVscodeLmProvider) and surface every remaining model
+// id/family that passes the requested-name regex. No hardcoded list of model
+// names participates: a model newly exposed by the endpoint appears the moment
+// VS Code reports it, so the published catalog and the config populated from it
+// stay truthful without a hand edit.
+function vscodeLmDiscoverCallableNames(models) {
+  const seen = new Set();
+  const names = [];
+  for (const model of Array.isArray(models) ? models : []) {
+    if (!isCallableVscodeLmProvider(model)) continue;
+    for (const value of [model && model.id, model && model.family]) {
+      if (typeof value !== "string") continue;
+      const name = value.trim();
+      if (name && VSCODE_LM_REQUESTED_MODEL_RE.test(name) && !seen.has(name)) {
+        seen.add(name);
+        names.push(name);
+      }
+    }
+  }
+  return names.slice(0, 128);
 }
 
 function canonicalVscodeLmModelName(value) {
@@ -4845,15 +4879,9 @@ class VscodeLmBridgeHost {
   async publishHeartbeat() {
     if (!this.repoInfo || this.disposed) return;
     const models = await this.models();
-    const visibleModels = Array.from(new Set([
-      ...VSCODE_LM_SUPPORTED_MODELS.filter((name) => selectVscodeLanguageModel(models, name)),
-      ...models.flatMap((model) => vscodeLmModelFields(model))
-        .map(canonicalVscodeLmModelName)
-        .filter((name) => VSCODE_LM_SUPPORTED_MODELS.includes(name)),
-      ...models.flatMap((model) => [model && model.id, model && model.family])
-        .filter((name) => typeof name === "string" && VSCODE_LM_REQUESTED_MODEL_RE.test(name.trim()))
-        .map((name) => name.trim()),
-    ])).slice(0, 128);
+    // The published catalog is exactly what VS Code reported, minus the
+    // measured non-callable providers -- no hardcoded model list is consulted.
+    const visibleModels = vscodeLmDiscoverCallableNames(models);
     const modelMetadata = visibleModels.slice(0, 64).flatMap((name) => {
       const model = selectVscodeLanguageModel(models, name);
       if (!model) return [];
@@ -9404,6 +9432,7 @@ module.exports = {
     vscodeLmBridgeRoot,
     vscodeLmModelFields,
     isCallableVscodeLmProvider,
+    vscodeLmDiscoverCallableNames,
     isGlm52LanguageModel,
     selectGlm52LanguageModel,
     isVscodeLanguageModel,

@@ -19,8 +19,14 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Iterable, Mapping
 
-from . import cost_ledger, repo_policy, task_store, workforce_router
+from . import cost_ledger, repo_policy, runtime_adapters, task_store, workforce_router
 from .platform_io import posix_path_modes_supported
+
+
+# Editor (vscode_lm) routes seed a single capability row per provider; when the
+# live editor host reports a catalog, that seed expands to one row per
+# discovered model.  Only these adapters read their model set from VS Code.
+_DISCOVERY_ADAPTERS: frozenset[str] = frozenset({"glm_vscode_lm"})
 
 
 SCHEMA_ID = "aiworkhub.workforce_catalog.v1"
@@ -469,6 +475,74 @@ def _resolve_effective_adapter(
     return declared, unavailable
 
 
+def _discovered_family_models(
+    worker: Mapping[str, Any],
+    ready_by_adapter: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """Return the editor-discovered models that belong to ``worker``'s family.
+
+    The names come from the live editor readiness (``observed_models``), held to
+    the shared requested-name regex and to the seed's provider-family stem so a
+    GLM seed only ever fans out into GLM models the editor actually reported.
+    No model name is enumerated here.
+    """
+
+    readiness = ready_by_adapter.get(str(worker.get("adapter_id") or ""), {})
+    observed = readiness.get("observed_models")
+    if not isinstance(observed, list):
+        return []
+    stem_match = re.match(r"[a-z]+", str(worker.get("model") or "").lower())
+    stem = stem_match.group(0) if stem_match else ""
+    discovered: list[str] = []
+    for value in observed:
+        name = str(value).strip()
+        if not name or not runtime_adapters.editor_requested_name_ok(name):
+            continue
+        normalized = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        if stem and not normalized.startswith(stem):
+            continue
+        if name not in discovered:
+            discovered.append(name)
+    return discovered
+
+
+def _expand_discovered_workers(
+    workers: Iterable[Mapping[str, Any]],
+    ready_by_adapter: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project each editor-discovered seed into one row per discovered model.
+
+    Configuration is populated from what VS Code reported, never by hand: a
+    model newly exposed by the endpoint appears as its own row without a code
+    change. A seed whose own declared model the editor did not report is
+    preserved (readiness marks it unavailable by name) rather than dropped, and
+    a seed for an adapter with no live catalog stays a single row (cold start).
+    """
+
+    expanded: list[dict[str, Any]] = []
+    for worker in workers:
+        row_worker = dict(worker)
+        if str(row_worker.get("adapter_id") or "") not in _DISCOVERY_ADAPTERS:
+            expanded.append(row_worker)
+            continue
+        discovered = _discovered_family_models(row_worker, ready_by_adapter)
+        if not discovered:
+            expanded.append(row_worker)
+            continue
+        seed_model = str(row_worker.get("model") or "")
+        seed_worker_id = str(row_worker.get("worker_id") or "")
+        for name in discovered:
+            projected = dict(row_worker, model=name)
+            projected["worker_id"] = seed_worker_id if name == seed_model else name
+            projected["discovered_from_editor"] = True
+            expanded.append(projected)
+        if seed_model and seed_model not in discovered:
+            preserved = dict(row_worker)
+            preserved["discovered_from_editor"] = False
+            expanded.append(preserved)
+    return expanded
+
+
 def build_catalog(
     repo_root: Path | str,
     *,
@@ -531,7 +605,7 @@ def build_catalog(
         economics_by_model = {}
     rows: list[dict[str, Any]] = []
     attributed_process_ids: set[int] = set()
-    for worker in catalog["workers"]:
+    for worker in _expand_discovered_workers(catalog["workers"], ready_by_adapter):
         effective_adapter, adapter_ready = _resolve_effective_adapter(
             worker, ready_by_adapter
         )

@@ -170,16 +170,39 @@ def test_glm_argv_is_noninteractive_byok_shape(monkeypatch: pytest.MonkeyPatch, 
     assert "--yolo" not in plan.argv
 
 
-def test_glm_rejects_every_non_glm52_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_glm_rejects_every_non_glm_family_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A name outside the GLM family is refused BY NAME; a GLM name is not.
+
+    This test used to assert that everything except ``glm-5.2`` was rejected,
+    including ``glm-5.1`` and ``glm-4``.  That was the old contract, and it was
+    a hardcoded allowlist standing in for a fact the editor states on request:
+    the owner's Copilot endpoint exposes six working GLM models and AIWorkHub
+    could address exactly one of them.  The editor is now the authority for
+    WHICH models exist, so the adapter's job is narrower -- refuse a name that
+    is not a GLM name at all, and let discovery decide the rest.
+
+    What must NOT regress is the refusal itself: a non-GLM name is still
+    launchable=False with a named reason and an empty argv, never silently
+    accepted and never silently dropped.
+    """
+
     repo = tmp_path / "r"
     repo.mkdir()
     exe = _copilot(tmp_path)
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: str(exe))
-    for bad_model in ("glm-4", "glm-5.1", "gpt-5.4", "auto"):
+    for bad_model in ("gpt-5.4", "auto", "claude-sonnet-4.6", "not a model"):
         plan = runtime_adapters.build_runtime_command(ADAPTER, "x", repo, model=bad_model)
-        assert plan.launchable is False
-        assert "unsupported_glm_model" in plan.validation_reason
-        assert plan.argv == []
+        assert plan.launchable is False, bad_model
+        assert "unsupported_glm_model" in plan.validation_reason, bad_model
+        assert plan.argv == [], bad_model
+    # A GLM-family name the editor may report is no longer refused by the
+    # adapter's own vocabulary.
+    for glm_model in ("glm-5.3", "glm-5.2", "glm-5.1", "glm-4.7"):
+        plan = runtime_adapters.build_runtime_command(ADAPTER, "x", repo, model=glm_model)
+        assert plan.launchable is True, glm_model
+        assert plan.validation_reason == "", glm_model
 
 
 def test_glm_credential_default_path_is_under_aiworkhub(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
