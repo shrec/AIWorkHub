@@ -1082,13 +1082,34 @@ def fold_quality_verdict(
     raw_reports = list(reviewer_reports)
     normalized_reports, schema_errors = normalize_reviewer_reports(raw_reports)
     blockers.extend(schema_errors)
+
+    # Blindness is a property of the REPORT, not of the tier. It is computed up
+    # front for EVERY judgment lens so that both the skipped->passed lift below
+    # and the tier-wide blindness sweep after it can honour it. Previously this
+    # was consumed only inside the required-lenses loop, so a blind reviewer for
+    # a lens the tier did not require (security/code_quality at medium) was
+    # never checked and its report's mere existence lifted the lens to passed.
+    blind_lenses: set[str] = set()
+    for report in raw_reports:
+        if not isinstance(report, Mapping):
+            continue
+        lens = report.get("lens")
+        if not isinstance(lens, str) or lens not in JUDGMENT_LENSES:
+            continue
+        if reviewer_report_could_not_inspect(report):
+            blind_lenses.add(lens)
+
     reports_by_lens: dict[str, list[dict[str, Any]]] = {}
     refine_required = False
     for report in normalized_reports:
         lens = str(report["lens"])
         reports_by_lens.setdefault(lens, []).append(report)
         row = lens_rows[lens]
-        if row["status"] == STATUS_SKIPPED:
+        # A report's mere EXISTENCE no longer lifts a lens from skipped to
+        # passed: only a report from a reviewer that actually observed the
+        # packet does. A blind reviewer leaves the lens skipped here and is
+        # marked reviewer_could_not_inspect by the sweep below.
+        if row["status"] == STATUS_SKIPPED and lens not in blind_lenses:
             row["status"] = STATUS_PASSED
         for finding in report["findings"]:
             finding_id = f"reviewer:{lens}:{finding['id']}"
@@ -1105,15 +1126,20 @@ def fold_quality_verdict(
                     blockers.append(f"refinement_required:{finding_id}")
                     row["status"] = STATUS_FAILED
 
-    blind_lenses: set[str] = set()
-    for report in raw_reports:
-        if not isinstance(report, Mapping):
-            continue
-        lens = report.get("lens")
-        if not isinstance(lens, str) or lens not in JUDGMENT_LENSES:
-            continue
-        if reviewer_report_could_not_inspect(report):
-            blind_lenses.add(lens)
+    # A reviewer that produced no observation is never PASSED, at any tier --
+    # the skipped->passed lift above already refuses to promote a blind lens, so
+    # it stays skipped here. Where the tier runs an attributable review (it
+    # requires at least one lens), a dispatched-but-blind reviewer for ANY
+    # judgment lens -- not only the tier's required ones -- is a blocking process
+    # failure: reviewer_could_not_inspect, never passed. At a tier that requires
+    # no review at all, an unsolicited blind review is non-blocking noise: it is
+    # simply not counted (left skipped), still never passed. The required-lenses
+    # loop below re-affirms the blocker for its own lenses (de-duplicated).
+    review_active = bool(required_lenses)
+    if review_active:
+        for lens in sorted(blind_lenses):
+            lens_rows[lens]["status"] = STATUS_REVIEWER_COULD_NOT_INSPECT
+            blockers.append(f"reviewer_could_not_inspect:{lens}")
 
     # Independence is a recorded ladder, not a vendor check. The
     # ``cross_provider_required`` flag now only marks the tiers that *require* an
@@ -1314,41 +1340,126 @@ def assess_quality_policy_authority(
 ) -> dict[str, Any]:
     """Detect a candidate weakening its own declared quality policy.
 
-    A candidate cannot lower its own acceptance bar by emptying or deleting
-    ``.aiworkhub/quality.json``. When the candidate declares strictly fewer
-    checks than the canonical tree (removal counts as zero), the weakening is
-    an observed signal that escalates the risk tier -- it does not block the
-    gate outright, but the escalated tier (medium+) then demands combined-tree
-    and reviewer evidence the bare candidate cannot fabricate.
+    A candidate cannot lower its own acceptance bar by hollowing out
+    ``.aiworkhub/quality.json``. Weakening is compared by CONTENT, not by count:
+    a canonical check is preserved only when the candidate still declares a
+    check with the same command identity, a path scope no narrower than the
+    canonical one, and a ``minimum_risk`` no higher. Replacing a command with a
+    no-op, narrowing its paths, or raising its ``minimum_risk`` all weaken the
+    policy even when the number of checks is unchanged. Any unpreserved
+    canonical check is an observed signal that escalates the risk tier -- it
+    does not block the gate outright, but the escalated tier (medium+) then
+    demands combined-tree and reviewer evidence the bare candidate cannot
+    fabricate.
 
-    A malformed candidate config is not this function's concern: the completion
-    gate already fails closed on it via ``config_error``. This assessment reads
-    only the declared check counts and never executes a command.
+    An unreadable/malformed config on EITHER side makes the comparison
+    impossible. That is its own outcome, ``unable_to_compare`` with ``weakened``
+    None -- never ``weakened`` False, which would silently disable the detector
+    the one time comparison cannot be performed. A malformed candidate is still
+    separately failed closed by the completion gate via ``config_error``. This
+    assessment reads only declared check descriptors and never executes a
+    command.
     """
 
-    def _count(root: Path | str) -> tuple[int, bool]:
+    def _signatures(root: Path | str) -> list[dict[str, Any]] | None:
+        """Return one content signature per declared check, or None when the
+        config cannot be read/parsed at all (comparison is then impossible)."""
+
         try:
             config = load_repo_config(root)
         except MalformedConfigError:
-            return 0, False
-        return len(config.get("checks") or []), True
+            return None
+        signatures: list[dict[str, Any]] = []
+        for entry in config.get("checks") or []:
+            command = tuple(str(part) for part in (entry.get("command") or ()))
+            patterns = entry.get("paths")
+            path_scope = (
+                None
+                if not patterns
+                else frozenset(
+                    str(pattern).strip().replace("\\", "/") for pattern in patterns
+                )
+            )
+            minimum_risk = str(entry.get("minimum_risk") or RISK_LOW)
+            signatures.append(
+                {
+                    "command": command,
+                    "path_scope": path_scope,
+                    "minimum_risk": minimum_risk,
+                }
+            )
+        return signatures
 
-    canonical_count, canonical_ok = _count(canonical_root)
-    candidate_count, candidate_ok = _count(candidate_root)
-    # Only a candidate that parses cleanly yet declares fewer checks than the
-    # canonical tree is "self-weakened" here; a malformed candidate is handled
-    # as a config_error blocker elsewhere and must not be double-counted.
-    weakened = (
-        canonical_ok
-        and candidate_ok
-        and canonical_count > 0
-        and candidate_count < canonical_count
-    )
+    canonical_sigs = _signatures(canonical_root)
+    candidate_sigs = _signatures(candidate_root)
+    canonical_ok = canonical_sigs is not None
+    candidate_ok = candidate_sigs is not None
+    canonical_count = len(canonical_sigs) if canonical_sigs is not None else 0
+    candidate_count = len(candidate_sigs) if candidate_sigs is not None else 0
+
+    if canonical_sigs is None or candidate_sigs is None:
+        # The one state in which weakening cannot be ruled out is reported as
+        # its own outcome, never as weakened=False.
+        return {
+            "schema_id": "aiworkhub.quality_policy_authority.v1",
+            "weakened": None,
+            "outcome": "unable_to_compare",
+            "action": "none",
+            "reason": (
+                "quality_policy_unable_to_compare:"
+                f"canonical_readable={str(canonical_ok).lower()},"
+                f"candidate_readable={str(candidate_ok).lower()}"
+            ),
+            "escalation_signal": "",
+            "blocks_gate": False,
+            "canonical_declared_checks": canonical_count,
+            "candidate_declared_checks": candidate_count,
+            "canonical_config_readable": canonical_ok,
+            "candidate_config_readable": candidate_ok,
+        }
+
+    def _scope_preserved(
+        canonical_scope: frozenset[str] | None,
+        candidate_scope: frozenset[str] | None,
+    ) -> bool:
+        # None means "runs on every path" -- the broadest possible scope. A
+        # candidate preserves scope only when it is at least as broad: an
+        # all-paths canonical check demands an all-paths candidate, and a
+        # scoped canonical check demands a candidate whose scope is a superset.
+        if canonical_scope is None:
+            return candidate_scope is None
+        if candidate_scope is None:
+            return True
+        return canonical_scope <= candidate_scope
+
+    def _preserved(canonical_sig: dict[str, Any]) -> bool:
+        for candidate_sig in candidate_sigs:
+            if candidate_sig["command"] != canonical_sig["command"]:
+                continue
+            if not _scope_preserved(
+                canonical_sig["path_scope"], candidate_sig["path_scope"]
+            ):
+                continue
+            if (
+                _RISK_RANK[candidate_sig["minimum_risk"]]
+                > _RISK_RANK[canonical_sig["minimum_risk"]]
+            ):
+                continue
+            return True
+        return False
+
+    weakened_checks = [sig for sig in canonical_sigs if not _preserved(sig)]
+    weakened = bool(weakened_checks)
     if weakened:
         action = "escalate_risk_tier"
         reason = (
-            "quality_policy_self_weakened:canonical_checks="
-            f"{canonical_count}>candidate_checks={candidate_count}"
+            "quality_policy_self_weakened:"
+            f"unpreserved_checks={len(weakened_checks)}/{canonical_count}:"
+            "commands="
+            + ",".join(
+                (" ".join(sig["command"]) or "<empty>")
+                for sig in weakened_checks[:8]
+            )
         )
         signal = QUALITY_POLICY_SELF_WEAKENED_SIGNAL
     else:
@@ -1357,15 +1468,16 @@ def assess_quality_policy_authority(
         signal = ""
     return {
         "schema_id": "aiworkhub.quality_policy_authority.v1",
-        "weakened": bool(weakened),
+        "weakened": weakened,
+        "outcome": "weakened" if weakened else "preserved",
         "action": action,
         "reason": reason,
         "escalation_signal": signal,
         "blocks_gate": False,
         "canonical_declared_checks": canonical_count,
         "candidate_declared_checks": candidate_count,
-        "canonical_config_readable": bool(canonical_ok),
-        "candidate_config_readable": bool(candidate_ok),
+        "canonical_config_readable": canonical_ok,
+        "candidate_config_readable": candidate_ok,
     }
 
 
@@ -2088,7 +2200,15 @@ def run_completion_quality_gate(
     """Execute the mandatory review-quality floor for one task delta.
 
     Built-in diff syntax checks always run. Every repo-declared check is
-    mandatory: ``failed`` and ``not_available`` both block. Optional
+    mandatory *when it applies to this delta and tier*: an applicable check
+    that runs and reports ``failed`` or ``not_available`` blocks. A check that
+    does not apply is skipped with an explicit, recorded reason
+    (``risk_below_minimum`` or ``changed_paths_not_applicable``) -- it is never
+    silently dropped, and a skipped applicable check is never counted as a
+    pass. ``verification_scope`` is ``repository_policy`` only when at least one
+    declared check actually EXECUTED; an all-skipped run reports
+    ``builtin_and_task_contract_only`` rather than claiming the repository's
+    policy governed a verdict none of its checks ran. Optional
     CodeQL/Semgrep/etc. availability is reported truthfully but does not pass
     or fail the task unless the repository declares its exact command in
     ``.aiworkhub/quality.json``.
@@ -2177,9 +2297,15 @@ def run_completion_quality_gate(
         "quality_verdict": verdict,
         "repository_quality_policy": config_status,
         "reachability": _reachability_record(reachability_inputs),
+        # verification_scope is derived from what EXECUTED, not from the mere
+        # presence of a declared policy. An all-skipped run (every declared
+        # check risk_below_minimum- or changed_paths_not_applicable-skipped) did
+        # not let the repository's policy govern anything, so it must not claim
+        # repository_policy scope.
         "verification_scope": (
             "repository_policy"
             if config_status["status"] == "configured"
+            and any(check.status != STATUS_SKIPPED for check in declared)
             else "builtin_and_task_contract_only"
         ),
     }
