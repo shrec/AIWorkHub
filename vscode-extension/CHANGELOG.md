@@ -1,5 +1,33 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.91 — 2026-08-19
+
+Six fixes to AIWorkHub's own safety checks, found by an independent audit that
+ran the code rather than reading it.
+
+### Fixed
+
+- **A reviewer that read nothing could still mark work as passed.** At the middle
+  risk level two of the three reviewers were never checked for whether they had
+  actually seen the code — and a review that produced no observation at all was
+  counted as a pass. The strongest verdict the system gives could be assembled
+  from reviewers that never looked. Now a reviewer that saw nothing never passes,
+  at any risk level.
+- **The gate said the project's own checks had vetted the work when none of them
+  had run.** It now reports only what actually executed.
+- **A task could quietly disarm the checks meant to police it** — keeping the
+  same number of checks while replacing them with commands that do nothing. The
+  comparison now reads what the checks contain, not how many there are.
+- **Failures could arrive labelled "ready for review".** Any outcome the system
+  did not recognise was delivered as if the work were finished and waiting. It is
+  now treated as blocked.
+- **A blocked task was locked forever**: reaching that state was allowed, leaving
+  it was not, and a separate manual tool existed only to undo it. Leaving is now
+  part of the contract.
+- **The list of possible outcomes was written out six times in six places and
+  three of the copies disagreed** — the underlying cause of the above. There is
+  now one list, and a test that fails if any copy drifts from it.
+
 ## 0.9.90 — 2026-08-19
 
 ### Fixed

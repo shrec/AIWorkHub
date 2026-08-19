@@ -12,6 +12,21 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.91
+
+- A reviewer that read nothing could still mark work as passed. At the middle
+  risk level two of three reviewers were never checked for whether they had seen
+  the code, and a review with no observation counted as a pass. Fixed at every
+  risk level.
+- The gate reported that the project's own checks had vetted the work when none
+  of them had run; it now reports only what executed.
+- A task could disarm the checks meant to police it while keeping their number
+  unchanged. The comparison now reads what the checks contain.
+- Failures could arrive labelled "ready for review"; unrecognised outcomes are
+  now treated as blocked.
+- A blocked task was locked forever — allowed to enter, not to leave. Leaving is
+  now part of the contract.
+
 ## What's new in 0.9.90
 
 - AIWorkHub can now tell you why a run died. A provider refusing a task — no

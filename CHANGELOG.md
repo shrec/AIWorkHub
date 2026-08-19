@@ -6,6 +6,60 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.91] - 2026-08-19
+
+Six defects from an independent empirical audit of 0.9.90, plus a blocking
+contract drift. Every number below was produced by RUNNING the code; the auditor
+changed nothing. The six share one root: terminal outcome, risk tier and policy
+strictness are each one concept and none of them was one TYPE anywhere.
+
+### Fixed
+
+- **A terminal outcome was one concept written out six times, and three copies
+  disagreed.** The launcher emitted five substatuses the state machine called
+  illegal - `token_budget_exceeded` among them - and nothing failed only because
+  that path happened to call one function rather than another. A barrier holding
+  by routing accident is not a barrier. One module now owns the vocabulary, the
+  five other sites import it, and a contract test fails when any copy drifts.
+  (NF-2026-00339)
+- **Any unknown substatus became `review_ready`.** Nineteen lines above that
+  fallback the same file documented B921 - "a blocked outcome must never be
+  delivered as review_ready" - and its own comment admitted two outcomes had
+  already fallen into it. Those two were patched in and the fail-open default was
+  left, so every future failure repeated the bug. Unknown now resolves to
+  blocked. (NF-2026-00340)
+- **`blocked` was a legal outcome and an illegal source at once**, so reaching it
+  locked a card forever, and a manual recovery tool existed solely to undo that.
+  It is now terminal with a defined exit, proven by a test. (NF-2026-00341)
+- **A blind reviewer passed.** At medium tier the blindness check ran only on the
+  tier's required lens, and a report's mere existence lifted a lens from skipped
+  to passed. Measured: security and code_quality both read `passed` while those
+  reviewers reported `usage_observed: false` and zero tokens - they said plainly
+  they had read nothing - and the verdict read `verified` with no blockers.
+  Blindness is now a property of the report, not of the tier, and never passes at
+  any tier. (NF-2026-00344)
+- **The gate claimed `repository_policy` scope when every declared check was
+  skipped.** Scope now derives from what EXECUTED. (NF-2026-00342)
+- **The self-weakening detector counted checks without reading them**, so a
+  candidate could keep both checks, replace their commands with `true`, scope
+  them to `docs/**`, raise their minimum risk to critical, and be reported as
+  unchanged. It now compares command identity, path scope and minimum risk - and
+  an unreadable canonical config yields `unable_to_compare` rather than the "no
+  weakening" it used to report. (NF-2026-00343)
+
+### Notes
+
+`contract_consistency_check` was failing and blocking: all three managed
+instruction carriers had drifted from their canonical projection. They are
+reprojected and it passes. The clauses that were missing are worth naming,
+because they are exactly the mistakes made while they were absent - "launch in
+parallel only cards whose allowed_writes do not overlap", and "a card's
+allowed_writes must include the tests that assert the contract it changes and the
+production call sites it must wire, or correct work is unwinnable."
+
+Canonical: 4687 passed, 38 skipped, ruff clean, with both audited behaviours
+re-measured on the canonical tree after promotion.
+
 ## [0.9.90] - 2026-08-19
 
 One card, three NeedFix records, on the layer that tells an operator why a run
