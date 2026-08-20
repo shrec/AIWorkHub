@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.8] - 2026-08-20
+
+### Fixed
+
+- The text-only GLM bridge no longer contradicts Source Graph guidance by
+  forcing every follow-up lookup to `mode=focus`. Exact file and symbol reads
+  now preserve their intentional `file`/`body` mode, target and workflow stage,
+  so indexed worker scopes do not fail as false zero-hit results.
+
 ## [0.10.7] - 2026-08-20
 
 ### Fixed

@@ -164,6 +164,9 @@ assert.strictEqual(internals.vscodeLmPathMatchesPattern("research/result.json", 
 assert.strictEqual(internals.vscodeLmPathMatchesPattern("../escape.json", "research/*.json"), false);
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("mode=file with query and target both equal"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("mode=body with query equal to the exact indexed symbol name"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("Use mode=focus only for broad orientation"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("Never coerce or repeat mode=focus for an exact file/body lookup"));
+assert.ok(!internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("For every tool call output ONLY: {\"schema_id\":\"aiworkhub.vscode_lm.tool_request.v1\",\"name\":\"aiworkhub_worker_source_graph_query\",\"input\":{\"mode\":\"focus\""));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("prepare is an internal bridge primitive"));
 assert.ok(!internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes('"aiworkhub_manager_semantic_edit_prepare"'));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("semantic_edit_stage"));

@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.8 — 2026-08-20
+
+### Fixed
+
+- Text-only GLM workers now preserve exact Source Graph `file`/`body` modes and
+  targets instead of reusing the broad orientation `focus` example.
+
 ## 0.10.7 — 2026-08-20
 
 ### Fixed

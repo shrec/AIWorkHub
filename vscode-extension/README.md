@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.8
+
+- Text-only GLM workers preserve intentional Source Graph query modes and
+  targets, so exact indexed file/symbol reads no longer collapse into false
+  zero-hit `focus` queries.
+
 ## What's new in 0.10.7
 
 - Terminal NeedFix lifecycle now releases stale converted-task storage pins.

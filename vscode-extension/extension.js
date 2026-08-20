@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.10.7";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.10.8";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -3807,7 +3807,9 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
     (sourceGraphPrefetched
       ? `- The bridge has already executed the mandatory initial Source Graph request and supplies its result below. Request more tools only when needed.\n`
       : `- Your FIRST response MUST be a Source Graph request and nothing else.\n`) +
-    `- For every tool call output ONLY: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${sourceGraphToolName}","input":{"mode":"focus","query":"...","workflow_stage":"orientation"}}\n` +
+    `- For every tool call output ONLY the strict envelope shape: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${sourceGraphToolName}","input":{"mode":"<intentional mode>","query":"...","target":null,"workflow_stage":"<current stage>"}}\n` +
+    `- Use mode=focus only for broad orientation. For an exact indexed file use mode=file with query and target both equal to that repo-relative path; for an exact symbol use mode=body with query equal to the indexed symbol and target equal to its repo-relative file.\n` +
+    `- Never coerce or repeat mode=focus for an exact file/body lookup; preserve the intentional mode, target, and workflow_stage in the tool input.\n` +
     (qualityReview
       ? `- The only successful terminal action is an authenticated aiworkhub_worker_quality_review_submit request.\n`
       : `- After each tool result, either request another allowlisted tool or output the final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n` +
