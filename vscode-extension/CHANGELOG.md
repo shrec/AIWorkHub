@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.3 — 2026-08-20
+
+### Performance
+
+- Full dashboard refreshes omit the large per-request protected-log detail that
+  the UI does not consume, reducing the measured payload by about 62.5% while
+  preserving aggregate retention truth.
+
 ## 0.10.2 — 2026-08-20
 
 ### Performance

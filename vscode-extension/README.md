@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.3
+
+- Full dashboard payloads are about 62.5% smaller on the canonical repository;
+  Storage retains its aggregate policy/count/byte truth without retransmitting
+  thousands of protected per-request rows that the UI never renders.
+
 ## What's new in 0.10.2
 
 - Storage telemetry survives MCP runtime and VS Code window reloads through an

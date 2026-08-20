@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-08-20
+
+### Performance
+
+- Full dashboard snapshots no longer transport the per-request protected
+  terminal-log list that the Storage UI never renders. The canonical live
+  payload fell from 2.16 MB to 811 KB, while the Storage projection fell from
+  1.39 MB to 38.6 KB and retains every aggregate count and byte total.
+
 ## [0.10.2] - 2026-08-20
 
 ### Performance
