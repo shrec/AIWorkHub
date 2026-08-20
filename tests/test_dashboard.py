@@ -385,14 +385,16 @@ def test_build_snapshot_combines_read_sources_and_operational_summaries():
     topic_stats = {row["name"]: row for row in snapshot["summaries"]["topics"]}
     assert topic_stats["imagery"]["total"] == 2
     assert topic_stats["mapping"]["stale"] == 1
-    assert [call for call in provider.calls if call[0] == "list_tasks"] == [
+    # Independent status reads run concurrently; completion/call order is not
+    # a contract, while the exact requested status set remains deterministic.
+    assert sorted(call for call in provider.calls if call[0] == "list_tasks") == sorted([
         ("list_tasks", "pending"),
         ("list_tasks", "processing"),
         ("list_tasks", "review"),
         ("list_tasks", "blocked"),
         ("list_tasks", "finished"),
         ("list_tasks", "archived"),
-    ]
+    ])
 
 
 def test_summary_snapshot_skips_full_webview_reads_without_changing_counts():
