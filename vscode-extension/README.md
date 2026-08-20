@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.10
+
+- Byte-identical compatibility edits are verified without rewriting files or
+  claiming changes, preventing already-satisfied cards from looping through
+  required-output validation.
+
 ## What's new in 0.10.9
 
 - Windows worker finalization and review acceptance no longer fail solely on

@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.10] - 2026-08-20
+
+### Fixed
+
+- VS Code LM workers now treat byte-identical compatibility edits as verified
+  no-ops: they neither rewrite the target nor report a false changed path. This
+  prevents already-satisfied task cards from entering required-output and
+  retry loops while retaining the mechanically verified final hash.
+
 ## [0.10.9] - 2026-08-20
 
 ### Fixed

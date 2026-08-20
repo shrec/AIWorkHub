@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.10 — 2026-08-20
+
+### Fixed
+
+- Byte-identical VS Code LM edits are now verified no-ops instead of false
+  changed paths, eliminating stale required-output and retry loops.
+
 ## 0.10.9 — 2026-08-20
 
 ### Fixed
