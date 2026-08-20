@@ -56,6 +56,17 @@ def _repo_binding(repo_root: Path) -> str:
     return hashlib.sha256(os.fsencode(str(repo_root))).hexdigest()
 
 
+def _compact_terminal_log_retention(value: Any) -> dict[str, Any]:
+    """Keep dashboard aggregates, never transport per-request retention rows."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: item
+        for key, item in value.items()
+        if key not in {"candidates", "protected"}
+    }
+
+
 def _load_persisted(repo_root: Path) -> dict[str, Any]:
     """Load a bounded, repository-bound last-known-good measurement.
 
@@ -94,6 +105,9 @@ def _load_persisted(repo_root: Path) -> dict[str, Any]:
     # Persisted telemetry can never override current disk capacity, readonly,
     # schema, or other response authority fields.
     loaded = {key: value for key, value in payload.items() if key in PERSISTED_PAYLOAD_KEYS}
+    loaded["terminal_log_retention"] = _compact_terminal_log_retention(
+        loaded.get("terminal_log_retention")
+    )
     loaded["_completed_monotonic"] = time.monotonic() - age
     return loaded
 
@@ -313,6 +327,7 @@ def _measure(repo_root: Path) -> dict[str, Any]:
         quarantine_batches = []
     try:
         terminal_logs = terminal_log_retention.preview(repo_root, include_candidates=False)
+        terminal_logs = _compact_terminal_log_retention(terminal_logs)
         terminal_log_batches = terminal_log_retention.list_batches(repo_root).get("batches") or []
     except terminal_log_retention.TerminalLogRetentionError as exc:
         terminal_logs = {

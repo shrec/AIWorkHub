@@ -127,6 +127,8 @@ def test_storage_snapshot_counts_repo_data_and_never_follows_symlinks(tmp_path, 
     assert result["retention_preview"]["eligible_bytes"] == 64
     assert result["retention_preview"]["registrations"]["registered_count"] == 3
     assert result["retention_preview"]["registrations"]["stale_candidate_count"] == 1
+    assert "protected" not in result["terminal_log_retention"]
+    assert "candidates" not in result["terminal_log_retention"]
     assert result["disk_total_bytes"] > 0
     assert result["disk_free_bytes"] > 0
     assert result["readonly"] is True
@@ -345,7 +347,10 @@ def test_storage_snapshot_survives_runtime_cache_reset(tmp_path, monkeypatch):
         "components": [],
         "retention_preview": {},
         "quarantine_batches": [],
-        "terminal_log_retention": {},
+        "terminal_log_retention": {
+            "protected": [{"request_id": "never-transport-this-row"}],
+            "protected_count": 1,
+        },
         "terminal_log_quarantine_batches": [],
         "task_retention": {},
         "task_retention_batches": [],
@@ -371,6 +376,7 @@ def test_storage_snapshot_survives_runtime_cache_reset(tmp_path, monkeypatch):
     assert result["scanned_at"] == "2026-08-20T00:00:00+00:00"
     assert result["readonly"] is True
     assert result["disk_total_bytes"] > 0
+    assert result["terminal_log_retention"] == {"protected_count": 1}
 
 
 def test_stale_persisted_storage_snapshot_is_visible_during_refresh(tmp_path, monkeypatch):
