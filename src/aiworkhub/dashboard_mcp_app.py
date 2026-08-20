@@ -433,6 +433,46 @@ def snapshot_view(full: bool = False) -> dict[str, Any]:
         snapshot["manager_identity_target"] = {}
     snapshot["server_tool"] = "aiworkhub_dashboard_snapshot"
     snapshot["authority_flags"] = _readonly_authority_flags()
+    # ``build_snapshot`` starts the non-blocking storage inventory before the
+    # heavier full reads. Re-sample its in-memory cache after those reads so a
+    # scan that finished meanwhile is visible in this same response instead of
+    # leaving the Webview on "Calculating" until a later polling interval.
+    try:
+        current_storage = snapshot.get("storage_usage")
+        latest_storage = storage_observability.snapshot(core.repo_root())
+        if full and isinstance(current_storage, dict):
+            # The normal inventory is ~3.5 s on the live 19.9 GB store while
+            # the full snapshot now hydrates in ~3 s. Give that already-running
+            # thread one small bounded settle window so the same response can
+            # publish its result. Never wait for an actually slow filesystem.
+            settle_deadline = time.monotonic() + 3.0
+            while (
+                latest_storage.get("scan_status") in {"scanning", "refreshing"}
+                and time.monotonic() < settle_deadline
+            ):
+                time.sleep(0.05)
+                latest_storage = storage_observability.snapshot(core.repo_root())
+        if isinstance(current_storage, dict) and isinstance(latest_storage, dict):
+            # Only refresh the header/overview scalars here.  The bounded full
+            # storage detail built at the start remains authoritative and this
+            # late cache sample cannot inflate the response with a second copy
+            # of large retention/registration collections.
+            for key in (
+                "scan_status",
+                "scanned_at",
+                "repo_data_bytes",
+                "repo_data_files",
+                "worker_tree_bytes",
+                "worker_tree_count",
+                "safe_reclaimable_bytes",
+                "quarantine_bytes",
+                "managed_total_bytes",
+                "errors",
+            ):
+                if key in latest_storage:
+                    current_storage[key] = latest_storage[key]
+    except Exception:  # noqa: BLE001 -- storage telemetry never breaks queue truth
+        pass
     if full:
         snapshot["snapshot_mode"] = "full"
         result = _debug_stage("bound_snapshot", lambda: _bound_snapshot(snapshot))
@@ -1431,6 +1471,10 @@ def health_view() -> dict[str, Any]:
             "repo": root_raw,
             "storage": storage,
         }
+        # Capacity lookup is immediate and managed-size inventory runs in a
+        # daemon thread. Starting it from the cheap health handshake gives the
+        # scan a head start before the first full Webview snapshot.
+        result["storage_usage"] = storage_observability.snapshot(root_raw)
     result["server_version"] = __version__
     result["server_tool"] = "aiworkhub_dashboard_health"
     result["authority_flags"] = _readonly_authority_flags()

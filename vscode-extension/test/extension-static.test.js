@@ -120,7 +120,8 @@ assert.ok(ext.includes("AIWORKHUB_REPO_ID"));
 assert.ok(ext.includes("AIWORKHUB_WINDOW_ID"));
 assert.ok(ext.includes("AIWORKHUB_CLAIM_EPISODE"));
 assert.ok(ext.includes('snapshot: "aiworkhub_dashboard_snapshot"'));
-assert.equal((ext.match(/DASHBOARD_TOOLS\.snapshot,/g) || []).length, 2);
+assert.equal((ext.match(/DASHBOARD_TOOLS\.snapshot,/g) || []).length, 3);
+assert.ok(ext.includes("{ full: false }"), "initial Webview render must use the bounded summary");
 assert.ok(ext.includes("MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS"));
 assert.ok(ext.includes("mcpClient.repositoryRoot !== root"));
 // B865: switching repositories must stop the OLD repo's lifecycle-owned

@@ -193,7 +193,10 @@ def test_extension_reload_restore_disposes_stale_controller_before_adopting_new_
 def test_extension_first_snapshot_precedes_dispatcher_convergence():
     handshake = _slice(_EXTENSION_JS, "async _handshake()", 1800)
     convergence = _slice(_EXTENSION_JS, "_convergeBackgroundServices()", 1800)
-    snapshot = _slice(_EXTENSION_JS, "async function pushSnapshotOnce(view)", 1800)
+    # The first snapshot now posts a bounded summary before the full payload;
+    # retain enough of the function to reach the deliberately later dispatcher
+    # convergence call.
+    snapshot = _slice(_EXTENSION_JS, "async function pushSnapshotOnce(view)", 4200)
     assert "this._convergeBackgroundServices()" not in handshake
     assert "this.ensureDispatcherStarted(5000)" in convergence
     assert snapshot.index("view.postMessage({") < snapshot.index("client._convergeBackgroundServices()")

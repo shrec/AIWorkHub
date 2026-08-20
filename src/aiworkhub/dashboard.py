@@ -15,6 +15,7 @@ import os
 import re
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -75,6 +76,51 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 _BEARER_TOKEN_RE = re.compile(
     r"(?i)\b(authorization)\s*(:)\s*(bearer)\s+([^\s,;\"'`<>]+)"
 )
+
+
+def _parallel_snapshot_reads(
+    operations: Mapping[str, tuple[str, Callable[[], Any], Any]],
+    errors: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Run independent dashboard reads concurrently with stable error order.
+
+    These operations are read-only and mostly SQLite/filesystem IO, which
+    releases the GIL.  On the canonical repository the full read set measured
+    6.06 s sequentially and 2.86 s concurrently.  Leave two observed cores for
+    the interactive MCP/control plane; a one-core host stays sequential.
+    """
+    if not operations:
+        return {}
+
+    available_workers = max(1, (os.cpu_count() or 1) - 2)
+    worker_count = min(len(operations), available_workers)
+
+    def run_one(spec: tuple[str, Callable[[], Any], Any]) -> tuple[Any, list[dict[str, str]]]:
+        source, operation, default = spec
+        local_errors: list[dict[str, str]] = []
+        return _safe_read(source, operation, local_errors, default), local_errors
+
+    if worker_count == 1:
+        completed = {key: run_one(spec) for key, spec in operations.items()}
+    else:
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="aiworkhub-dashboard-read",
+        ) as executor:
+            futures = {
+                key: executor.submit(run_one, spec)
+                for key, spec in operations.items()
+            }
+            # Consume in declaration order so the snapshot and its error list
+            # remain deterministic regardless of thread completion order.
+            completed = {key: futures[key].result() for key in operations}
+
+    results: dict[str, Any] = {}
+    for key in operations:
+        value, local_errors = completed[key]
+        results[key] = value
+        errors.extend(local_errors)
+    return results
 
 
 def _redact_credentials(text: str) -> str:
@@ -2151,13 +2197,77 @@ def build_snapshot(
     errors: list[dict[str, str]] = []
     task_groups: dict[str, list[dict[str, Any]]] = {}
 
-    for status in ACTIVE_STATUSES:
-        value = _safe_read(
-            f"tasks.{status}",
-            partial(data_provider.list_tasks, status),
-            errors,
-            [],
+    process_reader = getattr(
+        data_provider,
+        "get_agent_processes",
+        lambda: {"ok": True, "processes": [], "total_requests": 0},
+    )
+    kpi_process_reader = getattr(data_provider, "get_kpi_processes", None)
+    adapter_reader = getattr(
+        data_provider,
+        "get_adapter_readiness",
+        lambda: {"ok": True, "readonly": True, "adapters": []},
+    )
+    preflight_reader = getattr(data_provider, "get_environment_preflight", lambda: {})
+    workforce_reader = getattr(data_provider, "get_workforce_catalog", lambda: {})
+    callback_reader = getattr(
+        data_provider,
+        "get_callback_bridge_health",
+        lambda: {"bound_task_count": 0, "unbound_task_count": 0, "by_state": {}},
+    )
+    plan_reader = getattr(data_provider, "get_task_plan", lambda: {})
+    resolved_root = Path(provider_root or _default_repo_root()).resolve()
+
+    read_operations: dict[str, tuple[str, Callable[[], Any], Any]] = {
+        **{
+            f"tasks.{status}": (
+                f"tasks.{status}",
+                partial(data_provider.list_tasks, status),
+                [],
+            )
+            for status in ACTIVE_STATUSES
+        },
+        "completion_inbox": ("completion_inbox", data_provider.get_completion_inbox, {}),
+        "cost_ledger": ("cost_ledger", data_provider.get_cost_ledger, {}),
+        "collision_guard": ("collision_guard", data_provider.get_collision_report, {}),
+        "agent_processes": ("agent_processes", process_reader, {}),
+        "adapter_readiness": ("adapter_readiness", adapter_reader, {}),
+        "environment_preflight": ("environment_preflight", preflight_reader, {}),
+        "workforce_catalog": ("workforce_catalog", workforce_reader, {}),
+        "callback_bridge_health": ("callback_bridge_health", callback_reader, {}),
+        "task_plan": ("task_plan", plan_reader, {}),
+        "source_graph_index_health": (
+            "source_graph_index_health",
+            partial(source_graph_daemon.daemon_health, resolved_root),
+            {},
+        ),
+        "protocol_alert_telemetry": (
+            "protocol_alert_telemetry",
+            partial(_protocol_alert_telemetry, provider_root or _default_repo_root()),
+            {},
+        ),
+        "manager_decision_counts": (
+            "manager_decision_counts",
+            getattr(data_provider, "get_manager_decision_counts", lambda: {}),
+            {},
+        ),
+        "needfix": (
+            "needfix",
+            partial(_build_needfix_snapshot, provider_root or _default_repo_root()),
+            _needfix_unavailable(),
+        ),
+        "roadmap": ("roadmap", _build_roadmap_snapshot, _roadmap_unavailable()),
+    }
+    if kpi_process_reader is not None:
+        read_operations["kpi_process_history"] = (
+            "kpi_process_history",
+            kpi_process_reader,
+            {},
         )
+
+    reads = _parallel_snapshot_reads(read_operations, errors)
+    for status in ACTIVE_STATUSES:
+        value = reads[f"tasks.{status}"]
         task_groups[status] = _safe_read(
             f"tasks.{status}.normalize",
             partial(_normalize_task_rows, value, status),
@@ -2165,12 +2275,7 @@ def build_snapshot(
             [],
         )
 
-    inbox = _safe_read(
-        "completion_inbox",
-        data_provider.get_completion_inbox,
-        errors,
-        {},
-    )
+    inbox = reads["completion_inbox"]
     if not isinstance(inbox, Mapping):
         errors.append({
             "source": "completion_inbox",
@@ -2179,7 +2284,7 @@ def build_snapshot(
         })
         inbox = {}
 
-    ledger = _safe_read("cost_ledger", data_provider.get_cost_ledger, errors, {})
+    ledger = reads["cost_ledger"]
     if not isinstance(ledger, Mapping):
         errors.append({
             "source": "cost_ledger",
@@ -2188,12 +2293,7 @@ def build_snapshot(
         })
         ledger = {}
 
-    collision_report = _safe_read(
-        "collision_guard",
-        data_provider.get_collision_report,
-        errors,
-        {},
-    )
+    collision_report = reads["collision_guard"]
     if not isinstance(collision_report, Mapping):
         errors.append({
             "source": "collision_guard",
@@ -2202,12 +2302,7 @@ def build_snapshot(
         })
         collision_report = {}
 
-    process_reader = getattr(
-        data_provider,
-        "get_agent_processes",
-        lambda: {"ok": True, "processes": [], "total_requests": 0},
-    )
-    process_report = _safe_read("agent_processes", process_reader, errors, {})
+    process_report = reads["agent_processes"]
     if not isinstance(process_report, Mapping):
         errors.append({
             "source": "agent_processes",
@@ -2216,14 +2311,11 @@ def build_snapshot(
         })
         process_report = {}
 
-    kpi_process_reader = getattr(data_provider, "get_kpi_processes", None)
     if kpi_process_reader is None:
         kpi_process_report = process_report
         kpi_process_limit = DEFAULT_SNAPSHOT_PROCESS_LIMIT
     else:
-        kpi_process_report = _safe_read(
-            "kpi_process_history", kpi_process_reader, errors, process_report
-        )
+        kpi_process_report = reads["kpi_process_history"]
         if not isinstance(kpi_process_report, Mapping):
             errors.append({
                 "source": "kpi_process_history",
@@ -2233,12 +2325,7 @@ def build_snapshot(
             kpi_process_report = process_report
         kpi_process_limit = DEFAULT_KPI_HISTORY_PROCESS_LIMIT
 
-    adapter_reader = getattr(
-        data_provider,
-        "get_adapter_readiness",
-        lambda: {"ok": True, "readonly": True, "adapters": []},
-    )
-    adapter_readiness = _safe_read("adapter_readiness", adapter_reader, errors, {})
+    adapter_readiness = reads["adapter_readiness"]
     if not isinstance(adapter_readiness, Mapping):
         errors.append({
             "source": "adapter_readiness",
@@ -2247,10 +2334,7 @@ def build_snapshot(
         })
         adapter_readiness = {}
 
-    preflight_reader = getattr(data_provider, "get_environment_preflight", lambda: {})
-    environment_preflight = _safe_read(
-        "environment_preflight", preflight_reader, errors, {}
-    )
+    environment_preflight = reads["environment_preflight"]
     if not isinstance(environment_preflight, Mapping):
         errors.append({
             "source": "environment_preflight",
@@ -2259,8 +2343,7 @@ def build_snapshot(
         })
         environment_preflight = {}
 
-    workforce_reader = getattr(data_provider, "get_workforce_catalog", lambda: {})
-    workforce = _safe_read("workforce_catalog", workforce_reader, errors, {})
+    workforce = reads["workforce_catalog"]
     if not isinstance(workforce, Mapping):
         errors.append({
             "source": "workforce_catalog",
@@ -2269,12 +2352,7 @@ def build_snapshot(
         })
         workforce = {}
 
-    callback_reader = getattr(
-        data_provider,
-        "get_callback_bridge_health",
-        lambda: {"bound_task_count": 0, "unbound_task_count": 0, "by_state": {}},
-    )
-    callback_bridge_health = _safe_read("callback_bridge_health", callback_reader, errors, {})
+    callback_bridge_health = reads["callback_bridge_health"]
     if not isinstance(callback_bridge_health, Mapping):
         errors.append({
             "source": "callback_bridge_health",
@@ -2283,8 +2361,7 @@ def build_snapshot(
         })
         callback_bridge_health = {}
 
-    plan_reader = getattr(data_provider, "get_task_plan", lambda: {})
-    task_plan_snapshot = _safe_read("task_plan", plan_reader, errors, {})
+    task_plan_snapshot = reads["task_plan"]
     if not isinstance(task_plan_snapshot, Mapping):
         errors.append({
             "source": "task_plan",
@@ -2400,18 +2477,10 @@ def build_snapshot(
         row_counts[status] = {"returned": 0, "exact": exact, "truncated": exact > 0}
 
     source_graph_telemetry = _source_graph_telemetry(process_report)
-    source_graph_index_health = _safe_read(
-        "source_graph_index_health",
-        partial(
-            source_graph_daemon.daemon_health,
-            Path(provider_root or _default_repo_root()).resolve(),
-        ),
-        errors,
-        {},
-    )
+    source_graph_index_health = reads["source_graph_index_health"]
     read_efficiency_telemetry = _read_efficiency_telemetry(process_report)
     project_context_telemetry = _project_context_telemetry(process_report)
-    protocol_alert_telemetry = _protocol_alert_telemetry(provider_root or _default_repo_root())
+    protocol_alert_telemetry = reads["protocol_alert_telemetry"]
     cost_totals = _cost_totals(ledger)
     kpi_analytics = dashboard_kpis.build_kpi_snapshot(
         process_report=kpi_process_report,
@@ -2420,18 +2489,10 @@ def build_snapshot(
         callback_health=callback_bridge_health,
         cost_totals=cost_totals,
         process_limit=kpi_process_limit,
-        manager_decision_totals=_safe_read(
-            "manager_decision_counts",
-            getattr(data_provider, "get_manager_decision_counts", lambda: {}),
-            errors,
-            {},
-        ),
+        manager_decision_totals=reads["manager_decision_counts"],
     )
-
-    needfix_snapshot = _build_needfix_snapshot(
-        provider_root or _default_repo_root()
-    )
-    roadmap_snapshot = _build_roadmap_snapshot()
+    needfix_snapshot = reads["needfix"]
+    roadmap_snapshot = reads["roadmap"]
 
     return {
         "schema_version": 1,

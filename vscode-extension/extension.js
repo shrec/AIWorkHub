@@ -7082,10 +7082,14 @@ function refreshCoordinatorRouteBeforeSnapshot() {
 }
 
 async function pushSnapshotOnce(view) {
+  // The optional second argument is test-only dependency injection. Keep the
+  // public host call shape stable: production always resolves the repo-bound
+  // singleton through getMcpClient().
+  const options = arguments.length > 1 && arguments[1] ? arguments[1] : {};
   const requestSeq = ++view.snapshotRequestSeq;
   let lastError = null;
   debugTrace("snapshot.begin", { request_seq: requestSeq });
-  const client = getMcpClient();
+  const client = options.client || getMcpClient();
   view.bindClient(client);
   const snapshotRecovery = {
     category: "snapshot",
@@ -7094,6 +7098,35 @@ async function pushSnapshotOnce(view) {
     maxAttempts: MCP_SNAPSHOT_RECOVERY_ATTEMPTS,
     open: false,
   };
+  // Render the bounded summary first. The full snapshot intentionally joins
+  // many repository-local observability sources; making the Webview wait for
+  // that aggregation left every card blank for 20-30 seconds even though the
+  // summary is normally available in about two seconds.
+  try {
+    const summaryPayload = await client.callTool(
+      DASHBOARD_TOOLS.snapshot,
+      { full: false },
+      MCP_REQUEST_TIMEOUT_MS,
+    );
+    if (summaryPayload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
+      view.postMessage({
+        type: OUTBOUND_TYPES.snapshot,
+        payload: sanitizeWebviewPayload({
+          ...summaryPayload,
+          system_logs: systemLogSnapshot(),
+          extension_runtime_storage: runtimeRetentionSnapshot(),
+        }),
+      });
+      debugTrace("snapshot.summary.posted", { request_seq: requestSeq });
+    }
+  } catch (err) {
+    // Summary failure does not hide a full snapshot that may still succeed.
+    // Keep the existing bounded full-snapshot recovery classification below.
+    debugTrace("snapshot.summary.error", {
+      request_seq: requestSeq,
+      ...debugErrorFields(err),
+    });
+  }
   for (let attempt = 0; attempt < MCP_SNAPSHOT_RECOVERY_ATTEMPTS; attempt += 1) {
     if (attempt > 0) {
       if (client.recovery.open) break;
@@ -9401,6 +9434,7 @@ module.exports = {
     McpStdioClient,
     ViewState,
     pushSnapshot,
+    pushSnapshotOnce,
     pushSnapshotNoRetry,
     pushRuntimeInfo,
     runBackgroundTask,
