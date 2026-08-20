@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.9 — 2026-08-20
+
+### Fixed
+
+- Windows worker finalization and review acceptance now use a configurable,
+  bounded Git probe with exact process-tree cleanup and a complete mechanical
+  worktree-manifest fallback. Windows Preflight exercises the same isolated
+  zero-diff path and reports phase timings instead of returning a false Ready.
+
 ## 0.10.8 — 2026-08-20
 
 ### Fixed

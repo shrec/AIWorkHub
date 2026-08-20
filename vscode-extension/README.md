@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.9
+
+- Windows worker finalization and review acceptance no longer fail solely on
+  a hard-coded two-second Git probe. A full creation-time manifest verifies
+  zero-diff and changed paths after bounded Git-tree cleanup, while Preflight
+  now checks the real isolated finalization path.
+
 ## What's new in 0.10.8
 
 - Text-only GLM workers preserve intentional Source Graph query modes and

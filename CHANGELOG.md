@@ -6,6 +6,8 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.9] - 2026-08-20
+
 ### Fixed
 
 - Windows worker finalization no longer depends on a hard-coded two-second
