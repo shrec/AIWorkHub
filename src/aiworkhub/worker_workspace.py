@@ -1042,7 +1042,7 @@ def _materialize_rework_predecessor(
         authority_repo=repo,
         request_id=request_id,
         task_id=str(predecessor.get("task_id") or ""),
-        claim_id=str(predecessor.get("claim_id") or ""),
+        claim_epoch=predecessor.get("claim_epoch"),
         worktree=worktree,
         expected_path_hashes=hashes,
         allowed_writes=allowed_writes,
@@ -1116,14 +1116,14 @@ def seal_rework_delta_artifact(
     authority_repo: Path,
     task_id: str,
     request_id: str,
-    claim_id: str,
+    claim_epoch: int,
     file_entries: Iterable[tuple[str, bytes | None]],
     artifact_dir: Path,
 ) -> dict[str, str]:
     """Atomically seal exact predecessor bytes as one bounded delta artifact."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
         raise WorkspaceError(f"rework_delta_invalid_request_id:{request_id!r}")
-    if not task_id or not claim_id:
+    if not task_id or type(claim_epoch) is not int or claim_epoch < 1:
         raise WorkspaceError("rework_delta_identity_missing")
     entries = list(file_entries)
     if not entries:
@@ -1154,7 +1154,7 @@ def seal_rework_delta_artifact(
         "authority_repo": str(authority_repo.resolve(strict=False)),
         "task_id": task_id,
         "request_id": request_id,
-        "claim_id": claim_id,
+        "claim_epoch": claim_epoch,
         "files": files,
     }
     packet = {**payload, "canonical_digest": _rework_delta_canonical_digest(payload)}
@@ -1186,7 +1186,7 @@ def materialize_rework_delta_artifact(
     authority_repo: Path,
     request_id: str,
     task_id: str,
-    claim_id: str,
+    claim_epoch: int,
     worktree: Path,
     expected_path_hashes: dict[str, Any],
     allowed_writes: tuple[str, ...],
@@ -1225,7 +1225,8 @@ def materialize_rework_delta_artifact(
         str(packet.get("authority_repo")) != str(authority_repo.resolve(strict=False))
         or str(packet.get("request_id")) != request_id
         or str(packet.get("task_id")) != task_id
-        or str(packet.get("claim_id")) != claim_id
+        or type(packet.get("claim_epoch")) is not int
+        or packet.get("claim_epoch") != claim_epoch
     ):
         raise WorkspaceError("rework_delta_identity_mismatch")
     files = packet.get("files")

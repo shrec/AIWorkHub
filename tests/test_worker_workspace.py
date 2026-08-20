@@ -332,7 +332,7 @@ def test_rework_delta_artifact_round_trips_changed_and_deleted_files(
         repo,
         "task-1",
         "request-1",
-        "claim-1",
+        1,
         [("src/changed.txt", changed), ("src/deleted.txt", None)],
         tmp_path / "artifacts",
     )
@@ -342,7 +342,7 @@ def test_rework_delta_artifact_round_trips_changed_and_deleted_files(
         repo,
         "request-1",
         "task-1",
-        "claim-1",
+        1,
         worktree,
         {
             "src/changed.txt": hashlib.sha256(changed).hexdigest(),
@@ -366,7 +366,7 @@ def test_rework_delta_artifact_rejects_tampered_bytes(tmp_path: Path) -> None:
         repo,
         "task-1",
         "request-1",
-        "claim-1",
+        1,
         [("result.txt", content)],
         tmp_path / "artifacts",
     )
@@ -380,7 +380,7 @@ def test_rework_delta_artifact_rejects_tampered_bytes(tmp_path: Path) -> None:
             repo,
             "request-1",
             "task-1",
-            "claim-1",
+            1,
             worktree,
             {"result.txt": hashlib.sha256(content).hexdigest()},
             ("result.txt",),
@@ -400,15 +400,15 @@ def test_rework_delta_artifact_rejects_cross_identity_and_scope(
         repo,
         "task-1",
         "request-1",
-        "claim-1",
+        1,
         [("result.txt", content)],
         tmp_path / "artifacts",
     )
-    for authority_repo, request_id, task_id, claim_id in (
-        (tmp_path / "other", "request-1", "task-1", "claim-1"),
-        (repo, "request-2", "task-1", "claim-1"),
-        (repo, "request-1", "task-2", "claim-1"),
-        (repo, "request-1", "task-1", "claim-2"),
+    for authority_repo, request_id, task_id, claim_epoch in (
+        (tmp_path / "other", "request-1", "task-1", 1),
+        (repo, "request-2", "task-1", 1),
+        (repo, "request-1", "task-2", 1),
+        (repo, "request-1", "task-1", 2),
     ):
         with pytest.raises(
             worker_workspace.WorkspaceError, match="rework_delta_identity_mismatch"
@@ -418,7 +418,7 @@ def test_rework_delta_artifact_rejects_cross_identity_and_scope(
                 authority_repo,
                 request_id,
                 task_id,
-                claim_id,
+                claim_epoch,
                 worktree,
                 expected,
                 ("result.txt",),
@@ -431,7 +431,7 @@ def test_rework_delta_artifact_rejects_cross_identity_and_scope(
             repo,
             "request-1",
             "task-1",
-            "claim-1",
+            1,
             worktree,
             expected,
             ("other.txt",),
@@ -451,11 +451,11 @@ def test_rework_delta_artifact_rejects_incomplete_unexpected_and_duplicate(
         repo,
         "task-1",
         "request-1",
-        "claim-1",
+        1,
         [("result.txt", content)],
         tmp_path / "artifacts",
     )
-    common = (repo, "request-1", "task-1", "claim-1", worktree)
+    common = (repo, "request-1", "task-1", 1, worktree)
 
     with pytest.raises(
         worker_workspace.WorkspaceError, match="rework_delta_artifact_incomplete"
@@ -490,13 +490,25 @@ def test_rework_delta_artifact_rejects_incomplete_unexpected_and_duplicate(
 def test_rework_delta_artifact_rejects_invalid_paths_and_bounds(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    for claim_epoch in (True, 0, "1"):
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="rework_delta_identity_missing"
+        ):
+            worker_workspace.seal_rework_delta_artifact(
+                repo,
+                "task-1",
+                "request-1",
+                claim_epoch,  # type: ignore[arg-type]
+                [("result.txt", b"candidate")],
+                tmp_path / "artifacts",
+            )
     for raw_path in (None, "", "../outside", "/absolute", ".git/config"):
         with pytest.raises(worker_workspace.WorkspaceError):
             worker_workspace.seal_rework_delta_artifact(
                 repo,
                 "task-1",
                 "request-1",
-                "claim-1",
+                1,
                 [(raw_path, None)],  # type: ignore[list-item]
                 tmp_path / "artifacts",
             )
@@ -507,7 +519,7 @@ def test_rework_delta_artifact_rejects_invalid_paths_and_bounds(tmp_path: Path) 
             repo,
             "task-1",
             "request-1",
-            "claim-1",
+            1,
             [(f"rows/{index}.txt", None) for index in range(513)],
             tmp_path / "artifacts",
         )
@@ -518,7 +530,7 @@ def test_rework_delta_artifact_rejects_invalid_paths_and_bounds(tmp_path: Path) 
             repo,
             "task-1",
             "request-1",
-            "claim-1",
+            1,
             [("large.bin", b"x" * (worker_workspace.MAX_REWORK_OVERLAY_CONTENT_BYTES + 1))],
             tmp_path / "artifacts",
         )
@@ -545,7 +557,7 @@ def test_rework_delta_artifact_materializes_after_predecessor_cleanup(
         repo,
         "task-1",
         "delta-predecessor",
-        "claim-1",
+        1,
         [("out/result.txt", content)],
         tmp_path / "artifacts",
     )
@@ -560,7 +572,7 @@ def test_rework_delta_artifact_materializes_after_predecessor_cleanup(
                 "schema_id": "aiworkhub.rework_predecessor.v1",
                 "request_id": "delta-predecessor",
                 "task_id": "task-1",
-                "claim_id": "claim-1",
+                "claim_epoch": 1,
                 "workspace": predecessor_metadata,
                 "changed_path_hashes": {"out/result.txt": content_hash},
                 "delta_artifact": descriptor,
