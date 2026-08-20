@@ -12,6 +12,16 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.100
+
+- Dashboard counters and health render from a bounded summary before heavier
+  task, process, KPI, NeedFix and Roadmap sections hydrate.
+- Independent full-snapshot reads use a core-derived pool while reserving MCP
+  headroom; local full construction fell from 5.1–6.1 seconds to about 3.1.
+- Storage calculation starts during health initialization and publishes a
+  completed scan in the full response when available, eliminating the stale
+  multi-minute `Calculating` state on the measured 19.9 GB repository.
+
 ## What's new in 0.9.99
 
 - Manager dashboard summaries now skip full-only workforce, cost, KPI,

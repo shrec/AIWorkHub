@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.100] - 2026-08-20
+
+### Performance
+
+- The native dashboard now renders its bounded operational summary before the
+  full observability payload, removing the 20–30 second blank-panel wait.
+- Independent read-only dashboard sources run on a core-derived thread pool
+  that leaves two cores free for MCP. On the canonical repository, full
+  snapshot construction fell from 5.1–6.1 seconds to about 3.1 seconds.
+- Storage inventory starts during the cheap health handshake and the full
+  response publishes a scan that finishes during hydration. The measured
+  summary-to-complete path now reports the exact 19.9 GB managed total in about
+  5.9 seconds instead of leaving the card on `Calculating` until a later poll.
+
+### Fixed
+
+- Concurrent snapshot failures retain deterministic source/error ordering;
+  parallelism changes latency only, never the returned dashboard contract.
+
 ## [0.9.99] - 2026-08-20
 
 ### Performance

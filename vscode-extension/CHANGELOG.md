@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.100 — 2026-08-20
+
+### Performance
+
+- The dashboard posts its bounded summary first, so counters and health cards
+  appear in roughly two seconds instead of waiting 20–30 seconds for the full
+  payload.
+- Full snapshot reads hydrate concurrently with a core-derived worker count;
+  measured local construction fell to about three seconds.
+- Storage inventory begins during the health handshake and a completed scan is
+  folded into the same full response, preventing a stale `Calculating` card.
+
 ## 0.9.99 — 2026-08-20
 
 ### Performance
