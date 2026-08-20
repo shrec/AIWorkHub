@@ -2363,6 +2363,317 @@ def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> 
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _ReworkOverlayView:
+    """Read-only, request-local Source Graph delta prepared from the worktree."""
+
+    changed: Mapping[str, Any]
+    deleted: frozenset[str]
+    snapshot_sha256: str
+
+
+def _prepare_rework_overlay_view(
+    ctx: WorkerToolContext,
+    canonical_db_path: Path,
+    *,
+    build_revision: str,
+) -> _ReworkOverlayView | None:
+    """Extract only packet-bound worktree files without building or writing a DB."""
+
+    packet = ctx.rework_overlay_packet
+    if packet is None:
+        return None
+    from . import source_graph_ast as _source_graph_ast
+
+    entries = _build_rework_overlay_map(packet)
+    if not entries:
+        return _ReworkOverlayView({}, frozenset(), str(packet["canonical_digest"]))
+
+    canonical_hashes: dict[str, str] = {}
+    from . import source_graph as _source_graph
+
+    conn = _source_graph.connect(canonical_db_path, read_only=True)
+    try:
+        paths = tuple(sorted(entries))
+        for offset in range(0, len(paths), 400):
+            batch = paths[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"SELECT file_path, source_hash FROM files WHERE file_path IN ({placeholders})",
+                batch,
+            ).fetchall()
+            canonical_hashes.update({str(row[0]): str(row[1]) for row in rows})
+    finally:
+        conn.close()
+
+    repo_root = ctx.repo.resolve()
+    changed: dict[str, Any] = {}
+    deleted: set[str] = set()
+    snapshot_rows: list[dict[str, str | bool]] = []
+    for relative in sorted(entries):
+        raw_path = ctx.repo / relative
+        resolved = raw_path.resolve(strict=False)
+        if not resolved.is_relative_to(repo_root):
+            raise WorkerToolError(f"rework_overlay_path_escapes_workspace:{relative}")
+        if raw_path.is_symlink():
+            raise WorkerToolError(f"rework_overlay_path_symlink:{relative}")
+        if not resolved.exists():
+            deleted.add(relative)
+            snapshot_rows.append({"path": relative, "deleted": True})
+            continue
+        if not resolved.is_file():
+            raise WorkerToolError(f"rework_overlay_path_not_file:{relative}")
+        observed_hash = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        snapshot_rows.append({"path": relative, "sha256": observed_hash})
+        if canonical_hashes.get(relative) == observed_hash:
+            continue
+        extraction = _source_graph_ast.extract_file(
+            repo_root, resolved, build_revision=build_revision,
+        )
+        if extraction.status != "ok":
+            raise WorkerToolError(
+                f"rework_overlay_extract_failed:{relative}:{extraction.status}"
+            )
+        changed[relative] = extraction
+
+    snapshot_sha256 = hashlib.sha256(json.dumps(
+        {"packet": packet["canonical_digest"], "files": snapshot_rows},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return _ReworkOverlayView(changed, frozenset(deleted), snapshot_sha256)
+
+
+def _drop_shadowed_source_graph_rows(value: Any, shadowed: frozenset[str]) -> Any:
+    """Remove canonical rows and path lists owned by the request-local overlay."""
+
+    if isinstance(value, list):
+        rows = []
+        for item in value:
+            if isinstance(item, str) and item in shadowed:
+                continue
+            filtered = _drop_shadowed_source_graph_rows(item, shadowed)
+            if filtered is not None:
+                rows.append(filtered)
+        return rows
+    if not isinstance(value, dict):
+        return value
+    file_path = str(value.get("file_path") or value.get("file") or "")
+    if file_path in shadowed:
+        return None
+    return {
+        key: filtered
+        for key, item in value.items()
+        if (filtered := _drop_shadowed_source_graph_rows(item, shadowed)) is not None
+    }
+
+
+def _overlay_entity_match(extraction: Any, entity: Any, source: str) -> dict[str, Any]:
+    return {
+        "kind": entity.kind,
+        "name": entity.name,
+        "qualname": entity.qualname,
+        "file_path": entity.file_path,
+        "line_start": entity.line_start,
+        "line_end": entity.line_end,
+        "signature": entity.signature,
+        "evidence_label": entity.evidence_label,
+        "confidence": entity.confidence,
+        "source_hash": extraction.source_hash,
+        "build_revision": entity.build_revision,
+        "freshness": {
+            "state": "worktree_overlay",
+            "indexed_source_hash": extraction.source_hash,
+            "disk_source_hash": extraction.source_hash,
+        },
+        "source": source,
+        "provenance": "request_scoped_worktree",
+    }
+
+
+def _merge_rework_overlay_payload(
+    ctx: WorkerToolContext,
+    payload: dict[str, Any],
+    view: _ReworkOverlayView | None,
+    *,
+    mode: str,
+    query: str,
+    target: str | None,
+    budget: int,
+) -> tuple[dict[str, Any], bool]:
+    """Compose a canonical query result with a small in-memory worktree delta."""
+
+    if view is None or (not view.changed and not view.deleted):
+        return payload, False
+    shadowed = frozenset((*view.changed.keys(), *view.deleted))
+    merged = _drop_shadowed_source_graph_rows(payload, shadowed)
+    if not isinstance(merged, dict):
+        merged = {}
+
+    query_lower = query.casefold()
+    query_tokens = tuple(
+        token for token in re.split(r"[^a-zA-Z0-9_]+", query_lower) if token
+    )
+    overlay_matches: list[dict[str, Any]] = []
+    overlay_contexts: list[dict[str, Any]] = []
+    for relative, extraction in sorted(view.changed.items()):
+        text = (ctx.repo / relative).read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        if mode == "file":
+            requested = target or query
+            if requested != relative:
+                continue
+            file_row = {
+                "file_path": relative,
+                "language": extraction.language,
+                "status": extraction.status,
+                "source_hash": extraction.source_hash,
+                "build_revision": (
+                    extraction.entities[0].build_revision
+                    if extraction.entities else "worktree_overlay"
+                ),
+                "kind": "file",
+                "name": Path(relative).name,
+                "qualname": relative,
+                "line_start": 1,
+                "line_end": 1,
+                "provenance": "request_scoped_worktree",
+            }
+            overlay_matches.append(file_row)
+            overlay_contexts.append({
+                "found": True,
+                "file": file_row,
+                "entities": [
+                    _overlay_entity_match(extraction, entity, "")
+                    for entity in extraction.entities[:max(1, min(16, budget // 2))]
+                ],
+                "edges": [],
+                "source_preview": text[:4096],
+                "source_preview_bytes": len(text[:4096].encode("utf-8")),
+                "source_preview_truncated": len(text.encode("utf-8")) > 4096,
+            })
+            continue
+        if mode == "bodygrep":
+            if target is not None and target != relative:
+                continue
+            for line_number, line in enumerate(lines, 1):
+                if query_lower in line.casefold():
+                    overlay_matches.append({
+                        "kind": "body_match",
+                        "name": query,
+                        "qualname": f"{relative}:{line_number}",
+                        "file_path": relative,
+                        "line_start": line_number,
+                        "line_end": line_number,
+                        "signature": line.strip(),
+                        "source_hash": extraction.source_hash,
+                        "provenance": "request_scoped_worktree",
+                    })
+            continue
+        for entity in extraction.entities:
+            haystack = " ".join(
+                (entity.name, entity.qualname, entity.signature)
+            ).casefold()
+            exact = query_lower in {entity.name.casefold(), entity.qualname.casefold()}
+            if mode == "function" and entity.kind not in {"function", "method"}:
+                continue
+            if mode == "class" and entity.kind not in {"class", "struct", "enum"}:
+                continue
+            if mode in {"body", "function", "class"} and not exact:
+                continue
+            if mode in {"focus", "symbols"} and not all(
+                token in haystack for token in query_tokens
+            ):
+                continue
+            if mode not in {"body", "function", "class", "focus", "symbols"}:
+                continue
+            start = max(0, int(entity.line_start) - 1)
+            end = max(start, int(entity.line_end))
+            overlay_matches.append(
+                _overlay_entity_match(
+                    extraction, entity, "\n".join(lines[start:end]),
+                )
+            )
+
+    overlay_matches.sort(key=lambda row: (
+        str(row.get("file_path") or ""),
+        int(row.get("line_start") or 0),
+        str(row.get("qualname") or row.get("name") or ""),
+    ))
+    existing = merged.get("matches")
+    canonical_matches = existing if isinstance(existing, list) else []
+    merged["matches"] = (overlay_matches + canonical_matches)[:budget]
+    merged["candidate_files"] = sorted({
+        str(row.get("file_path") or "")
+        for row in merged["matches"]
+        if isinstance(row, dict) and str(row.get("file_path") or "")
+    })
+    if overlay_contexts:
+        canonical_contexts = merged.get("contexts")
+        merged["contexts"] = overlay_contexts + (
+            canonical_contexts if isinstance(canonical_contexts, list) else []
+        )
+    if mode == "focus" and overlay_matches:
+        ranked = merged.get("ranked_symbols")
+        merged["ranked_symbols"] = overlay_matches + (
+            ranked if isinstance(ranked, list) else []
+        )
+    merged["overlay"] = {
+        "authority_source": "rework_overlay",
+        "provenance": "request_scoped_worktree",
+        "snapshot_sha256": view.snapshot_sha256,
+        "changed_paths": sorted(view.changed),
+        "deleted_paths": sorted(view.deleted),
+    }
+    if mode in {"body", "function", "class"}:
+        merged["freshness"] = "worktree_overlay" if overlay_matches else "no_match"
+    return merged, True
+
+
+def _apply_rework_overlay_query(
+    ctx: WorkerToolContext,
+    mode: str,
+    query: str,
+    target: str | None,
+    budget: int,
+    *,
+    canonical_payload: dict[str, Any] | None = None,
+    view: _ReworkOverlayView | None = None,
+) -> Any:
+    """Production overlay seam; the legacy direct probe remains test-compatible."""
+
+    if canonical_payload is not None:
+        return _merge_rework_overlay_payload(
+            ctx, canonical_payload, view,
+            mode=mode, query=query, target=target, budget=budget,
+        )
+    if not ctx.rework_overlay_packet or target is None:
+        return None
+    entry = _build_rework_overlay_map(ctx.rework_overlay_packet).get(target)
+    if entry is None:
+        return None
+    if entry.get("deleted") is True:
+        return {"ok": False, "reason": "file_deleted_by_rework_overlay"}
+    encoded = entry.get("content_base64")
+    if encoded is None:
+        return {
+            "ok": True, "overlay": True, "mode": mode, "query": query,
+            "target": target, "source_hash": str(entry.get("sha256") or ""),
+            "matches": [], "candidate_files": [],
+        }
+    import base64
+    content = base64.b64decode(str(encoded), validate=True).decode(
+        "utf-8", errors="replace",
+    )
+    return {
+        "ok": True, "overlay": True, "mode": mode, "query": query,
+        "target": target, "source_hash": str(entry.get("sha256") or ""),
+        "source_preview": content[:8192],
+        "source_preview_truncated": len(content) > 8192,
+    }
+
+
 def source_graph_query(
     ctx: WorkerToolContext,
     *,
@@ -2451,12 +2762,26 @@ def source_graph_query(
             return _violation(ctx, tool, "target_not_allowed")
         scope = bounded_target
 
+    from . import source_graph as _source_graph_mod
     try:
-        binding = _resolve_source_graph_db(ctx)
-    except WorkerToolError as exc:
+        if ctx.rework_overlay_packet is None:
+            binding = _resolve_source_graph_db(ctx)
+            overlay_view = None
+        else:
+            candidate_binding = _candidate_source_graph_binding(ctx)
+            binding = candidate_binding or _canonical_source_graph_binding(ctx)
+            overlay_view = (
+                _prepare_rework_overlay_view(
+                    ctx,
+                    binding.db_path,
+                    build_revision=_source_graph_mod.BUILD_REVISION,
+                )
+                if candidate_binding is None
+                else None
+            )
+    except (WorkerToolError, OSError, sqlite3.Error) as exc:
         return _violation(ctx, tool, str(exc)[:160])
 
-    from . import source_graph as _source_graph_mod
     query_repo = binding.authority_repo or ctx.authority_repo
     index_identity = _source_graph_index_identity(
         binding.db_path, default_revision=_source_graph_mod.BUILD_REVISION,
@@ -2465,6 +2790,7 @@ def source_graph_query(
         "source_graph", ctx.task_id, ctx.request_id, str(query_repo),
         mode, bounded_query, scope, cursor, budget, bundle_type,
         binding.packet_sha256,
+        overlay_view.snapshot_sha256 if overlay_view is not None else "",
         index_identity["build_revision"], index_identity["finished_at"],
     )
     cached = _CACHE.get(cache_key)
@@ -2574,6 +2900,15 @@ def source_graph_query(
                 )
     except _source_graph_mod.SourceGraphError as exc:
         return _violation(ctx, tool, str(exc)[:160])
+    payload, overlay_applied = _apply_rework_overlay_query(
+        ctx,
+        mode,
+        bounded_query,
+        scope,
+        budget,
+        canonical_payload=payload,
+        view=overlay_view,
+    )
     if (
         mode == "file"
         and scope is not None
@@ -2678,7 +3013,18 @@ def source_graph_query(
                     else "no_ranked_semantic_match"
                 )
                 payload["requested_target"] = scope
-    hit_count = _json_hit_count(payload)
+    hit_payload = (
+        {key: value for key, value in payload.items() if key != "overlay"}
+        if isinstance(payload, dict)
+        else payload
+    )
+    if overlay_applied and mode in {
+        "focus", "file", "function", "class", "body", "bodygrep", "symbols",
+    }:
+        matches = payload.get("matches") if isinstance(payload, dict) else None
+        hit_count = len(matches) if isinstance(matches, list) else 0
+    else:
+        hit_count = _json_hit_count(hit_payload)
     evidence_counts = _source_graph_evidence_counts(payload)
     raw_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     truncated = len(raw_text.encode("utf-8")) > MAX_RAW_TOOL_OUTPUT_BYTES
@@ -2710,12 +3056,26 @@ def source_graph_query(
         "content_sha256": content_sha256,
         "cache_hit": False,
         "cache_receipt": False,
-        "authority_source": binding.authority_source,
-        "authority_state": binding.authority_state,
+        "authority_source": "rework_overlay" if overlay_applied else binding.authority_source,
+        "authority_state": (
+            "request_scoped_worktree" if overlay_applied else binding.authority_state
+        ),
         "authority_repo": str(query_repo),
-        "target_request_id": binding.target_request_id,
-        "target_task_id": binding.target_task_id,
-        "packet_sha256": binding.packet_sha256,
+        "target_request_id": (
+            str(ctx.rework_overlay_packet.get("predecessor_request_id") or "")
+            if overlay_applied and ctx.rework_overlay_packet is not None
+            else binding.target_request_id
+        ),
+        "target_task_id": (
+            str(ctx.rework_overlay_packet.get("predecessor_task_id") or "")
+            if overlay_applied and ctx.rework_overlay_packet is not None
+            else binding.target_task_id
+        ),
+        "packet_sha256": (
+            overlay_view.snapshot_sha256
+            if overlay_applied and overlay_view is not None
+            else binding.packet_sha256
+        ),
         "index_revision": index_identity["build_revision"],
         "index_finished_at": index_identity["finished_at"],
         "evidence_counts": evidence_counts,
@@ -2723,12 +3083,14 @@ def source_graph_query(
     _CACHE[cache_key] = {
         "result": result, "hit_count": hit_count, "bytes": bytes_returned,
         "content_sha256": content_sha256,
-        "authority_source": binding.authority_source, "authority_state": binding.authority_state,
+        "authority_source": result["authority_source"],
+        "authority_state": result["authority_state"],
         "evidence_counts": evidence_counts,
     }
     _append_audit(
         ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
-        authority_source=binding.authority_source, authority_state=binding.authority_state,
+        authority_source=result["authority_source"],
+        authority_state=result["authority_state"],
         authority_repo=query_repo,
         payload={
             "mode": mode,
@@ -2739,9 +3101,9 @@ def source_graph_query(
             "index_finished_at": index_identity["finished_at"],
             "evidence_counts": evidence_counts,
             "output_cap_bytes": output_cap_bytes,
-            "target_request_id": binding.target_request_id,
-            "target_task_id": binding.target_task_id,
-            "packet_sha256": binding.packet_sha256,
+            "target_request_id": result["target_request_id"],
+            "target_task_id": result["target_task_id"],
+            "packet_sha256": result["packet_sha256"],
         },
     )
     return result
@@ -4376,55 +4738,9 @@ def _verify_rework_overlay_packet(
 
 
 def _build_rework_overlay_map(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Return a dict mapping file path -> entry for fast overlay lookup."""
-    overlay: dict[str, dict[str, Any]] = {}
-    for entry in packet["files"]:
-        overlay[entry["path"]] = entry
-    return overlay
+    """Return the verified packet entries keyed by normalized relative path."""
 
-
-def _apply_rework_overlay_query(
-    ctx: WorkerToolContext,
-    mode: str,
-    query: str,
-    target: str | None,
-    budget: int,
-) -> dict[str, Any] | None:
-    """Return overlay result dict if the target file is shadowed by the rework packet.
-
-    Returns None when the fallback to canonical is needed.
-    """
-    if not ctx.rework_overlay_packet:
-        return None
-    overlay = _build_rework_overlay_map(ctx.rework_overlay_packet)
-    if target and target in overlay:
-        entry = overlay[target]
-        if "deleted" in entry:
-            return {"ok": False, "reason": "file_deleted_by_rework_overlay"}
-        if "content_base64" in entry:
-            import base64
-            content = base64.b64decode(entry["content_base64"]).decode("utf-8")
-            return {
-                "ok": True,
-                "overlay": True,
-                "mode": mode,
-                "query": query,
-                "target": target,
-                "source_preview": content[:8192],
-                "source_preview_truncated": len(content) > 8192,
-                "source_hash": entry.get("sha256", ""),
-            }
-        return {
-            "ok": True,
-            "overlay": True,
-            "mode": mode,
-            "query": query,
-            "target": target,
-            "source_hash": entry.get("sha256", ""),
-            "matches": [],
-            "candidate_files": [],
-        }
-    return None
+    return {str(entry["path"]): entry for entry in packet["files"]}
 
 
 if __name__ == "__main__":

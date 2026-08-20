@@ -194,10 +194,6 @@ CREATE TABLE IF NOT EXISTS task_events (
   payload_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_task_store_events_event_id
-  ON task_events(event, event_id DESC);
-CREATE INDEX IF NOT EXISTS idx_task_store_events_task_event_id
-  ON task_events(task_id, event, event_id DESC);
 
 CREATE TABLE IF NOT EXISTS callback_outbox (
   outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -256,6 +252,31 @@ CREATE TABLE IF NOT EXISTS task_retention_audit (
   created_at TEXT NOT NULL
 );
 """
+
+EVENT_INDEX_SCHEMA = """
+CREATE INDEX IF NOT EXISTS idx_task_store_events_event_id
+  ON task_events(event, event_id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_store_events_task_event_id
+  ON task_events(task_id, event, event_id DESC);
+"""
+
+
+def ensure_event_indexes(conn: sqlite3.Connection) -> bool:
+    """Install review-event indexes only when the host table has the new schema."""
+
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(task_events)").fetchall()
+    }
+    if not {"event_id", "task_id", "event"}.issubset(columns):
+        return False
+    before = {
+        str(row[1]) for row in conn.execute("PRAGMA index_list(task_events)").fetchall()
+    }
+    conn.executescript(EVENT_INDEX_SCHEMA)
+    after = {
+        str(row[1]) for row in conn.execute("PRAGMA index_list(task_events)").fetchall()
+    }
+    return before != after
 
 
 class TaskStoreError(RuntimeError):
@@ -342,6 +363,7 @@ def _atomic_init_schema(path: Path) -> None:
         conn = sqlite3.connect(str(tmp))
         try:
             conn.executescript(SCHEMA)
+            ensure_event_indexes(conn)
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.commit()
         finally:
@@ -602,6 +624,7 @@ def _upgrade_compatible_schema(path: Path) -> bool:
                     f"ALTER TABLE callback_batches ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
                 )
                 changed = True
+        changed = ensure_event_indexes(conn) or changed
         conn.commit()
     finally:
         conn.close()
