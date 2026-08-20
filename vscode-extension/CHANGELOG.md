@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.5 — 2026-08-20
+
+### Fixed
+
+- Worker Source Graph rework overlays are composed from one canonical read and
+  a bounded in-memory worktree delta, with deterministic shadow/tombstone
+  semantics and no query-time index build or database copy.
+- Older compatible task stores no longer fail startup while review-event
+  performance indexes are installed.
+
 ## 0.10.4 — 2026-08-20
 
 ### Performance

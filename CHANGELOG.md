@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-08-20
+
+### Fixed
+
+- Rework workers now query the canonical Source Graph once and compose only
+  packet-bound changed/deleted worktree paths in memory. Runtime queries no
+  longer build a private index or copy/write the canonical SQLite database;
+  changed files carry exact worktree hashes and deleted files are tombstoned.
+- Review-event indexes are installed only after the compatible `task_events`
+  schema is present, so additive startup against older task stores no longer
+  fails on a missing `event_id` column.
+
 ## [0.10.4] - 2026-08-20
 
 ### Performance

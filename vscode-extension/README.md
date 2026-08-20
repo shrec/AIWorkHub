@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.5
+
+- Rework workers see canonical Source Graph results plus exact changed/deleted
+  worktree paths without cloning or rebuilding the repository graph.
+- Task-store event indexes upgrade safely across older compatible schemas.
+
 ## What's new in 0.10.4
 
 - NeedFix active-state reads are roughly seven times faster on the canonical
