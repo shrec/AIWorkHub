@@ -395,8 +395,8 @@ def _unpushed_heads(repo_root: Path, heads: set[str]) -> set[str]:
     return {head for head in real_heads if head in reachable}
 
 
-def _request_ledger_owns_entry(repo_root: Path, base: Path, entry: Path) -> bool:
-    """Return whether AIWorkHub's durable request ledger owns ``entry``.
+def _request_ledger_owner_task_id(repo_root: Path, base: Path, entry: Path) -> str:
+    """Return the exact task id whose durable request ledger owns ``entry``.
 
     Git may prune a linked-worktree registration before retention gets a chance
     to account for the directory.  The request envelope is a second, exact
@@ -406,7 +406,7 @@ def _request_ledger_owns_entry(repo_root: Path, base: Path, entry: Path) -> bool
     task-lineage protection and the quarantine path's exact safety checks.
     """
     if not _WORKTREE_ID_RE.fullmatch(entry.name):
-        return False
+        return ""
     request_path = (
         configured_runtime_root(repo_root)
         / "process_logs"
@@ -415,24 +415,27 @@ def _request_ledger_owns_entry(repo_root: Path, base: Path, entry: Path) -> bool
     )
     try:
         if request_path.is_symlink() or not request_path.is_file():
-            return False
+            return ""
         if request_path.stat().st_size > 4 * 1024 * 1024:
-            return False
+            return ""
         payload = json.loads(request_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
+        return ""
     if not isinstance(payload, dict):
-        return False
+        return ""
     if payload.get("schema_id") != "aiworkhub.task_mcp.isolated_request.v1":
-        return False
+        return ""
     if str(payload.get("request_id") or "") != entry.name:
-        return False
+        return ""
     workspace = payload.get("workspace")
     if not isinstance(workspace, dict):
-        return False
+        return ""
+    owner_task_id = str(payload.get("task_id") or "").strip()
+    if not owner_task_id:
+        return ""
     expected_entry = (base / entry.name).resolve()
     try:
-        return (
+        owned = (
             Path(str(workspace.get("repo") or "")).resolve() == repo_root.resolve()
             and Path(str(workspace.get("path") or "")).resolve()
             == (expected_entry / "worktree").resolve()
@@ -440,8 +443,14 @@ def _request_ledger_owns_entry(repo_root: Path, base: Path, entry: Path) -> bool
             == (expected_entry / "home").resolve()
             and str(workspace.get("request_id") or "") == entry.name
         )
+        return owner_task_id if owned else ""
     except (OSError, RuntimeError):
-        return False
+        return ""
+
+
+def _request_ledger_owns_entry(repo_root: Path, base: Path, entry: Path) -> bool:
+    """Compatibility predicate for callers that need attribution only."""
+    return bool(_request_ledger_owner_task_id(repo_root, base, entry))
 
 
 def _linked_worktree_head(checkout: Path, repo_common_dir: str) -> str:
@@ -515,13 +524,17 @@ def _batch_repo_worktree_states(
     registered = _repo_registered_worktrees(repo_root)
     _rc, repo_origin = _git(repo_root, "config", "--get", "remote.origin.url")
     owned_head: dict[str, str] = {}
-    ledger_owned: set[str] = set()
+    ledger_owned: dict[str, str] = {}
     heads: set[str] = set()
     for entry in entries:
         checkout = entry / "worktree"
         head = registered.get(_norm_path(checkout), "")
-        if not head and _request_ledger_owns_entry(repo_root, entry.parent, entry):
-            ledger_owned.add(entry.name)
+        if not head:
+            owner_task_id = _request_ledger_owner_task_id(repo_root, entry.parent, entry)
+        else:
+            owner_task_id = ""
+        if not head and owner_task_id:
+            ledger_owned[entry.name] = owner_task_id
             head = _linked_worktree_head(checkout, repo_common_dir)
         if head and checkout.is_dir():
             owned_head[entry.name] = head
@@ -547,6 +560,7 @@ def _batch_repo_worktree_states(
             "ownership_source": (
                 "git_registration" if name not in ledger_owned else "request_ledger"
             ) if owned else "",
+            "owner_task_id": ledger_owned.get(name, ""),
         }
     return states
 
@@ -644,6 +658,7 @@ def scan_worktrees(
                 "unpushed": git_state["unpushed"],
                 "parent_git_dir": git_state["parent_git_dir"],
                 "ownership_source": str(git_state.get("ownership_source") or ""),
+                "owner_task_id": str(git_state.get("owner_task_id") or ""),
                 "modified_at_epoch": modified_at,
                 "age_seconds": max(0.0, time.time() - modified_at),
                 "class": worktree_class,

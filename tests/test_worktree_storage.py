@@ -73,6 +73,7 @@ def _write_request_ledger(repo: Path, base: Path, request_id: str) -> None:
             {
                 "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
                 "request_id": request_id,
+                "task_id": f"task-{request_id}",
                 "workspace": {
                     "repo": str(repo.resolve()),
                     "request_id": request_id,

@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.7] - 2026-08-20
+
+### Fixed
+
+- Storage retention now releases stale task/worktree pins when the owning
+  NeedFix is explicitly terminal, while nonterminal task lineage remains
+  protected. Exact request-ledger ownership and terminal NeedFix state are both
+  rechecked immediately before quarantine.
+- Broken Git metadata no longer strands terminal NeedFix worktrees forever.
+  Their files can be moved to reversible quarantine and restored truthfully to
+  the same ledger-owned orphan state; unknown or active orphans remain
+  fail-closed.
+
 ## [0.10.6] - 2026-08-20
 
 ### Fixed

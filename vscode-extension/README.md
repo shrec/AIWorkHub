@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.7
+
+- Terminal NeedFix lifecycle now releases stale converted-task storage pins.
+- Exact ledger-owned orphan worktrees can be quarantined and restored without
+  weakening protection for unknown or active workspaces.
+
 ## What's new in 0.10.6
 
 - Storage inventory attributes AIWorkHub-owned worktrees from their exact

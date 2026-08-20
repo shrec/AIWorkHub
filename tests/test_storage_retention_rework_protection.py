@@ -28,6 +28,7 @@ forbids ``os.utime``.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -37,7 +38,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import storage_retention, task_store
+from aiworkhub import needfix_store, storage_retention, task_store
 
 _AGED_NOW_OFFSET_DAYS = 31
 
@@ -125,6 +126,61 @@ def _insert_card(
         conn.close()
 
 
+def _insert_needfix(repo: Path, needfix_id: str, task_id: str, *, status: str) -> None:
+    needfix_store.initialize_repository(repo)
+    path = repo / ".aiworkhub" / "tasking" / "needfix.sqlite"
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "INSERT INTO needfix(id,dedupe_key,title,description,kind,severity,"
+            "provenance_json,status,converted_task_id,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                needfix_id,
+                f"dedupe-{needfix_id}",
+                needfix_id,
+                "storage lifecycle test",
+                "bug",
+                "medium",
+                "{}",
+                status,
+                task_id,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _write_request_ledger(
+    repo: Path, base: Path, request_id: str, task_id: str
+) -> None:
+    entry = base / request_id
+    home = entry / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    process_dir = repo / ".aiworkhub" / "runtime" / "process_logs" / "processes"
+    process_dir.mkdir(parents=True, exist_ok=True)
+    (process_dir / f"{request_id}.request.json").write_text(
+        json.dumps(
+            {
+                "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
+                "request_id": request_id,
+                "task_id": task_id,
+                "workspace": {
+                    "repo": str(repo.resolve()),
+                    "request_id": request_id,
+                    "path": str((entry / "worktree").resolve()),
+                    "home": str(home.resolve()),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _nonfinished_predecessors(repo: Path) -> set[str]:
     """Every rework_predecessor request id pinned by a card that is not in a
     finished lifecycle state, read straight from the canonical task table."""
@@ -167,6 +223,135 @@ def test_rework_predecessor_of_pending_card_is_protected_and_reported(
     assert preview["candidate_count"] == 0
     assert {"id": "attempt-1", "reason": "rework_predecessor_retained"} in preview["protected"]
     assert entry.is_dir()  # preview never mutates anything
+
+
+def test_terminal_needfix_releases_stale_blocked_task_predecessor_pin(
+    repo_with_worktrees,
+) -> None:
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    entry = _add_worktree(repo, base, "attempt-closed-needfix")
+    _insert_card(
+        repo,
+        "needfix-NF-2026-00999",
+        status="blocked",
+        rework_predecessor_request_id="attempt-closed-needfix",
+    )
+    _insert_needfix(
+        repo,
+        "NF-2026-00999",
+        "needfix-NF-2026-00999",
+        status="archived",
+    )
+
+    preview = storage_retention.preview(repo, base=base, now=_aged_now())
+
+    assert {item["id"] for item in preview["candidates"]} == {
+        "attempt-closed-needfix"
+    }
+    assert preview["pinned_predecessors"] == []
+    assert entry.is_dir()
+
+
+def test_nonterminal_needfix_keeps_blocked_task_predecessor_pin(
+    repo_with_worktrees,
+) -> None:
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    _add_worktree(repo, base, "attempt-active-needfix")
+    _insert_card(
+        repo,
+        "needfix-NF-2026-00998",
+        status="blocked",
+        rework_predecessor_request_id="attempt-active-needfix",
+    )
+    _insert_needfix(
+        repo,
+        "NF-2026-00998",
+        "needfix-NF-2026-00998",
+        status="task_created",
+    )
+
+    preview = storage_retention.preview(repo, base=base, now=_aged_now())
+
+    assert preview["candidate_count"] == 0
+    assert preview["pinned_predecessors"] == [
+        {
+            "id": "attempt-active-needfix",
+            "size_bytes": preview["pinned_predecessor_bytes"],
+            "pinned_by": ["needfix-NF-2026-00998"],
+        }
+    ]
+
+
+def test_terminal_needfix_request_ledger_orphan_quarantines_and_restores(
+    repo_with_worktrees, monkeypatch
+) -> None:
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    request_id = "attempt-terminal-orphan"
+    task_id = "needfix-NF-2026-00997"
+    entry = _add_worktree(repo, base, request_id)
+    _write_request_ledger(repo, base, request_id, task_id)
+    _insert_card(repo, task_id, status="blocked", launch_request_id=request_id)
+    _insert_needfix(repo, "NF-2026-00997", task_id, status="archived")
+    checkout = entry / "worktree"
+    gitdir = Path(
+        (checkout / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+    )
+    shutil.rmtree(gitdir)
+    monkeypatch.setattr(
+        storage_retention.worktree_storage,
+        "_repo_registered_worktrees",
+        lambda _repo: {},
+    )
+
+    preview = storage_retention.preview(repo, base=base, now=_aged_now())
+
+    assert [item["id"] for item in preview["candidates"]] == [request_id]
+    assert preview["candidates"][0]["reclaim_authority"] == (
+        "terminal_needfix_request_ledger"
+    )
+    result = storage_retention.quarantine(
+        repo,
+        preview_digest=preview["preview_digest"],
+        confirm=True,
+        base=base,
+        now=_aged_now(),
+    )
+    assert result["quarantined"] == 1
+    assert not entry.exists()
+    restored = storage_retention.restore(
+        repo, batch_id=result["batch_id"], confirm=True, base=base
+    )
+    assert restored["restored"] == 1
+    assert entry.is_dir()
+
+
+def test_nonterminal_request_ledger_orphan_remains_protected(
+    repo_with_worktrees, monkeypatch
+) -> None:
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    request_id = "attempt-active-orphan"
+    task_id = "needfix-NF-2026-00996"
+    entry = _add_worktree(repo, base, request_id)
+    _write_request_ledger(repo, base, request_id, task_id)
+    _insert_card(repo, task_id, status="blocked", launch_request_id=request_id)
+    _insert_needfix(repo, "NF-2026-00996", task_id, status="task_created")
+    checkout = entry / "worktree"
+    gitdir = Path(
+        (checkout / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+    )
+    shutil.rmtree(gitdir)
+    monkeypatch.setattr(
+        storage_retention.worktree_storage,
+        "_repo_registered_worktrees",
+        lambda _repo: {},
+    )
+
+    preview = storage_retention.preview(repo, base=base, now=_aged_now())
+
+    assert preview["candidate_count"] == 0
+    assert {item["id"]: item["reason"] for item in preview["protected"]}[
+        request_id
+    ] == "orphaned"
 
 
 def test_reclaim_leaves_no_launchable_card_without_its_predecessor(

@@ -65,6 +65,7 @@ MAX_DEADLINE_SECONDS = 86_400.0
 # reclaimable. Every other state (pending/processing/review/blocked) keeps its
 # predecessor attempt protected. Keyed on lifecycle only -- never mtime/age.
 _FINISHED_STATUSES = frozenset({"finished", "archived", "superseded"})
+_TERMINAL_NEEDFIX_STATUSES = frozenset({"rejected", "duplicate", "resolved", "archived"})
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 # A worktree HEAD recorded in a manifest is either a raw object name (sha1 or
 # sha256) or a symbolic ref. Reconstructing a pruned registration writes this
@@ -90,6 +91,37 @@ def _policy(repo_root: Path) -> tuple[int, int]:
     except (KeyError, TypeError, ValueError, repo_policy.RepoPolicyError):
         defaults = repo_policy.DEFAULT_POLICY["retention"]
         return int(defaults["terminal_runs_days"]), int(defaults["worktree_max_bytes"])
+
+
+def _terminal_needfix_task_ids(repo_root: Path) -> tuple[set[str], bool]:
+    """Return converted tasks whose owning NeedFix is explicitly terminal.
+
+    NeedFix's own lifecycle is the outer authority: archived/resolved/rejected/
+    duplicate records are closed even if an old converted task row was left
+    blocked.  Such stale rows must not pin a predecessor forever.  The read is
+    bounded to one indexed status query and fails closed; an absent NeedFix
+    database simply means there are no NeedFix-owned exemptions.
+    """
+    db_path = repo_root / ".aiworkhub" / "tasking" / "needfix.sqlite"
+    if not db_path.is_file():
+        return set(), True
+    try:
+        ro_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0)
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("PRAGMA busy_timeout=5000")
+            placeholders = ",".join("?" for _ in _TERMINAL_NEEDFIX_STATUSES)
+            rows = conn.execute(
+                f"SELECT converted_task_id FROM needfix "
+                f"WHERE status IN ({placeholders}) AND converted_task_id IS NOT NULL",
+                tuple(sorted(_TERMINAL_NEEDFIX_STATUSES)),
+            ).fetchall()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return set(), False
+    return {str(row[0]).strip() for row in rows if str(row[0] or "").strip()}, True
 
 
 def _protected_attempt_ids(
@@ -145,6 +177,7 @@ def _protected_attempt_ids(
     """
     protected: dict[str, str] = {}
     pinned_by: dict[str, list[str]] = {}
+    terminal_needfix_tasks, needfix_lineage_verified = _terminal_needfix_task_ids(repo_root)
     try:
         db_path = task_store.canonical_db_path(repo_root)
         # Path().resolve().as_uri() percent-encodes '#' as %23; the raw
@@ -170,17 +203,20 @@ def _protected_attempt_ids(
                 card_json = {}
             if not isinstance(card_json, dict):
                 continue
+            card_id = str(row["task_id"] or "").strip()
+            closed_by_needfix = (
+                needfix_lineage_verified and card_id in terminal_needfix_tasks
+            )
             if status in ("processing", "review"):
                 request_id = str(card_json.get("launch_request_id") or "").strip()
-                if request_id:
+                if request_id and not closed_by_needfix:
                     protected[request_id] = "live_worker"
-            if status not in _FINISHED_STATUSES:
+            if status not in _FINISHED_STATUSES and not closed_by_needfix:
                 predecessor = card_json.get("rework_predecessor")
                 if isinstance(predecessor, dict):
                     predecessor_id = str(predecessor.get("request_id") or "").strip()
                     if predecessor_id:
                         protected.setdefault(predecessor_id, "rework_predecessor_retained")
-                        card_id = str(row["task_id"] or "").strip()
                         if card_id:
                             holders = pinned_by.setdefault(predecessor_id, [])
                             if card_id not in holders:
@@ -224,6 +260,7 @@ def plan_worktree_reclaim(
     """
     root = Path(repo_root).resolve()
     protected_ids, lineage_verified, pinned_by = _protected_attempt_ids(root)
+    terminal_needfix_tasks, needfix_lineage_verified = _terminal_needfix_task_ids(root)
     minimum_age_seconds = max(0, min(int(min_age_days), 3650)) * 86400
     validated_now = _resolve_now(now)
     effective_now = time.time() if validated_now is None else validated_now
@@ -235,7 +272,15 @@ def plan_worktree_reclaim(
     protection_reasons: dict[str, str] = {}
     for wt in scan.get("worktrees") or []:
         wt_id = str(wt.get("id") or "")
-        if wt.get("class") == worktree_storage.CLASS_ORPHANED:
+        terminal_needfix_orphan = (
+            needfix_lineage_verified
+            and wt.get("ownership_source") == "request_ledger"
+            and str(wt.get("owner_task_id") or "") in terminal_needfix_tasks
+        )
+        if (
+            wt.get("class") == worktree_storage.CLASS_ORPHANED
+            and not terminal_needfix_orphan
+        ):
             would_keep.append(wt)
             protection_reasons[wt_id] = "orphaned"
             continue
@@ -243,7 +288,13 @@ def plan_worktree_reclaim(
             would_keep.append(wt)
             protection_reasons[wt_id] = protected_ids[wt_id]
             continue
-        if wt.get("class") == worktree_storage.CLASS_REMOVABLE_SAFE or lineage_verified:
+        if (
+            wt.get("class") == worktree_storage.CLASS_REMOVABLE_SAFE
+            or lineage_verified
+            or terminal_needfix_orphan
+        ):
+            if terminal_needfix_orphan:
+                wt = dict(wt, reclaim_authority="terminal_needfix_request_ledger")
             reclaimable.append(wt)
         else:
             # Dirty/unpushed and card lineage could not be verified: fail closed.
@@ -511,6 +562,9 @@ def _preview_payload(
             "head": str(item.get("head") or ""),
             "size_bytes": int(item.get("size_bytes") or 0),
             "modified_at_epoch": int(float(item.get("modified_at_epoch") or 0.0)),
+            "ownership_source": str(item.get("ownership_source") or ""),
+            "owner_task_id": str(item.get("owner_task_id") or ""),
+            "reclaim_authority": str(item.get("reclaim_authority") or ""),
         }
         for item in plan.get("would_remove") or []
     ]
@@ -1276,15 +1330,32 @@ def quarantine(
             continue
         # A candidate need not be CLASS_REMOVABLE_SAFE: plan_worktree_reclaim()
         # also admits superseded-lineage worktrees carrying unpushed local
-        # commits that were deliberately never going to be pushed. Orphaned
-        # (broken git metadata) worktrees are still refused here, matching
-        # preview's own exclusion.
+        # commits that were deliberately never going to be pushed. Broken Git
+        # metadata is admitted only by the explicit terminal-NeedFix + exact
+        # request-ledger authority established by the preview and rechecked here.
         git_state = worktree_storage._worktree_git_state(source / "worktree")
+        terminal_needfix_orphan = (
+            item.get("reclaim_authority") == "terminal_needfix_request_ledger"
+            and item.get("ownership_source") == "request_ledger"
+            and worktree_storage._request_ledger_owner_task_id(root, worktree_base, source)
+            == item.get("owner_task_id")
+        )
+        if terminal_needfix_orphan:
+            terminal_tasks, needfix_verified = _terminal_needfix_task_ids(root)
+            terminal_needfix_orphan = (
+                needfix_verified and item.get("owner_task_id") in terminal_tasks
+            )
         if (
-            worktree_storage._classify(git_state) == worktree_storage.CLASS_ORPHANED
-            or git_state.get("head") != item["head"]
+            (
+                not terminal_needfix_orphan
+                and (
+                    worktree_storage._classify(git_state)
+                    == worktree_storage.CLASS_ORPHANED
+                    or git_state.get("head") != item["head"]
+                    or git_state.get("parent_git_dir") != repo_common_dir
+                )
+            )
             or not repo_common_dir
-            or git_state.get("parent_git_dir") != repo_common_dir
         ):
             item["state"] = "skipped_git_state_changed"
             _atomic_json(manifest_path, manifest)
@@ -1541,6 +1612,7 @@ def restore(
     repo_common_dir = worktree_storage._git_common_dir(root)
     restored = 0
     reinstated: list[str] = []
+    restored_orphaned: list[str] = []
     registration_lost: list[str] = []
     workspace_absent: list[str] = []
     for item in manifest["items"]:
@@ -1583,6 +1655,24 @@ def restore(
         if repo_common_dir and worktree_storage._git_common_dir(checkout) == repo_common_dir:
             item["state"] = "restored"
             reinstated.append(item_id)
+        elif item.get("reclaim_authority") == "terminal_needfix_request_ledger":
+            owner_task_id = worktree_storage._request_ledger_owner_task_id(
+                root, worktree_base, destination
+            )
+            terminal_tasks, needfix_verified = _terminal_needfix_task_ids(root)
+            if (
+                needfix_verified
+                and owner_task_id == item.get("owner_task_id")
+                and owner_task_id in terminal_tasks
+            ):
+                # This checkout was already orphaned before quarantine. Restoring
+                # its files to that exact, ledger-owned state is a truthful full
+                # rollback; no Git registration existed that could be reinstated.
+                item["state"] = "restored_orphaned"
+                restored_orphaned.append(item_id)
+            else:
+                item["state"] = "restored_registration_lost"
+                registration_lost.append(item_id)
         else:
             # Files are back, but the registration could not be reinstated: record
             # a loud, non-ok outcome instead of reporting the worktree restored
@@ -1591,7 +1681,8 @@ def restore(
             registration_lost.append(item_id)
         _atomic_json(manifest_path, manifest)
     manifest["status"] = "restored" if restored else manifest.get("status", "quarantined")
-    manifest["restored_count"] = len(reinstated)
+    manifest["restored_count"] = len(reinstated) + len(restored_orphaned)
+    manifest["restored_orphaned"] = sorted(restored_orphaned)
     manifest["registration_lost"] = sorted(registration_lost)
     manifest["workspace_absent"] = sorted(workspace_absent)
     _atomic_json(manifest_path, manifest)
@@ -1602,6 +1693,7 @@ def restore(
         "batch_id": batch_id,
         "count": restored,
         "reinstated": len(reinstated),
+        "restored_orphaned": sorted(restored_orphaned),
         "registration_lost": sorted(registration_lost),
         "workspace_absent": sorted(workspace_absent),
     })
@@ -1624,6 +1716,7 @@ def restore(
         "batch_id": batch_id,
         "restored": restored,
         "reinstated": len(reinstated),
+        "restored_orphaned": len(restored_orphaned),
     }
 
 

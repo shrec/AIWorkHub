@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.7 — 2026-08-20
+
+### Fixed
+
+- Closed NeedFix records no longer leave stale task lineage pinning retained
+  worktrees indefinitely. Ledger-owned broken checkouts are reclaimable only
+  through reversible quarantine with terminal ownership revalidation.
+
 ## 0.10.6 — 2026-08-20
 
 ### Fixed
