@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.97 — 2026-08-20
+
+### Performance
+
+- Incremental Source Graph refreshes now resolve only changed Python callers
+  and added, removed or renamed function identities instead of scanning the
+  repository-wide call graph.
+- The Source Graph quality joins now use a dedicated qualname index. Measured
+  refresh time on the AIWorkHub repository fell from roughly 55 seconds to
+  roughly 5 seconds.
+- Task-plan and collision snapshots now decode all bounded cards in one SQLite
+  read instead of reopening the database once per task.
+
 ## 0.9.96 — 2026-08-20
 
 ### Fixed

@@ -6,6 +6,29 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.97] - 2026-08-20
+
+### Performance
+
+- **Incremental Source Graph refreshes no longer re-scan the repository-wide
+  Python call graph for a local edit.** Cross-file resolution is bounded to
+  changed callers and function identities that were actually added, removed or
+  renamed. Rename/delete invalidation remains fail-closed.
+- Added the missing `entities.qualname` SQLite index used by edge resolution
+  and index-quality joins. On the 818-file AIWorkHub repository, the measured
+  incremental refresh fell from about 55 seconds to about 5 seconds and the
+  quality scorecard from 29.1 seconds to 0.22 seconds.
+- **Task-plan snapshots no longer perform one SQLite read per task.** The plan
+  now consumes one bounded decoded-card snapshot; the measured 601-task plan
+  fell from over 90 seconds to about 0.31 seconds without changing DAG or
+  collision semantics.
+
+### Fixed
+
+- Source Graph readers remain serviceable during the shortened incremental
+  refresh window; the canonical base plus request-local partition model stays
+  intact and no full database copy is introduced.
+
 ## [0.9.96] - 2026-08-20
 
 ### Fixed

@@ -12,6 +12,15 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.97
+
+- Source Graph incremental refreshes are now scoped to changed Python callers
+  and genuinely changed function identities, preserving rename/delete truth
+  without a repository-wide edge scan.
+- A dedicated qualname index removes the dominant quality-scorecard bottleneck.
+- Task-plan snapshots use one bounded SQLite card read instead of an N+1 query
+  pattern, keeping large NeedFix/task histories responsive.
+
 ## What's new in 0.9.96
 
 - Long-running model work is no longer killed after ten quiet minutes while its
