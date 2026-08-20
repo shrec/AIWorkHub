@@ -419,3 +419,63 @@ def test_run_validations_mypy_declared_argv_bare_executed_is_repo_venv(
     assert result[0]["argv_rewritten"] is True
     assert captured["argv"] == [str(mypy.resolve()), "check", "src"]
     assert captured["shell"] is False
+
+
+def test_run_validations_bare_pytest_executes_trusted_repo_interpreter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-00271: a bare ``pytest`` command must execute through the trusted
+    repository interpreter (``sys.executable -m pytest``) when a trusted pytest
+    runtime root is available -- never through an unverifiable PATH ``pytest``."""
+    workspace = _workspace(tmp_path)
+    runtime_root = tmp_path / "project" / ".venv"
+    runtime_root.mkdir(parents=True)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        worker_workspace,
+        "resolve_trusted_pytest_runtime_root",
+        lambda: runtime_root.resolve(strict=False),
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "_validation_pythonpath_readonly_dirs",
+        lambda components: tuple(Path(c) for c in components),
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "resolve_validation_pythonpath",
+        lambda workspace, backend, components: str(runtime_root.resolve(strict=False)),
+    )
+    monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "landlock")
+    monkeypatch.setattr(
+        worker_workspace,
+        "provision_validation_exec_scratch",
+        lambda ws: tmp_path / "scratch",
+    )
+    monkeypatch.setattr(
+        worker_workspace, "cleanup_validation_exec_scratch", lambda path: None
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "sandbox_argv",
+        lambda ws, adapter_id, argv, **kw: list(argv),
+    )
+    monkeypatch.setattr(
+        worker_workspace, "sanitized_env", lambda *a, **kw: {"PATH": "/bin"}
+    )
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["shell"] = kwargs.get("shell")
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", fake_run)
+
+    result = worker_workspace.run_validations(workspace, ["pytest -q"])
+
+    expected = [worker_workspace.sys.executable, "-m", "pytest", "-q"]
+    assert result[0]["executed_argv"] == expected
+    assert result[0]["argv"] == expected
+    assert result[0]["argv_rewritten"] is True
+    assert captured["argv"] == expected
+    assert captured["shell"] is False

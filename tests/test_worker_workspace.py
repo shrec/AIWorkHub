@@ -3146,6 +3146,60 @@ def test_validation_permission_failure_does_not_obscure_candidate_failure(
     assert caught.value.requires_supersede is True
 
 
+def test_run_validations_explicit_backend_unsupported_is_named_not_failed(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-00271: an unsupported explicit ``backend=`` must surface as the
+    recoverable ``validation_unsupported_in_sandbox`` restriction -- never as the
+    acceptance-blocking ``validation_failed`` -- and keep the exact backend token
+    so a recovered card names the precise reason. It is a plain ``WorkspaceError``
+    (not a ``ValidationRunError``), so the finalizer routes it to the retryable
+    ``finalize_failed`` bucket that preserves the retained workspace/hashes."""
+    workspace = _bare_workspace(tmp_path, "unsupported-backend")
+
+    with pytest.raises(worker_workspace.WorkspaceError) as caught:
+        worker_workspace.run_validations(
+            workspace, ["pytest -q"], backend="bogus-backend"
+        )
+
+    message = str(caught.value)
+    assert message.startswith(worker_workspace.VALIDATION_UNSUPPORTED_IN_SANDBOX + ":")
+    assert "unsupported_sandbox_backend:bogus-backend" in message
+    assert worker_workspace.VALIDATION_FAILED not in message
+    assert not isinstance(caught.value, worker_workspace.ValidationRunError)
+    assert not isinstance(caught.value, worker_workspace.ValidationEnvironmentBlocked)
+
+
+def test_run_validations_sandbox_selection_failure_is_unsupported_not_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the sandbox backend cannot be provisioned (no bwrap/landlock), the
+    validation run must be named ``validation_unsupported_in_sandbox`` with the
+    exact selection restriction preserved -- never ``validation_failed`` -- so a
+    provider-free ``retry_finalization`` can re-run it in a corrected sandbox."""
+    workspace = _bare_workspace(tmp_path, "sandbox-unsupported")
+
+    def _raise_selection_error() -> None:
+        raise worker_workspace.WorkspaceError(
+            "secure_sandbox_unavailable:bubblewrap_unusable:landlock_unsupported"
+        )
+
+    monkeypatch.setattr(worker_workspace, "select_sandbox_backend", _raise_selection_error)
+
+    with pytest.raises(worker_workspace.WorkspaceError) as caught:
+        worker_workspace.run_validations(workspace, ["pytest -q"])
+
+    message = str(caught.value)
+    assert message.startswith(worker_workspace.VALIDATION_UNSUPPORTED_IN_SANDBOX + ":")
+    assert (
+        "secure_sandbox_unavailable:bubblewrap_unusable:landlock_unsupported"
+        in message
+    )
+    assert worker_workspace.VALIDATION_FAILED not in message
+    assert not isinstance(caught.value, worker_workspace.ValidationRunError)
+    assert not isinstance(caught.value, worker_workspace.ValidationEnvironmentBlocked)
+
+
 # ── NF-2026-00285: create/promote consistency window ───────────────────────
 
 

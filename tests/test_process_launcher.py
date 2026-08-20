@@ -640,6 +640,255 @@ def test_retry_finalization_rejects_product_validation_failure(monkeypatch, tmp_
     )
 
 
+def test_environment_blocked_validation_is_never_reported_as_validation_failed():
+    """NF-2026-00271: a recoverable environment/sandbox restriction must route
+    to the retryable ``finalize_failed`` bucket, never to the acceptance-blocking
+    ``validation_failed`` (the candidate did not fail its gate)."""
+    from aiworkhub import worker_workspace
+
+    env_blocked = worker_workspace.ValidationEnvironmentBlocked(
+        "validation_environment_blocked:missing_package:pytest:"
+        "restrictions=missing_package:stderr=",
+        [],
+        restriction="missing_package",
+        restrictions=("missing_package",),
+    )
+    assert (
+        process_launcher._terminal_state_for_workspace_error(env_blocked)
+        == "finalize_failed"
+    )
+
+    genuine = worker_workspace.ValidationRunError(
+        "validation_failed:pytest:rc=1:stdout=:stderr=", []
+    )
+    assert (
+        process_launcher._terminal_state_for_workspace_error(genuine)
+        == "validation_failed"
+    )
+
+    # Environment/sandbox restrictions must never become ``validation_failed``:
+    # an absent executable, an unavailable pytest runtime, an unprovisionable
+    # exec scratch, and a missing validator package are all recoverable.
+    assert process_launcher._terminal_state_for_workspace_error(
+        process_launcher.WorkspaceError("validation_executable_unavailable:pytest")
+    ) == "finalize_failed"
+    assert process_launcher._terminal_state_for_workspace_error(
+        process_launcher.WorkspaceError("validation_pytest_runtime_missing_pytest:/x")
+    ) == "finalize_failed"
+    assert process_launcher._terminal_state_for_workspace_error(
+        process_launcher.WorkspaceError(
+            "validation_exec_scratch_unavailable:request-home:noexec"
+        )
+    ) == "finalize_failed"
+    assert process_launcher._terminal_state_for_workspace_error(
+        process_launcher.WorkspaceError("unsupported_sandbox_backend:bogus")
+    ) == "finalize_failed"
+
+    # Genuine candidate gate failures keep the acceptance-blocking state.
+    assert process_launcher._terminal_state_for_workspace_error(
+        process_launcher.WorkspaceError("required_output_missing:out/result.json")
+    ) == "validation_failed"
+    assert process_launcher._terminal_state_for_workspace_error(
+        process_launcher.WorkspaceError("quality_gate_failed:coverage")
+    ) == "validation_failed"
+
+    assert process_launcher._terminal_state_for_workspace_error(
+        process_launcher.WorkspaceError("scope_violation:out/result.json")
+    ) == "scope_rejected"
+    assert process_launcher._terminal_state_for_workspace_error(
+        process_launcher.WorkspaceError("promotion_scope:out")
+    ) == "promotion_conflict"
+    assert process_launcher._terminal_state_for_workspace_error(
+        process_launcher.WorkspaceError("some_unexpected_error")
+    ) == "finalize_failed"
+
+
+def test_candidate_contract_validation_tokens_are_acceptance_blocking():
+    """NF-2026-00271 (rework): deterministic candidate/card validation defects
+    must stay acceptance-blocking ``validation_failed``. Only genuine
+    environment/sandbox restrictions may reach the retryable ``finalize_failed``
+    bucket; a catch-all there would let a provider-free ``retry_finalization``
+    loop re-run a defect the candidate itself authored."""
+    candidate_contract_tokens = (
+        "validation_route_adapter_missing",
+        "validation_commands_invalid",
+        "validation_command_invalid",
+        "validation_receipt_count_mismatch",
+        "validation_failure_delta_too_large",
+        "validation_command_limit_exceeded:9",
+        "validation_cwd_not_directory:sub",
+        "validation_pythonpath_not_directory:src",
+        # Additional deterministic defects from the same declared-command
+        # parsing and contract-shape surface.
+        "validation_route_backend_mismatch:expected=landlock:recorded=bwrap",
+        "validation_shell_syntax_forbidden:cd sub && pytest|tee",
+        "validation_pythonpath_empty",
+        "validation_cd_prefix_malformed",
+        "invalid_validation_command",
+    )
+    for token in candidate_contract_tokens:
+        assert (
+            process_launcher._terminal_state_for_workspace_error(
+                process_launcher.WorkspaceError(token)
+            )
+            == "validation_failed"
+        ), token
+
+    # The narrow environment/sandbox allowlist is unchanged: the same classifier
+    # still routes a missing executable / runtime / scratch / backend to the
+    # retryable bucket, never to ``validation_failed``.
+    for token in (
+        "validation_executable_unavailable:pytest",
+        "validation_pytest_runtime_unavailable:/x",
+        "validation_pytest_runtime_missing_pytest:/x",
+        "validation_exec_scratch_unavailable:request-home:noexec",
+        "unsupported_sandbox_backend:bogus",
+        "validation_unsupported_in_sandbox:secure_sandbox_unavailable",
+    ):
+        assert (
+            process_launcher._terminal_state_for_workspace_error(
+                process_launcher.WorkspaceError(token)
+            )
+            == "finalize_failed"
+        ), token
+
+
+def test_validation_security_refusals_are_acceptance_blocking():
+    """NF-2026-00271 (rework): security refusals and candidate validation
+    defects must stay acceptance-blocking ``validation_failed``. The exact-token
+    allowlist -- not a broad ``validation_executable_`` /
+    ``validation_pytest_runtime_`` family prefix -- is the only route to the
+    recoverable ``finalize_failed`` bucket, so a world-writable or
+    untrusted-owner validator binary/runtime-root, a symlink-forbidden pytest
+    runtime, or an unapproved/non-executable validator fails closed instead of
+    failing open."""
+    security_refusal_tokens = (
+        "validation_executable_world_writable:/x",
+        "validation_executable_untrusted_owner:/x",
+        "validation_executable_runtime_root_world_writable:/x",
+        "validation_executable_runtime_root_untrusted_owner:/x",
+        "validation_executable_untrusted_runtime_root:/x",
+        "validation_executable_not_approved:pylint",
+        "validation_executable_not_executable:/x",
+        "validation_pytest_runtime_world_writable:/x",
+        "validation_pytest_runtime_untrusted_owner:/x",
+        "validation_pytest_runtime_symlink_forbidden:/x",
+    )
+    for token in security_refusal_tokens:
+        assert (
+            process_launcher._terminal_state_for_workspace_error(
+                process_launcher.WorkspaceError(token)
+            )
+            == "validation_failed"
+        ), token
+
+
+def test_validation_recoverable_environment_tokens_are_exact():
+    """NF-2026-00271 (rework): only the six colon-terminated recoverable tokens
+    route to the retryable ``finalize_failed`` bucket. A broad family prefix
+    would fail-open and reclassify a security refusal as recoverable."""
+    recoverable_tokens = (
+        "validation_executable_unavailable:pytest",
+        "validation_pytest_runtime_unavailable:/x",
+        "validation_pytest_runtime_missing_pytest:/x",
+        "validation_exec_scratch_unavailable:request-home:noexec",
+        "unsupported_sandbox_backend:bogus",
+        "validation_unsupported_in_sandbox:secure_sandbox_unavailable",
+    )
+    for token in recoverable_tokens:
+        assert (
+            process_launcher._terminal_state_for_workspace_error(
+                process_launcher.WorkspaceError(token)
+            )
+            == "finalize_failed"
+        ), token
+
+
+def test_run_declared_validations_preserves_environment_blocked_subtype(monkeypatch):
+    """The finalizer seam must keep ``ValidationEnvironmentBlocked`` (with its
+    ``terminal_state``/``restriction``/``recoverable`` flags) so routing can
+    tell an environment block apart from a genuine candidate failure."""
+    from aiworkhub import worker_workspace
+
+    raised = worker_workspace.ValidationEnvironmentBlocked(
+        "validation_environment_blocked:missing_package:pytest:"
+        "restrictions=missing_package:stderr=",
+        [{
+            "command": "pytest",
+            "returncode": 1,
+            "failure_receipt": {"failure_class": "absent_validator_module"},
+        }],
+        restriction="missing_package",
+        restrictions=("missing_package",),
+    )
+
+    monkeypatch.setattr(
+        process_launcher.quality_evidence,
+        "normalize_behavioral_contract",
+        lambda work_kind, commands, roles: ("code", ["gate"]),
+    )
+    monkeypatch.setattr(process_launcher, "_validation_route_kwargs", lambda meta: {})
+
+    def _raise(*_args, **_kwargs):
+        raise raised
+
+    monkeypatch.setattr(process_launcher, "run_validations", _raise)
+
+    with pytest.raises(worker_workspace.ValidationEnvironmentBlocked) as caught:
+        process_launcher._run_declared_validations(
+            object(),
+            {"validation": ["pytest"], "work_kind": "code"},
+            {"adapter_id": "claude_cli"},
+        )
+
+    exc = caught.value
+    assert isinstance(exc, worker_workspace.ValidationEnvironmentBlocked)
+    assert exc.terminal_state == "validation_environment_blocked"
+    assert exc.recoverable is True
+    assert exc.requires_supersede is False
+    assert exc.restriction == "missing_package"
+    assert exc.restrictions == ("missing_package",)
+    assert exc.results[0]["behavioral_role"] == "gate"
+    assert exc.results[0]["failure_receipt"]["failure_class"] == "absent_validator_module"
+
+
+def test_run_declared_validations_keeps_genuine_failure_as_validation_run_error(monkeypatch):
+    """A real gate failure must stay ``ValidationRunError``/``validation_failed``
+    through the finalizer seam -- it is never weakened into an environment
+    block (NF-WAVE-SANDBOX-TRUTH)."""
+    from aiworkhub import worker_workspace
+
+    raised = worker_workspace.ValidationRunError(
+        "validation_failed:pytest:rc=1:stdout=:stderr=",
+        [{"command": "pytest", "returncode": 1}],
+    )
+
+    monkeypatch.setattr(
+        process_launcher.quality_evidence,
+        "normalize_behavioral_contract",
+        lambda work_kind, commands, roles: ("code", ["gate"]),
+    )
+    monkeypatch.setattr(process_launcher, "_validation_route_kwargs", lambda meta: {})
+
+    def _raise(*_args, **_kwargs):
+        raise raised
+
+    monkeypatch.setattr(process_launcher, "run_validations", _raise)
+
+    with pytest.raises(worker_workspace.ValidationRunError) as caught:
+        process_launcher._run_declared_validations(
+            object(),
+            {"validation": ["pytest"], "work_kind": "code"},
+            {"adapter_id": "claude_cli"},
+        )
+
+    exc = caught.value
+    assert not isinstance(exc, worker_workspace.ValidationEnvironmentBlocked)
+    assert exc.terminal_state == "validation_failed"
+    assert exc.requires_supersede is True
+    assert exc.results[0]["behavioral_role"] == "gate"
+
+
 def test_reconcile_defers_live_windows_pid_without_start_ticks(monkeypatch, tmp_path):
     manager = _manager(
         tmp_path,
@@ -1571,17 +1820,6 @@ def test_empty_declared_validation_skips_route_and_scratch(monkeypatch, tmp_path
         {"validation": []},
         {"adapter_id": "vscode_lm", "sandbox_backend": "deterministic_validation"},
     ) == []
-
-
-def test_operational_scratch_failure_is_not_quality_review_eligible():
-    error = "validation_exec_scratch_unavailable:request-home:noexec"
-
-    assert process_launcher._is_operational_validation_failure(
-        "validation_failed", error
-    ) is True
-    assert process_launcher._is_operational_validation_failure(
-        "validation_failed", "validation_failed:pytest:rc=1"
-    ) is False
 
 
 def test_validation_only_replay_skips_bridge_cancellation_only_without_provider():

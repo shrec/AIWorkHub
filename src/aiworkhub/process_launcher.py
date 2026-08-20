@@ -95,6 +95,7 @@ except ImportError:  # optional host-only credential helper in some worktrees
 from .worker_workspace import (
     WorkerWorkspace,
     GitCommandTimeout,
+    ValidationEnvironmentBlocked,
     ValidationRunError,
     WorkspaceError,
     cleanup_workspace,
@@ -440,7 +441,15 @@ def _run_declared_validations(
             **_validation_route_kwargs(route_metadata),
         )
     except ValidationRunError as exc:
-        raise ValidationRunError(str(exc), with_roles(exc.results)) from exc
+        rows = with_roles(exc.results)
+        if isinstance(exc, ValidationEnvironmentBlocked):
+            # Preserve the recoverable environment-blocked subtype so the
+            # finalizer can route it away from acceptance-blocking
+            # ``validation_failed`` (NF-2026-00271). Re-attaching the roles
+            # must not strip ``terminal_state``/``restriction``/``recoverable``.
+            exc.results = rows
+            raise
+        raise ValidationRunError(str(exc), rows) from exc
     return with_roles(results)
 
 
@@ -466,6 +475,79 @@ def _is_operational_validation_failure(terminal_state: str, error: str) -> bool:
             "validation_failed:validation_exec_scratch_unavailable:"
         )
     )
+
+
+# Narrow, explicit allowlist of the exact recoverable ``WorkspaceError`` tokens
+# that are genuine environment/sandbox restrictions: the declared
+# validator/interpreter (or its trusted runtime root) could not be resolved, the
+# exec scratch could not be provisioned, or the sandbox backend itself could not
+# be selected. These are recoverable by re-running in a corrected environment,
+# so they route to the retryable ``finalize_failed`` bucket. Every other
+# ``validation_*`` token -- including every security refusal (a world-writable
+# or untrusted-owner executable/runtime-root, a symlink-forbidden pytest
+# runtime, an unapproved or non-executable validator) -- is a deterministic
+# candidate/card defect and must stay acceptance-blocking ``validation_failed``.
+# Tokens are exact and colon-terminated so a broad family prefix can never
+# fail-open and reclassify a security refusal as recoverable.
+_VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES = (
+    "validation_executable_unavailable:",
+    "validation_pytest_runtime_unavailable:",
+    "validation_pytest_runtime_missing_pytest:",
+    "validation_exec_scratch_unavailable:",
+    "unsupported_sandbox_backend:",
+    "validation_unsupported_in_sandbox:",
+)
+
+
+def _terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
+    """Map a caught ``WorkspaceError`` to its truthful terminal process state.
+
+    ``ValidationEnvironmentBlocked`` is a recoverable, supersede-free
+    environment/sandbox restriction (NF-2026-00271): the candidate did not fail
+    its gate, the declared validator could not run here. It must never surface
+    as the acceptance-blocking ``validation_failed``; route it to the retryable
+    ``finalize_failed`` bucket so ``retry_finalization`` can re-run deterministic
+    validation without relaunching the provider, while ``error`` keeps the exact
+    restriction.
+
+    Genuine gate failures are class-based: a plain ``ValidationRunError`` (or a
+    ``required_output``/``quality_gate``/``behavioral_gate``/``residual_contract``
+    /``research_result`` ``WorkspaceError``) stays ``validation_failed``. The
+    only plain ``WorkspaceError`` tokens that become ``finalize_failed`` are the
+    exact recoverable environment/sandbox restrictions enumerated in
+    ``_VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES`` (executable/pytest-runtime
+    resolution, exec-scratch provisioning, and sandbox-backend selection). The
+    allowlist is colon-terminated and exact: a security refusal (a world-writable
+    or untrusted-owner executable/runtime-root, a symlink-forbidden pytest
+    runtime, an unapproved or non-executable validator) and every remaining
+    ``validation_``-prefixed token -- plus the legacy ``invalid_validation_command``
+    spelling -- are deterministic candidate/card defects (a malformed declared
+    command, a contract-shape violation, a receipt count mismatch, an over-limit
+    command list, or an unresolvable ``cwd``/``PYTHONPATH``) and must stay
+    acceptance-blocking so a provider-free retry loop can never re-run a defect
+    the candidate itself authored.
+    """
+    if isinstance(exc, ValidationEnvironmentBlocked):
+        return "finalize_failed"
+    if isinstance(exc, ValidationRunError):
+        return "validation_failed"
+    error = str(exc)
+    if error.startswith("scope_violation") or error.startswith("symlink_output"):
+        return "scope_rejected"
+    if error.startswith((
+        "required_output", "quality_gate", "behavioral_gate",
+        "residual_contract", "research_result",
+    )):
+        return "validation_failed"
+    if error.startswith(("parent_changed", "promotion_scope")):
+        return "promotion_conflict"
+    if error.startswith(_VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES):
+        return "finalize_failed"
+    if error.startswith("validation_") or error.startswith(
+        "invalid_validation_command"
+    ):
+        return "validation_failed"
+    return "finalize_failed"
 
 # Failure workspaces remain available through coordinator review.  Once a
 # coordinator has disposed that exact attempt (finished/archived, returned it
@@ -9447,17 +9529,7 @@ class ProcessManager:
                 if isinstance(exc, ValidationRunError):
                     validations = [dict(row) for row in exc.results]
                 error = str(exc)
-                if error.startswith("scope_violation") or error.startswith("symlink_output"):
-                    terminal_state = "scope_rejected"
-                elif error.startswith((
-                    "validation", "required_output", "quality_gate", "behavioral_gate", "residual_contract",
-                    "research_result",
-                )):
-                    terminal_state = "validation_failed"
-                elif error.startswith(("parent_changed", "promotion_scope")):
-                    terminal_state = "promotion_conflict"
-                else:
-                    terminal_state = "finalize_failed"
+                terminal_state = _terminal_state_for_workspace_error(exc)
                 # Keep the isolated candidate intact for coordinator
                 # diagnosis/retry on every genuine terminal failure, including
                 # a lost-claim race (error starts with "claim_ownership_lost").

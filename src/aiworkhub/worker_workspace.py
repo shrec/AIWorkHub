@@ -81,6 +81,14 @@ except ImportError:  # direct-script Landlock entrypoint
 # site below, which only runs under the package-imported entrypoint.
 VALIDATION_FAILED = "validation_failed"
 VALIDATION_ENVIRONMENT_BLOCKED = "validation_environment_blocked"
+# Worker-side (sandbox-selection) restriction. The sandbox backend itself could
+# not be provisioned BEFORE any command was built or run, so this is outside
+# ``validation_runner``'s per-row classification authority (the candidate never
+# executed). It blocks acceptance exactly like ``VALIDATION_ENVIRONMENT_BLOCKED``
+# but is recovered by re-running in a corrected sandbox -- never reported as
+# ``VALIDATION_FAILED``, and always preserving the retained workspace/hashes for
+# a provider-free ``retry_finalization``.
+VALIDATION_UNSUPPORTED_IN_SANDBOX = "validation_unsupported_in_sandbox"
 
 
 def _load_runtime_temp():
@@ -5326,6 +5334,24 @@ def _probe_absent_validator_modules(
     return tuple(name for name in modules if name in reported)
 
 
+def _validation_unsupported_in_sandbox_error(restriction: str) -> WorkspaceError:
+    """Wrap a sandbox-provisioning restriction with its truthful terminal name.
+
+    ``select_sandbox_backend`` (and the explicit ``backend=`` allowlist check)
+    fail BEFORE any command is parsed or spawned: no bubblewrap, no
+    landlock+seccomp, an invalid or unsupported backend request. The candidate
+    never executed, so this is not a candidate validation failure. Prefixing the
+    original restriction token (``secure_sandbox_unavailable``,
+    ``unsupported_sandbox_backend``, ...) with
+    ``VALIDATION_UNSUPPORTED_IN_SANDBOX`` keeps the exact restriction visible
+    for the finalizer's routing (``_terminal_state_for_workspace_error`` maps it
+    to the recoverable ``finalize_failed`` bucket, preserving the retained
+    workspace/hashes for provider-free ``retry_finalization``) while existing
+    substring callers/tests keep matching the unchanged token.
+    """
+    return WorkspaceError(f"{VALIDATION_UNSUPPORTED_IN_SANDBOX}:{restriction}")
+
+
 def run_validations(
     workspace: WorkerWorkspace,
     commands: Iterable[str],
@@ -5345,13 +5371,21 @@ def run_validations(
     if not rows:
         return []
     results: list[dict[str, Any]] = []
-    selected_backend = backend or select_sandbox_backend()
+    if backend:
+        selected_backend = backend
+    else:
+        try:
+            selected_backend = select_sandbox_backend()
+        except WorkspaceError as exc:
+            raise _validation_unsupported_in_sandbox_error(str(exc)) from exc
     if selected_backend not in {
         "landlock",
         "bubblewrap",
         VSCODE_LM_IN_PROCESS_BACKEND,
     }:
-        raise WorkspaceError(f"unsupported_sandbox_backend:{selected_backend}")
+        raise _validation_unsupported_in_sandbox_error(
+            f"unsupported_sandbox_backend:{selected_backend}"
+        )
     if (
         selected_backend == VSCODE_LM_IN_PROCESS_BACKEND
         and adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS
