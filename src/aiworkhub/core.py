@@ -3802,6 +3802,65 @@ def reject_review(
     # (rework_predecessor or terminal_review.evidence) and must pass
     # same-repo, same-task workspace containment plus changed-path hash
     # verification before any card state change or GC scheduling.
+    def _validated_rework_delta(
+        raw: Any,
+        *,
+        expected_request_id: str,
+        expected_claim_epoch: int | None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if raw is None:
+            return None, None
+        if not isinstance(raw, dict) or set(raw) != {
+            "schema_id",
+            "sealed",
+            "authority_repo",
+            "task_id",
+            "request_id",
+            "claim_epoch",
+            "artifact_path",
+            "artifact_sha256",
+        }:
+            return None, "rework_delta_descriptor_invalid"
+        claim_epoch = raw.get("claim_epoch")
+        digest = raw.get("artifact_sha256")
+        if (
+            raw.get("schema_id") != "aiworkhub.rework_delta_descriptor.v1"
+            or raw.get("sealed") is not True
+            or str(raw.get("authority_repo") or "")
+            != str(repo_root().resolve(strict=False))
+            or str(raw.get("task_id") or "") != task_id
+            or str(raw.get("request_id") or "") != expected_request_id
+            or type(claim_epoch) is not int
+            or claim_epoch < 1
+            or (
+                expected_claim_epoch is not None
+                and claim_epoch != expected_claim_epoch
+            )
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in digest)
+        ):
+            return None, "rework_delta_descriptor_identity_mismatch"
+        from . import worker_workspace
+
+        artifact_path = Path(str(raw.get("artifact_path") or ""))
+        artifact_root = (
+            worker_workspace.configured_runtime_root(repo_root())
+            / "rework_deltas"
+        ).resolve(strict=False)
+        resolved_artifact = artifact_path.resolve(strict=False)
+        if resolved_artifact.parent != artifact_root or not resolved_artifact.is_file():
+            return None, "rework_delta_descriptor_path_invalid"
+        try:
+            if resolved_artifact.stat().st_size > 64 * 1024 * 1024:
+                return None, "rework_delta_descriptor_too_large"
+            observed_digest = hashlib.sha256(resolved_artifact.read_bytes()).hexdigest()
+        except OSError:
+            return None, "rework_delta_descriptor_unreadable"
+        if observed_digest != digest:
+            return None, "rework_delta_descriptor_tampered"
+        return dict(raw), None
+
     def _resolve_predecessor(
         explicit: str | None,
     ) -> tuple[dict[str, Any] | None, str | None]:
@@ -3836,10 +3895,18 @@ def reject_review(
                 and isinstance(eh, dict)
                 and eh
             ):
+                existing_delta, delta_error = _validated_rework_delta(
+                    existing.get("rework_delta"),
+                    expected_request_id=stripped,
+                    expected_claim_epoch=None,
+                )
+                if delta_error:
+                    return None, delta_error
                 return {
                     "request_id": stripped,
                     "workspace": ew,
                     "changed_path_hashes": eh,
+                    "rework_delta": existing_delta,
                 }, None
         # Check current terminal_review evidence
         if (
@@ -3850,10 +3917,23 @@ def reject_review(
             and isinstance(t_hashes, dict)
             and t_hashes
         ):
+            terminal_epoch = terminal_review.get("claim_epoch")
+            if type(terminal_epoch) is not int or terminal_epoch < 1:
+                terminal_epoch = card.get("claim_epoch")
+            terminal_delta, delta_error = _validated_rework_delta(
+                evidence.get("rework_delta"),
+                expected_request_id=stripped,
+                expected_claim_epoch=(
+                    terminal_epoch if type(terminal_epoch) is int else None
+                ),
+            )
+            if delta_error:
+                return None, delta_error
             return {
                 "request_id": stripped,
                 "workspace": t_workspace,
                 "changed_path_hashes": t_hashes,
+                "rework_delta": terminal_delta,
             }, None
         return (
             None,
@@ -4007,6 +4087,7 @@ def reject_review(
             pred_request_id: str = resolved_predecessor["request_id"]
             pred_workspace: dict[str, Any] = resolved_predecessor["workspace"]
             pred_changed_hashes: dict[str, str] = resolved_predecessor["changed_path_hashes"]
+            pred_rework_delta = resolved_predecessor.get("rework_delta")
         else:
             pred_request_id = (
                 str(identity.get("request_id") or "").strip()
@@ -4015,6 +4096,22 @@ def reject_review(
             )
             pred_workspace = workspace
             pred_changed_hashes = changed_hashes
+            terminal_epoch = (
+                terminal_review.get("claim_epoch")
+                if isinstance(terminal_review, dict)
+                else None
+            )
+            if type(terminal_epoch) is not int or terminal_epoch < 1:
+                terminal_epoch = card.get("claim_epoch")
+            pred_rework_delta, delta_error = _validated_rework_delta(
+                evidence.get("rework_delta") if isinstance(evidence, dict) else None,
+                expected_request_id=pred_request_id,
+                expected_claim_epoch=(
+                    terminal_epoch if type(terminal_epoch) is int else None
+                ),
+            )
+            if delta_error:
+                return _lifecycle_error(delta_error)
         if (
             pred_request_id
             and isinstance(pred_workspace, dict)
@@ -4032,6 +4129,8 @@ def reject_review(
                 ),
                 "pinned_at": now,
             }
+            if pred_rework_delta is not None:
+                card["rework_predecessor"]["rework_delta"] = pred_rework_delta
         elif disposition == "pending" and normalized_residuals:
             return residual_error("residual_contract_requires_review_predecessor")
     if disposition == "pending":

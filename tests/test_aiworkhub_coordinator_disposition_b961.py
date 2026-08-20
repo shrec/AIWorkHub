@@ -222,6 +222,94 @@ def test_reject_to_pending_pins_exact_review_workspace(coord):
     assert "terminal_review" not in card
 
 
+def _terminal_rework_delta_card(
+    coord: Path,
+    task_id: str,
+    request_id: str,
+    *,
+    claim_epoch: int = 4,
+) -> tuple[dict, dict]:
+    artifact_root = coord / ".aiworkhub" / "runtime" / "rework_deltas"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    artifact_bytes = b'{"schema_id":"aiworkhub.rework_delta_artifact.v2"}'
+    artifact_path = artifact_root / "packet.json"
+    artifact_path.write_bytes(artifact_bytes)
+    descriptor = {
+        "schema_id": "aiworkhub.rework_delta_descriptor.v1",
+        "sealed": True,
+        "authority_repo": str(coord.resolve()),
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": claim_epoch,
+        "artifact_path": str(artifact_path),
+        "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+    }
+    workspace = {
+        "request_id": request_id,
+        "repo": str(coord),
+        "path": f"/tmp/aiworkhub-worktrees/{request_id}/worktree",
+        "home": f"/tmp/aiworkhub-worktrees/{request_id}/home",
+        "allowed_writes": ["out/result.txt"],
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+    return {
+        "claim_epoch": claim_epoch,
+        "terminal_review": {
+            "claim_epoch": claim_epoch,
+            "substatus": "validation_failed",
+            "evidence": {
+                "request_identity": {
+                    "request_id": request_id,
+                    "task_id": task_id,
+                },
+                "workspace": workspace,
+                "changed_path_hashes": {"out/result.txt": "a" * 64},
+                "rework_delta": descriptor,
+            },
+        },
+    }, descriptor
+
+
+def test_reject_to_pending_persists_authenticated_rework_delta(coord):
+    task_id = "T_DELTA_PIN"
+    request_id = "d" * 32
+    card, descriptor = _terminal_rework_delta_card(coord, task_id, request_id)
+    _insert(coord, task_id, card=card)
+
+    result = core.reject_review(task_id, "repair delta", to="pending")
+
+    assert result["ok"] is True, result
+    persisted = json.loads(_row(coord, task_id)["card_json"])
+    assert persisted["rework_predecessor"]["rework_delta"] == descriptor
+    assert persisted["rework_predecessor"]["request_id"] == request_id
+
+
+@pytest.mark.parametrize(
+    "mutation, expected",
+    [
+        (lambda row: row.update(claim_epoch=True), "identity_mismatch"),
+        (lambda row: row.update(task_id="OTHER"), "identity_mismatch"),
+        (lambda row: row.update(artifact_sha256="0" * 64), "tampered"),
+    ],
+)
+def test_reject_to_pending_fails_closed_on_spoofed_rework_delta(
+    coord, mutation, expected
+):
+    task_id = "T_DELTA_BAD_" + expected
+    request_id = "e" * 32
+    card, descriptor = _terminal_rework_delta_card(coord, task_id, request_id)
+    mutation(descriptor)
+    _insert(coord, task_id, card=card)
+
+    result = core.reject_review(task_id, "repair delta", to="pending")
+
+    assert result["ok"] is False
+    assert expected in result["stderr"]
+    row = _row(coord, task_id)
+    assert row["status"] == "review"
+
+
 def test_invalid_residual_identity_returns_actionable_schema(coord):
     _insert(coord, "T_BAD_RESIDUAL")
     result = core.reject_review(
