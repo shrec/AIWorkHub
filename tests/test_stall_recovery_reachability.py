@@ -125,17 +125,16 @@ def _stage_running_request(manager, tmp_path, *, status: dict, pid: int, ticks):
     return request_id
 
 
-def test_reconcile_recovers_wedged_but_alive_supervisor(monkeypatch, tmp_path):
+def test_reconcile_keeps_quiet_but_live_supervisor(monkeypatch, tmp_path):
     child, ticks = _live_child()
     if ticks is None:
         child.terminate()
         pytest.skip("proc start ticks unavailable")
     try:
         manager = _manager(tmp_path)
-        monkeypatch.setenv(process_launcher.STALL_GRACE_ENV, "30")
         now = time.time()
-        # Fresh heartbeat (so liveness is "alive", not "lost"), but the last
-        # meaningful progress is long past: a wedged-but-alive worker.
+        # Fresh heartbeat makes this exact process live. Old meaningful output
+        # is observability only and must never become terminal evidence.
         request_id = _stage_running_request(
             manager,
             tmp_path,
@@ -174,13 +173,12 @@ def test_reconcile_recovers_wedged_but_alive_supervisor(monkeypatch, tmp_path):
         result = manager.reconcile()
 
         latest = manager._request_events(request_id)[-1]
-        assert latest["state"] == "worker_failed"
-        assert latest["stall_detected"] is True
-        assert result.get("finalized", 0) >= 1
-        # The durable escalation path finalized it while alive; the passive
-        # watcher was never needed for this wedged worker.
-        assert watch_calls == []
-        assert child.pid in terminate_calls
+        assert latest["state"] == "running"
+        assert result.get("finalized", 0) == 0
+        assert terminate_calls == []
+        assert len(watch_calls) == 1
+        assert watch_calls[0][0] == request_id
+        assert child.poll() is None
     finally:
         child.terminate()
         child.wait(timeout=5)

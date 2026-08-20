@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.96] - 2026-08-20
+
+### Fixed
+
+- **A live provider worker was cancelled after ten minutes without a new
+  model-output event.** Two independent GLM 5.3 workers reproduced the same
+  failure on 0.9.95: their exact supervisor and child processes were alive,
+  heartbeats were fresh and stderr was empty, yet the reconciler terminated
+  both as `worker_stalled:no_meaningful_activity` at roughly 618–634 seconds.
+  Meaningful-output age is now observability only. A live exact process and
+  heartbeat remain processing indefinitely; terminal state still requires an
+  authenticated provider result/error, verified process exit or explicit owner
+  cancellation. The obsolete quiet-time death configuration was removed.
+
 ## [0.9.95] - 2026-08-20
 
 ### Fixed

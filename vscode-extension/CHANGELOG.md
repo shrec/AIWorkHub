@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.96 — 2026-08-20
+
+### Fixed
+
+- Long-running VS Code LM workers are no longer cancelled merely because the
+  model has not emitted a new visible response for ten minutes. A fresh exact
+  process identity and heartbeat keep the task alive; elapsed quiet time is
+  reported only as observability and never as terminal evidence.
+- Explicit provider errors, verified process exit and owner cancellation retain
+  their existing terminal behavior.
+
 ## 0.9.95 — 2026-08-20
 
 ### Fixed

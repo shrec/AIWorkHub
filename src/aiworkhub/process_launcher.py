@@ -487,7 +487,6 @@ GC_DISPOSED_CANONICAL_STATUSES = {"finished", "archived", "pending", "blocked"}
 HEARTBEAT_LEASE_ENV = "AIWORKHUB_HEARTBEAT_LEASE_SECONDS"
 QUIET_WARNING_ENV = "AIWORKHUB_QUIET_WARNING_SECONDS"
 LOST_RECOVERY_GRACE_ENV = "AIWORKHUB_LOST_RECOVERY_GRACE_SECONDS"
-STALL_GRACE_ENV = "AIWORKHUB_STALL_GRACE_SECONDS"
 # 4x the supervisor's default 15s heartbeat interval -- tolerant of scheduler
 # jitter/GC pauses without mistaking a merely-slow heartbeat for unresponsive.
 DEFAULT_HEARTBEAT_LEASE_SECONDS = 60.0
@@ -498,7 +497,6 @@ DEFAULT_QUIET_WARNING_SECONDS = 1800.0
 # still-existing supervisor is escalated to "lost" and its exact process
 # group is terminated by the reconciler.
 DEFAULT_LOST_RECOVERY_GRACE_SECONDS = 120.0
-DEFAULT_STALL_GRACE_SECONDS = 600.0
 # Bounded threshold past which a preparation heartbeat that stops advancing is
 # treated as a stall. Before the provider process exists a launch has no pid to
 # read liveness from; the preparation heartbeat epoch it republishes as it
@@ -533,12 +531,6 @@ def quiet_warning_seconds() -> float:
 def lost_recovery_grace_seconds() -> float:
     return _bounded_float_env(
         LOST_RECOVERY_GRACE_ENV, DEFAULT_LOST_RECOVERY_GRACE_SECONDS, minimum=15.0, maximum=3600.0
-    )
-
-
-def stall_grace_seconds() -> float:
-    return _bounded_float_env(
-        STALL_GRACE_ENV, DEFAULT_STALL_GRACE_SECONDS, minimum=30.0, maximum=86_400.0
     )
 
 
@@ -8792,23 +8784,11 @@ class ProcessManager:
                     and isinstance(meaningful_at, (int, float))
                 ):
                     stall_idle_seconds = max(0.0, time.time() - float(meaningful_at))
-                    if stall_idle_seconds > stall_grace_seconds():
-                        # Reverify the exact process identity immediately before
-                        # termination. A bare or recycled PID is never killed.
-                        recheck = _pid_identity_evidence(
-                            supervisor_pid, supervisor_ticks
-                        )
-                        if recheck.verdict is PidIdentityVerdict.UNKNOWN:
-                            raise _PidIdentityUnknownDeferred("pid_identity_unknown")
-                        if recheck.verdict is PidIdentityVerdict.MATCH:
-                            stall_detected = True
-                            liveness_lost = True
-                            terminate_supervisor = True
-                            supervisor_alive = False
-                            stall_error = (
-                                "worker_stalled:no_meaningful_activity:"
-                                f"idle_seconds={stall_idle_seconds:.3f}"
-                            )
+                    # Meaningful-output age is observability only. Providers
+                    # can legitimately poll or work silently for an unbounded
+                    # interval, so elapsed/quiet time is never terminal
+                    # evidence while the exact supervisor identity and its
+                    # heartbeat remain live (NF-2026-00176).
                 if (
                     not stall_detected
                     and liveness["liveness_state"] in {"alive", "quiet", "unresponsive"}

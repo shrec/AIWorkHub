@@ -12,6 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.96
+
+- Long-running model work is no longer killed after ten quiet minutes while its
+  exact supervisor, child and heartbeat remain live.
+- Time since the last visible model output is now diagnostic information only;
+  completion, provider error, verified exit or explicit cancellation determines
+  the task outcome.
+
 ## What's new in 0.9.95
 
 - VS Code LM workers no longer get stuck in the final semantic-edit stage. The
