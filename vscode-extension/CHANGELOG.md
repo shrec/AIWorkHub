@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.1 — 2026-08-20
+
+### Fixed
+
+- Fast summary refreshes no longer replace a full dashboard snapshot with
+  `No sample` / `Unavailable` placeholders while the full read is in flight.
+- Windows review acceptance and finalization use bounded Git probes with exact
+  process-tree cleanup and phase-specific errors instead of a 120-second
+  `git rev-parse HEAD` hang.
+
 ## 0.10.0 — 2026-08-20
 
 ### Performance

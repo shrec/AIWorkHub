@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-20
+
+### Fixed
+
+- Progressive dashboard summaries now update only queue and storage counters;
+  their deliberate empty placeholders can no longer erase the last full Source
+  Graph, context, NeedFix, Roadmap, preflight or task snapshot between polls.
+- Windows review acceptance and worker finalization no longer launch the
+  redundant `git rev-parse HEAD` probe. Remaining Git probes are phase-bounded,
+  reap their exact process tree and return structured timeout taxonomy.
+
+### Observability
+
+- Finalization events now report separate workspace-scope, validation and
+  evidence/transition wall-clock durations.
+
 ## [0.10.0] - 2026-08-20
 
 ### Performance

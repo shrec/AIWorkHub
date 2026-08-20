@@ -12,6 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.1
+
+- Progressive summaries update only their authoritative queue/storage fields,
+  so rich dashboard cards never flash back to `No sample` or `Unavailable`.
+- Windows zero-diff review acceptance and worker finalization avoid redundant
+  `git rev-parse HEAD`; remaining probes are bounded and reap their process tree.
+- Finalization telemetry separates scope, validation and transition time.
+
 ## What's new in 0.10.0
 
 - Dashboard counters and health render from a bounded summary before heavier
