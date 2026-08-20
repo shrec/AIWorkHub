@@ -364,7 +364,12 @@ def snapshot_view(full: bool = False) -> dict[str, Any]:
     """
     started = time.perf_counter()
     _debug_trace("snapshot.begin")
-    snapshot = dict(_debug_stage("dashboard.build_snapshot", dashboard.build_snapshot))
+    snapshot = dict(
+        _debug_stage(
+            "dashboard.build_snapshot",
+            lambda: dashboard.build_snapshot(summary_only=not full),
+        )
+    )
     storage = snapshot.get("storage")
     if isinstance(storage, dict) and not storage.get("ready", True):
         storage = dict(storage)

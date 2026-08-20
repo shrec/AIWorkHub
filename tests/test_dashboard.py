@@ -395,6 +395,25 @@ def test_build_snapshot_combines_read_sources_and_operational_summaries():
     ]
 
 
+def test_summary_snapshot_skips_full_webview_reads_without_changing_counts():
+    full_provider = FakeProvider()
+    summary_provider = FakeProvider()
+
+    full = dashboard.build_snapshot(full_provider)
+    summary = dashboard.build_snapshot(summary_provider, summary_only=True)
+
+    assert summary["status_counts"] == full["status_counts"]
+    assert summary["row_counts"] == full["row_counts"]
+    assert summary["warnings"] == full["warnings"]
+    assert summary["health"] == full["health"]
+    called = {name for name, _argument in summary_provider.calls}
+    assert "get_cost_ledger" not in called
+    assert "get_agent_processes" not in called
+    assert "get_callback_bridge_health" not in called
+    assert summary["cost_usage"] == {}
+    assert summary["agent_processes"] == {}
+
+
 @pytest.mark.parametrize("malformed", ["n/a", "NaN", "Infinity", float("inf")])
 def test_malformed_numeric_telemetry_does_not_blank_healthy_fields(malformed):
     compact = dashboard._compact_ai_infra({  # noqa: SLF001

@@ -74,6 +74,11 @@ def test_storage_snapshot_counts_repo_data_and_never_follows_symlinks(tmp_path, 
     nested_worker = data / "runtime" / "worktrees" / "foreign" / "worktree"
     nested_worker.mkdir(parents=True)
     (nested_worker / "payload.bin").write_bytes(b"w" * 512)
+    monkeypatch.setattr(
+        storage_observability.storage_retention,
+        "configured_worktree_root",
+        lambda _repo: data / "runtime" / "worktrees",
+    )
     outside = tmp_path / "outside.bin"
     outside.write_bytes(b"b" * 4096)
     (data / "outside-link").symlink_to(outside)

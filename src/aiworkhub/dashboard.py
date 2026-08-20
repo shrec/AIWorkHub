@@ -1902,7 +1902,179 @@ def _cost_totals(ledger: Mapping[str, Any] | None) -> dict[str, Any]:
     return totals
 
 
-def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
+def _build_summary_snapshot(
+    data_provider: Any,
+    *,
+    storage_state: Mapping[str, Any],
+    storage_usage: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build only the fields retained by the manager summary projection.
+
+    The old summary path built the entire Webview payload first (workforce,
+    cost history, KPI process history, task plan, NeedFix and Roadmap) and then
+    discarded those sections. On the live repository that made a 10 KB summary
+    wait 5.87 seconds. This narrow builder keeps exact count/warning semantics
+    while leaving the full Webview path unchanged.
+    """
+    errors: list[dict[str, str]] = []
+    task_groups: dict[str, list[dict[str, Any]]] = {}
+    for status in ACTIVE_STATUSES:
+        value = _safe_read(
+            f"tasks.{status}",
+            partial(data_provider.list_tasks, status),
+            errors,
+            [],
+        )
+        task_groups[status] = _safe_read(
+            f"tasks.{status}.normalize",
+            partial(_normalize_task_rows, value, status),
+            errors,
+            [],
+        )
+
+    inbox = _safe_read(
+        "completion_inbox", data_provider.get_completion_inbox, errors, {}
+    )
+    if not isinstance(inbox, Mapping):
+        errors.append({
+            "source": "completion_inbox",
+            "kind": "DashboardReadError",
+            "message": "completion inbox returned a non-object",
+        })
+        inbox = {}
+    collision_report = _safe_read(
+        "collision_guard", data_provider.get_collision_report, errors, {}
+    )
+    if not isinstance(collision_report, Mapping):
+        errors.append({
+            "source": "collision_guard",
+            "kind": "DashboardReadError",
+            "message": "collision guard returned a non-object",
+        })
+        collision_report = {}
+
+    stale_tasks = [
+        dict(item)
+        for item in inbox.get("stale_processing", [])
+        if isinstance(item, Mapping)
+    ]
+    exact_reader = getattr(data_provider, "get_exact_status_counts", None)
+    exact_counts: Mapping[str, Any] | None = None
+    if exact_reader is not None:
+        for attempt in range(2):
+            try:
+                exact_counts = exact_reader()
+                break
+            except Exception as exc:  # noqa: BLE001 -- same bounded retry as full view
+                if attempt == 1:
+                    errors.append({
+                        "source": "exact_status_counts",
+                        "kind": type(exc).__name__,
+                        "message": _bounded_text(exc),
+                    })
+        if exact_counts is not None and not isinstance(exact_counts, Mapping):
+            errors.append({
+                "source": "exact_status_counts",
+                "kind": "DashboardReadError",
+                "message": "exact status counts provider returned a non-object",
+            })
+            exact_counts = None
+
+    if exact_counts is not None:
+        status_counts = {
+            status: int(exact_counts.get(status) or 0)
+            for status in ALL_CANONICAL_STATUSES
+        }
+    else:
+        status_counts = {
+            status: len(task_groups[status]) for status in ACTIVE_STATUSES
+        }
+        for status in ("blocked", "finished", "archived"):
+            rows = _safe_read(
+                f"tasks.{status}",
+                partial(data_provider.list_tasks, status),
+                errors,
+                [],
+            )
+            status_counts[status] = len(rows)
+    status_counts["stale"] = len(stale_tasks)
+    status_counts["active"] = sum(
+        status_counts[status] for status in ACTIVE_STATUSES
+    )
+
+    row_counts: dict[str, dict[str, Any]] = {}
+    for status in ACTIVE_STATUSES:
+        returned = len(task_groups[status])
+        exact = status_counts.get(status, returned)
+        row_counts[status] = {
+            "returned": returned,
+            "exact": exact,
+            "truncated": returned < exact,
+        }
+    for status in ("blocked", "finished", "archived"):
+        exact = status_counts.get(status, 0)
+        row_counts[status] = {
+            "returned": 0,
+            "exact": exact,
+            "truncated": exact > 0,
+        }
+
+    collision_warnings = [
+        dict(item)
+        for item in collision_report.get("file_collisions", []) or []
+        if isinstance(item, Mapping)
+    ]
+    mismatch_warnings = [
+        dict(item)
+        for item in inbox.get("runner_mismatch_warnings", []) or []
+        if isinstance(item, Mapping)
+    ]
+    return {
+        "schema_version": 1,
+        "generated_at": _utc_now(),
+        "readonly": True,
+        "storage": dict(storage_state),
+        "storage_usage": dict(storage_usage),
+        "health": {
+            "ok": not errors,
+            "degraded": bool(errors),
+            "provider_error_count": len(errors),
+        },
+        "status_counts": status_counts,
+        "row_counts": row_counts,
+        "warnings": {
+            "stale": stale_tasks,
+            "collisions": collision_warnings,
+            "runner_mismatches": mismatch_warnings,
+        },
+        "errors": errors,
+        # Shape-only placeholders preserve truthful ``omitted_fields`` in the
+        # manager projection without executing any full-Webview provider read.
+        "tasks": {},
+        "summaries": {},
+        "completion_inbox": {},
+        "cost_usage": {},
+        "collision_report": {},
+        "agent_processes": {},
+        "adapter_readiness": {},
+        "environment_preflight": {},
+        "workforce_catalog": {},
+        "source_graph_telemetry": {},
+        "source_graph_index_health": {},
+        "read_efficiency_telemetry": {},
+        "project_context_telemetry": {},
+        "protocol_alert_telemetry": {},
+        "kpi_analytics": {},
+        "callback_bridge_health": {},
+        "task_plan": {},
+        "needfix": {},
+        "roadmap": {},
+    }
+
+
+def build_snapshot(
+    provider: Any | None = None, *, summary_only: bool = False
+) -> dict[str, Any]:
     """Build one dashboard snapshot while isolating every provider failure.
 
     Fails closed on storage: an uninitialized or degraded repository (no
@@ -1968,6 +2140,13 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             "warnings": {"stale": [], "collisions": [], "runner_mismatches": []},
             "errors": [],
         }
+
+    if summary_only:
+        return _build_summary_snapshot(
+            data_provider,
+            storage_state=storage_state,
+            storage_usage=storage_usage,
+        )
 
     errors: list[dict[str, str]] = []
     task_groups: dict[str, list[dict[str, Any]]] = {}

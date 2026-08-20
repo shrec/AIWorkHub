@@ -99,7 +99,7 @@ def test_snapshot_view_reuses_build_snapshot_as_sole_data_builder(monkeypatch):
     })
     result = dashboard_mcp_app.snapshot_view(full=True)
 
-    assert calls == [((), {})]
+    assert calls == [((), {"summary_only": False})]
     assert result["status_counts"] == FAKE_SNAPSHOT["status_counts"]
     assert result["tasks"] == FAKE_SNAPSHOT["tasks"]
     assert result["callback_delivery"]["status"] == "running"
@@ -112,7 +112,9 @@ def test_snapshot_view_reuses_build_snapshot_as_sole_data_builder(monkeypatch):
 
 
 def test_snapshot_identity_does_not_hide_stopped_callback_dispatcher(monkeypatch):
-    monkeypatch.setattr(dashboard, "build_snapshot", lambda: dict(FAKE_SNAPSHOT))
+    monkeypatch.setattr(
+        dashboard, "build_snapshot", lambda **_kwargs: dict(FAKE_SNAPSHOT)
+    )
     monkeypatch.setattr(core, "manager_bootstrap", lambda: {
         "ok": True,
         "role": "manager",
@@ -139,10 +141,17 @@ def test_snapshot_identity_does_not_hide_stopped_callback_dispatcher(monkeypatch
 
 
 def test_snapshot_default_is_bounded_manager_summary(monkeypatch):
-    monkeypatch.setattr(dashboard, "build_snapshot", lambda: dict(FAKE_SNAPSHOT))
+    calls: list[dict[str, Any]] = []
+
+    def fake_build_snapshot(**kwargs):
+        calls.append(kwargs)
+        return dict(FAKE_SNAPSHOT)
+
+    monkeypatch.setattr(dashboard, "build_snapshot", fake_build_snapshot)
 
     result = dashboard_mcp_app.snapshot_view()
 
+    assert calls == [{"summary_only": True}]
     assert result["snapshot_mode"] == "summary"
     assert result["full_snapshot_available"] is True
     assert result["status_counts"] == FAKE_SNAPSHOT["status_counts"]
@@ -155,7 +164,9 @@ def test_snapshot_default_is_bounded_manager_summary(monkeypatch):
 def test_snapshot_view_bounds_oversized_secondary_sections(monkeypatch):
     oversized = dict(FAKE_SNAPSHOT)
     oversized["agent_processes"] = {"processes": ["x" * 1024 for _ in range(6000)]}
-    monkeypatch.setattr(dashboard, "build_snapshot", lambda: dict(oversized))
+    monkeypatch.setattr(
+        dashboard, "build_snapshot", lambda **_kwargs: dict(oversized)
+    )
 
     result = dashboard_mcp_app.snapshot_view(full=True)
 
@@ -171,7 +182,7 @@ def test_snapshot_view_never_exceeds_response_bound_even_when_everything_is_huge
     huge = dict(FAKE_SNAPSHOT)
     for field in dashboard_mcp_app._SNAPSHOT_TRIM_ORDER:
         huge[field] = {"blob": "y" * (1024 * 1024)}
-    monkeypatch.setattr(dashboard, "build_snapshot", lambda: dict(huge))
+    monkeypatch.setattr(dashboard, "build_snapshot", lambda **_kwargs: dict(huge))
 
     result = dashboard_mcp_app.snapshot_view(full=True)
 
