@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.2 — 2026-08-20
+
+### Performance
+
+- The Storage card restores a repository-bound last-known-good inventory across
+  runtime/window reloads instead of returning to `Calculating` while the full
+  multi-gigabyte scan repeats.
+- Background storage refreshes are less frequent and preserve stale values until
+  the next atomically completed measurement is ready.
+
 ## 0.10.1 — 2026-08-20
 
 ### Fixed

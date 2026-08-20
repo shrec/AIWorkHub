@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-08-20
+
+### Performance
+
+- Storage telemetry now persists one repository-bound, atomically published
+  last-known-good snapshot across MCP runtime and VS Code window reloads. The
+  canonical 19.9 GB dashboard restored its Storage card in 5.6 ms instead of
+  returning to an 88-second `Calculating` scan.
+- Managed-storage refreshes use a five-minute cache lifetime and remain
+  single-flight in the background, avoiding near-continuous disk traversal on
+  repositories whose cold inventory takes longer than the former one-minute TTL.
+
+### Fixed
+
+- Stale Storage values remain visible while refresh runs instead of being
+  replaced by zeroes. Foreign, malformed, oversized, expired or symlinked cache
+  data is ignored, and persisted telemetry cannot override live disk capacity or
+  dashboard read-only authority.
+
 ## [0.10.1] - 2026-08-20
 
 ### Fixed

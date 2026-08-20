@@ -12,6 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.2
+
+- Storage telemetry survives MCP runtime and VS Code window reloads through an
+  atomic repository-bound last-known-good snapshot. On the canonical 19.9 GB
+  store, the card restored in 5.6 ms rather than recalculating for 88 seconds.
+- Slow background inventory refreshes keep the previous truthful measurement
+  visible and cannot override live disk capacity or read-only state.
+
 ## What's new in 0.10.1
 
 - Progressive summaries update only their authoritative queue/storage fields,
