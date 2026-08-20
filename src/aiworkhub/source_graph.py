@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS entities (
 CREATE INDEX IF NOT EXISTS idx_entities_file ON entities(file_path);
 CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
 CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(kind);
+CREATE INDEX IF NOT EXISTS idx_entities_qualname ON entities(qualname);
 
 CREATE TABLE IF NOT EXISTS edges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1383,7 +1384,11 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
 
 
 def _resolve_python_imported_calls(
-    conn: sqlite3.Connection, repo_root: Path,
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    *,
+    changed_files: set[str] | None = None,
+    affected_names: set[str] | None = None,
 ) -> int:
     """Bind Python calls only when imports and exact call syntax agree.
 
@@ -1402,22 +1407,58 @@ def _resolve_python_imported_calls(
     vanished symbol would read as EXTRACTED against an entity that is gone.
     """
 
-    conn.execute(
-        "UPDATE edges SET dst_qualname=NULL "
-        "WHERE extractor=? AND kind='calls' AND dst_qualname IS NOT NULL "
-        "AND evidence_label IN (?, ?) "
-        "AND NOT EXISTS (SELECT 1 FROM entities en WHERE en.qualname = edges.dst_qualname)",
-        (sgast.EXTRACTOR_ID, sgast.EXTRACTED, sgast.INFERRED),
-    )
+    incremental_scope = changed_files is not None and affected_names is not None
+    changed_files_json = json.dumps(sorted(changed_files or ()))
+    affected_names_json = json.dumps(sorted(affected_names or ()))
 
-    unresolved = conn.execute(
+    # A changed caller is invalidated and rewritten before this pass.  A
+    # changed/removed callee can only invalidate bindings with the same
+    # extracted destination name.  Restricting the reset to those names avoids
+    # a repository-wide edge scan for every one-file incremental refresh while
+    # retaining exact rename/delete semantics.  Full/legacy callers keep the
+    # conservative global pass by omitting the scope arguments.
+    if not incremental_scope:
+        conn.execute(
+            "UPDATE edges SET dst_qualname=NULL "
+            "WHERE extractor=? AND kind='calls' AND dst_qualname IS NOT NULL "
+            "AND evidence_label IN (?, ?) "
+            "AND NOT EXISTS (SELECT 1 FROM entities en WHERE en.qualname = edges.dst_qualname)",
+            (sgast.EXTRACTOR_ID, sgast.EXTRACTED, sgast.INFERRED),
+        )
+    elif affected_names:
+        conn.execute(
+            "UPDATE edges SET dst_qualname=NULL "
+            "WHERE extractor=? AND kind='calls' AND dst_qualname IS NOT NULL "
+            "AND evidence_label IN (?, ?) "
+            "AND dst_name IN (SELECT value FROM json_each(?)) "
+            "AND NOT EXISTS (SELECT 1 FROM entities en WHERE en.qualname = edges.dst_qualname)",
+            (
+                sgast.EXTRACTOR_ID,
+                sgast.EXTRACTED,
+                sgast.INFERRED,
+                affected_names_json,
+            ),
+        )
+
+    unresolved_sql = (
         "SELECT e.id, e.file_path, e.line, e.dst_name, e.evidence_label "
         "FROM edges e JOIN files f ON f.file_path=e.file_path "
         "WHERE e.extractor=? AND f.language='python' AND e.kind='calls' "
         "AND e.dst_qualname IS NULL AND e.evidence_label IN (?, ?) "
-        "ORDER BY e.id",
-        (sgast.EXTRACTOR_ID, sgast.EXTRACTED, sgast.INFERRED),
-    ).fetchall()
+    )
+    unresolved_params: list[Any] = [
+        sgast.EXTRACTOR_ID,
+        sgast.EXTRACTED,
+        sgast.INFERRED,
+    ]
+    if incremental_scope:
+        unresolved_sql += (
+            "AND (e.file_path IN (SELECT value FROM json_each(?)) "
+            "OR e.dst_name IN (SELECT value FROM json_each(?))) "
+        )
+        unresolved_params.extend((changed_files_json, affected_names_json))
+    unresolved_sql += "ORDER BY e.id"
+    unresolved = conn.execute(unresolved_sql, unresolved_params).fetchall()
     imports_by_file: dict[str, list[sqlite3.Row]] = {}
     lines_by_file: dict[str, tuple[str, ...]] = {}
     candidates_by_name: dict[str, list[sqlite3.Row]] = {}
@@ -1849,6 +1890,48 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 continue
             pending_extractions.append((extraction, file_size, mtime_ns))
 
+        removed_paths = set(existing).difference(seen_rel)
+        resolver_changed_paths = {
+            extraction.file_path for extraction, _, _ in pending_extractions
+        }.union(removed_paths)
+        python_changed_paths = {
+            path
+            for path in resolver_changed_paths
+            if sglanguages.language_for_path(Path(path)) == "python"
+        }
+        affected_python_names: set[str] = set()
+        if python_changed_paths:
+            # Only an added/removed/renamed function identity can change a
+            # cross-file binding.  A body-only edit keeps the same qualname and
+            # must not fan out to every caller of every function in a large
+            # module.  Compare old/new identities before invalidation; deleted
+            # and parse-failed files naturally have an empty new set.
+            old_python_functions = {
+                (str(row["file_path"]), str(row["name"]), str(row["qualname"]))
+                for row in conn.execute(
+                    "SELECT e.file_path, e.name, e.qualname FROM entities e "
+                    "JOIN files f ON f.file_path=e.file_path "
+                    "WHERE f.language='python' AND e.kind='function' "
+                    "AND e.file_path IN (SELECT value FROM json_each(?))",
+                    (json.dumps(sorted(python_changed_paths)),),
+                )
+            }
+            new_python_functions: set[tuple[str, str, str]] = set()
+            for extraction, _, _ in pending_extractions:
+                if extraction.file_path not in python_changed_paths:
+                    continue
+                new_python_functions.update(
+                    (extraction.file_path, entity.name, entity.qualname)
+                    for entity in extraction.entities
+                    if entity.kind == "function"
+                )
+            affected_python_names.update(
+                name
+                for _, name, _ in old_python_functions.symmetric_difference(
+                    new_python_functions
+                )
+            )
+
         with conn:
             if pending_stat_updates:
                 conn.executemany(
@@ -1920,7 +2003,13 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                     removed += 1
             if changed or removed:
                 _resolve_cpp_cross_file_edges(conn)
-                _resolve_python_imported_calls(conn, repo_root)
+                if python_changed_paths:
+                    _resolve_python_imported_calls(
+                        conn,
+                        repo_root,
+                        changed_files=python_changed_paths,
+                        affected_names=affected_python_names,
+                    )
                 _resolve_javascript_import_bindings(conn)
             sginsights.materialize_git_metrics(
                 conn, repo_root, sorted(seen_rel), limit=10000,
@@ -3926,6 +4015,19 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
         conn = connect(db_path)
         try:
             with conn:
+                python_file = extraction.language == "python"
+                old_python_functions = (
+                    {
+                        (str(row["name"]), str(row["qualname"]))
+                        for row in conn.execute(
+                            "SELECT name, qualname FROM entities "
+                            "WHERE file_path=? AND kind='function'",
+                            (rel,),
+                        )
+                    }
+                    if python_file
+                    else set()
+                )
                 _invalidate_file(conn, rel)
                 try:
                     path_stat = resolved.stat()
@@ -3944,7 +4046,23 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                 # so leaving it unresolved here would strand those edges
                 # permanently. Resolution is idempotent and generation-safe.
                 _resolve_cpp_cross_file_edges(conn)
-                _resolve_python_imported_calls(conn, repo_root)
+                if python_file:
+                    new_python_functions = {
+                        (entity.name, entity.qualname)
+                        for entity in extraction.entities
+                        if entity.kind == "function"
+                    }
+                    _resolve_python_imported_calls(
+                        conn,
+                        repo_root,
+                        changed_files={rel},
+                        affected_names={
+                            name
+                            for name, _ in old_python_functions.symmetric_difference(
+                                new_python_functions
+                            )
+                        },
+                    )
                 _resolve_javascript_import_bindings(conn)
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('single_file_last_mutation', ?) "

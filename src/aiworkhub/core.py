@@ -2043,13 +2043,10 @@ def _full_cards_for_plan() -> list[dict[str, Any]]:
     """Every canonical card in this repo, merged with its ``card_json`` (so
     ``allowed_writes``/``depends_on`` are present) -- the input ``task_plan``
     needs to build a DAG snapshot."""
-    rows = task_store.list_tasks(repo_root(), status=None, limit=5000)
-    cards: list[dict[str, Any]] = []
-    for row in rows:
-        full = task_store.get_task(repo_root(), str(row["task_id"]))
-        if full is not None:
-            cards.append(full)
-    return cards
+    # One bounded snapshot replaces the historical ``list_tasks`` + one
+    # ``get_task`` connection/quick-check per row.  The batch decoder is the
+    # same one used by ``get_task``, so this changes cost, not plan semantics.
+    return task_store.list_task_cards(repo_root(), limit=5000)
 
 
 def task_plan_snapshot() -> dict[str, Any]:

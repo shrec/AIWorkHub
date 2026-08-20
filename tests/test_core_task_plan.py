@@ -71,6 +71,43 @@ def test_task_plan_snapshot_reports_blockers_and_ready(tmp_path):
     assert "t2" not in snapshot["ready"]
 
 
+def test_task_plan_snapshot_uses_one_bounded_card_read(monkeypatch):
+    # The plan projection must stay one verified database snapshot regardless of size.
+    repo = core.repo_root()
+    _insert_card(repo, "t1", status="pending", allowed_writes=["a.py"])
+    _insert_card(
+        repo,
+        "t2",
+        status="pending",
+        allowed_writes=["b.py"],
+        depends_on=["t1"],
+    )
+    real_list_task_cards = task_store.list_task_cards
+    calls: list[tuple[Path, int]] = []
+
+    def _one_batch(root: Path, *, limit: int = 500):
+        calls.append((Path(root), limit))
+        return real_list_task_cards(root, limit=limit)
+
+    monkeypatch.setattr(task_store, "list_task_cards", _one_batch)
+    monkeypatch.setattr(
+        task_store,
+        "list_tasks",
+        lambda *args, **kwargs: pytest.fail("task-plan N+1 summary read returned"),
+    )
+    monkeypatch.setattr(
+        task_store,
+        "get_task",
+        lambda *args, **kwargs: pytest.fail("task-plan per-card read returned"),
+    )
+
+    snapshot = core.task_plan_snapshot()
+
+    assert calls == [(repo, 5000)]
+    assert snapshot["dependencies"]["t2"] == ["t1"]
+    assert snapshot["ready"] == ["t1"]
+
+
 def test_task_plan_snapshot_unblocks_after_dependency_finishes(tmp_path):
     repo = core.repo_root()
     _insert_card(repo, "t1", status="finished", worker_status="done", allowed_writes=["a.py"])

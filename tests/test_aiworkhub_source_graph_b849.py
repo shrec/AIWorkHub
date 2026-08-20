@@ -93,6 +93,30 @@ def test_db_path_resolves_under_repo_local_aiworkhub_dir(tmp_path):
     assert db_path.is_relative_to(repo)
 
 
+def test_entity_qualname_join_has_a_dedicated_index(tmp_path):
+    repo = _new_repo(tmp_path, "qualname_index")
+    _write(repo / "pkg" / "mod.py", "def indexed_symbol():\n    return 1\n")
+
+    sg.build_index(repo, incremental=False)
+
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        indexes = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA index_list(entities)")
+        }
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM edges e "
+            "WHERE EXISTS (SELECT 1 FROM entities d "
+            "WHERE d.qualname=e.dst_qualname)"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert "idx_entities_qualname" in indexes
+    assert any("idx_entities_qualname" in str(row["detail"]) for row in plan)
+
+
 def test_db_path_requires_manifest_never_falls_back_to_cwd(tmp_path, monkeypatch):
     unmanaged = tmp_path / "no_manifest"
     unmanaged.mkdir()
@@ -686,6 +710,51 @@ def test_python_import_evidence_resolves_only_exact_function_calls(tmp_path):
             for target in by_call[(6, "unrelated")]
         )
         assert by_call[(7, "helper")] == {None}
+    finally:
+        conn.close()
+
+
+def test_incremental_python_import_resolution_is_changed_scope_only(
+    tmp_path, monkeypatch,
+):
+    repo = _new_repo(tmp_path, "repo")
+    helper = repo / "pkg" / "helpers.py"
+    _write(helper, "def helper(value):\n    return value + 1\n")
+    _write(
+        repo / "pkg" / "caller.py",
+        "from pkg.helpers import helper\n\ndef run(value):\n    return helper(value)\n",
+    )
+    for index in range(20):
+        _write(
+            repo / "pkg" / f"unrelated_{index}.py",
+            "import pkg.helpers as helpers\n\ndef run(value):\n"
+            "    return helpers.never_resolves(value)\n",
+        )
+    sg.build_index(repo, incremental=False)
+
+    original_read_text = Path.read_text
+    unrelated_reads: list[str] = []
+
+    def _tracked_read_text(path: Path, *args, **kwargs):
+        if path.name.startswith("unrelated_"):
+            unrelated_reads.append(path.name)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _tracked_read_text)
+    _write(helper, "def helper_renamed(value):\n    return value + 2\n")
+
+    report = sg.build_index(repo, incremental=True)
+
+    assert report.files_changed == 1
+    assert unrelated_reads == []
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        edge = conn.execute(
+            "SELECT dst_qualname FROM edges WHERE file_path='pkg/caller.py' "
+            "AND kind='calls' AND dst_name='helper'"
+        ).fetchone()
+        assert edge is not None
+        assert edge["dst_qualname"] is None
     finally:
         conn.close()
 
