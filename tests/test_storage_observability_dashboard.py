@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -325,3 +326,161 @@ def test_storage_scan_failure_is_bounded_and_does_not_break_capacity(tmp_path, m
     assert result["scan_status"] == "error"
     assert result["errors"] == ["storage_scan_failed:RuntimeError"]
     assert result["disk_total_bytes"] > 0
+
+
+def test_storage_snapshot_survives_runtime_cache_reset(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert task_store.initialize_repository(repo)["ok"]
+    measured = {
+        "scan_status": "ready",
+        "scanned_at": "2026-08-20T00:00:00+00:00",
+        "managed_total_bytes": 123456,
+        "repo_data_bytes": 123,
+        "repo_data_files": 4,
+        "worker_tree_bytes": 120000,
+        "worker_tree_count": 3,
+        "quarantine_bytes": 0,
+        "safe_reclaimable_bytes": 1000,
+        "components": [],
+        "retention_preview": {},
+        "quarantine_batches": [],
+        "terminal_log_retention": {},
+        "terminal_log_quarantine_batches": [],
+        "task_retention": {},
+        "task_retention_batches": [],
+        "errors": [],
+        # A persisted payload is never allowed to override live response authority.
+        "readonly": False,
+        "disk_total_bytes": 0,
+    }
+    storage_observability._persist(repo.resolve(), measured)
+    storage_observability._reset_cache_for_tests()
+    monkeypatch.setattr(
+        storage_observability,
+        "_measure",
+        lambda _root: (_ for _ in ()).throw(AssertionError("fresh cache rescanned")),
+    )
+
+    started = time.monotonic()
+    result = storage_observability.snapshot(repo)
+
+    assert time.monotonic() - started < 0.1
+    assert result["scan_status"] == "ready"
+    assert result["managed_total_bytes"] == 123456
+    assert result["scanned_at"] == "2026-08-20T00:00:00+00:00"
+    assert result["readonly"] is True
+    assert result["disk_total_bytes"] > 0
+
+
+def test_stale_persisted_storage_snapshot_is_visible_during_refresh(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert task_store.initialize_repository(repo)["ok"]
+    payload = {
+        "scan_status": "ready",
+        "scanned_at": "2026-08-19T00:00:00+00:00",
+        "managed_total_bytes": 654321,
+        "errors": [],
+    }
+    cache_path = repo / storage_observability.PERSISTED_CACHE_RELATIVE_PATH
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps({
+            "schema_id": storage_observability.PERSISTED_CACHE_SCHEMA,
+            "repo_binding": storage_observability._repo_binding(repo.resolve()),
+            "completed_at_epoch": time.time()
+            - storage_observability.SCAN_TTL_SECONDS
+            - 1,
+            "payload": payload,
+        }),
+        encoding="utf-8",
+    )
+    release = threading.Event()
+
+    def slow_refresh(_root: Path) -> dict:
+        release.wait(1.0)
+        return {**payload, "managed_total_bytes": 777777}
+
+    monkeypatch.setattr(storage_observability, "_measure", slow_refresh)
+    storage_observability._reset_cache_for_tests()
+    try:
+        started = time.monotonic()
+        result = storage_observability.snapshot(repo)
+
+        assert time.monotonic() - started < 0.1
+        assert result["scan_status"] == "refreshing"
+        assert result["managed_total_bytes"] == 654321
+    finally:
+        release.set()
+        _wait_ready(repo)
+
+
+def test_foreign_or_malformed_storage_cache_is_ignored(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert task_store.initialize_repository(repo)["ok"]
+    cache_path = repo / storage_observability.PERSISTED_CACHE_RELATIVE_PATH
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps({
+            "schema_id": storage_observability.PERSISTED_CACHE_SCHEMA,
+            "repo_binding": "0" * 64,
+            "completed_at_epoch": time.time(),
+            "payload": {
+                "scan_status": "ready",
+                "managed_total_bytes": 999999,
+                "errors": [],
+            },
+        }),
+        encoding="utf-8",
+    )
+    release = threading.Event()
+
+    def measured_after_release(_root: Path) -> dict:
+        release.wait(1.0)
+        return {"scan_status": "ready", "managed_total_bytes": 1, "errors": []}
+
+    monkeypatch.setattr(
+        storage_observability,
+        "_measure",
+        measured_after_release,
+    )
+    storage_observability._reset_cache_for_tests()
+    try:
+        result = storage_observability.snapshot(repo)
+        assert result["scan_status"] == "scanning"
+        assert result["managed_total_bytes"] == 0
+    finally:
+        release.set()
+        _wait_ready(repo)
+
+
+def test_storage_invalidation_keeps_last_good_visible_while_refreshing(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert task_store.initialize_repository(repo)["ok"]
+    payload = {
+        "scan_status": "ready",
+        "scanned_at": "2026-08-20T00:00:00+00:00",
+        "managed_total_bytes": 222222,
+        "errors": [],
+    }
+    storage_observability._persist(repo.resolve(), payload)
+    storage_observability._reset_cache_for_tests()
+    assert storage_observability.snapshot(repo)["scan_status"] == "ready"
+    release = threading.Event()
+
+    def refreshed_after_release(_root: Path) -> dict:
+        release.wait(1.0)
+        return {**payload, "managed_total_bytes": 333333}
+
+    monkeypatch.setattr(storage_observability, "_measure", refreshed_after_release)
+    storage_observability.invalidate(repo)
+    try:
+        result = storage_observability.snapshot(repo)
+        assert result["scan_status"] == "refreshing"
+        assert result["managed_total_bytes"] == 222222
+    finally:
+        release.set()
+        assert _wait_ready(repo)["managed_total_bytes"] == 333333

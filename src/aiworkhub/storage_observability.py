@@ -8,8 +8,12 @@ sizes in one daemon thread per repository, with a short cache lifetime.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import os
 import shutil
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -25,11 +29,122 @@ from . import (
     worktree_storage,
 )
 
-SCAN_TTL_SECONDS = 60.0
+SCAN_TTL_SECONDS = 300.0
+PERSISTED_CACHE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+PERSISTED_CACHE_MAX_BYTES = 8 * 1024 * 1024
+PERSISTED_CACHE_SCHEMA = "aiworkhub.storage-observability-cache.v1"
+PERSISTED_CACHE_RELATIVE_PATH = Path(
+    ".aiworkhub/runtime/cache/storage-observability-v1.json"
+)
+PERSISTED_PAYLOAD_KEYS = frozenset({
+    "scan_status", "scanned_at", "repo_data_bytes", "repo_data_files",
+    "worker_tree_bytes", "worker_tree_count", "safe_reclaimable_bytes",
+    "quarantine_bytes", "managed_total_bytes", "components",
+    "retention_preview", "quarantine_batches", "terminal_log_retention",
+    "terminal_log_quarantine_batches", "task_retention",
+    "task_retention_batches", "storage_bounds", "errors",
+})
 
 _lock = threading.Lock()
 _cache: dict[str, dict[str, Any]] = {}
 _running: set[str] = set()
+_loaded: set[str] = set()
+_invalidated: set[str] = set()
+
+
+def _repo_binding(repo_root: Path) -> str:
+    return hashlib.sha256(os.fsencode(str(repo_root))).hexdigest()
+
+
+def _load_persisted(repo_root: Path) -> dict[str, Any]:
+    """Load a bounded, repository-bound last-known-good measurement.
+
+    The cache is advisory telemetry, never authority.  Any malformed, oversized,
+    symlinked, foreign-repository, or expired file is ignored fail-closed.
+    """
+    path = repo_root / PERSISTED_CACHE_RELATIVE_PATH
+    try:
+        if path.is_symlink():
+            return {}
+        stat = path.stat()
+        if stat.st_size <= 0 or stat.st_size > PERSISTED_CACHE_MAX_BYTES:
+            return {}
+        raw = path.read_bytes()
+        envelope = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    if not isinstance(envelope, dict):
+        return {}
+    if envelope.get("schema_id") != PERSISTED_CACHE_SCHEMA:
+        return {}
+    if envelope.get("repo_binding") != _repo_binding(repo_root):
+        return {}
+    completed_at = envelope.get("completed_at_epoch")
+    payload = envelope.get("payload")
+    if not isinstance(completed_at, (int, float)) or isinstance(completed_at, bool):
+        return {}
+    completed_at = float(completed_at)
+    if not math.isfinite(completed_at):
+        return {}
+    age = max(0.0, time.time() - completed_at)
+    if age > PERSISTED_CACHE_MAX_AGE_SECONDS or not isinstance(payload, dict):
+        return {}
+    if payload.get("scan_status") != "ready" or not isinstance(payload.get("errors"), list):
+        return {}
+    # Persisted telemetry can never override current disk capacity, readonly,
+    # schema, or other response authority fields.
+    loaded = {key: value for key, value in payload.items() if key in PERSISTED_PAYLOAD_KEYS}
+    loaded["_completed_monotonic"] = time.monotonic() - age
+    return loaded
+
+
+def _persist(repo_root: Path, measured: dict[str, Any]) -> None:
+    """Atomically persist a successful scan without exposing a partial cache."""
+    # Uninitialised paths used by diagnostics/tests must remain observationally
+    # read-only.  Canonical repositories always have this manifest.
+    hub = repo_root / ".aiworkhub"
+    runtime = hub / "runtime"
+    cache_dir = runtime / "cache"
+    if hub.is_symlink() or runtime.is_symlink() or cache_dir.is_symlink():
+        return
+    if not (hub / "project.json").is_file():
+        return
+    path = repo_root / PERSISTED_CACHE_RELATIVE_PATH
+    parent = path.parent
+    temp: Path | None = None
+    try:
+        payload = {
+            key: value for key, value in measured.items() if not key.startswith("_")
+        }
+        envelope = {
+            "schema_id": PERSISTED_CACHE_SCHEMA,
+            "repo_binding": _repo_binding(repo_root),
+            "completed_at_epoch": time.time(),
+            "payload": payload,
+        }
+        encoded = json.dumps(
+            envelope, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        if len(encoded) > PERSISTED_CACHE_MAX_BYTES:
+            return
+        parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=parent)
+        temp = Path(name)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        os.chmod(path, 0o600)
+        temp = None
+    except (OSError, TypeError, ValueError, OverflowError):
+        return
+    finally:
+        if temp is not None:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _tree_size(path: Path, *, exclude: tuple[Path, ...] = ()) -> tuple[int, int]:
@@ -344,20 +459,35 @@ def _refresh(key: str, repo_root: Path) -> None:
             "errors": [f"storage_scan_failed:{type(exc).__name__}"],
         }
     measured["_completed_monotonic"] = time.monotonic()
+    if measured.get("scan_status") == "ready":
+        _persist(repo_root, measured)
     with _lock:
         _cache[key] = measured
         _running.discard(key)
+        _invalidated.discard(key)
 
 
 def snapshot(repo_root: Path | str) -> dict[str, Any]:
     """Return bounded disk telemetry and schedule stale managed-size scans.
 
-    The returned object contains no absolute paths and performs no mutation.
-    ``disk_*`` capacity is current; managed byte counts are cached for at most
-    :data:`SCAN_TTL_SECONDS` and show ``scan_status=scanning`` until ready.
+    The returned object contains no absolute paths. ``disk_*`` capacity is
+    current; managed byte counts are cached for at most
+    :data:`SCAN_TTL_SECONDS`. A repository-bound last-known-good telemetry cache
+    survives runtime reloads, while its refresh remains off the request thread.
     """
     root = Path(repo_root).resolve()
     key = str(root)
+    with _lock:
+        should_load = key not in _loaded
+        if should_load:
+            _loaded.add(key)
+    if should_load:
+        persisted = _load_persisted(root)
+        if persisted:
+            with _lock:
+                # A refresh that completed while the cache was being read is newer.
+                _cache.setdefault(key, persisted)
+    disk: dict[str, Any]
     try:
         usage = shutil.disk_usage(root)
         disk = {
@@ -379,7 +509,11 @@ def snapshot(repo_root: Path | str) -> dict[str, Any]:
     with _lock:
         cached = dict(_cache.get(key) or {})
         completed = float(cached.get("_completed_monotonic") or 0.0)
-        stale = not completed or now - completed >= SCAN_TTL_SECONDS
+        stale = (
+            not completed
+            or now - completed >= SCAN_TTL_SECONDS
+            or key in _invalidated
+        )
         if stale and key not in _running:
             _running.add(key)
             threading.Thread(
@@ -447,10 +581,13 @@ def _reset_cache_for_tests() -> None:
     with _lock:
         _cache.clear()
         _running.clear()
+        _loaded.clear()
+        _invalidated.clear()
 
 
 def invalidate(repo_root: Path | str) -> None:
-    """Drop one repository's completed size snapshot after a retention write."""
+    """Refresh one repository after a retention write without blanking the UI."""
     key = str(Path(repo_root).resolve())
     with _lock:
-        _cache.pop(key, None)
+        _invalidated.add(key)
+        _loaded.discard(key)
