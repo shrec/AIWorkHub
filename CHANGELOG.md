@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-08-20
+
+### Performance
+
+- NeedFix active-state derivation now loads one bounded canonical task-card
+  snapshot and reuses it for listing and exact counting. Live dashboard latency
+  fell from 2.88 seconds to about 0.40 seconds while preserving exact fallback
+  beyond the bounded snapshot.
+- Canonical task events now index both event chronology and task/event
+  chronology. The review-decision aggregate no longer performs thousands of
+  correlated primary-key scans; measured latency fell from roughly 2.4 seconds
+  to under 0.9 seconds.
+
 ## [0.10.3] - 2026-08-20
 
 ### Performance

@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.4
+
+- NeedFix active-state reads are roughly seven times faster on the canonical
+  repository through one bounded task-card snapshot with exact fallback.
+- Indexed review-event chronology removes the dashboard's correlated event-log
+  scan and keeps decision/latency aggregates exact.
+
 ## What's new in 0.10.3
 
 - Full dashboard payloads are about 62.5% smaller on the canonical repository;

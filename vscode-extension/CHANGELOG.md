@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.4 — 2026-08-20
+
+### Performance
+
+- NeedFix dashboard derivation reuses one bounded task-card snapshot instead of
+  repeating point reads for list and count.
+- Review decision/latency telemetry uses indexed task-event chronology instead
+  of correlated full-history scans.
+
 ## 0.10.3 — 2026-08-20
 
 ### Performance
