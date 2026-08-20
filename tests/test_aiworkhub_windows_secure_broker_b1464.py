@@ -210,6 +210,16 @@ def test_windows_preflight_excludes_native_cli_but_keeps_editor_bridge_ready(
     monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: True)
     monkeypatch.setattr(
         repo_policy.worker_workspace,
+        "finalization_preflight_probe",
+        lambda _root, _adapter: {
+            "ok": True,
+            "status": "ready",
+            "reason": "",
+            "phase": "preflight_finalization",
+        },
+    )
+    monkeypatch.setattr(
+        repo_policy.worker_workspace,
         "select_sandbox_backend",
         lambda: (_ for _ in ()).throw(worker_workspace.WorkspaceError("windows_appcontainer_sandbox_unavailable")),
     )

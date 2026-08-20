@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows worker finalization no longer depends on a hard-coded two-second
+  `git diff` subprocess. Timed-out Git trees are reaped and a complete,
+  creation-time worktree manifest mechanically verifies zero-diff and all
+  modified, added, deleted or renamed paths; incomplete fallback evidence
+  fails closed. Windows Preflight now exercises the same isolated finalization
+  path and reports phase-level provisioning and cleanup timings.
+
 ## [0.10.8] - 2026-08-20
 
 ### Fixed

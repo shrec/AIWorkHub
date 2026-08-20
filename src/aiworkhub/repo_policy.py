@@ -477,6 +477,28 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         if not launchable_routes
         else ("degraded" if unavailable_routes else "full")
     )
+    finalization_probe: dict[str, Any] = {
+        "ok": True,
+        "status": "not_required",
+        "reason": "non_windows_host",
+    }
+    if _is_windows_host() and launchable_routes:
+        probe_adapter = str(
+            (selected or launchable_routes[0]).get("adapter_id") or "vscode_lm"
+        )
+        try:
+            finalization_probe = worker_workspace.finalization_preflight_probe(
+                root, probe_adapter
+            )
+        except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError) as exc:
+            finalization_probe = {
+                "ok": False,
+                "status": "blocked",
+                "reason": f"preflight_finalization_probe_failed:{exc}"[:500],
+                "phase": "preflight_finalization",
+            }
+        if not finalization_probe.get("ok"):
+            errors.append("worker_finalization_not_ready")
     selected_route_backend = str((selected or {}).get("sandbox_backend") or "")
     route_enforceable = bool(
         selected_route_backend and (selected or {}).get("launchable")
@@ -589,6 +611,7 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             if key in callback_health
         },
         "workspace_hygiene": hygiene_status,
+        "worker_finalization": finalization_probe,
         "providers": providers,
         # Per-route observability so this surface reports, route by route, which
         # routes can never have quota verified here and the named reason why --

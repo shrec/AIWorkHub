@@ -27,9 +27,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -224,6 +226,13 @@ _ISOLATED_QUEUE_PLACEHOLDER_TASK_ID = "AIWORKHUB_ISOLATED_QUEUE_PLACEHOLDER_B328
 # materialize a detached worktree on cold storage.  The generic command
 # timeout is intentionally shorter; provisioning gets its own bounded budget.
 WORKTREE_CREATE_TIMEOUT_SECONDS = 600
+FINALIZATION_GIT_TIMEOUT_ENV = "AIWORKHUB_FINALIZATION_GIT_TIMEOUT_SECONDS"
+DEFAULT_FINALIZATION_GIT_TIMEOUT_SECONDS = 5.0
+MIN_FINALIZATION_GIT_TIMEOUT_SECONDS = 0.25
+MAX_FINALIZATION_GIT_TIMEOUT_SECONDS = 120.0
+_FINALIZATION_PROBE_CACHE_SECONDS = 300.0
+_FINALIZATION_PROBE_LOCK = threading.Lock()
+_FINALIZATION_PROBE_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
 # Landlock uses the generic syscall numbers on the Linux architectures Python
 # supports in this deployment. Unsupported kernels return ENOSYS and launch is
@@ -308,6 +317,8 @@ class GitCommandTimeout(WorkspaceError):
             "workspace_provision": "workspace_provision_git_timeout",
             "worker_finalization": "worker_finalization_timeout",
             "review_acceptance": "review_acceptance_git_probe_timeout",
+            "preflight_finalization": "preflight_finalization_git_timeout",
+            "workspace_cleanup": "workspace_cleanup_git_timeout",
         }.get(phase, "git_command_timeout")
         command = " ".join(argv[:8])
         super().__init__(
@@ -385,6 +396,11 @@ class WorkerWorkspace:
     allowed_writes: tuple[str, ...]
     parent_baseline: dict[str, str | None]
     workspace_baseline: dict[str, str | None]
+    # Complete worktree manifest used only when the bounded Git detector is
+    # unavailable.  Unlike ``workspace_baseline`` this covers every file, so a
+    # fallback cannot silently miss an out-of-scope modification or new file.
+    tree_baseline: dict[str, str | None] | None = None
+    provisioning_timings_ms: dict[str, float] | None = None
     inherited_rework_paths: tuple[str, ...] = ()
     # Commit OID the isolated worktree was detached at when it was created.
     # ``changed_paths`` diffs against this pinned base, not the live symbolic
@@ -402,6 +418,8 @@ class WorkerWorkspace:
             "allowed_writes": list(self.allowed_writes),
             "parent_baseline": dict(self.parent_baseline),
             "workspace_baseline": dict(self.workspace_baseline),
+            "tree_baseline": dict(self.tree_baseline or {}),
+            "provisioning_timings_ms": dict(self.provisioning_timings_ms or {}),
             "inherited_rework_paths": list(self.inherited_rework_paths),
             "base_oid": self.base_oid,
         }
@@ -422,6 +440,14 @@ class WorkerWorkspace:
                 str(k): (None if v is None else str(v))
                 for k, v in dict(payload.get("workspace_baseline") or {}).items()
             },
+            tree_baseline={
+                str(k): (None if v is None else str(v))
+                for k, v in dict(payload.get("tree_baseline") or {}).items()
+            } or None,
+            provisioning_timings_ms={
+                str(k): float(v)
+                for k, v in dict(payload.get("provisioning_timings_ms") or {}).items()
+            } or None,
             inherited_rework_paths=tuple(
                 _relative_repo_path(v)
                 for v in payload.get("inherited_rework_paths") or ()
@@ -732,6 +758,81 @@ def _hash_path(path: Path) -> str | None:
             digest.update(chunk)
     mode = stat.S_IMODE(path.stat().st_mode)
     return f"file:{mode:o}:{digest.hexdigest()}"
+
+
+def finalization_git_timeout_seconds() -> float:
+    """Return the bounded finalization Git budget configured for this host."""
+    raw = os.environ.get(FINALIZATION_GIT_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_FINALIZATION_GIT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise WorkspaceError("invalid_finalization_git_timeout") from exc
+    if not MIN_FINALIZATION_GIT_TIMEOUT_SECONDS <= value <= MAX_FINALIZATION_GIT_TIMEOUT_SECONDS:
+        raise WorkspaceError("finalization_git_timeout_out_of_range")
+    return value
+
+
+def _worktree_manifest_paths(root: Path) -> list[tuple[str, Path]]:
+    """List every mechanically relevant worktree file without following links."""
+    rows: list[tuple[str, Path]] = []
+    stack = [root]
+    while stack:
+        directory = stack.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise WorkspaceError(f"workspace_manifest_scan_failed:{directory}:{exc}") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            relative = path.relative_to(root).as_posix()
+            # A linked worktree's .git pointer is Git-owned administrative
+            # metadata, not candidate content and never an allowed output.
+            if relative == ".git":
+                continue
+            if entry.is_symlink():
+                rows.append((_relative_repo_path(relative), path))
+            elif entry.is_dir(follow_symlinks=False):
+                stack.append(path)
+            elif entry.is_file(follow_symlinks=False):
+                rows.append((_relative_repo_path(relative), path))
+            else:
+                raise WorkspaceError(f"workspace_manifest_special_file:{relative}")
+    rows.sort(key=lambda item: item[0])
+    return rows
+
+
+def _worktree_manifest(root: Path) -> dict[str, str | None]:
+    """Hash the complete worktree using bounded CPU-derived IO parallelism."""
+    rows = _worktree_manifest_paths(root)
+    if not rows:
+        return {}
+    # Hashing independent files releases the GIL while reading.  Keep one core
+    # free for the interactive MCP server and never use a hard-coded pool size.
+    worker_count = min(len(rows), max(1, (os.cpu_count() or 2) - 1))
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        hashes = list(pool.map(lambda item: _hash_path(item[1]), rows))
+    return {relative: digest for (relative, _path), digest in zip(rows, hashes)}
+
+
+def _manifest_changed_paths(workspace: WorkerWorkspace, *, git_phase: str) -> list[str]:
+    baseline = workspace.tree_baseline
+    if baseline is None:
+        raise WorkspaceError(f"{git_phase}_git_fallback_unavailable:baseline_missing")
+    current = _worktree_manifest(workspace.path)
+    rows = {
+        relative
+        for relative in set(baseline) | set(current)
+        if baseline.get(relative) != current.get(relative)
+    }
+    # Rework predecessor bytes are intentionally present at workspace creation
+    # yet still form part of the candidate delta against the canonical parent.
+    for relative in workspace.inherited_rework_paths:
+        current_hash = current.get(relative)
+        if current_hash != workspace.parent_baseline.get(relative):
+            rows.add(_relative_repo_path(relative))
+    return sorted(rows)
 
 
 def _expand_declared(repo: Path, declared: Iterable[str]) -> list[str]:
@@ -1920,13 +2021,19 @@ def create_workspace(
     if path.exists() or home.exists():
         raise WorkspaceError(f"workspace_exists:{request_id}")
     path.parent.mkdir(parents=True, exist_ok=False, mode=0o700)
+    provisioning_started = time.monotonic()
+    provisioning_timings_ms: dict[str, float] = {}
 
     try:
+        phase_started = time.monotonic()
         result = _run(
             ["git", "worktree", "add", "--detach", str(path), "HEAD"],
             cwd=repo,
             timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
             phase="workspace_provision",
+        )
+        provisioning_timings_ms["worktree_create"] = round(
+            (time.monotonic() - phase_started) * 1000.0, 3
         )
     except Exception:
         # ``git worktree add`` can raise (for example a timeout that kills git
@@ -1944,6 +2051,7 @@ def create_workspace(
         raise WorkspaceError(f"git_worktree_add_failed:{result.stderr[-1000:]}")
     declared = list(card.get("read_first") or []) + list(card.get("immutable_inputs") or []) + list(allowed)
     try:
+        phase_started = time.monotonic()
         seeded = _expand_declared(repo, declared)
         seeded = _resolve_local_quoted_includes(repo, seeded)
         for relative in seeded:
@@ -1962,6 +2070,10 @@ def create_workspace(
             repo, path, card, allowed
         )
         seeded = sorted(set(seeded) | set(rework_seeded))
+        provisioning_timings_ms["declared_seed"] = round(
+            (time.monotonic() - phase_started) * 1000.0, 3
+        )
+        phase_started = time.monotonic()
         baseline: dict[str, str | None] = {}
         for relative in _expand_declared(repo, allowed):
             baseline[relative] = _hash_path(repo / relative)
@@ -1969,8 +2081,24 @@ def create_workspace(
             relative: _hash_path(path / relative)
             for relative in sorted(set(seeded) | set(_expand_declared(path, allowed)))
         }
+        provisioning_timings_ms["declared_baseline"] = round(
+            (time.monotonic() - phase_started) * 1000.0, 3
+        )
+        phase_started = time.monotonic()
+        tree_baseline = _worktree_manifest(path)
+        provisioning_timings_ms["tree_baseline"] = round(
+            (time.monotonic() - phase_started) * 1000.0, 3
+        )
+        phase_started = time.monotonic()
         _credential_home(home, adapter_id, repo)
+        provisioning_timings_ms["credential_home"] = round(
+            (time.monotonic() - phase_started) * 1000.0, 3
+        )
+        phase_started = time.monotonic()
         provision_isolated_task_queue_db(repo, home)
+        provisioning_timings_ms["task_queue"] = round(
+            (time.monotonic() - phase_started) * 1000.0, 3
+        )
         # NF-2026-00285 (check-then-act closure): re-check at the end of the seed
         # window. The declared inputs were just copied from the LIVE parent tree;
         # if a promotion began writing into that tree at any point during the
@@ -1984,7 +2112,11 @@ def create_workspace(
         cleanup_workspace(repo, path, home)
         raise
     try:
+        phase_started = time.monotonic()
         base_oid = _isolated_worktree_base_oid(repo, path)
+        provisioning_timings_ms["base_oid"] = round(
+            (time.monotonic() - phase_started) * 1000.0, 3
+        )
     except WorkspaceError:
         cleanup_workspace(repo, path, home)
         raise
@@ -1996,12 +2128,23 @@ def create_workspace(
         allowed_writes=allowed,
         parent_baseline=baseline,
         workspace_baseline=workspace_baseline,
+        tree_baseline=tree_baseline,
+        provisioning_timings_ms={
+            **provisioning_timings_ms,
+            "total": round((time.monotonic() - provisioning_started) * 1000.0, 3),
+        },
         inherited_rework_paths=tuple(sorted(set(rework_seeded))),
         base_oid=base_oid,
     )
 
 
-def cleanup_workspace(repo: Path, path: Path, home: Path) -> None:
+def cleanup_workspace(
+    repo: Path,
+    path: Path,
+    home: Path,
+    *,
+    git_timeout: float = 120,
+) -> None:
     repo = repo.resolve()
     path = path.resolve()
     home = home.resolve()
@@ -2019,15 +2162,112 @@ def cleanup_workspace(repo: Path, path: Path, home: Path) -> None:
     # already disappeared.  ``git worktree remove --force`` is intentionally
     # idempotent for a registered-but-missing path; gating this call on
     # ``path.exists()`` left prunable entries in ``.git/worktrees`` forever.
-    _run(["git", "worktree", "remove", "--force", str(path)], cwd=repo)
+    _run(
+        ["git", "worktree", "remove", "--force", str(path)],
+        cwd=repo,
+        timeout=git_timeout,
+        phase="workspace_cleanup",
+    )
     shutil.rmtree(path.parent, ignore_errors=True)
     # A failed first remove (for example, because Windows still had a handle
     # open) may become removable after the directory cleanup.  Prune only
     # administratively stale registrations; Git never deletes a live
     # worktree through this command.
-    _run(["git", "worktree", "prune", "--expire", "now"], cwd=repo)
+    _run(
+        ["git", "worktree", "prune", "--expire", "now"],
+        cwd=repo,
+        timeout=git_timeout,
+        phase="workspace_cleanup",
+    )
     if path.exists() or home.exists():
         raise WorkspaceError("workspace_cleanup_incomplete")
+
+
+def finalization_preflight_probe(
+    repo: Path,
+    adapter_id: str,
+    *,
+    cache_seconds: float = _FINALIZATION_PROBE_CACHE_SECONDS,
+) -> dict[str, Any]:
+    """Exercise the real isolated zero-diff path with a short-lived cache."""
+    repo = repo.resolve()
+    key = (str(repo), str(adapter_id))
+    now = time.monotonic()
+    with _FINALIZATION_PROBE_LOCK:
+        cached = _FINALIZATION_PROBE_CACHE.get(key)
+        if cached and now - cached[0] <= cache_seconds:
+            return {**cached[1], "cache_hit": True}
+
+    request_id = f"preflight-finalization-{uuid.uuid4().hex[:16]}"
+    workspace: WorkerWorkspace | None = None
+    started = time.monotonic()
+    cleanup_ms = 0.0
+    try:
+        workspace = create_workspace(
+            repo,
+            request_id,
+            {
+                "allowed_writes": [],
+                "required_outputs": [],
+                "read_first": [],
+                "immutable_inputs": [],
+            },
+            adapter_id,
+        )
+        changed = enforce_scope(
+            workspace,
+            git_phase="preflight_finalization",
+            git_timeout=finalization_git_timeout_seconds(),
+        )
+        if changed:
+            raise WorkspaceError("preflight_finalization_nonzero_delta")
+        result: dict[str, Any] = {
+            "ok": True,
+            "status": "ready",
+            "reason": "",
+            "phase": "preflight_finalization",
+            "command": "git diff --name-only --no-renames -z <base_oid>",
+            "provisioning_timings_ms": dict(workspace.provisioning_timings_ms or {}),
+        }
+    except (OSError, RuntimeError, ValueError, WorkspaceError) as exc:
+        result = {
+            "ok": False,
+            "status": "blocked",
+            "reason": str(exc)[:500],
+            "phase": "preflight_finalization",
+            "command": "git diff --name-only --no-renames -z <base_oid>",
+            "provisioning_timings_ms": (
+                dict(workspace.provisioning_timings_ms or {}) if workspace else {}
+            ),
+        }
+    finally:
+        if workspace is not None:
+            cleanup_started = time.monotonic()
+            try:
+                cleanup_workspace(
+                    workspace.repo,
+                    workspace.path,
+                    workspace.home,
+                    git_timeout=finalization_git_timeout_seconds(),
+                )
+            except (OSError, RuntimeError, ValueError, WorkspaceError) as exc:
+                result = {
+                    **result,
+                    "ok": False,
+                    "status": "blocked",
+                    "reason": f"preflight_finalization_cleanup_failed:{exc}"[:500],
+                    "phase": "workspace_cleanup",
+                }
+            cleanup_ms = (time.monotonic() - cleanup_started) * 1000.0
+    result = {
+        **result,
+        "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
+        "cleanup_ms": round(cleanup_ms, 3),
+        "cache_hit": False,
+    }
+    with _FINALIZATION_PROBE_LOCK:
+        _FINALIZATION_PROBE_CACHE[key] = (time.monotonic(), dict(result))
+    return result
 
 
 def _canonical_worktree_delta_paths(repo: Path) -> list[str]:
@@ -2272,22 +2512,35 @@ def changed_paths(
     # records both sides.  With Git's default rename detection, ``--name-only``
     # would report only the destination and hide the deleted source from the
     # scope check.
-    tracked = _run(
-        ["git", "diff", "--name-only", "--no-renames", "-z", diff_ref],
-        cwd=workspace.path,
-        timeout=git_timeout,
-        phase=git_phase,
-    )
-    if tracked.returncode != 0:
-        raise WorkspaceError(f"git_diff_failed:{tracked.stderr[:300]}")
-    untracked = _run(
-        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-        cwd=workspace.path,
-        timeout=git_timeout,
-        phase=git_phase,
-    )
-    if untracked.returncode != 0:
-        raise WorkspaceError(f"git_untracked_failed:{untracked.stderr[:300]}")
+    try:
+        tracked = _run(
+            ["git", "diff", "--name-only", "--no-renames", "-z", diff_ref],
+            cwd=workspace.path,
+            timeout=git_timeout,
+            phase=git_phase,
+        )
+        if tracked.returncode != 0:
+            raise WorkspaceError(f"git_diff_failed:{tracked.stderr[:300]}")
+        untracked = _run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=workspace.path,
+            timeout=git_timeout,
+            phase=git_phase,
+        )
+        if untracked.returncode != 0:
+            raise WorkspaceError(f"git_untracked_failed:{untracked.stderr[:300]}")
+    except GitCommandTimeout as primary_error:
+        # The Windows extension-host process context can block a Git child even
+        # when the same command is fast in an interactive shell.  _run already
+        # terminates the exact child tree; compare the complete creation-time
+        # manifest instead of trusting provider output or accepting zero-diff.
+        try:
+            return _manifest_changed_paths(workspace, git_phase=git_phase)
+        except (OSError, RuntimeError, ValueError, WorkspaceError) as fallback_error:
+            raise WorkspaceError(
+                f"{git_phase}_git_fallback_failed:"
+                f"primary={primary_error}:fallback={fallback_error}"
+            ) from fallback_error
     rows: set[str] = {
         _relative_repo_path(item)
         for item in (tracked.stdout + untracked.stdout).split("\x00")

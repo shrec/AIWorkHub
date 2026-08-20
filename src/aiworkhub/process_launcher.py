@@ -9123,7 +9123,7 @@ class ProcessManager:
                     return enforce_scope(
                         workspace,
                         git_phase="worker_finalization",
-                        git_timeout=2.0,
+                        git_timeout=_worker_workspace.finalization_git_timeout_seconds(),
                     )
                 finally:
                     scope_duration_ms += (
@@ -11373,7 +11373,7 @@ class ProcessManager:
                     if enforce_scope(
                         workspace,
                         git_phase="review_acceptance",
-                        git_timeout=2.0,
+                        git_timeout=_worker_workspace.finalization_git_timeout_seconds(),
                     ):
                         raise WorkspaceError("quality_review_workspace_mutated")
                     if evidence.get("changed_paths") not in ([], None):
@@ -11534,7 +11534,7 @@ class ProcessManager:
                     if enforce_scope(
                         workspace,
                         git_phase="review_acceptance",
-                        git_timeout=2.0,
+                        git_timeout=_worker_workspace.finalization_git_timeout_seconds(),
                     ):
                         raise WorkspaceError("research_workspace_mutated")
                     if evidence.get("changed_paths") not in ([], None):
@@ -11698,7 +11698,7 @@ class ProcessManager:
                 changed = enforce_scope(
                     workspace,
                     git_phase="review_acceptance",
-                    git_timeout=2.0,
+                    git_timeout=_worker_workspace.finalization_git_timeout_seconds(),
                 )
                 required_output_records = validate_required_outputs(
                     workspace,
@@ -11904,7 +11904,7 @@ class ProcessManager:
                     if enforce_scope(
                         reviewer_workspace,
                         git_phase="review_acceptance",
-                        git_timeout=2.0,
+                        git_timeout=_worker_workspace.finalization_git_timeout_seconds(),
                     ):
                         raise WorkspaceError(
                             f"quality_reviewer_workspace_mutated:{reviewer_request_id}"

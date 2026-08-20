@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,17 @@ def _repo(tmp_path: Path) -> Path:
     _git(repo, "add", "tracked.txt")
     _git(repo, "commit", "-m", "baseline")
     return repo
+
+
+def _timed_out(workspace, phase: str) -> worker_workspace.GitCommandTimeout:
+    return worker_workspace.GitCommandTimeout(
+        phase=phase,
+        argv=["git", "diff"],
+        cwd=workspace.path,
+        timeout=0.05,
+        pid=1234,
+        tree_terminated=True,
+    )
 
 
 def test_acceptance_scope_reads_detached_head_metadata_without_rev_parse(
@@ -101,4 +113,104 @@ def test_finalization_git_timeout_uses_distinct_taxonomy(tmp_path: Path) -> None
             cwd=tmp_path,
             timeout=0.05,
             phase="worker_finalization",
+        )
+
+
+def test_finalization_git_timeout_falls_back_to_complete_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path)
+    for name in ("deleted.txt", "rename-src.txt"):
+        (repo / name).write_text(f"{name}\n", encoding="utf-8")
+    _git(repo, "add", "deleted.txt", "rename-src.txt")
+    _git(repo, "commit", "-m", "more baseline")
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "manifest-fallback",
+        {
+            "allowed_writes": [
+                "tracked.txt",
+                "deleted.txt",
+                "rename-src.txt",
+                "rename-dst.txt",
+                "new.txt",
+            ]
+        },
+        "validation",
+    )
+    real_run = worker_workspace._run
+
+    def blocked_git(argv, **kwargs):
+        if argv[:2] == ["git", "diff"]:
+            raise _timed_out(workspace, str(kwargs.get("phase") or ""))
+        return real_run(argv, **kwargs)
+
+    try:
+        (workspace.path / "tracked.txt").write_text("modified\n", encoding="utf-8")
+        (workspace.path / "deleted.txt").unlink()
+        (workspace.path / "new.txt").write_text("new\n", encoding="utf-8")
+        (workspace.path / "rename-src.txt").replace(
+            workspace.path / "rename-dst.txt"
+        )
+        monkeypatch.setattr(worker_workspace, "_run", blocked_git)
+
+        assert worker_workspace.changed_paths(
+            workspace, git_phase="worker_finalization", git_timeout=0.05
+        ) == [
+            "deleted.txt",
+            "new.txt",
+            "rename-dst.txt",
+            "rename-src.txt",
+            "tracked.txt",
+        ]
+    finally:
+        monkeypatch.setattr(worker_workspace, "_run", real_run)
+        worker_workspace.cleanup_workspace(
+            workspace.repo, workspace.path, workspace.home
+        )
+
+
+def test_manifest_fallback_fails_closed_for_out_of_scope_and_missing_baseline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path)
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "manifest-scope",
+        {"allowed_writes": ["tracked.txt"]},
+        "validation",
+    )
+    real_run = worker_workspace._run
+
+    def blocked_git(argv, **kwargs):
+        if argv[:2] == ["git", "diff"]:
+            raise _timed_out(workspace, str(kwargs.get("phase") or ""))
+        return real_run(argv, **kwargs)
+
+    try:
+        (workspace.path / "outside.txt").write_text("forbidden\n", encoding="utf-8")
+        monkeypatch.setattr(worker_workspace, "_run", blocked_git)
+        with pytest.raises(worker_workspace.WorkspaceError, match="scope_violation:outside.txt"):
+            worker_workspace.enforce_scope(
+                workspace, git_phase="worker_finalization", git_timeout=0.05
+            )
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="worker_finalization_git_fallback_failed:.*baseline_missing",
+        ):
+            worker_workspace.changed_paths(
+                replace(workspace, tree_baseline=None),
+                git_phase="worker_finalization",
+                git_timeout=0.05,
+            )
+    finally:
+        monkeypatch.setattr(worker_workspace, "_run", real_run)
+        worker_workspace.cleanup_workspace(
+            workspace.repo, workspace.path, workspace.home
         )
