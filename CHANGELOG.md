@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.95] - 2026-08-20
+
+### Fixed
+
+- **VS Code LM workers could enter an unrecoverable force-stage loop.** The
+  advertised semantic-edit schema mixed mutually exclusive create and
+  replace-range fields, while its outer `additionalProperties: false` rejected
+  every valid branch. GLM consequently guessed operation names, received
+  `operation_invalid`, retried malformed payloads and finally stopped with
+  `vscode_lm_semantic_edit_stage_required`. The tool now exposes two exact,
+  executable schema branches, supplies canonical offline examples in native and
+  text protocols, and rejects hybrid or extra-field payloads deterministically.
+- **A late non-stage tool request was treated differently by tool name.** During
+  bounded staging, any non-stage request is now corrected once without invoking
+  MCP; a repeated violation terminates once with a structured reason. Valid
+  stage and finalize calls remain offline and retain exact call/result identity.
+
 ## [0.9.94] - 2026-08-19
 
 The OS boundary. Every defect below was measured by running the code, and the

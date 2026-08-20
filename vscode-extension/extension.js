@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.94";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.95";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2952,17 +2952,31 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
     description: "Stage one small hash-bound line replacement or one complete new file. The bridge validates and retains it; no workspace write occurs until the final envelope is accepted.",
     inputSchema: {
       type: "object",
-      additionalProperties: false,
-      required: ["operation", "file_path"],
-      properties: {
-        operation: { type: "string", enum: ["replace_range", "create"] },
-        file_path: { type: "string", minLength: 1, maxLength: 512 },
-        start_line: { type: "integer", minimum: 1 },
-        end_line: { type: "integer", minimum: 1 },
-        new: { type: "string" },
-        content: { type: "string" },
-        preserve_trailing_newline: { type: "boolean" },
-      },
+      oneOf: [
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["operation", "file_path", "start_line", "end_line", "new"],
+          properties: {
+            operation: { const: "replace_range" },
+            file_path: { type: "string", minLength: 1, maxLength: 512 },
+            start_line: { type: "integer", minimum: 1 },
+            end_line: { type: "integer", minimum: 1 },
+            new: { type: "string" },
+            preserve_trailing_newline: { type: "boolean" },
+          },
+        },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["operation", "file_path", "content"],
+          properties: {
+            operation: { const: "create" },
+            file_path: { type: "string", minLength: 1, maxLength: 512 },
+            content: { type: "string" },
+          },
+        },
+      ],
     },
   },
   {
@@ -3369,6 +3383,9 @@ function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
     `- Never read or emit a complete existing file. Use Source Graph body mode for the smallest exact symbol, then return only its replacement in a line range.\n` +
     `- Preferred delivery: after body discovery call ${VSCODE_LM_STAGE_EDIT_TOOL} once per smallest replacement or complete new file. The bridge performs hash-bound prepare internally and retains the fragment without writing it.\n` +
     `- After every intended fragment is staged, call ${VSCODE_LM_FINALIZE_EDIT_TOOL} with only a short truthful summary. Do not resend staged code; the bridge assembles the final envelope offline.\n` +
+    `- Canonical offline create stage request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}}\n` +
+    `- Canonical offline replace-range stage request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":1,"end_line":1,"new":"<replacement code>"}}\n` +
+    `- Canonical offline finalize request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_FINALIZE_EDIT_TOOL}","input":{"summary":"<short applied summary>"}}\n` +
     `- Semantic-edit prepare is an internal bridge primitive and is not provider-callable. Stage each replacement with file_path, start_line, end_line, and new; the bridge resolves and binds current_sha256 internally.\n` +
     `- Semantic edits must name an allowed path and use non-overlapping 1-based inclusive start_line/end_line values from Source Graph evidence.\n` +
     `- Each new value must contain the complete, substantive replacement for its declared range; it may be empty only for an intentional deletion. Do not echo old code. preserve_trailing_newline defaults true.\n` +
@@ -3648,8 +3665,17 @@ function createVscodeLmStagedEditCollector(request) {
       return reject(`path_not_allowed:${filePath || "missing"}`);
     }
     const contract = contractByPath.get(filePath);
+    const unexpectedKeys = (candidate) => {
+      const all = ["operation", "file_path"];
+      if (candidate === "create") {
+        return Object.keys(input).filter((key) => !all.concat(["content"]).includes(key));
+      }
+      return Object.keys(input).filter((key) => !all.concat(["start_line", "end_line", "new", "preserve_trailing_newline"]).includes(key));
+    };
     if (operation === "create") {
       if (!contract || contract.action !== "create") return reject(`action_mismatch:${filePath}:create`);
+      const unknown = unexpectedKeys("create");
+      if (unknown.length > 0) return reject(`stage_payload_extra_fields:${filePath}:${unknown.join(",")}`);
       if (typeof input.content !== "string") return reject(`content_invalid:${filePath}`);
       const fidelity = vscodeLmFidelityError(input.content, filePath, "staged_create", { create: true });
       if (fidelity) return reject(fidelity);
@@ -3661,6 +3687,8 @@ function createVscodeLmStagedEditCollector(request) {
     }
     if (operation !== "replace_range") return reject(`operation_invalid:${operation || "missing"}`);
     if (!contract || contract.action !== "edit") return reject(`action_mismatch:${filePath}:replace_range`);
+    const unknown = unexpectedKeys("replace_range");
+    if (unknown.length > 0) return reject(`stage_payload_extra_fields:${filePath}:${unknown.join(",")}`);
     if (!Number.isSafeInteger(input.start_line) || input.start_line < 1 ||
         !Number.isSafeInteger(input.end_line) || input.end_line < input.start_line ||
         typeof input.new !== "string" ||
@@ -3781,7 +3809,10 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
     `- For every tool call output ONLY: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${sourceGraphToolName}","input":{"mode":"focus","query":"...","workflow_stage":"orientation"}}\n` +
     (qualityReview
       ? `- The only successful terminal action is an authenticated aiworkhub_worker_quality_review_submit request.\n`
-      : `- After each tool result, either request another allowlisted tool or output the final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n`) +
+      : `- After each tool result, either request another allowlisted tool or output the final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n` +
+        `- Canonical stage request (replace_range): {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editStageName}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":1,"end_line":1,"new":"<replacement code>"}}\n` +
+        `- Canonical stage request (create): {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editStageName}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}}\n` +
+        `- Canonical finalize request: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${editFinalizeName}","input":{"summary":"<short applied summary>"}}\n`) +
     `- Allowed tool names: ${JSON.stringify(toolNames)}.\n` +
     `- Never wrap JSON in Markdown or add prose.`;
 }
@@ -4281,10 +4312,10 @@ async function runVscodeLmTextProtocol(
     );
     const permitted = availableTools.find((tool) => tool.name === envelope.name);
     if (!permitted) {
-      // A role-correct Source Graph request during forced staging is a phase
-      // violation, not an authority violation. Correct it once without invoking
-      // MCP; a repeated request fails with one bounded structured error.
-      if (forceStagedEdit && envelope.name === expectedSgTool) {
+      // A non-stage tool request during forced staging is a phase violation, not
+      // an authority violation. Correct it once without invoking MCP; a repeated
+      // request fails with one bounded structured error.
+      if (forceStagedEdit) {
         protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
         if (stagedEditViolations >= 1) {
           throw vscodeLmProtocolFailure(
@@ -4295,7 +4326,9 @@ async function runVscodeLmTextProtocol(
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
           `Only ${VSCODE_LM_STAGE_EDIT_TOOL} is accepted in the bounded semantic-edit stage. ` +
-          `Output ONLY one ${VSCODE_LM_TOOL_REQUEST_SCHEMA} request for ${VSCODE_LM_STAGE_EDIT_TOOL}.`,
+          `Use one of these exact tool envelope shapes and nothing else:\n` +
+          `{"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}} and ` +
+          `{"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":1,"end_line":1,"new":"<replacement code>"}}.`,
         ));
         continue;
       }
@@ -4566,24 +4599,21 @@ async function runVscodeLmAgent(
     }
     if (startedWithSourceGraph) postSourceTurns += 1;
     if (forceStagedEdit && calls.some((call) => call.name !== VSCODE_LM_STAGE_EDIT_TOOL)) {
-      const nonStageCalls = calls.filter((call) => call.name !== VSCODE_LM_STAGE_EDIT_TOOL);
-      if (nonStageCalls.every((call) => call.name === expectedSgTool)) {
-        protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
-        if (stagedEditViolations >= 1) {
-          throw vscodeLmProtocolFailure(
-            "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
-          );
-        }
-        stagedEditViolations += 1;
-        messages.push(vscode.LanguageModelChatMessage.Assistant(filterOutToolCallParts(assistantParts)));
-        messages.push(vscode.LanguageModelChatMessage.User(
-          `Only ${VSCODE_LM_STAGE_EDIT_TOOL} is accepted in the bounded semantic-edit stage. ` +
-          `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now with only the smallest required replacement/create.`,
-        ));
-        continue;
+      protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
+      if (stagedEditViolations >= 1) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+        );
       }
-      const offending = nonStageCalls.find((call) => call.name !== expectedSgTool);
-      throw new Error(`vscode_lm_tool_not_allowed:${String(offending && offending.name || "")}`);
+      stagedEditViolations += 1;
+      messages.push(vscode.LanguageModelChatMessage.Assistant(filterOutToolCallParts(assistantParts)));
+      messages.push(vscode.LanguageModelChatMessage.User(
+        `Only ${VSCODE_LM_STAGE_EDIT_TOOL} is accepted in the bounded semantic-edit stage. ` +
+        `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now with only the smallest required envelope shape. ` +
+        `Use create for new files: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"create","file_path":"<allowed-path>","content":"<full file content>"}} ` +
+        `or replace_range for edits: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${VSCODE_LM_STAGE_EDIT_TOOL}","input":{"operation":"replace_range","file_path":"<allowed-path>","start_line":1,"end_line":1,"new":"<replacement code>"}}.`,
+      ));
+      continue;
     }
     if (calls.length === 0) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");

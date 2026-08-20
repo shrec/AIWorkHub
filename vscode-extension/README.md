@@ -12,6 +12,16 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.95
+
+- VS Code LM workers no longer get stuck in the final semantic-edit stage. The
+  bridge advertises separate, strict schemas and canonical examples for new-file
+  creation and range replacement.
+- Late session, memory, KB and Source Graph requests are corrected once without
+  being sent to MCP; repeated violations stop with one bounded reason.
+- Offline stage/finalize calls now reject missing, hybrid and extra fields while
+  preserving exact tool-call identity.
+
 ## What's new in 0.9.94
 
 - AIWorkHub could stop responding until you reloaded the window: two operations

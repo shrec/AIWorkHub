@@ -1,5 +1,20 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.95 — 2026-08-20
+
+### Fixed
+
+- GLM and other VS Code LM workers no longer get trapped at the final semantic
+  edit stage. Create and replace-range operations now have separate strict
+  schemas and concrete request examples, so valid edits are accepted without
+  guessing operation names.
+- A late session, memory, KB or Source Graph call during forced staging is
+  corrected once without reaching MCP. A repeated protocol violation stops with
+  one bounded, explicit reason instead of cascading through malformed JSON and
+  `tool_not_allowed` failures.
+- Stage and finalize remain offline bridge operations, with strict rejection of
+  missing, hybrid and unexpected fields.
+
 ## 0.9.94 — 2026-08-19
 
 ### Fixed

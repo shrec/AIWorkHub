@@ -92,6 +92,40 @@ assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiwork
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_prepare"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_stage"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_finalize"));
+const stageTool = internals.VSCODE_LM_PRIVATE_TOOLS.find((tool) => tool.name === "aiworkhub_manager_semantic_edit_stage");
+assert.ok(Array.isArray(stageTool.inputSchema && stageTool.inputSchema.oneOf), "stage tool schema must be oneOf");
+assert.strictEqual(stageTool.inputSchema.oneOf.length, 2);
+assert.ok(stageTool.inputSchema.oneOf.every((schema) => schema.additionalProperties === false));
+assert.notStrictEqual(stageTool.inputSchema.additionalProperties, false, "outer oneOf schema must not reject branch properties");
+const schemaMatches = (schema, value) => {
+  if (!schema || schema.type !== "object" || !value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (Array.isArray(schema.oneOf)) return schema.oneOf.filter((branch) => schemaMatches(branch, value)).length === 1;
+  const properties = schema.properties || {};
+  if ((schema.required || []).some((key) => !Object.prototype.hasOwnProperty.call(value, key))) return false;
+  if (schema.additionalProperties === false && Object.keys(value).some((key) => !Object.prototype.hasOwnProperty.call(properties, key))) return false;
+  return Object.entries(value).every(([key, field]) => {
+    const rule = properties[key];
+    if (!rule) return schema.additionalProperties !== false;
+    if (Object.prototype.hasOwnProperty.call(rule, "const") && field !== rule.const) return false;
+    if (rule.type === "string" && typeof field !== "string") return false;
+    if (rule.type === "integer" && (!Number.isInteger(field) || field < (rule.minimum || Number.MIN_SAFE_INTEGER))) return false;
+    if (rule.type === "boolean" && typeof field !== "boolean") return false;
+    return true;
+  });
+};
+assert.strictEqual(schemaMatches(stageTool.inputSchema, {
+  operation: "create", file_path: "new.js", content: "export {};\n",
+}), true);
+assert.strictEqual(schemaMatches(stageTool.inputSchema, {
+  operation: "replace_range", file_path: "old.js", start_line: 1, end_line: 1, new: "export {};",
+}), true);
+for (const invalidStageInput of [
+  { operation: "create", file_path: "new.js" },
+  { operation: "replace_range", file_path: "old.js", start_line: 1, end_line: 1 },
+  { operation: "move", file_path: "old.js", start_line: 1, end_line: 1, new: "x" },
+  { operation: "create", file_path: "new.js", content: "x", start_line: 1 },
+  { operation: "replace_range", file_path: "old.js", start_line: 1, end_line: 1, new: "x", content: "y" },
+]) assert.strictEqual(schemaMatches(stageTool.inputSchema, invalidStageInput), false);
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_session_current_state"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_ai_memory_search"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_kb_search"));
@@ -148,6 +182,10 @@ const qualityReviewTextPrompt = internals.glmTextToolProtocolPrompt(
 assert.ok(qualityReviewTextPrompt.includes("MUST finish by calling aiworkhub_worker_quality_review_submit"));
 assert.ok(!qualityReviewTextPrompt.includes("aiworkhub_manager_semantic_edit_apply"));
 assert.ok(!qualityReviewTextPrompt.includes("Output ONLY one final aiworkhub.vscode_lm.edit_response"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("Canonical stage request"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("Canonical stage request (create)"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("Canonical stage request (replace_range)"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("Canonical finalize request"));
 assert.strictEqual(
   internals.validateVscodeLmFinalEnvelope({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
@@ -928,6 +966,57 @@ async function textProtocolChecks() {
   assert.strictEqual(atomicFinal.ok, true);
   assert.strictEqual(atomicFinal.__finalEnvelope.edits[0].ranges.length, 1);
   assert.strictEqual(atomicFinal.__finalEnvelope.edits[0].ranges[0].new, "return 4");
+  const mixedCollector = internals.createVscodeLmStagedEditCollector({
+    allowedWrites: ["src/app.py", "tests/created.py"],
+    path_contracts: {
+      ...editContract,
+      "tests/created.py": {
+        action: "create",
+        current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        line_count: 0,
+        parent_existed: false,
+      },
+    },
+  });
+  assert.strictEqual((await mixedCollector.stage({
+    operation: "replace_range",
+    file_path: "src/app.py",
+    start_line: 2,
+    end_line: 2,
+    new: "return 10",
+  })).ok, true);
+  assert.strictEqual((await mixedCollector.stage({
+    operation: "create",
+    file_path: "tests/created.py",
+    content: "def created():\n    return True\n",
+  })).ok, true);
+  const mixedReplaceMissingNew = await mixedCollector.stage({
+    operation: "replace_range", file_path: "src/app.py", start_line: 1, end_line: 1,
+  });
+  assert.strictEqual(mixedReplaceMissingNew.ok, false);
+  assert.match(mixedReplaceMissingNew.reason, /range_invalid/);
+  const mixedReplaceExtra = await mixedCollector.stage({
+    operation: "replace_range", file_path: "src/app.py", start_line: 2, end_line: 2,
+    new: "replace_extra", content: "forbidden",
+  });
+  assert.strictEqual(mixedReplaceExtra.ok, false);
+  assert.match(mixedReplaceExtra.reason, /stage_payload_extra_fields/);
+  const mixedCreateMissingContent = await mixedCollector.stage({
+    operation: "create", file_path: "tests/created.py",
+  });
+  assert.strictEqual(mixedCreateMissingContent.ok, false);
+  assert.match(mixedCreateMissingContent.reason, /content_invalid/);
+  const mixedCreateExtra = await mixedCollector.stage({
+    operation: "create", file_path: "tests/created.py", content: "ok",
+    start_line: 1, end_line: 1, new: "bad",
+  });
+  assert.strictEqual(mixedCreateExtra.ok, false);
+  assert.match(mixedCreateExtra.reason, /stage_payload_extra_fields/);
+  const mixedOperationInvalid = await mixedCollector.stage({
+    operation: "move_block", file_path: "src/app.py", start_line: 1, end_line: 1, new: "bad",
+  });
+  assert.strictEqual(mixedOperationInvalid.ok, false);
+  assert.match(mixedOperationInvalid.reason, /operation_invalid/);
 
   const copiedSentinelV3 = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
@@ -2995,10 +3084,16 @@ async function nf179ForcedStageRecoveryChecks() {
         value = toolRequest("aiworkhub_manager_semantic_edit_stage", {
           operation: "create", file_path: "out/result.json", content: "{}\n",
         });
+      } else if (instruction.includes("The bounded discovery phase is complete")) {
+        value = toolRequest("aiworkhub_worker_session_current_state", {
+          mode: "focus",
+          query: "forced-stage-corrective",
+          workflow_stage: "implementation",
+        });
       } else {
         value = toolRequest("aiworkhub_worker_source_graph_query", {
           mode: "focus",
-          query: instruction.includes("bounded discovery phase") ? "forced-stage-corrective" : "work",
+          query: "work",
           workflow_stage: "implementation",
         });
       }
@@ -3016,7 +3111,7 @@ async function nf179ForcedStageRecoveryChecks() {
     },
   );
   assert.strictEqual(JSON.parse(textResult).creates[0].path, "out/result.json");
-  assert.ok(!textInvocations.some((call) => call.name === "aiworkhub_manager_semantic_edit_stage"));
+  assert.ok(!textInvocations.some((call) => call.name === "aiworkhub_worker_session_current_state"));
   assert.ok(!textInvocations.some((call) => call.input && call.input.query === "forced-stage-corrective"));
 
   let repeatedTurns = 0;
@@ -3039,6 +3134,42 @@ async function nf179ForcedStageRecoveryChecks() {
     ),
     /vscode_lm_semantic_edit_stage_required/,
   );
+
+  const nativeWrongStageModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (messages, options) => {
+      const instruction = lastUserText(messages);
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+      }
+      if (instruction.includes("bounded discovery phase")) {
+        return { stream: (async function* stream() {
+          yield { callId: "nf179-native-wrong", name: "aiworkhub_worker_session_current_state", input: {} };
+        }()) };
+      }
+      if (instruction.includes("Only aiworkhub_manager_semantic_edit_stage")) {
+        return { stream: (async function* stream() {
+          yield { callId: "nf179-native-stage", name: "aiworkhub_manager_semantic_edit_stage", input: { operation: "create", file_path: "out/result.json", content: "{}\n" } };
+        }()) };
+      }
+      return { stream: (async function* stream() {
+        yield { callId: "nf179-native-source", name: "aiworkhub_worker_source_graph_query", input: { mode: "focus", query: "work", workflow_stage: "implementation" } };
+      }()) };
+    },
+  };
+  const nativeWrongCalls = [];
+  const nativeWrongResult = await internals.runVscodeLmAgent(
+    nativeWrongStageModel,
+    request,
+    undefined,
+    async (call) => {
+      nativeWrongCalls.push(call);
+      if (call.name === "aiworkhub_manager_semantic_edit_stage") return { ok: true, content: "graph" };
+      throw new Error("mcp_unavailable");
+    },
+  );
+  assert.strictEqual(JSON.parse(nativeWrongResult).creates[0].path, "out/result.json");
+  assert.ok(!nativeWrongCalls.some((call) => call.name === "aiworkhub_worker_session_current_state"));
 
   const nativeInvocations = [];
   const forcedToolSets = [];
