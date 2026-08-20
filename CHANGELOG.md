@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.99] - 2026-08-20
+
+### Performance
+
+- Manager dashboard summaries now read only the queue counts, inbox and
+  collision fields they actually return. On the live repository, summary
+  construction fell from 6.52 seconds to 0.35 seconds; the full Webview
+  snapshot remains available unchanged.
+
+### Fixed
+
+- Windows workspace creation no longer spawns the redundant post-create
+  `git symbolic-ref` and `git rev-parse` probes that could hang for 120 seconds
+  inside the launcher. Detached state, repository ownership and the pinned base
+  OID are verified directly from bounded Git worktree metadata instead.
+- The storage accounting regression fixture now explicitly configures its
+  nested worker root, removing host-environment dependence across Python
+  3.12–3.14 CI.
+
 ## [0.9.98] - 2026-08-20
 
 ### Performance

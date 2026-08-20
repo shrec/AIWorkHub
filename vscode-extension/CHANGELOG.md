@@ -1,5 +1,20 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.99 — 2026-08-20
+
+### Performance
+
+- The manager dashboard summary no longer builds and discards the full
+  workforce, cost, KPI, process, task-plan, NeedFix and Roadmap payload. Measured
+  summary construction fell from 6.52 seconds to 0.35 seconds.
+
+### Fixed
+
+- Windows worker workspace verification now reads bounded Git administrative
+  metadata instead of launching `git symbolic-ref` and two `git rev-parse`
+  children after checkout, removing the exact 120-second provisioning hang
+  reported on AIWorkHub 0.9.98.
+
 ## 0.9.98 — 2026-08-20
 
 ### Performance

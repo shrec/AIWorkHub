@@ -12,8 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.98
+## What's new in 0.9.99
 
+- Manager dashboard summaries now skip full-only workforce, cost, KPI,
+  process, task-plan, NeedFix and Roadmap reads, reducing the measured summary
+  build from 6.52 seconds to 0.35 seconds.
+- Windows workspace verification no longer starts redundant post-create Git
+  probes; detached state and base OID are read from bounded worktree metadata,
+  removing the reported `git symbolic-ref` provisioning hang.
 - Dashboard Storage calculation removes a quarantine-batch N+1 query and uses
   a single lower-syscall tree walk; measured cold latency fell from 25.87
   seconds to 3.44 seconds on the live 19.9 GB store.
