@@ -6,7 +6,7 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
-## [0.9.100] - 2026-08-20
+## [0.10.0] - 2026-08-20
 
 ### Performance
 

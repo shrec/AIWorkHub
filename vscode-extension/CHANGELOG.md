@@ -1,6 +1,6 @@
 # AIWorkHub for VS Code — Changelog
 
-## 0.9.100 — 2026-08-20
+## 0.10.0 — 2026-08-20
 
 ### Performance
 

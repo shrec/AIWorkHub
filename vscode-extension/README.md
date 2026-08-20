@@ -12,7 +12,7 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.100
+## What's new in 0.10.0
 
 - Dashboard counters and health render from a bounded summary before heavier
   task, process, KPI, NeedFix and Roadmap sections hydrate.
