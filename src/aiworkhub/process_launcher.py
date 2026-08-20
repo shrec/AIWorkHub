@@ -9511,7 +9511,9 @@ class ProcessManager:
                         )
                         if rework_delta is not None:
                             terminal_evidence["rework_delta"] = rework_delta
-                    if terminal_state == "finalize_failed":
+                    if terminal_state == "finalize_failed" or (
+                        _is_operational_validation_failure(terminal_state, error)
+                    ):
                         terminal_evidence["error"] = error[:500]
                         release_result = self._terminal_failure_exact(
                             metadata,
