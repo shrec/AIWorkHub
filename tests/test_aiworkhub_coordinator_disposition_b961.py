@@ -297,6 +297,12 @@ def test_reject_to_pending_persists_authenticated_rework_delta(coord):
         "path": descriptor["artifact_path"],
         "digest": descriptor["artifact_sha256"],
     }
+    assert worker_workspace.has_verified_rework_delta(
+        predecessor, authority_repo=coord
+    )
+    assert process_launcher.ProcessManager._gc_disposition(
+        persisted, request_id, repo=coord
+    ) == (True, "sealed_rework_delta")
     # The retained predecessor worktree may already be gone here.  The compact
     # fields persisted by reject_review must be directly consumable by the
     # delta materializer without any fallback to that deleted workspace.

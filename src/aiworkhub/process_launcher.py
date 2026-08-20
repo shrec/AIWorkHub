@@ -8375,7 +8375,12 @@ class ProcessManager:
         return {"gc_scanned": scanned, "gc_cleaned": cleaned, "gc_skipped": skipped}
 
     @staticmethod
-    def _gc_disposition(card: dict[str, Any], request_id: str) -> tuple[bool, str]:
+    def _gc_disposition(
+        card: dict[str, Any],
+        request_id: str,
+        *,
+        repo: Path | None = None,
+    ) -> tuple[bool, str]:
         """Return whether ``request_id`` is no longer a live review surface.
 
         This deliberately fails closed for processing cards and malformed
@@ -8395,6 +8400,10 @@ class ProcessManager:
         # candidate that a manager can recover or retry.  Its retention is an
         # identity invariant, not a pending-status convenience.
         if pinned_request_id == request_id:
+            if repo is not None and _worker_workspace.has_verified_rework_delta(
+                predecessor, authority_repo=repo
+            ):
+                return True, "sealed_rework_delta"
             return False, "pinned_rework_predecessor"
         if canonical_status in GC_DISPOSED_CANONICAL_STATUSES:
             return True, f"disposed_task_status:{canonical_status}"
@@ -8522,7 +8531,9 @@ class ProcessManager:
                     "gc": False,
                     "reason": f"task_lookup_failed:{exc}"[:200],
                 }
-            eligible, disposition = self._gc_disposition(card, request_id)
+            eligible, disposition = self._gc_disposition(
+                card, request_id, repo=self.repo
+            )
             if not eligible:
                 if disposition != "current_review_request":
                     return {

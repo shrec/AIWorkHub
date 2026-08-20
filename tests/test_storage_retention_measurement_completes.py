@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import storage_retention, task_store, worktree_storage
+from aiworkhub import storage_retention, task_store, worker_workspace, worktree_storage
 
 _AGED_NOW_OFFSET_DAYS = 31
 
@@ -99,6 +99,7 @@ def _insert_card(
     launch_request_id: str = "",
     accepted_request_id: str = "",
     rework_predecessor_request_id: str = "",
+    rework_predecessor: dict[str, object] | None = None,
 ) -> None:
     db_path = task_store.canonical_db_path(repo)
     now = datetime.now(timezone.utc).isoformat()
@@ -107,7 +108,9 @@ def _insert_card(
         card["launch_request_id"] = launch_request_id
     if accepted_request_id:
         card["accepted_request_id"] = accepted_request_id
-    if rework_predecessor_request_id:
+    if rework_predecessor is not None:
+        card["rework_predecessor"] = rework_predecessor
+    elif rework_predecessor_request_id:
         card["rework_predecessor"] = {"request_id": rework_predecessor_request_id}
     conn = sqlite3.connect(str(db_path))
     try:
@@ -187,6 +190,58 @@ def test_pinned_rework_predecessor_is_never_a_candidate_by_verified_lineage(
     # The genuinely superseded/unpinned clean worktree is still reclaimed.
     assert "reclaimable" in candidate_ids
     assert (base / "predecessor").is_dir()  # preview mutates nothing
+
+
+def test_sealed_rework_delta_releases_predecessor_storage(
+    repo_with_worktrees,
+) -> None:
+    """Once the exact changed bytes are durably sealed, the large predecessor
+    worktree is no longer the content authority and must not stay pinned."""
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    request_id = "sealed-predecessor"
+    task_id = "NF-sealed"
+    claim_epoch = 3
+    _add_clean_worktree(repo, base, request_id)
+    artifact = worker_workspace.seal_rework_delta_artifact(
+        authority_repo=repo,
+        task_id=task_id,
+        request_id=request_id,
+        claim_epoch=claim_epoch,
+        file_entries=[("file.txt", b"sealed rework\n")],
+        artifact_dir=(
+            worker_workspace.configured_runtime_root(repo) / "rework_deltas"
+        ),
+    )
+    descriptor = {
+        "schema_id": "aiworkhub.rework_delta_descriptor.v1",
+        "sealed": True,
+        "authority_repo": str(repo.resolve()),
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": claim_epoch,
+        "artifact_path": artifact["path"],
+        "artifact_sha256": artifact["digest"],
+    }
+    predecessor: dict[str, object] = {
+        "request_id": request_id,
+        "task_id": task_id,
+        "claim_epoch": claim_epoch,
+        "delta_artifact": artifact,
+        "rework_delta": descriptor,
+    }
+    _insert_card(
+        repo,
+        task_id,
+        status="pending",
+        rework_predecessor=predecessor,
+    )
+
+    result = storage_retention.preview(repo, base=base, now=_aged_now())
+    candidate_ids = {item["id"] for item in result["candidates"]}
+
+    assert result["complete"] is True
+    assert request_id in candidate_ids
+    assert not any(item["id"] == request_id for item in result["protected"])
 
 
 def test_worktree_a_live_process_holds_is_never_a_candidate(repo_with_worktrees) -> None:

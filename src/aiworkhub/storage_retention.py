@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import repo_policy, task_store, worktree_storage
-from .worker_workspace import configured_worktree_root
+from .worker_workspace import configured_worktree_root, has_verified_rework_delta
 
 
 SCHEMA_ID = "aiworkhub.storage_retention.v1"
@@ -215,7 +215,9 @@ def _protected_attempt_ids(
                 predecessor = card_json.get("rework_predecessor")
                 if isinstance(predecessor, dict):
                     predecessor_id = str(predecessor.get("request_id") or "").strip()
-                    if predecessor_id:
+                    if predecessor_id and not has_verified_rework_delta(
+                        predecessor, authority_repo=repo_root
+                    ):
                         protected.setdefault(predecessor_id, "rework_predecessor_retained")
                         if card_id:
                             holders = pinned_by.setdefault(predecessor_id, [])

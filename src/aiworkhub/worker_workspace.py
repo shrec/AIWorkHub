@@ -1181,6 +1181,81 @@ def seal_rework_delta_artifact(
     return {"path": str(artifact_path), "digest": artifact_digest}
 
 
+def has_verified_rework_delta(
+    predecessor: Any,
+    *,
+    authority_repo: Path,
+) -> bool:
+    """Return whether a predecessor has a durable, identity-bound delta.
+
+    This is the retention fence shared by process GC and the storage planner.
+    A worktree may be released only after the exact descriptor projected by
+    ``reject_review`` still names an intact content-addressed artifact beneath
+    this repository's runtime root.  Any malformed, missing, moved, symlinked,
+    oversized, or tampered artifact fails closed and keeps the worktree pinned.
+    """
+    if not isinstance(predecessor, dict):
+        return False
+    descriptor = predecessor.get("rework_delta")
+    artifact = predecessor.get("delta_artifact")
+    if (
+        not isinstance(descriptor, dict)
+        or set(descriptor) != {
+            "schema_id",
+            "sealed",
+            "authority_repo",
+            "task_id",
+            "request_id",
+            "claim_epoch",
+            "artifact_path",
+            "artifact_sha256",
+        }
+        or not isinstance(artifact, dict)
+        or set(artifact) != {"path", "digest"}
+    ):
+        return False
+    authority_repo = authority_repo.resolve(strict=False)
+    request_id = str(predecessor.get("request_id") or "").strip()
+    task_id = str(predecessor.get("task_id") or "").strip()
+    claim_epoch = predecessor.get("claim_epoch")
+    digest = descriptor.get("artifact_sha256")
+    raw_path = descriptor.get("artifact_path")
+    if (
+        descriptor.get("schema_id") != "aiworkhub.rework_delta_descriptor.v1"
+        or descriptor.get("sealed") is not True
+        or str(descriptor.get("authority_repo") or "") != str(authority_repo)
+        or str(descriptor.get("request_id") or "") != request_id
+        or str(descriptor.get("task_id") or "") != task_id
+        or type(claim_epoch) is not int
+        or claim_epoch < 1
+        or descriptor.get("claim_epoch") != claim_epoch
+        or not _REQUEST_ID_RE.fullmatch(request_id)
+        or not task_id
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or artifact != {"path": raw_path, "digest": digest}
+    ):
+        return False
+    artifact_path = Path(str(raw_path or ""))
+    artifact_root = (configured_runtime_root(authority_repo) / "rework_deltas").resolve(
+        strict=False
+    )
+    resolved = artifact_path.resolve(strict=False)
+    if (
+        resolved.parent != artifact_root
+        or resolved.name != f"{digest}.json"
+        or artifact_path.is_symlink()
+        or not resolved.is_file()
+    ):
+        return False
+    try:
+        if resolved.stat().st_size > 64 * 1024 * 1024:
+            return False
+        return hashlib.sha256(resolved.read_bytes()).hexdigest() == digest
+    except OSError:
+        return False
+
+
 def materialize_rework_delta_artifact(
     artifact: Any,
     authority_repo: Path,
