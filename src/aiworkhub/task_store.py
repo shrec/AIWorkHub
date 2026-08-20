@@ -388,10 +388,22 @@ def _initialize_auxiliary_schema(db_id: str, path: Path) -> None:
             )
             conn.executescript(context_graph.SCHEMA)
         elif db_id == "memory":
-            conn.executescript(
-                "CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT);"
-                "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(key,value,tags,scope);"
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS memories("
+                "id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT)"
             )
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='memories_fts'"
+            ).fetchone() is None:
+                conn.execute(
+                    "CREATE VIRTUAL TABLE memories_fts "
+                    "USING fts5(key,value,tags,scope)"
+                )
+                conn.execute(
+                    "INSERT INTO memories_fts(rowid,key,value,tags,scope) "
+                    "SELECT id,key,value,tags,scope FROM memories"
+                )
         elif db_id == "kb":
             conn.executescript(
                 "CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY,key TEXT UNIQUE,title TEXT,body TEXT,category TEXT,tags TEXT,source_refs TEXT);"
@@ -433,6 +445,12 @@ def _reconcile_auxiliary_databases(repo: RepositoryState, registry_path: Path) -
             else:
                 _initialize_auxiliary_schema(db_id, canonical)
                 initialized.append(db_id)
+        elif db_id in {"session", "transcript", "memory", "kb"}:
+            # Schema repair belongs to repository initialization, never to a
+            # live manager/worker query. These DDL statements are idempotent
+            # and keep serving paths strictly read-only while still upgrading
+            # repositories created by older AIWorkHub versions.
+            _initialize_auxiliary_schema(db_id, canonical)
         conn = connect_readonly(canonical)
         try:
             qc = conn.execute("PRAGMA quick_check(1)").fetchone()[0]

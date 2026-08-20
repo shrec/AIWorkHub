@@ -359,14 +359,16 @@ def test_ensure_memories_fts_bounded_on_corrupt_virtual_table(tmp_path: Path) ->
     assert result["reason"] == "fts_already_exists"
 
 
-# ── integration: search path uses ensure_memories_fts ────────────────
+# Integration: initialization repairs; search remains read-only.
 
 
-def test_ai_memory_search_repairs_fts_before_query(tmp_path: Path, monkeypatch) -> None:
-    """Simulates the worker/manager search path: ensure_memories_fts runs
-    before the MATCH query against the repaired FTS table."""
+def test_ai_memory_search_is_query_only_after_repository_reconciliation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Repository reconciliation repairs FTS before the query hot path."""
     repo = _repo(tmp_path)
     _seed_legacy_memory(repo, key="searchable", value="find-me")
+    assert task_store.initialize_repository(repo)["ok"]
 
     from aiworkhub.worker_ai_tools_mcp import WorkerToolContext
 
@@ -401,6 +403,13 @@ def test_ai_memory_search_repairs_fts_before_query(tmp_path: Path, monkeypatch) 
         worker_ai_tools_mcp,
         "_append_audit",
         lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        context_writes,
+        "ensure_memories_fts",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("search hot path attempted writable FTS repair")
+        ),
     )
 
     from aiworkhub.worker_ai_tools_mcp import ai_memory_search

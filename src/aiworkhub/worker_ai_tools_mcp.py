@@ -3115,18 +3115,16 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
         binding = _resolve_authority_db(ctx, component="memory", db_id="memory")
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
-    from . import context_writes
-    repair = context_writes.ensure_memories_fts(ctx.authority_repo)
-    if not repair.get("ok"):
-        return _violation(ctx, tool, f"fts_migration_failed:{repair.get('error', 'unknown')}"[:160])
-    if repair.get("reason") == "memories_table_absent":
-        return _violation(ctx, tool, "fts_unavailable:memories_table_absent")
     try:
         con = _open_readonly_db(binding.db_path, tool=tool)
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
     try:
         rows: list[sqlite3.Row] = []
+        if not _table_exists(con, "memories"):
+            return _violation(ctx, tool, "fts_unavailable:memories_table_absent")
+        if not _table_exists(con, "memories_fts"):
+            return _violation(ctx, tool, "fts_unavailable:memories_fts_absent")
         match_expr = _fts_match_expr(bounded)
         if match_expr is not None:
             if _table_exists(con, "context_entity_state"):

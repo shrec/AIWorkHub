@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import capture_adapters, feature_settings, storage_registry
+from .sqlite_readonly import connect_readonly
 
 
 SCHEMA_ID = "aiworkhub.context_graph.v1"
@@ -142,7 +143,7 @@ def _connect(repo: Path | str, *, read_only: bool = False) -> tuple[sqlite3.Conn
     if not path.is_file() or path.is_symlink():
         raise ContextGraphError("canonical_transcript_unavailable")
     if read_only:
-        con = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+        con = connect_readonly(path, timeout=5)
     else:
         con = sqlite3.connect(str(path), timeout=5)
     con.row_factory = sqlite3.Row
