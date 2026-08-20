@@ -449,13 +449,34 @@ def _resolve_active_state_hooks(repo: Path):
     if not ready:
         return None, None, None, f"task_store_not_ready:{reason}"
 
+    task_cards: list[dict[str, Any]] | None = None
+    task_by_id: dict[str, dict[str, Any]] = {}
+
+    def load_task_cards() -> list[dict[str, Any]]:
+        nonlocal task_cards, task_by_id
+        if task_cards is None:
+            task_cards = task_store.list_task_cards(
+                repo, limit=_RECONCILE_CARD_SCAN_LIMIT
+            )
+            task_by_id = {
+                str(card.get("task_id") or ""): card
+                for card in task_cards
+                if card.get("task_id")
+            }
+        return task_cards
+
     def get_task_fn(task_id: str):
+        load_task_cards()
+        if task_id in task_by_id:
+            return task_by_id[task_id]
+        # The bounded snapshot deliberately cannot prove absence beyond its
+        # limit. Preserve exact behavior with one point lookup for that case.
         return task_store.get_task(repo, task_id)
 
     def list_task_cards_fn():
         # Bounded, single-snapshot card read; the store calls this lazily and at
         # most once per reconcile, only to reach the explicit-reference route.
-        return task_store.list_task_cards(repo, limit=_RECONCILE_CARD_SCAN_LIMIT)
+        return load_task_cards()
 
     return get_task_fn, task_store.canonical_status, list_task_cards_fn, None
 

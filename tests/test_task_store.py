@@ -127,6 +127,17 @@ def test_manager_decision_counts_include_rework_and_review_archival(tmp_path: Pa
         "accepted": 1, "rejected": 2, "total": 3,
     }
     assert result["rejected_latency"]["count"] == 0
+    connection = sqlite3.connect(db_path)
+    try:
+        indexes = {
+            str(row[1]) for row in connection.execute("PRAGMA index_list('task_events')")
+        }
+    finally:
+        connection.close()
+    assert {
+        "idx_task_store_events_event_id",
+        "idx_task_store_events_task_event_id",
+    } <= indexes
 
 
 def test_list_task_cards_matches_canonical_detail_in_one_bounded_batch(tmp_path: Path) -> None:

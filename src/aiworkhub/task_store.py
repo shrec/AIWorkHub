@@ -194,6 +194,10 @@ CREATE TABLE IF NOT EXISTS task_events (
   payload_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_task_store_events_event_id
+  ON task_events(event, event_id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_store_events_task_event_id
+  ON task_events(task_id, event, event_id DESC);
 
 CREATE TABLE IF NOT EXISTS callback_outbox (
   outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,

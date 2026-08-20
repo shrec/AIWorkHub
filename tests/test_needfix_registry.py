@@ -1959,3 +1959,38 @@ class TestActiveListingProductionWiring:
         assert creport["derived"] is False
         assert creport["underived_reason"]
         assert creport["count"] is None
+
+    def test_active_listing_uses_one_bounded_task_snapshot(
+        self, tmp_path: Path, monkeypatch
+    ):
+        task_store.initialize_repository(tmp_path)
+        for index in range(24):
+            task_id = f"T-{index:02d}"
+            self._insert_task(
+                tmp_path, task_id, "finished" if index % 2 else "pending"
+            )
+            self._link(tmp_path, f"finding-{index:02d}", task_id)
+
+        original_list = task_store.list_task_cards
+        original_get = task_store.get_task
+        calls = {"list": 0, "get": 0}
+
+        def counted_list(*args, **kwargs):
+            calls["list"] += 1
+            return original_list(*args, **kwargs)
+
+        def counted_get(*args, **kwargs):
+            calls["get"] += 1
+            return original_get(*args, **kwargs)
+
+        monkeypatch.setattr(task_store, "list_task_cards", counted_list)
+        monkeypatch.setattr(task_store, "get_task", counted_get)
+
+        report = needfix_ingest.list_active(
+            tmp_path, limit=needfix_store.MAX_LIST_LIMIT
+        )
+
+        # Every linked card either landed or is currently owned, so all 24
+        # records are derived closed; the point lookup count must still be zero.
+        assert report["count"] == len(report["items"]) == 0
+        assert calls == {"list": 1, "get": 0}
