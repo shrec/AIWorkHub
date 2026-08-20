@@ -12,6 +12,16 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.98
+
+- Dashboard Storage calculation removes a quarantine-batch N+1 query and uses
+  a single lower-syscall tree walk; measured cold latency fell from 25.87
+  seconds to 3.44 seconds on the live 19.9 GB store.
+- Nested worker bytes are counted exactly once while repository-owned and
+  unattributed worktrees remain separately visible.
+- AI Memory and Context Graph searches keep their query paths read-only after
+  initialization-time schema reconciliation.
+
 ## What's new in 0.9.97
 
 - Source Graph incremental refreshes are now scoped to changed Python callers

@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.98] - 2026-08-20
+
+### Performance
+
+- **Dashboard storage inventory no longer resolves repository identity once per
+  quarantine batch.** On the live 740-batch, 19.9 GB store, the measured cold
+  scan fell from 25.87 seconds to 3.44 seconds.
+- Storage sizing uses a single `scandir` traversal, prunes the separately
+  inventoried worktree root, and stops after the public 100-batch bound instead
+  of measuring hundreds of rows that are discarded.
+- AI Memory and Context Graph query paths remain read-only after repository
+  initialization; schema/FTS reconciliation moved off the query hot path.
+
+### Fixed
+
+- Managed storage no longer counts nested worktrees once as repository data and
+  again as worker data. Global, repository-owned and unattributed worktree bytes
+  retain their separate truthful projections.
+
 ## [0.9.97] - 2026-08-20
 
 ### Performance

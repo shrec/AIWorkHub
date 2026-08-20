@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.98 — 2026-08-20
+
+### Performance
+
+- The Storage card now avoids an N+1 repository-identity lookup across hundreds
+  of terminal-log quarantine batches. Measured cold calculation on the live
+  19.9 GB store fell from 25.87 seconds to 3.44 seconds.
+- Storage directory sizing uses a lower-syscall traversal and never re-walks or
+  double-counts the nested worker tree.
+- Context Graph and AI Memory searches no longer run schema or FTS repair on
+  every read.
+
 ## 0.9.97 — 2026-08-20
 
 ### Performance
