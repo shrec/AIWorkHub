@@ -871,12 +871,23 @@ def list_batches(repo_root: Path | str) -> dict[str, Any]:
     qroot = root / QUARANTINE_RELATIVE_PATH
     if not qroot.exists():
         return {"ok": True, "batches": [], "count": 0}
+    # Repository identity is invariant for the whole listing.  Resolving it in
+    # the loop turned one dashboard refresh into an N+1 storage-readiness query
+    # (740 SQLite opens on the observed repository), accounting for ~19 seconds
+    # of a 26-second storage scan.  Resolve once, then validate every manifest
+    # against that same canonical identity.
+    repo_id = _repo_id(root)
     rows: list[dict[str, Any]] = []
     for entry in sorted(qroot.iterdir(), reverse=True):
+        # The public contract returns at most the newest 100 valid batches. Do
+        # not inventory payloads for hundreds of older directories only to
+        # slice them away after the expensive filesystem walk.
+        if len(rows) >= 100:
+            break
         if not entry.is_dir() or not _BATCH_RE.fullmatch(entry.name):
             continue
         try:
-            value = _manifest(entry / MANIFEST_NAME, _repo_id(root))
+            value = _manifest(entry / MANIFEST_NAME, repo_id)
             deadline = datetime.fromisoformat(str(value.get("restore_deadline") or ""))
         except (TerminalLogRetentionError, ValueError):
             continue
@@ -921,7 +932,7 @@ def list_batches(repo_root: Path | str) -> dict[str, Any]:
             # named trigger delivers.
             "reapable_empty": record_empty and not has_payload,
         })
-    return {"ok": True, "batches": rows[:100], "count": len(rows[:100])}
+    return {"ok": True, "batches": rows, "count": len(rows)}
 
 
 def restore(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str, Any]:

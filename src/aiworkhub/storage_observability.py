@@ -32,22 +32,42 @@ _cache: dict[str, dict[str, Any]] = {}
 _running: set[str] = set()
 
 
-def _tree_size(path: Path) -> tuple[int, int]:
-    """Return apparent bytes and file count without following symlinks."""
+def _tree_size(path: Path, *, exclude: tuple[Path, ...] = ()) -> tuple[int, int]:
+    """Return apparent bytes and file count without following symlinks.
+
+    Exact excluded directories are pruned before descent.  The managed
+    worktree root lives below ``.aiworkhub/runtime`` and is inventoried by the
+    retention scanner, so pruning it here prevents both a second multi-GB walk
+    and double-counting its bytes as repository data and worker data.
+    """
     total = 0
     files = 0
     if not path.is_dir():
         return total, files
-    for root, _dirs, names in os.walk(path, followlinks=False):
-        for name in names:
-            candidate = Path(root) / name
-            try:
-                if candidate.is_symlink():
-                    continue
-                total += candidate.stat().st_size
-                files += 1
-            except OSError:
-                continue
+    excluded = {
+        os.path.normcase(os.path.abspath(str(item)))
+        for item in exclude
+    }
+    stack = [str(path)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as iterator:
+                for entry in iterator:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            if os.path.normcase(os.path.abspath(entry.path)) in excluded:
+                                continue
+                            stack.append(entry.path)
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_size
+                            files += 1
+                    except OSError:
+                        continue
+        except OSError:
+            continue
     return total, files
 
 
@@ -136,28 +156,76 @@ def _storage_bounds(
     }
 
 
-def _measure(repo_root: Path) -> dict[str, Any]:
-    repo_bytes, repo_files = _tree_size(repo_root / ".aiworkhub")
+def _measure_components(
+    repo_root: Path, worktree_base: Path
+) -> tuple[int, int, list[dict[str, Any]]]:
+    repo_bytes = 0
+    repo_files = 0
     components: list[dict[str, Any]] = []
     hub = repo_root / ".aiworkhub"
-    if hub.is_dir():
-        for entry in sorted(hub.iterdir(), key=lambda item: item.name):
-            if entry.is_symlink():
+    if not hub.is_dir():
+        return repo_bytes, repo_files, components
+    for entry in sorted(hub.iterdir(), key=lambda item: item.name):
+        if entry.is_symlink():
+            continue
+        if entry.is_dir():
+            size, files = _tree_size(entry, exclude=(worktree_base,))
+        elif entry.is_file():
+            try:
+                size, files = entry.stat().st_size, 1
+            except OSError:
                 continue
-            if entry.is_dir():
-                size, files = _tree_size(entry)
-            elif entry.is_file():
-                try:
-                    size, files = entry.stat().st_size, 1
-                except OSError:
-                    continue
-            else:
-                continue
-            components.append({"id": entry.name, "bytes": size, "files": files})
+        else:
+            continue
+        repo_bytes += size
+        repo_files += files
+        components.append({"id": entry.name, "bytes": size, "files": files})
+    return repo_bytes, repo_files, components
+
+
+def _measure(repo_root: Path) -> dict[str, Any]:
+    worktree_base = storage_retention.configured_worktree_root(repo_root).resolve()
+    # These walks share one physical filesystem. A bounded thread pool was
+    # measured on the live 19.9 GB store and regressed 4.63 s -> 5.89 s from
+    # metadata-queue/GIL contention, so this path is deliberately sequential.
+    repo_bytes, repo_files, components = _measure_components(repo_root, worktree_base)
     footprint = storage_retention.repo_storage_footprint(repo_root)
+    registrations = worktree_storage.scan_worktree_registrations(repo_root)
+    try:
+        quarantine = storage_retention.list_batches(repo_root)
+        quarantine_batches = quarantine.get("batches") or []
+    except storage_retention.StorageRetentionError:
+        quarantine_batches = []
+    try:
+        terminal_logs = terminal_log_retention.preview(repo_root, include_candidates=False)
+        terminal_log_batches = terminal_log_retention.list_batches(repo_root).get("batches") or []
+    except terminal_log_retention.TerminalLogRetentionError as exc:
+        terminal_logs = {
+            "ok": False,
+            "error": str(exc)[:160],
+            "current_bytes": 0,
+            "candidate_count": 0,
+            "candidate_bytes": 0,
+            "protected_count": 0,
+            "projected_bytes": 0,
+        }
+        terminal_log_batches = []
+    try:
+        archived_tasks = task_retention.preview(repo_root)
+        task_retention_batches = task_retention.list_batches(repo_root).get("batches") or []
+    except (task_retention.TaskRetentionError, task_store.TaskStoreError) as exc:
+        archived_tasks = {
+            "ok": False,
+            "error": str(exc)[:160],
+            "candidate_count": 0,
+            "candidate_total": 0,
+            "archived_total": 0,
+            "protected_callback_count": 0,
+        }
+        task_retention_batches = []
+
     worktrees = footprint["scan"]
     observed_total_bytes = int(footprint["observed_total_bytes"])
-    registrations = worktree_storage.scan_worktree_registrations(repo_root)
     summary = worktrees.get("summary") or {}
     worker_bytes = int(summary.get("total_bytes") or 0)
     try:
@@ -190,40 +258,8 @@ def _measure(repo_root: Path) -> dict[str, Any]:
             "reclaim_bytes": int(summary.get("removable_safe_bytes") or 0),
         }
         safe_reclaim_bytes = int(summary.get("removable_safe_bytes") or 0)
-    try:
-        quarantine = storage_retention.list_batches(repo_root)
-        quarantine_batches = quarantine.get("batches") or []
-    except storage_retention.StorageRetentionError:
-        quarantine_batches = []
     quarantine_bytes = sum(int(item.get("bytes") or 0) for item in quarantine_batches)
     pinned_predecessor_bytes = int(cleanup.get("pinned_predecessor_bytes") or 0)
-    try:
-        terminal_logs = terminal_log_retention.preview(repo_root, include_candidates=False)
-        terminal_log_batches = terminal_log_retention.list_batches(repo_root).get("batches") or []
-    except terminal_log_retention.TerminalLogRetentionError as exc:
-        terminal_logs = {
-            "ok": False,
-            "error": str(exc)[:160],
-            "current_bytes": 0,
-            "candidate_count": 0,
-            "candidate_bytes": 0,
-            "protected_count": 0,
-            "projected_bytes": 0,
-        }
-        terminal_log_batches = []
-    try:
-        archived_tasks = task_retention.preview(repo_root)
-        task_retention_batches = task_retention.list_batches(repo_root).get("batches") or []
-    except (task_retention.TaskRetentionError, task_store.TaskStoreError) as exc:
-        archived_tasks = {
-            "ok": False,
-            "error": str(exc)[:160],
-            "candidate_count": 0,
-            "candidate_total": 0,
-            "archived_total": 0,
-            "protected_callback_count": 0,
-        }
-        task_retention_batches = []
     return {
         "scan_status": "ready",
         "scanned_at": datetime.now(timezone.utc).isoformat(),
@@ -233,7 +269,16 @@ def _measure(repo_root: Path) -> dict[str, Any]:
         "worker_tree_count": int(summary.get("count") or 0),
         "safe_reclaimable_bytes": safe_reclaim_bytes,
         "quarantine_bytes": quarantine_bytes,
-        "managed_total_bytes": repo_bytes + worker_bytes + quarantine_bytes,
+        # The worktree base is physically nested under ``.aiworkhub/runtime``.
+        # ``repo_bytes`` deliberately prunes it, then the global worktree total
+        # is added exactly once.  ``worker_tree_bytes`` remains repository-scoped
+        # for ownership reporting, while managed bytes truthfully cover the full
+        # on-disk tree (including unattributed/foreign retained worktrees).
+        "managed_total_bytes": (
+            repo_bytes
+            + int(footprint.get("global_worktree_bytes") or worker_bytes)
+            + quarantine_bytes
+        ),
         "components": components,
         "retention_preview": {
             "policy_days": min_age_days,

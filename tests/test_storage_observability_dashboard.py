@@ -68,6 +68,12 @@ def test_storage_snapshot_counts_repo_data_and_never_follows_symlinks(tmp_path, 
     data = repo / ".aiworkhub"
     data.mkdir(parents=True)
     (data / "state.db").write_bytes(b"a" * 128)
+    # The configured worker root is nested below .aiworkhub/runtime. It is
+    # measured by the worktree inventory and must not be walked or counted a
+    # second time as repository data.
+    nested_worker = data / "runtime" / "worktrees" / "foreign" / "worktree"
+    nested_worker.mkdir(parents=True)
+    (nested_worker / "payload.bin").write_bytes(b"w" * 512)
     outside = tmp_path / "outside.bin"
     outside.write_bytes(b"b" * 4096)
     (data / "outside-link").symlink_to(outside)
@@ -106,7 +112,10 @@ def test_storage_snapshot_counts_repo_data_and_never_follows_symlinks(tmp_path, 
     assert result["worker_tree_count"] == 2
     assert result["safe_reclaimable_bytes"] == 64
     assert result["managed_total_bytes"] == 384
-    assert result["components"] == [{"id": "state.db", "bytes": 128, "files": 1}]
+    assert result["components"] == [
+        {"id": "runtime", "bytes": 0, "files": 0},
+        {"id": "state.db", "bytes": 128, "files": 1},
+    ]
     assert result["retention_preview"]["dry_run"] is True
     assert result["retention_preview"]["repository_scoped"] is True
     assert result["retention_preview"]["eligible_bytes"] == 64

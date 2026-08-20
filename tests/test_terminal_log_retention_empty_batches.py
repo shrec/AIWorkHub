@@ -183,6 +183,62 @@ def _files_in_batch(repo: Path, batch_id: str) -> set[str]:
     }
 
 
+def test_list_batches_resolves_repository_identity_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    for suffix in ("aa", "bb", "cc"):
+        _write_batch(
+            repo,
+            f"l20260816T101142-0000000000{suffix}",
+            status="quarantined",
+            deadline=_FUTURE_DEADLINE,
+            item_states=("quarantined",),
+        )
+
+    real_repo_id = terminal_log_retention._repo_id
+    calls = 0
+
+    def counted_repo_id(root: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return real_repo_id(root)
+
+    monkeypatch.setattr(terminal_log_retention, "_repo_id", counted_repo_id)
+
+    assert terminal_log_retention.list_batches(repo)["count"] == 3
+    assert calls == 1
+
+
+def test_list_batches_does_not_inventory_payloads_beyond_public_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    for index in range(105):
+        _write_batch(
+            repo,
+            f"l20260816T{index:06d}-{index:012x}",
+            status="empty",
+            deadline=_FUTURE_DEADLINE,
+            item_states=(),
+        )
+
+    calls = 0
+
+    def counted_payload(_batch: Path) -> tuple[int, bool]:
+        nonlocal calls
+        calls += 1
+        return 0, False
+
+    monkeypatch.setattr(
+        terminal_log_retention, "_batch_payload_summary", counted_payload
+    )
+
+    result = terminal_log_retention.list_batches(repo)
+    assert result["count"] == 100
+    assert calls == 100
+
+
 def test_enforce_with_nothing_eligible_opens_no_batch(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
 
