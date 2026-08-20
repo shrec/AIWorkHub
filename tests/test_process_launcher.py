@@ -4327,3 +4327,124 @@ def test_finalization_retry_reuses_prior_recorded_usage(monkeypatch, tmp_path):
 
     assert event["usage_recorded"] is True
     assert event["usage"]["input_tokens"] == 7
+
+
+def test_terminal_rework_delta_evidence_seals_changed_and_deleted_paths(
+    monkeypatch, tmp_path
+):
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    (worktree / "src").mkdir(parents=True)
+    (worktree / "src" / "changed.py").write_bytes(b"changed\n")
+    workspace = SimpleNamespace(repo=repo, path=worktree)
+    captured = {}
+
+    monkeypatch.setattr(
+        process_launcher._worker_workspace,
+        "configured_runtime_root",
+        lambda authority_repo: authority_repo / ".aiworkhub" / "runtime",
+    )
+
+    def seal(authority_repo, task_id, request_id, claim_epoch, entries, artifact_dir):
+        captured.update(
+            authority_repo=authority_repo,
+            task_id=task_id,
+            request_id=request_id,
+            claim_epoch=claim_epoch,
+            entries=list(entries),
+            artifact_dir=artifact_dir,
+        )
+        return {"path": str(artifact_dir / "packet.json"), "digest": "a" * 64}
+
+    monkeypatch.setattr(
+        process_launcher._worker_workspace, "seal_rework_delta_artifact", seal
+    )
+
+    evidence = process_launcher._terminal_rework_delta_evidence(
+        workspace,
+        {"task_id": "TASK-DELTA", "claim_epoch": 3},
+        "a" * 32,
+        ["src/changed.py", "src/deleted.py"],
+    )
+
+    assert evidence == {
+        "schema_id": "aiworkhub.rework_delta_descriptor.v1",
+        "sealed": True,
+        "authority_repo": str(repo.resolve()),
+        "task_id": "TASK-DELTA",
+        "request_id": "a" * 32,
+        "claim_epoch": 3,
+        "artifact_path": str(repo / ".aiworkhub/runtime/rework_deltas/packet.json"),
+        "artifact_sha256": "a" * 64,
+    }
+    assert captured["authority_repo"] == repo.resolve()
+    assert captured["entries"] == [
+        ("src/changed.py", b"changed\n"),
+        ("src/deleted.py", None),
+    ]
+    assert captured["artifact_dir"] == repo / ".aiworkhub/runtime/rework_deltas"
+
+
+@pytest.mark.parametrize("claim_epoch", [True, 0, "1", None])
+def test_terminal_rework_delta_evidence_rejects_invalid_claim_epoch(
+    monkeypatch, tmp_path, claim_epoch
+):
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    (worktree / "changed.py").write_bytes(b"changed")
+    monkeypatch.setattr(
+        process_launcher._worker_workspace,
+        "seal_rework_delta_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid identity must not seal")
+        ),
+    )
+
+    evidence = process_launcher._terminal_rework_delta_evidence(
+        SimpleNamespace(repo=repo, path=worktree),
+        {"task_id": "TASK-DELTA", "claim_epoch": claim_epoch},
+        "b" * 32,
+        ["changed.py"],
+    )
+
+    assert evidence == {
+        "schema_id": "aiworkhub.rework_delta_seal.v1",
+        "sealed": False,
+        "reason": "rework_delta_identity_invalid",
+    }
+
+
+def test_terminal_rework_delta_evidence_reports_seal_failure_without_descriptor(
+    monkeypatch, tmp_path
+):
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    (worktree / "changed.py").write_bytes(b"changed")
+    monkeypatch.setattr(
+        process_launcher._worker_workspace,
+        "configured_runtime_root",
+        lambda authority_repo: authority_repo / ".aiworkhub" / "runtime",
+    )
+    monkeypatch.setattr(
+        process_launcher._worker_workspace,
+        "seal_rework_delta_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            process_launcher.WorkspaceError("synthetic_failure")
+        ),
+    )
+
+    evidence = process_launcher._terminal_rework_delta_evidence(
+        SimpleNamespace(repo=repo, path=worktree),
+        {"task_id": "TASK-DELTA", "claim_epoch": 2},
+        "c" * 32,
+        ["changed.py"],
+    )
+
+    assert evidence["sealed"] is False
+    assert evidence["reason"] == "rework_delta_seal_failed:synthetic_failure"
+    assert "artifact_path" not in evidence

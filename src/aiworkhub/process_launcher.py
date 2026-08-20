@@ -2894,6 +2894,67 @@ def _changed_path_hashes(
     return hashes
 
 
+def _terminal_rework_delta_evidence(
+    workspace: WorkerWorkspace,
+    metadata: Mapping[str, Any],
+    request_id: str,
+    changed: list[str],
+) -> dict[str, Any] | None:
+    """Seal a validation-failed candidate outside its disposable worktree.
+
+    The returned evidence is intentionally small and identity-bound.  The
+    artifact itself contains the exact changed bytes (and deletion markers)
+    and is verified by ``worker_workspace`` when a successor materializes it.
+    """
+    if not changed:
+        return None
+    task_id = str(metadata.get("task_id") or "").strip()
+    claim_epoch = metadata.get("claim_epoch")
+    if not task_id or type(claim_epoch) is not int or claim_epoch < 1:
+        return {
+            "schema_id": "aiworkhub.rework_delta_seal.v1",
+            "sealed": False,
+            "reason": "rework_delta_identity_invalid",
+        }
+
+    entries: list[tuple[str, bytes | None]] = []
+    try:
+        for relative in changed:
+            source = workspace.path / relative
+            if source.is_symlink():
+                raise WorkspaceError(f"rework_delta_symlink_forbidden:{relative}")
+            entries.append((relative, source.read_bytes() if source.is_file() else None))
+        authority_repo = workspace.repo.resolve(strict=False)
+        artifact_dir = (
+            _worker_workspace.configured_runtime_root(authority_repo)
+            / "rework_deltas"
+        )
+        sealed = _worker_workspace.seal_rework_delta_artifact(
+            authority_repo,
+            task_id,
+            request_id,
+            claim_epoch,
+            entries,
+            artifact_dir,
+        )
+    except (OSError, ValueError, WorkspaceError) as exc:
+        return {
+            "schema_id": "aiworkhub.rework_delta_seal.v1",
+            "sealed": False,
+            "reason": f"rework_delta_seal_failed:{exc}"[:300],
+        }
+    return {
+        "schema_id": "aiworkhub.rework_delta_descriptor.v1",
+        "sealed": True,
+        "authority_repo": str(authority_repo),
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": claim_epoch,
+        "artifact_path": str(sealed["path"]),
+        "artifact_sha256": str(sealed["digest"]),
+    }
+
+
 REVIEW_WORKSPACE_RETENTION_AUDIT_SCHEMA_ID = (
     "aiworkhub.review_workspace_retention_audit.v1"
 )
@@ -9441,9 +9502,16 @@ class ProcessManager:
                         },
                         **retained_candidate,
                     }
-                    if terminal_state == "finalize_failed" or (
-                        _is_operational_validation_failure(terminal_state, error)
-                    ):
+                    if terminal_state == "validation_failed":
+                        rework_delta = _terminal_rework_delta_evidence(
+                            workspace,
+                            metadata,
+                            request_id,
+                            changed,
+                        )
+                        if rework_delta is not None:
+                            terminal_evidence["rework_delta"] = rework_delta
+                    if terminal_state == "finalize_failed":
                         terminal_evidence["error"] = error[:500]
                         release_result = self._terminal_failure_exact(
                             metadata,
