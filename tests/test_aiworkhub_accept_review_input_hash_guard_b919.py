@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 import types
 import uuid
 from pathlib import Path
@@ -412,7 +413,11 @@ def _fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         "assert_gc_safe_workspace_shape",
         lambda _request_id, _path, _home, **_kwargs: None,
     )
-    monkeypatch.setattr(process_launcher, "enforce_scope", lambda _ws: [output_relative])
+    monkeypatch.setattr(
+        process_launcher,
+        "enforce_scope",
+        lambda _ws, **_kwargs: [output_relative],
+    )
     monkeypatch.setattr(
         process_launcher,
         "validate_required_outputs",
@@ -842,3 +847,42 @@ def test_target_acceptance_consumes_already_accepted_reviewer_receipt(
         "finished": True,
         "cleanup_error": "",
     }]
+
+
+def test_accept_review_git_timeout_is_structured_and_releases_promotion_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (
+        manager,
+        _card,
+        request_id,
+        task_id,
+        _runner,
+        _topic,
+        repo,
+        _workspace_dir,
+        _promote_calls,
+        _accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+
+    def timed_out_scope(_workspace, **_kwargs):
+        raise process_launcher.GitCommandTimeout(
+            phase="review_acceptance",
+            argv=["git", "diff", "--name-only"],
+            cwd=repo,
+            timeout=2.0,
+            pid=4242,
+            tree_terminated=True,
+        )
+
+    monkeypatch.setattr(process_launcher, "enforce_scope", timed_out_scope)
+    started = time.monotonic()
+    result = manager.accept_review(request_id, task_id)
+
+    assert time.monotonic() - started < 5.0
+    assert result["ok"] is False
+    assert result["error"].startswith("review_acceptance_git_probe_timeout:")
+    # The structured return occurs inside a context-managed promotion lock;
+    # reacquisition proves the timeout path did not strand it.
+    with manager._promotion_lock():
+        pass

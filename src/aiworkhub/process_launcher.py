@@ -94,6 +94,7 @@ except ImportError:  # optional host-only credential helper in some worktrees
     glm_credentials = None  # type: ignore[assignment]
 from .worker_workspace import (
     WorkerWorkspace,
+    GitCommandTimeout,
     ValidationRunError,
     WorkspaceError,
     cleanup_workspace,
@@ -8958,6 +8959,35 @@ class ProcessManager:
             attempt_artifact_error = ""
             outcome_evidence_record: dict[str, Any] | None = None
             cleanup = True
+            scope_duration_ms = 0.0
+            validation_wall_duration_ms = 0.0
+
+            def _enforce_finalization_scope() -> list[str]:
+                nonlocal scope_duration_ms
+                phase_started = time.monotonic()
+                try:
+                    return enforce_scope(
+                        workspace,
+                        git_phase="worker_finalization",
+                        git_timeout=2.0,
+                    )
+                finally:
+                    scope_duration_ms += (
+                        time.monotonic() - phase_started
+                    ) * 1000.0
+
+            def _run_finalization_validations() -> list[dict[str, Any]]:
+                nonlocal validation_wall_duration_ms
+                phase_started = time.monotonic()
+                try:
+                    return _run_declared_validations(
+                        workspace, metadata, metadata
+                    )
+                finally:
+                    validation_wall_duration_ms += (
+                        time.monotonic() - phase_started
+                    ) * 1000.0
+
             try:
                 if terminal_state != "exited":
                     # A worker that timed out, crashed, or was cancelled did
@@ -9021,7 +9051,7 @@ class ProcessManager:
                             timeout_changed: list[str] = []
                             retained: dict[str, Any] = {}
                             try:
-                                timeout_changed = enforce_scope(workspace)
+                                timeout_changed = _enforce_finalization_scope()
                                 retained = retained_rework_candidate_evidence(
                                     terminal_state,
                                     workspace,
@@ -9079,7 +9109,7 @@ class ProcessManager:
                         error = "write_gate_closed_during_reconciliation"
                     else:
                         if isinstance(metadata.get("quality_review"), dict):
-                            changed = enforce_scope(workspace)
+                            changed = _enforce_finalization_scope()
                             if changed:
                                 raise WorkspaceError(
                                     "quality_review_workspace_mutated:"
@@ -9140,7 +9170,7 @@ class ProcessManager:
                                     or ""
                                 )[:300]
                             raise _QualityReviewFinalized
-                        changed = enforce_scope(workspace)
+                        changed = _enforce_finalization_scope()
                         residual_contract_result = validate_residual_contract(
                             workspace,
                             list(metadata.get("residual_contract_manifest") or []),
@@ -9174,15 +9204,18 @@ class ProcessManager:
                         # must not erase the otherwise useful test evidence or
                         # force the coordinator to rerun the worker merely to
                         # learn whether its candidate builds.
-                        validations = _run_declared_validations(
-                            workspace, metadata, metadata
-                        )
+                        validations = _run_finalization_validations()
                         if worker_mcp_gate.get("gated") and not worker_mcp_gate.get("satisfied", True):
                             raise WorkspaceError(
                                 "validation_required_aiworkhub_mcp_call_missing:"
                                 + str(worker_mcp_gate.get("reason") or "")
                             )
-                        changed = enforce_scope(workspace)
+                        # An empty validation plan cannot mutate the workspace;
+                        # avoid a second Git scan on the read-only/zero-diff hot
+                        # path. Commands that did run are followed by the full
+                        # post-validation scope check as before.
+                        if validations:
+                            changed = _enforce_finalization_scope()
                         # B561: union validated required-output exact paths into
                         # the review candidate set.  validate_required_outputs
                         # finds gitignored files that changed_paths (git-diff /
@@ -9555,11 +9588,18 @@ class ProcessManager:
             semantic_edit_evidence = _semantic_edit_evidence_from_output(
                 stdout_path, worker_mcp_gate=worker_mcp_gate,
             )
-            validation_duration_ms = round(
-                sum(
-                    max(0.0, float(row.get("duration_seconds") or 0.0))
-                    for row in validations
-                ) * 1000.0,
+            finalization_duration_ms = round(
+                (time.monotonic() - finalization_started) * 1000.0, 3
+            )
+            validation_duration_ms = round(validation_wall_duration_ms, 3)
+            scope_duration_ms = round(scope_duration_ms, 3)
+            evidence_transition_duration_ms = round(
+                max(
+                    0.0,
+                    finalization_duration_ms
+                    - validation_duration_ms
+                    - scope_duration_ms,
+                ),
                 3,
             )
             event = self._append_event({
@@ -9638,11 +9678,11 @@ class ProcessManager:
                 "attempt_artifact_manifest": attempt_artifact_receipt,
                 "attempt_artifact_error": attempt_artifact_error,
                 "evidence_record": outcome_evidence_record,
-                "finalization_duration_ms": round(
-                    (time.monotonic() - finalization_started) * 1000.0, 3
-                ),
+                "finalization_duration_ms": finalization_duration_ms,
                 "finalization_phase_durations_ms": {
+                    "workspace_scope": scope_duration_ms,
                     "validation": validation_duration_ms,
+                    "evidence_and_transition": evidence_transition_duration_ms,
                 },
             })
             if cleanup:
@@ -11177,7 +11217,11 @@ class ProcessManager:
 
             if readonly_quality_review:
                 try:
-                    if enforce_scope(workspace):
+                    if enforce_scope(
+                        workspace,
+                        git_phase="review_acceptance",
+                        git_timeout=2.0,
+                    ):
                         raise WorkspaceError("quality_review_workspace_mutated")
                     if evidence.get("changed_paths") not in ([], None):
                         raise WorkspaceError("quality_review_changed_paths_forbidden")
@@ -11233,6 +11277,13 @@ class ProcessManager:
                     validations = _run_declared_validations(
                         workspace, card, latest
                     )
+                except GitCommandTimeout as exc:
+                    return {
+                        "ok": False,
+                        "error": str(exc)[:500],
+                        "request_id": request_id,
+                        "task_id": task_id,
+                    }
                 except WorkspaceError as exc:
                     return {
                         "ok": False,
@@ -11327,7 +11378,11 @@ class ProcessManager:
 
             if readonly_research:
                 try:
-                    if enforce_scope(workspace):
+                    if enforce_scope(
+                        workspace,
+                        git_phase="review_acceptance",
+                        git_timeout=2.0,
+                    ):
                         raise WorkspaceError("research_workspace_mutated")
                     if evidence.get("changed_paths") not in ([], None):
                         raise WorkspaceError("research_changed_paths_forbidden")
@@ -11388,6 +11443,13 @@ class ProcessManager:
                     validations = _run_declared_validations(
                         workspace, card, latest
                     )
+                except GitCommandTimeout as exc:
+                    return {
+                        "ok": False,
+                        "error": str(exc)[:500],
+                        "request_id": request_id,
+                        "task_id": task_id,
+                    }
                 except WorkspaceError as exc:
                     return {
                         "ok": False,
@@ -11480,7 +11542,11 @@ class ProcessManager:
                 }
 
             try:
-                changed = enforce_scope(workspace)
+                changed = enforce_scope(
+                    workspace,
+                    git_phase="review_acceptance",
+                    git_timeout=2.0,
+                )
                 required_output_records = validate_required_outputs(
                     workspace,
                     card.get("required_outputs") or [],
@@ -11682,7 +11748,11 @@ class ProcessManager:
                     reviewer_workspace = WorkerWorkspace.from_metadata(
                         dict(reviewer_metadata["workspace"])
                     )
-                    if enforce_scope(reviewer_workspace):
+                    if enforce_scope(
+                        reviewer_workspace,
+                        git_phase="review_acceptance",
+                        git_timeout=2.0,
+                    ):
                         raise WorkspaceError(
                             f"quality_reviewer_workspace_mutated:{reviewer_request_id}"
                         )
@@ -11733,6 +11803,13 @@ class ProcessManager:
                     for relative in current_hashes
                 ):
                     raise WorkspaceError("stored_hash_mismatch")
+            except GitCommandTimeout as exc:
+                return {
+                    "ok": False,
+                    "error": str(exc)[:500],
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
             except WorkspaceError as exc:
                 return {
                     "ok": False,

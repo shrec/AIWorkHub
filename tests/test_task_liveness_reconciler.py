@@ -755,7 +755,7 @@ def test_successful_exit_reconciled_after_launcher_disappearance_runs_each_step_
 
     calls = {"enforce_scope": 0, "run_validations": 0, "promote": 0, "mark_review": 0}
 
-    def fake_enforce_scope(workspace):
+    def fake_enforce_scope(workspace, **_kwargs):
         calls["enforce_scope"] += 1
         return ["out/result.txt"]
 
@@ -803,18 +803,16 @@ def test_successful_exit_reconciled_after_launcher_disappearance_runs_each_step_
     latest = events[-1]
     assert latest["state"] == "review_ready"
     assert card["status"] == "review"
-    # enforce_scope runs twice by design (re-checked after validations, in
-    # case a validation command itself changed files). This card declares an
-    # empty validation contract, so route resolution, scratch provisioning and
-    # the validation executor are skipped entirely. The review transition runs
-    # exactly once; canonical promotion is deferred to the coordinator's
-    # accept_review operation.
-    assert calls == {"enforce_scope": 2, "run_validations": 0, "promote": 0, "mark_review": 1}
+    # An empty validation contract cannot mutate the workspace, so the bounded
+    # initial scope check is reused instead of spawning a redundant second Git
+    # scan. The review transition runs exactly once; canonical promotion is
+    # deferred to the coordinator's accept_review operation.
+    assert calls == {"enforce_scope": 1, "run_validations": 0, "promote": 0, "mark_review": 1}
 
     # --- idempotent double scan: a second scan must be a total no-op ---
     result2 = task_reconciler.run_scan(manager)
     assert result2["ok"] is True
-    assert calls == {"enforce_scope": 2, "run_validations": 0, "promote": 0, "mark_review": 1}
+    assert calls == {"enforce_scope": 1, "run_validations": 0, "promote": 0, "mark_review": 1}
     events_after = manager._request_events("req-exited-orphaned")
     assert len(events_after) == len(events)
 
@@ -1064,7 +1062,11 @@ def test_daemon_writes_lifecycle_transitions_with_writes_enabled(tmp_path, monke
     card = _card()
     card.update({"status": "processing", "worker_status": "in_progress"})
     manager = _build_manager(tmp_path, card)
-    monkeypatch.setattr(process_launcher, "enforce_scope", lambda workspace: ["out/result.txt"])
+    monkeypatch.setattr(
+        process_launcher,
+        "enforce_scope",
+        lambda workspace, **_kwargs: ["out/result.txt"],
+    )
     monkeypatch.setattr(
         process_launcher, "run_validations", lambda workspace, commands, **_kw: [
             {"command": c, "returncode": 0} for c in commands

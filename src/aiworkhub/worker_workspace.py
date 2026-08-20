@@ -283,6 +283,37 @@ class WorkspaceError(RuntimeError):
     """A fail-closed workspace, sandbox, scope, or promotion error."""
 
 
+class GitCommandTimeout(WorkspaceError):
+    """A bounded Git child exceeded its phase deadline and was reaped."""
+
+    def __init__(
+        self,
+        *,
+        phase: str,
+        argv: list[str],
+        cwd: Path,
+        timeout: float,
+        pid: int,
+        tree_terminated: bool,
+    ) -> None:
+        token = {
+            "workspace_provision": "workspace_provision_git_timeout",
+            "worker_finalization": "worker_finalization_timeout",
+            "review_acceptance": "review_acceptance_git_probe_timeout",
+        }.get(phase, "git_command_timeout")
+        command = " ".join(argv[:8])
+        super().__init__(
+            f"{token}:phase={phase}:command={command}:cwd={cwd}:"
+            f"timeout={timeout:g}:pid={pid}:tree_terminated={str(tree_terminated).lower()}"
+        )
+        self.phase = phase
+        self.argv = tuple(argv)
+        self.cwd = cwd
+        self.timeout = timeout
+        self.pid = pid
+        self.tree_terminated = tree_terminated
+
+
 class ValidationRunError(WorkspaceError):
     """A bounded validation batch failed with structured rows retained.
 
@@ -412,17 +443,84 @@ class _LandlockPathBeneathAttr(ctypes.Structure):
     ]
 
 
-def _run(argv: list[str], *, cwd: Path, timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+def _terminate_git_process_tree(process: subprocess.Popen[str]) -> bool:
+    """Terminate the exact process group created for one bounded Git call."""
+    if process.poll() is not None:
+        return True
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(process.pid), "/T"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+                shell=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+    else:
+        import signal
+
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                process.kill()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            return False
+    return process.poll() is not None
+
+
+def _run(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout: float = 120,
+    phase: str = "workspace_git",
+) -> subprocess.CompletedProcess[str]:
+    popen_kwargs: dict[str, Any] = {
+        "cwd": cwd,
+        "text": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "shell": False,
+        "env": {**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+    }
+    if os.name == "nt":
+        # ``CREATE_NEW_PROCESS_GROUP`` is Windows-only and absent from POSIX
+        # typeshed/runtime modules. Keep the documented Win32 flag local while
+        # preserving importability and type-checking on every other platform.
+        popen_kwargs["creationflags"] = 0x00000200
+    else:
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(argv, **popen_kwargs)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        tree_terminated = _terminate_git_process_tree(process)
+        raise GitCommandTimeout(
+            phase=phase,
+            argv=argv,
+            cwd=cwd,
+            timeout=timeout,
+            pid=process.pid,
+            tree_terminated=tree_terminated,
+        ) from exc
+    return subprocess.CompletedProcess(
         argv,
-        cwd=cwd,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-        shell=False,
-        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        int(process.returncode or 0),
+        stdout,
+        stderr,
     )
 
 
@@ -1512,6 +1610,7 @@ def create_workspace(
             ["git", "worktree", "add", "--detach", str(path), "HEAD"],
             cwd=repo,
             timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
+            phase="workspace_provision",
         )
     except Exception:
         # ``git worktree add`` can raise (for example a timeout that kills git
@@ -1819,7 +1918,12 @@ def assert_gc_safe_workspace_shape(
     )
 
 
-def changed_paths(workspace: WorkerWorkspace) -> list[str]:
+def changed_paths(
+    workspace: WorkerWorkspace,
+    *,
+    git_phase: str = "workspace_scope",
+    git_timeout: float = 120,
+) -> list[str]:
     # Diff against the OID the worktree was pinned to at creation, never the
     # live symbolic ``HEAD``.  A worker that commits inside its own detached
     # worktree moves ``HEAD``; diffing symbolic ``HEAD`` would then report the
@@ -1829,14 +1933,18 @@ def changed_paths(workspace: WorkerWorkspace) -> list[str]:
     # than diff against an unrelated tree.
     diff_ref = workspace.base_oid or "HEAD"
     if workspace.base_oid:
-        head = _run(["git", "rev-parse", "HEAD"], cwd=workspace.path)
-        if head.returncode != 0:
-            raise WorkspaceError(f"git_rev_parse_head_failed:{head.stderr[:300]}")
-        current_head = head.stdout.strip()
+        # The detached worktree's administrative HEAD is the authority already
+        # verified at creation. Re-spawning ``git rev-parse HEAD`` here caused
+        # the exact Windows accept-review 120-second hang reported in 0.9.99.
+        current_head = _isolated_worktree_base_oid(
+            workspace.repo, workspace.path
+        )
         if current_head != workspace.base_oid:
             ancestry = _run(
                 ["git", "merge-base", "--is-ancestor", workspace.base_oid, "HEAD"],
                 cwd=workspace.path,
+                timeout=git_timeout,
+                phase=git_phase,
             )
             if ancestry.returncode != 0:
                 raise WorkspaceError(
@@ -1851,12 +1959,16 @@ def changed_paths(workspace: WorkerWorkspace) -> list[str]:
     tracked = _run(
         ["git", "diff", "--name-only", "--no-renames", "-z", diff_ref],
         cwd=workspace.path,
+        timeout=git_timeout,
+        phase=git_phase,
     )
     if tracked.returncode != 0:
         raise WorkspaceError(f"git_diff_failed:{tracked.stderr[:300]}")
     untracked = _run(
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         cwd=workspace.path,
+        timeout=git_timeout,
+        phase=git_phase,
     )
     if untracked.returncode != 0:
         raise WorkspaceError(f"git_untracked_failed:{untracked.stderr[:300]}")
@@ -1879,8 +1991,15 @@ def changed_paths(workspace: WorkerWorkspace) -> list[str]:
     return sorted(rows)
 
 
-def enforce_scope(workspace: WorkerWorkspace) -> list[str]:
-    changed = changed_paths(workspace)
+def enforce_scope(
+    workspace: WorkerWorkspace,
+    *,
+    git_phase: str = "workspace_scope",
+    git_timeout: float = 120,
+) -> list[str]:
+    changed = changed_paths(
+        workspace, git_phase=git_phase, git_timeout=git_timeout
+    )
     outside = [path for path in changed if not _matches(path, workspace.allowed_writes)]
     if outside:
         raise WorkspaceError("scope_violation:" + ",".join(outside[:20]))

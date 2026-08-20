@@ -239,7 +239,11 @@ def _patch_success_pipeline(monkeypatch, card, calls: dict | None = None) -> Non
     calls = calls if calls is not None else {}
     calls.setdefault("promote", 0)
     calls.setdefault("mark_review", 0)
-    monkeypatch.setattr(process_launcher, "enforce_scope", lambda workspace: ["out/result.txt"])
+    monkeypatch.setattr(
+        process_launcher,
+        "enforce_scope",
+        lambda workspace, **_kwargs: ["out/result.txt"],
+    )
     monkeypatch.setattr(
         process_launcher, "run_validations",
         lambda workspace, commands, **_kw: [{"command": c, "returncode": 0} for c in commands],

@@ -1352,7 +1352,11 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
     assert event["workspace_retained"] is True
     assert event["promoted_paths"] == []
     assert event["finalization_duration_ms"] >= 0
-    assert event["finalization_phase_durations_ms"] == {"validation": 0.0}
+    phase_durations = event["finalization_phase_durations_ms"]
+    assert 0.0 <= phase_durations["validation"] < 5.0
+    assert phase_durations["workspace_scope"] >= 0.0
+    assert phase_durations["evidence_and_transition"] >= 0.0
+    assert sum(phase_durations.values()) <= event["finalization_duration_ms"] + 1.0
     assert "out/result.json" in event["changed_paths"]
 
     # No promotion or direct mark_review call ever happened.

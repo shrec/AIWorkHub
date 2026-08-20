@@ -551,6 +551,33 @@ function renderSummary(snapshot) {
   }
 }
 
+// A bounded summary arrives before the expensive full snapshot. It contains
+// queue/storage fields plus deliberate empty placeholders for every rich
+// observability section. Rendering it as a full snapshot made each 30-second
+// refresh erase the last good Source Graph, context, NeedFix, Roadmap and
+// preflight cards until the full read completed. Update only the fields that
+// the summary actually owns; never replace the last full snapshot or task rows.
+function renderSummaryProjection(snapshot) {
+  const counts = snapshot && snapshot.status_counts ? snapshot.status_counts : {};
+  for (const metric of ["active", "pending", "processing", "review", "blocked", "finished", "stale"]) {
+    const target = document.querySelector(`#metric-${metric}`);
+    target.textContent = formatCount(counts[metric]);
+    target.title = String(numberValue(counts[metric]));
+  }
+  if (snapshot && snapshot.generated_at) {
+    elements.lastSync.textContent = `Synced ${formatRelativeTime(snapshot.generated_at)}`;
+  }
+  const storage = snapshot && snapshot.storage_usage && typeof snapshot.storage_usage === "object"
+    ? snapshot.storage_usage
+    : null;
+  if (storage) {
+    elements.headerStorageManaged.textContent = storage.scan_status === "scanning"
+      ? "Calculating"
+      : formatBytes(storage.managed_total_bytes);
+    elements.headerStorageFree.textContent = `Free ${formatBytes(storage.disk_free_bytes)}`;
+  }
+}
+
 function renderSourceHealth(snapshot) {
   const errors = asArray(snapshot.errors);
   if (errors.length === 0) {
@@ -4110,6 +4137,9 @@ window.addEventListener("message", (event) => {
   }
   stopReadyRetry();
   switch (message.type) {
+    case "snapshotSummary":
+      renderSummaryProjection(message.payload);
+      break;
     case "snapshot":
       renderSnapshot(message.payload);
       break;

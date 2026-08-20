@@ -245,7 +245,11 @@ def test_valid_exact_grant_reaches_review_ready_via_task_engine_not_core_mark_re
     monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: False)
     _forbid_ambient_mark_review(monkeypatch)
 
-    monkeypatch.setattr(process_launcher, "enforce_scope", lambda workspace: ["out/result.txt"])
+    monkeypatch.setattr(
+        process_launcher,
+        "enforce_scope",
+        lambda workspace, **_kwargs: ["out/result.txt"],
+    )
     monkeypatch.setattr(
         process_launcher, "run_validations",
         lambda workspace, commands, **_kw: [{"command": c, "returncode": 0} for c in commands],
@@ -363,7 +367,11 @@ def test_replayed_grant_after_successful_consumption_is_rejected(tmp_path, monke
     monkeypatch.delenv(process_launcher.ALLOW_WRITES_ENV, raising=False)
     monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: False)
     _forbid_ambient_mark_review(monkeypatch)
-    monkeypatch.setattr(process_launcher, "enforce_scope", lambda workspace: ["out/result.txt"])
+    monkeypatch.setattr(
+        process_launcher,
+        "enforce_scope",
+        lambda workspace, **_kwargs: ["out/result.txt"],
+    )
     monkeypatch.setattr(
         process_launcher, "run_validations",
         lambda workspace, commands, **_kw: [{"command": c, "returncode": 0} for c in commands],
@@ -421,7 +429,11 @@ def test_finalize_never_sets_ambient_allow_writes_env(tmp_path, monkeypatch):
     monkeypatch.delenv(process_launcher.ALLOW_LAUNCH_ENV, raising=False)
     monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: False)
     _forbid_ambient_mark_review(monkeypatch)
-    monkeypatch.setattr(process_launcher, "enforce_scope", lambda workspace: ["out/result.txt"])
+    monkeypatch.setattr(
+        process_launcher,
+        "enforce_scope",
+        lambda workspace, **_kwargs: ["out/result.txt"],
+    )
     monkeypatch.setattr(
         process_launcher, "run_validations",
         lambda workspace, commands, **_kw: [{"command": c, "returncode": 0} for c in commands],

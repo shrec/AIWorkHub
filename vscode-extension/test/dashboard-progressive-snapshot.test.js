@@ -62,8 +62,10 @@ try {
     extension.__testInternals.constants.MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS,
   );
   assert.deepStrictEqual(
-    messages.filter((message) => message.type === "snapshot").map((message) => message.payload.snapshot_mode),
-    ["summary", "full"],
+    messages
+      .filter((message) => message.type === "snapshotSummary" || message.type === "snapshot")
+      .map((message) => [message.type, message.payload.snapshot_mode]),
+    [["snapshotSummary", "summary"], ["snapshot", "full"]],
   );
   assert.strictEqual(convergenceCalls, 1);
 

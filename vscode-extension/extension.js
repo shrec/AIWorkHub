@@ -222,6 +222,7 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
 // Outbound message types the extension host posts into the Webview.
 const OUTBOUND_TYPES = Object.freeze({
   snapshot: "snapshot",
+  snapshotSummary: "snapshotSummary",
   snapshotDelayed: "snapshotDelayed",
   taskDetail: "taskDetail",
   offline: "offline",
@@ -7110,7 +7111,7 @@ async function pushSnapshotOnce(view) {
     );
     if (summaryPayload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
       view.postMessage({
-        type: OUTBOUND_TYPES.snapshot,
+        type: OUTBOUND_TYPES.snapshotSummary,
         payload: sanitizeWebviewPayload({
           ...summaryPayload,
           system_logs: systemLogSnapshot(),
