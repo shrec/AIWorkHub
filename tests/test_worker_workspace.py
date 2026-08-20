@@ -302,6 +302,279 @@ def test_rework_workspace_materializes_hash_pinned_predecessor_baseline(
         worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
 
 
+def _rewrite_rework_delta_packet(
+    descriptor: dict[str, str], mutate: object
+) -> dict[str, str]:
+    artifact_path = Path(descriptor["path"])
+    packet = json.loads(artifact_path.read_text(encoding="utf-8"))
+    mutate(packet)  # type: ignore[operator]
+    payload = {key: value for key, value in packet.items() if key != "canonical_digest"}
+    packet["canonical_digest"] = worker_workspace._rework_delta_canonical_digest(
+        payload
+    )
+    encoded = json.dumps(packet, indent=2, ensure_ascii=True).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    rewritten = artifact_path.parent / f"{digest}.json"
+    rewritten.write_bytes(encoded)
+    return {"path": str(rewritten), "digest": digest}
+
+
+def test_rework_delta_artifact_round_trips_changed_and_deleted_files(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    (worktree / "src").mkdir(parents=True)
+    (worktree / "src" / "deleted.txt").write_text("old\n", encoding="utf-8")
+    changed = b"new bytes\n"
+    descriptor = worker_workspace.seal_rework_delta_artifact(
+        repo,
+        "task-1",
+        "request-1",
+        "claim-1",
+        [("src/changed.txt", changed), ("src/deleted.txt", None)],
+        tmp_path / "artifacts",
+    )
+
+    seeded = worker_workspace.materialize_rework_delta_artifact(
+        descriptor,
+        repo,
+        "request-1",
+        "task-1",
+        "claim-1",
+        worktree,
+        {
+            "src/changed.txt": hashlib.sha256(changed).hexdigest(),
+            "src/deleted.txt": None,
+        },
+        ("src/changed.txt", "src/deleted.txt"),
+    )
+
+    assert seeded == ["src/changed.txt", "src/deleted.txt"]
+    assert (worktree / "src" / "changed.txt").read_bytes() == changed
+    assert not (worktree / "src" / "deleted.txt").exists()
+
+
+def test_rework_delta_artifact_rejects_tampered_bytes(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    content = b"candidate\n"
+    descriptor = worker_workspace.seal_rework_delta_artifact(
+        repo,
+        "task-1",
+        "request-1",
+        "claim-1",
+        [("result.txt", content)],
+        tmp_path / "artifacts",
+    )
+    Path(descriptor["path"]).write_bytes(b"{}")
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="rework_delta_artifact_tampered"
+    ):
+        worker_workspace.materialize_rework_delta_artifact(
+            descriptor,
+            repo,
+            "request-1",
+            "task-1",
+            "claim-1",
+            worktree,
+            {"result.txt": hashlib.sha256(content).hexdigest()},
+            ("result.txt",),
+        )
+
+
+def test_rework_delta_artifact_rejects_cross_identity_and_scope(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    content = b"candidate\n"
+    expected = {"result.txt": hashlib.sha256(content).hexdigest()}
+    descriptor = worker_workspace.seal_rework_delta_artifact(
+        repo,
+        "task-1",
+        "request-1",
+        "claim-1",
+        [("result.txt", content)],
+        tmp_path / "artifacts",
+    )
+    for authority_repo, request_id, task_id, claim_id in (
+        (tmp_path / "other", "request-1", "task-1", "claim-1"),
+        (repo, "request-2", "task-1", "claim-1"),
+        (repo, "request-1", "task-2", "claim-1"),
+        (repo, "request-1", "task-1", "claim-2"),
+    ):
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="rework_delta_identity_mismatch"
+        ):
+            worker_workspace.materialize_rework_delta_artifact(
+                descriptor,
+                authority_repo,
+                request_id,
+                task_id,
+                claim_id,
+                worktree,
+                expected,
+                ("result.txt",),
+            )
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="rework_predecessor_outside_scope"
+    ):
+        worker_workspace.materialize_rework_delta_artifact(
+            descriptor,
+            repo,
+            "request-1",
+            "task-1",
+            "claim-1",
+            worktree,
+            expected,
+            ("other.txt",),
+        )
+
+
+def test_rework_delta_artifact_rejects_incomplete_unexpected_and_duplicate(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    content = b"candidate\n"
+    content_hash = hashlib.sha256(content).hexdigest()
+    descriptor = worker_workspace.seal_rework_delta_artifact(
+        repo,
+        "task-1",
+        "request-1",
+        "claim-1",
+        [("result.txt", content)],
+        tmp_path / "artifacts",
+    )
+    common = (repo, "request-1", "task-1", "claim-1", worktree)
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="rework_delta_artifact_incomplete"
+    ):
+        worker_workspace.materialize_rework_delta_artifact(
+            descriptor,
+            *common,
+            {"result.txt": content_hash, "missing.txt": None},
+            ("result.txt", "missing.txt"),
+        )
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="rework_delta_unexpected_path"
+    ):
+        worker_workspace.materialize_rework_delta_artifact(
+            descriptor, *common, {}, ("result.txt",)
+        )
+
+    duplicate = _rewrite_rework_delta_packet(
+        descriptor, lambda packet: packet["files"].append(dict(packet["files"][0]))
+    )
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="rework_delta_duplicate_path"
+    ):
+        worker_workspace.materialize_rework_delta_artifact(
+            duplicate,
+            *common,
+            {"result.txt": content_hash},
+            ("result.txt",),
+        )
+
+
+def test_rework_delta_artifact_rejects_invalid_paths_and_bounds(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for raw_path in (None, "", "../outside", "/absolute", ".git/config"):
+        with pytest.raises(worker_workspace.WorkspaceError):
+            worker_workspace.seal_rework_delta_artifact(
+                repo,
+                "task-1",
+                "request-1",
+                "claim-1",
+                [(raw_path, None)],  # type: ignore[list-item]
+                tmp_path / "artifacts",
+            )
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="rework_delta_file_count_exceeds_limit"
+    ):
+        worker_workspace.seal_rework_delta_artifact(
+            repo,
+            "task-1",
+            "request-1",
+            "claim-1",
+            [(f"rows/{index}.txt", None) for index in range(513)],
+            tmp_path / "artifacts",
+        )
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="rework_delta_content_exceeds_limit"
+    ):
+        worker_workspace.seal_rework_delta_artifact(
+            repo,
+            "task-1",
+            "request-1",
+            "claim-1",
+            [("large.bin", b"x" * (worker_workspace.MAX_REWORK_OVERLAY_CONTENT_BYTES + 1))],
+            tmp_path / "artifacts",
+        )
+
+
+def test_rework_delta_artifact_materializes_after_predecessor_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    predecessor = worker_workspace.create_workspace(
+        repo,
+        "delta-predecessor",
+        {"allowed_writes": ["out/result.txt"]},
+        "validation",
+    )
+    candidate = predecessor.path / "out" / "result.txt"
+    candidate.write_bytes(b"sealed candidate\n")
+    content = candidate.read_bytes()
+    content_hash = hashlib.sha256(content).hexdigest()
+    predecessor_metadata = predecessor.as_metadata()
+    descriptor = worker_workspace.seal_rework_delta_artifact(
+        repo,
+        "task-1",
+        "delta-predecessor",
+        "claim-1",
+        [("out/result.txt", content)],
+        tmp_path / "artifacts",
+    )
+    worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+
+    successor = worker_workspace.create_workspace(
+        repo,
+        "delta-successor",
+        {
+            "allowed_writes": ["out/result.txt"],
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": "delta-predecessor",
+                "task_id": "task-1",
+                "claim_id": "claim-1",
+                "workspace": predecessor_metadata,
+                "changed_path_hashes": {"out/result.txt": content_hash},
+                "delta_artifact": descriptor,
+            },
+        },
+        "validation",
+    )
+    try:
+        assert (successor.path / "out" / "result.txt").read_bytes() == content
+        assert successor.inherited_rework_paths == ("out/result.txt",)
+    finally:
+        worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+
+
 def test_validate_required_outputs_replay_authorization_permits_hash_pinned_unchanged_predecessor_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

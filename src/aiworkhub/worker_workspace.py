@@ -1004,11 +1004,8 @@ def _materialize_rework_predecessor(
 ) -> list[str]:
     """Overlay one hash-pinned reviewed candidate into a successor worktree.
 
-    Only paths that the predecessor's terminal evidence recorded as changed
-    and that the successor may write are materialized.  The retained source
-    workspace, request identity, repository identity and every content hash
-    are revalidated before copying.  This makes rework incremental without
-    promoting rejected bytes into the canonical checkout.
+    Use the retained worktree while it exists. Once it is absent, only a
+    sealed content-addressed changed/deleted-file delta may seed the successor.
     """
     predecessor = card.get("rework_predecessor")
     if predecessor is None:
@@ -1034,8 +1031,31 @@ def _materialize_rework_predecessor(
     assert_gc_safe_workspace_shape(
         request_id, source_workspace.path, source_workspace.home, repo=repo
     )
-    if source_workspace.path.is_symlink() or not source_workspace.path.is_dir():
+    if not source_workspace.path.is_symlink() and source_workspace.path.is_dir():
+        return _materialize_rework_predecessor_from_worktree(
+            worktree, source_workspace, hashes, allowed_writes
+        )
+    if predecessor.get("delta_artifact") is None:
         raise WorkspaceError("rework_predecessor_workspace_missing")
+    return materialize_rework_delta_artifact(
+        artifact=predecessor["delta_artifact"],
+        authority_repo=repo,
+        request_id=request_id,
+        task_id=str(predecessor.get("task_id") or ""),
+        claim_id=str(predecessor.get("claim_id") or ""),
+        worktree=worktree,
+        expected_path_hashes=hashes,
+        allowed_writes=allowed_writes,
+    )
+
+
+def _materialize_rework_predecessor_from_worktree(
+    worktree: Path,
+    source_workspace: WorkerWorkspace,
+    hashes: dict[str, Any],
+    allowed_writes: tuple[str, ...],
+) -> list[str]:
+    """Copy the hash-pinned predecessor delta from the retained worktree."""
 
     seeded: list[str] = []
     for raw_relative, raw_expected in sorted(hashes.items()):
@@ -1066,6 +1086,218 @@ def _materialize_rework_predecessor(
             _copy_one(source, destination)
         seeded.append(relative)
     return seeded
+
+
+REWORK_DELTA_ARTIFACT_SCHEMA_ID = "aiworkhub.rework_delta_artifact.v2"
+
+
+def _rework_delta_canonical_digest(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _rework_delta_normalize_path(raw_path: object) -> str:
+    if not isinstance(raw_path, str) or not raw_path:
+        raise WorkspaceError(f"rework_delta_invalid_path:{raw_path!r}")
+    relative = _relative_repo_path(raw_path)
+    posix = PurePosixPath(relative)
+    if (
+        not relative
+        or posix.is_absolute()
+        or any(part in {"", ".", ".."} for part in posix.parts)
+        or posix.parts[0] == ".git"
+    ):
+        raise WorkspaceError(f"rework_delta_invalid_path:{raw_path!r}")
+    return relative
+
+
+def seal_rework_delta_artifact(
+    authority_repo: Path,
+    task_id: str,
+    request_id: str,
+    claim_id: str,
+    file_entries: Iterable[tuple[str, bytes | None]],
+    artifact_dir: Path,
+) -> dict[str, str]:
+    """Atomically seal exact predecessor bytes as one bounded delta artifact."""
+    if not _REQUEST_ID_RE.fullmatch(request_id):
+        raise WorkspaceError(f"rework_delta_invalid_request_id:{request_id!r}")
+    if not task_id or not claim_id:
+        raise WorkspaceError("rework_delta_identity_missing")
+    entries = list(file_entries)
+    if not entries:
+        raise WorkspaceError("rework_delta_artifact_empty")
+    if len(entries) > MAX_REWORK_OVERLAY_FILES:
+        raise WorkspaceError("rework_delta_file_count_exceeds_limit")
+    files: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    total_content_bytes = 0
+    for raw_path, content in entries:
+        relative = _rework_delta_normalize_path(raw_path)
+        if relative in seen_paths:
+            raise WorkspaceError(f"rework_delta_duplicate_path:{relative}")
+        seen_paths.add(relative)
+        entry: dict[str, Any] = {"path": relative}
+        if content is None:
+            entry["deleted"] = True
+        else:
+            total_content_bytes += len(content)
+            if total_content_bytes > MAX_REWORK_OVERLAY_CONTENT_BYTES:
+                raise WorkspaceError("rework_delta_content_exceeds_limit")
+            entry["sha256"] = hashlib.sha256(content).hexdigest()
+            entry["content_base64"] = base64.b64encode(content).decode("ascii")
+        files.append(entry)
+    files.sort(key=lambda item: item["path"])
+    payload = {
+        "schema_id": REWORK_DELTA_ARTIFACT_SCHEMA_ID,
+        "authority_repo": str(authority_repo.resolve(strict=False)),
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_id": claim_id,
+        "files": files,
+    }
+    packet = {**payload, "canonical_digest": _rework_delta_canonical_digest(payload)}
+    encoded = json.dumps(packet, indent=2, ensure_ascii=True).encode("utf-8")
+    artifact_digest = hashlib.sha256(encoded).hexdigest()
+    artifact_dir = artifact_dir.resolve(strict=False)
+    artifact_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    chmod_path(artifact_dir, 0o700)
+    artifact_path = artifact_dir / f"{artifact_digest}.json"
+    fd, temp_name = tempfile.mkstemp(
+        dir=artifact_dir, prefix=".rework-delta-", suffix=".tmp"
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        chmod_path(temp_path, 0o600)
+        atomic_replace(temp_path, artifact_path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return {"path": str(artifact_path), "digest": artifact_digest}
+
+
+def materialize_rework_delta_artifact(
+    artifact: Any,
+    authority_repo: Path,
+    request_id: str,
+    task_id: str,
+    claim_id: str,
+    worktree: Path,
+    expected_path_hashes: dict[str, Any],
+    allowed_writes: tuple[str, ...],
+) -> list[str]:
+    """Verify and materialize one sealed changed/deleted-file delta."""
+    if not isinstance(artifact, dict):
+        raise WorkspaceError("rework_delta_artifact_invalid")
+    raw_path = str(artifact.get("path") or "")
+    digest = str(artifact.get("digest") or "")
+    if not raw_path or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise WorkspaceError("rework_delta_artifact_invalid")
+    artifact_path = Path(raw_path)
+    if (
+        artifact_path.name != f"{digest}.json"
+        or artifact_path.is_symlink()
+        or not artifact_path.is_file()
+    ):
+        raise WorkspaceError("rework_delta_artifact_missing")
+    encoded = artifact_path.read_bytes()
+    if hashlib.sha256(encoded).hexdigest() != digest:
+        raise WorkspaceError("rework_delta_artifact_tampered")
+    try:
+        packet = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkspaceError("rework_delta_artifact_invalid") from exc
+    if not isinstance(packet, dict):
+        raise WorkspaceError("rework_delta_artifact_invalid")
+    canonical_digest = str(packet.pop("canonical_digest", "") or "")
+    if (
+        packet.get("schema_id") != REWORK_DELTA_ARTIFACT_SCHEMA_ID
+        or not re.fullmatch(r"[0-9a-f]{64}", canonical_digest)
+        or _rework_delta_canonical_digest(packet) != canonical_digest
+    ):
+        raise WorkspaceError("rework_delta_artifact_tampered")
+    if (
+        str(packet.get("authority_repo")) != str(authority_repo.resolve(strict=False))
+        or str(packet.get("request_id")) != request_id
+        or str(packet.get("task_id")) != task_id
+        or str(packet.get("claim_id")) != claim_id
+    ):
+        raise WorkspaceError("rework_delta_identity_mismatch")
+    files = packet.get("files")
+    if not isinstance(files, list) or not files or len(files) > MAX_REWORK_OVERLAY_FILES:
+        raise WorkspaceError("rework_delta_artifact_incomplete")
+    expected = {
+        _relative_repo_path(str(key)): value
+        for key, value in expected_path_hashes.items()
+    }
+    planned: list[tuple[str, bytes | None]] = []
+    seen_paths: set[str] = set()
+    total_content_bytes = 0
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise WorkspaceError("rework_delta_artifact_invalid")
+        relative = _rework_delta_normalize_path(entry.get("path"))
+        if relative in seen_paths:
+            raise WorkspaceError(f"rework_delta_duplicate_path:{relative}")
+        seen_paths.add(relative)
+        if relative not in expected:
+            raise WorkspaceError(f"rework_delta_unexpected_path:{relative}")
+        raw_expected = expected[relative]
+        if raw_expected is not None and (
+            not isinstance(raw_expected, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", raw_expected)
+        ):
+            raise WorkspaceError(f"rework_predecessor_hash_invalid:{relative}")
+        if not _matches(relative, allowed_writes):
+            raise WorkspaceError(f"rework_predecessor_outside_scope:{relative}")
+        _require_beneath(worktree, worktree / relative)
+        if entry.get("deleted") is True:
+            if (
+                raw_expected is not None
+                or entry.get("sha256") is not None
+                or entry.get("content_base64") is not None
+            ):
+                raise WorkspaceError(f"rework_delta_delete_conflict:{relative}")
+            planned.append((relative, None))
+            continue
+        file_sha = str(entry.get("sha256") or "")
+        content_base64 = entry.get("content_base64")
+        if not re.fullmatch(r"[0-9a-f]{64}", file_sha) or not isinstance(
+            content_base64, str
+        ):
+            raise WorkspaceError(f"rework_delta_artifact_incomplete:{relative}")
+        try:
+            content = base64.b64decode(content_base64, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise WorkspaceError(f"rework_delta_artifact_invalid:{relative}") from exc
+        if hashlib.sha256(content).hexdigest() != file_sha:
+            raise WorkspaceError(f"rework_delta_content_hash_mismatch:{relative}")
+        if file_sha != raw_expected:
+            raise WorkspaceError(f"rework_predecessor_hash_mismatch:{relative}")
+        total_content_bytes += len(content)
+        if total_content_bytes > MAX_REWORK_OVERLAY_CONTENT_BYTES:
+            raise WorkspaceError("rework_delta_content_exceeds_limit")
+        planned.append((relative, content))
+    if seen_paths != set(expected):
+        raise WorkspaceError("rework_delta_artifact_incomplete")
+    seeded: list[str] = []
+    for relative, content in planned:
+        destination = worktree / relative
+        if content is None:
+            if destination.is_symlink() or destination.is_file():
+                destination.unlink()
+            elif destination.exists():
+                raise WorkspaceError(f"rework_predecessor_delete_non_file:{relative}")
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+        seeded.append(relative)
+    return sorted(seeded)
 
 
 def _json_pointer_parts(pointer: str) -> tuple[str, ...]:
