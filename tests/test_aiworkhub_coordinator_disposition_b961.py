@@ -25,7 +25,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import aiworkhub  # noqa: E402
-from aiworkhub import callback_store, core, task_store  # noqa: E402
+from aiworkhub import callback_store, core, task_store, worker_workspace  # noqa: E402
 from aiworkhub import process_launcher  # noqa: E402
 
 NOW = "2026-07-20T00:00:00+00:00"
@@ -230,10 +230,15 @@ def _terminal_rework_delta_card(
     claim_epoch: int = 4,
 ) -> tuple[dict, dict]:
     artifact_root = coord / ".aiworkhub" / "runtime" / "rework_deltas"
-    artifact_root.mkdir(parents=True, exist_ok=True)
-    artifact_bytes = b'{"schema_id":"aiworkhub.rework_delta_artifact.v2"}'
-    artifact_path = artifact_root / "packet.json"
-    artifact_path.write_bytes(artifact_bytes)
+    content = b"reviewed predecessor bytes\n"
+    artifact = worker_workspace.seal_rework_delta_artifact(
+        authority_repo=coord,
+        task_id=task_id,
+        request_id=request_id,
+        claim_epoch=claim_epoch,
+        file_entries=[("out/result.txt", content)],
+        artifact_dir=artifact_root,
+    )
     descriptor = {
         "schema_id": "aiworkhub.rework_delta_descriptor.v1",
         "sealed": True,
@@ -241,8 +246,8 @@ def _terminal_rework_delta_card(
         "task_id": task_id,
         "request_id": request_id,
         "claim_epoch": claim_epoch,
-        "artifact_path": str(artifact_path),
-        "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "artifact_path": artifact["path"],
+        "artifact_sha256": artifact["digest"],
     }
     workspace = {
         "request_id": request_id,
@@ -264,7 +269,9 @@ def _terminal_rework_delta_card(
                     "task_id": task_id,
                 },
                 "workspace": workspace,
-                "changed_path_hashes": {"out/result.txt": "a" * 64},
+                "changed_path_hashes": {
+                    "out/result.txt": hashlib.sha256(content).hexdigest()
+                },
                 "rework_delta": descriptor,
             },
         },
@@ -281,8 +288,32 @@ def test_reject_to_pending_persists_authenticated_rework_delta(coord):
 
     assert result["ok"] is True, result
     persisted = json.loads(_row(coord, task_id)["card_json"])
-    assert persisted["rework_predecessor"]["rework_delta"] == descriptor
-    assert persisted["rework_predecessor"]["request_id"] == request_id
+    predecessor = persisted["rework_predecessor"]
+    assert predecessor["rework_delta"] == descriptor
+    assert predecessor["request_id"] == request_id
+    assert predecessor["task_id"] == task_id
+    assert predecessor["claim_epoch"] == descriptor["claim_epoch"]
+    assert predecessor["delta_artifact"] == {
+        "path": descriptor["artifact_path"],
+        "digest": descriptor["artifact_sha256"],
+    }
+    # The retained predecessor worktree may already be gone here.  The compact
+    # fields persisted by reject_review must be directly consumable by the
+    # delta materializer without any fallback to that deleted workspace.
+    worktree = coord / "successor-worktree"
+    worktree.mkdir()
+    seeded = worker_workspace.materialize_rework_delta_artifact(
+        artifact=predecessor["delta_artifact"],
+        authority_repo=coord,
+        request_id=predecessor["request_id"],
+        task_id=predecessor["task_id"],
+        claim_epoch=predecessor["claim_epoch"],
+        worktree=worktree,
+        expected_path_hashes=predecessor["changed_path_hashes"],
+        allowed_writes=("out/result.txt",),
+    )
+    assert seeded == ["out/result.txt"]
+    assert (worktree / "out/result.txt").read_bytes() == b"reviewed predecessor bytes\n"
 
 
 @pytest.mark.parametrize(

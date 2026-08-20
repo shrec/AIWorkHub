@@ -4130,7 +4130,18 @@ def reject_review(
                 "pinned_at": now,
             }
             if pred_rework_delta is not None:
-                card["rework_predecessor"]["rework_delta"] = pred_rework_delta
+                # Keep the authenticated descriptor for audit while projecting
+                # the exact compact shape consumed by worker_workspace after
+                # the retained predecessor worktree has been collected.
+                card["rework_predecessor"].update({
+                    "task_id": pred_rework_delta["task_id"],
+                    "claim_epoch": pred_rework_delta["claim_epoch"],
+                    "delta_artifact": {
+                        "path": pred_rework_delta["artifact_path"],
+                        "digest": pred_rework_delta["artifact_sha256"],
+                    },
+                    "rework_delta": pred_rework_delta,
+                })
         elif disposition == "pending" and normalized_residuals:
             return residual_error("residual_contract_requires_review_predecessor")
     if disposition == "pending":
