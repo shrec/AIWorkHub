@@ -45,7 +45,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .worker_workspace import configured_worktree_root
+from .worker_workspace import configured_runtime_root, configured_worktree_root
 
 _GIT_TIMEOUT_SECONDS = 30
 _WORKTREE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -395,6 +395,89 @@ def _unpushed_heads(repo_root: Path, heads: set[str]) -> set[str]:
     return {head for head in real_heads if head in reachable}
 
 
+def _request_ledger_owns_entry(repo_root: Path, base: Path, entry: Path) -> bool:
+    """Return whether AIWorkHub's durable request ledger owns ``entry``.
+
+    Git may prune a linked-worktree registration before retention gets a chance
+    to account for the directory.  The request envelope is a second, exact
+    ownership record: its request id, repository, checkout and HOME must all bind
+    to this one repo-local entry.  A missing, oversized, symlinked or malformed
+    envelope fails closed.  This is attribution only; deletion still goes through
+    task-lineage protection and the quarantine path's exact safety checks.
+    """
+    if not _WORKTREE_ID_RE.fullmatch(entry.name):
+        return False
+    request_path = (
+        configured_runtime_root(repo_root)
+        / "process_logs"
+        / "processes"
+        / f"{entry.name}.request.json"
+    )
+    try:
+        if request_path.is_symlink() or not request_path.is_file():
+            return False
+        if request_path.stat().st_size > 4 * 1024 * 1024:
+            return False
+        payload = json.loads(request_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("schema_id") != "aiworkhub.task_mcp.isolated_request.v1":
+        return False
+    if str(payload.get("request_id") or "") != entry.name:
+        return False
+    workspace = payload.get("workspace")
+    if not isinstance(workspace, dict):
+        return False
+    expected_entry = (base / entry.name).resolve()
+    try:
+        return (
+            Path(str(workspace.get("repo") or "")).resolve() == repo_root.resolve()
+            and Path(str(workspace.get("path") or "")).resolve()
+            == (expected_entry / "worktree").resolve()
+            and Path(str(workspace.get("home") or "")).resolve()
+            == (expected_entry / "home").resolve()
+            and str(workspace.get("request_id") or "") == entry.name
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
+def _linked_worktree_head(checkout: Path, repo_common_dir: str) -> str:
+    """Read a detached worktree HEAD without spawning Git.
+
+    This recovers attribution when ``git worktree list`` omitted a stale locked
+    registration but the checkout still points at a live admin directory owned
+    by this repository.  Symbolic HEADs deliberately fail closed; worker
+    worktrees are created detached and a later exact cleanup check handles any
+    exceptional layout.
+    """
+    try:
+        pointer = (checkout / ".git").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    target = ""
+    for line in pointer.splitlines():
+        if line.strip().startswith("gitdir:"):
+            target = line.split(":", 1)[1].strip()
+            break
+    if not target:
+        return ""
+    admin = Path(target)
+    if not admin.is_absolute():
+        admin = (checkout / admin).resolve()
+    try:
+        common = Path(repo_common_dir).resolve()
+        resolved_admin = admin.resolve()
+        if not resolved_admin.is_relative_to(common / "worktrees"):
+            return ""
+        head = (resolved_admin / "HEAD").read_text(encoding="ascii").strip().lower()
+    except (OSError, UnicodeDecodeError, RuntimeError):
+        return ""
+    return head if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head) else ""
+
+
 def _batch_repo_worktree_states(
     repo_root: Path, repo_common_dir: str, entries: list[Path]
 ) -> dict[str, dict[str, Any]]:
@@ -432,10 +515,14 @@ def _batch_repo_worktree_states(
     registered = _repo_registered_worktrees(repo_root)
     _rc, repo_origin = _git(repo_root, "config", "--get", "remote.origin.url")
     owned_head: dict[str, str] = {}
+    ledger_owned: set[str] = set()
     heads: set[str] = set()
     for entry in entries:
         checkout = entry / "worktree"
         head = registered.get(_norm_path(checkout), "")
+        if not head and _request_ledger_owns_entry(repo_root, entry.parent, entry):
+            ledger_owned.add(entry.name)
+            head = _linked_worktree_head(checkout, repo_common_dir)
         if head and checkout.is_dir():
             owned_head[entry.name] = head
             heads.add(head)
@@ -445,6 +532,7 @@ def _batch_repo_worktree_states(
     states: dict[str, dict[str, Any]] = {}
     for name, head in owned_head.items():
         git_ok = bool(head)
+        owned = git_ok or name in ledger_owned
         states[name] = {
             "git_ok": git_ok,
             "origin": repo_origin if git_ok else "",
@@ -455,7 +543,10 @@ def _batch_repo_worktree_states(
             "dirty": False,
             "dirty_deferred": True,
             "unpushed": bool(git_ok and head in unpushed),
-            "parent_git_dir": repo_common_dir if git_ok else "",
+            "parent_git_dir": repo_common_dir if owned else "",
+            "ownership_source": (
+                "git_registration" if name not in ledger_owned else "request_ledger"
+            ) if owned else "",
         }
     return states
 
@@ -552,6 +643,7 @@ def scan_worktrees(
                 "dirty_deferred": bool(git_state.get("dirty_deferred", False)),
                 "unpushed": git_state["unpushed"],
                 "parent_git_dir": git_state["parent_git_dir"],
+                "ownership_source": str(git_state.get("ownership_source") or ""),
                 "modified_at_epoch": modified_at,
                 "age_seconds": max(0.0, time.time() - modified_at),
                 "class": worktree_class,

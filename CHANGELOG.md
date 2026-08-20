@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.6] - 2026-08-20
+
+### Fixed
+
+- Repository storage inventory now uses the exact durable worker request
+  envelope as a secondary ownership authority when Git has pruned a linked
+  worktree registration. Repo/request/path/HOME bindings must all match; broken
+  checkouts remain fail-closed and are never presented as safely removable.
+- Stale registered worktree HEADs are recovered from repository-owned Git admin
+  metadata without adding per-worktree Git subprocesses. On the canonical
+  repository this reduced falsely unattributed storage from 5.27 GB to 2.3 KB
+  while keeping the warm preview under one second.
+
 ## [0.10.5] - 2026-08-20
 
 ### Fixed

@@ -18,6 +18,8 @@ repo-scoped behaviour and the unchanged per-worktree classification.
 
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -58,6 +60,29 @@ def _add_worktree(repo: Path, base: Path, name: str) -> Path:
     worktree.parent.mkdir(parents=True)
     _git(repo, "worktree", "add", "--detach", str(worktree), "HEAD")
     return worktree
+
+
+def _write_request_ledger(repo: Path, base: Path, request_id: str) -> None:
+    entry = base / request_id
+    home = entry / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    process_dir = repo / ".aiworkhub" / "runtime" / "process_logs" / "processes"
+    process_dir.mkdir(parents=True, exist_ok=True)
+    (process_dir / f"{request_id}.request.json").write_text(
+        json.dumps(
+            {
+                "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
+                "request_id": request_id,
+                "workspace": {
+                    "repo": str(repo.resolve()),
+                    "request_id": request_id,
+                    "path": str((entry / "worktree").resolve()),
+                    "home": str(home.resolve()),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _count_git_spawns(fn) -> int:
@@ -164,6 +189,75 @@ def test_repo_scoped_scan_batches_unpushed_detection(worktrees) -> None:
     ids = _by_id(ws.scan_worktrees(worktrees["base"], repo_root=worktrees["parent"]))
     assert ids["W_UNPUSHED"]["unpushed"] is True
     assert ids["W_SAFE"]["unpushed"] is False
+
+
+def test_repo_scoped_scan_uses_exact_request_ledger_after_registration_loss(
+    tmp_path, monkeypatch
+) -> None:
+    repo = _clone_repo(tmp_path)
+    base = tmp_path / "worktrees"
+    base.mkdir()
+    request_id = "request-ledger-owned"
+    _add_worktree(repo, base, request_id)
+    _write_request_ledger(repo, base, request_id)
+    monkeypatch.delenv("AIWORKHUB_RUNTIME_ROOT", raising=False)
+    monkeypatch.setattr(ws, "_repo_registered_worktrees", lambda _repo: {})
+
+    ids = _by_id(ws.scan_worktrees(base, repo_root=repo, with_sizes=False))
+
+    assert set(ids) == {request_id}
+    assert ids[request_id]["ownership_source"] == "request_ledger"
+    assert ids[request_id]["git_ok"] is True
+    assert ids[request_id]["head"]
+
+
+def test_request_ledger_attribution_fails_closed_on_repo_or_path_mismatch(
+    tmp_path, monkeypatch
+) -> None:
+    repo = _clone_repo(tmp_path)
+    base = tmp_path / "worktrees"
+    base.mkdir()
+    request_id = "request-ledger-spoof"
+    _add_worktree(repo, base, request_id)
+    _write_request_ledger(repo, base, request_id)
+    request_path = (
+        repo / ".aiworkhub" / "runtime" / "process_logs" / "processes"
+        / f"{request_id}.request.json"
+    )
+    payload = json.loads(request_path.read_text(encoding="utf-8"))
+    payload["workspace"]["repo"] = str((tmp_path / "other-repo").resolve())
+    request_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.delenv("AIWORKHUB_RUNTIME_ROOT", raising=False)
+    monkeypatch.setattr(ws, "_repo_registered_worktrees", lambda _repo: {})
+
+    scan = ws.scan_worktrees(base, repo_root=repo, with_sizes=False)
+
+    assert scan["worktrees"] == []
+    assert scan["global_summary"]["count"] == 1
+
+
+def test_request_ledger_attributes_but_never_marks_broken_checkout_safe(
+    tmp_path, monkeypatch
+) -> None:
+    repo = _clone_repo(tmp_path)
+    base = tmp_path / "worktrees"
+    base.mkdir()
+    request_id = "request-ledger-broken"
+    checkout = _add_worktree(repo, base, request_id)
+    _write_request_ledger(repo, base, request_id)
+    gitdir = Path(
+        (checkout / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+    )
+    shutil.rmtree(gitdir)
+    monkeypatch.delenv("AIWORKHUB_RUNTIME_ROOT", raising=False)
+    monkeypatch.setattr(ws, "_repo_registered_worktrees", lambda _repo: {})
+
+    ids = _by_id(ws.scan_worktrees(base, repo_root=repo, with_sizes=False))
+
+    assert set(ids) == {request_id}
+    assert ids[request_id]["ownership_source"] == "request_ledger"
+    assert ids[request_id]["git_ok"] is False
+    assert ids[request_id]["class"] == ws.CLASS_ORPHANED
 
 
 def test_global_scan_preserves_exact_safety_classification(worktrees) -> None:

@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.6 — 2026-08-20
+
+### Fixed
+
+- Storage ownership survives pruned Git worktree registrations through exact,
+  fail-closed request-ledger binding, without restoring per-worktree process
+  spawn overhead or weakening quarantine safety.
+
 ## 0.10.5 — 2026-08-20
 
 ### Fixed

@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.6
+
+- Storage inventory attributes AIWorkHub-owned worktrees from their exact
+  durable request envelope even after Git prunes the linked registration.
+- Ownership recovery stays process-free per worktree and never treats a broken
+  checkout as safely removable.
+
 ## What's new in 0.10.5
 
 - Rework workers see canonical Source Graph results plus exact changed/deleted
