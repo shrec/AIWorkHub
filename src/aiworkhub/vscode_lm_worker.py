@@ -1074,9 +1074,14 @@ def run(spec_path: Path) -> dict[str, Any]:
     final_hashes: dict[str, str] = {}
     final_sizes: dict[str, int] = {}
     for relative, content in planned:
-        _write_atomic(workspace, relative, content)
-        readback_bytes = _target_path(workspace, relative).read_bytes()
         exp_bytes, exp_hash, exp_size = expected_content[relative]
+        target = _target_path(workspace, relative)
+        existing_bytes = target.read_bytes() if target.is_file() else None
+        if existing_bytes == exp_bytes:
+            readback_bytes = existing_bytes
+        else:
+            _write_atomic(workspace, relative, content)
+            readback_bytes = target.read_bytes()
         if readback_bytes != exp_bytes:
             raise RuntimeError(
                 f"vscode_lm_edit_response_write_readback_mismatch:"
@@ -1086,14 +1091,17 @@ def run(spec_path: Path) -> dict[str, Any]:
                 f"{hashlib.sha256(readback_bytes).hexdigest()}:"
                 f"actual_bytes={len(readback_bytes)}"
             )
-        written.append(relative)
+        if existing_bytes != exp_bytes:
+            written.append(relative)
         final_hashes[relative] = exp_hash
         final_sizes[relative] = exp_size
+    written_set = set(written)
     for metric in semantic_metrics:
         metric_path = metric.get("path")
         if metric_path in final_hashes:
             metric["final_sha256"] = final_hashes[metric_path]
             metric["final_bytes"] = final_sizes[metric_path]
+            metric["no_op"] = metric_path not in written_set
         metric["apply_surface"] = "vscode_lm_worker_provider_side"
         metric["mcp_receipt"] = None
     return {

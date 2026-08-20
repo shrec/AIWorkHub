@@ -858,6 +858,32 @@ class TestRunSpecPathIntegration:
             == "line1\nL2\nline3\nL4\nline5\n"
         )
 
+    def test_run_byte_identical_edit_is_truthful_no_op(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        spec_path, target = self._make_spec_and_response(
+            tmp_path,
+            "line1\nline2\nline3\n",
+            "src/mod.py",
+            [{"ranges": [{
+                "start_line": 2, "end_line": 2,
+                "new": "line2\n",
+            }]}],
+            "req-no-op",
+            ["src/*.py"],
+        )
+
+        def _unexpected_write(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("byte-identical edit must not rewrite the file")
+
+        monkeypatch.setattr(vscode_lm_worker, "_write_atomic", _unexpected_write)
+        result = vscode_lm_worker.run(spec_path)
+
+        assert result["is_error"] is False
+        assert result["changed_paths"] == []
+        assert result["semantic_edit_metrics"][0]["no_op"] is True
+        assert target.read_text(encoding="utf-8") == "line1\nline2\nline3\n"
+
     def test_run_consolidated_disjoint_ranges(
         self, tmp_path: Path,
     ) -> None:
