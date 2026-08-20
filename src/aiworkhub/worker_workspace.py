@@ -426,6 +426,112 @@ def _run(argv: list[str], *, cwd: Path, timeout: int = 120) -> subprocess.Comple
     )
 
 
+def _read_git_control_file(path: Path, *, label: str) -> str:
+    """Read one bounded Git administrative file without spawning Git."""
+    if path.is_symlink() or not path.is_file():
+        raise WorkspaceError(f"{label}_missing")
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise WorkspaceError(f"{label}_unreadable:{type(exc).__name__}") from exc
+    if not payload or len(payload) > 4096 or b"\x00" in payload:
+        raise WorkspaceError(f"{label}_invalid")
+    try:
+        value = payload.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise WorkspaceError(f"{label}_invalid_encoding") from exc
+    if not value or "\n" in value or "\r" in value:
+        raise WorkspaceError(f"{label}_invalid")
+    return value
+
+
+def _gitdir_pointer(marker: Path, *, label: str) -> Path:
+    value = _read_git_control_file(marker, label=label)
+    prefix = "gitdir: "
+    if not value.startswith(prefix):
+        raise WorkspaceError(f"{label}_invalid")
+    raw = value[len(prefix):].strip()
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = marker.parent / candidate
+    try:
+        return candidate.resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceError(f"{label}_target_unavailable") from exc
+
+
+def _common_git_dir(repo: Path) -> Path:
+    marker = repo / ".git"
+    if marker.is_symlink():
+        raise WorkspaceError("repository_git_marker_symlink_forbidden")
+    if marker.is_dir():
+        return marker.resolve(strict=True)
+    git_dir = _gitdir_pointer(marker, label="repository_git_marker")
+    common_marker = git_dir / "commondir"
+    if not common_marker.exists():
+        return git_dir
+    raw = _read_git_control_file(common_marker, label="repository_commondir")
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = git_dir / candidate
+    try:
+        return candidate.resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceError("repository_commondir_unavailable") from exc
+
+
+def _isolated_worktree_base_oid(repo: Path, path: Path) -> str:
+    """Verify a new detached worktree from bounded Git metadata only.
+
+    ``git worktree add --detach`` has already created an administrative record.
+    Re-spawning ``git symbolic-ref`` and two ``git rev-parse`` probes added no
+    authority, but on Windows one of those tiny children could inherit a bad
+    launcher handle and hold the interactive launch call for 120 seconds. The
+    worktree pointer, its round-trip backlink, ``commondir`` and detached HEAD
+    encode the same facts without another process or an unbounded wait.
+    """
+    marker = path / ".git"
+    if marker.is_symlink() or not marker.is_file():
+        raise WorkspaceError("worktree_is_not_detached_and_isolated")
+    admin_dir = _gitdir_pointer(marker, label="worktree_git_marker")
+    common_dir = _common_git_dir(repo)
+    try:
+        admin_dir.relative_to(common_dir / "worktrees")
+    except ValueError as exc:
+        raise WorkspaceError("worktree_gitdir_outside_repository") from exc
+
+    backlink_raw = _read_git_control_file(
+        admin_dir / "gitdir", label="worktree_gitdir_backlink"
+    )
+    backlink = Path(backlink_raw)
+    if not backlink.is_absolute():
+        backlink = admin_dir / backlink
+    if os.path.normcase(os.path.abspath(backlink)) != os.path.normcase(
+        os.path.abspath(marker)
+    ):
+        raise WorkspaceError("worktree_gitdir_backlink_mismatch")
+
+    common_raw = _read_git_control_file(
+        admin_dir / "commondir", label="worktree_commondir"
+    )
+    linked_common = Path(common_raw)
+    if not linked_common.is_absolute():
+        linked_common = admin_dir / linked_common
+    try:
+        linked_common = linked_common.resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceError("worktree_commondir_unavailable") from exc
+    if os.path.normcase(str(linked_common)) != os.path.normcase(str(common_dir)):
+        raise WorkspaceError("worktree_repository_identity_mismatch")
+
+    head = _read_git_control_file(admin_dir / "HEAD", label="worktree_head")
+    if head.startswith("ref:"):
+        raise WorkspaceError("worktree_is_not_detached_and_isolated")
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) is None:
+        raise WorkspaceError("worktree_base_oid_unavailable")
+    return head
+
+
 def _relative_repo_path(raw: str) -> str:
     if not isinstance(raw, str):
         raise WorkspaceError(f"invalid_repo_path_type:{type(raw).__name__}")
@@ -1462,16 +1568,11 @@ def create_workspace(
     except Exception:
         cleanup_workspace(repo, path, home)
         raise
-    detached = _run(["git", "symbolic-ref", "-q", "HEAD"], cwd=path)
-    top = _run(["git", "rev-parse", "--show-toplevel"], cwd=path)
-    if detached.returncode == 0 or top.returncode != 0 or Path(top.stdout.strip()).resolve() != path:
+    try:
+        base_oid = _isolated_worktree_base_oid(repo, path)
+    except WorkspaceError:
         cleanup_workspace(repo, path, home)
-        raise WorkspaceError("worktree_is_not_detached_and_isolated")
-    head = _run(["git", "rev-parse", "HEAD"], cwd=path)
-    base_oid = head.stdout.strip()
-    if head.returncode != 0 or not base_oid:
-        cleanup_workspace(repo, path, home)
-        raise WorkspaceError("worktree_base_oid_unavailable")
+        raise
     return WorkerWorkspace(
         request_id=request_id,
         repo=repo,

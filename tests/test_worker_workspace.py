@@ -184,6 +184,65 @@ def test_workspace_is_detached_and_seeded_parent_changes_are_not_worker_changes(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+def test_workspace_creation_uses_bounded_metadata_not_post_create_git_probes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+    )
+    real_run = worker_workspace._run
+    calls: list[tuple[str, ...]] = []
+
+    def guarded_run(argv, **kwargs):
+        calls.append(tuple(argv))
+        if len(argv) > 1 and argv[1] in {"symbolic-ref", "rev-parse"}:
+            raise AssertionError(f"post-create Git probe forbidden: {argv}")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(worker_workspace, "_run", guarded_run)
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "metadata-only-probe",
+        {"allowed_writes": ["out/result.txt"]},
+        "validation",
+    )
+    try:
+        assert len(workspace.base_oid or "") in {40, 64}
+        assert [call[1] for call in calls if len(call) > 1] == ["worktree"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_isolated_worktree_metadata_rejects_symbolic_head(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "symbolic-head-rejection",
+        {"allowed_writes": ["out/result.txt"]},
+        "validation",
+    )
+    try:
+        admin_dir = worker_workspace._gitdir_pointer(
+            workspace.path / ".git", label="test_worktree_marker"
+        )
+        (admin_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="worktree_is_not_detached_and_isolated",
+        ):
+            worker_workspace._isolated_worktree_base_oid(repo, workspace.path)
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
 def test_rework_workspace_materializes_hash_pinned_predecessor_baseline(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
