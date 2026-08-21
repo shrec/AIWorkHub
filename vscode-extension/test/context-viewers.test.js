@@ -47,6 +47,8 @@ assert.ok(app.includes('state.settingsTab'));
 assert.ok(app.includes('dataset.settingsTab'));
 assert.ok(app.includes('"retention", "Retention"'));
 assert.ok(app.includes('["models", "Models"]'));
+assert.ok(app.includes("live VS Code/Copilot model"));
+assert.ok(app.includes("discovered in VS Code · no task capability assigned"));
 assert.ok(app.includes('"telemetry", "Telemetry"'));
 assert.ok(css.includes(".diagnostic-icon-button svg"));
 assert.ok(css.includes(".settings-row"));

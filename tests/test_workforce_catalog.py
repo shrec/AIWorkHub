@@ -188,6 +188,60 @@ def test_repository_model_policy_removes_disabled_routes_from_ranking(
     assert "worker_unavailable" in glm_candidate["exclusion_reasons"]
 
 
+def test_copilot_policy_disables_every_editor_hosted_worker_route(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    model_settings.update(
+        root,
+        provider="copilot",
+        enabled=False,
+        expected_revision=0,
+    )
+    preflight = _preflight()
+    for row in preflight["providers"]:
+        if row["adapter_id"] == "glm_vscode_lm":
+            row["observed_models"] = ["glm-5.2", "glm-5.3"]
+
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=preflight
+    )
+    editor_rows = [
+        row for row in snapshot["workers"]
+        if row.get("policy_provider") == "copilot"
+    ]
+    assert editor_rows
+    assert all(row["policy_adapter"] == "vscode_lm" for row in editor_rows)
+    assert all(row["policy_enabled"] is False for row in editor_rows)
+    assert all(row["available"] is False for row in editor_rows)
+
+
+def test_copilot_exact_model_switch_does_not_disable_sibling_model(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    model_settings.update(
+        root,
+        provider="copilot",
+        adapter="vscode_lm",
+        model="glm-5.3",
+        enabled=False,
+        expected_revision=0,
+    )
+    preflight = _preflight()
+    for row in preflight["providers"]:
+        if row["adapter_id"] == "glm_vscode_lm":
+            row["observed_models"] = ["glm-5.2", "glm-5.3"]
+
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=preflight
+    )
+    by_model = {
+        row["model"]: row
+        for row in snapshot["workers"]
+        if row.get("policy_provider") == "copilot"
+        and row["model"] in {"glm-5.2", "glm-5.3"}
+    }
+    assert by_model["glm-5.2"]["available"] is True
+    assert by_model["glm-5.3"]["available"] is False
+
+
 def test_rank_task_uses_manager_adjustment_without_fabricating_outcomes(tmp_path: Path) -> None:
     root = _root(tmp_path)
     workers = [

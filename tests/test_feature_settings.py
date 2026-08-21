@@ -11,7 +11,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import core, dashboard_mcp_app, feature_settings, source_graph, source_graph_daemon, task_store  # noqa: E402
+from aiworkhub import core, dashboard_mcp_app, feature_settings, source_graph, source_graph_daemon, task_store, vscode_lm_bridge  # noqa: E402
 
 
 def _repo(tmp_path: Path, name: str) -> Path:
@@ -153,6 +153,15 @@ def test_dashboard_exposes_and_updates_repository_model_policy(
 ) -> None:
     root = _repo(tmp_path, "repo")
     monkeypatch.setattr(core, "repo_root", lambda: root)
+    monkeypatch.setattr(
+        vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *_args, **_kwargs: {
+            "launchable": True,
+            "blocker_reason": "",
+            "observed_models": ["gpt-5.6-sol", "glm-5.3"],
+        },
+    )
 
     viewed = dashboard_mcp_app.settings_view()
     model_policy = viewed["model_policy"]
@@ -162,23 +171,46 @@ def test_dashboard_exposes_and_updates_repository_model_policy(
     assert all(
         row["effective_enabled"] for row in model_policy["catalog"]["workers"]
     )
+    assert model_policy["catalog"]["discovered_model_count"] == 2
+    copilot_models = {
+        row["model"]
+        for row in model_policy["catalog"]["workers"]
+        if row["provider"] == "copilot"
+    }
+    assert {"gpt-5.6-sol", "glm-5.3"}.issubset(copilot_models)
+
+    copilot_disabled = dashboard_mcp_app.model_settings_update_view(
+        provider="copilot",
+        enabled=False,
+        expected_revision=0,
+    )
+    assert copilot_disabled["ok"] is True
+    assert copilot_disabled["providers"] == {"copilot": False}
+
+    reloaded = dashboard_mcp_app.settings_view()["model_policy"]
+    copilot_rows = [
+        row for row in reloaded["catalog"]["workers"]
+        if row["provider"] == "copilot"
+    ]
+    assert copilot_rows
+    assert all(row["effective_enabled"] is False for row in copilot_rows)
 
     disabled = dashboard_mcp_app.model_settings_update_view(
         provider="zhipu",
         enabled=False,
-        expected_revision=0,
+        expected_revision=1,
     )
     assert disabled["ok"] is True
-    assert disabled["revision"] == 1
-    assert disabled["providers"] == {"zhipu": False}
+    assert disabled["revision"] == 2
+    assert disabled["providers"] == {"copilot": False, "zhipu": False}
 
     reloaded = dashboard_mcp_app.settings_view()["model_policy"]
-    zhipu_rows = [
+    legacy_zhipu_rows = [
         row for row in reloaded["catalog"]["workers"]
-        if row["provider"] == "zhipu"
+        if row.get("vendor_provider") == "zhipu"
     ]
-    assert zhipu_rows
-    assert all(row["effective_enabled"] is False for row in zhipu_rows)
+    assert legacy_zhipu_rows
+    assert all(row["effective_enabled"] is False for row in legacy_zhipu_rows)
 
     conflict = dashboard_mcp_app.model_settings_update_view(
         provider="zhipu",
@@ -187,4 +219,4 @@ def test_dashboard_exposes_and_updates_repository_model_policy(
     )
     assert conflict["ok"] is False
     assert "revision_conflict" in conflict["error"]
-    assert conflict["current_revision"] == 1
+    assert conflict["current_revision"] == 2

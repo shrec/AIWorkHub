@@ -35,6 +35,14 @@ from .platform_io import posix_path_modes_supported
 # discovered model.  Only these adapters read their model set from VS Code.
 _DISCOVERY_ADAPTERS: frozenset[str] = frozenset({"glm_vscode_lm"})
 
+# These adapters all execute through the VS Code Language Model API.  The
+# model vendor (OpenAI, Anthropic, Zhipu, ...) and the subscription/transport
+# owner are different identities: repository policy must be able to disable
+# Copilot without also disabling a native Codex/Claude/provider route.
+_EDITOR_POLICY_ADAPTERS: frozenset[str] = frozenset(
+    {"vscode_lm", "deepseek_vscode_lm", "glm_vscode_lm"}
+)
+
 
 SCHEMA_ID = "aiworkhub.workforce_catalog.v1"
 CATALOG_RELATIVE_PATH = Path(".aiworkhub/config/workforce.json")
@@ -130,6 +138,28 @@ DEFAULT_WORKERS: tuple[dict[str, Any], ...] = (
 
 class WorkforceCatalogError(RuntimeError):
     pass
+
+
+def policy_route_identity(provider: str, adapter_id: str) -> tuple[str, str]:
+    """Return the repository-policy owner for one effective launch route.
+
+    Editor-hosted models are paid/authorized through the Copilot/VS Code LM
+    surface even when their model vendor is GLM, DeepSeek or OpenAI.  Collapse
+    the implementation-specific editor adapters into one stable policy key so
+    a single Copilot switch, and its exact per-model children, gate every such
+    route consistently.
+    """
+
+    adapter = str(adapter_id).strip()
+    if adapter in _EDITOR_POLICY_ADAPTERS:
+        return "copilot", "vscode_lm"
+    return str(provider).strip().lower(), adapter
+
+
+def model_identity_valid(value: str) -> bool:
+    """Return whether a discovered model id is safe for policy persistence."""
+
+    return bool(_TOKEN_RE.fullmatch(str(value)))
 
 
 def catalog_path(repo_root: Path | str) -> Path:
@@ -710,12 +740,25 @@ def build_catalog(
         access_observed = bool(adapter_ready.get("access_observed"))
         route_health = _route_circuit(matched, now_epoch=observed_now_epoch)
         route_available = route_health["state"] != "open"
-        policy_enabled = model_settings.evaluate_state(
+        policy_provider, policy_adapter = policy_route_identity(
+            worker["provider"], effective_adapter
+        )
+        route_policy_enabled = model_settings.evaluate_state(
+            model_policy,
+            provider=policy_provider,
+            adapter=policy_adapter,
+            model=worker["model"],
+        )
+        # Preserve 0.10.24 vendor-level settings while adding the explicit
+        # transport-owner gate.  A legacy disabled vendor remains fail-closed;
+        # a newly disabled Copilot group now also blocks every editor route.
+        vendor_policy_enabled = model_settings.evaluate_state(
             model_policy,
             provider=worker["provider"],
             adapter=effective_adapter,
             model=worker["model"],
         )
+        policy_enabled = route_policy_enabled and vendor_policy_enabled
         effective_enabled = bool(worker["enabled"] and policy_enabled)
         model_routes = economics_by_model.get(worker["model"])
         if not isinstance(model_routes, Mapping):
@@ -732,6 +775,9 @@ def build_catalog(
             **worker,
             "enabled": effective_enabled,
             "policy_enabled": policy_enabled,
+            "policy_provider": policy_provider,
+            "policy_adapter": policy_adapter,
+            "vendor_policy_enabled": vendor_policy_enabled,
             "effective_adapter_id": effective_adapter,
             "adapter_fallback_used": effective_adapter != worker["adapter_id"],
             "available": bool(

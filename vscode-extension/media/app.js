@@ -4071,6 +4071,12 @@ function renderSettings(payload) {
     const workers = Array.isArray(modelPolicy.catalog?.workers)
       ? modelPolicy.catalog.workers
       : [];
+    const discoveredCount = Number(modelPolicy.catalog?.discovered_model_count || 0);
+    heading.appendChild(createElement(
+      "small",
+      "",
+      `${discoveredCount} live VS Code/Copilot model${discoveredCount === 1 ? "" : "s"} discovered`,
+    ));
     const providers = [...new Set(workers.map((row) => String(row.provider || "")).filter(Boolean))].sort();
     for (const provider of providers) {
       const providerRows = workers.filter((row) => row.provider === provider);
@@ -4100,7 +4106,13 @@ function renderSettings(payload) {
         const routeCopy = createElement("span", "settings-copy");
         routeCopy.append(
           createElement("strong", "", String(route.model || route.worker_id || "Model")),
-          createElement("small", "", `${String(route.adapter || "unknown adapter")} · ${String(route.worker_id || "unidentified worker")}`),
+          createElement(
+            "small",
+            "",
+            route.inventory_only
+              ? `${String(route.adapter || "unknown adapter")} · discovered in VS Code · no task capability assigned`
+              : `${String(route.adapter || "unknown adapter")} · ${String(route.worker_id || "unidentified worker")}`,
+          ),
         );
         const routeControl = createElement("span", "switch-control");
         const routeInput = document.createElement("input");

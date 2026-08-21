@@ -41,6 +41,7 @@ from aiworkhub import (
     task_retention,
     task_store,
     terminal_log_retention,
+    vscode_lm_bridge,
     workforce_catalog,
 )
 
@@ -209,7 +210,7 @@ MAX_MODEL_POLICY_CATALOG_ROWS = 64
 
 
 def _model_policy_view(root: Any) -> dict[str, Any]:
-    """Return bounded repository policy plus the configured worker inventory."""
+    """Return bounded policy plus configured and live editor model inventory."""
     policy = model_settings.load(root)
     catalog = workforce_catalog.load_catalog(root)
     workers: list[dict[str, Any]] = []
@@ -217,40 +218,116 @@ def _model_policy_view(root: Any) -> dict[str, Any]:
         row for row in catalog.get("workers", []) if isinstance(row, Mapping)
     ]
     for row in source_rows[:MAX_MODEL_POLICY_CATALOG_ROWS]:
-        provider = str(row.get("provider") or "")
-        adapter = str(row.get("adapter_id") or "")
+        vendor_provider = str(row.get("provider") or "")
+        declared_adapter = str(row.get("adapter_id") or "")
         model = str(row.get("model") or "")
-        if not provider or not adapter or not model:
+        if not vendor_provider or not declared_adapter or not model:
             continue
+        provider, adapter = workforce_catalog.policy_route_identity(
+            vendor_provider, declared_adapter
+        )
         catalog_enabled = bool(row.get("enabled", True))
+        route_policy_enabled = model_settings.evaluate_state(
+            policy,
+            provider=provider,
+            adapter=adapter,
+            model=model,
+        )
+        vendor_policy_enabled = model_settings.evaluate_state(
+            policy,
+            provider=vendor_provider,
+            adapter=declared_adapter,
+            model=model,
+        )
         workers.append(
             {
                 "worker_id": str(row.get("worker_id") or "")[:128],
                 "provider": provider[:128],
                 "adapter": adapter[:128],
                 "model": model[:128],
+                "vendor_provider": vendor_provider[:128],
+                "declared_adapter": declared_adapter[:128],
                 "catalog_enabled": catalog_enabled,
                 "effective_enabled": catalog_enabled
-                and model_settings.evaluate_state(
-                    policy,
-                    provider=provider,
-                    adapter=adapter,
-                    model=model,
-                ),
+                and route_policy_enabled
+                and vendor_policy_enabled,
+                "inventory_only": False,
             }
         )
+
+    # This is a bounded heartbeat-registry read, not the full environment
+    # preflight (which may intentionally run expensive Windows lifecycle
+    # probes).  Settings therefore remains fast while reflecting the exact
+    # model catalog that the active VS Code/Copilot host reported.
+    editor = vscode_lm_bridge.bridge_readiness(
+        root,
+        model=None,
+        adapter_id="vscode_lm",
+    )
+    observed_models = editor.get("observed_models")
+    existing = {
+        (row["provider"], row["adapter"], row["model"])
+        for row in workers
+    }
+    discovered_count = 0
+    inventory_only_count = 0
+    if isinstance(observed_models, list):
+        for value in observed_models[:MAX_MODEL_POLICY_CATALOG_ROWS]:
+            model = str(value).strip()
+            key = ("copilot", "vscode_lm", model)
+            if (
+                not model
+                or not workforce_catalog.model_identity_valid(model)
+            ):
+                continue
+            discovered_count += 1
+            if key in existing:
+                for worker in workers:
+                    if (
+                        worker["provider"], worker["adapter"], worker["model"]
+                    ) == key:
+                        worker["discovered_from_editor"] = True
+                continue
+            inventory_only_count += 1
+            existing.add(key)
+            workers.append(
+                {
+                    "worker_id": "",
+                    "provider": "copilot",
+                    "adapter": "vscode_lm",
+                    "model": model[:128],
+                    "vendor_provider": "",
+                    "declared_adapter": "vscode_lm",
+                    "catalog_enabled": True,
+                    "effective_enabled": model_settings.evaluate_state(
+                        policy,
+                        provider="copilot",
+                        adapter="vscode_lm",
+                        model=model,
+                    ),
+                    "inventory_only": True,
+                    "discovered_from_editor": True,
+                }
+            )
     workers.sort(
         key=lambda row: (
             row["provider"], row["adapter"], row["model"], row["worker_id"]
         )
     )
+    total_rows = len(workers)
+    workers = workers[:MAX_MODEL_POLICY_CATALOG_ROWS]
     return {
         **policy,
         "catalog": {
             "workers": workers,
-            "worker_count": len(source_rows),
+            "worker_count": total_rows,
+            "configured_worker_count": len(source_rows),
+            "discovered_model_count": discovered_count,
+            "inventory_only_model_count": inventory_only_count,
+            "editor_catalog_live": bool(editor.get("launchable")),
+            "editor_catalog_reason": str(editor.get("blocker_reason") or "")[:200],
             "row_limit": MAX_MODEL_POLICY_CATALOG_ROWS,
-            "truncated": len(source_rows) > MAX_MODEL_POLICY_CATALOG_ROWS,
+            "truncated": total_rows > MAX_MODEL_POLICY_CATALOG_ROWS,
         },
     }
 
@@ -270,6 +347,7 @@ def settings_view() -> dict[str, Any]:
         feature_settings.FeatureSettingsError,
         model_settings.ModelSettingsError,
         repo_policy.RepoPolicyError,
+        vscode_lm_bridge.BridgeError,
         workforce_catalog.WorkforceCatalogError,
         OSError,
         sqlite3.Error,

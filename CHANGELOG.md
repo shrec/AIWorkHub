@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.25] - 2026-08-21
+
+### Added
+
+- Repository Settings now projects the live VS Code/Copilot model catalog as
+  individual model switches instead of showing only statically configured
+  workforce rows.
+
+### Fixed
+
+- Copilot is a distinct repository policy owner from native model vendors.
+  Disabling Copilot now excludes every editor-hosted route while native
+  Codex, Claude and provider routes remain independently controllable.
+- Exact Copilot model switches use one normalized `vscode_lm` policy identity,
+  so disabling one discovered model does not disable its siblings.
+
 ## [0.10.24] - 2026-08-21
 
 ### Added

@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.25 — 2026-08-21
+
+### Added
+
+- The Models tab lists every model discovered from the active VS Code/Copilot
+  host and provides an exact repository-local switch for each model.
+
+### Fixed
+
+- Copilot routes are grouped and gated separately from native provider routes,
+  with one provider switch covering all editor-hosted transports.
+
 ## 0.10.24 — 2026-08-21
 
 ### Added

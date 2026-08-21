@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.25
+
+- Repository Settings discovers the live VS Code/Copilot model catalog and
+  shows one switch per model, plus a Copilot-wide provider switch.
+- Copilot policy is independent from native Codex, Claude and direct-provider
+  routes, so repository-specific model availability is represented truthfully.
+
 ## What's new in 0.10.24
 
 - Repository Settings now has a Models tab for repository-local provider and
