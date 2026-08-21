@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.40
+
+- Sparse Python validation follows bounded repository-local imports, so
+  candidate tests execute against a complete package closure without copying
+  unrelated repository files.
+
 ## What's new in 0.10.39
 
 - Grok/Kilo read-only results now finalize correctly from the exact structured

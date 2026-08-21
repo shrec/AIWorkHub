@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.40 — 2026-08-21
+
+### Fixed
+
+- Sparse Python candidate validation now seeds the exact transitive local
+  import closure instead of failing when a required package module is absent.
+
 ## 0.10.39 — 2026-08-21
 
 ### Fixed

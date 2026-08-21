@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.40] - 2026-08-21
+
+### Fixed
+
+- Sparse Python validation worktrees now include the bounded transitive closure
+  of repository-local static imports. Candidate tests no longer fail during
+  collection because package modules such as `core.py` were omitted, while
+  unrelated modules and the rest of the repository remain unmaterialized.
+
 ## [0.10.39] - 2026-08-21
 
 ### Fixed
