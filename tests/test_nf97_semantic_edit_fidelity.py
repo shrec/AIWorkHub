@@ -61,6 +61,7 @@ def test_authenticated_111_byte_executable_to_ellipsis_is_rejected(payload: str)
         "# FIXME: implement this",
         "implementation omitted",
         "code omitted for brevity",
+        "<code>",
         "<new validate_required_outputs code>",
     ],
 )

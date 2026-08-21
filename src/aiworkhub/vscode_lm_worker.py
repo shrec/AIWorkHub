@@ -79,7 +79,8 @@ def _matches(path: str, patterns: list[str]) -> bool:
 
 
 _FIDELITY_ANGLE_PLACEHOLDER = re.compile(
-    r"^\s*<\s*(?:new\s+[\w.:-]+\s+code|test\s+file\s+content|"
+    r"^\s*<\s*(?:(?:code|implementation)|new\s+[\w.:-]+\s+code|"
+    r"test\s+file\s+content|"
     r"(?:full|complete)\s+file\s+content|insert\s+[^>]+\s+here)\s*>\s*$",
     re.IGNORECASE,
 )
