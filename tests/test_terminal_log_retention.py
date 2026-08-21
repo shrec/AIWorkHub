@@ -117,6 +117,35 @@ def test_preview_is_paginated_but_digest_covers_full_candidate_set(tmp_path: Pat
     assert summary["candidate_total"] == 75
 
 
+def test_latest_rows_uses_incremental_ledger_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path)
+    ledger = repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("{}\n", encoding="utf-8")
+    request_id = "a" * 32
+    projected = {
+        request_id: {"request_id": request_id, "state": "exited"},
+        "not-a-request": {"request_id": "not-a-request", "state": "exited"},
+    }
+    monkeypatch.setattr(
+        terminal_log_retention.process_event_ledger,
+        "latest_events",
+        lambda _path: projected,
+    )
+    monkeypatch.setattr(
+        terminal_log_retention.process_event_ledger,
+        "iter_events",
+        lambda _path: (_ for _ in ()).throw(AssertionError("full replay used")),
+    )
+
+    assert terminal_log_retention._latest_rows(repo) == {
+        request_id: projected[request_id]
+    }
+
+
 def test_policy_enforcement_automatically_quarantines_expired_output(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     request_id = "1" * 32

@@ -177,11 +177,10 @@ def _latest_rows(root: Path) -> dict[str, dict[str, Any]]:
     ):
         raise TerminalLogRetentionError("terminal_log_ledger_invalid")
     latest: dict[str, dict[str, Any]] = {}
-    for row in process_event_ledger.iter_events(ledger):
-        request_id = str(row.get("request_id") or "")
+    for request_id, row in process_event_ledger.latest_events(ledger).items():
         if not _REQUEST_RE.fullmatch(request_id):
             continue
-        latest[request_id] = {**latest.get(request_id, {}), **row}
+        latest[request_id] = row
     return latest
 
 

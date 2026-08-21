@@ -11,8 +11,11 @@ import json
 import heapq
 import os
 import stat
+import threading
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -21,6 +24,21 @@ from .platform_io import atomic_replace, chmod_fd, lock_fd, unlock_fd
 
 
 ACTIVE_LEDGER_MAX_BYTES = 48 * 1024 * 1024
+_LATEST_EVENT_CACHE_MAX_ENTRIES = 32
+_FileSignature = tuple[str, int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _LatestEventProjection:
+    signatures: tuple[_FileSignature, ...]
+    complete_active_offset: int
+    latest: dict[str, dict[str, Any]]
+
+
+_LATEST_EVENT_CACHE_LOCK = threading.RLock()
+_LATEST_EVENT_CACHE: OrderedDict[
+    tuple[str, str], _LatestEventProjection
+] = OrderedDict()
 
 
 def _archive_pattern(path: Path) -> str:
@@ -233,3 +251,185 @@ def iter_events(path: Path) -> Iterator[dict[str, Any]]:
                 following,
             ),
         )
+
+
+def _ledger_signatures(path: Path) -> tuple[_FileSignature, ...] | None:
+    signatures: list[_FileSignature] = []
+    ledgers = ledger_paths(path)
+    for ledger in ledgers:
+        try:
+            info = ledger.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            return None
+        signatures.append(
+            (
+                str(ledger.resolve(strict=False)),
+                int(info.st_dev),
+                int(info.st_ino),
+                int(info.st_size),
+                int(info.st_mtime_ns),
+                int(info.st_ctime_ns),
+            )
+        )
+    return tuple(signatures)
+
+
+def _active_complete_offset(path: Path, *, size: int) -> int:
+    """Return the end of the final complete JSONL row in the active file."""
+
+    if size <= 0:
+        return 0
+    try:
+        with path.open("rb") as handle:
+            position = size
+            while position > 0:
+                start = max(0, position - 64 * 1024)
+                handle.seek(start)
+                chunk = handle.read(position - start)
+                newline = chunk.rfind(b"\n")
+                if newline >= 0:
+                    return start + newline + 1
+                position = start
+    except OSError:
+        return 0
+    return 0
+
+
+def _merge_latest_row(
+    latest: dict[str, dict[str, Any]], row: dict[str, Any], key_field: str
+) -> None:
+    key = str(row.get(key_field) or "")
+    if key:
+        latest[key] = {**latest.get(key, {}), **row}
+
+
+def _parse_complete_jsonl(payload: bytes) -> Iterator[dict[str, Any]]:
+    for raw_line in payload.split(b"\n")[:-1]:
+        try:
+            row = json.loads(raw_line.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            yield row
+
+
+def _cache_projection(
+    cache_key: tuple[str, str], projection: _LatestEventProjection
+) -> None:
+    with _LATEST_EVENT_CACHE_LOCK:
+        _LATEST_EVENT_CACHE[cache_key] = projection
+        _LATEST_EVENT_CACHE.move_to_end(cache_key)
+        while len(_LATEST_EVENT_CACHE) > _LATEST_EVENT_CACHE_MAX_ENTRIES:
+            _LATEST_EVENT_CACHE.popitem(last=False)
+
+
+def _rebuild_latest_events(
+    path: Path,
+    *,
+    key_field: str,
+    cache_key: tuple[str, str],
+) -> dict[str, dict[str, Any]]:
+    before = _ledger_signatures(path)
+    latest: dict[str, dict[str, Any]] = {}
+    for row in iter_events(path):
+        _merge_latest_row(latest, row, key_field)
+    after = _ledger_signatures(path)
+
+    # Cache only a stable read. A concurrent rotation/append still returns the
+    # same bounded stream semantics as iter_events, but cannot seed stale state.
+    if before is not None and before == after:
+        active_offset = 0
+        if after and after[-1][0] == str(path.resolve(strict=False)):
+            active_offset = _active_complete_offset(path, size=after[-1][3])
+            if _ledger_signatures(path) != after:
+                return {key: dict(value) for key, value in latest.items()}
+        _cache_projection(
+            cache_key,
+            _LatestEventProjection(
+                signatures=after,
+                complete_active_offset=active_offset,
+                latest=latest,
+            ),
+        )
+    return {key: dict(value) for key, value in latest.items()}
+
+
+def latest_events(
+    path: Path,
+    *,
+    key_field: str = "request_id",
+) -> dict[str, dict[str, Any]]:
+    """Return the latest merged row per key using an append-aware projection.
+
+    The append-only common path parses only complete bytes added since the
+    preceding call. Rotations, spills, replacements, truncations, deletions or
+    any immutable-segment change invalidate the projection and replay the
+    canonical ``iter_events`` ordering. The cache is process-local, bounded and
+    never an authority: a restart merely pays one cold replay.
+    """
+
+    resolved_path = str(path.resolve(strict=False))
+    cache_key = (resolved_path, key_field)
+    current = _ledger_signatures(path)
+    with _LATEST_EVENT_CACHE_LOCK:
+        cached = _LATEST_EVENT_CACHE.get(cache_key)
+        if cached is not None:
+            _LATEST_EVENT_CACHE.move_to_end(cache_key)
+
+    if cached is not None and current is not None:
+        if current == cached.signatures:
+            return {key: dict(value) for key, value in cached.latest.items()}
+
+        # Incremental replay is safe only for growth of the same active file,
+        # with every immutable segment unchanged and no spill merge involved.
+        old = cached.signatures
+        active_is_last = bool(
+            old
+            and current
+            and old[-1][0] == resolved_path
+            and current[-1][0] == resolved_path
+        )
+        no_spills = not any(_is_spill(path, Path(item[0])) for item in current)
+        immutable_unchanged = (
+            len(old) == len(current) and old[:-1] == current[:-1]
+        )
+        same_active = active_is_last and old[-1][1:3] == current[-1][1:3]
+        active_grew = same_active and current[-1][3] > old[-1][3]
+        if no_spills and immutable_unchanged and active_grew:
+            start = cached.complete_active_offset
+            observed_size = current[-1][3]
+            try:
+                with path.open("rb") as handle:
+                    opened = os.fstat(handle.fileno())
+                    if (
+                        int(opened.st_dev),
+                        int(opened.st_ino),
+                        int(opened.st_size),
+                    ) != (current[-1][1], current[-1][2], observed_size):
+                        raise OSError("process_event_ledger_changed_during_read")
+                    handle.seek(start)
+                    payload = handle.read(observed_size - start)
+            except OSError:
+                return _rebuild_latest_events(
+                    path, key_field=key_field, cache_key=cache_key
+                )
+
+            complete_length = payload.rfind(b"\n") + 1
+            latest = {key: dict(value) for key, value in cached.latest.items()}
+            if complete_length:
+                for row in _parse_complete_jsonl(payload[:complete_length]):
+                    _merge_latest_row(latest, row, key_field)
+            if _ledger_signatures(path) == current:
+                _cache_projection(
+                    cache_key,
+                    _LatestEventProjection(
+                        signatures=current,
+                        complete_active_offset=start + complete_length,
+                        latest=latest,
+                    ),
+                )
+                return {key: dict(value) for key, value in latest.items()}
+
+    return _rebuild_latest_events(path, key_field=key_field, cache_key=cache_key)

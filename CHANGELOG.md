@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.13] - 2026-08-21
+
+### Performance
+
+- Terminal-log retention now keeps a bounded append-aware latest-event
+  projection instead of reparsing the complete process-event ledger on every
+  Storage refresh. On the canonical 33,000-row ledger, warm projection time
+  fell from 1.12 seconds to about 0.01 seconds and the complete retention
+  preview fell to roughly 0.27-0.35 seconds.
+- Ordinary appends parse only newly completed JSONL rows. Rotation, spill,
+  replacement, truncation, deletion and immutable-segment changes invalidate
+  the projection and replay canonical event ordering, so caching never changes
+  retention authority.
+
 ## [0.10.12] - 2026-08-21
 
 ### Performance

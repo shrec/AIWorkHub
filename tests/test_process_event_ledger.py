@@ -113,3 +113,95 @@ def test_non_timeout_append_lock_failure_remains_fail_closed(
     with pytest.raises(PermissionError, match="denied"):
         process_event_ledger.append_event(path, {"request_id": "request-a"})
     assert process_event_ledger.ledger_paths(path) == []
+
+
+def test_latest_events_reuses_projection_and_reads_only_complete_appends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "process_events.jsonl"
+    process_event_ledger.append_event(
+        path, {"request_id": "request-a", "state": "starting"}
+    )
+    reads = 0
+    original = process_event_ledger._iter_ledger_file
+
+    def counted(ledger: Path):
+        nonlocal reads
+        reads += 1
+        yield from original(ledger)
+
+    monkeypatch.setattr(process_event_ledger, "_iter_ledger_file", counted)
+    assert process_event_ledger.latest_events(path)["request-a"]["state"] == "starting"
+    cold_reads = reads
+    assert process_event_ledger.latest_events(path)["request-a"]["state"] == "starting"
+    assert reads == cold_reads
+
+    partial = b'{"request_id":"request-a","state":"running"}'
+    with path.open("ab") as handle:
+        handle.write(partial)
+    assert process_event_ledger.latest_events(path)["request-a"]["state"] == "starting"
+    with path.open("ab") as handle:
+        handle.write(b"\n")
+    assert process_event_ledger.latest_events(path)["request-a"]["state"] == "running"
+    assert reads == cold_reads
+
+
+def test_latest_events_invalidates_deleted_segment_and_truncated_active(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "process_events.jsonl"
+    archive = tmp_path / "process_events.20260821T000000.000000Z.1.a.jsonl"
+    archive.write_text(
+        '{"request_id":"request-archive","state":"finished"}\n',
+        encoding="utf-8",
+    )
+    path.write_text(
+        '{"request_id":"request-a","state":"starting"}\n'
+        '{"request_id":"request-b","state":"starting"}\n',
+        encoding="utf-8",
+    )
+    assert set(process_event_ledger.latest_events(path)) == {
+        "request-archive",
+        "request-a",
+        "request-b",
+    }
+
+    archive.unlink()
+    path.write_text(
+        '{"request_id":"request-b","state":"finished"}\n', encoding="utf-8"
+    )
+    assert process_event_ledger.latest_events(path) == {
+        "request-b": {"request_id": "request-b", "state": "finished"}
+    }
+
+
+def test_latest_events_preserves_spill_timestamp_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "process_events.jsonl"
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "request-a",
+            "state": "starting",
+            "timestamp": "2026-08-21T00:00:00+00:00",
+        },
+    )
+
+    @contextmanager
+    def timed_out_lock(_path: Path):
+        raise TimeoutError("locked")
+        yield
+
+    monkeypatch.setattr(process_event_ledger, "_append_lock", timed_out_lock)
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "request-a",
+            "state": "finished",
+            "timestamp": "2026-08-21T00:00:01+00:00",
+        },
+    )
+    assert process_event_ledger.latest_events(path)["request-a"]["state"] == "finished"

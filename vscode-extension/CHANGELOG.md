@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.13 — 2026-08-21
+
+### Performance
+
+- Storage retention reuses a bounded append-aware process-event projection
+  rather than decoding the entire multi-gigabyte historical ledger on each
+  refresh. Warm ledger reads now complete in about 10 ms on the canonical
+  repository and complete retention previews in roughly 0.27-0.35 seconds.
+- All non-append lifecycle changes invalidate the projection and replay the
+  canonical ledger, preserving spill ordering and fail-closed evidence.
+
 ## 0.10.12 — 2026-08-21
 
 ### Performance

@@ -12,6 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.13
+
+- Storage refreshes reuse a bounded append-aware process-event projection;
+  warm reads of the canonical 33,000-row ledger fell from 1.12 seconds to
+  about 10 ms and complete retention preview to roughly 0.27-0.35 seconds.
+- Rotation, spill, replacement, truncation and deletion invalidate the cache
+  and replay canonical event order, so the speedup does not weaken evidence.
+
 ## What's new in 0.10.12
 
 - Source Graph imported-call resolution tokenizes each source line once,
