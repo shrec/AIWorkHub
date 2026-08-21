@@ -84,3 +84,47 @@ def test_passing_check_may_keep_the_head_but_must_mark_the_cut():
     assert len(summary) <= CAP
     # Any truncated field states it was cut, even when the head is what's kept.
     assert qe.SUMMARY_TRUNCATION_MARKER in summary
+
+
+def test_long_provenance_is_marked_and_identical_in_both_serializers():
+    provenance = "source:" + ("bounded-evidence/" * 300)
+    check = qe.EvidenceCheck(
+        check_id="c",
+        kind="test",
+        status=qe.STATUS_PASSED,
+        provenance=provenance,
+    )
+
+    dataclass_value = check.to_dict()["provenance"]
+    mapping_value = qe._check_payload(
+        {
+            "check_id": "c",
+            "kind": "test",
+            "status": qe.STATUS_PASSED,
+            "provenance": provenance,
+        }
+    )["provenance"]
+
+    assert dataclass_value == mapping_value
+    assert len(dataclass_value) <= CAP
+    assert qe.SUMMARY_TRUNCATION_MARKER in dataclass_value
+
+
+def test_short_provenance_is_byte_for_byte_unchanged():
+    provenance = "source:exact-receipt:abc123"
+    check = qe.EvidenceCheck(
+        check_id="c",
+        kind="test",
+        status=qe.STATUS_PASSED,
+        provenance=provenance,
+    )
+
+    assert check.to_dict()["provenance"] == provenance
+    assert qe._check_payload(
+        {
+            "check_id": "c",
+            "kind": "test",
+            "status": qe.STATUS_PASSED,
+            "provenance": provenance,
+        }
+    )["provenance"] == provenance

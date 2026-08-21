@@ -722,7 +722,7 @@ class EvidenceCheck:
             "duration_seconds": round(self.duration_seconds, 6),
             "affected_paths": list(self.affected_paths[:MAX_AFFECTED_PATHS]),
             "summary": _bounded_summary(self.summary, status=self.status),
-            "provenance": self.provenance,
+            "provenance": _bounded_summary(self.provenance),
             "error": self.error,
         }
 
@@ -782,7 +782,7 @@ def _check_payload(check: EvidenceCheck | Mapping[str, Any]) -> dict[str, Any]:
         "kind": kind,
         "status": status,
         "summary": _bounded_summary(str(check.get("summary") or ""), status=str(status)),
-        "provenance": str(check.get("provenance") or "")[:MAX_SUMMARY_CHARS],
+        "provenance": _bounded_summary(str(check.get("provenance") or "")),
     }
 
 
