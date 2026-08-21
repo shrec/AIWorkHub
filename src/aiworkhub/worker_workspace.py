@@ -250,7 +250,7 @@ MIN_FINALIZATION_GIT_TIMEOUT_SECONDS = 0.25
 MAX_FINALIZATION_GIT_TIMEOUT_SECONDS = 120.0
 _FINALIZATION_PROBE_CACHE_SECONDS = 300.0
 _FINALIZATION_PROBE_LOCK = threading.Lock()
-_FINALIZATION_PROBE_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_FINALIZATION_PROBE_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 
 # Landlock uses the generic syscall numbers on the Linux architectures Python
 # supports in this deployment. Unsupported kernels return ENOSYS and launch is
@@ -533,6 +533,18 @@ def _terminate_git_process_tree(process: subprocess.Popen[str]) -> bool:
     return process.poll() is not None
 
 
+def _git_environment() -> dict[str, str]:
+    """Return a noninteractive Git environment without ambient redirection."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
 def _run(
     argv: list[str],
     *,
@@ -546,8 +558,9 @@ def _run(
         "text": True,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
+        "stdin": subprocess.DEVNULL,
         "shell": False,
-        "env": {**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        "env": _git_environment(),
     }
     if input_text is not None:
         popen_kwargs["stdin"] = subprocess.PIPE
@@ -733,6 +746,55 @@ def _isolated_worktree_base_oid(repo: Path, path: Path) -> str:
         raise WorkspaceError("worktree_is_not_detached_and_isolated")
     if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) is None:
         raise WorkspaceError("worktree_base_oid_unavailable")
+    return head
+
+
+def _read_packed_ref_oid(git_dir: Path, ref: str) -> str:
+    """Resolve one branch ref from the bounded ``packed-refs`` table."""
+    path = git_dir / "packed-refs"
+    if path.is_symlink() or not path.is_file():
+        raise WorkspaceError("repository_head_oid_unavailable")
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise WorkspaceError("repository_head_oid_unavailable") from exc
+    if not payload or len(payload) > 1_048_576 or b"\x00" in payload:
+        raise WorkspaceError("repository_head_oid_unavailable")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WorkspaceError("repository_head_oid_unavailable") from exc
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "^")):
+            continue
+        oid, separator, name = line.partition(" ")
+        if separator and name == ref and re.fullmatch(r"[0-9a-f]{40,64}", oid):
+            return oid
+    raise WorkspaceError("repository_head_oid_unavailable")
+
+
+def _repository_head_oid(repo: Path) -> str:
+    """Resolve HEAD from bounded Git metadata without spawning a subprocess."""
+    git_dir = _common_git_dir(repo)
+    head = _read_git_control_file(git_dir / "HEAD", label="repository_head")
+    if head.startswith("ref:"):
+        ref = head[4:].strip()
+        if (
+            not ref
+            or ref.startswith(("/", "\\"))
+            or "\\" in ref
+            or "\x00" in ref
+            or any(part in {"", ".", ".."} for part in ref.split("/"))
+        ):
+            raise WorkspaceError("repository_head_oid_unavailable")
+        ref_path = git_dir / ref
+        if ref_path.is_symlink() or not ref_path.is_file():
+            head = _read_packed_ref_oid(git_dir, ref)
+        else:
+            head = _read_git_control_file(ref_path, label="repository_head_ref")
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) is None:
+        raise WorkspaceError("repository_head_oid_unavailable")
     return head
 
 
@@ -2506,7 +2568,12 @@ def finalization_preflight_probe(
 ) -> dict[str, Any]:
     """Exercise the real isolated zero-diff path with a short-lived cache."""
     repo = repo.resolve()
-    key = (str(repo), str(adapter_id))
+    try:
+        head_oid = _repository_head_oid(repo)
+    except WorkspaceError:
+        # Never turn unresolved Git authority into a reusable Ready receipt.
+        head_oid = "unresolved"
+    key = (str(repo), str(adapter_id), head_oid)
     now = time.monotonic()
     with _FINALIZATION_PROBE_LOCK:
         cached = _FINALIZATION_PROBE_CACHE.get(key)
@@ -2587,8 +2654,9 @@ def finalization_preflight_probe(
         "cleanup_ms": round(cleanup_ms, 3),
         "cache_hit": False,
     }
-    with _FINALIZATION_PROBE_LOCK:
-        _FINALIZATION_PROBE_CACHE[key] = (time.monotonic(), dict(result))
+    if result.get("ok") is True and head_oid != "unresolved":
+        with _FINALIZATION_PROBE_LOCK:
+            _FINALIZATION_PROBE_CACHE[key] = (time.monotonic(), dict(result))
     return result
 
 

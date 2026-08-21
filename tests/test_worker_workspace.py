@@ -382,6 +382,97 @@ def test_npm_prefix_validation_fails_closed_for_unbound_dependency_tree(
         )
 
 
+def test_git_subprocess_environment_is_noninteractive_and_closed_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("GIT_ASKPASS", "interactive-helper")
+    monkeypatch.setenv("git_dir", str(tmp_path / "redirected"))
+    monkeypatch.setenv("GIT_OPTIONAL_LOCKS", "1")
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+    script = (
+        "import os,sys;"
+        "print(os.environ.get('GIT_ASKPASS'));"
+        "print(os.environ.get('git_dir'));"
+        "print(os.environ.get('GIT_OPTIONAL_LOCKS'));"
+        "print(os.environ.get('GIT_TERMINAL_PROMPT'));"
+        "print(len(sys.stdin.read()))"
+    )
+    result = worker_workspace._run(
+        [sys.executable, "-c", script], cwd=tmp_path, phase="workspace_git"
+    )
+    assert result.stdout.splitlines() == ["None", "None", "0", "0", "0"]
+
+
+def test_repository_head_oid_is_process_free_and_tracks_head(repo: Path) -> None:
+    first = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert worker_workspace._repository_head_oid(repo) == first
+    assert _git(repo, "pack-refs", "--all").returncode == 0
+    assert worker_workspace._repository_head_oid(repo) == first
+    assert _git(repo, "commit", "--allow-empty", "-qm", "next head").returncode == 0
+    second = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert second != first
+    assert worker_workspace._repository_head_oid(repo) == second
+
+
+def test_preflight_cache_is_head_bound_and_failures_are_not_cached(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    calls: list[str] = []
+
+    def fake_workspace(repo_path, request_id, _card, _adapter_id):
+        calls.append(request_id)
+        root = tmp_path / request_id
+        path = root / "worktree"
+        home = root / "home"
+        path.mkdir(parents=True)
+        home.mkdir()
+        return worker_workspace.WorkerWorkspace(
+            request_id=request_id,
+            repo=Path(repo_path),
+            path=path,
+            home=home,
+            allowed_writes=(),
+            parent_baseline={},
+            workspace_baseline={},
+            tree_baseline={},
+            base_oid="a" * 40,
+        )
+
+    monkeypatch.setattr(worker_workspace, "create_workspace", fake_workspace)
+    monkeypatch.setattr(
+        worker_workspace, "enforce_scope", lambda _workspace, **_kwargs: []
+    )
+    monkeypatch.setattr(
+        worker_workspace, "cleanup_workspace", lambda *_args, **_kwargs: None
+    )
+    worker_workspace._FINALIZATION_PROBE_CACHE.clear()
+    first = worker_workspace.finalization_preflight_probe(repo, "validation")
+    second = worker_workspace.finalization_preflight_probe(repo, "validation")
+    assert first["ok"] is True and first["cache_hit"] is False
+    assert second["ok"] is True and second["cache_hit"] is True
+    assert len(calls) == 1
+
+    assert _git(repo, "commit", "--allow-empty", "-qm", "invalidate probe").returncode == 0
+    third = worker_workspace.finalization_preflight_probe(repo, "validation")
+    assert third["ok"] is True and third["cache_hit"] is False
+    assert len(calls) == 2
+
+    def fail_workspace(*_args, **_kwargs):
+        calls.append("failure")
+        raise worker_workspace.WorkspaceError("synthetic_provision_failure")
+
+    monkeypatch.setattr(worker_workspace, "create_workspace", fail_workspace)
+    worker_workspace._FINALIZATION_PROBE_CACHE.clear()
+    failed_one = worker_workspace.finalization_preflight_probe(repo, "validation")
+    failed_two = worker_workspace.finalization_preflight_probe(repo, "validation")
+    assert failed_one["ok"] is False and failed_one["cache_hit"] is False
+    assert failed_two["ok"] is False and failed_two["cache_hit"] is False
+    assert calls[-2:] == ["failure", "failure"]
+
+
 def test_default_workspace_root_is_repo_local_runtime_boundary(
     monkeypatch: pytest.MonkeyPatch,
     repo: Path,
