@@ -108,6 +108,27 @@ def test_cleanup_fails_closed_on_mismatched_reciprocal_registration(
     assert root.exists()
 
 
+def test_cleanup_unregistered_request_workspace_needs_no_git_repository(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "synthetic-repo"
+    repo.mkdir()
+    root = tmp_path / "worktrees" / "req-unregistered"
+    path = root / "worktree"
+    home = root / "home"
+    path.mkdir(parents=True)
+    home.mkdir()
+
+    def subprocess_forbidden(*_args, **_kwargs):
+        raise AssertionError("unregistered cleanup must not spawn Git")
+
+    monkeypatch.setattr(worker_workspace, "_run", subprocess_forbidden)
+    worker_workspace.cleanup_workspace(repo, path, home)
+
+    assert not root.exists()
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "parent"

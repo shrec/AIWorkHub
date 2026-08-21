@@ -2509,6 +2509,12 @@ def create_workspace(
 
 def _registered_worktree_admin_dir(repo: Path, path: Path) -> Path | None:
     """Return the exact reciprocal Git worktree registration, if present."""
+    repo_marker = repo / ".git"
+    if not repo_marker.exists() and not repo_marker.is_symlink():
+        # Validation fixtures and already-detached retained workspaces may be
+        # exact request-owned directories without any Git registration. There
+        # is no administrative state to touch; directory cleanup remains safe.
+        return None
     common = _common_git_dir(repo)
     admin_root = common / "worktrees"
     if admin_root.is_symlink():
