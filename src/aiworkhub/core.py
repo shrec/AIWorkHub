@@ -2541,17 +2541,6 @@ def _repository_switch_locked(repo_id: str) -> dict[str, Any]:
     if len(matches) != 1:
         return {"ok": False, "error": "repository_route_not_live" if not matches else "repository_route_ambiguous"}
     record = matches[0]
-    targets = record.get("targets")
-    target = targets.get(provider) if isinstance(targets, dict) else None
-    route = target.get("route") if isinstance(target, dict) else None
-    if not isinstance(route, dict):
-        return {"ok": False, "error": "target_manager_route_missing"}
-    if (
-        str(record.get("window_id") or "") != window_id
-        or str(route.get("thread_id") or "") != thread_id
-        or str(route.get("repo_id") or requested) != requested
-    ):
-        return {"ok": False, "error": "target_route_not_owned_by_current_manager"}
     try:
         target_root = Path(str(record.get("repo_root") or "")).resolve()
         readiness = task_store.storage_readiness(target_root)
@@ -2562,6 +2551,29 @@ def _repository_switch_locked(repo_id: str) -> dict[str, Any]:
     current_root = repo_root()
     if current_root == target_root:
         return {**repository_current(), "switched": False}
+    try:
+        current_readiness = task_store.storage_readiness(current_root)
+    except (OSError, RuntimeError, task_store.TaskStoreError):
+        return {"ok": False, "error": "current_repository_unavailable"}
+    current_repo_id = str(current_readiness.repo_id or "")
+    if not current_readiness.ready or not _REPO_ID_RE.fullmatch(current_repo_id):
+        return {"ok": False, "error": "current_repository_identity_mismatch"}
+    route_transfer = shared_router.transfer_manager_route(
+        provider=provider,
+        thread_id=thread_id,
+        window_id=window_id,
+        source_repo_id=current_repo_id,
+        target_repo_id=requested,
+        repositories=[
+            row for row in registry.get("repositories", []) if isinstance(row, dict)
+        ],
+    )
+    if not route_transfer.get("ok"):
+        return {
+            "ok": False,
+            "error": str(route_transfer.get("error") or "route_transfer_failed"),
+            "route_transfer": route_transfer,
+        }
     previous_override = _PROCESS_REPO_ROOT_OVERRIDE
     bridge = _callback_bridge_module()
     daemon = _source_graph_daemon_module()
@@ -2589,6 +2601,7 @@ def _repository_switch_locked(repo_id: str) -> dict[str, Any]:
             **repository_current(),
             "switched": True,
             "previous_repo_root": str(current_root),
+            "route_transfer": route_transfer,
             "source_graph": source_graph,
             "callback": callback,
         }
@@ -2605,12 +2618,31 @@ def _repository_switch_locked(repo_id: str) -> dict[str, Any]:
             except (OSError, RuntimeError, ValueError, task_store.TaskStoreError):
                 pass
         _PROCESS_REPO_ROOT_OVERRIDE = previous_override
+        rollback = shared_router.rollback_manager_route(
+            provider=provider,
+            thread_id=thread_id,
+            window_id=window_id,
+            failed_repo_id=requested,
+            restore_repo_id=current_repo_id,
+            expected_epoch=int(route_transfer["epoch"]),
+        )
         try:
             daemon.ensure_started(current_root)
             dispatcher_ensure_started()
         except (OSError, RuntimeError, ValueError, task_store.TaskStoreError):
             pass
-        return {"ok": False, "error": f"repository_switch_failed:{type(exc).__name__}:{str(exc)[:160]}"}
+        if not rollback.get("ok"):
+            return {
+                "ok": False,
+                "error": "repository_switch_rollback_failed",
+                "switch_error": f"{type(exc).__name__}:{str(exc)[:160]}",
+                "route_rollback": rollback,
+            }
+        return {
+            "ok": False,
+            "error": f"repository_switch_failed:{type(exc).__name__}:{str(exc)[:160]}",
+            "route_rollback": rollback,
+        }
 
 
 def _task_contract_path(raw: Any) -> str:

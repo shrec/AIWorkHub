@@ -1,31 +1,329 @@
 """Shared AIWorkHub repository route registry.
 
-This module is intentionally read-only from Python MCP tools.  Durable task
-state remains repository-local under ``.aiworkhub``; the shared registry under
-``~/.aiworkhub/router/repos`` is only a bounded discovery/index surface that
-lets a manager see which VS Code windows/repositories are alive.
+Durable task state remains repository-local under ``.aiworkhub``.  The shared
+registry under ``~/.aiworkhub/router`` contains only bounded discovery leases
+and a manager-route ownership fence; it never moves task or context data.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from . import repository_state
-from .platform_io import process_is_alive
+from .platform_io import atomic_replace, chmod_path, lock_fd, process_is_alive, unlock_fd
 
 
 SCHEMA_ID = "aiworkhub.shared_repo_route.v1"
 DEFAULT_TTL_SECONDS = 15 * 60
 MAX_RECORD_BYTES = 256 * 1024
 _REPO_ID_RE = re.compile(r"^repo_[a-f0-9]{32}$")
+_THREAD_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+OWNERSHIP_SCHEMA_ID = "aiworkhub.shared_manager_route_ownership.v1"
+_OWNERSHIP_LOCK = threading.RLock()
 
 
 def registry_dir(home: Path | None = None) -> Path:
     return (home or Path.home()) / ".aiworkhub" / "router" / "repos"
+
+
+def _ownership_path(home: Path | None = None) -> Path:
+    return registry_dir(home).parent / "manager-route-ownership.json"
+
+
+def _read_ownership(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"schema_id": OWNERSHIP_SCHEMA_ID, "revision": 0, "routes": {}}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"route_ownership_read_failed:{type(exc).__name__}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_id") != OWNERSHIP_SCHEMA_ID:
+        raise RuntimeError("route_ownership_schema_mismatch")
+    if not isinstance(payload.get("routes"), dict):
+        raise RuntimeError("route_ownership_routes_invalid")
+    return payload
+
+
+def _write_ownership(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        chmod_path(temporary, 0o600)
+        atomic_replace(temporary, path)
+        chmod_path(path, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _route_key(provider: str, thread_id: str) -> str:
+    return f"{provider}:{thread_id}"
+
+
+def _apply_manager_route_ownership(
+    records: list[dict[str, Any]], *, home: Path | None = None
+) -> tuple[list[dict[str, Any]], str]:
+    """Project atomic ownership rows onto renewable extension records."""
+
+    try:
+        ownership = _read_ownership(_ownership_path(home))
+    except RuntimeError as exc:
+        return records, str(exc)
+    projected = [dict(record) for record in records]
+    for raw in ownership.get("routes", {}).values():
+        if not isinstance(raw, dict):
+            continue
+        provider = str(raw.get("provider") or "").strip().lower()
+        thread_id = str(raw.get("thread_id") or "").strip().lower()
+        target_repo_id = str(raw.get("repo_id") or "").strip()
+        window_id = str(raw.get("window_id") or "").strip()
+        epoch = raw.get("epoch")
+        if (
+            provider != "codex"
+            or not _THREAD_ID_RE.fullmatch(thread_id)
+            or not _REPO_ID_RE.fullmatch(target_repo_id)
+            or not window_id
+            or type(epoch) is not int
+            or epoch < 1
+        ):
+            continue
+        for record in projected:
+            targets = record.get("targets")
+            provider_target = targets.get(provider) if isinstance(targets, dict) else None
+            route = provider_target.get("route") if isinstance(provider_target, dict) else None
+            if not isinstance(route, dict):
+                route = {}
+            route_thread = str(route.get("thread_id") or "").strip().lower()
+            is_target = str(record.get("repo_id") or "") == target_repo_id
+            if not is_target and route_thread != thread_id:
+                continue
+            next_route = dict(route)
+            if is_target:
+                next_route.update(
+                    {
+                        "thread_id": thread_id,
+                        "session_id": thread_id,
+                        "repo_id": target_repo_id,
+                        "owner_window_id": window_id,
+                        "ownership_epoch": epoch,
+                    }
+                )
+            else:
+                next_route.update(
+                    {
+                        "thread_id": "",
+                        "session_id": "",
+                        "ownership_epoch": epoch,
+                        "fenced_by_repo_id": target_repo_id,
+                    }
+                )
+            next_target = {
+                **(provider_target if isinstance(provider_target, dict) else {}),
+                "route": next_route,
+            }
+            record["targets"] = {
+                **(targets if isinstance(targets, dict) else {}),
+                provider: next_target,
+            }
+            record["manager_route_ownership"] = dict(raw)
+    return projected, ""
+
+
+def _acquire_ownership_file_lock(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        lock_fd(fd, blocking=False)
+    except OSError as exc:
+        os.close(fd)
+        raise RuntimeError("route_ownership_conflict") from exc
+    return fd
+
+
+def transfer_manager_route(
+    *,
+    provider: str,
+    thread_id: str,
+    window_id: str,
+    source_repo_id: str,
+    target_repo_id: str,
+    repositories: list[dict[str, Any]],
+    home: Path | None = None,
+) -> dict[str, Any]:
+    """CAS one verified manager route from a live source to a live target.
+
+    The shared ownership ledger is intentionally separate from repository-local
+    task stores and extension lease records.  One atomic row is therefore the
+    fence: readers never need a two-file source/target update to agree on who
+    owns the chat.  The extension may continue renewing either repository
+    record without overwriting this manager-owned transfer epoch.
+    """
+
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_thread = str(thread_id or "").strip().lower()
+    normalized_window = str(window_id or "").strip()
+    source = str(source_repo_id or "").strip()
+    target = str(target_repo_id or "").strip()
+    if normalized_provider != "codex":
+        return {"ok": False, "error": "route_transfer_provider_invalid"}
+    if not _THREAD_ID_RE.fullmatch(normalized_thread) or not normalized_window:
+        return {"ok": False, "error": "route_transfer_identity_invalid"}
+    if not _REPO_ID_RE.fullmatch(source) or not _REPO_ID_RE.fullmatch(target) or source == target:
+        return {"ok": False, "error": "route_transfer_repository_invalid"}
+
+    live = {
+        str(record.get("repo_id") or ""): record
+        for record in repositories
+        if isinstance(record, dict)
+        and bool(record.get("extension_host_alive"))
+        and not bool(record.get("stale"))
+    }
+    if target not in live:
+        return {"ok": False, "error": "route_transfer_target_not_live"}
+    target_record = live[target]
+    target_targets = target_record.get("targets")
+    target_provider = target_targets.get(normalized_provider) if isinstance(target_targets, dict) else None
+    target_route = target_provider.get("route") if isinstance(target_provider, dict) else None
+    target_thread = (
+        str(target_route.get("thread_id") or "").strip().lower()
+        if isinstance(target_route, dict)
+        else ""
+    )
+    if _THREAD_ID_RE.fullmatch(target_thread) and target_thread != normalized_thread:
+        return {"ok": False, "error": "route_transfer_target_owned_by_foreign_manager"}
+
+    ownership_path = _ownership_path(home)
+    lock_path = ownership_path.with_suffix(".lock")
+    with _OWNERSHIP_LOCK:
+        try:
+            fd = _acquire_ownership_file_lock(lock_path)
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
+        try:
+            payload = _read_ownership(ownership_path)
+            routes = dict(payload["routes"])
+            key = _route_key(normalized_provider, normalized_thread)
+            current = routes.get(key)
+            if isinstance(current, dict):
+                if (
+                    str(current.get("repo_id") or "") != source
+                    or str(current.get("window_id") or "") != normalized_window
+                ):
+                    return {
+                        "ok": False,
+                        "error": "route_ownership_epoch_conflict",
+                        "current_repo_id": str(current.get("repo_id") or ""),
+                        "current_epoch": int(current.get("epoch") or 0),
+                    }
+                epoch = int(current.get("epoch") or 0) + 1
+            else:
+                source_record = live.get(source)
+                source_targets = source_record.get("targets") if isinstance(source_record, dict) else None
+                source_target = source_targets.get(normalized_provider) if isinstance(source_targets, dict) else None
+                source_route = source_target.get("route") if isinstance(source_target, dict) else None
+                if (
+                    not isinstance(source_record, dict)
+                    or str(source_record.get("window_id") or "") != normalized_window
+                    or not isinstance(source_route, dict)
+                    or str(source_route.get("thread_id") or "").strip().lower() != normalized_thread
+                ):
+                    return {"ok": False, "error": "route_transfer_source_not_owned"}
+                epoch = 1
+            route = {
+                "provider": normalized_provider,
+                "thread_id": normalized_thread,
+                "window_id": normalized_window,
+                "repo_id": target,
+                "previous_repo_id": source,
+                "epoch": epoch,
+                "updated_at_epoch": time.time(),
+            }
+            routes[key] = route
+            next_payload = {
+                "schema_id": OWNERSHIP_SCHEMA_ID,
+                "revision": int(payload.get("revision") or 0) + 1,
+                "routes": routes,
+            }
+            _write_ownership(ownership_path, next_payload)
+            return {
+                "ok": True,
+                "schema_id": "aiworkhub.manager_route_transfer.v1",
+                **route,
+                "ledger_revision": next_payload["revision"],
+            }
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)[:200]}
+        finally:
+            unlock_fd(fd)
+            os.close(fd)
+
+
+def rollback_manager_route(
+    *,
+    provider: str,
+    thread_id: str,
+    window_id: str,
+    failed_repo_id: str,
+    restore_repo_id: str,
+    expected_epoch: int,
+    home: Path | None = None,
+) -> dict[str, Any]:
+    """Restore a failed transfer only when its exact epoch still owns it."""
+
+    ownership_path = _ownership_path(home)
+    lock_path = ownership_path.with_suffix(".lock")
+    key = _route_key(str(provider).strip().lower(), str(thread_id).strip().lower())
+    with _OWNERSHIP_LOCK:
+        try:
+            fd = _acquire_ownership_file_lock(lock_path)
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
+        try:
+            payload = _read_ownership(ownership_path)
+            routes = dict(payload["routes"])
+            current = routes.get(key)
+            if not isinstance(current, dict) or (
+                str(current.get("repo_id") or "") != str(failed_repo_id)
+                or str(current.get("window_id") or "") != str(window_id)
+                or type(current.get("epoch")) is not int
+                or current["epoch"] != expected_epoch
+            ):
+                return {"ok": False, "error": "route_rollback_epoch_conflict"}
+            route = {
+                **current,
+                "repo_id": str(restore_repo_id),
+                "previous_repo_id": str(failed_repo_id),
+                "epoch": expected_epoch + 1,
+                "updated_at_epoch": time.time(),
+            }
+            routes[key] = route
+            next_payload = {
+                "schema_id": OWNERSHIP_SCHEMA_ID,
+                "revision": int(payload.get("revision") or 0) + 1,
+                "routes": routes,
+            }
+            _write_ownership(ownership_path, next_payload)
+            return {"ok": True, "schema_id": "aiworkhub.manager_route_rollback.v1", **route}
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)[:200]}
+        finally:
+            unlock_fd(fd)
+            os.close(fd)
 
 
 def _read_manifest_repo_id(root: Path) -> str:
@@ -155,6 +453,7 @@ def list_known_repositories(
                 inactive.append(record)
         else:
             rejects.append(record)
+    records, ownership_error = _apply_manager_route_ownership(records)
     return {
         "ok": True,
         "schema_id": SCHEMA_ID,
@@ -162,6 +461,7 @@ def list_known_repositories(
         "repositories": records,
         "inactive": inactive[:16],
         "rejects": rejects[:16],
+        "ownership_error": ownership_error,
     }
 
 

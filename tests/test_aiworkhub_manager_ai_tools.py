@@ -254,6 +254,7 @@ def test_repository_switch_is_repo_id_only_and_preserves_current_manager(tmp_pat
     target.mkdir()
     assert task_store.initialize_repository(old)["ok"]
     assert task_store.initialize_repository(target)["ok"]
+    old_id = task_store.storage_readiness(old).repo_id
     target_id = task_store.storage_readiness(target).repo_id
     thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
     identity = {
@@ -267,15 +268,25 @@ def test_repository_switch_is_repo_id_only_and_preserves_current_manager(tmp_pat
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
     monkeypatch.setattr(core, "_codex_manager_identity", lambda: identity)
     monkeypatch.setattr(
+        shared_router, "registry_dir", lambda home=None: tmp_path / "router" / "repos"
+    )
+    monkeypatch.setattr(
         shared_router,
         "list_known_repositories",
         lambda **kwargs: {
             "ok": True,
-            "repositories": [{
-                "repo_id": target_id, "repo_root": str(target), "repo_name": "target",
-                "window_id": "window_switch", "extension_host_alive": True, "stale": False,
-                "targets": {"codex": {"route": {"repo_id": target_id, "thread_id": thread_id}}},
-            }],
+            "repositories": [
+                {
+                    "repo_id": old_id, "repo_root": str(old), "repo_name": "old",
+                    "window_id": "window_switch", "extension_host_alive": True, "stale": False,
+                    "targets": {"codex": {"route": {"repo_id": old_id, "thread_id": thread_id}}},
+                },
+                {
+                    "repo_id": target_id, "repo_root": str(target), "repo_name": "target",
+                    "window_id": "window_target", "extension_host_alive": True, "stale": False,
+                    "targets": {"codex": {"route": {"repo_id": target_id, "thread_id": ""}}},
+                },
+            ],
         },
     )
     lifecycle = {"stopped_dispatcher": [], "stopped_daemon": [], "started_daemon": []}
@@ -298,6 +309,7 @@ def test_repository_switch_is_repo_id_only_and_preserves_current_manager(tmp_pat
 
     assert result["ok"] is True
     assert result["switched"] is True
+    assert result["route_transfer"]["epoch"] == 1
     assert result["binding_source"] == "manager_switch"
     assert core.repo_root() == target.resolve()
     assert lifecycle["stopped_dispatcher"] == [old.resolve()]
@@ -325,6 +337,9 @@ def test_repository_switch_roundtrip_is_serialized_and_repo_local(tmp_path, monk
     monkeypatch.setattr(core, "_implicit_codex_repository_root", lambda: None)
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
     monkeypatch.setattr(core, "_codex_manager_identity", lambda: identity)
+    monkeypatch.setattr(
+        shared_router, "registry_dir", lambda home=None: tmp_path / "router" / "repos"
+    )
 
     def record(root: Path, repo_id: str) -> dict:
         return {
@@ -377,6 +392,7 @@ def test_repository_switch_failed_target_stops_target_and_restores_old_services(
     target.mkdir()
     assert task_store.initialize_repository(old)["ok"]
     assert task_store.initialize_repository(target)["ok"]
+    old_id = task_store.storage_readiness(old).repo_id
     target_id = task_store.storage_readiness(target).repo_id
     thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
     identity = {
@@ -389,16 +405,29 @@ def test_repository_switch_failed_target_stops_target_and_restores_old_services(
     monkeypatch.setattr(core, "_implicit_codex_repository_root", lambda: None)
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
     monkeypatch.setattr(core, "_codex_manager_identity", lambda: identity)
+    monkeypatch.setattr(
+        shared_router, "registry_dir", lambda home=None: tmp_path / "router" / "repos"
+    )
     monkeypatch.setattr(shared_router, "list_known_repositories", lambda **kwargs: {
         "ok": True,
-        "repositories": [{
-            "repo_id": target_id,
-            "repo_root": str(target),
-            "window_id": "window_rollback",
-            "extension_host_alive": True,
-            "stale": False,
-            "targets": {"codex": {"route": {"repo_id": target_id, "thread_id": thread_id}}},
-        }],
+        "repositories": [
+            {
+                "repo_id": old_id,
+                "repo_root": str(old),
+                "window_id": "window_rollback",
+                "extension_host_alive": True,
+                "stale": False,
+                "targets": {"codex": {"route": {"repo_id": old_id, "thread_id": thread_id}}},
+            },
+            {
+                "repo_id": target_id,
+                "repo_root": str(target),
+                "window_id": "window_target",
+                "extension_host_alive": True,
+                "stale": False,
+                "targets": {"codex": {"route": {"repo_id": target_id, "thread_id": ""}}},
+            },
+        ],
     })
     lifecycle = {"dispatcher_stop": [], "daemon_stop": [], "daemon_start": []}
     monkeypatch.setattr(
@@ -427,6 +456,8 @@ def test_repository_switch_failed_target_stops_target_and_restores_old_services(
 
     assert result["ok"] is False
     assert "target_index_failed" in result["error"]
+    assert result["route_rollback"]["repo_id"] == old_id
+    assert result["route_rollback"]["epoch"] == 2
     assert core.repo_root() == old.resolve()
     assert lifecycle["dispatcher_stop"] == [old.resolve(), target.resolve()]
     assert lifecycle["daemon_stop"] == [old.resolve(), target.resolve()]
@@ -451,6 +482,9 @@ def test_repository_switch_rejects_foreign_thread_without_mutating_binding(tmp_p
         "provider": "codex", "session_id": thread_id, "thread_id": thread_id,
         "window_id": "window_owner",
     })
+    monkeypatch.setattr(
+        shared_router, "registry_dir", lambda home=None: tmp_path / "router" / "repos"
+    )
     monkeypatch.setattr(shared_router, "list_known_repositories", lambda **kwargs: {
         "ok": True, "repositories": [{
             "repo_id": target_id, "repo_root": str(target), "window_id": "window_foreign",
@@ -461,7 +495,8 @@ def test_repository_switch_rejects_foreign_thread_without_mutating_binding(tmp_p
 
     result = core.repository_switch(target_id)
 
-    assert result == {"ok": False, "error": "target_route_not_owned_by_current_manager"}
+    assert result["ok"] is False
+    assert result["error"] == "route_transfer_source_not_owned"
     assert core.repo_root() == old.resolve()
 
 
