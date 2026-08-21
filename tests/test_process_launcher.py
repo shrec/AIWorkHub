@@ -78,6 +78,11 @@ def _open_gates(monkeypatch):
     # adapter command. Keep them independent of whether the CI host has a
     # first-party Claude subscription; auth failure/ready behavior has its own
     # focused tests in test_claude_vscode_lm_preference.py.
+    monkeypatch.setattr(
+        process_launcher.claude_auth,
+        "auth_status",
+        lambda: {"launchable": True, "blocker_reason": ""},
+    )
 
 
 def test_request_events_cache_is_request_scoped_and_invalidates_on_append(
@@ -118,11 +123,6 @@ def test_request_events_cache_is_request_scoped_and_invalidates_on_append(
     manager._append_event({"request_id": first_id, "state": "review_ready"})
     assert manager._request_events(first_id)[-1]["state"] == "review_ready"
     assert scans == 3
-    monkeypatch.setattr(
-        process_launcher.claude_auth,
-        "auth_status",
-        lambda: {"launchable": True, "blocker_reason": ""},
-    )
 
 
 def _wait_terminal(manager, request_id, timeout=5.0):
