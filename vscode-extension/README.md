@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.26
+
+- Settings remains responsive with one scroll surface, fixed chrome and stable
+  scroll position while provider/model policy is updated.
+- Plan DAG separates current work from retained history, adds filtering and
+  opens the full Task Detail from compact dependency cards.
+
 ## What's new in 0.10.25
 
 - Repository Settings discovers the live VS Code/Copilot model catalog and

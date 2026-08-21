@@ -53,5 +53,7 @@ assert.ok(app.includes('"telemetry", "Telemetry"'));
 assert.ok(css.includes(".diagnostic-icon-button svg"));
 assert.ok(css.includes(".settings-row"));
 assert.ok(css.includes(".settings-tabs"));
+assert.ok(css.includes(".diagnostic-dialog.settings-dialog"));
+assert.ok(css.includes("scrollbar-gutter: stable"));
 assert.ok(css.includes(".settings-metric-grid"));
 assert.ok(css.includes(".settings-model-provider"));

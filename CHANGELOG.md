@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.26] - 2026-08-21
+
+### Fixed
+
+- Repository Settings now has one bounded scrolling body with a fixed dialog
+  header/footer, sticky tabs, responsive model rows and stable scroll position
+  after a model switch updates the policy revision.
+- Plan DAG defaults to current actionable work instead of rendering all task
+  history at once. A searchable All history view preserves audit access, while
+  compact cards open the canonical full Task Detail on selection.
+
 ## [0.10.25] - 2026-08-21
 
 ### Added

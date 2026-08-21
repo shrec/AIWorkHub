@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.26 — 2026-08-21
+
+### Fixed
+
+- Repository Settings uses one responsive scroll surface; its heading,
+  footnote and sticky tabs remain stable while model switches rerender.
+- Plan DAG defaults to current work, adds history/search controls, uses compact
+  cards and opens full canonical Task Detail when a card is selected.
+
 ## 0.10.25 — 2026-08-21
 
 ### Added

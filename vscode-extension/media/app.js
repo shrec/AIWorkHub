@@ -53,6 +53,8 @@ const state = {
   roadmapDetail: null,
   featureSettings: null,
   settingsTab: "features",
+  planScope: persisted.planScope === "all" ? "all" : "active",
+  planSearch: "",
   returnPage: 0,
   returnSearch: "",
   returnTopic: "all",
@@ -69,6 +71,7 @@ function persistState() {
     selectedTaskId: state.selectedTaskId,
     status: state.status,
     sort: state.sort,
+    planScope: state.planScope,
   });
 }
 
@@ -1610,13 +1613,57 @@ function renderPlanDag(snapshot) {
   const lifecycle = plan.lifecycle && typeof plan.lifecycle === "object" ? plan.lifecycle : {};
   const ready = new Set(Array.isArray(plan.ready) ? plan.ready : []);
   const critical = new Set(Array.isArray(plan.critical_path) ? plan.critical_path : []);
+  const terminalStates = new Set(["finished", "archived", "superseded", "cancelled"]);
+  const taskById = new Map(state.tasks.map((task) => [String(task.task_id || ""), task]));
+  const query = state.planSearch.trim().toLowerCase();
+  const visibleTask = (taskId) => {
+    const lifecycleState = String(lifecycle[taskId] || "pending").toLowerCase();
+    if (state.planScope !== "all" && terminalStates.has(lifecycleState)) return false;
+    if (!query) return true;
+    const task = taskById.get(String(taskId)) || {};
+    return [taskId, lifecycleState, task.objective, task.topic, task.runner]
+      .map((value) => String(value || "").toLowerCase())
+      .join(" ")
+      .includes(query);
+  };
+  const visibleCount = plan.layers.reduce(
+    (count, layer) => count + (Array.isArray(layer?.task_ids) ? layer.task_ids.filter(visibleTask).length : 0),
+    0,
+  );
+  const toolbar = createElement("div", "plan-toolbar");
+  const scope = createElement("div", "plan-scope", "");
+  for (const [value, label] of [["active", "Current work"], ["all", "All history"]]) {
+    const button = createElement("button", `plan-scope-button${state.planScope === value ? " is-active" : ""}`, label);
+    button.type = "button";
+    button.dataset.planScope = value;
+    button.setAttribute("aria-pressed", String(state.planScope === value));
+    scope.appendChild(button);
+  }
+  const search = document.createElement("input");
+  search.type = "search";
+  search.className = "plan-search";
+  search.placeholder = "Filter task id, objective, topic or runner";
+  search.setAttribute("aria-label", "Filter Plan DAG");
+  search.value = state.planSearch;
+  search.dataset.planSearch = "true";
+  toolbar.append(scope, search, createElement(
+    "span",
+    "plan-visible-count",
+    `Showing ${formatCount(visibleCount)} of ${formatCount(plan.task_ids.length)} tasks`,
+  ));
+  fragment.appendChild(toolbar);
   const dag = createElement("div", "plan-dag-grid");
   for (const layer of plan.layers) {
     if (!layer || !Array.isArray(layer.task_ids)) continue;
+    const visibleIds = layer.task_ids.filter(visibleTask);
+    if (!visibleIds.length) continue;
     const column = createElement("section", "plan-layer");
-    column.appendChild(createElement("h3", "plan-layer-title", `Stage ${numberValue(layer.index) + 1}`));
-    for (const taskId of layer.task_ids) {
-      const card = createElement("div", "plan-node");
+    column.appendChild(createElement("h3", "plan-layer-title", `Stage ${numberValue(layer.index) + 1} · ${formatCount(visibleIds.length)}`));
+    for (const taskId of visibleIds) {
+      const task = taskById.get(String(taskId)) || {};
+      const card = createElement("button", "plan-node");
+      card.type = "button";
+      card.dataset.taskId = String(taskId);
       if (critical.has(taskId)) card.classList.add("critical");
       if (ready.has(taskId)) card.classList.add("ready");
       if (Array.isArray(blockers[taskId]) && blockers[taskId].length) card.classList.add("blocked");
@@ -1624,15 +1671,21 @@ function renderPlanDag(snapshot) {
         createElement("strong", "plan-node-id", taskId),
         createElement("span", "plan-node-state", String(lifecycle[taskId] || "pending")),
       );
+      if (task.objective) {
+        card.appendChild(createElement("span", "plan-node-objective", String(task.objective)));
+      }
       const deps = Array.isArray(dependencies[taskId]) ? dependencies[taskId] : [];
-      if (deps.length) card.appendChild(createElement("span", "plan-node-deps", `← ${deps.join(", ")}`));
+      if (deps.length) card.appendChild(createElement("span", "plan-node-deps", `← ${formatCount(deps.length)} dependenc${deps.length === 1 ? "y" : "ies"}`));
       const blockedBy = Array.isArray(blockers[taskId]) ? blockers[taskId] : [];
-      if (blockedBy.length) card.appendChild(createElement("span", "plan-node-blockers", `blocked: ${blockedBy.join(", ")}`));
+      if (blockedBy.length) card.appendChild(createElement("span", "plan-node-blockers", `blocked by ${formatCount(blockedBy.length)}`));
+      card.title = [taskId, task.objective, deps.length ? `depends on: ${deps.join(", ")}` : "", blockedBy.length ? `blocked by: ${blockedBy.join(", ")}` : ""]
+        .filter(Boolean)
+        .join("\n");
       column.appendChild(card);
     }
     dag.appendChild(column);
   }
-  fragment.appendChild(dag);
+  fragment.appendChild(visibleCount ? dag : createElement("div", "panel-list-empty", "No tasks match this Plan DAG view"));
 
   if (Array.isArray(plan.critical_path) && plan.critical_path.length) {
     fragment.appendChild(createElement(
@@ -3996,6 +4049,7 @@ const FEATURE_LABELS = Object.freeze({
 });
 
 function renderSettings(payload) {
+  const previousScrollTop = elements.settingsList.scrollTop;
   if (!payload || payload.ok !== true || !payload.features) {
     state.featureSettings = null;
     elements.settingsSummary.textContent = (payload && payload.error) || "Settings unavailable";
@@ -4217,6 +4271,7 @@ function renderSettings(payload) {
   ));
   for (const section of Object.values(sections)) fragment.appendChild(section);
   elements.settingsList.replaceChildren(fragment);
+  elements.settingsList.scrollTop = Math.min(previousScrollTop, elements.settingsList.scrollHeight);
 }
 
 // ── Fixed-enum inbound message handling from the extension host ───────────
@@ -4423,7 +4478,34 @@ document.addEventListener("click", (event) => {
   }
   const target = event.target.closest("[data-task-id]");
   if (target && target.dataset.taskId) {
+    if (target.closest("#plan-dag") && elements.operationsDialog.open) {
+      elements.operationsDialog.close();
+    }
     requestTaskDetail(String(target.dataset.taskId));
+    if (target.closest("#plan-dag")) {
+      window.setTimeout(() => elements.detailContent.closest(".detail-panel")?.scrollIntoView({ block: "start", behavior: "smooth" }), 0);
+    }
+  }
+});
+
+elements.planDag.addEventListener("click", (event) => {
+  const scope = event.target.closest("[data-plan-scope]");
+  if (!scope) return;
+  state.planScope = scope.dataset.planScope === "all" ? "all" : "active";
+  persistState();
+  if (state.snapshot) renderPlanDag(state.snapshot);
+});
+
+elements.planDag.addEventListener("input", (event) => {
+  const search = event.target.closest("[data-plan-search]");
+  if (!search) return;
+  state.planSearch = search.value;
+  if (state.snapshot) {
+    const selectionStart = search.selectionStart;
+    renderPlanDag(state.snapshot);
+    const replacement = elements.planDag.querySelector("[data-plan-search]");
+    replacement?.focus();
+    if (replacement && selectionStart !== null) replacement.setSelectionRange(selectionStart, selectionStart);
   }
 });
 

@@ -18,10 +18,13 @@ for (const marker of [
   "critical_path",
   "cycle_nodes",
   "blocked:",
+  "Current work",
+  "All history",
+  "state.planScope",
 ]) {
   assert.ok(app.includes(marker), `missing Plan DAG renderer contract: ${marker}`);
 }
-for (const marker of [".plan-dag-grid", ".plan-node.critical", ".plan-node.blocked"]) {
+for (const marker of [".plan-dag-grid", ".plan-node.critical", ".plan-node.blocked", ".plan-toolbar", ".plan-search"]) {
   assert.ok(css.includes(marker), `missing Plan DAG style: ${marker}`);
 }
 
