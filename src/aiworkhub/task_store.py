@@ -2578,6 +2578,97 @@ def recover_blocked_rework(
         ).fetchone()
         if already is not None:
             if current_canonical == "pending":
+                if validation_only_replay:
+                    predecessor = card.get("rework_predecessor")
+                    if not isinstance(predecessor, dict):
+                        return False, "validation_only_replay_missing_evidence"
+                    predecessor_request_id = str(
+                        predecessor.get("request_id") or ""
+                    ).strip()
+                    predecessor_changed_path_hashes = predecessor.get(
+                        "changed_path_hashes"
+                    )
+                    claim_epoch = card.get("claim_epoch")
+                    if (
+                        not predecessor_request_id
+                        or not isinstance(predecessor_changed_path_hashes, dict)
+                        or not predecessor_changed_path_hashes
+                    ):
+                        return False, "validation_only_replay_missing_evidence"
+                    if type(claim_epoch) is not int or claim_epoch < 1:
+                        return False, "validation_only_replay_claim_epoch_invalid"
+
+                    # A task can complete a validation-only replay, be rejected
+                    # back to pending with a newly pinned predecessor, and then
+                    # need another provider-free validation episode.  The first
+                    # recovery event is append-only history; it must not make
+                    # the stale one-episode authorization look idempotent.  Bind
+                    # a fresh authorization to the *current* predecessor and
+                    # claim epoch instead of reusing the earlier episode.
+                    now = datetime.now(timezone.utc).isoformat()
+                    authorization = {
+                        "task_id": task_id,
+                        "actor": actor,
+                        "predecessor_request_id": predecessor_request_id,
+                        "changed_path_hashes": dict(
+                            predecessor_changed_path_hashes
+                        ),
+                        "authorized_at": now,
+                        "next_claim_epoch": claim_epoch,
+                        "one_episode_binding": True,
+                    }
+                    current_authorization = card.get(
+                        "validation_only_replay_authorization"
+                    )
+                    if isinstance(current_authorization, dict) and all(
+                        current_authorization.get(key) == authorization[key]
+                        for key in (
+                            "task_id",
+                            "predecessor_request_id",
+                            "changed_path_hashes",
+                            "next_claim_epoch",
+                            "one_episode_binding",
+                        )
+                    ):
+                        return True, "already_recovered"
+                    card["validation_only_replay_authorization"] = authorization
+                    card.pop("operational_blocker", None)
+                    cur = conn.execute(
+                        "UPDATE tasks SET updated_at=?, card_json=? "
+                        "WHERE task_id=? AND status='pending'",
+                        (
+                            now,
+                            json.dumps(
+                                card, ensure_ascii=False, sort_keys=True
+                            ),
+                            task_id,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        conn.rollback()
+                        return False, "validation_only_replay_rebind_conflict"
+                    conn.execute(
+                        "INSERT INTO task_events(task_id, event, runner, "
+                        "payload_json, created_at) VALUES "
+                        "(?, 'blocked_rework_validation_replay_reauthorized', "
+                        "?, ?, ?)",
+                        (
+                            task_id,
+                            actor[:120],
+                            json.dumps(
+                                {
+                                    **authorization,
+                                    "actor": actor[:120],
+                                    "recorded_at": now,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            now,
+                        ),
+                    )
+                    conn.commit()
+                    return True, "recovered_validation_only_replay"
                 if not clean_root_if_predecessor_missing:
                     return True, "already_recovered"
                 allowed, reason, clean_root_evidence = missing_predecessor_authority()

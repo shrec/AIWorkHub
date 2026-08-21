@@ -1409,6 +1409,80 @@ def test_recover_blocked_rework_validation_only_replay_persists_authorization(tm
     assert "authorized_at" in auth
 
 
+def test_pending_rework_rebinds_validation_only_replay_to_latest_episode(tmp_path):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    first_request = "a" * 32
+    second_request = "b" * 32
+    task_id = _make_blocked_rework_task_with_terminal_review(
+        root,
+        request_id=first_request,
+        changed_path_hashes={"a.py": "1" * 64},
+    )
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor="coordinator",
+        feedback_reason="run validation",
+        validation_only_replay=True,
+    )
+    assert (ok, state) == (True, "recovered")
+
+    # Model the completed replay being rejected back to pending: the current
+    # retained predecessor and claim epoch advance, while the old one-episode
+    # authorization remains on the decoded card until recovery refreshes it.
+    card = task_store.get_task(root, task_id)
+    assert card is not None
+    card["claim_epoch"] = 3
+    card["rework_predecessor"] = {
+        "request_id": second_request,
+        "changed_path_hashes": {"b.py": "2" * 64},
+    }
+    card["operational_blocker"] = {
+        "kind": "launch_blocked",
+        "reason": "validation_only_replay_predecessor_mismatch",
+    }
+    _readiness, db_path = task_store._require_ready(root)
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (
+                json.dumps(
+                    task_store.persistable_card_payload(card),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                task_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor="coordinator",
+        feedback_reason="replay current retained candidate",
+        validation_only_replay=True,
+    )
+
+    assert (ok, state) == (True, "recovered_validation_only_replay")
+    rebound = task_store.get_task(root, task_id)
+    assert rebound is not None
+    auth = rebound["validation_only_replay_authorization"]
+    assert auth["predecessor_request_id"] == second_request
+    assert auth["changed_path_hashes"] == {"b.py": "2" * 64}
+    assert auth["next_claim_epoch"] == rebound["claim_epoch"] == 3
+    assert "operational_blocker" not in rebound
+    events = task_store.get_task_events(root, task_id)
+    assert sum(
+        event["event"] == "blocked_rework_validation_replay_reauthorized"
+        for event in events
+    ) == 1
+
+
 def test_recover_blocked_rework_ordinary_recovery_regression(tmp_path):
     root = tmp_path
     task_store.initialize_repository(root)
