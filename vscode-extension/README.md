@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.31
+
+- Read-only zero-diff validation failures preserve their exact primary MCP
+  gate result; retention GC no longer masks them with a workspace quarantine.
+- Writable candidates remain protected by sealed hash verification.
+
 ## What's new in 0.10.30
 
 - Workforce quality scores distinguish provider/control-plane failures from

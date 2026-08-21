@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.31 — 2026-08-21
+
+### Fixed
+
+- Read-only zero-diff validation failures keep their original authenticated
+  MCP-gate reason instead of being reclassified as a retained-workspace hash
+  failure during reconciliation.
+
 ## 0.10.30 — 2026-08-21
 
 ### Fixed

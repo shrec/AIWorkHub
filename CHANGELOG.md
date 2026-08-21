@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.31] - 2026-08-21
+
+### Fixed
+
+- Retention reconciliation now recognizes a mechanically verified read-only
+  zero-diff `validation_failed` review without requiring a non-existent hash
+  map. The original MCP gate failure remains authoritative instead of being
+  replaced by `retained_workspace_quarantined:review_workspace_hashes_missing`.
+- Writable and review-ready candidates still require sealed path hashes and
+  retain the existing fail-closed quarantine behavior on ambiguity.
+
 ## [0.10.30] - 2026-08-21
 
 ### Fixed
