@@ -3863,6 +3863,8 @@ def reject_review(
 
     def _resolve_predecessor(
         explicit: str | None,
+        *,
+        validate_delta: bool,
     ) -> tuple[dict[str, Any] | None, str | None]:
         if explicit is None:
             return None, None  # default: current review
@@ -3895,13 +3897,15 @@ def reject_review(
                 and isinstance(eh, dict)
                 and eh
             ):
-                existing_delta, delta_error = _validated_rework_delta(
-                    existing.get("rework_delta"),
-                    expected_request_id=stripped,
-                    expected_claim_epoch=None,
-                )
-                if delta_error:
-                    return None, delta_error
+                existing_delta = None
+                if validate_delta:
+                    existing_delta, delta_error = _validated_rework_delta(
+                        existing.get("rework_delta"),
+                        expected_request_id=stripped,
+                        expected_claim_epoch=None,
+                    )
+                    if delta_error:
+                        return None, delta_error
                 return {
                     "request_id": stripped,
                     "workspace": ew,
@@ -3920,15 +3924,17 @@ def reject_review(
             terminal_epoch = terminal_review.get("claim_epoch")
             if type(terminal_epoch) is not int or terminal_epoch < 1:
                 terminal_epoch = card.get("claim_epoch")
-            terminal_delta, delta_error = _validated_rework_delta(
-                evidence.get("rework_delta"),
-                expected_request_id=stripped,
-                expected_claim_epoch=(
-                    terminal_epoch if type(terminal_epoch) is int else None
-                ),
-            )
-            if delta_error:
-                return None, delta_error
+            terminal_delta = None
+            if validate_delta:
+                terminal_delta, delta_error = _validated_rework_delta(
+                    evidence.get("rework_delta"),
+                    expected_request_id=stripped,
+                    expected_claim_epoch=(
+                        terminal_epoch if type(terminal_epoch) is int else None
+                    ),
+                )
+                if delta_error:
+                    return None, delta_error
             return {
                 "request_id": stripped,
                 "workspace": t_workspace,
@@ -3940,7 +3946,9 @@ def reject_review(
             f"predecessor_request_id {stripped} not found in retained review evidence",
         )
 
-    resolved_predecessor, pred_error = _resolve_predecessor(predecessor_request_id)
+    resolved_predecessor, pred_error = _resolve_predecessor(
+        predecessor_request_id, validate_delta=(disposition == "pending")
+    )
     if pred_error:
         return _lifecycle_error(pred_error)
 
@@ -4096,22 +4104,25 @@ def reject_review(
             )
             pred_workspace = workspace
             pred_changed_hashes = changed_hashes
-            terminal_epoch = (
-                terminal_review.get("claim_epoch")
-                if isinstance(terminal_review, dict)
-                else None
-            )
-            if type(terminal_epoch) is not int or terminal_epoch < 1:
-                terminal_epoch = card.get("claim_epoch")
-            pred_rework_delta, delta_error = _validated_rework_delta(
-                evidence.get("rework_delta") if isinstance(evidence, dict) else None,
-                expected_request_id=pred_request_id,
-                expected_claim_epoch=(
-                    terminal_epoch if type(terminal_epoch) is int else None
-                ),
-            )
-            if delta_error:
-                return _lifecycle_error(delta_error)
+            if disposition == "pending":
+                terminal_epoch = (
+                    terminal_review.get("claim_epoch")
+                    if isinstance(terminal_review, dict)
+                    else None
+                )
+                if type(terminal_epoch) is not int or terminal_epoch < 1:
+                    terminal_epoch = card.get("claim_epoch")
+                pred_rework_delta, delta_error = _validated_rework_delta(
+                    evidence.get("rework_delta") if isinstance(evidence, dict) else None,
+                    expected_request_id=pred_request_id,
+                    expected_claim_epoch=(
+                        terminal_epoch if type(terminal_epoch) is int else None
+                    ),
+                )
+                if delta_error:
+                    return _lifecycle_error(delta_error)
+            else:
+                pred_rework_delta = None
         if (
             pred_request_id
             and isinstance(pred_workspace, dict)

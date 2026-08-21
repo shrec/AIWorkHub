@@ -347,6 +347,108 @@ def test_reject_to_pending_fails_closed_on_spoofed_rework_delta(
     assert row["status"] == "review"
 
 
+def _unsealed_rework_delta_card(coord: Path, task_id: str, request_id: str) -> dict:
+    """Terminal review evidence whose retained ``rework_delta`` is present but
+    unsealed -- the exact malformed evidence that once deadlocked blocked /
+    archived / superseded dispositions behind a pending-only seal check."""
+    workspace = {
+        "request_id": request_id,
+        "repo": str(coord),
+        "path": f"/tmp/aiworkhub-worktrees/{request_id}/worktree",
+        "home": f"/tmp/aiworkhub-worktrees/{request_id}/home",
+        "allowed_writes": ["out/result.txt"],
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+    descriptor = {
+        "schema_id": "aiworkhub.rework_delta_descriptor.v1",
+        "sealed": False,
+        "authority_repo": str(coord.resolve()),
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": 4,
+        "artifact_path": str(
+            coord / ".aiworkhub" / "runtime" / "rework_deltas" / "absent.json"
+        ),
+        "artifact_sha256": "0" * 64,
+    }
+    return {
+        "claim_epoch": 4,
+        "terminal_review": {
+            "claim_epoch": 4,
+            "substatus": "validation_failed",
+            "evidence": {
+                "request_identity": {"request_id": request_id, "task_id": task_id},
+                "workspace": workspace,
+                "changed_path_hashes": {"out/result.txt": "c" * 64},
+                "rework_delta": descriptor,
+            },
+        },
+    }
+
+
+def test_reject_pending_fails_closed_on_unsealed_rework_delta(coord):
+    """Pending rework still strictly requires a sealed authenticated delta: an
+    unsealed retained rework_delta must fail closed with the task left in
+    review."""
+    task_id = "T_UNSEALED_PENDING"
+    request_id = "f" * 32
+    _insert(coord, task_id, card=_unsealed_rework_delta_card(coord, task_id, request_id))
+
+    result = core.reject_review(
+        task_id, "repair delta", to="pending", predecessor_request_id=request_id
+    )
+
+    assert result["ok"] is False
+    assert "identity_mismatch" in (result.get("stderr") or "")
+    row = _row(coord, task_id)
+    assert row["status"] == "review"
+    assert row["worker_status"] == "review"
+
+
+def test_reject_blocked_skips_unsealed_rework_delta(coord):
+    """Blocked disposition must not validate or inherit the retained rework
+    delta -- the exact unsealed fixture is parked without inheriting bytes."""
+    task_id = "T_UNSEALED_BLOCKED"
+    request_id = "a" * 32
+    _insert(coord, task_id, card=_unsealed_rework_delta_card(coord, task_id, request_id))
+
+    result = core.reject_review(
+        task_id, "needs external input", to="blocked", predecessor_request_id=request_id
+    )
+
+    assert result["ok"] is True, result
+    row = _row(coord, task_id)
+    assert row["status"] == "blocked"
+    assert row["worker_status"] == "blocked"
+    card = json.loads(row["card_json"])
+    predecessor = card["rework_predecessor"]
+    assert predecessor["request_id"] == request_id
+    assert predecessor["changed_path_hashes"] == {"out/result.txt": "c" * 64}
+    assert "rework_delta" not in predecessor
+    assert "delta_artifact" not in predecessor
+    assert "reviewer_finalization" in result
+
+
+@pytest.mark.parametrize("disposition", ["archived", "superseded"])
+def test_reject_retire_skips_unsealed_rework_delta(coord, disposition):
+    """archived / superseded retire the identical unsealed fixture out of the
+    review queue without validating or inheriting the delta."""
+    task_id = "T_UNSEALED_" + disposition.upper()
+    request_id = "b" * 32
+    _insert(coord, task_id, card=_unsealed_rework_delta_card(coord, task_id, request_id))
+
+    result = core.reject_review(
+        task_id, "obsolete", to=disposition, predecessor_request_id=request_id
+    )
+
+    assert result["ok"] is True, result
+    row = _row(coord, task_id)
+    assert str(row["archived_at"]).strip()
+    assert disposition in _events(coord, task_id)
+    assert "reviewer_finalization" in result
+
+
 def test_invalid_residual_identity_returns_actionable_schema(coord):
     _insert(coord, "T_BAD_RESIDUAL")
     result = core.reject_review(
