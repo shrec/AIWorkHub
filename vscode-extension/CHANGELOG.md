@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.41 — 2026-08-21
+
+### Fixed
+
+- Validation-only rework recovery refreshes stale single-episode bindings
+  after a newer retained predecessor is pinned.
+
 ## 0.10.40 — 2026-08-21
 
 ### Fixed

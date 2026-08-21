@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.41] - 2026-08-21
+
+### Fixed
+
+- Repeated provider-free validation replays now bind their one-episode
+  authorization to the latest retained predecessor and claim epoch. A prior
+  recovery event can no longer strand a pending rework card in a permanent
+  `validation_only_replay_predecessor_mismatch` loop.
+
 ## [0.10.40] - 2026-08-21
 
 ### Fixed
