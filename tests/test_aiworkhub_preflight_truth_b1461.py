@@ -27,7 +27,7 @@ def _common(monkeypatch, *, graph: dict[str, object]) -> None:
     )
     monkeypatch.setattr(
         repo_policy.worker_workspace,
-        "finalization_preflight_probe",
+        "finalization_preflight_probe_nonblocking",
         lambda _root, _adapter: {
             "ok": True,
             "status": "ready",
@@ -166,7 +166,7 @@ def test_windows_finalization_probe_blocks_false_ready(monkeypatch, tmp_path):
     monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: True)
     monkeypatch.setattr(
         repo_policy.worker_workspace,
-        "finalization_preflight_probe",
+        "finalization_preflight_probe_nonblocking",
         lambda _root, _adapter: {
             "ok": False,
             "status": "blocked",

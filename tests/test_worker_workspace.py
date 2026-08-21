@@ -7,6 +7,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -522,6 +524,108 @@ def test_preflight_cache_is_head_bound_and_failures_are_not_cached(
     assert failed_one["ok"] is False and failed_one["cache_hit"] is False
     assert failed_two["ok"] is False and failed_two["cache_hit"] is False
     assert calls[-2:] == ["failure", "failure"]
+
+
+def test_nonblocking_preflight_coalesces_and_publishes_success(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    calls = 0
+
+    def fake_probe(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        started.set()
+        assert release.wait(2.0)
+        finished.set()
+        return {
+            "ok": True,
+            "status": "ready",
+            "reason": "",
+            "phase": "preflight_finalization",
+            "cache_hit": False,
+        }
+
+    monkeypatch.setattr(worker_workspace, "finalization_preflight_probe", fake_probe)
+    worker_workspace._FINALIZATION_PROBE_CACHE.clear()
+    worker_workspace._FINALIZATION_PROBE_FAILURES.clear()
+    worker_workspace._FINALIZATION_PROBE_ACTIVE.clear()
+
+    before = time.monotonic()
+    first = worker_workspace.finalization_preflight_probe_nonblocking(repo, "validation")
+    assert time.monotonic() - before < 0.5
+    assert first["status"] == "probing"
+    assert first["reason"] == "worker_finalization_probe_started"
+    assert started.wait(1.0)
+
+    second = worker_workspace.finalization_preflight_probe_nonblocking(repo, "validation")
+    assert second["status"] == "probing"
+    assert second["reason"] == "worker_finalization_probe_running"
+    assert calls == 1
+
+    release.set()
+    assert finished.wait(1.0)
+    deadline = time.monotonic() + 1.0
+    while worker_workspace._FINALIZATION_PROBE_ACTIVE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    third = worker_workspace.finalization_preflight_probe_nonblocking(repo, "validation")
+    assert third["ok"] is True
+    assert third["status"] == "ready"
+    assert third["cache_hit"] is True
+    assert calls == 1
+
+
+def test_nonblocking_preflight_caches_failure_for_bounded_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+) -> None:
+    finished = threading.Event()
+    calls = 0
+
+    def fake_probe(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        finished.set()
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": "synthetic_probe_failure",
+            "phase": "preflight_finalization",
+            "cache_hit": False,
+        }
+
+    monkeypatch.setattr(worker_workspace, "finalization_preflight_probe", fake_probe)
+    worker_workspace._FINALIZATION_PROBE_CACHE.clear()
+    worker_workspace._FINALIZATION_PROBE_FAILURES.clear()
+    worker_workspace._FINALIZATION_PROBE_ACTIVE.clear()
+
+    first = worker_workspace.finalization_preflight_probe_nonblocking(repo, "validation")
+    assert first["status"] == "probing"
+    assert finished.wait(1.0)
+    deadline = time.monotonic() + 1.0
+    while worker_workspace._FINALIZATION_PROBE_ACTIVE and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    failed = worker_workspace.finalization_preflight_probe_nonblocking(
+        repo, "validation", failure_cache_seconds=30.0
+    )
+    assert failed["ok"] is False
+    assert failed["status"] == "blocked"
+    assert failed["reason"] == "synthetic_probe_failure"
+    assert failed["cache_hit"] is True
+    assert calls == 1
+
+    retry = worker_workspace.finalization_preflight_probe_nonblocking(
+        repo, "validation", failure_cache_seconds=0.0
+    )
+    assert retry["status"] == "probing"
+    deadline = time.monotonic() + 1.0
+    while worker_workspace._FINALIZATION_PROBE_ACTIVE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert calls == 2
 
 
 def test_default_workspace_root_is_repo_local_runtime_boundary(

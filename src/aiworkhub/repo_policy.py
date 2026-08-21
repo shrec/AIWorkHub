@@ -487,7 +487,7 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             (selected or launchable_routes[0]).get("adapter_id") or "vscode_lm"
         )
         try:
-            finalization_probe = worker_workspace.finalization_preflight_probe(
+            finalization_probe = worker_workspace.finalization_preflight_probe_nonblocking(
                 root, probe_adapter
             )
         except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError) as exc:

@@ -210,7 +210,7 @@ def test_windows_preflight_excludes_native_cli_but_keeps_editor_bridge_ready(
     monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: True)
     monkeypatch.setattr(
         repo_policy.worker_workspace,
-        "finalization_preflight_probe",
+        "finalization_preflight_probe_nonblocking",
         lambda _root, _adapter: {
             "ok": True,
             "status": "ready",

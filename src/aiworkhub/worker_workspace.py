@@ -251,6 +251,12 @@ MAX_FINALIZATION_GIT_TIMEOUT_SECONDS = 120.0
 _FINALIZATION_PROBE_CACHE_SECONDS = 300.0
 _FINALIZATION_PROBE_LOCK = threading.Lock()
 _FINALIZATION_PROBE_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+_FINALIZATION_PROBE_FAILURES: dict[
+    tuple[str, str, str], tuple[float, dict[str, Any]]
+] = {}
+_FINALIZATION_PROBE_ACTIVE: dict[
+    tuple[str, str, str], tuple[float, threading.Thread]
+] = {}
 
 # Landlock uses the generic syscall numbers on the Linux architectures Python
 # supports in this deployment. Unsupported kernels return ENOSYS and launch is
@@ -2614,6 +2620,15 @@ def cleanup_workspace(
             raise WorkspaceError("workspace_cleanup_registration_retained")
 
 
+def _finalization_probe_key(repo: Path, adapter_id: str) -> tuple[str, str, str]:
+    repo = repo.resolve()
+    try:
+        head_oid = _repository_head_oid(repo)
+    except WorkspaceError:
+        head_oid = "unresolved"
+    return str(repo), str(adapter_id), head_oid
+
+
 def finalization_preflight_probe(
     repo: Path,
     adapter_id: str,
@@ -2622,12 +2637,8 @@ def finalization_preflight_probe(
 ) -> dict[str, Any]:
     """Exercise the real isolated zero-diff path with a short-lived cache."""
     repo = repo.resolve()
-    try:
-        head_oid = _repository_head_oid(repo)
-    except WorkspaceError:
-        # Never turn unresolved Git authority into a reusable Ready receipt.
-        head_oid = "unresolved"
-    key = (str(repo), str(adapter_id), head_oid)
+    key = _finalization_probe_key(repo, adapter_id)
+    head_oid = key[2]
     now = time.monotonic()
     with _FINALIZATION_PROBE_LOCK:
         cached = _FINALIZATION_PROBE_CACHE.get(key)
@@ -2712,6 +2723,81 @@ def finalization_preflight_probe(
         with _FINALIZATION_PROBE_LOCK:
             _FINALIZATION_PROBE_CACHE[key] = (time.monotonic(), dict(result))
     return result
+
+
+def finalization_preflight_probe_nonblocking(
+    repo: Path,
+    adapter_id: str,
+    *,
+    cache_seconds: float = _FINALIZATION_PROBE_CACHE_SECONDS,
+    failure_cache_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Return immediately while one coalesced real probe runs in background."""
+    repo = repo.resolve()
+    key = _finalization_probe_key(repo, adapter_id)
+    now = time.monotonic()
+    with _FINALIZATION_PROBE_LOCK:
+        cached = _FINALIZATION_PROBE_CACHE.get(key)
+        if cached and now - cached[0] <= cache_seconds:
+            return {**cached[1], "cache_hit": True, "background": True}
+        failed = _FINALIZATION_PROBE_FAILURES.get(key)
+        if failed and now - failed[0] <= failure_cache_seconds:
+            return {**failed[1], "cache_hit": True, "background": True}
+        active = _FINALIZATION_PROBE_ACTIVE.get(key)
+        if active and active[1].is_alive():
+            return {
+                "ok": False,
+                "status": "probing",
+                "reason": "worker_finalization_probe_running",
+                "phase": "preflight_finalization",
+                "cache_hit": False,
+                "background": True,
+                "elapsed_ms": round((now - active[0]) * 1000.0, 3),
+            }
+
+        def run_probe() -> None:
+            try:
+                result = finalization_preflight_probe(
+                    repo, adapter_id, cache_seconds=cache_seconds
+                )
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "status": "blocked",
+                    "reason": f"preflight_finalization_probe_failed:{exc}"[:500],
+                    "phase": "preflight_finalization",
+                    "cache_hit": False,
+                }
+            with _FINALIZATION_PROBE_LOCK:
+                _FINALIZATION_PROBE_ACTIVE.pop(key, None)
+                if result.get("ok") is True and key[2] != "unresolved":
+                    _FINALIZATION_PROBE_CACHE[key] = (
+                        time.monotonic(),
+                        dict(result),
+                    )
+                    _FINALIZATION_PROBE_FAILURES.pop(key, None)
+                else:
+                    _FINALIZATION_PROBE_FAILURES[key] = (
+                        time.monotonic(),
+                        dict(result),
+                    )
+
+        thread = threading.Thread(
+            target=run_probe,
+            name=f"aiworkhub-finalization-preflight-{key[2][:12]}",
+            daemon=True,
+        )
+        _FINALIZATION_PROBE_ACTIVE[key] = (now, thread)
+        thread.start()
+    return {
+        "ok": False,
+        "status": "probing",
+        "reason": "worker_finalization_probe_started",
+        "phase": "preflight_finalization",
+        "cache_hit": False,
+        "background": True,
+        "elapsed_ms": 0.0,
+    }
 
 
 def _canonical_worktree_delta_paths(repo: Path) -> list[str]:
