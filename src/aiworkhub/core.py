@@ -3926,13 +3926,21 @@ def reject_review(
                 terminal_epoch = card.get("claim_epoch")
             terminal_delta = None
             if validate_delta:
-                terminal_delta, delta_error = _validated_rework_delta(
-                    evidence.get("rework_delta"),
-                    expected_request_id=stripped,
-                    expected_claim_epoch=(
-                        terminal_epoch if type(terminal_epoch) is int else None
-                    ),
-                )
+                raw_delta = evidence.get("rework_delta")
+                if (
+                    raw_delta is None
+                    and isinstance(terminal_review, dict)
+                    and terminal_review.get("substatus") == "validation_failed"
+                ):
+                    delta_error = "rework_delta_descriptor_missing"
+                else:
+                    terminal_delta, delta_error = _validated_rework_delta(
+                        raw_delta,
+                        expected_request_id=stripped,
+                        expected_claim_epoch=(
+                            terminal_epoch if type(terminal_epoch) is int else None
+                        ),
+                    )
                 if delta_error:
                     return None, delta_error
             return {
@@ -3946,9 +3954,27 @@ def reject_review(
             f"predecessor_request_id {stripped} not found in retained review evidence",
         )
 
+    rework_delta_reuse_error: str | None = None
     resolved_predecessor, pred_error = _resolve_predecessor(
         predecessor_request_id, validate_delta=(disposition == "pending")
     )
+    if (
+        disposition == "pending"
+        and pred_error is not None
+        and pred_error.startswith("rework_delta_")
+    ):
+        # A malformed delta is not authority for candidate bytes, but it must
+        # not trap the task in review forever.  Re-resolve only the immutable
+        # predecessor identity so the rejection can complete, then discard
+        # every workspace/hash/delta reuse field below.  The next launch starts
+        # from canonical HEAD and receives the bounded review feedback only.
+        resolved_predecessor, identity_error = _resolve_predecessor(
+            predecessor_request_id, validate_delta=False
+        )
+        if identity_error:
+            return _lifecycle_error(identity_error)
+        rework_delta_reuse_error = pred_error
+        pred_error = None
     if pred_error:
         return _lifecycle_error(pred_error)
 
@@ -4091,11 +4117,16 @@ def reject_review(
         changed_hashes = (
             evidence.get("changed_path_hashes") if isinstance(evidence, dict) else None
         )
-        if resolved_predecessor is not None:
+        if resolved_predecessor is not None and rework_delta_reuse_error is None:
             pred_request_id: str = resolved_predecessor["request_id"]
             pred_workspace: dict[str, Any] = resolved_predecessor["workspace"]
             pred_changed_hashes: dict[str, str] = resolved_predecessor["changed_path_hashes"]
             pred_rework_delta = resolved_predecessor.get("rework_delta")
+        elif resolved_predecessor is not None:
+            pred_request_id = str(resolved_predecessor["request_id"] or "").strip()
+            pred_workspace = {}
+            pred_changed_hashes = {}
+            pred_rework_delta = None
         else:
             pred_request_id = (
                 str(identity.get("request_id") or "").strip()
@@ -4112,15 +4143,31 @@ def reject_review(
                 )
                 if type(terminal_epoch) is not int or terminal_epoch < 1:
                     terminal_epoch = card.get("claim_epoch")
-                pred_rework_delta, delta_error = _validated_rework_delta(
-                    evidence.get("rework_delta") if isinstance(evidence, dict) else None,
-                    expected_request_id=pred_request_id,
-                    expected_claim_epoch=(
-                        terminal_epoch if type(terminal_epoch) is int else None
-                    ),
+                raw_delta = (
+                    evidence.get("rework_delta")
+                    if isinstance(evidence, dict)
+                    else None
                 )
+                if (
+                    raw_delta is None
+                    and isinstance(terminal_review, dict)
+                    and terminal_review.get("substatus") == "validation_failed"
+                ):
+                    pred_rework_delta = None
+                    delta_error = "rework_delta_descriptor_missing"
+                else:
+                    pred_rework_delta, delta_error = _validated_rework_delta(
+                        raw_delta,
+                        expected_request_id=pred_request_id,
+                        expected_claim_epoch=(
+                            terminal_epoch if type(terminal_epoch) is int else None
+                        ),
+                    )
                 if delta_error:
-                    return _lifecycle_error(delta_error)
+                    rework_delta_reuse_error = delta_error
+                    pred_workspace = {}
+                    pred_changed_hashes = {}
+                    pred_rework_delta = None
             else:
                 pred_rework_delta = None
         if (
@@ -4215,6 +4262,7 @@ def reject_review(
                         "reason_identity": reason_identity,
                         "to": disposition,
                         "prior_episode": prior_episode,
+                        "rework_delta_reuse_error": rework_delta_reuse_error,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -4230,6 +4278,13 @@ def reject_review(
     result = _reconcile_retained_workspaces(
         _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
     )
+    if rework_delta_reuse_error is not None:
+        result["rework_delta_recovery"] = {
+            "schema_id": "aiworkhub.rework_delta_recovery.v1",
+            "state": "discarded_untrusted_delta",
+            "reason": rework_delta_reuse_error,
+            "predecessor_request_id": pred_request_id,
+        }
     result["reviewer_finalization"] = _finalize_bound_reviewers()
     return result
 

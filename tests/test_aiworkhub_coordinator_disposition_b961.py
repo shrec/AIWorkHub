@@ -330,7 +330,7 @@ def test_reject_to_pending_persists_authenticated_rework_delta(coord):
         (lambda row: row.update(artifact_sha256="0" * 64), "tampered"),
     ],
 )
-def test_reject_to_pending_fails_closed_on_spoofed_rework_delta(
+def test_reject_to_pending_discards_spoofed_rework_delta(
     coord, mutation, expected
 ):
     task_id = "T_DELTA_BAD_" + expected
@@ -341,10 +341,19 @@ def test_reject_to_pending_fails_closed_on_spoofed_rework_delta(
 
     result = core.reject_review(task_id, "repair delta", to="pending")
 
-    assert result["ok"] is False
-    assert expected in result["stderr"]
+    assert result["ok"] is True, result
+    assert result["rework_delta_recovery"] == {
+        "schema_id": "aiworkhub.rework_delta_recovery.v1",
+        "state": "discarded_untrusted_delta",
+        "reason": f"rework_delta_descriptor_{expected}",
+        "predecessor_request_id": request_id,
+    }
     row = _row(coord, task_id)
-    assert row["status"] == "review"
+    assert row["status"] == "pending"
+    persisted = json.loads(row["card_json"])
+    assert "rework_predecessor" not in persisted
+    assert "terminal_review" not in persisted
+    assert persisted["review_feedback"]["predecessor_changed_paths"] == []
 
 
 def _unsealed_rework_delta_card(coord: Path, task_id: str, request_id: str) -> dict:
@@ -387,10 +396,8 @@ def _unsealed_rework_delta_card(coord: Path, task_id: str, request_id: str) -> d
     }
 
 
-def test_reject_pending_fails_closed_on_unsealed_rework_delta(coord):
-    """Pending rework still strictly requires a sealed authenticated delta: an
-    unsealed retained rework_delta must fail closed with the task left in
-    review."""
+def test_reject_pending_discards_unsealed_rework_delta(coord):
+    """An unsealed delta is never reused, but cannot trap the task in review."""
     task_id = "T_UNSEALED_PENDING"
     request_id = "f" * 32
     _insert(coord, task_id, card=_unsealed_rework_delta_card(coord, task_id, request_id))
@@ -399,11 +406,36 @@ def test_reject_pending_fails_closed_on_unsealed_rework_delta(coord):
         task_id, "repair delta", to="pending", predecessor_request_id=request_id
     )
 
-    assert result["ok"] is False
-    assert "identity_mismatch" in (result.get("stderr") or "")
+    assert result["ok"] is True, result
+    assert result["rework_delta_recovery"]["state"] == "discarded_untrusted_delta"
+    assert "identity_mismatch" in result["rework_delta_recovery"]["reason"]
     row = _row(coord, task_id)
-    assert row["status"] == "review"
-    assert row["worker_status"] == "review"
+    assert row["status"] == "pending"
+    assert row["worker_status"] == "unclaimed"
+    persisted = json.loads(row["card_json"])
+    assert "rework_predecessor" not in persisted
+    assert "terminal_review" not in persisted
+
+
+def test_reject_pending_discards_missing_validation_failed_delta(coord):
+    task_id = "T_MISSING_PENDING"
+    request_id = "9" * 32
+    card = _unsealed_rework_delta_card(coord, task_id, request_id)
+    del card["terminal_review"]["evidence"]["rework_delta"]
+    _insert(coord, task_id, card=card)
+
+    result = core.reject_review(task_id, "repair delta", to="pending")
+
+    assert result["ok"] is True, result
+    assert result["rework_delta_recovery"] == {
+        "schema_id": "aiworkhub.rework_delta_recovery.v1",
+        "state": "discarded_untrusted_delta",
+        "reason": "rework_delta_descriptor_missing",
+        "predecessor_request_id": request_id,
+    }
+    persisted = json.loads(_row(coord, task_id)["card_json"])
+    assert "rework_predecessor" not in persisted
+    assert persisted["review_feedback"]["predecessor_changed_paths"] == []
 
 
 def test_reject_blocked_skips_unsealed_rework_delta(coord):
