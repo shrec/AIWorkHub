@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.22] - 2026-08-21
+
+### Fixed
+
+- Workspace cleanup no longer launches blocking `git worktree remove` or
+  global `git worktree prune` subprocesses. It verifies the exact reciprocal
+  worktree registration and removes only the request-owned workspace and Git
+  administrative directory.
+- Windows finalization Preflight is nonblocking and coalesced per repository,
+  adapter and HEAD. Concurrent dashboard/MCP refreshes share one background
+  probe; successful and failed results are published with bounded caches and a
+  running probe can never be reported as Ready.
+
+### Performance
+
+- The release-host live workspace canary created its isolated worktree in
+  about 18 ms and cleaned it in under 1 ms without a cleanup Git subprocess.
+
 ## [0.10.21] - 2026-08-21
 
 ### Fixed

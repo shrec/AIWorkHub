@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.22 — 2026-08-21
+
+### Fixed
+
+- Exact workspace cleanup is process-free and no longer depends on slow or
+  wedged Windows `git worktree remove`/`prune` subprocesses.
+- Windows finalization Preflight now returns immediately while one coalesced,
+  HEAD-bound background canary establishes the real Ready or Blocked result.
+
 ## 0.10.21 — 2026-08-21
 
 ### Fixed

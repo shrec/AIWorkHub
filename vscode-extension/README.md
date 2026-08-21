@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.22
+
+- Workspace cleanup verifies and removes the exact request-owned worktree
+  registration without invoking a blocking Git cleanup subprocess.
+- Windows finalization Preflight coalesces concurrent refreshes into one
+  background canary, keeping the dashboard and MCP request lane responsive.
+
 ## What's new in 0.10.21
 
 - Retained sparse workspaces are now the mechanical authority for Python and
