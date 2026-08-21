@@ -48,6 +48,11 @@ def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tm
         "build_snapshot",
         lambda cards: {"card_count": len(cards)},
     )
+    monkeypatch.setattr(
+        dashboard,
+        "_build_roadmap_snapshot",
+        lambda **kwargs: {"cards": len(kwargs["task_cards_snapshot"])},
+    )
     monkeypatch.setattr(dashboard.os, "cpu_count", lambda: 8)
 
     errors: list[dict[str, str]] = []
@@ -58,6 +63,7 @@ def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tm
                 "workforce": ("workforce", provider.get_workforce_catalog, {}),
                 "preflight": ("preflight", provider.get_environment_preflight, {}),
                 "needfix": ("needfix", provider.get_needfix_snapshot, {}),
+                "roadmap": ("roadmap", provider.get_roadmap_snapshot, {}),
                 "plan": ("plan", provider.get_task_plan, {}),
                 "collision": ("collision", provider.get_collision_report, {}),
             },
@@ -69,6 +75,7 @@ def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tm
     assert result["cost"]["tasks"] == []
     assert result["workforce"] == {"cards": 1, "usage": 1}
     assert result["plan"]["card_count"] == 1
+    assert result["roadmap"] == {"cards": 1}
 
     # The cache never survives its read set and direct provider calls preserve
     # the historical fresh-read behavior.

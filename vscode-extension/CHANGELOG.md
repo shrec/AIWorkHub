@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.19 — 2026-08-21
+
+### Performance
+
+- Roadmap task-state joins share the dashboard refresh's bounded task-card
+  projection. Complete snapshots avoid redundant routed point lookups, while
+  partial snapshots keep the exact canonical fallback.
+
 ## 0.10.18 — 2026-08-21
 
 ### Performance

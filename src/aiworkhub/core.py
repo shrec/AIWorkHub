@@ -16,7 +16,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 from . import (
@@ -6859,7 +6859,11 @@ def roadmap_link_task(roadmap_id: str, task_id: str) -> dict[str, Any]:
 
 
 def roadmap_snapshot(
-    *, limit: int = 200, include_archived: bool = False
+    *,
+    limit: int = 200,
+    include_archived: bool = False,
+    task_cards_snapshot: Sequence[Mapping[str, Any]] | None = None,
+    task_cards_snapshot_complete: bool = False,
 ) -> dict[str, Any]:
     """Return bounded roadmap truth joined to canonical task lifecycle."""
     items = roadmap_list(include_archived=include_archived, limit=limit)
@@ -6867,11 +6871,21 @@ def roadmap_snapshot(
         repo_root(), include_archived=include_archived
     )
     total = sum(status_counts.values())
+    task_cards_by_id = {
+        str(card.get("task_id") or ""): card
+        for card in task_cards_snapshot or ()
+        if card.get("task_id")
+    }
     rows: list[dict[str, Any]] = []
     for item in items:
         tasks: list[dict[str, str]] = []
         for task_id in item["task_ids"]:
-            card = task_store.get_task(repo_root(), task_id)
+            if task_id in task_cards_by_id:
+                card = task_cards_by_id[task_id]
+            elif task_cards_snapshot_complete:
+                card = None
+            else:
+                card = task_store.get_task(repo_root(), task_id)
             tasks.append(
                 {
                     "task_id": task_id,

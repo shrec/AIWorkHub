@@ -1846,6 +1846,16 @@ class DashboardProvider:
             ),
         )
 
+    def get_roadmap_snapshot(self) -> dict[str, Any]:
+        """Roadmap view joined to this dashboard snapshot's task cards."""
+        task_cards = self._task_cards()
+        return _build_roadmap_snapshot(
+            task_cards_snapshot=task_cards,
+            task_cards_snapshot_complete=(
+                len(task_cards) < TASK_CARD_SNAPSHOT_LIMIT
+            ),
+        )
+
     def get_adapter_readiness(self) -> dict[str, Any]:
         """Read-only worker-adapter readiness (never exposes any secret)."""
         return deepseek_credentials.adapter_readiness(repo=self.repo_root)
@@ -2309,6 +2319,11 @@ def build_snapshot(
         "get_needfix_snapshot",
         partial(_build_needfix_snapshot, provider_root or _default_repo_root()),
     )
+    roadmap_reader = getattr(
+        data_provider,
+        "get_roadmap_snapshot",
+        _build_roadmap_snapshot,
+    )
     resolved_root = Path(provider_root or _default_repo_root()).resolve()
 
     read_operations: dict[str, tuple[str, Callable[[], Any], Any]] = {
@@ -2349,7 +2364,7 @@ def build_snapshot(
             needfix_reader,
             _needfix_unavailable(),
         ),
-        "roadmap": ("roadmap", _build_roadmap_snapshot, _roadmap_unavailable()),
+        "roadmap": ("roadmap", roadmap_reader, _roadmap_unavailable()),
     }
     if kpi_process_reader is not None:
         read_operations["kpi_process_history"] = (
@@ -2739,10 +2754,18 @@ def _roadmap_unavailable(error: str = "roadmap_store_unavailable") -> dict[str, 
     }
 
 
-def _build_roadmap_snapshot() -> dict[str, Any]:
+def _build_roadmap_snapshot(
+    *,
+    task_cards_snapshot: tuple[dict[str, Any], ...] | None = None,
+    task_cards_snapshot_complete: bool = False,
+) -> dict[str, Any]:
     """Bounded Roadmap + Task-DAG projection from the canonical core API."""
     try:
-        return core.roadmap_snapshot(limit=ROADMAP_SNAPSHOT_LIMIT)
+        return core.roadmap_snapshot(
+            limit=ROADMAP_SNAPSHOT_LIMIT,
+            task_cards_snapshot=task_cards_snapshot,
+            task_cards_snapshot_complete=task_cards_snapshot_complete,
+        )
     except Exception as exc:
         return _roadmap_unavailable(str(exc)[:500])
 

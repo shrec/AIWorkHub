@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.19] - 2026-08-21
+
+### Performance
+
+- Dashboard Roadmap joins now reuse the exact bounded task-card snapshot
+  already read for the same refresh. The canonical 25-outcome join fell from
+  13 routed point lookups and 0.383 seconds to a 0.0079-second median after
+  the shared card read (about 48 times faster).
+- Standalone Roadmap calls and capped/partial caller snapshots retain exact
+  canonical point lookups for task IDs whose absence cannot be proven.
+- The canonical full dashboard snapshot measured a 1.13-second median after
+  this change, down from roughly 1.20 seconds in 0.10.18.
+
 ## [0.10.18] - 2026-08-21
 
 ### Performance

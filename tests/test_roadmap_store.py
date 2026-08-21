@@ -171,6 +171,53 @@ def test_snapshot_joins_tasks_and_dependency_blockers(
     assert child_row["tasks"] == [{"task_id": "task-child", "status": "pending"}]
 
 
+def test_snapshot_reuses_complete_caller_task_cards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    monkeypatch.setattr(core, "repo_root", lambda: repo)
+    item = _add(repo, "Outcome")
+    roadmap_store.link_task(repo, item["id"], "task-child")
+
+    def unexpected_get(*_args, **_kwargs):
+        raise AssertionError("complete caller snapshot must avoid point lookup")
+
+    monkeypatch.setattr(core.task_store, "get_task", unexpected_get)
+    snapshot = core.roadmap_snapshot(
+        task_cards_snapshot=({"task_id": "task-child", "status": "pending"},),
+        task_cards_snapshot_complete=True,
+    )
+
+    assert snapshot["items"][0]["tasks"] == [
+        {"task_id": "task-child", "status": "pending"}
+    ]
+
+
+def test_snapshot_partial_caller_cards_keep_point_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    monkeypatch.setattr(core, "repo_root", lambda: repo)
+    item = _add(repo, "Outcome")
+    roadmap_store.link_task(repo, item["id"], "task-child")
+    calls = {"get": 0}
+
+    def counted_get(*_args, **_kwargs):
+        calls["get"] += 1
+        return {"status": "finished"}
+
+    monkeypatch.setattr(core.task_store, "get_task", counted_get)
+    snapshot = core.roadmap_snapshot(
+        task_cards_snapshot=(),
+        task_cards_snapshot_complete=False,
+    )
+
+    assert snapshot["items"][0]["tasks"] == [
+        {"task_id": "task-child", "status": "finished"}
+    ]
+    assert calls == {"get": 1}
+
+
 def test_snapshot_aggregates_are_not_limited_to_visible_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

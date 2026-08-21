@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.19
+
+- Roadmap task-state joins now reuse the refresh's complete task-card snapshot.
+  The canonical join measured about 48× faster after the shared read, and the
+  full dashboard snapshot is now approximately 1.13 seconds median.
+
 ## What's new in 0.10.18
 
 - Dashboard NeedFix derivation shares the refresh's task-card snapshot and
