@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.17] - 2026-08-21
+
+### Performance
+
+- Replaced the dashboard review-latency correlated SQLite lookup with an
+  equivalent set-based projection. On the canonical repository the measured
+  query fell from roughly 0.95–1.00 seconds to a 0.10-second median.
+- Dashboard Workforce and Preflight readers now share one repository probe
+  inside the same bounded refresh. Direct calls and later refreshes remain
+  fresh; the full dashboard snapshot measured a 1.54-second median after both
+  changes.
+
 ## [0.10.16] - 2026-08-21
 
 ### Fixed

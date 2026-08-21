@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.17 — 2026-08-21
+
+### Performance
+
+- Review-decision latency is projected with one set-based SQLite query instead
+  of one correlated lookup per decision row.
+- Workforce and Preflight share one bounded readiness probe per dashboard
+  refresh, reducing duplicate repository work without cross-refresh caching.
+
 ## 0.10.16 — 2026-08-21
 
 ### Fixed

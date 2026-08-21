@@ -2959,12 +2959,21 @@ def manager_decision_counts(root: str | Path) -> dict[str, Any]:
         accepted = int(row["accepted"] or 0)
         rejected = int(row["rejected"] or 0)
         latency_rows = conn.execute(
-            "SELECT d.event, d.payload_json, d.created_at decision_at, "
-            " (SELECT r.created_at FROM task_events r "
-            "  WHERE r.task_id=d.task_id AND r.event='terminal_review' "
-            "    AND r.event_id<d.event_id ORDER BY r.event_id DESC LIMIT 1) review_at "
-            "FROM task_events d WHERE d.event IN ('accept_review','reject_review','archived','superseded') "
-            "ORDER BY d.event_id DESC LIMIT 5000"
+            "WITH decisions AS MATERIALIZED ("
+            " SELECT event_id,task_id,event,payload_json,created_at "
+            " FROM task_events "
+            " WHERE event IN ('accept_review','reject_review','archived','superseded') "
+            " ORDER BY event_id DESC LIMIT 5000"
+            "), review_ids AS ("
+            " SELECT d.event_id decision_id, MAX(r.event_id) review_id "
+            " FROM decisions d LEFT JOIN task_events r "
+            " ON r.task_id=d.task_id AND r.event='terminal_review' "
+            " AND r.event_id<d.event_id GROUP BY d.event_id"
+            ") "
+            "SELECT d.event,d.payload_json,d.created_at decision_at,r.created_at review_at "
+            "FROM decisions d JOIN review_ids x ON x.decision_id=d.event_id "
+            "LEFT JOIN task_events r ON r.event_id=x.review_id "
+            "ORDER BY d.event_id DESC"
         ).fetchall()
         latency: dict[str, list[float]] = {"accepted": [], "rejected": []}
         for item in latency_rows:

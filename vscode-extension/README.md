@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.17
+
+- Dashboard review-decision metrics now use a measured set-based SQLite query,
+  and Workforce shares the exact same bounded Preflight probe requested by the
+  refresh. Canonical full-snapshot median was approximately 1.54 seconds.
+
 ## What's new in 0.10.16
 
 - Dashboard single-flight inputs now expire at the end of the exact refresh,

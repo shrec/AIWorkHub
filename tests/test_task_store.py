@@ -140,6 +140,41 @@ def test_manager_decision_counts_include_rework_and_review_archival(tmp_path: Pa
     } <= indexes
 
 
+def test_manager_decision_counts_uses_nearest_prior_review_per_decision(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _insert_task(repo, "TASK_DECISION_LATENCY", status="pending")
+    _readiness, db_path = task_store._require_ready(repo)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executemany(
+            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+            "VALUES('TASK_DECISION_LATENCY',?,'codex','{}',?)",
+            [
+                ("terminal_review", "2026-08-02T00:00:00Z"),
+                ("accept_review", "2026-08-02T00:00:09Z"),
+                ("terminal_review", "2026-08-02T00:01:00Z"),
+                ("reject_review", "2026-08-02T00:01:21Z"),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = task_store.manager_decision_counts(repo)
+
+    assert result["accepted_latency"] == {
+        "count": 1,
+        "p50_seconds": 9.0,
+        "p95_seconds": 9.0,
+    }
+    assert result["rejected_latency"] == {
+        "count": 1,
+        "p50_seconds": 21.0,
+        "p95_seconds": 21.0,
+    }
+
+
 def test_list_task_cards_matches_canonical_detail_in_one_bounded_batch(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

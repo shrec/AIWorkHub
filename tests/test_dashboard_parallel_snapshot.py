@@ -8,7 +8,7 @@ from aiworkhub import dashboard
 
 def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tmp_path):
     provider = dashboard.DashboardProvider(repo_root=tmp_path)
-    calls = {"cards": 0, "ledger": 0}
+    calls = {"cards": 0, "ledger": 0, "preflight": 0}
 
     def load_cards(*_args, **_kwargs):
         calls["cards"] += 1
@@ -23,8 +23,14 @@ def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tm
             "cost_per_accepted_outcome": {"accepted": 1},
         }
 
+    def load_preflight(*_args, **_kwargs):
+        calls["preflight"] += 1
+        time.sleep(0.05)
+        return {"providers": []}
+
     monkeypatch.setattr(dashboard.task_store, "list_task_cards", load_cards)
     monkeypatch.setattr(dashboard.cost_ledger, "build_cost_ledger", load_ledger)
+    monkeypatch.setattr(dashboard.repo_policy, "build_preflight", load_preflight)
     monkeypatch.setattr(dashboard.task_store, "list_tasks", lambda *_a, **_k: [])
     monkeypatch.setattr(
         dashboard, "read_process_runs", lambda **_kwargs: {"processes": []}
@@ -50,6 +56,7 @@ def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tm
             {
                 "cost": ("cost", provider.get_cost_ledger, {}),
                 "workforce": ("workforce", provider.get_workforce_catalog, {}),
+                "preflight": ("preflight", provider.get_environment_preflight, {}),
                 "plan": ("plan", provider.get_task_plan, {}),
                 "collision": ("collision", provider.get_collision_report, {}),
             },
@@ -57,7 +64,7 @@ def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tm
         )
 
     assert errors == []
-    assert calls == {"cards": 1, "ledger": 1}
+    assert calls == {"cards": 1, "ledger": 1, "preflight": 1}
     assert result["cost"]["tasks"] == []
     assert result["workforce"] == {"cards": 1, "usage": 1}
     assert result["plan"]["card_count"] == 1
@@ -66,7 +73,10 @@ def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tm
     # the historical fresh-read behavior.
     provider.get_task_plan()
     provider.get_task_plan()
+    provider.get_environment_preflight()
+    provider.get_environment_preflight()
     assert calls["cards"] == 3
+    assert calls["preflight"] == 3
 
 
 def test_parallel_snapshot_reads_use_core_derived_concurrency(monkeypatch):

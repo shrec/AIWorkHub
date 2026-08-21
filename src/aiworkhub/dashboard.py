@@ -1835,7 +1835,10 @@ class DashboardProvider:
 
     def get_environment_preflight(self) -> dict[str, Any]:
         """Unified repository, policy, Source Graph and provider readiness."""
-        return repo_policy.build_preflight(self.repo_root)
+        return self._snapshot_once(
+            "environment_preflight",
+            lambda: repo_policy.build_preflight(self.repo_root),
+        )
 
     def get_workforce_catalog(self) -> dict[str, Any]:
         """Configured workforce joined to bounded canonical process evidence."""
@@ -1846,6 +1849,7 @@ class DashboardProvider:
             cards=list(self._task_cards()),
             process_rows=process_report.get("processes") or [],
             usage_rows=ledger.get("tasks") or [],
+            preflight=self.get_environment_preflight(),
             cost_per_accepted_outcome=ledger.get("cost_per_accepted_outcome") or {},
         )
 
