@@ -116,9 +116,11 @@ def _commit_validation_worker_package(repo: Path) -> None:
     ):
         shutil.copyfile(source_package / name, destination_package / name)
     (repo / "probe_candidate_import.py").write_text(
+        "import os\n"
         "from aiworkhub import worker_workspace as w\n"
         "print(w.__file__)\n"
-        "print(w.NF376_CANDIDATE_SENTINEL)\n",
+        "print(w.NF376_CANDIDATE_SENTINEL)\n"
+        "print(os.environ.get(w.PYTHON_CANDIDATE_AUTHORITY_ENV, ''))\n",
         encoding="utf-8",
     )
     assert _git(repo, "add", "src/aiworkhub", "probe_candidate_import.py").returncode == 0
@@ -161,6 +163,8 @@ def test_validation_workspace_seeds_exact_worker_package_support_and_imports_can
         with candidate_module.open("a", encoding="utf-8") as stream:
             stream.write("\nNF376_CANDIDATE_SENTINEL = 'candidate-worktree'\n")
 
+        expected_authority = worker_workspace.python_candidate_authority(workspace)
+
         result, = worker_workspace.run_validations(
             workspace,
             ["PYTHONPATH=src python3 probe_candidate_import.py"],
@@ -171,9 +175,55 @@ def test_validation_workspace_seeds_exact_worker_package_support_and_imports_can
         assert result["returncode"] == 0
         assert str(candidate_module) in result["stdout_head"]
         assert "candidate-worktree" in result["stdout_head"]
+        assert expected_authority["digest"] in result["stdout_head"]
+        assert result["python_candidate_authority"] == expected_authority
         assert worker_workspace.changed_paths(workspace) == [
             "src/aiworkhub/worker_workspace.py"
         ]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_python_candidate_authority_tracks_added_modified_and_deleted_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    _commit_validation_worker_package(repo)
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "authority-worktrees"),
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "candidate-authority",
+        {
+            "allowed_writes": ["src/aiworkhub/worker_workspace.py"],
+            "read_first": ["src/aiworkhub/worker_workspace.py"],
+            "validation": ["PYTHONPATH=src python3 probe_candidate_import.py"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        modified = workspace.path / "src/aiworkhub/worker_workspace.py"
+        modified.write_bytes(modified.read_bytes() + b"\n# modified\n")
+        added = workspace.path / "src/aiworkhub/added_authority.py"
+        added.write_bytes(b"VALUE = 1\n")
+        (workspace.path / "src/aiworkhub/runtime_temp.py").unlink()
+        (workspace.path / "src/aiworkhub/ignored.txt").write_bytes(b"not python\n")
+
+        authority = worker_workspace.python_candidate_authority(workspace)
+        states = {
+            row["path"]: row["state"] for row in authority["sources"]
+        }
+
+        assert states == {
+            "src/aiworkhub/added_authority.py": "added",
+            "src/aiworkhub/runtime_temp.py": "deleted",
+            "src/aiworkhub/worker_workspace.py": "modified",
+        }
+        assert len(authority["digest"]) == 64
+        assert set(authority["digest"]) <= set("0123456789abcdef")
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 

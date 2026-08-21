@@ -896,6 +896,58 @@ def _manifest_changed_paths(workspace: WorkerWorkspace, *, git_phase: str) -> li
     return sorted(rows)
 
 
+PYTHON_CANDIDATE_AUTHORITY_ENV = "AIWORKHUB_PYTHON_CANDIDATE_AUTHORITY"
+
+
+def _python_candidate_authority_rows(
+    workspace: WorkerWorkspace,
+) -> list[dict[str, str]]:
+    """Describe the exact retained Python delta without importing candidate code."""
+    # A real isolated workspace created by ``create_workspace`` always carries
+    # this manifest.  Lightweight unit/portability harnesses intentionally do
+    # not; they have no retained candidate delta to authorize.
+    if workspace.tree_baseline is None:
+        return []
+    current = _worktree_manifest(workspace.path)
+    rows: list[dict[str, str]] = []
+    for relative in sorted(set(workspace.tree_baseline) | set(current)):
+        if not relative.endswith(".py"):
+            continue
+        before = workspace.tree_baseline.get(relative)
+        after = current.get(relative)
+        if before == after:
+            continue
+        state = "added" if before is None else "deleted" if after is None else "modified"
+        row = {"path": _relative_repo_path(relative), "state": state}
+        if after is not None:
+            target = workspace.path / relative
+            if target.is_symlink() or not target.is_file():
+                raise WorkspaceError(
+                    f"python_candidate_authority_path_invalid:{relative}"
+                )
+            row["bytes_sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
+        rows.append(row)
+    return rows
+
+
+def python_candidate_authority(workspace: WorkerWorkspace) -> dict[str, Any]:
+    """Return deterministic path/state/bytes authority for Python candidate files."""
+    rows = _python_candidate_authority_rows(workspace)
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(row["path"].encode("utf-8"))
+        digest.update(b"\x1f")
+        digest.update(row["state"].encode("ascii"))
+        digest.update(b"\x1f")
+        digest.update(row.get("bytes_sha256", "").encode("ascii"))
+        digest.update(b"\x1e")
+    return {
+        "schema_id": "aiworkhub.python_candidate_authority.v1",
+        "digest": digest.hexdigest() if rows else "",
+        "sources": rows,
+    }
+
+
 def _expand_declared(repo: Path, declared: Iterable[str]) -> list[str]:
     """Expand declared paths from the live parent filesystem.
 
@@ -5821,6 +5873,7 @@ def run_validations(
                 cd_relative,
             ) = _parse_validation_command_detailed(command)
             declared_argv = list(tokens)
+            candidate_authority = python_candidate_authority(workspace)
             effective_components = pythonpath_components
             if _is_candidate_pytest_wrapper_command(tokens):
                 # NF128: the exact candidate wrapper gets declared
@@ -5910,6 +5963,8 @@ def run_validations(
             # this for every validation command is harmless; only mypy
             # consumes it.
             env["MYPY_CACHE_DIR"] = scratch_env_value
+            if candidate_authority["digest"]:
+                env[PYTHON_CANDIDATE_AUTHORITY_ENV] = candidate_authority["digest"]
             if _is_pytest_validation_command(tokens):
                 # Validation workspaces are intentionally read-only outside
                 # the declared task outputs.  Pytest's cache provider writes
@@ -5969,6 +6024,7 @@ def run_validations(
                         "env_override": env_override_evidence,
                         "sandbox_backend": selected_backend,
                         "execution_boundary": execution_boundary,
+                        "python_candidate_authority": candidate_authority,
                         "returncode": None,
                         "timed_out": True,
                         "duration_seconds": round(time.monotonic() - started, 6),
@@ -6001,6 +6057,7 @@ def run_validations(
                     "env_override": env_override_evidence,
                     "sandbox_backend": selected_backend,
                     "execution_boundary": execution_boundary,
+                    "python_candidate_authority": candidate_authority,
                     "returncode": None,
                     "timed_out": False,
                     "launch_error": type(exc).__name__,
@@ -6031,6 +6088,7 @@ def run_validations(
                 "env_override": env_override_evidence,
                 "sandbox_backend": selected_backend,
                 "execution_boundary": execution_boundary,
+                "python_candidate_authority": candidate_authority,
                 "returncode": result.returncode,
                 "duration_seconds": round(time.monotonic() - started, 6),
                 "stdout_head": stdout[:4_096],
