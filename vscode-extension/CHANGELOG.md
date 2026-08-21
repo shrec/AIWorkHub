@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.28 — 2026-08-21
+
+### Fixed
+
+- Repository switching transfers the verified foreground Codex manager route
+  with an atomic epoch fence instead of requiring the target window to claim
+  the chat in advance.
+- Truncated quality-evidence provenance is explicitly marked and consistent
+  across serializers.
+
 ## 0.10.27 — 2026-08-21
 
 ### Fixed

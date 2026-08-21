@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.28
+
+- A live Codex manager route can move between repositories atomically, with a
+  monotonic ownership fence, one-winner concurrency and exact rollback.
+- Quality evidence no longer silently truncates provenance in one serializer.
+
 ## What's new in 0.10.27
 
 - Malformed or missing validation-failure deltas are discarded with a

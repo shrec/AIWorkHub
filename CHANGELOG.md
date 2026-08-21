@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.28] - 2026-08-21
+
+### Fixed
+
+- A verified foreground Codex chat can atomically transfer its manager route
+  from the current live repository to another live repository without the
+  target already claiming that thread. A shared ownership fence uses
+  monotonic epochs, rejects stale/foreign and concurrent losers, and rolls
+  back exactly if target services fail to converge.
+- Quality-evidence provenance now uses the same explicit bounded-truncation
+  serializer in both canonical representations; short provenance remains
+  byte-for-byte unchanged.
+
 ## [0.10.27] - 2026-08-21
 
 ### Fixed
