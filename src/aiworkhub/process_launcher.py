@@ -44,6 +44,7 @@ from . import claude_auth
 from . import context_write_intents
 from . import context_writes
 from . import evidence_levels
+from . import kilo_auth
 from .platform_io import (
     AdvisoryLockTimeout,
     chmod_fd,
@@ -294,6 +295,20 @@ def sanitized_env(
         home=home,
         isolated_task_queue_db=isolated_task_queue_db,
     )
+    if adapter_id == runtime_adapters.GROK_KILO_ADAPTER:
+        # Kilo follows the XDG base-directory contract.  Point every mutable
+        # Kilo surface at the same request-local HOME that the selected
+        # sandbox exposes (the real workspace HOME for Landlock/AppContainer,
+        # or the shared mount alias for bubblewrap).  This prevents the CLI
+        # from consulting or mutating the coordinator's ambient Kilo state.
+        isolated_home = Path(safe["HOME"])
+        safe.update(
+            {
+                "XDG_DATA_HOME": str(isolated_home / ".local" / "share"),
+                "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+                "XDG_CACHE_HOME": str(isolated_home / ".cache"),
+            }
+        )
     if provider_env:
         safe.update({str(key): str(value) for key, value in provider_env.items()})
     return safe
@@ -4973,6 +4988,14 @@ class ProcessManager:
                 None,
                 str(readiness.get("resolved_model") or "").strip() or resolved_model,
             )
+        if adapter_id == runtime_adapters.GROK_KILO_ADAPTER:
+            resolved_model, model_error = runtime_adapters.resolve_grok_kilo_model(
+                model
+            )
+            if model_error:
+                raise LaunchRejected(f"grok_kilo_model_rejected:{model_error}")
+            assert resolved_model is not None
+            return None, resolved_model
         else:
             return None, model
 
@@ -6450,6 +6473,8 @@ class ProcessManager:
         residual_contract_manifest: list[dict[str, Any]] = []
         claimed = False
         provider_env: dict[str, str] | None = None
+        kilo_auth_source: Path | None = None
+        kilo_auth_evidence: dict[str, Any] | None = None
         launch_phase = "preflight"
 
         def _abandon_terminalized_reviewer() -> dict[str, Any]:
@@ -6521,6 +6546,17 @@ class ProcessManager:
             # A missing/invalid credential raises here, leaving the task
             # pending/unclaimed -- never claim on a missing credential.
             provider_env, model = self._resolve_provider_env(adapter_id, model)
+            if adapter_id == runtime_adapters.GROK_KILO_ADAPTER:
+                try:
+                    kilo_auth_source = kilo_auth.resolve_kilo_auth_source(
+                        home=Path.home(),
+                        xdg_data_home=os.environ.get("XDG_DATA_HOME") or None,
+                        platform_name=os.name,
+                    )
+                except kilo_auth.KiloAuthError as exc:
+                    raise LaunchRejected(
+                        f"grok_kilo_auth_unavailable:{exc.reason}"
+                    ) from exc
             sandbox_backend = _sandbox_backend_for_adapter(adapter_id)
             launch_phase = "workspace_and_runtime_provision"
             request_id = reserved_request_id or uuid.uuid4().hex
@@ -6661,6 +6697,26 @@ class ProcessManager:
                         card=card,
                         rework_overlay_packet=rework_overlay_packet,
                     )
+                if adapter_id == runtime_adapters.GROK_KILO_ADAPTER:
+                    if kilo_auth_source is None:
+                        raise LaunchRejected("grok_kilo_auth_unavailable:source_unresolved")
+                    try:
+                        projection = kilo_auth.project_xai_auth(
+                            kilo_auth_source, workspace.home
+                        )
+                    except kilo_auth.KiloAuthError as exc:
+                        # Never include the coordinator auth path or provider
+                        # record in launch evidence.  The typed reason is
+                        # sufficient for a bounded pre-claim failure.
+                        raise LaunchRejected(
+                            f"grok_kilo_auth_unavailable:{exc.reason}"
+                        ) from exc
+                    kilo_auth_evidence = {
+                        "provider": projection.provider,
+                        "status": projection.status,
+                        "destination_bytes": projection.destination_bytes,
+                        "destination_sha256": projection.destination_sha256,
+                    }
                 worker_source_graph_targets = _worker_mcp_source_graph_targets(context_result)
                 worker_session_topic = _worker_mcp_session_topic(context_result, topic)
                 worker_mcp_runtime = _provision_worker_mcp_runtime_for_authority(
@@ -6933,6 +6989,8 @@ class ProcessManager:
                         "claude_mcp_config_path": str(worker_mcp_runtime.claude_mcp_config_path),
                         "copilot_mcp_config_path": str(worker_mcp_runtime.copilot_mcp_config_path),
                         "codex_config_toml_path": str(worker_mcp_runtime.codex_config_toml_path),
+                        "kilo_config_path": str(worker_mcp_runtime.kilo_config_path),
+                        "kilo_auth": kilo_auth_evidence,
                         "authority_repo": str(authority_repo),
                         "source_graph_targets": worker_source_graph_targets,
                         "allowed_writes": [

@@ -71,6 +71,140 @@ def _manager(tmp_path: Path, *, show_task, argv) -> process_launcher.ProcessMana
     )
 
 
+def test_grok_kilo_provider_preflight_resolves_only_supported_model(tmp_path) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+
+    provider_env, model = manager._resolve_provider_env("grok_kilo_cli", None)
+    assert provider_env is None
+    assert model == "xai/grok-4.6"
+
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match="grok_kilo_model_rejected:unsupported_grok_kilo_model",
+    ):
+        manager._resolve_provider_env("grok_kilo_cli", "xai/grok-4.5")
+
+
+def test_grok_kilo_child_env_is_request_local_and_secret_free(tmp_path) -> None:
+    home = tmp_path / "isolated-home"
+    env = process_launcher.sanitized_env("grok_kilo_cli", home=home)
+
+    assert env["HOME"] == str(home.resolve())
+    assert env["XDG_DATA_HOME"] == str(home.resolve() / ".local" / "share")
+    assert env["XDG_CONFIG_HOME"] == str(home.resolve() / ".config")
+    assert env["XDG_CACHE_HOME"] == str(home.resolve() / ".cache")
+    assert not any("TOKEN" in key or "API_KEY" in key for key in env)
+
+
+def test_grok_kilo_launch_projects_auth_before_worker_runtime_registration(
+    monkeypatch, tmp_path
+) -> None:
+    _open_gates(monkeypatch)
+    secret = "xai-secret-must-never-appear"
+    source = tmp_path / "coordinator-auth.json"
+    source.write_text(
+        json.dumps(
+            {
+                "xai": {"type": "oauth", "refresh": secret},
+                "unrelated": {"token": "must-be-stripped"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "request" / "worktree"
+    home = tmp_path / "request" / "home"
+    for directory in (repo, worktree, home):
+        directory.mkdir(parents=True)
+    card = {
+        "task_id": "TASK_GROK",
+        "runner": "grok_runner",
+        "topic": "code",
+        "status": "pending",
+        "worker_status": "unclaimed",
+        "claimed_by": "",
+        "allowed_writes": ["out/result.json"],
+        "priority": "high",
+    }
+    workspace = process_launcher.WorkerWorkspace(
+        request_id="placeholder",
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=("out/result.json",),
+        parent_baseline={"out/result.json": None},
+        workspace_baseline={"out/result.json": None},
+    )
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(lambda: card),
+        collision_guard=_collision,
+        adapter_builder=_plan(["kilo"], repo),
+    )
+    monkeypatch.setattr(manager, "_preflight_card", lambda *a, **k: dict(card))
+    monkeypatch.setattr(
+        process_launcher, "_launch_project_context", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        process_launcher, "_sandbox_backend_for_adapter", lambda _adapter: "landlock"
+    )
+    monkeypatch.setattr(
+        process_launcher.kilo_auth,
+        "resolve_kilo_auth_source",
+        lambda **_kwargs: source,
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "create_workspace",
+        lambda _repo, request_id, _card, _adapter: process_launcher.replace(
+            workspace, request_id=request_id
+        ),
+    )
+    monkeypatch.setattr(
+        process_launcher, "build_residual_contract_manifest", lambda *a, **k: []
+    )
+    order: list[str] = []
+
+    def stop_after_projection(*_args, **_kwargs):
+        projected = json.loads(
+            (home / ".local" / "share" / "kilo" / "auth.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert list(projected) == ["xai"]
+        assert projected["xai"]["refresh"] == secret
+        order.append("projected-before-runtime")
+        raise RuntimeError("stop-after-kilo-projection")
+
+    monkeypatch.setattr(
+        process_launcher,
+        "_provision_worker_mcp_runtime_for_authority",
+        stop_after_projection,
+    )
+
+    result = manager._launch_isolated(
+        task_id="TASK_GROK",
+        runner="grok_runner",
+        topic="code",
+        adapter_id="grok_kilo_cli",
+        model="xai/grok-4.6",
+        owner_prompt="",
+        timeout_seconds=30,
+    )
+
+    assert order == ["projected-before-runtime"]
+    assert result["ok"] is False
+    serialized = json.dumps(result, sort_keys=True)
+    assert secret not in serialized
+    assert str(source) not in serialized
+
+
 def _claim_receipt(*, epoch: object = 2, request_id: str = "req-claim") -> dict:
     return {
         "ok": True,
