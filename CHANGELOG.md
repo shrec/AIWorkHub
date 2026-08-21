@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.11] - 2026-08-21
+
+### Performance
+
+- Worker isolation now registers a no-checkout worktree and materializes only
+  task-card-declared files with Git sparse-checkout. The canonical fresh
+  finalization preflight fell to about 24 ms while mechanical modified, added,
+  deleted and renamed-path verification remains intact.
+- Repeated request-event lookups reuse an identity-safe ledger projection;
+  measured warm lookup time fell from about 1.24 seconds to below 0.2 ms while
+  append, rotation, truncation and replacement invalidate the cache.
+
+### Fixed
+
+- Windows cleanup recovers from an exact `git worktree remove` timeout by
+  deleting only the request-owned tree and pruning its missing registration;
+  failures now report the actual cleanup command instead of an earlier diff.
+- Semantic edits containing literal angle placeholders such as `<code>` or
+  `<implementation>` are rejected before they can replace valid source.
+
 ## [0.10.10] - 2026-08-20
 
 ### Fixed

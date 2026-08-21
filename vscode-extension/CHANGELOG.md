@@ -1,5 +1,23 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.11 — 2026-08-21
+
+### Performance
+
+- Windows and Linux workers now materialize declared sparse worktrees instead
+  of checking out an entire repository for every task. Finalization preflight
+  remains mechanically verified and completes in milliseconds on the
+  canonical repository.
+- Request-scoped event lookup uses an identity-safe warm projection rather
+  than reparsing the complete process ledger for every worker tool call.
+
+### Fixed
+
+- Timed-out Windows worktree removal has a bounded request-owned cleanup/prune
+  fallback and reports the exact failing command.
+- Literal `<code>` and `<implementation>` semantic-edit placeholders are
+  rejected before file mutation.
+
 ## 0.10.10 — 2026-08-20
 
 ### Fixed

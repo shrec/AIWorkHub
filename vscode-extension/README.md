@@ -12,6 +12,16 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.11
+
+- Workers materialize only task-declared files in sparse linked worktrees,
+  avoiding whole-repository checkout cost while retaining mechanical scope and
+  zero-diff verification.
+- Warm process-event lookups no longer reparse the complete ledger, and exact
+  append/rotation/replacement identities invalidate cached projections.
+- Windows cleanup timeout recovery is request-owned and diagnostics identify
+  the real failing command; semantic-edit placeholders fail closed.
+
 ## What's new in 0.10.10
 
 - Byte-identical compatibility edits are verified without rewriting files or
