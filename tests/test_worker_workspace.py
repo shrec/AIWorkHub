@@ -55,6 +55,57 @@ def test_cleanup_unregisters_a_registered_worktree_whose_directory_is_missing(
     assert not root.exists()
 
 
+def test_cleanup_registered_worktree_is_process_free(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    tmp_path: Path,
+) -> None:
+    request_id = "req-process-free-cleanup"
+    root = tmp_path / "worktrees" / request_id
+    path = root / "worktree"
+    home = root / "home"
+    assert _git(repo, "worktree", "add", "--detach", str(path), "HEAD").returncode == 0
+    home.mkdir(parents=True)
+    before = _git(repo, "worktree", "list", "--porcelain").stdout
+    assert str(path) in before
+
+    def subprocess_forbidden(*_args, **_kwargs):
+        raise AssertionError("cleanup must not spawn Git")
+
+    monkeypatch.setattr(worker_workspace, "_run", subprocess_forbidden)
+    worker_workspace.cleanup_workspace(repo, path, home, git_timeout=0.01)
+
+    assert not root.exists()
+    after = _git(repo, "worktree", "list", "--porcelain").stdout
+    assert str(path) not in after
+
+
+def test_cleanup_fails_closed_on_mismatched_reciprocal_registration(
+    repo: Path,
+    tmp_path: Path,
+) -> None:
+    request_id = "req-mismatched-registration"
+    root = tmp_path / "worktrees" / request_id
+    path = root / "worktree"
+    home = root / "home"
+    assert _git(repo, "worktree", "add", "--detach", str(path), "HEAD").returncode == 0
+    home.mkdir(parents=True)
+    marker = path / ".git"
+    admin_dir = worker_workspace._gitdir_pointer(
+        marker, label="test_workspace_marker"
+    )
+    (admin_dir / "gitdir").write_text(
+        str(tmp_path / "different" / ".git"), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="workspace_cleanup_registration_mismatch",
+    ):
+        worker_workspace.cleanup_workspace(repo, path, home)
+    assert root.exists()
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "parent"

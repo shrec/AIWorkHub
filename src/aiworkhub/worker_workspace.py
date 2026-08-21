@@ -2501,6 +2501,83 @@ def create_workspace(
     )
 
 
+def _registered_worktree_admin_dir(repo: Path, path: Path) -> Path | None:
+    """Return the exact reciprocal Git worktree registration, if present."""
+    common = _common_git_dir(repo)
+    admin_root = common / "worktrees"
+    if admin_root.is_symlink():
+        raise WorkspaceError("workspace_cleanup_admin_root_symlink")
+    marker = path / ".git"
+    expected_marker = marker.resolve(strict=False)
+    candidates: list[Path] = []
+    if marker.is_file() and not marker.is_symlink():
+        candidates.append(_gitdir_pointer(marker, label="workspace_git_marker"))
+    elif admin_root.is_dir():
+        try:
+            entries = list(os.scandir(admin_root))
+        except OSError as exc:
+            raise WorkspaceError("workspace_cleanup_admin_scan_failed") from exc
+        if len(entries) > MAX_SEED_FILES:
+            raise WorkspaceError("workspace_cleanup_admin_scan_limit_exceeded")
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+            candidates.append(Path(entry.path))
+    matches: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved.parent != admin_root.resolve(strict=False):
+            if marker.is_file():
+                raise WorkspaceError("workspace_cleanup_admin_escape")
+            continue
+        gitdir_file = resolved / "gitdir"
+        if gitdir_file.is_symlink() or not gitdir_file.is_file():
+            if marker.is_file():
+                raise WorkspaceError("workspace_cleanup_reverse_pointer_missing")
+            continue
+        reverse = _read_git_control_file(
+            gitdir_file, label="workspace_cleanup_reverse_pointer"
+        )
+        reverse_path = Path(reverse)
+        if not reverse_path.is_absolute():
+            reverse_path = resolved / reverse_path
+        if reverse_path.resolve(strict=False) == expected_marker:
+            matches.append(resolved)
+    unique = sorted(set(matches))
+    if len(unique) > 1:
+        raise WorkspaceError("workspace_cleanup_registration_ambiguous")
+    if marker.is_file() and not unique:
+        raise WorkspaceError("workspace_cleanup_registration_mismatch")
+    return unique[0] if unique else None
+
+
+def _rmtree_workspace_owned(root: Path) -> None:
+    """Remove one already-authorized workspace/admin tree, repairing mode only."""
+    if not root.exists():
+        return
+    if root.is_symlink() or not root.is_dir():
+        raise WorkspaceError("workspace_cleanup_root_invalid")
+
+    def repair_and_retry(function: Any, target: str, _exc: BaseException) -> None:
+        try:
+            os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+            function(target)
+        except OSError as exc:
+            raise WorkspaceError(
+                f"workspace_cleanup_remove_failed:{Path(target).name}:"
+                f"{type(exc).__name__}"
+            ) from exc
+
+    try:
+        shutil.rmtree(root, onexc=repair_and_retry)
+    except TypeError:  # pragma: no cover - Python <3.12 compatibility
+        shutil.rmtree(root, onerror=repair_and_retry)
+    except OSError as exc:
+        raise WorkspaceError(
+            f"workspace_cleanup_remove_failed:{root.name}:{type(exc).__name__}"
+        ) from exc
+
+
 def cleanup_workspace(
     repo: Path,
     path: Path,
@@ -2521,43 +2598,20 @@ def cleanup_workspace(
         path == repo or repo in path.parents
     ) and workspace_root != canonical_repo_root:
         raise WorkspaceError("refusing_to_cleanup_parent_worktree")
-    # Ask Git to unregister the exact worktree even when its directory has
-    # already disappeared.  ``git worktree remove --force`` is intentionally
-    # idempotent for a registered-but-missing path; gating this call on
-    # ``path.exists()`` left prunable entries in ``.git/worktrees`` forever.
-    remove_error: WorkspaceError | None = None
-    try:
-        _run(
-            ["git", "worktree", "remove", "--force", str(path)],
-            cwd=repo,
-            timeout=git_timeout,
-            phase="workspace_cleanup",
-        )
-    except WorkspaceError as exc:
-        # A timed-out Windows Git child may already have released every file
-        # handle. Remove the request-owned directory mechanically and let prune
-        # unregister only the now-missing administrative record.
-        remove_error = exc
-    shutil.rmtree(path.parent, ignore_errors=True)
-    # A failed first remove (for example, because Windows still had a handle
-    # open) may become removable after the directory cleanup.  Prune only
-    # administratively stale registrations; Git never deletes a live
-    # worktree through this command.
-    try:
-        _run(
-            ["git", "worktree", "prune", "--expire", "now"],
-            cwd=repo,
-            timeout=git_timeout,
-            phase="workspace_cleanup",
-        )
-    except WorkspaceError:
-        if remove_error is not None:
-            raise remove_error
-        raise
-    if path.exists() or home.exists():
-        if remove_error is not None:
-            raise remove_error
-        raise WorkspaceError("workspace_cleanup_incomplete")
+    # Cleanup must remain serviceable even when Git subprocesses are the thing
+    # that is wedged (the Windows NF356 failure). Resolve the one registration
+    # by its reciprocal gitdir pointers, remove the request-owned tree, then
+    # remove only that exact administrative directory. No global prune and no
+    # subprocess are needed.
+    _ = git_timeout  # retained API compatibility; cleanup is process-free.
+    admin_dir = _registered_worktree_admin_dir(repo, path)
+    _rmtree_workspace_owned(path.parent)
+    if path.exists() or home.exists() or path.parent.exists():
+        raise WorkspaceError("workspace_cleanup_directory_retained")
+    if admin_dir is not None:
+        _rmtree_workspace_owned(admin_dir)
+        if admin_dir.exists():
+            raise WorkspaceError("workspace_cleanup_registration_retained")
 
 
 def finalization_preflight_probe(
