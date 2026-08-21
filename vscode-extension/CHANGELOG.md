@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.30 — 2026-08-21
+
+### Fixed
+
+- Provider infrastructure failures no longer count as model-quality failures
+  in workforce ranking.
+- Repository-disabled routes no longer degrade aggregate Preflight coverage.
+- Reload rebinding supersedes stale callback wakes instead of preserving a
+  historical pending backlog.
+
 ## 0.10.29 — 2026-08-21
 
 ### Fixed

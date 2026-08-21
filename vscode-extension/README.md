@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.30
+
+- Workforce quality scores distinguish provider/control-plane failures from
+  candidate validation evidence.
+- Preflight coverage respects repository-local model switches, and reload
+  callback reconciliation prunes wakes from completed terminal episodes.
+
 ## What's new in 0.10.29
 
 - Required research-card MCP tools are enforced by the authenticated audit

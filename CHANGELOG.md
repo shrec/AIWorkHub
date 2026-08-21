@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.30] - 2026-08-21
+
+### Fixed
+
+- Workforce quality evidence now excludes launch, transport, timeout and
+  finalization infrastructure failures while retaining validation failures as
+  model-quality evidence. High-assurance routing is no longer poisoned by
+  control-plane incidents.
+- Repository-disabled model routes are excluded from aggregate Preflight
+  coverage as well as workforce selection, so an intentionally disabled CLI
+  route cannot make an otherwise healthy repository appear degraded.
+- Manager reload rebinding now prunes callbacks whose task is no longer in the
+  matching terminal episode instead of repeatedly carrying historical pending
+  wakes into the active manager backlog.
+- The query-only reviewer Source Graph regression now scopes its build spy to
+  the candidate overlay, preventing an unrelated concurrent background index
+  from causing a false suite failure.
+
 ## [0.10.29] - 2026-08-21
 
 ### Fixed
