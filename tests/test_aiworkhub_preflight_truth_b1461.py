@@ -161,7 +161,7 @@ def test_windows_platform_exclusions_do_not_degrade_ready_editor_routes(monkeypa
     assert summary["eligible_route_count"] == 3
     assert summary["launchable_route_count"] == 3
     assert summary["unavailable_route_count"] == 0
-    assert summary["excluded_route_count"] == 4
+    assert summary["excluded_route_count"] == 5
     assert summary["coverage_ratio"] == 1.0
     assert all(item["exclusion"] == "platform" for item in summary["excluded_routes"])
 

@@ -12,6 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.38
+
+- Grok 4.6 is available through the authenticated Kilo/xAI subscription route
+  and can be enabled or disabled independently in Repository Settings.
+- Every Grok worker receives a private request-local Kilo HOME, xAI-only auth
+  projection and AIWorkHub MCP configuration; ambient providers stay outside
+  the sandbox.
+
 ## What's new in 0.10.37
 
 - Rework tasks now preserve authenticated Source Graph authority when the

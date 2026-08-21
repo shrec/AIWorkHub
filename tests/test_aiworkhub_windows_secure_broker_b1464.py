@@ -248,7 +248,7 @@ def test_windows_preflight_excludes_native_cli_but_keeps_editor_bridge_ready(
     assert report["status"] == "ready"
     assert report["provider_summary"]["coverage_status"] == "full"
     assert report["provider_summary"]["unavailable_route_count"] == 0
-    assert report["provider_summary"]["excluded_route_count"] == 4
+    assert report["provider_summary"]["excluded_route_count"] == 5
 
 
 def test_windows_workforce_allocation_uses_only_launchable_editor_routes(

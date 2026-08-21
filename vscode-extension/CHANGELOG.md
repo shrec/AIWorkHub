@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.38 — 2026-08-21
+
+### Added
+
+- Grok 4.6 through the authenticated Kilo/xAI subscription route, with
+  repository-level enable/disable controls and truthful preflight status.
+- Per-worker isolated Kilo auth, XDG state and AIWorkHub MCP tool config.
+
 ## 0.10.37 — 2026-08-21
 
 ### Fixed

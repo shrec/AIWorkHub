@@ -301,6 +301,7 @@ def test_awh_obs_014_every_configured_adapter_is_accounted_for() -> None:
         "vscode_lm": (),
         "deepseek_vscode_lm": (),
         "glm_vscode_lm": (),
+        "grok_kilo_cli": (),
         "deepseek_manual": (),  # manual-only, never launched
     }
     # Every supported adapter has an accounted-for telemetry entry -- no adapter

@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.38] - 2026-08-21
+
+### Added
+
+- Added the native `grok_kilo_cli` route for the exact `xai/grok-4.6` model,
+  including deterministic Kilo executable discovery, repository-local model
+  controls, workforce routing and truthful preflight observability.
+- Added an xAI-only credential projection into each request's isolated Kilo
+  HOME and generated a private Kilo MCP configuration for worker tools.
+
+### Security
+
+- Grok workers use request-scoped HOME and XDG data/config/cache roots; no
+  ambient Kilo providers, credentials or caches enter the sandbox.
+- Launch evidence contains only bounded, secret-free xAI projection metadata.
+
 ## [0.10.37] - 2026-08-21
 
 ### Fixed
