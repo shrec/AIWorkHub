@@ -209,6 +209,7 @@ def _seed_gc_candidate(
     workspace_retained: bool = True,
     create_dirs: bool = True,
     root: Path | None = None,
+    error: str = "",
 ) -> tuple[Path, Path, Path]:
     """Seed one persisted request whose retained workspace physically exists
     at the exact ``<root>/<request_id>/{worktree,home}`` shape GC expects."""
@@ -262,6 +263,7 @@ def _seed_gc_candidate(
         "pid_start_ticks": pid_start_ticks,
         "metadata_path": str(metadata_path),
         "workspace_retained": workspace_retained,
+        "error": error,
     })
     return path, home, metadata_path
 
@@ -489,6 +491,107 @@ def test_current_review_request_is_preserved_but_older_attempt_is_gc_cleaned(tmp
     assert manager._request_events(older_request)[-1]["workspace_gc_reason"] == (
         f"superseded_review_request:{current_request}"
     )
+
+
+def test_readonly_validation_failure_without_hashes_keeps_primary_failure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    request_id = "req-readonly-validation-failed"
+    card = _card()
+    card.update({
+        "status": "review",
+        "worker_status": "review",
+        "allowed_writes": [],
+    })
+    primary_error = (
+        "validation_required_aiworkhub_mcp_call_missing:"
+        "worker_mcp_required_tools_missing:session_current_state,ai_memory,kb"
+    )
+    manager = _build_manager(tmp_path, card)
+    path, home, metadata_path = _seed_gc_candidate(
+        manager,
+        tmp_path,
+        card,
+        request_id=request_id,
+        pid=2_147_483_079,
+        pid_start_ticks=999_999_929,
+        state="validation_failed",
+        error=primary_error,
+    )
+    # A real read-only worktree has no worker-created repository bytes.  The
+    # isolated HOME may still contain runtime evidence.
+    (path / "evidence.txt").unlink()
+    workspace_payload = json.loads(metadata_path.read_text(encoding="utf-8"))["workspace"]
+    card["terminal_review"] = {
+        "substatus": "validation_failed",
+        "evidence": {
+            "request_identity": {
+                "request_id": request_id,
+                "task_id": card["task_id"],
+                "runner": card["runner"],
+            },
+            "workspace": workspace_payload,
+            "changed_paths": [],
+            "error": primary_error,
+        },
+    }
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "mark_review_workspace_missing",
+        lambda *_args, **_kwargs: pytest.fail(
+            "read-only zero-diff validation failure must not be reclassified"
+        ),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "quarantine_review_workspace",
+        lambda *_args, **_kwargs: pytest.fail(
+            "read-only zero-diff validation failure must not be quarantined"
+        ),
+    )
+
+    result = manager._gc_finalized_workspaces()
+
+    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
+    assert path.exists() and home.exists()
+    latest = manager._request_events(request_id)[-1]
+    assert latest["state"] == "validation_failed"
+    assert latest["error"] == primary_error
+    assert "workspace_gc" not in latest
+
+
+def test_writable_validation_failure_without_hashes_still_fails_closed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    request_id = "req-writable-validation-failed"
+    card = _card()
+    card.update({"status": "review", "worker_status": "review"})
+    manager = _build_manager(tmp_path, card)
+    _, _, metadata_path = _seed_gc_candidate(
+        manager,
+        tmp_path,
+        card,
+        request_id=request_id,
+        pid=2_147_483_080,
+        pid_start_ticks=999_999_930,
+        state="validation_failed",
+    )
+    workspace_payload = json.loads(metadata_path.read_text(encoding="utf-8"))["workspace"]
+    card["terminal_review"] = {
+        "substatus": "validation_failed",
+        "evidence": {
+            "request_identity": {"request_id": request_id},
+            "workspace": workspace_payload,
+            "changed_paths": [],
+        },
+    }
+    workspace = worker_workspace.WorkerWorkspace.from_metadata(workspace_payload)
+
+    assert manager._retained_review_workspace_integrity(
+        card, request_id, workspace
+    ) == (False, "review_workspace_hashes_missing")
 
 
 def test_review_without_exact_request_identity_fails_closed(tmp_path, monkeypatch):

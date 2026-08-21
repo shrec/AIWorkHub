@@ -8622,6 +8622,20 @@ class ProcessManager:
             return False, "review_workspace_evidence_missing"
         stored_hashes = evidence.get("changed_path_hashes")
         changed_paths = evidence.get("changed_paths")
+        # A read-only validation failure has no candidate bytes to seal.  The
+        # finalizer's mechanically-derived empty ``changed_paths`` list is the
+        # complete evidence for that case, so requiring a hash map that cannot
+        # contain any entries only lets retention GC replace the real gate
+        # failure with ``review_workspace_hashes_missing``.  Keep writable and
+        # review-ready candidates on the existing fail-closed hash path.
+        if (
+            stored_hashes is None
+            and changed_paths == []
+            and not metadata_workspace.allowed_writes
+            and not review_workspace.allowed_writes
+            and str(terminal.get("substatus") or "") == "validation_failed"
+        ):
+            stored_hashes = {}
         if not isinstance(stored_hashes, dict):
             return False, "review_workspace_hashes_missing"
         if not stored_hashes and isinstance(changed_paths, list) and changed_paths:
