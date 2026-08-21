@@ -5567,8 +5567,12 @@ def _approved_pythonpath_site(component: str) -> Path:
         )
     approved_raw = Path(site.getusersitepackages())
     approved_site = approved_raw.resolve()
+    pytest_runtime = _current_pytest_runtime_root()
+    approved_paths = {approved_raw, approved_site}
+    if pytest_runtime is not None:
+        approved_paths.add(pytest_runtime)
     # Reject untrusted spellings before containment can dereference a UNC path.
-    if candidate not in (approved_raw, approved_site):
+    if candidate not in approved_paths:
         raise WorkspaceError(
             f"validation_pythonpath_absolute_component_forbidden:{component}"
         )
@@ -5586,7 +5590,7 @@ def _approved_pythonpath_site(component: str) -> Path:
                 f"validation_pythonpath_absolute_component_forbidden:{component}"
             ) from exc
         raise
-    if target != approved_site or not target.is_dir():
+    if target not in approved_paths or not target.is_dir():
         raise WorkspaceError(
             f"validation_pythonpath_absolute_component_forbidden:{component}"
         )
@@ -5814,27 +5818,19 @@ def _uninstall_candidate_pytest_wrapper_module(
     sys.modules.pop(module_name, None)
 
 
-def resolve_trusted_pytest_runtime_root() -> Path:
-    """Resolve and validate the one canonical, read-only pytest package root
-    used to repair ``pytest``/``python3 -m pytest`` validation commands under
-    the sanitized, credential-free validation HOME (B755).
+def _current_pytest_runtime_root() -> Path | None:
+    """Return the exact site-packages root supplying this interpreter's pytest."""
+    spec = importlib.util.find_spec("pytest")
+    if spec is None or not isinstance(spec.origin, str) or not spec.origin:
+        return None
+    package_init = Path(spec.origin)
+    if package_init.name != "__init__.py" or package_init.parent.name != "pytest":
+        return None
+    return package_init.parent.parent.resolve(strict=False)
 
-    B753/B674 false negative: an isolated validation run's sanitized HOME has
-    no ``~/.local/lib/pythonX/site-packages`` of its own, so a pytest
-    validation command fails with ``ModuleNotFoundError: No module named
-    'pytest'`` even though the parent host has pytest installed. This
-    resolves the exact same trusted root ``resolve_validation_pythonpath``
-    already accepts as the sole approved absolute PYTHONPATH component
-    (``site.getusersitepackages()`` under the current, unsandboxed
-    coordinator interpreter's real HOME), and additionally rejects it
-    outright if it is a symlink, not owned by this process's user,
-    world-writable, or does not actually contain an importable ``pytest``
-    package -- never a copy, never any other real-HOME content, never
-    writable. Fails closed with a ``WorkspaceError`` if no such root exists,
-    instead of silently handing back a path that will fail to import at test
-    time.
-    """
-    raw = Path(site.getusersitepackages())
+
+def _validate_pytest_runtime_root(raw: Path) -> Path:
+    """Validate one exact pytest package root without broadening PYTHONPATH."""
     if raw.is_symlink():
         raise WorkspaceError(f"validation_pytest_runtime_symlink_forbidden:{raw}")
     candidate = raw.resolve(strict=False)
@@ -5847,20 +5843,53 @@ def resolve_trusted_pytest_runtime_root() -> Path:
     except OSError as exc:
         raise WorkspaceError(f"validation_pytest_runtime_unavailable:{candidate}") from exc
     # The host pytest runtime is only checked for same-owner where POSIX
-    # ownership is meaningful; Windows ACLs protect the user site-packages
-    # tree, and os.getuid() is unavailable there.
+    # ownership is meaningful; Windows ACLs protect the package tree.
     if os.name != "nt" and info.st_uid != os.getuid():
         raise WorkspaceError(f"validation_pytest_runtime_untrusted_owner:{candidate}")
-    # POSIX mode bits are only an authoritative world-writable determination
-    # on POSIX. On Windows st_mode carries no ACL information, so the 0o002
-    # bit there is meaningless and previously rejected every pytest
-    # validation with validation_pytest_runtime_world_writable.
     if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o002:
         raise WorkspaceError(f"validation_pytest_runtime_world_writable:{candidate}")
     package_init = candidate / "pytest" / "__init__.py"
     if package_init.is_symlink() or not package_init.is_file():
         raise WorkspaceError(f"validation_pytest_runtime_missing_pytest:{candidate}")
     return candidate
+
+
+def resolve_trusted_pytest_runtime_root() -> Path:
+    """Resolve and validate the one canonical, read-only pytest package root
+    used to repair ``pytest``/``python3 -m pytest`` validation commands under
+    the sanitized, credential-free validation HOME (B755).
+
+    B753/B674 false negative: an isolated validation run's sanitized HOME has
+    no ``~/.local/lib/pythonX/site-packages`` of its own, so a pytest
+    validation command fails with ``ModuleNotFoundError: No module named
+    'pytest'`` even though the parent host has pytest installed. This
+    resolves the exact same trusted root ``resolve_validation_pythonpath``
+    accepts as an approved absolute PYTHONPATH component. The configured user
+    site remains preferred; when that real configured directory is absent (as
+    in an activated CI virtualenv), the exact site-packages root supplying the
+    coordinator interpreter's own pytest package is used. Both paths reject
+    outright if it is a symlink, not owned by this process's user,
+    world-writable, or does not actually contain an importable ``pytest``
+    package -- never a copy, never any other real-HOME content, never
+    writable. Fails closed with a ``WorkspaceError`` if no such root exists,
+    instead of silently handing back a path that will fail to import at test
+    time.
+    """
+    raw = Path(site.getusersitepackages())
+    try:
+        return _validate_pytest_runtime_root(raw)
+    except WorkspaceError as exc:
+        configured = getattr(site, "USER_SITE", None)
+        configured_raw = Path(configured) if isinstance(configured, str) else None
+        recoverable = str(exc).startswith(
+            ("validation_pytest_runtime_unavailable:", "validation_pytest_runtime_missing_pytest:")
+        )
+        if configured_raw is None or raw != configured_raw or not recoverable:
+            raise
+        runtime_root = _current_pytest_runtime_root()
+        if runtime_root is None or runtime_root == raw.resolve(strict=False):
+            raise
+        return _validate_pytest_runtime_root(runtime_root)
 
 
 def _validation_pythonpath_readonly_dirs(components: tuple[str, ...]) -> tuple[Path, ...]:

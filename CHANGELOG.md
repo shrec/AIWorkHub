@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.35] - 2026-08-21
+
+### Fixed
+
+- Pytest validation now falls back from an absent configured user site to the
+  exact trusted pytest package root of the active virtualenv, keeping sparse
+  candidate validation portable across GitHub Actions Python 3.12–3.14.
+
 ## [0.10.34] - 2026-08-21
 
 ### Fixed

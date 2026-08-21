@@ -12,6 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.35
+
+- Isolated validation uses the exact pytest runtime from the active virtualenv
+  when CI has no user site-packages directory.
+
 ## What's new in 0.10.34
 
 - Sparse pytest workspaces retain repository-local configuration, so parent

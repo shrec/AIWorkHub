@@ -258,6 +258,25 @@ class TestResolveTrustedPytestRuntimeRoot(_TolerateNestedSeccompChmodDenial):
             with self.assertRaisesRegex(worker_workspace.WorkspaceError, "validation_pytest_runtime_unavailable"):
                 worker_workspace.resolve_trusted_pytest_runtime_root()
 
+    def test_missing_configured_user_site_uses_exact_active_venv_runtime(self) -> None:
+        missing = self.tmp_path / "configured-user-site-does-not-exist"
+        runtime = self.tmp_path / "venv" / "lib" / "site-packages"
+        runtime.mkdir(parents=True)
+        os.chmod(runtime, 0o755)
+        _write_fake_pytest_package(runtime)
+        spec = mock.Mock(origin=str(runtime / "pytest" / "__init__.py"))
+        with mock.patch.object(
+            worker_workspace.site, "getusersitepackages", return_value=str(missing)
+        ), mock.patch.object(
+            worker_workspace.site, "USER_SITE", str(missing)
+        ), mock.patch.object(
+            worker_workspace.importlib.util, "find_spec", return_value=spec
+        ):
+            resolved = worker_workspace.resolve_trusted_pytest_runtime_root()
+            approved = worker_workspace._approved_pythonpath_site(str(resolved))
+        self.assertEqual(resolved, runtime.resolve())
+        self.assertEqual(approved, runtime.resolve())
+
     def test_symlinked_root_is_rejected(self) -> None:
         real_dir = self.tmp_path / "real_site_packages"
         real_dir.mkdir()

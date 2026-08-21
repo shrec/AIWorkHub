@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.35 — 2026-08-21
+
+### Fixed
+
+- Isolated pytest validation resolves the active virtualenv runtime when the
+  configured user site is absent, fixing Python 3.12–3.14 CI and packaging.
+
 ## 0.10.34 — 2026-08-21
 
 ### Fixed
