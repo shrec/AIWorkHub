@@ -12,6 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.15
+
+- Dashboard plan, workforce, collision and cost readers share the same
+  snapshot-scoped canonical inputs, removing duplicate SQLite verification
+  and card decoding while preserving fresh state on every refresh.
+- Canonical full-snapshot median time fell from about 2.48 seconds to 2.02
+  seconds; focused and full repository suites preserve output parity.
+
 ## What's new in 0.10.14
 
 - Exact request-ledger-owned worktrees are reclaimable after their canonical

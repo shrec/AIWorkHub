@@ -928,7 +928,7 @@ def test_production_provider_uses_only_existing_read_paths(monkeypatch, tmp_path
 
     assert ("task_store.list_tasks", root, "pending", 25) in calls
     assert ("task_store.get_task", root, "TASK_PENDING_B12_V1") in calls
-    assert ("cost_ledger.build_cost_ledger", root, False) in calls
+    assert ("cost_ledger.build_cost_ledger", root, True) in calls
     assert all(
         call[0].startswith("task_store.")
         or call[0] == "cost_ledger.build_cost_ledger"

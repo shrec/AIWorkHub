@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.15 — 2026-08-21
+
+### Performance
+
+- Parallel dashboard readers now share one snapshot-scoped task-card and
+  cost-ledger projection instead of repeating the same SQLite checks and JSON
+  decoding. The canonical full refresh improved by roughly 19% without a
+  cross-refresh cache or stale-state window.
+
 ## 0.10.14 — 2026-08-21
 
 ### Fixed

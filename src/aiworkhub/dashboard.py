@@ -15,10 +15,11 @@ import os
 import re
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, Mapping
 
 from aiworkhub import (
@@ -1665,6 +1666,43 @@ class DashboardProvider:
         self.repo_root = Path(repo_root) if repo_root is not None else _default_repo_root()
         self.task_limit = max(1, min(int(task_limit), completion_inbox.MAX_LIMIT))
         self.stale_processing_hours = max(0.0, float(stale_processing_hours))
+        # One provider instance serves exactly one dashboard snapshot.  Several
+        # independent parallel readers need the same full cards/cost ledger;
+        # single-flight them here instead of decoding the canonical queue and
+        # running its SQLite readiness checks once per consumer.  This cache is
+        # deliberately provider-scoped, so a later refresh always gets fresh
+        # canonical data.
+        self._snapshot_cache_lock = Lock()
+        self._snapshot_cache: dict[str, Future[Any]] = {}
+
+    def _snapshot_once(self, key: str, loader: Callable[[], Any]) -> Any:
+        with self._snapshot_cache_lock:
+            future = self._snapshot_cache.get(key)
+            owner = future is None
+            if future is None:
+                future = Future()
+                self._snapshot_cache[key] = future
+        if owner:
+            try:
+                future.set_result(loader())
+            except BaseException as exc:
+                future.set_exception(exc)
+        return future.result()
+
+    def _task_cards(self) -> tuple[dict[str, Any], ...]:
+        return self._snapshot_once(
+            "task_cards",
+            lambda: tuple(task_store.list_task_cards(self.repo_root, limit=5000)),
+        )
+
+    def _cost_ledger(self) -> dict[str, Any]:
+        return self._snapshot_once(
+            "cost_ledger",
+            lambda: cost_ledger.build_cost_ledger(
+                repo_root=self.repo_root,
+                include_tasks=True,
+            ),
+        )
 
     def get_storage_readiness(self) -> task_store.StorageReadiness:
         """Verified registry/database authority readiness for the active
@@ -1707,10 +1745,8 @@ class DashboardProvider:
         # Reuse the canonical union ledger exposed through Task MCP. Task
         # cards alone omit retry/terminal usage and can produce a false-zero
         # dashboard while measured launch records exist.
-        result = dict(cost_ledger.build_cost_ledger(
-            repo_root=self.repo_root,
-            include_tasks=False,
-        ))
+        result = dict(self._cost_ledger())
+        result["tasks"] = []
         result["schema_id"] = "aiworkhub.dashboard.canonical_cost_ledger.v1"
         return result
 
@@ -1719,9 +1755,12 @@ class DashboardProvider:
         for status in ACTIVE_STATUSES:
             active.extend(task_store.list_tasks(self.repo_root, status=status, limit=self.task_limit))
         owners_by_path: dict[str, list[str]] = defaultdict(list)
+        cards_by_id = {
+            str(card.get("task_id") or ""): card for card in self._task_cards()
+        }
         for row in active:
             task_id = str(row.get("task_id") or "")
-            card = task_store.get_task(self.repo_root, task_id) or {}
+            card = cards_by_id.get(task_id) or task_store.get_task(self.repo_root, task_id) or {}
             for path in card.get("allowed_writes") or []:
                 normalized = str(path).strip()
                 if normalized and task_id not in owners_by_path[normalized]:
@@ -1773,12 +1812,10 @@ class DashboardProvider:
     def get_workforce_catalog(self) -> dict[str, Any]:
         """Configured workforce joined to bounded canonical process evidence."""
         process_report = read_process_runs(limit=DEFAULT_PROCESS_LIMIT)
-        ledger = cost_ledger.build_cost_ledger(
-            repo_root=self.repo_root, include_tasks=True
-        )
+        ledger = self._cost_ledger()
         return workforce_catalog.build_catalog(
             self.repo_root,
-            cards=task_store.list_task_cards(self.repo_root, limit=5000),
+            cards=list(self._task_cards()),
             process_rows=process_report.get("processes") or [],
             usage_rows=ledger.get("tasks") or [],
             cost_per_accepted_outcome=ledger.get("cost_per_accepted_outcome") or {},
@@ -1793,7 +1830,7 @@ class DashboardProvider:
 
     def get_task_plan(self) -> dict[str, Any]:
         """Read-only Plan-DAG projection from full canonical cards."""
-        cards = task_store.list_task_cards(self.repo_root, limit=5000)
+        cards = list(self._task_cards())
         return {
             "ok": True,
             "schema_id": "aiworkhub.task_plan_snapshot.v1",

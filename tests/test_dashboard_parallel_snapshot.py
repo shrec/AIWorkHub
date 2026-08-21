@@ -1,8 +1,65 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from aiworkhub import dashboard
+
+
+def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tmp_path):
+    provider = dashboard.DashboardProvider(repo_root=tmp_path)
+    calls = {"cards": 0, "ledger": 0}
+
+    def load_cards(*_args, **_kwargs):
+        calls["cards"] += 1
+        time.sleep(0.05)
+        return [{"task_id": "T-1", "allowed_writes": ["src/a.py"]}]
+
+    def load_ledger(*_args, **_kwargs):
+        calls["ledger"] += 1
+        time.sleep(0.05)
+        return {
+            "tasks": [{"task_id": "T-1", "total_tokens": 7}],
+            "cost_per_accepted_outcome": {"accepted": 1},
+        }
+
+    monkeypatch.setattr(dashboard.task_store, "list_task_cards", load_cards)
+    monkeypatch.setattr(dashboard.cost_ledger, "build_cost_ledger", load_ledger)
+    monkeypatch.setattr(dashboard.task_store, "list_tasks", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        dashboard, "read_process_runs", lambda **_kwargs: {"processes": []}
+    )
+    monkeypatch.setattr(
+        dashboard.workforce_catalog,
+        "build_catalog",
+        lambda _repo, **kwargs: {
+            "cards": len(kwargs["cards"]),
+            "usage": len(kwargs["usage_rows"]),
+        },
+    )
+    monkeypatch.setattr(
+        dashboard.task_plan,
+        "build_snapshot",
+        lambda cards: {"card_count": len(cards)},
+    )
+    monkeypatch.setattr(dashboard.os, "cpu_count", lambda: 8)
+
+    errors: list[dict[str, str]] = []
+    result = dashboard._parallel_snapshot_reads(  # noqa: SLF001
+        {
+            "cost": ("cost", provider.get_cost_ledger, {}),
+            "workforce": ("workforce", provider.get_workforce_catalog, {}),
+            "plan": ("plan", provider.get_task_plan, {}),
+            "collision": ("collision", provider.get_collision_report, {}),
+        },
+        errors,
+    )
+
+    assert errors == []
+    assert calls == {"cards": 1, "ledger": 1}
+    assert result["cost"]["tasks"] == []
+    assert result["workforce"] == {"cards": 1, "usage": 1}
+    assert result["plan"]["card_count"] == 1
 
 
 def test_parallel_snapshot_reads_use_core_derived_concurrency(monkeypatch):

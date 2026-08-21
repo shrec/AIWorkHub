@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.15] - 2026-08-21
+
+### Performance
+
+- A full dashboard refresh now single-flights its shared canonical task-card
+  and cost-ledger inputs across the parallel plan, workforce, collision and
+  cost consumers. The cache exists only for one snapshot, so later refreshes
+  always read fresh repository state.
+- On the canonical repository, median full-snapshot wall time fell from about
+  2.48 seconds to 2.02 seconds (roughly 19%), while Python call volume fell by
+  about 21%. Dashboard semantics and output remain unchanged.
+
 ## [0.10.14] - 2026-08-21
 
 ### Fixed
