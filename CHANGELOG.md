@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.20] - 2026-08-21
+
+### Fixed
+
+- Review rejection to `blocked`, `archived`, or `superseded` no longer
+  validates or inherits a malformed retained rework delta. Pending rework
+  remains fail-closed and still requires the authenticated delta contract.
+- Terminal candidates with invalid rework metadata can now leave the review
+  queue without direct database edits, breaking a self-hosting retry loop.
+
 ## [0.10.19] - 2026-08-21
 
 ### Performance

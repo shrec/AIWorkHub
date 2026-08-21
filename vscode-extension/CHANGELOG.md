@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.20 — 2026-08-21
+
+### Fixed
+
+- Non-rework review dispositions can retire malformed retained candidates
+  without weakening the authenticated contract used by pending rework.
+
 ## 0.10.19 — 2026-08-21
 
 ### Performance
