@@ -255,6 +255,133 @@ def test_zero_validation_workspace_does_not_seed_worker_package_support(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+def test_npm_prefix_validation_seeds_immutable_support_and_runs_from_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    npm = shutil.which("npm")
+    if npm is None:
+        pytest.skip("npm is not installed")
+    extension = repo / "web-extension"
+    (extension / "test").mkdir(parents=True)
+    (extension / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "candidate-validation-fixture",
+                "version": "1.0.0",
+                "scripts": {"test": "node test/candidate.test.js"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (extension / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "name": "candidate-validation-fixture",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "requires": True,
+                "packages": {
+                    "": {
+                        "name": "candidate-validation-fixture",
+                        "version": "1.0.0",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (extension / "test" / "candidate.test.js").write_text(
+        "console.log('candidate-npm-support-ok');\n", encoding="utf-8"
+    )
+    assert _git(repo, "add", "web-extension").returncode == 0
+    assert _git(repo, "commit", "-qm", "npm validation support").returncode == 0
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "npm-validation-worktrees"),
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "npm-validation-support",
+        {
+            "allowed_writes": ["out/result.txt"],
+            "read_first": ["read/input.txt"],
+            "validation": ["npm --prefix web-extension test"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        for relative in (
+            "web-extension/package.json",
+            "web-extension/package-lock.json",
+            "web-extension/test/candidate.test.js",
+        ):
+            candidate = workspace.path / relative
+            assert candidate.is_file()
+            assert hashlib.sha256(candidate.read_bytes()).digest() == hashlib.sha256(
+                (repo / relative).read_bytes()
+            ).digest()
+
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["npm --prefix web-extension test"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+        assert result["returncode"] == 0
+        assert "candidate-npm-support-ok" in result["stdout_head"]
+        assert worker_workspace.changed_paths(workspace) == []
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_npm_prefix_validation_fails_closed_for_unbound_dependency_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    extension = repo / "dependent-extension"
+    extension.mkdir()
+    (extension / "package.json").write_text(
+        json.dumps({"name": "dependent", "version": "1.0.0"}), encoding="utf-8"
+    )
+    (extension / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "name": "dependent",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"name": "dependent", "version": "1.0.0"},
+                    "node_modules/example": {"version": "2.0.0"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _git(repo, "add", "dependent-extension").returncode == 0
+    assert _git(repo, "commit", "-qm", "dependent validation fixture").returncode == 0
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "dependent-validation-worktrees"),
+    )
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_npm_dependency_tree_unbound:dependent-extension:1",
+    ):
+        worker_workspace.create_workspace(
+            repo,
+            "npm-dependency-unbound",
+            {
+                "allowed_writes": ["out/result.txt"],
+                "read_first": ["read/input.txt"],
+                "validation": ["npm --prefix dependent-extension test"],
+            },
+            "glm_vscode_lm",
+        )
+
+
 def test_default_workspace_root_is_repo_local_runtime_boundary(
     monkeypatch: pytest.MonkeyPatch,
     repo: Path,

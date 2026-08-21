@@ -184,6 +184,17 @@ _VALIDATION_WORKER_PACKAGE_SUPPORT = (
     "src/aiworkhub/runtime_temp.py",
     "src/aiworkhub/validation_runner.py",
 )
+_NPM_SUPPORT_EXCLUDED_DIRS = frozenset(
+    {
+        "node_modules",
+        "dist",
+        ".git",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
 MAX_REWORK_OVERLAY_FILES = 512
 MAX_REWORK_OVERLAY_CONTENT_BYTES = 8 * 1024 * 1024
 MAX_VALIDATION_COMMANDS = 32
@@ -985,6 +996,110 @@ def _expand_declared(repo: Path, declared: Iterable[str]) -> list[str]:
     if len(rows) > MAX_SEED_FILES:
         raise WorkspaceError(f"seed_file_limit_exceeded:{len(rows)}")
     return sorted(rows)
+
+
+def _npm_validation_prefixes(commands: Iterable[str]) -> tuple[str, ...]:
+    """Return exact repository-relative ``npm --prefix`` validation roots."""
+    prefixes: set[str] = set()
+    for command in commands:
+        tokens, _components, _tmpdir, cd_relative = _parse_validation_command_detailed(
+            command
+        )
+        if not tokens or Path(tokens[0]).name.lower() not in {"npm", "npm.cmd"}:
+            continue
+        raw_prefix = ""
+        for index, token in enumerate(tokens[1:], start=1):
+            if token == "--prefix" and index + 1 < len(tokens):
+                raw_prefix = tokens[index + 1]
+                break
+            if token.startswith("--prefix="):
+                raw_prefix = token.split("=", 1)[1]
+                break
+        if not raw_prefix:
+            continue
+        prefix = _relative_repo_path(raw_prefix)
+        if cd_relative:
+            prefix = _relative_repo_path(
+                (PurePosixPath(cd_relative) / PurePosixPath(prefix)).as_posix()
+            )
+        prefixes.add(prefix)
+    return tuple(sorted(prefixes))
+
+
+def _regular_support_files(root: Path, relative_root: str) -> set[str]:
+    """Enumerate a bounded immutable validation-support subtree."""
+    base = root / relative_root
+    _require_beneath(root, base)
+    if base.is_symlink() or not base.is_dir():
+        raise WorkspaceError(f"validation_npm_support_missing:{relative_root}")
+    rows: set[str] = set()
+    for directory, dirnames, filenames in os.walk(base, followlinks=False):
+        dirnames[:] = sorted(
+            name for name in dirnames if name not in _NPM_SUPPORT_EXCLUDED_DIRS
+        )
+        current = Path(directory)
+        for name in sorted(filenames):
+            if name.endswith(".vsix"):
+                continue
+            candidate = current / name
+            relative = _relative_repo_path(candidate.relative_to(root).as_posix())
+            if candidate.is_symlink() or not candidate.is_file():
+                raise WorkspaceError(f"validation_npm_support_invalid:{relative}")
+            rows.add(relative)
+            if len(rows) > MAX_SEED_FILES:
+                raise WorkspaceError("validation_npm_support_file_limit_exceeded")
+    return rows
+
+
+def _npm_validation_support(repo: Path, commands: Iterable[str]) -> tuple[str, ...]:
+    """Resolve immutable files needed by exact sparse ``npm --prefix`` gates.
+
+    The dependency tree is deliberately not copied.  Projects with external
+    dependencies must provide a separately verified read-only tree; silently
+    hydrating or downloading ``node_modules`` during validation would make the
+    candidate non-reproducible and reintroduce the large-copy bottleneck.
+    """
+    rows: set[str] = set()
+    for prefix in _npm_validation_prefixes(commands):
+        package_path = repo / prefix / "package.json"
+        lock_path = repo / prefix / "package-lock.json"
+        for required in (package_path, lock_path):
+            _require_beneath(repo, required)
+            if required.is_symlink() or not required.is_file():
+                raise WorkspaceError(
+                    f"validation_npm_support_missing:"
+                    f"{required.relative_to(repo).as_posix()}"
+                )
+        try:
+            package = json.loads(package_path.read_text(encoding="utf-8"))
+            lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WorkspaceError(f"validation_npm_manifest_invalid:{prefix}") from exc
+        packages = lock.get("packages")
+        if not isinstance(package, dict) or not isinstance(packages, dict):
+            raise WorkspaceError(f"validation_npm_manifest_invalid:{prefix}")
+        dependency_rows = [key for key in packages if str(key).startswith("node_modules/")]
+        if dependency_rows:
+            raise WorkspaceError(
+                f"validation_npm_dependency_tree_unbound:{prefix}:"
+                f"{len(dependency_rows)}"
+            )
+        rows.update(_regular_support_files(repo, prefix))
+        # AIWorkHub's extension suite has explicit static/package assertions
+        # against these repository-owned roots.  Seed their committed bytes as
+        # immutable support rather than broadening worker write authority.
+        if package.get("name") == "aiworkhub" and prefix == "vscode-extension":
+            rows.update(_regular_support_files(repo, "src/aiworkhub"))
+            for relative in (
+                "README.md",
+                "scripts/aiworkhub-app-server-mux",
+                "scripts/aiworkhub-app-server-mux.cmd",
+            ):
+                candidate = repo / relative
+                if candidate.is_symlink() or not candidate.is_file():
+                    raise WorkspaceError(f"validation_npm_support_missing:{relative}")
+                rows.add(relative)
+    return tuple(sorted(rows))
 
 
 # ---- local quoted-include dependency preflight (B664) -----------------------
@@ -2152,6 +2267,12 @@ def create_workspace(
             for relative in _VALIDATION_WORKER_PACKAGE_SUPPORT
             if relative not in live_seeded
         )
+    npm_support_seeded = tuple(
+        relative
+        for relative in _npm_validation_support(repo, validation_rows)
+        if relative not in live_seeded
+    )
+    support_seeded = tuple(sorted(set(support_seeded) | set(npm_support_seeded)))
     seeded = sorted(set(live_seeded) | set(support_seeded))
     # Git ignore rules participate in changed-path truth. Materialize the root
     # rule file and rules in ancestors of declared files without checking out
