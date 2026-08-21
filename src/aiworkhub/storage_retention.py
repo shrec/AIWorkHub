@@ -126,7 +126,7 @@ def _terminal_needfix_task_ids(repo_root: Path) -> tuple[set[str], bool]:
 
 def _protected_attempt_ids(
     repo_root: Path,
-) -> tuple[dict[str, str], bool, dict[str, list[str]]]:
+) -> tuple[dict[str, str], bool, dict[str, list[str]], set[str]]:
     """Worktree ids a live attempt or in-flight rework lineage still holds.
 
     A worktree is protected -- and therefore never a quarantine candidate --
@@ -165,8 +165,8 @@ def _protected_attempt_ids(
     single query whose bound is the exact size of the ``tasks`` table, which
     can never itself exclude a live card.
 
-    Returns ``(protected, verified, pinned_by)``. ``protected`` maps each
-    protected request id to its reason. ``pinned_by`` maps each
+    Returns ``(protected, verified, pinned_by, terminal_tasks)``. ``protected``
+    maps each protected request id to its reason. ``pinned_by`` maps each
     ``rework_predecessor_retained`` worktree id to the sorted list of card ids
     still pinning it, so the preview can report how much storage is held by
     in-flight rework lineage AND which cards hold it -- an operator can then see
@@ -177,6 +177,7 @@ def _protected_attempt_ids(
     """
     protected: dict[str, str] = {}
     pinned_by: dict[str, list[str]] = {}
+    terminal_tasks: set[str] = set()
     terminal_needfix_tasks, needfix_lineage_verified = _terminal_needfix_task_ids(repo_root)
     try:
         db_path = task_store.canonical_db_path(repo_root)
@@ -204,6 +205,8 @@ def _protected_attempt_ids(
             if not isinstance(card_json, dict):
                 continue
             card_id = str(row["task_id"] or "").strip()
+            if card_id and status in _FINISHED_STATUSES:
+                terminal_tasks.add(card_id)
             closed_by_needfix = (
                 needfix_lineage_verified and card_id in terminal_needfix_tasks
             )
@@ -224,10 +227,10 @@ def _protected_attempt_ids(
                             if card_id not in holders:
                                 holders.append(card_id)
     except (task_store.TaskStoreError, sqlite3.Error, OSError):
-        return {}, False, {}
+        return {}, False, {}, set()
     for holders in pinned_by.values():
         holders.sort()
-    return protected, True, pinned_by
+    return protected, True, pinned_by, terminal_tasks
 
 
 def plan_worktree_reclaim(
@@ -246,8 +249,9 @@ def plan_worktree_reclaim(
     git-clean and fully pushed. A superseded rework attempt commonly carries
     local commits that were deliberately never pushed (the rework replaced
     them), which made the pure git-state check protect it forever regardless
-    of rejection count. Orphaned worktrees (broken git metadata) are still
-    never included here; that remains a separate, opt-in cleanup path.
+    of rejection count. Orphaned worktrees (broken Git metadata) remain
+    excluded unless an exact request-ledger owner is independently terminal;
+    unknown, foreign and nonterminal ownership stays fail-closed.
 
     When ``current_bytes`` exceeds ``max_bytes``, the oldest eligible-but-
     under-age superseded worktrees are pulled forward (oldest modified first)
@@ -261,7 +265,9 @@ def plan_worktree_reclaim(
     mtimes.
     """
     root = Path(repo_root).resolve()
-    protected_ids, lineage_verified, pinned_by = _protected_attempt_ids(root)
+    protected_ids, lineage_verified, pinned_by, terminal_tasks = (
+        _protected_attempt_ids(root)
+    )
     terminal_needfix_tasks, needfix_lineage_verified = _terminal_needfix_task_ids(root)
     minimum_age_seconds = max(0, min(int(min_age_days), 3650)) * 86400
     validated_now = _resolve_now(now)
@@ -279,9 +285,15 @@ def plan_worktree_reclaim(
             and wt.get("ownership_source") == "request_ledger"
             and str(wt.get("owner_task_id") or "") in terminal_needfix_tasks
         )
+        terminal_task_orphan = (
+            lineage_verified
+            and wt.get("ownership_source") == "request_ledger"
+            and str(wt.get("owner_task_id") or "") in terminal_tasks
+        )
         if (
             wt.get("class") == worktree_storage.CLASS_ORPHANED
             and not terminal_needfix_orphan
+            and not terminal_task_orphan
         ):
             would_keep.append(wt)
             protection_reasons[wt_id] = "orphaned"
@@ -294,9 +306,12 @@ def plan_worktree_reclaim(
             wt.get("class") == worktree_storage.CLASS_REMOVABLE_SAFE
             or lineage_verified
             or terminal_needfix_orphan
+            or terminal_task_orphan
         ):
             if terminal_needfix_orphan:
                 wt = dict(wt, reclaim_authority="terminal_needfix_request_ledger")
+            elif terminal_task_orphan:
+                wt = dict(wt, reclaim_authority="terminal_task_request_ledger")
             reclaimable.append(wt)
         else:
             # Dirty/unpushed and card lineage could not be verified: fail closed.
@@ -537,7 +552,9 @@ def _preview_payload(
         # (_protected_attempt_ids) and the git common dir, never from a name or an
         # age alone. If the deadline is hit mid-walk the preview surfaces exactly
         # these instead of an empty list that reads as a clean repository.
-        protected_ids, lineage_verified, _pinned_by = _protected_attempt_ids(repo_root)
+        protected_ids, lineage_verified, _pinned_by, _terminal_tasks = (
+            _protected_attempt_ids(repo_root)
+        )
         progress.configure(
             repo_common_dir=worktree_storage._git_common_dir(repo_root),
             protected_ids=protected_ids,
@@ -1306,6 +1323,20 @@ def quarantine(
     moved = 0
     moved_bytes = 0
     repo_common_dir = worktree_storage._git_common_dir(root)
+    authorities = {
+        str(item.get("reclaim_authority") or "") for item in manifest["items"]
+    }
+    terminal_needfix_tasks, needfix_verified = (
+        _terminal_needfix_task_ids(root)
+        if "terminal_needfix_request_ledger" in authorities
+        else (set(), False)
+    )
+    if "terminal_task_request_ledger" in authorities:
+        _protected, task_lineage_verified, _pinned, terminal_tasks = (
+            _protected_attempt_ids(root)
+        )
+    else:
+        task_lineage_verified, terminal_tasks = False, set()
     for item in manifest["items"]:
         item_id = item["id"]
         if not _ID_RE.fullmatch(item_id):
@@ -1333,7 +1364,7 @@ def quarantine(
         # A candidate need not be CLASS_REMOVABLE_SAFE: plan_worktree_reclaim()
         # also admits superseded-lineage worktrees carrying unpushed local
         # commits that were deliberately never going to be pushed. Broken Git
-        # metadata is admitted only by the explicit terminal-NeedFix + exact
+        # metadata is admitted only by explicit terminal task/NeedFix + exact
         # request-ledger authority established by the preview and rechecked here.
         git_state = worktree_storage._worktree_git_state(source / "worktree")
         terminal_needfix_orphan = (
@@ -1343,13 +1374,27 @@ def quarantine(
             == item.get("owner_task_id")
         )
         if terminal_needfix_orphan:
-            terminal_tasks, needfix_verified = _terminal_needfix_task_ids(root)
             terminal_needfix_orphan = (
-                needfix_verified and item.get("owner_task_id") in terminal_tasks
+                needfix_verified
+                and item.get("owner_task_id") in terminal_needfix_tasks
+            )
+        terminal_task_orphan = (
+            item.get("reclaim_authority") == "terminal_task_request_ledger"
+            and item.get("ownership_source") == "request_ledger"
+            and worktree_storage._request_ledger_owner_task_id(
+                root, worktree_base, source
+            )
+            == item.get("owner_task_id")
+        )
+        if terminal_task_orphan:
+            terminal_task_orphan = (
+                task_lineage_verified
+                and item.get("owner_task_id") in terminal_tasks
             )
         if (
             (
                 not terminal_needfix_orphan
+                and not terminal_task_orphan
                 and (
                     worktree_storage._classify(git_state)
                     == worktree_storage.CLASS_ORPHANED
@@ -1617,6 +1662,22 @@ def restore(
     restored_orphaned: list[str] = []
     registration_lost: list[str] = []
     workspace_absent: list[str] = []
+    authorities = {
+        str(item.get("reclaim_authority") or "")
+        for item in manifest["items"]
+        if isinstance(item, dict)
+    }
+    terminal_needfix_tasks, needfix_verified = (
+        _terminal_needfix_task_ids(root)
+        if "terminal_needfix_request_ledger" in authorities
+        else (set(), False)
+    )
+    if "terminal_task_request_ledger" in authorities:
+        _protected, task_lineage_verified, _pinned, terminal_tasks = (
+            _protected_attempt_ids(root)
+        )
+    else:
+        task_lineage_verified, terminal_tasks = False, set()
     for item in manifest["items"]:
         if not isinstance(item, dict) or item.get("state") != "quarantined":
             continue
@@ -1657,16 +1718,23 @@ def restore(
         if repo_common_dir and worktree_storage._git_common_dir(checkout) == repo_common_dir:
             item["state"] = "restored"
             reinstated.append(item_id)
-        elif item.get("reclaim_authority") == "terminal_needfix_request_ledger":
+        elif item.get("reclaim_authority") in {
+            "terminal_needfix_request_ledger",
+            "terminal_task_request_ledger",
+        }:
             owner_task_id = worktree_storage._request_ledger_owner_task_id(
                 root, worktree_base, destination
             )
-            terminal_tasks, needfix_verified = _terminal_needfix_task_ids(root)
-            if (
-                needfix_verified
-                and owner_task_id == item.get("owner_task_id")
-                and owner_task_id in terminal_tasks
-            ):
+            owner_terminal = False
+            if item.get("reclaim_authority") == "terminal_needfix_request_ledger":
+                owner_terminal = (
+                    needfix_verified and owner_task_id in terminal_needfix_tasks
+                )
+            else:
+                owner_terminal = (
+                    task_lineage_verified and owner_task_id in terminal_tasks
+                )
+            if owner_terminal and owner_task_id == item.get("owner_task_id"):
                 # This checkout was already orphaned before quarantine. Restoring
                 # its files to that exact, ledger-owned state is a truthful full
                 # rollback; no Git registration existed that could be reinstated.

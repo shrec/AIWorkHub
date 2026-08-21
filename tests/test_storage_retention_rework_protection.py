@@ -354,6 +354,57 @@ def test_nonterminal_request_ledger_orphan_remains_protected(
     ] == "orphaned"
 
 
+def test_archived_task_request_ledger_orphan_quarantines_and_restores(
+    repo_with_worktrees, monkeypatch
+) -> None:
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    request_id = "attempt-archived-task-orphan"
+    task_id = "TASK-ARCHIVED"
+    entry = _add_worktree(repo, base, request_id)
+    _write_request_ledger(repo, base, request_id, task_id)
+    _insert_card(repo, task_id, status="blocked", launch_request_id=request_id)
+    conn = sqlite3.connect(str(task_store.canonical_db_path(repo)))
+    try:
+        conn.execute(
+            "UPDATE tasks SET archived_at=? WHERE task_id=?",
+            (datetime.now(timezone.utc).isoformat(), task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    checkout = entry / "worktree"
+    gitdir = Path(
+        (checkout / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+    )
+    shutil.rmtree(gitdir)
+    monkeypatch.setattr(
+        storage_retention.worktree_storage,
+        "_repo_registered_worktrees",
+        lambda _repo: {},
+    )
+
+    preview = storage_retention.preview(repo, base=base, now=_aged_now())
+
+    assert [item["id"] for item in preview["candidates"]] == [request_id]
+    assert preview["candidates"][0]["reclaim_authority"] == (
+        "terminal_task_request_ledger"
+    )
+    result = storage_retention.quarantine(
+        repo,
+        preview_digest=preview["preview_digest"],
+        confirm=True,
+        base=base,
+        now=_aged_now(),
+    )
+    assert result["quarantined"] == 1
+    assert not entry.exists()
+    restored = storage_retention.restore(
+        repo, batch_id=result["batch_id"], confirm=True, base=base
+    )
+    assert restored["restored"] == 1
+    assert entry.is_dir()
+
+
 def test_reclaim_leaves_no_launchable_card_without_its_predecessor(
     repo_with_worktrees,
 ) -> None:
@@ -402,10 +453,13 @@ def test_ro_lineage_connection_encodes_hash_and_creates_no_file(
     truncated = tmp_path / "db"  # what the buggy fragment-dropping URI created
     monkeypatch.setattr(task_store, "canonical_db_path", lambda _root: hashed)
 
-    protected, verified, pinned_by = storage_retention._protected_attempt_ids(tmp_path)
+    protected, verified, pinned_by, terminal_tasks = (
+        storage_retention._protected_attempt_ids(tmp_path)
+    )
 
     assert protected == {}
     assert pinned_by == {}
+    assert terminal_tasks == set()
     assert verified is False  # unreadable lineage fails closed
     assert not truncated.exists()  # no read-write create at the truncated path
     assert not hashed.exists()  # mode=ro on a missing file creates nothing

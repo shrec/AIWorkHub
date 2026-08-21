@@ -12,6 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.14
+
+- Exact request-ledger-owned worktrees are reclaimable after their canonical
+  task is finished, archived or superseded, even when old Git registration is
+  broken; live/unknown/foreign ownership remains fail-closed.
+- Batched lifecycle revalidation avoids repeated task-table reads during large
+  storage cleanup, while quarantine and restore remain fully reversible.
+
 ## What's new in 0.10.13
 
 - Storage refreshes reuse a bounded append-aware process-event projection;

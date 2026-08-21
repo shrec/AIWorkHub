@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.14] - 2026-08-21
+
+### Fixed
+
+- Request-ledger-owned orphan worktrees now become reversible retention
+  candidates when their exact canonical owner task is independently finished,
+  archived or superseded. Live, nonterminal, unknown and foreign ownership
+  remains fail-closed, and quarantine plus restore revalidate both identities.
+- Terminal task identities are read once per quarantine/restore batch instead
+  of once per worktree, avoiding repeated canonical task-table scans during
+  large cleanup operations.
+
+### Storage
+
+- Archiving 19 historical blocked attempts and applying the exact owner rule
+  released 25 stale worktrees (4.03 GB) to reversible quarantine on the
+  canonical repository. Active worktree storage fell from 4.26 GB to 232 MB;
+  two current unresolved predecessor worktrees remain protected.
+
 ## [0.10.13] - 2026-08-21
 
 ### Performance

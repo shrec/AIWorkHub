@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.14 — 2026-08-21
+
+### Fixed
+
+- Archived/finished task worktrees with broken Git registration can now enter
+  reversible quarantine only when the exact request ledger and canonical task
+  lifecycle independently prove terminal ownership. Unknown, foreign and live
+  worktrees stay protected.
+- Cleanup reads terminal owner identities once per batch, avoiding repeated
+  task-table scans for large retention waves.
+
 ## 0.10.13 — 2026-08-21
 
 ### Performance
