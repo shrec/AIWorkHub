@@ -90,19 +90,6 @@ _CHMOD_TOKENS = (
     "setxattr",
     "utimensat",
 )
-_SPAWN_TOKENS = (
-    "seccomp",
-    "clone",
-    "fork",
-    "execve",
-    "exec ",
-    "spawn",
-    "no new privs",
-    "no_new_privs",
-    "operation not permitted",
-    "eperm",
-)
-
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -494,27 +481,26 @@ def dash_m_validator_modules(tokens: list[str]) -> tuple[str, ...]:
 
 
 def _command_segments(command: str) -> list[list[str]]:
-    """Lex ``command`` into ``&&``-separated argv segments.
+    """Lex ``command`` into shell-chain argv segments without executing it.
 
-    ``shlex`` does not understand shell operators, so ``&&`` survives as a bare
-    token and each run of tokens between two ``&&`` is one segment. Leading
-    ``NAME=value`` env assignments are stripped from every segment so the actual
-    program+args are inspected. Splitting on ``&&`` deliberately checks BOTH
-    sides: the pytest call may lead (``pytest ... && echo ok``) or trail
-    (``cd sub && pytest ...``). A leading ``cd <dir>`` is simply a non-pytest
-    segment that is skipped, so no ``cd`` special-casing is needed. Returns
-    ``[]`` when the command cannot be lexed (an unparseable command is not our
-    concern here; the runner reports it truthfully at execution time).
+    ``punctuation_chars`` makes adjacent operators such as ``pytest;echo`` and
+    ``cd x||pytest`` visible as standalone tokens. Quoted operator-like values
+    remain ordinary arguments, so ``pytest -k 'a || b' tests/x.py`` is not
+    split. Every operator run is only a boundary; this parser never invokes a
+    shell or interprets the command.
     """
 
     try:
-        tokens = shlex.split(command, comments=False, posix=True)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.commenters = ""
+        lexer.whitespace_split = True
+        tokens = list(lexer)
     except ValueError:
         return []
     segments: list[list[str]] = []
     current: list[str] = []
     for token in tokens:
-        if token == "&&":
+        if token and set(token) <= {";", "&", "|"}:
             segments.append(current)
             current = []
             continue
@@ -592,7 +578,7 @@ def _pytest_spawns_subprocess(args: list[str]) -> bool:
 
 
 def _segment_unrunnable_reason(args: list[str]) -> str | None:
-    """Named reason a single ``&&`` segment cannot run in the sandbox, else ``None``."""
+    """Named reason one chained segment cannot run in the sandbox, else ``None``."""
 
     pytest_args = _pytest_args(args)
     if pytest_args is None:
@@ -616,8 +602,8 @@ def sandbox_unrunnable_reason(command: str) -> str | None:
     * ``subprocess_pytest`` -- ``--forked`` / ``--boxed`` / xdist ``-n`` spawn
       pytest worker subprocesses the sandbox forbids.
 
-    Every ``&&`` segment is inspected, so a full-suite pytest call cannot hide
-    on either side of ``&&`` (``pytest && echo ok`` or ``cd x && pytest``).
+    Every shell-chain segment is inspected, so a full-suite pytest call cannot
+    hide beside ``&&``, ``||``, ``;``, or an adjacent operator spelling.
     Conservative by design: a command that bounds its run -- a concrete path, a
     bare directory, or a ``-k``/``-m``/``--deselect``/``--lf``/``--ff``
     selection -- is never flagged, so genuinely runnable cards are never

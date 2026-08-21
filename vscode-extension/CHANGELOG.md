@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.32 — 2026-08-21
+
+### Fixed
+
+- Quarantine paths accept only canonical request IDs before any filesystem
+  mutation, and validation preflight detects hidden chained full-suite pytest
+  commands including adjacent operators.
+- Bare-string reasoning deltas render as reasoning without shadowing result or
+  nested tool-result payloads that contain auxiliary reasoning metadata.
+
 ## 0.10.31 — 2026-08-21
 
 ### Fixed

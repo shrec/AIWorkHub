@@ -3708,16 +3708,22 @@ function reasoningTimelineEvent(event, rawLine) {
   const type = String(firstText(event.type, event.event, event.kind, event.subtype) || "").toLowerCase();
   const item = event.item && typeof event.item === "object" ? event.item : {};
   const itemType = String(firstText(item.type, item.kind) || "").toLowerCase();
+  const deltaText = typeof event.delta === "string" ? event.delta : "";
   const delta = event.delta && typeof event.delta === "object" ? event.delta : {};
-  const looksLikeReasoning = type.includes("reasoning") || itemType.includes("reasoning")
+  const carriesResultOrToolPayload = event.result !== undefined || Boolean(event.terminal_reason)
+    || type === "result" || type.includes("tool_result") || type.includes("tool_use")
+    || itemType.includes("tool_result") || itemType.includes("tool_use");
+  const looksLikeReasoning = !carriesResultOrToolPayload
+    && (type.includes("reasoning") || itemType.includes("reasoning")
     || event.reasoning !== undefined || item.reasoning !== undefined
-    || REASONING_DELTA_TYPES.has(String(delta.type || ""));
+    || REASONING_DELTA_TYPES.has(String(delta.type || "")));
   if (!looksLikeReasoning) {
     return null;
   }
   return reasoningRow(
     firstText(
       event.reasoning, item.reasoning,
+      deltaText,
       delta.text, delta.reasoning, delta.thinking,
       event.text, item.text,
       event.summary, item.summary,
@@ -3757,13 +3763,13 @@ function timelineEventFromObject(event, rawLine) {
       raw: safeRawEvent(rawLine),
     };
   }
-  const reasoningEvent = reasoningTimelineEvent(event, rawLine);
-  if (reasoningEvent) {
-    return reasoningEvent;
-  }
   const toolResultEvent = toolResultEventFromUserMessage(event, rawLine);
   if (toolResultEvent) {
     return toolResultEvent;
+  }
+  const reasoningEvent = reasoningTimelineEvent(event, rawLine);
+  if (reasoningEvent) {
+    return reasoningEvent;
   }
   const nestedResult = parseNestedJson(event.result);
   if (nestedResult && typeof nestedResult === "object" && !Array.isArray(nestedResult)) {

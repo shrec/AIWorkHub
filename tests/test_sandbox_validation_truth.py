@@ -359,6 +359,39 @@ def test_bounded_pytest_beside_another_command_across_the_ampersand_is_runnable(
     )
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo start; python -m pytest",
+        "python -m pytest || echo failed",
+        "echo start;python -m pytest",
+        "cd sub||pytest -q",
+        "echo start&&;python -m pytest",
+    ],
+)
+def test_full_suite_pytest_is_flagged_across_supported_chain_operators(
+    command: str,
+) -> None:
+    reason = validation_runner.sandbox_unrunnable_reason(command)
+    assert reason is not None, command
+    assert validation_runner.RESTRICTION_FULL_REPOSITORY_SUITE in reason, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest tests/test_x.py; echo done",
+        "echo start||pytest -k retention",
+        "pytest -k 'a || b' tests/test_x.py",
+        "pytest -k 'a;b' tests/test_x.py",
+    ],
+)
+def test_bounded_and_quoted_operator_like_pytest_commands_remain_runnable(
+    command: str,
+) -> None:
+    assert validation_runner.sandbox_unrunnable_reason(command) is None, command
+
+
 # ── TWO (rework): the terminal state keys on STRUCTURAL signals, NEVER on the
 # candidate's own output text ────────────────────────────────────────────────
 # ``failure_class`` (worker_workspace._validation_failure_class) is derived

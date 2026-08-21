@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.32
+
+- Retained-workspace quarantine validates canonical request IDs before creating
+  or moving destination bytes.
+- Validation preflight recognizes adjacent command-chain operators, and live
+  output keeps reasoning metadata from shadowing result/tool-result events.
+
 ## What's new in 0.10.31
 
 - Read-only zero-diff validation failures preserve their exact primary MCP

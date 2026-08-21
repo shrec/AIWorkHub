@@ -437,6 +437,36 @@ function lines(...events) {
   const rendered = document.querySelector("#detail-live-output-container").textContent;
   assert(rendered.includes("Reasoning"));
   assert(rendered.includes("Deciding the launcher path"));
+
+  const bareStringDelta = api.timelineEventsFromText(lines(
+    { type: "reasoning", delta: "Inspecting the canonical task state" },
+  ));
+  assert.strictEqual(bareStringDelta.length, 1);
+  assert.strictEqual(bareStringDelta[0].title, "Reasoning");
+  assert(bareStringDelta[0].message.includes("Inspecting the canonical task state"));
+
+  const resultWithAuxiliaryReasoning = api.timelineEventsFromText(lines(
+    { type: "result", result: "verified result", reasoning: "auxiliary metadata" },
+  ));
+  assert.strictEqual(resultWithAuxiliaryReasoning.length, 1);
+  assert.strictEqual(resultWithAuxiliaryReasoning[0].kind, "result");
+  assert.strictEqual(resultWithAuxiliaryReasoning[0].title, "Result");
+  assert(resultWithAuxiliaryReasoning[0].message.includes("verified result"));
+
+  const toolResultWithAuxiliaryReasoning = api.timelineEventsFromText(lines(
+    {
+      type: "user",
+      reasoning: "auxiliary metadata",
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tool_reasoning_guard", content: "tool output" }],
+      },
+    },
+  ));
+  assert.strictEqual(toolResultWithAuxiliaryReasoning.length, 1);
+  assert.strictEqual(toolResultWithAuxiliaryReasoning[0].title, "Tool result");
+  assert.notStrictEqual(toolResultWithAuxiliaryReasoning[0].title, "Reasoning");
+  assert(toolResultWithAuxiliaryReasoning[0].message.includes("tool output"));
 }
 
 {

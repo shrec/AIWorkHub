@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from aiworkhub import process_launcher as pl
 
 
@@ -47,7 +49,10 @@ def test_failed_integrity_workspace_is_quarantined_not_deleted(tmp_path: Path) -
     assert observed != stored  # integrity check still detects the mismatch
 
     dest = pl.quarantine_review_workspace(
-        process_log, request_id="req123", path=worktree, home=home,
+        process_log,
+        request_id="0123456789abcdef0123456789abcdef",
+        path=worktree,
+        home=home,
     )
     # The live tree is gone but the exact bytes survive in quarantine for a
     # manager to diff against the sealed hashes -- never straight to delete.
@@ -142,3 +147,67 @@ def test_lm_claim_cancelled_before_request_workspace_deleted(tmp_path: Path) -> 
     assert errors == []
     # The claim is cancelled BEFORE the workspace it refers to is deleted.
     assert order == ["cancel_claim", "cleanup_workspace"]
+
+
+@pytest.mark.parametrize(
+    "hostile_id",
+    [
+        "../escape",
+        "..",
+        ".",
+        "a/b",
+        "req123",
+        "dead beef",
+        "0xdeadbeef",
+        "deadbeef",
+        "A" * 32,
+        "a" * 31,
+        "a" * 33,
+        "",
+        None,
+    ],
+)
+def test_quarantine_rejects_unsafe_request_id_before_destination_creation(
+    tmp_path: Path, hostile_id: object
+) -> None:
+    process_log = tmp_path / "state" / "process_events.jsonl"
+    process_log.parent.mkdir(parents=True)
+    worktree, home, _ = _seed_workspace(tmp_path)
+    quarantine_root = pl.review_workspace_quarantine_root(process_log)
+
+    with pytest.raises(ValueError, match="unsafe request_id"):
+        pl.quarantine_review_workspace(
+            process_log,
+            request_id=hostile_id,
+            path=worktree,
+            home=home,
+        )
+
+    assert not quarantine_root.exists()
+    assert worktree.exists()
+    assert home.exists()
+
+
+def test_quarantine_accepts_canonical_request_id_and_preserves_collision_suffix(
+    tmp_path: Path,
+) -> None:
+    process_log = tmp_path / "state" / "process_events.jsonl"
+    process_log.parent.mkdir(parents=True)
+    root = pl.review_workspace_quarantine_root(process_log)
+    request_id = "0123456789abcdef0123456789abcdef"
+
+    worktree, home, _ = _seed_workspace(tmp_path, request_id=request_id)
+    first = pl.quarantine_review_workspace(
+        process_log, request_id=request_id, path=worktree, home=home
+    )
+    assert first == root / request_id
+    assert (first / "worktree" / "answer.py").read_text(encoding="utf-8") == "VERIFIED = 1\n"
+
+    worktree_two, home_two, _ = _seed_workspace(
+        tmp_path / "second", request_id=request_id
+    )
+    second = pl.quarantine_review_workspace(
+        process_log, request_id=request_id, path=worktree_two, home=home_two
+    )
+    assert second == root / f"{request_id}.1"
+    assert (second / "worktree" / "answer.py").exists()

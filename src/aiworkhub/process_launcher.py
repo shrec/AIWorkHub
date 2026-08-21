@@ -3102,6 +3102,12 @@ def quarantine_review_workspace(
     request-scoped quarantine directory and never unlinked here.  Returns the
     quarantine directory.
     """
+    if not isinstance(request_id, str) or re.fullmatch(r"[0-9a-f]{32}", request_id) is None:
+        raise ValueError(
+            f"refusing quarantine for unsafe request_id {request_id!r}: only "
+            "canonical 32-character lowercase hexadecimal request IDs may name "
+            "a quarantine destination"
+        )
 
     root = review_workspace_quarantine_root(process_log_path)
     root.mkdir(parents=True, exist_ok=True)

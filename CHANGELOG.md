@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.32] - 2026-08-21
+
+### Fixed
+
+- Retained-workspace quarantine now validates an exact canonical lowercase
+  hexadecimal request ID before creating a destination or moving any bytes,
+  preventing path-component escape and ambiguous quarantine names.
+- Validation-card preflight now recognizes spaced and adjacent shell-chain
+  operators (`;`, `&&`, `||` and operator runs) without executing a shell, so
+  an unbounded pytest command cannot hide in another command segment.
+- Live output renders bare-string reasoning deltas while preserving real result
+  and nested tool-result payloads when they also carry auxiliary reasoning
+  metadata.
+
 ## [0.10.31] - 2026-08-21
 
 ### Fixed
