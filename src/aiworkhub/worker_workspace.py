@@ -531,6 +531,8 @@ def _run(
         "shell": False,
         "env": {**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
     }
+    if input_text is not None:
+        popen_kwargs["stdin"] = subprocess.PIPE
     if os.name == "nt":
         # ``CREATE_NEW_PROCESS_GROUP`` is Windows-only and absent from POSIX
         # typeshed/runtime modules. Keep the documented Win32 flag local while
@@ -575,11 +577,17 @@ def _sparse_checkout_pattern(relative: str) -> str:
 def _prepare_sparse_worktree(
     path: Path,
     seeded: list[str],
+    allowed: tuple[str, ...],
     *,
     timeout: float,
 ) -> None:
     """Materialize only declared tracked files while preserving Git truth."""
     patterns = sorted({_sparse_checkout_pattern(relative) for relative in seeded})
+    # Allowed patterns must also be present in the sparse definition so a new
+    # output can be staged without ``git add --sparse``. Unlike seeded paths,
+    # their glob metacharacters are intentional and retain card semantics.
+    patterns.extend(f"/{relative}" for relative in allowed)
+    patterns = sorted(set(patterns))
     if not patterns:
         patterns = ["/__AIWORKHUB_EMPTY_SPARSE_WORKTREE__"]
     commands: tuple[tuple[list[str], str | None], ...] = (
@@ -2115,6 +2123,7 @@ def create_workspace(
             _prepare_sparse_worktree(
                 path,
                 seeded,
+                allowed,
                 timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
             )
             provisioning_timings_ms["sparse_checkout"] = round(

@@ -156,7 +156,14 @@ def test_committed_required_output_is_carried_by_promote(
 def test_staged_rename_records_both_sides_and_is_scope_checked(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
 ) -> None:
-    ws = _make(monkeypatch, tmp_path, repo, "staged-rename", ["src/b.py"])
+    ws = _make(
+        monkeypatch,
+        tmp_path,
+        repo,
+        "staged-rename",
+        ["src/b.py"],
+        ["src/a.py"],
+    )
     try:
         assert _git(ws.path, "mv", "-f", "src/a.py", "src/b.py").returncode == 0
 
