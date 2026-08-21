@@ -45,21 +45,28 @@ def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tm
     monkeypatch.setattr(dashboard.os, "cpu_count", lambda: 8)
 
     errors: list[dict[str, str]] = []
-    result = dashboard._parallel_snapshot_reads(  # noqa: SLF001
-        {
-            "cost": ("cost", provider.get_cost_ledger, {}),
-            "workforce": ("workforce", provider.get_workforce_catalog, {}),
-            "plan": ("plan", provider.get_task_plan, {}),
-            "collision": ("collision", provider.get_collision_report, {}),
-        },
-        errors,
-    )
+    with provider.snapshot_read_scope():
+        result = dashboard._parallel_snapshot_reads(  # noqa: SLF001
+            {
+                "cost": ("cost", provider.get_cost_ledger, {}),
+                "workforce": ("workforce", provider.get_workforce_catalog, {}),
+                "plan": ("plan", provider.get_task_plan, {}),
+                "collision": ("collision", provider.get_collision_report, {}),
+            },
+            errors,
+        )
 
     assert errors == []
     assert calls == {"cards": 1, "ledger": 1}
     assert result["cost"]["tasks"] == []
     assert result["workforce"] == {"cards": 1, "usage": 1}
     assert result["plan"]["card_count"] == 1
+
+    # The cache never survives its read set and direct provider calls preserve
+    # the historical fresh-read behavior.
+    provider.get_task_plan()
+    provider.get_task_plan()
+    assert calls["cards"] == 3
 
 
 def test_parallel_snapshot_reads_use_core_derived_concurrency(monkeypatch):

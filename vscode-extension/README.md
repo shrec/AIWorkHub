@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.16
+
+- Dashboard single-flight inputs now expire at the end of the exact refresh,
+  including when an integration reuses the same provider object. This keeps
+  the performance gain without creating a cross-refresh stale-data window.
+
 ## What's new in 0.10.15
 
 - Dashboard plan, workforce, collision and cost readers share the same

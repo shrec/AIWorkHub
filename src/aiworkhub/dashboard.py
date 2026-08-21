@@ -16,6 +16,7 @@ import re
 import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -1666,22 +1667,49 @@ class DashboardProvider:
         self.repo_root = Path(repo_root) if repo_root is not None else _default_repo_root()
         self.task_limit = max(1, min(int(task_limit), completion_inbox.MAX_LIMIT))
         self.stale_processing_hours = max(0.0, float(stale_processing_hours))
-        # One provider instance serves exactly one dashboard snapshot.  Several
-        # independent parallel readers need the same full cards/cost ledger;
+        # One explicit read scope serves exactly one dashboard snapshot.
+        # Several independent parallel readers need the same full cards/ledger;
         # single-flight them here instead of decoding the canonical queue and
         # running its SQLite readiness checks once per consumer.  This cache is
-        # deliberately provider-scoped, so a later refresh always gets fresh
-        # canonical data.
+        # the scope clears it on exit, so a later refresh always gets fresh
+        # canonical data even when its caller reuses this provider instance.
+        self._snapshot_scope_lock = Lock()
         self._snapshot_cache_lock = Lock()
         self._snapshot_cache: dict[str, Future[Any]] = {}
+        self._snapshot_cache_active = False
+
+    @contextmanager
+    def snapshot_read_scope(self):
+        """Share heavy inputs only within one completed dashboard read set."""
+        # A provider is normally request-local. If a custom caller reuses one
+        # concurrently, serialize only that provider's snapshots rather than
+        # leaking one refresh's canonical projection into another.
+        with self._snapshot_scope_lock:
+            with self._snapshot_cache_lock:
+                self._snapshot_cache.clear()
+                self._snapshot_cache_active = True
+            try:
+                yield
+            finally:
+                with self._snapshot_cache_lock:
+                    self._snapshot_cache_active = False
+                    self._snapshot_cache.clear()
 
     def _snapshot_once(self, key: str, loader: Callable[[], Any]) -> Any:
         with self._snapshot_cache_lock:
-            future = self._snapshot_cache.get(key)
-            owner = future is None
-            if future is None:
-                future = Future()
-                self._snapshot_cache[key] = future
+            cache_active = self._snapshot_cache_active
+            if cache_active:
+                future = self._snapshot_cache.get(key)
+                owner = future is None
+                if future is None:
+                    future = Future()
+                    self._snapshot_cache[key] = future
+            else:
+                future = None
+                owner = False
+        if not cache_active:
+            return loader()
+        assert future is not None
         if owner:
             try:
                 future.set_result(loader())
@@ -2224,12 +2252,14 @@ def build_snapshot(
             "errors": [],
         }
 
+    snapshot_scope = getattr(data_provider, "snapshot_read_scope", None)
     if summary_only:
-        return _build_summary_snapshot(
-            data_provider,
-            storage_state=storage_state,
-            storage_usage=storage_usage,
-        )
+        with snapshot_scope() if callable(snapshot_scope) else nullcontext():
+            return _build_summary_snapshot(
+                data_provider,
+                storage_state=storage_state,
+                storage_usage=storage_usage,
+            )
 
     errors: list[dict[str, str]] = []
     task_groups: dict[str, list[dict[str, Any]]] = {}
@@ -2302,7 +2332,8 @@ def build_snapshot(
             {},
         )
 
-    reads = _parallel_snapshot_reads(read_operations, errors)
+    with snapshot_scope() if callable(snapshot_scope) else nullcontext():
+        reads = _parallel_snapshot_reads(read_operations, errors)
     for status in ACTIVE_STATUSES:
         value = reads[f"tasks.{status}"]
         task_groups[status] = _safe_read(

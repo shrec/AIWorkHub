@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.16] - 2026-08-21
+
+### Fixed
+
+- Dashboard single-flight state is now activated only for one bounded read
+  set and is cleared on every exit. Reusing a `DashboardProvider` across
+  refreshes therefore cannot reuse task or cost data from the prior refresh.
+- Concurrent snapshots that intentionally share a provider are serialized at
+  that provider boundary; unrelated provider instances remain fully parallel.
+
 ## [0.10.15] - 2026-08-21
 
 ### Performance

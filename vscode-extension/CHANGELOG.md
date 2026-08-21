@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.16 — 2026-08-21
+
+### Fixed
+
+- Snapshot input sharing is now strictly bounded to one dashboard read set;
+  reused provider instances cannot carry task or cost projections into a later
+  refresh, while independent dashboard instances remain parallel.
+
 ## 0.10.15 — 2026-08-21
 
 ### Performance
