@@ -108,6 +108,26 @@ def test_cleanup_fails_closed_on_mismatched_reciprocal_registration(
     assert root.exists()
 
 
+def test_cleanup_accepts_bounded_partial_forward_registration(
+    repo: Path,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "worktrees" / "req-partial-registration"
+    path = root / "worktree"
+    home = root / "home"
+    assert _git(repo, "worktree", "add", "--detach", str(path), "HEAD").returncode == 0
+    home.mkdir(parents=True)
+    admin_dir = worker_workspace._gitdir_pointer(
+        path / ".git", label="test_workspace_marker"
+    )
+    (admin_dir / "gitdir").unlink()
+
+    worker_workspace.cleanup_workspace(repo, path, home)
+
+    assert not root.exists()
+    assert not admin_dir.exists()
+
+
 def test_cleanup_unregistered_request_workspace_needs_no_git_repository(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -127,6 +147,46 @@ def test_cleanup_unregistered_request_workspace_needs_no_git_repository(
     worker_workspace.cleanup_workspace(repo, path, home)
 
     assert not root.exists()
+
+
+def test_create_workspace_timeout_uses_process_free_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+) -> None:
+    run_calls: list[tuple[str, ...]] = []
+    cleanup_calls: list[tuple[Path, Path, Path]] = []
+
+    def fail_worktree_add(argv, **_kwargs):
+        run_calls.append(tuple(argv))
+        raise worker_workspace.GitCommandTimeout(
+            phase="workspace_provision",
+            argv=list(argv),
+            cwd=repo,
+            timeout=1.0,
+            pid=4242,
+            tree_terminated=True,
+        )
+
+    monkeypatch.setattr(worker_workspace, "_run", fail_worktree_add)
+    monkeypatch.setattr(
+        worker_workspace,
+        "cleanup_workspace",
+        lambda cleanup_repo, path, home: cleanup_calls.append(
+            (cleanup_repo, path, home)
+        ),
+    )
+
+    with pytest.raises(worker_workspace.GitCommandTimeout):
+        worker_workspace.create_workspace(
+            repo,
+            "req-create-timeout",
+            {"allowed_writes": [], "validation": []},
+            "validation",
+        )
+
+    assert len(run_calls) == 1
+    assert run_calls[0][:3] == ("git", "worktree", "add")
+    assert len(cleanup_calls) == 1
 
 
 @pytest.fixture

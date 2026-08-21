@@ -2399,14 +2399,13 @@ def create_workspace(
     except Exception:
         # ``git worktree add`` can raise (for example a timeout that kills git
         # mid-checkout) after it has already written a partial checkout and a
-        # ``.git/worktrees`` registration.  Remove the directory first, then
-        # prune the now-dangling administrative record so no worktree leaks.
-        shutil.rmtree(path.parent, ignore_errors=True)
-        _run(["git", "worktree", "prune", "--expire", "now"], cwd=repo)
+        # ``.git/worktrees`` registration. Use the same exact, process-free
+        # reciprocal cleanup path; a wedged Git process must not force another
+        # Git process into the failure path.
+        cleanup_workspace(repo, path, home)
         raise
     if result.returncode != 0:
-        shutil.rmtree(path.parent, ignore_errors=True)
-        _run(["git", "worktree", "prune", "--expire", "now"], cwd=repo)
+        cleanup_workspace(repo, path, home)
         # Git reports the actionable cause (for example ENOSPC) at the end,
         # after a long checkout progress stream. Preserve that tail.
         raise WorkspaceError(f"git_worktree_add_failed:{result.stderr[-1000:]}")
@@ -2545,7 +2544,10 @@ def _registered_worktree_admin_dir(repo: Path, path: Path) -> Path | None:
         gitdir_file = resolved / "gitdir"
         if gitdir_file.is_symlink() or not gitdir_file.is_file():
             if marker.is_file():
-                raise WorkspaceError("workspace_cleanup_reverse_pointer_missing")
+                # A killed ``git worktree add`` may have published the bounded
+                # forward marker before its reverse pointer. The marker still
+                # gives exact authority for this one admin directory.
+                matches.append(resolved)
             continue
         reverse = _read_git_control_file(
             gitdir_file, label="workspace_cleanup_reverse_pointer"
