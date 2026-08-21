@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.29] - 2026-08-21
+
+### Fixed
+
+- Required project-context tools are now a blocking authenticated MCP gate for
+  read-only/research cards as well as code cards; provider prose cannot stand
+  in for missing Session Manager, AI Memory or KB ledger receipts.
+- Explicit rejection of a current zero-diff review request now resolves the
+  same canonical predecessor evidence as automatic selection.
+- A cold Windows finalization probe gets one bounded warm-up interval and
+  reports `probing` instead of a transient false `Blocked` state.
+
 ## [0.10.28] - 2026-08-21
 
 ### Fixed

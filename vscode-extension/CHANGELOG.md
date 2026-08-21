@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.29 — 2026-08-21
+
+### Fixed
+
+- Required research-card MCP tools now fail closed on missing authenticated
+  receipts instead of trusting provider text.
+- Explicit zero-diff rework selection matches automatic predecessor
+  resolution, and cold Windows finalization probes no longer flash a false
+  Blocked state.
+
 ## 0.10.28 — 2026-08-21
 
 ### Fixed

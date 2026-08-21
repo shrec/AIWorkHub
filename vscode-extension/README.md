@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.29
+
+- Required research-card MCP tools are enforced by the authenticated audit
+  ledger before `review_ready`.
+- Explicit zero-diff review rejection and cold Windows finalization preflight
+  now follow the same deterministic lifecycle as their automatic/warm paths.
+
 ## What's new in 0.10.28
 
 - A live Codex manager route can move between repositories atomically, with a
