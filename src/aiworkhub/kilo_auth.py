@@ -42,6 +42,7 @@ __all__ = [
     "MAX_SOURCE_BYTES",
     "PROVIDER_ID",
     "project_xai_auth",
+    "resolve_kilo_auth_source",
 ]
 
 # The only provider identity ever read, projected, or reported.
@@ -305,3 +306,33 @@ def project_xai_auth(source: StrPath, isolated_home: StrPath) -> KiloAuthProject
         destination_sha256=hashlib.sha256(document).hexdigest(),
         status="projected",
     )
+
+
+def resolve_kilo_auth_source(
+    *,
+    home: StrPath,
+    xdg_data_home: StrPath | None = None,
+    platform_name: str = "posix",
+) -> Path:
+    """Return Kilo's canonical auth path from explicit path inputs only.
+
+    The function performs no filesystem access and never consults ``HOME`` or
+    the process environment.  Callers may supply an explicit XDG data root;
+    otherwise Kilo's portable default below the supplied home is used on both
+    POSIX and Windows hosts.
+    """
+
+    if platform_name not in {"posix", "nt"}:
+        raise KiloAuthSourceError("unsupported platform name")
+    home_path = Path(os.fspath(home))
+    if not home_path.is_absolute() or ".." in home_path.parts:
+        raise KiloAuthSourceError("home must be an absolute normalized path")
+    if xdg_data_home is None:
+        data_root = home_path / ".local" / "share"
+    else:
+        data_root = Path(os.fspath(xdg_data_home))
+        if not data_root.is_absolute() or ".." in data_root.parts:
+            raise KiloAuthSourceError(
+                "XDG data home must be an absolute normalized path"
+            )
+    return data_root / "kilo" / AUTH_FILENAME

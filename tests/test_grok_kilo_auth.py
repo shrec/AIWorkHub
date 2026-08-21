@@ -24,6 +24,7 @@ from aiworkhub.kilo_auth import (  # noqa: E402
     KiloAuthSourceError,
     MAX_SOURCE_BYTES,
     project_xai_auth,
+    resolve_kilo_auth_source,
 )
 
 XAI_ACCESS_TOKEN = "xai-access-token-DO-NOT-PRINT-0001"
@@ -95,6 +96,38 @@ def test_receipt_carries_only_safe_metadata(tmp_path):
     assert receipt.source_sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
     assert receipt.destination_bytes == len(dest_raw)
     assert receipt.destination_sha256 == hashlib.sha256(dest_raw).hexdigest()
+
+
+@pytest.mark.parametrize("platform_name", ["posix", "nt"])
+def test_resolve_auth_source_uses_explicit_portable_default(tmp_path, platform_name):
+    home = (tmp_path / "home").resolve()
+    assert resolve_kilo_auth_source(
+        home=home, platform_name=platform_name
+    ) == home / ".local" / "share" / "kilo" / "auth.json"
+
+
+def test_resolve_auth_source_honors_explicit_xdg_root(tmp_path):
+    home = (tmp_path / "home").resolve()
+    data = (tmp_path / "xdg-data").resolve()
+    assert resolve_kilo_auth_source(
+        home=home, xdg_data_home=data
+    ) == data / "kilo" / "auth.json"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "reason"),
+    [
+        ({"home": "relative"}, "home must be an absolute normalized path"),
+        (
+            {"home": "/safe", "xdg_data_home": "relative"},
+            "XDG data home must be an absolute normalized path",
+        ),
+        ({"home": "/safe", "platform_name": "other"}, "unsupported platform name"),
+    ],
+)
+def test_resolve_auth_source_fails_closed_without_ambient_reads(kwargs, reason):
+    with pytest.raises(KiloAuthSourceError, match=reason):
+        resolve_kilo_auth_source(**kwargs)
 
 
 def test_missing_source_fails_closed(tmp_path):

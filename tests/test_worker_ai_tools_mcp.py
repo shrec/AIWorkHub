@@ -3,17 +3,57 @@ from __future__ import annotations
 import hashlib
 import asyncio
 import json
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import get_args, get_type_hints
 
 import pytest
+import stat
 
 from aiworkhub import quality_reviewer
 from aiworkhub import repository_state
 from aiworkhub import source_graph
 from aiworkhub import worker_ai_tools_mcp as worker_tools
+
+
+def test_generate_worker_runtime_writes_exact_private_kilo_config(tmp_path):
+    home = tmp_path / "home"
+    runtime = worker_tools.generate_worker_mcp_runtime(
+        home=home,
+        request_id="a" * 32,
+        task_id="task-kilo",
+        runner="grok-4.6",
+        topic="code",
+        repo=tmp_path / "repo",
+        authority_repo=tmp_path / "authority",
+        source_graph_targets=[],
+        session_topic="code",
+        package_import_root=tmp_path / "package-root",
+        python_executable="/usr/bin/python3",
+    )
+
+    assert runtime.kilo_config_path == home / ".config" / "kilo" / "kilo.json"
+    payload = json.loads(runtime.kilo_config_path.read_text(encoding="utf-8"))
+    assert payload == {
+        "mcp": {
+            worker_tools.SERVER_NAME: {
+                "type": "local",
+                "command": [
+                    "/usr/bin/python3",
+                    "-m",
+                    "aiworkhub.worker_ai_tools_mcp",
+                ],
+                "environment": runtime.env,
+                "enabled": True,
+            }
+        }
+    }
+    if os.name == "posix":
+        assert stat.S_IMODE(runtime.kilo_config_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(runtime.kilo_config_path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE((home / ".config").stat().st_mode) == 0o700
 
 
 def _ctx(

@@ -4232,6 +4232,7 @@ class WorkerMcpRuntime:
     claude_mcp_config_path: Path
     copilot_mcp_config_path: Path
     codex_config_toml_path: Path
+    kilo_config_path: Path
     audit_ledger_path: Path
     audit_hmac_key_path: Path
     tool_names: tuple[str, ...]
@@ -4383,6 +4384,22 @@ def generate_worker_mcp_runtime(
     copilot_path = runtime_dir / "copilot_mcp_config.json"
     _write_json_0600(copilot_path, mcp_config)
 
+    kilo_config_root = (home / ".config").resolve()
+    kilo_config_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(kilo_config_root, 0o700)
+    kilo_path = (kilo_config_root / "kilo" / "kilo.json").resolve()
+    kilo_config = {
+        "mcp": {
+            SERVER_NAME: {
+                "type": "local",
+                "command": [py, *launch_args],
+                "environment": env,
+                "enabled": True,
+            }
+        }
+    }
+    _write_json_0600(kilo_path, kilo_config)
+
     codex_home = (home / ".codex").resolve()
     codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(codex_home, 0o700)
@@ -4413,6 +4430,7 @@ def generate_worker_mcp_runtime(
         claude_mcp_config_path=claude_path,
         copilot_mcp_config_path=copilot_path,
         codex_config_toml_path=codex_config_path,
+        kilo_config_path=kilo_path,
         audit_ledger_path=ledger_path,
         audit_hmac_key_path=key_path,
         tool_names=MCP_TOOL_NAMES,

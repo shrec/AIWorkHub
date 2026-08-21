@@ -84,6 +84,7 @@ GLM_SECRET_ENV_VAR = "COPILOT_PROVIDER_API_KEY"
 GROK_KILO_ADAPTER = "grok_kilo_cli"
 GROK_KILO_SUPPORTED_MODELS: tuple[str, ...] = ("xai/grok-4.6",)
 GROK_KILO_DEFAULT_MODEL = GROK_KILO_SUPPORTED_MODELS[0]
+_KILO_EXTENSION_DIR_GLOB = "kilocode.kilo-code-*"
 VSCODE_LM_ADAPTER = "vscode_lm"
 WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER = "windows_native_cli_requires_appcontainer_sandbox"
 
@@ -419,6 +420,61 @@ def _resolve_override(adapter_id: str, raw_path: PathValue) -> ExecutableResolut
     return ExecutableResolution(adapter_id, str(resolved), True, "")
 
 
+def _default_kilo_extension_roots() -> tuple[Path, ...]:
+    """Return only the bounded editor extension roots Kilo officially uses."""
+
+    home = Path.home()
+    return (
+        home / ".vscode" / "extensions",
+        home / ".vscode-server" / "extensions",
+        home / ".vscode-server-insiders" / "extensions",
+    )
+
+
+def _kilo_extension_version(path: Path) -> tuple[int, ...]:
+    match = re.search(r"kilocode\.kilo-code-(\d+(?:\.\d+)*)", path.name)
+    return tuple(int(part) for part in match.group(1).split(".")) if match else ()
+
+
+def _resolve_kilo_extension_executable(adapter_id: str) -> ExecutableResolution:
+    binary_name = "kilo.exe" if os.name == "nt" else "kilo"
+    candidates: list[Path] = []
+    for root in _default_kilo_extension_roots():
+        if root.is_symlink() or not root.is_dir():
+            continue
+        try:
+            extension_dirs = sorted(
+                root.glob(_KILO_EXTENSION_DIR_GLOB), key=lambda path: path.name
+            )[:128]
+        except OSError:
+            continue
+        for extension_dir in extension_dirs:
+            candidate = extension_dir / "bin" / binary_name
+            if (
+                extension_dir.is_symlink()
+                or candidate.parent.is_symlink()
+                or candidate.is_symlink()
+            ):
+                continue
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                candidates.append(candidate)
+    if not candidates:
+        return ExecutableResolution(
+            adapter_id, None, False, "executable not found: kilo"
+        )
+    selected = max(
+        candidates,
+        key=lambda path: (_kilo_extension_version(path.parent.parent), str(path)),
+    )
+    try:
+        resolved = selected.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return ExecutableResolution(
+            adapter_id, None, False, "discovered Kilo executable is not a file"
+        )
+    return ExecutableResolution(adapter_id, str(resolved), True, "")
+
+
 def resolve_executable(
     adapter_id: str,
     executable_overrides: ExecutableOverrides | None = None,
@@ -453,6 +509,8 @@ def resolve_executable(
     binary = ADAPTER_EXECUTABLES[adapter_id]
     discovered = shutil.which(binary)
     if not discovered:
+        if adapter_id == GROK_KILO_ADAPTER:
+            return _resolve_kilo_extension_executable(adapter_id)
         return ExecutableResolution(
             adapter_id, None, False, f"executable not found: {binary}"
         )

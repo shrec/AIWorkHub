@@ -492,3 +492,63 @@ def test_grok_kilo_preserves_windows_appcontainer_gate(monkeypatch, tmp_path):
         runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
     )
     assert allowed.launchable is True
+
+
+def test_grok_kilo_discovers_newest_bounded_vscode_extension(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root = tmp_path / "extensions"
+    older_bin = root / "kilocode.kilo-code-7.9.0" / "bin"
+    newer_bin = root / "kilocode.kilo-code-7.10.0" / "bin"
+    older_bin.mkdir(parents=True)
+    newer_bin.mkdir(parents=True)
+    older = _executable(older_bin, "kilo")
+    newer = _executable(newer_bin, "kilo")
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: None)
+    monkeypatch.setattr(
+        runtime_adapters, "_default_kilo_extension_roots", lambda: (root,)
+    )
+
+    plan = runtime_adapters.build_runtime_command("grok_kilo_cli", "Prompt", repo)
+
+    assert older.exists()
+    assert plan.executable == str(newer)
+    assert plan.argv[0] == str(newer)
+
+
+def test_grok_kilo_path_discovery_precedes_extension_fallback(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path_bin = tmp_path / "path"
+    path_bin.mkdir()
+    path_kilo = _executable(path_bin, "kilo")
+
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: str(path_kilo))
+    monkeypatch.setattr(
+        runtime_adapters,
+        "_default_kilo_extension_roots",
+        lambda: (_ for _ in ()).throw(AssertionError("fallback must not run")),
+    )
+
+    plan = runtime_adapters.build_runtime_command("grok_kilo_cli", "Prompt", repo)
+    assert plan.executable == str(path_kilo)
+
+
+def test_grok_kilo_extension_symlink_is_rejected(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root = tmp_path / "extensions"
+    real_bin = tmp_path / "real"
+    real_bin.mkdir()
+    real = _executable(real_bin, "kilo")
+    link = root / "kilocode.kilo-code-9.0.0" / "bin" / "kilo"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: None)
+    monkeypatch.setattr(
+        runtime_adapters, "_default_kilo_extension_roots", lambda: (root,)
+    )
+
+    plan = runtime_adapters.build_runtime_command("grok_kilo_cli", "Prompt", repo)
+    assert plan.launchable is False
+    assert plan.validation_reason == "executable not found: kilo"
