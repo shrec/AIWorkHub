@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.21] - 2026-08-21
+
+### Fixed
+
+- Sparse Python validation now imports and measures the retained candidate
+  package instead of the canonical editable install, with deterministic
+  path/state/bytes authority retained in every validation receipt.
+- Declared `npm --prefix` validation receives immutable package and test
+  support from the detached candidate base; no dependency tree is copied or
+  downloaded, and an unbound dependency tree fails closed before execution.
+- Git lifecycle subprocesses no longer inherit ambient `GIT_*` redirection or
+  interactive prompt configuration. Preflight resolves HEAD directly from
+  bounded Git metadata and caches only successful, exact HEAD-bound receipts.
+
+### Performance
+
+- The full VS Code test suite now runs from a sparse candidate workspace
+  without copying `node_modules`; the live 40-file discovery canary completed
+  in about five seconds on the release host.
+
 ## [0.10.20] - 2026-08-21
 
 ### Fixed

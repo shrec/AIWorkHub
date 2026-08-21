@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.21 — 2026-08-21
+
+### Fixed
+
+- Candidate Python and npm validation now execute from the retained sparse
+  workspace with deterministic source/config authority.
+- Windows-facing Git preflight is noninteractive, HEAD-bound and process-free
+  for cache identity, preventing failed probes from being cached as Ready.
+
 ## 0.10.20 — 2026-08-21
 
 ### Fixed

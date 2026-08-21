@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.21
+
+- Retained sparse workspaces are now the mechanical authority for Python and
+  npm validation instead of the canonical editable install.
+- Git preflight no longer spawns a process merely to identify HEAD, strips
+  ambient Git overrides and never caches a failed probe as Ready.
+
 ## What's new in 0.10.20
 
 - Review tasks whose retained rework metadata is malformed can now be safely
