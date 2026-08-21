@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.27
+
+- Malformed or missing validation-failure deltas are discarded with a
+  structured no-reuse receipt, allowing review rejection to complete safely
+  from canonical HEAD instead of looping in the review queue.
+
 ## What's new in 0.10.26
 
 - Settings remains responsive with one scroll surface, fixed chrome and stable

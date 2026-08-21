@@ -5,4 +5,4 @@ through setuptools' dynamic ``attr`` provider; extension metadata is a checked
 projection maintained by ``scripts/release_metadata.py``.
 """
 
-__version__ = "0.10.26"
+__version__ = "0.10.27"

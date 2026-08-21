@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.27 — 2026-08-21
+
+### Fixed
+
+- Validation-failed review tasks can be safely returned for clean rework when
+  their retained delta descriptor is missing or invalid, instead of remaining
+  stuck in the review queue.
+
 ## 0.10.26 — 2026-08-21
 
 ### Fixed

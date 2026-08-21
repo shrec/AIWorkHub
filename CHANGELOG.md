@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.27] - 2026-08-21
+
+### Fixed
+
+- Rejecting a validation-failed review no longer gets trapped by a malformed,
+  missing, unsealed or tampered rework-delta descriptor. Untrusted delta bytes
+  are discarded, the task returns to pending from canonical HEAD, and the
+  disposition reports the exact no-reuse reason.
+- Valid sealed rework deltas retain their existing authenticated reuse path;
+  malformed evidence cannot weaken workspace, hash or allowed-write checks.
+
 ## [0.10.26] - 2026-08-21
 
 ### Fixed
