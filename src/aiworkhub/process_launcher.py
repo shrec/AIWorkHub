@@ -3658,11 +3658,13 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     reaches this count, so a worker cannot satisfy the gate by writing text
     that merely looks like an audit entry.
     """
+    context_metadata = metadata.get("project_context") or {}
     task_type = str(
-        ((metadata.get("project_context") or {}).get("task_context_policy") or {}).get("task_type") or ""
+        (context_metadata.get("task_context_policy") or {}).get("task_type") or ""
     )
+    context_required = context_metadata.get("required") is True
     worker_mcp_meta = metadata.get("worker_mcp") or {}
-    sections = (metadata.get("project_context") or {}).get("sections") or []
+    sections = context_metadata.get("sections") or []
     tools_policy = dict(repo_policy.DEFAULT_POLICY["tools"])
     policy_error = ""
     authority_repo = worker_mcp_meta.get("authority_repo")
@@ -3689,10 +3691,22 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
                 and name not in required_tools
             ):
                 required_tools.append(name)
-    gated = task_type == "code" and bool(required_tools)
+    # An explicit required project-context contract is stronger than the
+    # repository's generic code-task defaults.  Research/read-only cards use
+    # this path too, so derive their blocking tools from the exact requested
+    # sections instead of silently classifying them as observation-only.
+    if context_required:
+        for section in sections:
+            if not isinstance(section, dict) or not section.get("requested", True):
+                continue
+            name = str(section.get("name") or "")
+            if name in _GATEABLE_CONTEXT_SECTIONS and name not in required_tools:
+                required_tools.append(name)
+    gated = bool(required_tools) and (task_type == "code" or context_required)
     result: dict[str, Any] = {
         "gated": gated,
         "task_type": task_type,
+        "project_context_required": context_required,
         "required_tools": required_tools if gated else [],
         "missing_tools": [],
         "satisfied": True,
@@ -3838,7 +3852,7 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             continue
         if int(successful.get(tool) or 0) > 0:
             satisfaction_by_tool[tool] = "live_worker_call"
-        elif injected_acknowledged and tool in injected_tools:
+        elif not context_required and injected_acknowledged and tool in injected_tools:
             satisfaction_by_tool[tool] = "injected_receipt"
         elif rework_attempt:
             # A rework is a validation-only replay of an already-green
@@ -3857,7 +3871,12 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         result["satisfied"] = False
         reasons: list[str] = []
         if missing:
-            reasons.append("required_aiworkhub_mcp_calls_missing:" + ",".join(missing))
+            prefix = (
+                "worker_mcp_required_tools_missing:"
+                if context_required
+                else "required_aiworkhub_mcp_calls_missing:"
+            )
+            reasons.append(prefix + ",".join(missing))
         if stale:
             reasons.append("source_graph_stale_or_cached:" + ",".join(stale))
         result["reason"] = verification.get("reason") or "; ".join(reasons)

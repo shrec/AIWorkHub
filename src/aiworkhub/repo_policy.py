@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
@@ -47,6 +48,7 @@ MANDATORY_RAW_DISCOVERY_DENIES = ("grep", "rg", "find", "tree")
 READINESS_READY = "ready"
 READINESS_READY_UNVERIFIED = "ready_unverified"
 QUOTA_STATE_UNAVAILABLE = "unavailable_from_provider_api"
+_FINALIZATION_PREFLIGHT_WARMUP_SECONDS = 1.0
 
 DEFAULT_POLICY: dict[str, Any] = {
     "schema_id": SCHEMA_ID,
@@ -482,6 +484,7 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         "status": "not_required",
         "reason": "non_windows_host",
     }
+    finalization_pending = False
     if _is_windows_host() and launchable_routes:
         probe_adapter = str(
             (selected or launchable_routes[0]).get("adapter_id") or "vscode_lm"
@@ -490,6 +493,20 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             finalization_probe = worker_workspace.finalization_preflight_probe_nonblocking(
                 root, probe_adapter
             )
+            # A cold probe normally completes in a few hundred milliseconds.
+            # Give that coalesced background probe one bounded warm-up window
+            # so callers do not observe a transient hard Blocked result.
+            deadline = time.monotonic() + _FINALIZATION_PREFLIGHT_WARMUP_SECONDS
+            while (
+                str(finalization_probe.get("status") or "") == "probing"
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+                finalization_probe = (
+                    worker_workspace.finalization_preflight_probe_nonblocking(
+                        root, probe_adapter
+                    )
+                )
         except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError) as exc:
             finalization_probe = {
                 "ok": False,
@@ -497,7 +514,10 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
                 "reason": f"preflight_finalization_probe_failed:{exc}"[:500],
                 "phase": "preflight_finalization",
             }
-        if not finalization_probe.get("ok"):
+        finalization_pending = (
+            str(finalization_probe.get("status") or "") == "probing"
+        )
+        if not finalization_probe.get("ok") and not finalization_pending:
             errors.append("worker_finalization_not_ready")
     selected_route_backend = str((selected or {}).get("sandbox_backend") or "")
     route_enforceable = bool(
@@ -533,13 +553,19 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         if route_coverage_status == "degraded"
         else []
     )
+    if finalization_pending:
+        warnings.append("worker_finalization_probe_pending")
     return {
-        "ok": not unique_errors,
+        "ok": not unique_errors and not finalization_pending,
         "schema_id": PREFLIGHT_SCHEMA_ID,
         "status": (
             "blocked"
             if unique_errors
-            else ("degraded" if route_coverage_status == "degraded" else "ready")
+            else (
+                "probing"
+                if finalization_pending
+                else ("degraded" if route_coverage_status == "degraded" else "ready")
+            )
         ),
         "errors": unique_errors,
         "warnings": warnings,

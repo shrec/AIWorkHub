@@ -3951,7 +3951,6 @@ def reject_review(
             and isinstance(t_workspace, dict)
             and str(t_workspace.get("request_id") or "").strip() == stripped
             and isinstance(t_hashes, dict)
-            and t_hashes
         ):
             terminal_epoch = terminal_review.get("claim_epoch")
             if type(terminal_epoch) is not int or terminal_epoch < 1:

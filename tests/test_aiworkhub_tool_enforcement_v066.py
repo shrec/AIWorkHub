@@ -54,6 +54,39 @@ def test_completion_gate_requires_every_requested_aiworkhub_surface(monkeypatch)
     assert result["reason"] == "required_aiworkhub_mcp_calls_missing:kb"
 
 
+def test_required_research_context_is_a_blocking_authenticated_tool_gate(
+    monkeypatch,
+) -> None:
+    metadata = _metadata()
+    metadata["project_context"]["required"] = True
+    metadata["project_context"]["task_context_policy"]["task_type"] = "research"
+    monkeypatch.setattr(
+        process_launcher.worker_ai_tools_mcp,
+        "verify_audit_ledger",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "policy_violations": 0,
+            "live_source_graph_calls": 1,
+            "successful_call_count_by_tool": {"source_graph": 1},
+        },
+    )
+
+    result = process_launcher._worker_mcp_live_call_gate(metadata, "request-1")
+
+    assert result["gated"] is True
+    assert result["required_tools"] == [
+        "source_graph",
+        "session_current_state",
+        "ai_memory",
+        "kb",
+    ]
+    assert result["satisfied"] is False
+    assert result["missing_tools"] == ["session_current_state", "ai_memory", "kb"]
+    assert result["reason"] == (
+        "worker_mcp_required_tools_missing:session_current_state,ai_memory,kb"
+    )
+
+
 def test_completion_gate_rejects_cache_only_source_graph_for_code_tasks(monkeypatch) -> None:
     """A successful ledger entry that is not a fresh live invocation remains
     fail-closed and is reported consistently as stale/cached, not missing."""

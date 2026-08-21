@@ -204,6 +204,63 @@ def test_windows_finalization_probe_blocks_false_ready(monkeypatch, tmp_path):
     assert "git diff" in report["worker_finalization"]["reason"]
 
 
+def test_windows_cold_finalization_probe_warms_without_transient_blocked(
+    monkeypatch, tmp_path
+):
+    root = _root(tmp_path)
+    _common(monkeypatch, graph=_ready_graph())
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: True)
+    responses = iter(
+        [
+            {
+                "ok": False,
+                "status": "probing",
+                "reason": "worker_finalization_probe_started",
+                "phase": "preflight_finalization",
+            },
+            {
+                "ok": True,
+                "status": "ready",
+                "reason": "",
+                "phase": "preflight_finalization",
+                "duration_ms": 320,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        repo_policy.worker_workspace,
+        "finalization_preflight_probe_nonblocking",
+        lambda _root, _adapter: next(responses),
+    )
+    monkeypatch.setattr(
+        repo_policy.worker_workspace, "select_sandbox_backend", lambda: "windows"
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id, "/bin/x", True, ""
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *args, **kwargs: {
+            "launchable": True,
+            "blocker_reason": "",
+            "access_observed": True,
+            "consent_required": False,
+        },
+    )
+
+    report = repo_policy.build_preflight(root)
+
+    assert report["ok"] is True
+    assert report["status"] == "ready"
+    assert "worker_finalization_not_ready" not in report["errors"]
+    assert report["worker_finalization"]["duration_ms"] == 320
+
+
 def test_zero_launchable_routes_is_a_global_preflight_blocker(monkeypatch, tmp_path):
     root = _root(tmp_path)
     _common(monkeypatch, graph=_ready_graph())

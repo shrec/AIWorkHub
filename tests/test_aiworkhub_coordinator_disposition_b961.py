@@ -860,6 +860,48 @@ def test_reject_to_blocked_explicit_predecessor_pins_selection(coord):
     assert "terminal_review" not in card
 
 
+def test_reject_explicit_current_zero_diff_predecessor_matches_automatic_resolution(
+    coord,
+):
+    request_id = "zero-diff-current-request"
+    workspace = {
+        "request_id": request_id,
+        "repo": str(coord),
+        "path": f"/tmp/aiworkhub-worktrees/{request_id}/worktree",
+        "home": f"/tmp/aiworkhub-worktrees/{request_id}/home",
+        "allowed_writes": [],
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+    _insert(
+        coord,
+        "T_V2_ZERO_DIFF_EXPLICIT",
+        card={
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": request_id},
+                    "workspace": workspace,
+                    "changed_path_hashes": {},
+                },
+            },
+        },
+    )
+
+    result = core.reject_review(
+        "T_V2_ZERO_DIFF_EXPLICIT",
+        "repeat the read-only audit",
+        to="pending",
+        predecessor_request_id=request_id,
+    )
+
+    assert result["ok"] is True, result
+    card = json.loads(_row(coord, "T_V2_ZERO_DIFF_EXPLICIT")["card_json"])
+    assert card["review_feedback"]["predecessor_request_id"] == request_id
+    assert card["review_feedback"]["predecessor_changed_paths"] == []
+    assert "terminal_review" not in card
+
+
 def test_reject_default_predecessor_is_current_review(coord):
     """When predecessor_request_id is omitted (None), the current terminal_review
     request is the safe default -- identical to V1 behaviour."""
