@@ -759,6 +759,41 @@ def test_incremental_python_import_resolution_is_changed_scope_only(
         conn.close()
 
 
+def test_python_import_resolution_tokenizes_each_source_line_once(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "helpers.py",
+        "def first():\n    return 1\n\ndef second():\n    return 2\n",
+    )
+    call_line = "    return helpers.first(), helpers.second()"
+    _write(
+        repo / "pkg" / "caller.py",
+        "import pkg.helpers as helpers\n\ndef run():\n" + call_line + "\n",
+    )
+    original = sg._python_dotted_calls
+    tokenized_lines: list[str] = []
+
+    def tracked(source_line: str):
+        tokenized_lines.append(source_line)
+        return original(source_line)
+
+    monkeypatch.setattr(sg, "_python_dotted_calls", tracked)
+
+    sg.build_index(repo, incremental=False)
+
+    assert tokenized_lines.count(call_line) == 1
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT dst_name, dst_qualname FROM edges "
+            "WHERE file_path='pkg/caller.py' AND kind='calls' ORDER BY dst_name"
+        ).fetchall()
+        assert {str(row["dst_name"]) for row in rows} == {"first", "second"}
+        assert all(row["dst_qualname"] for row in rows)
+    finally:
+        conn.close()
+
+
 def test_python_import_resolution_stays_unresolved_when_target_is_ambiguous(tmp_path):
     repo = _new_repo(tmp_path, "repo")
     _write(repo / "a" / "helpers.py", "def helper():\n    return 1\n")
@@ -1510,6 +1545,12 @@ def test_multicore_extraction_is_bounded_and_merge_order_is_deterministic(
     assert write_order == [f"pkg/{name}" for name in names]
     assert report.extraction_telemetry["selected_workers"] == 2
     assert report.extraction_telemetry["reason"] == "env_override"
+    assert set(report.phase_seconds) == {
+        "extraction", "git_metrics", "hash", "merge", "quality", "resolution", "total",
+    }
+    assert all(seconds >= 0 for seconds in report.phase_seconds.values())
+    assert report.phase_seconds["total"] >= report.phase_seconds["extraction"]
+    assert report.to_json()["phase_seconds"] == report.phase_seconds
 
 
 def test_multicore_extraction_worker_configuration_is_bounded(monkeypatch):

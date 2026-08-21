@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.12 — 2026-08-21
+
+### Performance
+
+- Source Graph full rebuilds avoid millions of repeated Python regular-
+  expression compilations during imported-call resolution. The canonical
+  823-file build fell from 66.82 seconds to 18.60 seconds with identical
+  deterministic indexing semantics.
+- Build health now includes phase-level timing evidence for the complete
+  Source Graph pipeline.
+
 ## 0.10.11 — 2026-08-21
 
 ### Performance

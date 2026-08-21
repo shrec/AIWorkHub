@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.12] - 2026-08-21
+
+### Performance
+
+- Python imported-call resolution now tokenizes each source line once instead
+  of compiling an alias-specific regular expression for every unresolved edge.
+  On the canonical 823-file graph this reduced the resolver from 54.17 seconds
+  to 5.85 seconds and the full 8-worker rebuild from 66.82 to 18.60 seconds.
+- Source Graph build receipts now expose bounded phase timings for hashing,
+  extraction, merge, cross-file resolution, Git metrics, quality and total
+  wall time so future regressions identify the exact bottleneck.
+
+### Fixed
+
+- Clean-host launcher tests restore their injected provider-auth fixture,
+  keeping Linux, Windows, macOS and Python 3.12-3.14 CI qualification aligned.
+
 ## [0.10.11] - 2026-08-21
 
 ### Performance

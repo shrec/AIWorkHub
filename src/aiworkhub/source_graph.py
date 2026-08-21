@@ -96,6 +96,9 @@ MAX_SOURCE_GRAPH_HASH_WORKERS = 16
 MIN_PARALLEL_HASH_FILES = 8
 MIN_PARALLEL_HASH_BYTES = 256 * 1024
 SOURCE_GRAPH_HASH_STABLE_READ_ATTEMPTS = 3
+_PYTHON_DOTTED_CALL_RE = re.compile(
+    r"\b([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)+)\s*\("
+)
 _INDEXED_EXTENSION_SET = frozenset(
     suffix.casefold() for suffix in sglanguages.INDEXED_EXTENSIONS
 )
@@ -683,6 +686,7 @@ class BuildReport:
     hash_telemetry: dict[str, Any] = field(default_factory=dict)
     quality_reused: bool = False
     files_skipped: int = 0
+    phase_seconds: dict[str, float] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -715,6 +719,7 @@ class BuildReport:
             "hash_backend": self.hash_backend,
             "hash_telemetry": self.hash_telemetry,
             "quality_reused": self.quality_reused,
+            "phase_seconds": self.phase_seconds,
         }
 
 
@@ -1383,6 +1388,13 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
     return resolved
 
 
+def _python_dotted_calls(source_line: str) -> tuple[tuple[str, ...], ...]:
+    return tuple(
+        tuple(part.strip() for part in match.group(1).split("."))
+        for match in _PYTHON_DOTTED_CALL_RE.finditer(source_line)
+    )
+
+
 def _resolve_python_imported_calls(
     conn: sqlite3.Connection,
     repo_root: Path,
@@ -1461,6 +1473,7 @@ def _resolve_python_imported_calls(
     unresolved = conn.execute(unresolved_sql, unresolved_params).fetchall()
     imports_by_file: dict[str, list[sqlite3.Row]] = {}
     lines_by_file: dict[str, tuple[str, ...]] = {}
+    dotted_calls_by_line: dict[tuple[str, int], tuple[tuple[str, ...], ...]] = {}
     candidates_by_name: dict[str, list[sqlite3.Row]] = {}
     resolved = 0
 
@@ -1511,13 +1524,18 @@ def _resolve_python_imported_calls(
                 lines_by_file[file_path] = lines
             line_number = int(edge["line"] or 0)
             source_line = lines[line_number - 1] if 0 < line_number <= len(lines) else ""
+            line_key = (file_path, line_number)
+            dotted_calls = dotted_calls_by_line.get(line_key)
+            if dotted_calls is None:
+                dotted_calls = _python_dotted_calls(source_line)
+                dotted_calls_by_line[line_key] = dotted_calls
             for item in imports:
                 alias = str(item["name"])
-                alias_call = re.compile(
-                    rf"\b{re.escape(alias)}(?:\s*\.\s*[A-Za-z_]\w*)*"
-                    rf"\s*\.\s*{re.escape(name)}\s*\("
-                )
-                if alias_call.search(source_line):
+                if any(
+                    parts[-1] == name and alias in parts[:-1]
+                    for parts in dotted_calls
+                    if len(parts) >= 2
+                ):
                     matching_imports.append(str(item["signature"]))
         if not matching_imports:
             continue
@@ -1651,6 +1669,7 @@ def _resolve_javascript_import_bindings(conn: sqlite3.Connection) -> int:
 
 
 def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, incremental: bool = True) -> BuildReport:
+    build_started = time.monotonic()
     repo_root = repo_root.resolve()
     resolved_db_path = db_path or resolve_db_path(repo_root)
     conn = connect(resolved_db_path)
@@ -1680,6 +1699,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
     freelist_ratio = 0.0
     compaction_recommended = False
     compaction_deferred_reason = ""
+    phase_seconds: dict[str, float] = {}
     try:
         # Read the prior generation before extraction, but do not begin the
         # write transaction until every source file has been parsed.  Large
@@ -1866,6 +1886,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 for candidate in process_candidates
             ]
         extraction_seconds = max(0.0, time.monotonic() - extraction_started)
+        phase_seconds["extraction"] = extraction_seconds
 
         # ``Executor.map`` preserves candidate order.  The SQLite merge stays
         # single-threaded so parallel extraction cannot change row authority,
@@ -1932,6 +1953,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 )
             )
 
+        merge_started = time.monotonic()
         with conn:
             if pending_stat_updates:
                 conn.executemany(
@@ -2001,6 +2023,8 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 if rel not in seen_rel:
                     _invalidate_file(conn, rel)
                     removed += 1
+            phase_seconds["merge"] = max(0.0, time.monotonic() - merge_started)
+            resolution_started = time.monotonic()
             if changed or removed:
                 _resolve_cpp_cross_file_edges(conn)
                 if python_changed_paths:
@@ -2011,8 +2035,15 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                         affected_names=affected_python_names,
                     )
                 _resolve_javascript_import_bindings(conn)
+            phase_seconds["resolution"] = max(
+                0.0, time.monotonic() - resolution_started
+            )
+            git_metrics_started = time.monotonic()
             sginsights.materialize_git_metrics(
                 conn, repo_root, sorted(seen_rel), limit=10000,
+            )
+            phase_seconds["git_metrics"] = max(
+                0.0, time.monotonic() - git_metrics_started
             )
             finished_at = _now_iso()
             skipped_files = [
@@ -2079,6 +2110,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             )
         except (TypeError, json.JSONDecodeError):
             previous_quality = None
+        quality_started = time.monotonic()
         if (
             changed == 0 and removed == 0
             and isinstance(previous_quality, dict) and previous_quality
@@ -2098,6 +2130,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 finished_at=finished_at,
                 previous=previous_quality if isinstance(previous_quality, dict) else None,
             )
+        phase_seconds["quality"] = max(0.0, time.monotonic() - quality_started)
         with conn:
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('index_quality', ?) "
@@ -2120,6 +2153,8 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             )
     finally:
         conn.close()
+    phase_seconds["hash"] = hash_seconds
+    phase_seconds["total"] = max(0.0, time.monotonic() - build_started)
     return BuildReport(
         repo_root=str(repo_root), db_path=str(resolved_db_path), incremental=incremental,
         files_seen=len(files_on_disk), files_changed=changed, files_unchanged=unchanged,
@@ -2148,6 +2183,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
         hash_backend=hash_backend,
         hash_telemetry=hash_telemetry,
         quality_reused=quality_reused,
+        phase_seconds=phase_seconds,
     )
 
 

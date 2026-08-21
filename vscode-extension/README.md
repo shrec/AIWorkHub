@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.12
+
+- Source Graph imported-call resolution tokenizes each source line once,
+  cutting the canonical full rebuild from 66.82 seconds to 18.60 seconds.
+- Phase-level build telemetry identifies hashing, extraction, merge,
+  resolution, Git-metrics and quality costs independently.
+
 ## What's new in 0.10.11
 
 - Workers materialize only task-declared files in sparse linked worktrees,
