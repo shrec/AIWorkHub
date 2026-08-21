@@ -340,6 +340,60 @@ def test_validation_workspace_seeds_exact_worker_package_support_and_imports_can
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+def test_python_validation_seeds_transitive_local_import_closure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    package = repo / "src/examplepkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "candidate.py").write_text(
+        "from . import core\nVALUE = core.VALUE\n", encoding="utf-8"
+    )
+    (package / "core.py").write_text(
+        "from .support import VALUE\n", encoding="utf-8"
+    )
+    (package / "support.py").write_text("VALUE = 'closure-ok'\n", encoding="utf-8")
+    (package / "unused.py").write_text("VALUE = 'not-seeded'\n", encoding="utf-8")
+    probe = repo / "probe.py"
+    probe.write_text("from examplepkg.candidate import VALUE\nprint(VALUE)\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\npythonpath = ['src']\n", encoding="utf-8"
+    )
+    assert _git(repo, "add", "src/examplepkg", "probe.py", "pyproject.toml").returncode == 0
+    assert _git(repo, "commit", "-qm", "python closure fixture").returncode == 0
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "python-closure-worktrees"),
+    )
+
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "python-import-closure",
+        {
+            "allowed_writes": ["src/examplepkg/candidate.py"],
+            "read_first": ["src/examplepkg/candidate.py", "probe.py"],
+            "validation": ["PYTHONPATH=src python3 probe.py"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        assert (workspace.path / "src/examplepkg/core.py").is_file()
+        assert (workspace.path / "src/examplepkg/support.py").is_file()
+        assert not (workspace.path / "src/examplepkg/unused.py").exists()
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["PYTHONPATH=src python3 probe.py"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+        assert result["returncode"] == 0
+        assert "closure-ok" in result["stdout_head"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
 def test_python_validation_imports_new_sparse_candidate_module_without_pythonpath(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -10,6 +10,7 @@ after scope, validation, and parent-content checks.
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import ctypes
 import errno
@@ -1078,6 +1079,130 @@ def _expand_declared(repo: Path, declared: Iterable[str]) -> list[str]:
     if len(rows) > MAX_SEED_FILES:
         raise WorkspaceError(f"seed_file_limit_exceeded:{len(rows)}")
     return sorted(rows)
+
+
+def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str, ...]:
+    """Return the bounded static package-local import closure for Python seeds.
+
+    Sparse validation must import candidate modules from the detached worktree,
+    not fall through to the installed/canonical package.  Follow only imports
+    that resolve to regular repository files; third-party and stdlib imports
+    remain external.  Relative imports are unambiguously repository-local and
+    therefore fail closed when their target cannot be resolved.
+    """
+
+    repo = repo.resolve()
+    initial = sorted({_relative_repo_path(value) for value in seeded})
+    roots: set[Path] = {repo}
+    src_root = repo / "src"
+    if src_root.is_dir() and not src_root.is_symlink():
+        roots.add(src_root)
+
+    def package_context(relative: str) -> tuple[Path, tuple[str, ...]]:
+        current = (repo / relative).parent
+        parts: list[str] = []
+        while current != repo and (current / "__init__.py").is_file():
+            parts.insert(0, current.name)
+            current = current.parent
+        if parts:
+            roots.add(current)
+        return current, tuple(parts)
+
+    for relative in initial:
+        if relative.endswith(".py") and (repo / relative).is_file():
+            package_context(relative)
+
+    def module_file(parts: tuple[str, ...]) -> tuple[Path, Path] | None:
+        if not parts:
+            return None
+        for root in sorted(roots, key=lambda value: value.as_posix()):
+            module = root.joinpath(*parts).with_suffix(".py")
+            package = root.joinpath(*parts, "__init__.py")
+            for candidate in (module, package):
+                _require_beneath(repo, candidate)
+                if candidate.is_symlink():
+                    raise WorkspaceError(
+                        "validation_python_import_symlink:"
+                        + candidate.relative_to(repo).as_posix()
+                    )
+                if candidate.is_file():
+                    return root, candidate
+        return None
+
+    def add_module(parts: tuple[str, ...], pending: list[str], rows: set[str]) -> bool:
+        resolved = module_file(parts)
+        if resolved is None:
+            return False
+        root, candidate = resolved
+        additions = [candidate]
+        parent = candidate.parent
+        while parent != root:
+            package_init = parent / "__init__.py"
+            if not package_init.is_file():
+                break
+            additions.append(package_init)
+            parent = parent.parent
+        for path in additions:
+            relative = _relative_repo_path(path.relative_to(repo).as_posix())
+            if relative not in rows:
+                rows.add(relative)
+                pending.append(relative)
+                if len(rows) > MAX_SEED_FILES:
+                    raise WorkspaceError(
+                        f"seed_file_limit_exceeded:{len(rows)}"
+                    )
+        return True
+
+    rows = set(initial)
+    pending = [
+        relative
+        for relative in initial
+        if relative.endswith(".py") and (repo / relative).is_file()
+    ]
+    parsed: set[str] = set()
+    while pending:
+        relative = pending.pop()
+        if relative in parsed:
+            continue
+        parsed.add(relative)
+        source_path = repo / relative
+        if source_path.is_symlink() or not source_path.is_file():
+            continue
+        try:
+            tree = ast.parse(source_path.read_bytes(), filename=relative)
+        except (OSError, SyntaxError, ValueError) as exc:
+            raise WorkspaceError(
+                f"validation_python_import_parse_failed:{relative}"
+            ) from exc
+        _root, package_parts = package_context(relative)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    add_module(tuple(alias.name.split(".")), pending, rows)
+                continue
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            module_parts = tuple((node.module or "").split(".")) if node.module else ()
+            if node.level:
+                if not package_parts or node.level > len(package_parts):
+                    raise WorkspaceError(
+                        f"validation_python_relative_import_unresolved:{relative}:"
+                        f"level={node.level}"
+                    )
+                base = package_parts[: len(package_parts) - node.level + 1] + module_parts
+                if module_parts and not add_module(base, pending, rows):
+                    raise WorkspaceError(
+                        f"validation_python_relative_import_unresolved:{relative}:"
+                        + ".".join(base)
+                    )
+            else:
+                base = module_parts
+                add_module(base, pending, rows)
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                add_module(base + tuple(alias.name.split(".")), pending, rows)
+    return tuple(sorted(rows))
 
 
 def _npm_validation_prefixes(commands: Iterable[str]) -> tuple[str, ...]:
@@ -2350,6 +2475,13 @@ def create_workspace(
             relative
             for relative in _VALIDATION_WORKER_PACKAGE_SUPPORT
             if relative not in live_seeded
+        )
+    if validation_rows:
+        python_seeded = _resolve_local_python_imports(
+            repo, (*live_seeded, *support_seeded)
+        )
+        support_seeded = tuple(
+            sorted(set(support_seeded) | (set(python_seeded) - set(live_seeded)))
         )
     npm_support_seeded = tuple(
         relative
