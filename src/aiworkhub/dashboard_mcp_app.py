@@ -26,6 +26,7 @@ from aiworkhub import (
     context_graph,
     dashboard,
     feature_settings,
+    model_settings,
     needfix_store,
     process_launcher,
     roadmap_store,
@@ -40,6 +41,7 @@ from aiworkhub import (
     task_retention,
     task_store,
     terminal_log_retention,
+    workforce_catalog,
 )
 
 
@@ -203,6 +205,56 @@ def _storage_write_authority_flags() -> dict[str, bool]:
     }
 
 
+MAX_MODEL_POLICY_CATALOG_ROWS = 64
+
+
+def _model_policy_view(root: Any) -> dict[str, Any]:
+    """Return bounded repository policy plus the configured worker inventory."""
+    policy = model_settings.load(root)
+    catalog = workforce_catalog.load_catalog(root)
+    workers: list[dict[str, Any]] = []
+    source_rows = [
+        row for row in catalog.get("workers", []) if isinstance(row, Mapping)
+    ]
+    for row in source_rows[:MAX_MODEL_POLICY_CATALOG_ROWS]:
+        provider = str(row.get("provider") or "")
+        adapter = str(row.get("adapter_id") or "")
+        model = str(row.get("model") or "")
+        if not provider or not adapter or not model:
+            continue
+        catalog_enabled = bool(row.get("enabled", True))
+        workers.append(
+            {
+                "worker_id": str(row.get("worker_id") or "")[:128],
+                "provider": provider[:128],
+                "adapter": adapter[:128],
+                "model": model[:128],
+                "catalog_enabled": catalog_enabled,
+                "effective_enabled": catalog_enabled
+                and model_settings.evaluate_state(
+                    policy,
+                    provider=provider,
+                    adapter=adapter,
+                    model=model,
+                ),
+            }
+        )
+    workers.sort(
+        key=lambda row: (
+            row["provider"], row["adapter"], row["model"], row["worker_id"]
+        )
+    )
+    return {
+        **policy,
+        "catalog": {
+            "workers": workers,
+            "worker_count": len(source_rows),
+            "row_limit": MAX_MODEL_POLICY_CATALOG_ROWS,
+            "truncated": len(source_rows) > MAX_MODEL_POLICY_CATALOG_ROWS,
+        },
+    }
+
+
 def settings_view() -> dict[str, Any]:
     """READ-ONLY: repository-local feature switches and capabilities."""
     try:
@@ -212,10 +264,13 @@ def settings_view() -> dict[str, Any]:
         result["source_graph_policy"] = source_graph.source_graph_policy_view(root)
         policy = repo_policy.load_policy(root)
         result["retention_policy"] = dict(policy.get("retention") or {})
+        result["model_policy"] = _model_policy_view(root)
     except (
         context_graph.ContextGraphError,
         feature_settings.FeatureSettingsError,
+        model_settings.ModelSettingsError,
         repo_policy.RepoPolicyError,
+        workforce_catalog.WorkforceCatalogError,
         OSError,
         sqlite3.Error,
     ) as exc:
@@ -279,6 +334,35 @@ def settings_update_view(changes: dict[str, bool], expected_revision: int) -> di
     ) as exc:
         result = {"ok": False, "error": str(exc)[:240]}
     result["server_tool"] = "aiworkhub_dashboard_settings_update"
+    result["authority_flags"] = _storage_write_authority_flags()
+    return result
+
+
+def model_settings_update_view(
+    provider: str,
+    enabled: bool,
+    expected_revision: int,
+    adapter: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """USER WRITE: update one repository-local model routing switch."""
+    root = core.repo_root()
+    try:
+        result = model_settings.update(
+            root,
+            provider=provider,
+            adapter=adapter,
+            model=model,
+            enabled=enabled,
+            expected_revision=expected_revision,
+        )
+    except (model_settings.ModelSettingsError, OSError, ValueError) as exc:
+        result = {"ok": False, "error": str(exc)[:240]}
+        try:
+            result["current_revision"] = model_settings.load(root)["revision"]
+        except (model_settings.ModelSettingsError, OSError):
+            pass
+    result["server_tool"] = "aiworkhub_dashboard_model_settings_update"
     result["authority_flags"] = _storage_write_authority_flags()
     return result
 
@@ -1690,6 +1774,10 @@ SETTINGS_TOOL_NAME = "aiworkhub_dashboard_settings"
 SETTINGS_TOOLS: dict[str, Any] = {SETTINGS_TOOL_NAME: settings_view}
 SETTINGS_UPDATE_TOOL_NAME = "aiworkhub_dashboard_settings_update"
 SETTINGS_UPDATE_TOOLS: dict[str, Any] = {SETTINGS_UPDATE_TOOL_NAME: settings_update_view}
+MODEL_SETTINGS_UPDATE_TOOL_NAME = "aiworkhub_dashboard_model_settings_update"
+MODEL_SETTINGS_UPDATE_TOOLS: dict[str, Any] = {
+    MODEL_SETTINGS_UPDATE_TOOL_NAME: model_settings_update_view,
+}
 SOURCE_GRAPH_SETTINGS_UPDATE_TOOL_NAME = "aiworkhub_dashboard_source_graph_settings_update"
 SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS: dict[str, Any] = {
     SOURCE_GRAPH_SETTINGS_UPDATE_TOOL_NAME: source_graph_settings_update_view,
@@ -1760,6 +1848,8 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in SETTINGS_UPDATE_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in MODEL_SETTINGS_UPDATE_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS.items():
         mcp.tool(name=name)(fn)
     for name, fn in STORAGE_RETENTION_READ_TOOLS.items():
@@ -1793,6 +1883,7 @@ def register(mcp: Any) -> tuple[str, ...]:
         + tuple(NEEDFIX_WRITE_TOOLS)
         + tuple(ROADMAP_READ_TOOLS)
         + tuple(SETTINGS_UPDATE_TOOLS)
+        + tuple(MODEL_SETTINGS_UPDATE_TOOLS)
         + tuple(SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS)
         + (INITIALIZE_TOOL_NAME,)
     )

@@ -146,3 +146,45 @@ def test_dashboard_exposes_and_updates_source_graph_languages(
     enabled = {row["id"]: row["enabled"] for row in changed["languages"]}
     assert enabled["cpp"] is False
     assert enabled["json"] is False
+
+
+def test_dashboard_exposes_and_updates_repository_model_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repo(tmp_path, "repo")
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+
+    viewed = dashboard_mcp_app.settings_view()
+    model_policy = viewed["model_policy"]
+    assert model_policy["revision"] == 0
+    assert model_policy["configured"] is False
+    assert model_policy["catalog"]["workers"]
+    assert all(
+        row["effective_enabled"] for row in model_policy["catalog"]["workers"]
+    )
+
+    disabled = dashboard_mcp_app.model_settings_update_view(
+        provider="zhipu",
+        enabled=False,
+        expected_revision=0,
+    )
+    assert disabled["ok"] is True
+    assert disabled["revision"] == 1
+    assert disabled["providers"] == {"zhipu": False}
+
+    reloaded = dashboard_mcp_app.settings_view()["model_policy"]
+    zhipu_rows = [
+        row for row in reloaded["catalog"]["workers"]
+        if row["provider"] == "zhipu"
+    ]
+    assert zhipu_rows
+    assert all(row["effective_enabled"] is False for row in zhipu_rows)
+
+    conflict = dashboard_mcp_app.model_settings_update_view(
+        provider="zhipu",
+        enabled=True,
+        expected_revision=0,
+    )
+    assert conflict["ok"] is False
+    assert "revision_conflict" in conflict["error"]
+    assert conflict["current_revision"] == 1

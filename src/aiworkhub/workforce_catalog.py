@@ -19,7 +19,14 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Iterable, Mapping
 
-from . import cost_ledger, repo_policy, runtime_adapters, task_store, workforce_router
+from . import (
+    cost_ledger,
+    model_settings,
+    repo_policy,
+    runtime_adapters,
+    task_store,
+    workforce_router,
+)
 from .platform_io import posix_path_modes_supported
 
 
@@ -555,6 +562,7 @@ def build_catalog(
 ) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     catalog = load_catalog(root)
+    model_policy = model_settings.load(root)
     task_cards = [dict(item) for item in (cards if cards is not None else _canonical_cards(root))]
     processes = [dict(item) for item in (process_rows or [])]
     usage = [dict(item) for item in (usage_rows or [])]
@@ -702,6 +710,13 @@ def build_catalog(
         access_observed = bool(adapter_ready.get("access_observed"))
         route_health = _route_circuit(matched, now_epoch=observed_now_epoch)
         route_available = route_health["state"] != "open"
+        policy_enabled = model_settings.evaluate_state(
+            model_policy,
+            provider=worker["provider"],
+            adapter=effective_adapter,
+            model=worker["model"],
+        )
+        effective_enabled = bool(worker["enabled"] and policy_enabled)
         model_routes = economics_by_model.get(worker["model"])
         if not isinstance(model_routes, Mapping):
             model_routes = {}
@@ -715,10 +730,12 @@ def build_catalog(
                 worker["worker_id"], effective_adapter
             ),
             **worker,
+            "enabled": effective_enabled,
+            "policy_enabled": policy_enabled,
             "effective_adapter_id": effective_adapter,
             "adapter_fallback_used": effective_adapter != worker["adapter_id"],
             "available": bool(
-                worker["enabled"]
+                effective_enabled
                 and adapter_ready.get("launchable")
                 and route_available
             ),
@@ -790,6 +807,7 @@ def build_catalog(
             "manager_adjustment_range": [-20.0, 20.0],
             "economic_routing_is_advisory_only": True,
             "unknown_cost_never_ranks_as_free": True,
+            "repository_model_policy_enforced": True,
         },
     }
 

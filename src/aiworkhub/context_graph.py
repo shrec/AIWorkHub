@@ -84,6 +84,13 @@ CREATE TABLE IF NOT EXISTS context_projection_meta(
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS context_query_telemetry(
+    operation TEXT PRIMARY KEY,
+    call_count INTEGER NOT NULL,
+    hit_count INTEGER NOT NULL,
+    returned_bytes INTEGER NOT NULL,
+    last_called_at TEXT NOT NULL
+);
 """
 
 
@@ -175,7 +182,8 @@ def status(repo: Path | str) -> dict[str, Any]:
             str(row["name"])
             for row in con.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-                "('conversation_events','context_nodes','context_edges','context_projection_meta')"
+                "('conversation_events','context_nodes','context_edges','context_projection_meta',"
+                "'context_query_telemetry')"
             ).fetchall()
         }
         if "conversation_events" not in tables:
@@ -192,6 +200,23 @@ def status(repo: Path | str) -> dict[str, Any]:
         row = con.execute(
             "SELECT value FROM context_projection_meta WHERE key='last_event_id'"
         ).fetchone()
+        telemetry_rows = (
+            con.execute(
+                "SELECT operation,call_count,hit_count,returned_bytes,last_called_at "
+                "FROM context_query_telemetry ORDER BY operation"
+            ).fetchall()
+            if "context_query_telemetry" in tables
+            else []
+        )
+        by_operation = {
+            str(item["operation"]): {
+                "calls": int(item["call_count"]),
+                "hits": int(item["hit_count"]),
+                "bytes": int(item["returned_bytes"]),
+                "last_called_at": str(item["last_called_at"]),
+            }
+            for item in telemetry_rows
+        }
         return {
             "ok": True,
             "ready": True,
@@ -203,11 +228,53 @@ def status(repo: Path | str) -> dict[str, Any]:
             "nodes": counts["context_nodes"],
             "edges": counts["context_edges"],
             "last_event_id": int(row["value"]) if row is not None else 0,
+            "query_telemetry": {
+                "calls": sum(item["calls"] for item in by_operation.values()),
+                "hits": sum(item["hits"] for item in by_operation.values()),
+                "bytes": sum(item["bytes"] for item in by_operation.values()),
+                "by_operation": by_operation,
+            },
         }
     except sqlite3.Error as exc:
         raise ContextGraphError(f"context_graph_status_failed:{type(exc).__name__}") from exc
     finally:
         con.close()
+
+
+def record_query_telemetry(
+    repo: Path | str, *, operation: str, result: Mapping[str, Any]
+) -> bool:
+    """Best-effort durable accounting for manager Context Graph reads."""
+    if operation not in {"search", "range", "related"}:
+        raise ContextGraphError("invalid_context_graph_telemetry_operation")
+    hits = max(0, int(result.get("count") or 0))
+    returned_bytes = len(
+        json.dumps(result, ensure_ascii=False, default=str).encode("utf-8")
+    )
+    try:
+        con, _repo_id = _connect(repo)
+        try:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS context_query_telemetry("
+                "operation TEXT PRIMARY KEY,call_count INTEGER NOT NULL,"
+                "hit_count INTEGER NOT NULL,returned_bytes INTEGER NOT NULL,"
+                "last_called_at TEXT NOT NULL)"
+            )
+            con.execute(
+                "INSERT INTO context_query_telemetry("
+                "operation,call_count,hit_count,returned_bytes,last_called_at"
+                ") VALUES(?,1,?,?,?) ON CONFLICT(operation) DO UPDATE SET "
+                "call_count=call_count+1,hit_count=hit_count+excluded.hit_count,"
+                "returned_bytes=returned_bytes+excluded.returned_bytes,"
+                "last_called_at=excluded.last_called_at",
+                (operation, hits, returned_bytes, datetime.now(timezone.utc).isoformat()),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except (OSError, sqlite3.Error):
+        return False
+    return True
 
 
 def _node(con: sqlite3.Connection, node_id: str, node_type: str, label: str,

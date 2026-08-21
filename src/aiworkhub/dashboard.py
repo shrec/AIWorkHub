@@ -25,6 +25,7 @@ from typing import Any, Callable, Mapping
 
 from aiworkhub import (
     completion_inbox,
+    context_graph,
     core,
     cost_ledger,
     dashboard_kpis,
@@ -2205,6 +2206,7 @@ def _build_summary_snapshot(
         "source_graph_index_health": {},
         "read_efficiency_telemetry": {},
         "project_context_telemetry": {},
+        "context_graph_runtime": {},
         "protocol_alert_telemetry": {},
         "kpi_analytics": {},
         "callback_bridge_health": {},
@@ -2265,6 +2267,7 @@ def build_snapshot(
             "source_graph_index_health": {},
             "read_efficiency_telemetry": _read_efficiency_telemetry({}),
             "project_context_telemetry": _project_context_telemetry({}),
+            "context_graph_runtime": {},
             "protocol_alert_telemetry": _protocol_alert_telemetry(None),
             "kpi_analytics": dashboard_kpis.build_kpi_snapshot(
                 process_report={},
@@ -2347,6 +2350,11 @@ def build_snapshot(
         "source_graph_index_health": (
             "source_graph_index_health",
             partial(source_graph_daemon.daemon_health, resolved_root),
+            {},
+        ),
+        "context_graph_runtime": (
+            "context_graph_runtime",
+            partial(context_graph.status, resolved_root),
             {},
         ),
         "protocol_alert_telemetry": (
@@ -2589,6 +2597,22 @@ def build_snapshot(
     source_graph_index_health = reads["source_graph_index_health"]
     read_efficiency_telemetry = _read_efficiency_telemetry(process_report)
     project_context_telemetry = _project_context_telemetry(process_report)
+    context_graph_runtime = reads["context_graph_runtime"]
+    if isinstance(context_graph_runtime, Mapping):
+        query_telemetry = context_graph_runtime.get("query_telemetry")
+        query_telemetry = query_telemetry if isinstance(query_telemetry, Mapping) else {}
+        calls = int(query_telemetry.get("calls") or 0)
+        project_context_telemetry["context_graph"] = {
+            "requested_tasks": calls,
+            "executed_tasks": calls,
+            "hit_count": int(query_telemetry.get("hits") or 0),
+            "bytes": int(query_telemetry.get("bytes") or 0),
+            "degraded_tasks": 0,
+            "events": int(context_graph_runtime.get("events") or 0),
+            "nodes": int(context_graph_runtime.get("nodes") or 0),
+            "edges": int(context_graph_runtime.get("edges") or 0),
+            "by_operation": dict(query_telemetry.get("by_operation") or {}),
+        }
     protocol_alert_telemetry = reads["protocol_alert_telemetry"]
     cost_totals = _cost_totals(ledger)
     kpi_analytics = dashboard_kpis.build_kpi_snapshot(
@@ -2638,6 +2662,7 @@ def build_snapshot(
         "source_graph_index_health": dict(source_graph_index_health),
         "read_efficiency_telemetry": read_efficiency_telemetry,
         "project_context_telemetry": project_context_telemetry,
+        "context_graph_runtime": dict(context_graph_runtime) if isinstance(context_graph_runtime, Mapping) else {},
         "protocol_alert_telemetry": protocol_alert_telemetry,
         "kpi_analytics": kpi_analytics,
         "callback_bridge_health": dict(callback_bridge_health),

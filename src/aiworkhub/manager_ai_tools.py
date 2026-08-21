@@ -171,6 +171,9 @@ def context_graph_search(*, query: str, limit: int = 12) -> dict[str, Any]:
         return manager
     try:
         result = context_graph.search(context.authority_repo, query, limit=limit)
+        context_graph.record_query_telemetry(
+            context.authority_repo, operation="search", result=result
+        )
     except (context_graph.ContextGraphError, OSError, sqlite3.Error) as exc:
         result = {"ok": False, "error": str(exc)[:240]}
     return {**result, "manager": manager, "surface": "manager_mcp"}
@@ -190,6 +193,9 @@ def context_graph_range(
             before=before,
             after=after,
         )
+        context_graph.record_query_telemetry(
+            context.authority_repo, operation="range", result=result
+        )
     except (context_graph.ContextGraphError, OSError, sqlite3.Error) as exc:
         result = {"ok": False, "error": str(exc)[:240]}
     return {**result, "manager": manager, "surface": "manager_mcp"}
@@ -201,6 +207,9 @@ def context_graph_related(*, node_id: str, limit: int = 20) -> dict[str, Any]:
         return manager
     try:
         result = context_graph.related(context.authority_repo, node_id=node_id, limit=limit)
+        context_graph.record_query_telemetry(
+            context.authority_repo, operation="related", result=result
+        )
     except (context_graph.ContextGraphError, OSError, sqlite3.Error) as exc:
         result = {"ok": False, "error": str(exc)[:240]}
     return {**result, "manager": manager, "surface": "manager_mcp"}

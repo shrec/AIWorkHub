@@ -6,7 +6,7 @@ import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
-from aiworkhub import workforce_catalog, workforce_router
+from aiworkhub import model_settings, workforce_catalog, workforce_router
 
 
 def test_catalog_atomic_write_skips_redundant_chmod_when_already_private(
@@ -151,6 +151,41 @@ def test_catalog_scores_only_attributed_canonical_outcomes(tmp_path: Path) -> No
     assert untouched["observed_score"] is None
     assert untouched["outcomes"]["evidence_source"] == "conservative_prior"
     assert untouched["availability_observed"] is False
+
+
+def test_repository_model_policy_removes_disabled_routes_from_ranking(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    model_settings.update(
+        root,
+        provider="zhipu",
+        enabled=False,
+        expected_revision=0,
+    )
+
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=_preflight()
+    )
+    glm = next(item for item in snapshot["workers"] if item["worker_id"] == "glm-5.2")
+    assert glm["policy_enabled"] is False
+    assert glm["enabled"] is False
+    assert glm["available"] is False
+    assert snapshot["truth_contract"]["repository_model_policy_enforced"] is True
+
+    task = workforce_router.TaskRequirements.build(
+        task_id="T-policy",
+        repo_id="repo",
+        kinds=["code"],
+        tool_needs=["filesystem"],
+    )
+    decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
+    assert decision["selected_worker_id"] != "glm-5.2"
+    glm_candidate = next(
+        item for item in decision["candidates"] if item["worker_id"] == "glm-5.2"
+    )
+    assert glm_candidate["excluded"] is True
+    assert "worker_unavailable" in glm_candidate["exclusion_reasons"]
 
 
 def test_rank_task_uses_manager_adjustment_without_fabricating_outcomes(tmp_path: Path) -> None:

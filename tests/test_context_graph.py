@@ -95,6 +95,27 @@ def test_event_ingestion_is_idempotent_searchable_and_repo_local(tmp_path: Path)
     assert runtime["edges"] == 5
 
 
+def test_manager_query_telemetry_is_durable_and_bounded(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _enable(repo)
+    _append(repo, suffix="1", content="telemetry target")
+
+    searched = context_graph.search(repo, "telemetry")
+    assert context_graph.record_query_telemetry(
+        repo, operation="search", result=searched
+    )
+    assert context_graph.record_query_telemetry(
+        repo, operation="related", result={"ok": True, "count": 0}
+    )
+
+    telemetry = context_graph.status(repo)["query_telemetry"]
+    assert telemetry["calls"] == 2
+    assert telemetry["hits"] == 1
+    assert telemetry["bytes"] > 0
+    assert telemetry["by_operation"]["search"]["calls"] == 1
+    assert telemetry["by_operation"]["related"]["hits"] == 0
+
+
 def test_exact_range_related_edges_and_deterministic_rebuild(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     _enable(repo)

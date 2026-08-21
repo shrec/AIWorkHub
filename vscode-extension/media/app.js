@@ -109,6 +109,9 @@ const elements = {
   headerKb: document.querySelector("#header-kb"),
   headerKbValue: document.querySelector("#header-kb-value"),
   headerKbDetail: document.querySelector("#header-kb-detail"),
+  headerContextGraph: document.querySelector("#header-context-graph"),
+  headerContextGraphValue: document.querySelector("#header-context-graph-value"),
+  headerContextGraphDetail: document.querySelector("#header-context-graph-detail"),
   headerNeedfix: document.querySelector("#header-needfix"),
   headerNeedfixValue: document.querySelector("#header-needfix-value"),
   headerNeedfixDetail: document.querySelector("#header-needfix-detail"),
@@ -449,6 +452,7 @@ function renderSummary(snapshot) {
     ["session_current_state", elements.headerSessionManager, elements.headerSessionManagerValue, elements.headerSessionManagerDetail],
     ["ai_memory", elements.headerAiMemory, elements.headerAiMemoryValue, elements.headerAiMemoryDetail],
     ["kb", elements.headerKb, elements.headerKbValue, elements.headerKbDetail],
+    ["context_graph", elements.headerContextGraph, elements.headerContextGraphValue, elements.headerContextGraphDetail],
   ]) {
     if (!value || !detail) continue;
     const telemetry = contextTelemetry[name] && typeof contextTelemetry[name] === "object"
@@ -460,7 +464,11 @@ function renderSummary(snapshot) {
     const degraded = telemetry ? numberValue(telemetry.degraded_tasks) : 0;
     const requested = telemetry ? numberValue(telemetry.requested_tasks) : 0;
     value.textContent = telemetry ? `${formatCount(executed)}/${formatCount(requested)} runs` : "No sample";
-    detail.textContent = telemetry ? `${formatCount(hits)} matches · ${formatBytes(bytes)} returned` : "No evidence";
+    detail.textContent = telemetry
+      ? (name === "context_graph"
+        ? `${formatCount(telemetry.events)} events · ${formatCount(telemetry.nodes)} nodes`
+        : `${formatCount(hits)} matches · ${formatBytes(bytes)} returned`)
+      : "No evidence";
     if (card) card.title = telemetry
       ? `${formatCount(requested)} requested · ${formatCount(executed)} executed · ${formatCount(hits)} context matches · ${formatBytes(bytes)} returned · ${degraded} degraded`
       : "Context telemetry unavailable";
@@ -4004,6 +4012,7 @@ function renderSettings(payload) {
   const sections = {};
   for (const [id, label] of [
     ["features", "Features"],
+    ["models", "Models"],
     ["source-graph", "Source Graph"],
     ["retention", "Retention"],
     ["telemetry", "Telemetry"],
@@ -4048,6 +4057,75 @@ function renderSettings(payload) {
     control.append(input, track);
     row.append(copy, control);
     sections[key === "source_graph" ? "source-graph" : "features"].append(row);
+  }
+  const modelPolicy = payload.model_policy && payload.model_policy.ok === true
+    ? payload.model_policy
+    : null;
+  if (modelPolicy) {
+    const heading = createElement("div", "settings-group-heading");
+    heading.append(
+      createElement("strong", "", `Repository model routes · revision ${Number(modelPolicy.revision || 0)}`),
+      createElement("small", "", "Disable a provider for this repository, or refine an enabled provider with exact model switches. Disabled parent routes cannot be re-enabled by child switches."),
+    );
+    sections.models.appendChild(heading);
+    const workers = Array.isArray(modelPolicy.catalog?.workers)
+      ? modelPolicy.catalog.workers
+      : [];
+    const providers = [...new Set(workers.map((row) => String(row.provider || "")).filter(Boolean))].sort();
+    for (const provider of providers) {
+      const providerRows = workers.filter((row) => row.provider === provider);
+      const configured = Object.prototype.hasOwnProperty.call(modelPolicy.providers || {}, provider);
+      const enabled = configured ? Boolean(modelPolicy.providers[provider]) : true;
+      const row = document.createElement("label");
+      row.className = "settings-row settings-model-provider";
+      const copy = createElement("span", "settings-copy");
+      copy.append(
+        createElement("strong", "", provider),
+        createElement("small", "", `${providerRows.length} configured route${providerRows.length === 1 ? "" : "s"} · ${configured ? "repository override" : "enabled by default"}`),
+      );
+      const control = createElement("span", "switch-control");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = enabled;
+      input.dataset.modelProvider = provider;
+      input.dataset.modelRevision = String(Number(modelPolicy.revision || 0));
+      input.setAttribute("aria-label", `${provider} provider enabled`);
+      control.append(input, createElement("span", "switch-track"));
+      row.append(copy, control);
+      sections.models.appendChild(row);
+
+      for (const route of providerRows) {
+        const routeRow = document.createElement("label");
+        routeRow.className = "settings-row settings-model-route";
+        const routeCopy = createElement("span", "settings-copy");
+        routeCopy.append(
+          createElement("strong", "", String(route.model || route.worker_id || "Model")),
+          createElement("small", "", `${String(route.adapter || "unknown adapter")} · ${String(route.worker_id || "unidentified worker")}`),
+        );
+        const routeControl = createElement("span", "switch-control");
+        const routeInput = document.createElement("input");
+        routeInput.type = "checkbox";
+        routeInput.checked = Boolean(route.effective_enabled);
+        routeInput.disabled = !enabled || !Boolean(route.catalog_enabled);
+        routeInput.dataset.modelProvider = String(route.provider || "");
+        routeInput.dataset.modelAdapter = String(route.adapter || "");
+        routeInput.dataset.modelName = String(route.model || "");
+        routeInput.dataset.modelRevision = String(Number(modelPolicy.revision || 0));
+        routeInput.setAttribute("aria-label", `${String(route.model || "model")} enabled`);
+        routeControl.append(routeInput, createElement("span", "switch-track"));
+        routeRow.append(routeCopy, routeControl);
+        sections.models.appendChild(routeRow);
+      }
+    }
+    if (!workers.length) {
+      sections.models.appendChild(createElement("div", "panel-state", "No configured model routes"));
+    }
+  } else {
+    sections.models.appendChild(createElement(
+      "div",
+      "panel-state error-state",
+      payload.model_policy?.error || "Model policy unavailable",
+    ));
   }
   const policy = payload.source_graph_policy;
   if (policy && policy.ok === true && Array.isArray(policy.languages)) {
@@ -4615,6 +4693,19 @@ elements.openSettings.addEventListener("click", () => {
 });
 
 elements.settingsList.addEventListener("change", (event) => {
+  const modelInput = event.target.closest("[data-model-provider]");
+  if (modelInput && state.featureSettings) {
+    modelInput.disabled = true;
+    vscode.postMessage({
+      type: "updateModelSetting",
+      provider: modelInput.dataset.modelProvider,
+      adapter: modelInput.dataset.modelAdapter || "",
+      model: modelInput.dataset.modelName || "",
+      enabled: Boolean(modelInput.checked),
+      expectedRevision: Number(modelInput.dataset.modelRevision || 0),
+    });
+    return;
+  }
   const languageInput = event.target.closest("[data-source-graph-language]");
   if (languageInput && state.featureSettings) {
     languageInput.disabled = true;

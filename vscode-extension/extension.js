@@ -201,6 +201,7 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "needfixConvertCommit",
   "requestSettings",
   "updateFeatureSetting",
+  "updateModelSetting",
   "updateSourceGraphLanguage",
   "requestStorageCleanup",
   "requestStorageRegistrationPrune",
@@ -334,6 +335,7 @@ const DASHBOARD_TOOLS = Object.freeze({
   settings: "aiworkhub_dashboard_settings",
 });
 const SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_settings_update";
+const MODEL_SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_model_settings_update";
 const NEEDFIX_TOOLS = Object.freeze({
   list: "aiworkhub_dashboard_needfix_list",
   detail: "aiworkhub_dashboard_needfix_detail",
@@ -7478,6 +7480,42 @@ async function updateFeatureSetting(view, feature, enabled, expectedRevision) {
   }
 }
 
+async function updateModelSetting(view, provider, adapter, model, enabled, expectedRevision) {
+  const identity = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+  if (!identity.test(provider) || (adapter !== "" && !identity.test(adapter)) ||
+      (model !== "" && (!adapter || !identity.test(model))) ||
+      typeof enabled !== "boolean" || !Number.isSafeInteger(expectedRevision) ||
+      expectedRevision < 0) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: "invalid_model_setting_update" });
+    return;
+  }
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const args = {
+      provider,
+      enabled,
+      expected_revision: expectedRevision,
+    };
+    if (adapter) args.adapter = adapter;
+    if (model) args.model = model;
+    const payload = await client.callTool(MODEL_SETTINGS_UPDATE_TOOL, args);
+    if (!payload || payload.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (payload && payload.error) || "model_setting_update_failed" });
+      await pushSettings(view);
+      return;
+    }
+    if (view.stillBoundTo(client)) {
+      await pushSettings(view);
+      const label = model || adapter || provider;
+      view.postMessage({ type: OUTBOUND_TYPES.notification, message: `${label} ${enabled ? "enabled" : "disabled"}` });
+    }
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+    await pushSettings(view);
+  }
+}
+
 async function updateSourceGraphLanguage(view, language, enabled, expectedRevision) {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(language) || typeof enabled !== "boolean" ||
       !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
@@ -8237,6 +8275,16 @@ function handleInboundMessage(view, message) {
         Number(message.expectedRevision),
       );
       break;
+    case "updateModelSetting":
+      updateModelSetting(
+        view,
+        String(message.provider || ""),
+        String(message.adapter || ""),
+        String(message.model || ""),
+        message.enabled,
+        Number(message.expectedRevision),
+      );
+      break;
     case "updateSourceGraphLanguage":
       updateSourceGraphLanguage(
         view,
@@ -8423,6 +8471,12 @@ function getHtmlForWebview(webview, extensionUri) {
         <span class="header-storage-label">KB</span>
         <strong id="header-kb-value">—</strong>
         <span class="header-insight-detail" id="header-kb-detail">No evidence</span>
+      </div>
+
+      <div class="header-insight-card" id="header-context-graph" title="Manager Context Graph usage and repository graph size">
+        <span class="header-storage-label">Context Graph</span>
+        <strong id="header-context-graph-value">—</strong>
+        <span class="header-insight-detail" id="header-context-graph-detail">No evidence</span>
       </div>
 
       <button class="header-insight-card" id="header-needfix" type="button" title="Open the durable NeedFix intake and triage registry">
@@ -8877,7 +8931,7 @@ function getHtmlForWebview(webview, extensionUri) {
     <div class="settings-list" id="settings-list">
       <div class="panel-state">Loading settings</div>
     </div>
-    <div class="settings-footnote">Stored only in this repository's <code>.aiworkhub/config/features.json</code> and <code>.aiworkhub/config/source_graph.json</code>. Task orchestration and callback routing remain protected core services.</div>
+    <div class="settings-footnote">Stored only in this repository's <code>.aiworkhub/config/features.json</code>, <code>.aiworkhub/config/source_graph.json</code> and <code>.aiworkhub/config/models.json</code>. Task orchestration and callback routing remain protected core services.</div>
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

@@ -5,11 +5,10 @@ repository's canonical ``.aiworkhub/config`` authority.  It stores only
 provider/adapter/model identity strings and boolean enablement switches,
 so it accepts no credentials, commands, executable code or file paths.
 Reads are bounded and fail closed on malformed, oversized, symlinked or
-duplicate-bearing state.  Updates use an optimistic revision so two VS Code
-windows cannot silently overwrite one another.  Evaluation defaults to
-enabled: a provider disable cascades to its adapters and models, an adapter
-disable stays scoped to that provider's transport, and an exact
-provider+adapter+model override takes deterministic precedence.
+duplicate-bearing state. Updates use an optimistic revision so two VS Code
+windows cannot silently overwrite one another. Evaluation defaults to
+enabled, while provider and adapter disables remain hard parent gates for
+every child route.
 """
 
 from __future__ import annotations
@@ -192,10 +191,9 @@ def evaluate(
 ) -> bool:
     """Effective enablement for one observed route.
 
-    Precedence is deterministic: an exact provider+adapter+model override
-    wins, then the provider+adapter switch, then the provider switch, then
-    the always-enabled default.  Identities never collide because every
-    level keeps its own key namespace.
+    Parent switches are hard gates. An exact model switch refines only a
+    provider and adapter that remain enabled. Identities never collide
+    because every level keeps its own key namespace.
     """
     _validate_identity(provider, "provider")
     if model is not None and adapter is None:
@@ -205,7 +203,26 @@ def evaluate(
     if model is not None:
         _validate_identity(model, "model")
 
-    state = load(repo_root)
+    return evaluate_state(
+        load(repo_root), provider=provider, adapter=adapter, model=model
+    )
+
+
+def evaluate_state(
+    state: Mapping[str, Any],
+    *,
+    provider: str,
+    adapter: str | None = None,
+    model: str | None = None,
+) -> bool:
+    """Evaluate one route against an already loaded policy snapshot."""
+    _validate_identity(provider, "provider")
+    if model is not None and adapter is None:
+        raise ModelSettingsError("model_settings_model_requires_adapter")
+    if adapter is not None:
+        _validate_identity(adapter, "adapter")
+    if model is not None:
+        _validate_identity(model, "model")
     # Parent switches are hard gates.  An exact child override can refine an
     # enabled route, but it must never resurrect a provider or adapter that
     # the repository owner disabled as a group.

@@ -2426,6 +2426,18 @@ tbody tr.is-selected td:first-child {
 
 .settings-tab-panel[hidden] { display: none; }
 
+.settings-model-provider {
+  margin-top: 8px;
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
+  background: var(--accent-soft);
+}
+
+.settings-model-route {
+  min-height: 50px;
+  margin-left: 18px;
+  border-left: 2px solid var(--line);
+}
+
 .settings-metric-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
