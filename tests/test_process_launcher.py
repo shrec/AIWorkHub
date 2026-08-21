@@ -89,6 +89,99 @@ def test_grok_kilo_provider_preflight_resolves_only_supported_model(tmp_path) ->
         manager._resolve_provider_env("grok_kilo_cli", "xai/grok-4.5")
 
 
+def test_grok_kilo_readonly_canary_text_result_is_meaningful(tmp_path) -> None:
+    canary = json.dumps(
+        {
+            "request_id": "debf2f43a57c4abe89b66ef887216f6f",
+            "gates": ["source_graph", "session", "ai_memory", "kb"],
+            "changed_paths": [],
+        }
+    )
+    stdout = tmp_path / "grok-kilo-canary.ndjson"
+    payload = "\n".join(
+        [
+            json.dumps({"type": "session.init", "subtype": "kilo"}),
+            json.dumps(
+                {"type": "tool", "part": {"type": "function_call", "name": "graph"}}
+            ),
+            json.dumps(
+                {"type": "reasoning", "part": {"type": "reasoning", "text": "x"}}
+            ),
+            json.dumps({"type": "text", "part": {"type": "text", "text": "   "}}),
+            "not-json",
+            json.dumps({"type": "text", "part": {"type": "text", "text": canary}}),
+        ]
+    ) + "\n"
+    stdout.write_text(payload, encoding="utf-8")
+
+    evidence = process_launcher._readonly_research_result_evidence(stdout)
+
+    assert evidence["meaningful_output"] is True
+    assert evidence["result_event_count"] == 1
+    assert evidence["result_chars"] == len(canary)
+    assert evidence["reason"] == ""
+    assert evidence["sha256"] == hashlib.sha256(stdout.read_bytes()).hexdigest()
+
+
+def test_grok_kilo_readonly_chatter_without_text_part_stays_missing(tmp_path) -> None:
+    stdout = tmp_path / "grok-kilo-chatter.ndjson"
+    stdout.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session.init", "kilo": True}),
+                json.dumps({"type": "tool", "part": {"type": "function_call"}}),
+                json.dumps(
+                    {"type": "reasoning", "part": {"type": "reasoning", "text": "x"}}
+                ),
+                json.dumps({"type": "text", "part": {"type": "text", "text": ""}}),
+                json.dumps({"type": "text", "part": "not-a-dict"}),
+                json.dumps(
+                    {"type": "text", "part": {"type": "text", "text": ["list"]}}
+                ),
+                json.dumps(
+                    {"type": "text", "text": "top-level text without part envelope"}
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "text", "part": {"type": "text", "text": "x"}},
+                    }
+                ),
+                json.dumps({"type": "error", "message": "kilo failed"}),
+                "{broken",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = process_launcher._readonly_research_result_evidence(stdout)
+
+    assert evidence["meaningful_output"] is False
+    assert evidence["reason"] == "research_result_missing"
+    assert evidence["result_event_count"] == 0
+
+
+def test_grok_kilo_text_part_extraction_is_structurally_exact() -> None:
+    extract = process_launcher._research_result_text
+    assert extract({"type": "text", "part": {"type": "text", "text": " ok "}}) == "ok"
+    assert extract({"type": "text", "part": {"type": "text", "text": "   "}}) == ""
+    assert extract({"type": "text", "part": {"type": "text"}}) == ""
+    assert extract({"type": "text", "part": {"type": "text", "text": 7}}) == ""
+    assert extract({"type": "text", "part": {"type": "reasoning", "text": "x"}}) == ""
+    assert extract({"type": "reasoning", "part": {"type": "text", "text": "x"}}) == ""
+
+    # Existing provider result shapes stay intact.
+    assert extract({"type": "result", "result": "claude final"}) == "claude final"
+    assert extract({"type": "result", "is_error": True, "result": "x"}) == ""
+    assert extract(
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "codex"}}
+    ) == "codex"
+    assert extract(
+        {"type": "assistant.message", "data": {"content": "vscode"}}
+    ) == "vscode"
+
+
 def test_grok_kilo_child_env_is_request_local_and_secret_free(tmp_path) -> None:
     home = tmp_path / "isolated-home"
     env = process_launcher.sanitized_env("grok_kilo_cli", home=home)

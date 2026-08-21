@@ -2295,6 +2295,12 @@ def _research_result_text(event: dict[str, Any]) -> str:
         data = event.get("data")
         value = data.get("content") if isinstance(data, dict) else None
         return value.strip() if isinstance(value, str) else ""
+    if event_type == "text":
+        part = event.get("part")
+        if not isinstance(part, dict) or part.get("type") != "text":
+            return ""
+        value = part.get("text")
+        return value.strip() if isinstance(value, str) else ""
     return ""
 
 
