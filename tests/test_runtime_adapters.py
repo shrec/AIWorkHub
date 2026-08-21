@@ -405,3 +405,90 @@ def test_missing_discovered_executable_is_not_launchable(monkeypatch, tmp_path):
 
 def test_module_has_no_process_execution_dependency():
     assert "subprocess" not in runtime_adapters.__dict__
+
+
+def test_grok_kilo_runtime_plan_is_exact_and_preserves_prompt(tmp_path):
+    repo = tmp_path / "repo with spaces"
+    repo.mkdir()
+    executable = _executable(tmp_path, "kilo")
+    prompt = "Inspect one bounded target; keep $TOKEN literal თბილისი"
+
+    plan = runtime_adapters.build_runtime_command(
+        "grok_kilo_cli",
+        prompt,
+        repo,
+        executable_overrides={"grok_kilo_cli": executable},
+    )
+
+    assert plan.launchable is True
+    assert plan.argv == [
+        str(executable),
+        "run",
+        "--pure",
+        "--model",
+        "xai/grok-4.6",
+        "--format",
+        "json",
+        "--dir",
+        str(repo.resolve()),
+        "--auto",
+        prompt,
+    ]
+    assert plan.argv.count(prompt) == 1
+    assert not any("AUTH" in token or "XDG_" in token for token in plan.argv)
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["", "   ", "grok-4.6", "xai/grok-4", "openai/gpt-5", "xai/grok-4.6\x00"],
+)
+def test_grok_kilo_rejects_every_noncanonical_model(model, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, "kilo")
+
+    plan = runtime_adapters.build_runtime_command(
+        "grok_kilo_cli",
+        "Prompt",
+        repo,
+        model=model,
+        executable_overrides={"grok_kilo_cli": executable},
+    )
+
+    assert plan.launchable is False
+    assert plan.argv == []
+    assert plan.validation_reason.startswith("unsupported_grok_kilo_model:")
+
+
+def test_grok_kilo_registry_and_provider_family_are_explicit():
+    assert "grok_kilo_cli" in runtime_adapters.SUPPORTED_ADAPTERS
+    assert "grok_kilo_cli" in runtime_adapters.LOCAL_ADAPTERS
+    assert runtime_adapters.ADAPTER_EXECUTABLES["grok_kilo_cli"] == "kilo"
+    assert runtime_adapters.provider_for_adapter("grok_kilo_cli") == "xai"
+
+
+def test_grok_kilo_preserves_windows_appcontainer_gate(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, "kilo")
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
+
+    blocked = runtime_adapters.build_runtime_command(
+        "grok_kilo_cli",
+        "Prompt",
+        repo,
+        executable_overrides={"grok_kilo_cli": executable},
+    )
+    allowed = runtime_adapters.build_runtime_command(
+        "grok_kilo_cli",
+        "Prompt",
+        repo,
+        executable_overrides={"grok_kilo_cli": executable},
+        outer_sandbox_backend="appcontainer",
+    )
+
+    assert blocked.launchable is False
+    assert blocked.validation_reason == (
+        runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+    )
+    assert allowed.launchable is True

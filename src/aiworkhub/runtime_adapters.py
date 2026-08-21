@@ -26,6 +26,7 @@ SUPPORTED_ADAPTERS: tuple[str, ...] = (
     "deepseek_vscode_lm",
     "glm_copilot_cli",
     "glm_vscode_lm",
+    "grok_kilo_cli",
     "deepseek_manual",
 )
 LOCAL_ADAPTERS: tuple[str, ...] = (
@@ -36,6 +37,7 @@ LOCAL_ADAPTERS: tuple[str, ...] = (
     "deepseek_vscode_lm",
     "glm_copilot_cli",
     "glm_vscode_lm",
+    "grok_kilo_cli",
 )
 MANUAL_ONLY_ADAPTERS: tuple[str, ...] = ("deepseek_manual",)
 
@@ -52,6 +54,9 @@ ADAPTER_EXECUTABLES: Mapping[str, str] = MappingProxyType(
         # OpenAI-compatible API (see glm_credentials.py).
         "glm_copilot_cli": "copilot",
         "glm_vscode_lm": sys.executable,
+        # Official Kilo CLI, authenticated against xAI in a request-scoped
+        # home by the launcher.  This pure planner never reads credentials.
+        "grok_kilo_cli": "kilo",
     }
 )
 
@@ -76,6 +81,9 @@ GLM_VSCODE_LM_ADAPTER = "glm_vscode_lm"
 GLM_SUPPORTED_MODELS: tuple[str, ...] = ("glm-5.2",)
 GLM_DEFAULT_MODEL = "glm-5.2"
 GLM_SECRET_ENV_VAR = "COPILOT_PROVIDER_API_KEY"
+GROK_KILO_ADAPTER = "grok_kilo_cli"
+GROK_KILO_SUPPORTED_MODELS: tuple[str, ...] = ("xai/grok-4.6",)
+GROK_KILO_DEFAULT_MODEL = GROK_KILO_SUPPORTED_MODELS[0]
 VSCODE_LM_ADAPTER = "vscode_lm"
 WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER = "windows_native_cli_requires_appcontainer_sandbox"
 
@@ -236,6 +244,7 @@ _ADAPTER_PROVIDERS: Mapping[str, str] = MappingProxyType(
         "deepseek_vscode_lm": "deepseek",
         "glm_copilot_cli": "glm",
         "glm_vscode_lm": "glm",
+        "grok_kilo_cli": "xai",
     }
 )
 
@@ -486,6 +495,22 @@ def resolve_deepseek_model(model: str | None) -> tuple[str | None, str | None]:
     return candidate, None
 
 
+def resolve_grok_kilo_model(model: str | None) -> tuple[str | None, str | None]:
+    """Resolve the single xAI model supported by the Kilo CLI adapter."""
+
+    if model is None:
+        return GROK_KILO_DEFAULT_MODEL, None
+    if not isinstance(model, str) or not model.strip() or "\x00" in model:
+        return None, "unsupported_grok_kilo_model:malformed"
+    candidate = model.strip()
+    if candidate not in GROK_KILO_SUPPORTED_MODELS:
+        return None, (
+            "unsupported_grok_kilo_model:"
+            f"{candidate}:allowed={'|'.join(GROK_KILO_SUPPORTED_MODELS)}"
+        )
+    return candidate, None
+
+
 def _is_glm_family(name: str) -> bool:
     """True when ``name`` normalizes into the GLM provider family."""
 
@@ -612,7 +637,7 @@ def build_runtime_command(
     if "\x00" in prompt:
         return _invalid_plan(adapter_id, "prompt contains a NUL character")
 
-    if model is not None:
+    if model is not None and adapter_id != GROK_KILO_ADAPTER:
         if not isinstance(model, str) or not model.strip():
             return _invalid_plan(adapter_id, "model must be a nonempty string when provided")
         if "\x00" in model:
@@ -742,6 +767,24 @@ def build_runtime_command(
         if model is not None:
             argv.extend(("--model", model))
         argv.append(prompt)
+    elif adapter_id == GROK_KILO_ADAPTER:
+        resolved_model, model_error = resolve_grok_kilo_model(model)
+        if model_error:
+            return _invalid_plan(adapter_id, model_error, cwd=cwd)
+        assert resolved_model is not None
+        argv = [
+            executable,
+            "run",
+            "--pure",
+            "--model",
+            resolved_model,
+            "--format",
+            "json",
+            "--dir",
+            cwd,
+            "--auto",
+            prompt,
+        ]
     else:  # Copilot CLI in BYOK mode for OpenAI-compatible local-worker adapters
         if adapter_id == DEEPSEEK_COPILOT_ADAPTER:
             resolved_model, model_error = resolve_deepseek_model(model)
@@ -1233,6 +1276,9 @@ __all__ = [
     "GLM_COLD_START_FALLBACK_MODEL",
     "GLM_SECRET_ENV_VAR",
     "GLM_SUPPORTED_MODELS",
+    "GROK_KILO_ADAPTER",
+    "GROK_KILO_DEFAULT_MODEL",
+    "GROK_KILO_SUPPORTED_MODELS",
     "EDITOR_NONCALLABLE_VENDORS",
     "EDITOR_NONCALLABLE_ID_PREFIXES",
     "EDITOR_REQUESTED_MODEL_RE",
@@ -1265,4 +1311,5 @@ __all__ = [
     "resolve_deepseek_model",
     "resolve_executable",
     "resolve_glm_model",
+    "resolve_grok_kilo_model",
 ]
