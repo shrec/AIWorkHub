@@ -5829,7 +5829,11 @@ def _current_pytest_runtime_root() -> Path | None:
     return package_init.parent.parent.resolve(strict=False)
 
 
-def _validate_pytest_runtime_root(raw: Path) -> Path:
+def _validate_pytest_runtime_root(
+    raw: Path,
+    *,
+    allow_active_runtime_world_writable: bool = False,
+) -> Path:
     """Validate one exact pytest package root without broadening PYTHONPATH."""
     if raw.is_symlink():
         raise WorkspaceError(f"validation_pytest_runtime_symlink_forbidden:{raw}")
@@ -5846,7 +5850,11 @@ def _validate_pytest_runtime_root(raw: Path) -> Path:
     # ownership is meaningful; Windows ACLs protect the package tree.
     if os.name != "nt" and info.st_uid != os.getuid():
         raise WorkspaceError(f"validation_pytest_runtime_untrusted_owner:{candidate}")
-    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o002:
+    if (
+        os.name != "nt"
+        and stat.S_IMODE(info.st_mode) & 0o002
+        and not allow_active_runtime_world_writable
+    ):
         raise WorkspaceError(f"validation_pytest_runtime_world_writable:{candidate}")
     package_init = candidate / "pytest" / "__init__.py"
     if package_init.is_symlink() or not package_init.is_file():
@@ -5871,7 +5879,12 @@ def resolve_trusted_pytest_runtime_root() -> Path:
     outright if it is a symlink, not owned by this process's user,
     world-writable, or does not actually contain an importable ``pytest``
     package -- never a copy, never any other real-HOME content, never
-    writable. Fails closed with a ``WorkspaceError`` if no such root exists,
+    writable. The sole exception is the exact package root already supplying
+    pytest to the active interpreter: some ephemeral CI toolcache installs
+    expose that root with permissive mode bits, but its code has necessarily
+    already been imported by this process and validation binds it read-only.
+    An arbitrary writable path is never admitted. Fails closed with a
+    ``WorkspaceError`` if no such root exists,
     instead of silently handing back a path that will fail to import at test
     time.
     """
@@ -5889,7 +5902,10 @@ def resolve_trusted_pytest_runtime_root() -> Path:
         runtime_root = _current_pytest_runtime_root()
         if runtime_root is None or runtime_root == raw.resolve(strict=False):
             raise
-        return _validate_pytest_runtime_root(runtime_root)
+        return _validate_pytest_runtime_root(
+            runtime_root,
+            allow_active_runtime_world_writable=True,
+        )
 
 
 def _validation_pythonpath_readonly_dirs(components: tuple[str, ...]) -> tuple[Path, ...]:

@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.36] - 2026-08-21
+
+### Fixed
+
+- Release validation now recognizes the exact pytest runtime already loaded by
+  the active interpreter even when an ephemeral CI toolcache exposes its
+  `site-packages` root with permissive mode bits. Arbitrary writable roots
+  remain rejected and the admitted runtime is bound read-only.
+
 ## [0.10.35] - 2026-08-21
 
 ### Fixed

@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.36 — 2026-08-21
+
+### Fixed
+
+- Packaging accepts only the active interpreter's exact pytest runtime when a
+  CI toolcache uses permissive directory modes, while still rejecting
+  arbitrary writable validation roots.
+
 ## 0.10.35 — 2026-08-21
 
 ### Fixed
