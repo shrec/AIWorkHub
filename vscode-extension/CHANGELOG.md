@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.23 — 2026-08-21
+
+### Fixed
+
+- Failed Windows worktree creation no longer enters a second blocking Git
+  cleanup/prune path; exact partial state is cleaned without another process.
+
 ## 0.10.22 — 2026-08-21
 
 ### Fixed

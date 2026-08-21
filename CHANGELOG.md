@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.23] - 2026-08-21
+
+### Fixed
+
+- A timed-out or failed `git worktree add` no longer launches a second Git
+  subprocess for global pruning. Partial exact registrations and request-owned
+  directories use the same process-free cleanup authority as normal teardown.
+- Detached/manual validation workspaces without Git registration remain
+  safely cleanable, while mismatched reciprocal registrations still fail
+  closed and preserve evidence.
+
 ## [0.10.22] - 2026-08-21
 
 ### Fixed

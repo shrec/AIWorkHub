@@ -12,6 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.23
+
+- Worktree-creation failures now use exact process-free cleanup too, avoiding
+  the previous timeout → `git worktree prune` → timeout loop.
+
 ## What's new in 0.10.22
 
 - Workspace cleanup verifies and removes the exact request-owned worktree
