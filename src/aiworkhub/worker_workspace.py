@@ -521,6 +521,7 @@ def _run(
     cwd: Path,
     timeout: float = 120,
     phase: str = "workspace_git",
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     popen_kwargs: dict[str, Any] = {
         "cwd": cwd,
@@ -539,7 +540,10 @@ def _run(
         popen_kwargs["start_new_session"] = True
     process = subprocess.Popen(argv, **popen_kwargs)
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
+        if input_text is None:
+            stdout, stderr = process.communicate(timeout=timeout)
+        else:
+            stdout, stderr = process.communicate(input=input_text, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         tree_terminated = _terminate_git_process_tree(process)
         raise GitCommandTimeout(
@@ -556,6 +560,48 @@ def _run(
         stdout,
         stderr,
     )
+
+
+def _sparse_checkout_pattern(relative: str) -> str:
+    """Return one exact non-cone sparse-checkout pattern."""
+    if "\n" in relative or "\r" in relative:
+        raise WorkspaceError("sparse_checkout_path_contains_line_break")
+    escaped = relative.replace("\\", "\\\\")
+    for token in ("*", "?", "["):
+        escaped = escaped.replace(token, f"\\{token}")
+    return f"/{escaped}"
+
+
+def _prepare_sparse_worktree(
+    path: Path,
+    seeded: list[str],
+    *,
+    timeout: float,
+) -> None:
+    """Materialize only declared tracked files while preserving Git truth."""
+    patterns = sorted({_sparse_checkout_pattern(relative) for relative in seeded})
+    if not patterns:
+        patterns = ["/__AIWORKHUB_EMPTY_SPARSE_WORKTREE__"]
+    commands: tuple[tuple[list[str], str | None], ...] = (
+        (["git", "sparse-checkout", "init", "--no-cone"], None),
+        (
+            ["git", "sparse-checkout", "set", "--no-cone", "--stdin"],
+            "\n".join(patterns) + "\n",
+        ),
+        (["git", "read-tree", "-mu", "HEAD"], None),
+    )
+    for argv, input_text in commands:
+        result = _run(
+            argv,
+            cwd=path,
+            timeout=timeout,
+            phase="workspace_provision",
+            input_text=input_text,
+        )
+        if result.returncode != 0:
+            raise WorkspaceError(
+                f"workspace_sparse_checkout_failed:{argv[1]}:{result.stderr[-500:]}"
+            )
 
 
 def _read_git_control_file(path: Path, *, label: str) -> str:
@@ -2024,16 +2070,62 @@ def create_workspace(
     provisioning_started = time.monotonic()
     provisioning_timings_ms: dict[str, float] = {}
 
+    declared = list(card.get("read_first") or []) + list(card.get("immutable_inputs") or []) + list(allowed)
+    seeded = _expand_declared(repo, declared)
+    seeded = _resolve_local_quoted_includes(repo, seeded)
+    # Git ignore rules participate in changed-path truth. Materialize the root
+    # rule file and rules in ancestors of declared files without checking out
+    # the rest of a potentially multi-gigabyte repository.
+    ignore_candidates = {".gitignore"}
+    for relative in seeded:
+        parent = PurePosixPath(relative).parent
+        while str(parent) not in {"", "."}:
+            ignore_candidates.add((parent / ".gitignore").as_posix())
+            parent = parent.parent
+    seeded = sorted(
+        set(seeded)
+        | {
+            relative
+            for relative in ignore_candidates
+            if (repo / relative).is_file() and not (repo / relative).is_symlink()
+        }
+    )
+
     try:
         phase_started = time.monotonic()
         result = _run(
-            ["git", "worktree", "add", "--detach", str(path), "HEAD"],
+            [
+                "git",
+                "worktree",
+                "add",
+                "--detach",
+                "--no-checkout",
+                str(path),
+                "HEAD",
+            ],
             cwd=repo,
             timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
             phase="workspace_provision",
         )
-        provisioning_timings_ms["worktree_create"] = round(
+        provisioning_timings_ms["worktree_register"] = round(
             (time.monotonic() - phase_started) * 1000.0, 3
+        )
+        if result.returncode == 0:
+            phase_started = time.monotonic()
+            _prepare_sparse_worktree(
+                path,
+                seeded,
+                timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
+            )
+            provisioning_timings_ms["sparse_checkout"] = round(
+                (time.monotonic() - phase_started) * 1000.0, 3
+            )
+        provisioning_timings_ms["worktree_create"] = round(
+            sum(
+                provisioning_timings_ms.get(name, 0.0)
+                for name in ("worktree_register", "sparse_checkout")
+            ),
+            3,
         )
     except Exception:
         # ``git worktree add`` can raise (for example a timeout that kills git
@@ -2049,11 +2141,8 @@ def create_workspace(
         # Git reports the actionable cause (for example ENOSPC) at the end,
         # after a long checkout progress stream. Preserve that tail.
         raise WorkspaceError(f"git_worktree_add_failed:{result.stderr[-1000:]}")
-    declared = list(card.get("read_first") or []) + list(card.get("immutable_inputs") or []) + list(allowed)
     try:
         phase_started = time.monotonic()
-        seeded = _expand_declared(repo, declared)
-        seeded = _resolve_local_quoted_includes(repo, seeded)
         for relative in seeded:
             destination = path / relative
             _require_beneath(path, destination)
@@ -2162,24 +2251,38 @@ def cleanup_workspace(
     # already disappeared.  ``git worktree remove --force`` is intentionally
     # idempotent for a registered-but-missing path; gating this call on
     # ``path.exists()`` left prunable entries in ``.git/worktrees`` forever.
-    _run(
-        ["git", "worktree", "remove", "--force", str(path)],
-        cwd=repo,
-        timeout=git_timeout,
-        phase="workspace_cleanup",
-    )
+    remove_error: WorkspaceError | None = None
+    try:
+        _run(
+            ["git", "worktree", "remove", "--force", str(path)],
+            cwd=repo,
+            timeout=git_timeout,
+            phase="workspace_cleanup",
+        )
+    except WorkspaceError as exc:
+        # A timed-out Windows Git child may already have released every file
+        # handle. Remove the request-owned directory mechanically and let prune
+        # unregister only the now-missing administrative record.
+        remove_error = exc
     shutil.rmtree(path.parent, ignore_errors=True)
     # A failed first remove (for example, because Windows still had a handle
     # open) may become removable after the directory cleanup.  Prune only
     # administratively stale registrations; Git never deletes a live
     # worktree through this command.
-    _run(
-        ["git", "worktree", "prune", "--expire", "now"],
-        cwd=repo,
-        timeout=git_timeout,
-        phase="workspace_cleanup",
-    )
+    try:
+        _run(
+            ["git", "worktree", "prune", "--expire", "now"],
+            cwd=repo,
+            timeout=git_timeout,
+            phase="workspace_cleanup",
+        )
+    except WorkspaceError:
+        if remove_error is not None:
+            raise remove_error
+        raise
     if path.exists() or home.exists():
+        if remove_error is not None:
+            raise remove_error
         raise WorkspaceError("workspace_cleanup_incomplete")
 
 
@@ -2251,12 +2354,19 @@ def finalization_preflight_probe(
                     git_timeout=finalization_git_timeout_seconds(),
                 )
             except (OSError, RuntimeError, ValueError, WorkspaceError) as exc:
+                if isinstance(exc, GitCommandTimeout):
+                    failed_phase = exc.phase
+                    failed_command = " ".join(exc.argv)
+                else:
+                    failed_phase = "workspace_cleanup"
+                    failed_command = "workspace cleanup"
                 result = {
                     **result,
                     "ok": False,
                     "status": "blocked",
                     "reason": f"preflight_finalization_cleanup_failed:{exc}"[:500],
-                    "phase": "workspace_cleanup",
+                    "phase": failed_phase,
+                    "command": failed_command,
                 }
             cleanup_ms = (time.monotonic() - cleanup_started) * 1000.0
     result = {

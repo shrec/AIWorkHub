@@ -210,9 +210,131 @@ def test_workspace_creation_uses_bounded_metadata_not_post_create_git_probes(
     )
     try:
         assert len(workspace.base_oid or "") in {40, 64}
-        assert [call[1] for call in calls if len(call) > 1] == ["worktree"]
+        assert [call[1] for call in calls if len(call) > 1] == [
+            "worktree",
+            "sparse-checkout",
+            "sparse-checkout",
+            "read-tree",
+        ]
+        assert "--no-checkout" in calls[0]
+        assert not (workspace.path / "parent-secret.txt").exists()
+        assert (workspace.path / "out" / "result.txt").is_file()
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_sparse_workspace_detects_modified_added_deleted_and_renamed_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "worktrees"),
+    )
+    cases = (
+        ("modified", lambda root: (root / "out/result.txt").write_bytes(b"changed\n"), ["out/result.txt"]),
+        ("added", lambda root: (root / "out/new.txt").write_bytes(b"new\n"), ["out/new.txt"]),
+        ("deleted", lambda root: (root / "out/result.txt").unlink(), ["out/result.txt"]),
+        (
+            "renamed",
+            lambda root: (root / "out/result.txt").replace(root / "out/renamed.txt"),
+            ["out/renamed.txt", "out/result.txt"],
+        ),
+    )
+    for request_id, mutate, expected in cases:
+        workspace = worker_workspace.create_workspace(
+            repo,
+            request_id,
+            {
+                "allowed_writes": [
+                    "out/result.txt",
+                    "out/new.txt",
+                    "out/renamed.txt",
+                ],
+                "read_first": ["read/input.txt"],
+            },
+            "validation",
+        )
+        try:
+            assert not (workspace.path / "parent-secret.txt").exists()
+            mutate(workspace.path)
+            assert worker_workspace.enforce_scope(workspace) == expected
+        finally:
+            worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_cleanup_recovers_after_exact_worktree_remove_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "cleanup-timeout")
+    real_run = worker_workspace._run
+
+    def timeout_remove(argv, **kwargs):
+        if argv[:4] == ["git", "worktree", "remove", "--force"]:
+            raise worker_workspace.GitCommandTimeout(
+                phase="workspace_cleanup",
+                argv=argv,
+                cwd=Path(kwargs["cwd"]),
+                timeout=float(kwargs["timeout"]),
+                pid=4242,
+                tree_terminated=True,
+            )
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(worker_workspace, "_run", timeout_remove)
+    worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+    assert not workspace.path.parent.exists()
+    assert str(workspace.path) not in _git(repo, "worktree", "list", "--porcelain").stdout
+
+
+def test_preflight_cleanup_timeout_reports_the_actual_cleanup_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    root = tmp_path / "synthetic-preflight"
+    path = root / "worktree"
+    home = root / "home"
+    path.mkdir(parents=True)
+    home.mkdir()
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="preflight-synthetic",
+        repo=repo,
+        path=path,
+        home=home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+        tree_baseline={},
+        provisioning_timings_ms={"worktree_create": 1.0},
+        base_oid="a" * 40,
+    )
+    monkeypatch.setattr(worker_workspace, "create_workspace", lambda *_args, **_kwargs: workspace)
+    monkeypatch.setattr(worker_workspace, "enforce_scope", lambda *_args, **_kwargs: [])
+
+    def fail_cleanup(*_args, **_kwargs):
+        raise worker_workspace.GitCommandTimeout(
+            phase="workspace_cleanup",
+            argv=["git", "worktree", "remove", "--force", str(path)],
+            cwd=repo,
+            timeout=5.0,
+            pid=4242,
+            tree_terminated=True,
+        )
+
+    monkeypatch.setattr(worker_workspace, "cleanup_workspace", fail_cleanup)
+    result = worker_workspace.finalization_preflight_probe(
+        repo,
+        "synthetic-cleanup-timeout",
+        cache_seconds=0,
+    )
+    assert result["ok"] is False
+    assert result["phase"] == "workspace_cleanup"
+    assert result["command"] == f"git worktree remove --force {path}"
+    assert "workspace_cleanup_git_timeout" in result["reason"]
 
 
 def test_isolated_worktree_metadata_rejects_symbolic_head(
