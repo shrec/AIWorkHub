@@ -137,6 +137,8 @@ def test_catalog_scores_only_attributed_canonical_outcomes(tmp_path: Path) -> No
     deepseek = next(item for item in snapshot["workers"] if item["worker_id"] == "deepseek-v4-pro")
     outcomes = deepseek["outcomes"]
     assert outcomes["sample_count"] == 2
+    assert outcomes["attempted_task_count"] == 2
+    assert outcomes["infrastructure_failure_count"] == 0
     assert outcomes["attempt_count"] == 3
     assert outcomes["retry_count"] == 1
     assert outcomes["accepted_rate"] == 0.5
@@ -151,6 +153,33 @@ def test_catalog_scores_only_attributed_canonical_outcomes(tmp_path: Path) -> No
     assert untouched["observed_score"] is None
     assert untouched["outcomes"]["evidence_source"] == "conservative_prior"
     assert untouched["availability_observed"] is False
+
+
+def test_infrastructure_failures_do_not_poison_model_quality_evidence(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    cards = [
+        {"task_id": "infra", "status": "blocked", "terminal_substatus": "launch_failed"},
+        {"task_id": "quality", "status": "finished", "terminal_substatus": "review_ready"},
+    ]
+    processes = [
+        {"request_id": "ri", "task_id": "infra", "adapter_id": "glm_vscode_lm", "model": "glm-5.2"},
+        {"request_id": "rq", "task_id": "quality", "adapter_id": "glm_vscode_lm", "model": "glm-5.2"},
+    ]
+
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=cards, process_rows=processes, preflight=_preflight()
+    )
+    glm = next(item for item in snapshot["workers"] if item["worker_id"] == "glm-5.2")
+
+    assert glm["outcomes"]["sample_count"] == 1
+    assert glm["outcomes"]["attempted_task_count"] == 2
+    assert glm["outcomes"]["infrastructure_failure_count"] == 1
+    assert glm["outcomes"]["accepted_rate"] == 1.0
+    assert glm["outcomes"]["review_ready_rate"] == 1.0
+    assert glm["outcomes"]["validation_failure_rate"] == 0.0
+    assert glm["observed_score"] == 100.0
 
 
 def test_repository_model_policy_removes_disabled_routes_from_ranking(

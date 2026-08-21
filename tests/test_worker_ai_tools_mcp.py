@@ -145,6 +145,11 @@ def test_quality_review_source_graph_query_is_query_only_and_fails_closed(
     real_build_index = source_graph.build_index
 
     def fake_build_index(*args: object, **kwargs: object) -> object:
+        # The full suite intentionally runs background indexing probes. This
+        # guard owns only the candidate overlay under test; an unrelated
+        # repository finishing concurrently is not a query-time build here.
+        if not args or Path(args[0]).resolve() != candidate.resolve():
+            return real_build_index(*args, **kwargs)
         build_calls.append((args, kwargs))
         raise AssertionError("build_index must never run at query time")
 

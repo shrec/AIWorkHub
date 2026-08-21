@@ -123,6 +123,40 @@ def test_claim_without_origin_thread_id_is_unscoped_backward_compatible(tmp_path
     assert claimed["origin_thread_id"] == session_a
 
 
+def test_rebind_prunes_stale_pending_callback_instead_of_retargeting_it(tmp_path):
+    conn = _make_db(tmp_path)
+    old_session = str(uuid.uuid4())
+    new_session = str(uuid.uuid4())
+    task_id = _task_id()
+    _seed_review_task(conn, task_id, old_session, provider="codex")
+    card = json.loads(
+        conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()["card_json"]
+    )
+    card["status"] = "finished"
+    conn.execute(
+        "UPDATE tasks SET status='finished', worker_status='finished', card_json=? "
+        "WHERE task_id=?",
+        (json.dumps(card, sort_keys=True), task_id),
+    )
+    conn.commit()
+
+    rebound = callback_store.rebind_pending_callbacks(
+        conn, provider="codex", origin_thread_id=new_session
+    )
+    row = conn.execute(
+        "SELECT state, origin_thread_id, last_error FROM callback_outbox "
+        "WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+
+    assert rebound == 0
+    assert row["state"] == "superseded"
+    assert row["origin_thread_id"] == old_session
+    assert row["last_error"] == "task_no_longer_in_matching_terminal_state_or_episode"
+
+
 # ---------------------------------------------------------------------------
 # has_deliverable_callback: non-mutating peek.
 # ---------------------------------------------------------------------------

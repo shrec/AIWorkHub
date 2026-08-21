@@ -39,11 +39,6 @@ _DISCOVERY_ADAPTERS: frozenset[str] = frozenset({"glm_vscode_lm"})
 # model vendor (OpenAI, Anthropic, Zhipu, ...) and the subscription/transport
 # owner are different identities: repository policy must be able to disable
 # Copilot without also disabling a native Codex/Claude/provider route.
-_EDITOR_POLICY_ADAPTERS: frozenset[str] = frozenset(
-    {"vscode_lm", "deepseek_vscode_lm", "glm_vscode_lm"}
-)
-
-
 SCHEMA_ID = "aiworkhub.workforce_catalog.v1"
 CATALOG_RELATIVE_PATH = Path(".aiworkhub/config/workforce.json")
 AUDIT_RELATIVE_PATH = Path(".aiworkhub/config/workforce.audit.jsonl")
@@ -150,10 +145,7 @@ def policy_route_identity(provider: str, adapter_id: str) -> tuple[str, str]:
     route consistently.
     """
 
-    adapter = str(adapter_id).strip()
-    if adapter in _EDITOR_POLICY_ADAPTERS:
-        return "copilot", "vscode_lm"
-    return str(provider).strip().lower(), adapter
+    return model_settings.policy_route_identity(provider, adapter_id)
 
 
 def model_identity_valid(value: str) -> bool:
@@ -672,11 +664,28 @@ def build_catalog(
             )
         ]
         matched_cards = [card_by_task[task_id] for task_id in task_ids if task_id in card_by_task]
-        sample_count = len(matched_cards)
-        accepted = sum(1 for item in matched_cards if str(item.get("status") or "") == "finished")
-        review_ready = sum(1 for item in matched_cards if str(item.get("status") or "") in {"review", "finished"})
+        infrastructure_substatuses = {
+            "launch_failed", "timed_out", "worker_failed", "finalize_failed"
+        }
+        infrastructure_cards = [
+            item for item in matched_cards
+            if str(item.get("terminal_substatus") or "")
+            in infrastructure_substatuses
+        ]
+        quality_cards = [
+            item for item in matched_cards if item not in infrastructure_cards
+        ]
+        sample_count = len(quality_cards)
+        accepted = sum(
+            1 for item in quality_cards
+            if str(item.get("status") or "") == "finished"
+        )
+        review_ready = sum(
+            1 for item in quality_cards
+            if str(item.get("status") or "") in {"review", "finished"}
+        )
         failed = 0
-        for item in matched_cards:
+        for item in quality_cards:
             substatus = str(item.get("terminal_substatus") or "")
             verification = item.get("deterministic_verification")
             if substatus in {"validation_failed", "launch_failed", "timed_out"} or (
@@ -689,7 +698,7 @@ def build_catalog(
             if value is not None
         ]
         attempts = len(matched)
-        retries = max(0, attempts - sample_count)
+        retries = max(0, attempts - len(matched_cards))
         usage_source = matched_usage or matched
         tokens = sum(int(item.get("total_tokens") or 0) for item in usage_source)
         def cost_known(item: Mapping[str, Any]) -> bool:
@@ -796,6 +805,8 @@ def build_catalog(
             "quota_state": "unavailable_from_provider_api",
             "outcomes": {
                 "sample_count": sample_count,
+                "attempted_task_count": len(matched_cards),
+                "infrastructure_failure_count": len(infrastructure_cards),
                 "attempt_count": attempts,
                 "retry_count": retries,
                 "accepted_rate": accepted_rate,

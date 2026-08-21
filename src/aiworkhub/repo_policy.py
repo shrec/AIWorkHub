@@ -19,6 +19,7 @@ from typing import Any, Mapping
 
 from . import (
     claude_auth,
+    model_settings,
     quality_evidence,
     runtime_adapters,
     source_graph_daemon,
@@ -279,9 +280,20 @@ def _provider_status(
     policy: Mapping[str, Any],
     sandbox_backend: str,
     sandbox_error: str,
+    model_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolution = runtime_adapters.resolve_executable(adapter_id)
     policy_allowed = adapter_id in policy["providers"]["allowed_adapters"]
+    if model_policy is None:
+        model_policy = model_settings.load(repo_root)
+    policy_provider, policy_adapter = model_settings.policy_identity_for_adapter(
+        adapter_id
+    )
+    repository_model_policy_enabled = model_settings.evaluate_state(
+        model_policy,
+        provider=policy_provider,
+        adapter=policy_adapter,
+    )
     native_windows_cli_without_broker = (
         _is_windows_host()
         and adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS
@@ -296,8 +308,16 @@ def _provider_status(
         # editor-hosted routes look degraded merely by being in the portable
         # adapter catalog. Explicitly policy-denied routes are likewise not a
         # required coverage target.
-        "coverage_required": bool(policy_allowed and not native_windows_cli_without_broker),
+        "coverage_required": bool(
+            policy_allowed
+            and repository_model_policy_enabled
+            and not native_windows_cli_without_broker
+        ),
         "platform_excluded": bool(native_windows_cli_without_broker),
+        "model_policy_excluded": not repository_model_policy_enabled,
+        "repository_model_policy_enabled": repository_model_policy_enabled,
+        "policy_provider": policy_provider,
+        "policy_adapter": policy_adapter,
         "installed": bool(resolution.ok),
         "launchable": bool(resolution.ok),
         "access_observed": False,
@@ -411,6 +431,10 @@ def _provider_status(
         result["launchable"] = False
         result["status"] = "policy_denied"
         result["reason"] = "adapter_denied_by_repo_policy"
+    elif not repository_model_policy_enabled:
+        result["launchable"] = False
+        result["status"] = "repository_model_policy_disabled"
+        result["reason"] = "route_disabled_by_repository_model_settings"
     return result
 
 
@@ -426,6 +450,15 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         policy = {**validate_policy(deepcopy(DEFAULT_POLICY)), "configured": False}
         policy_error = str(exc)[:300]
         errors.append("repo_policy_invalid")
+    try:
+        repository_model_policy = model_settings.load(root)
+        model_policy_error = ""
+    except model_settings.ModelSettingsError as exc:
+        repository_model_policy = {
+            "providers": {}, "adapters": {}, "models": {}
+        }
+        model_policy_error = str(exc)[:300]
+        errors.append("repository_model_settings_invalid")
     declared_checks, quality_error = _declared_check_ids(root)
     missing_checks = sorted(
         set(policy["validation"]["required_check_ids"]) - set(declared_checks)
@@ -460,7 +493,14 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         sandbox_backend = ""
         sandbox_error = str(exc)[:200]
     providers = [
-        _provider_status(root, name, policy, sandbox_backend, sandbox_error)
+        _provider_status(
+            root,
+            name,
+            policy,
+            sandbox_backend,
+            sandbox_error,
+            model_policy=repository_model_policy,
+        )
         for name in runtime_adapters.LOCAL_ADAPTERS
     ]
     selected = next((item for item in providers if item["adapter_id"] == adapter_id), None)
@@ -578,6 +618,8 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             "valid": not policy_error,
             "configured": bool(policy.get("configured")),
             "error": policy_error,
+            "model_settings_valid": not model_policy_error,
+            "model_settings_error": model_policy_error,
             "providers": dict(policy["providers"]),
             "tools": dict(policy["tools"]),
             "validation": {
@@ -673,7 +715,11 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
                     "exclusion": (
                         "platform"
                         if item.get("platform_excluded")
-                        else "policy"
+                        else (
+                            "repository_model_policy"
+                            if item.get("model_policy_excluded")
+                            else "policy"
+                        )
                     ),
                 }
                 for item in excluded_routes

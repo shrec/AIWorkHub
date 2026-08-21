@@ -972,13 +972,40 @@ def rebind_pending_callbacks(
         raise ValueError("provider and origin_thread_id are required")
     conn.execute("BEGIN IMMEDIATE")
     try:
-        rows = conn.execute(
-            "SELECT outbox_id, batch_id FROM callback_outbox "
+        candidates = conn.execute(
+            "SELECT outbox_id, batch_id, task_id, transition, episode_id "
+            "FROM callback_outbox "
             "WHERE provider=? AND state='pending' AND origin_thread_id<>?",
             (provider, origin_thread_id),
         ).fetchall()
-        batch_ids = {str(row["batch_id"] or "") for row in rows if row["batch_id"]}
+        rows = []
         now = utc_now()
+        for row in candidates:
+            if _task_still_in_matching_terminal_state(
+                conn,
+                row["task_id"],
+                row["transition"],
+                row["episode_id"],
+            ):
+                rows.append(row)
+                continue
+            conn.execute(
+                "UPDATE callback_outbox SET state='superseded', "
+                "last_error='task_no_longer_in_matching_terminal_state_or_episode', "
+                "updated_at=? WHERE outbox_id=? AND state='pending'",
+                (now, row["outbox_id"]),
+            )
+            append_event(
+                conn,
+                row["task_id"],
+                "callback_superseded",
+                "",
+                {
+                    "transition": row["transition"],
+                    "reason": "stale_pending_pruned_before_route_rebind",
+                },
+            )
+        batch_ids = {str(row["batch_id"] or "") for row in rows if row["batch_id"]}
         for batch_id in batch_ids:
             conn.execute(
                 "UPDATE callback_batches SET state='superseded', lease_id='', "

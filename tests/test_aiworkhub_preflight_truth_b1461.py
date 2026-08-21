@@ -3,7 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from aiworkhub import repo_policy, runtime_adapters, source_graph_daemon, worker_workspace
+from aiworkhub import (
+    model_settings,
+    repo_policy,
+    runtime_adapters,
+    source_graph_daemon,
+    worker_workspace,
+)
 
 
 def _root(tmp_path: Path) -> Path:
@@ -158,6 +164,61 @@ def test_windows_platform_exclusions_do_not_degrade_ready_editor_routes(monkeypa
     assert summary["excluded_route_count"] == 4
     assert summary["coverage_ratio"] == 1.0
     assert all(item["exclusion"] == "platform" for item in summary["excluded_routes"])
+
+
+def test_repository_disabled_route_is_excluded_from_preflight_coverage(
+    monkeypatch, tmp_path,
+):
+    root = _root(tmp_path)
+    _common(monkeypatch, graph=_ready_graph())
+    model_settings.update(
+        root,
+        provider="zhipu",
+        adapter="glm_copilot_cli",
+        enabled=False,
+        expected_revision=0,
+    )
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: False)
+    monkeypatch.setattr(
+        repo_policy.worker_workspace,
+        "select_sandbox_backend",
+        lambda: "bubblewrap",
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id,
+            "/bin/x" if adapter_id != "glm_copilot_cli" else "",
+            adapter_id != "glm_copilot_cli",
+            "" if adapter_id != "glm_copilot_cli" else "credential_absent",
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *args, **kwargs: {
+            "launchable": True,
+            "blocker_reason": "",
+            "access_observed": True,
+        },
+    )
+
+    report = repo_policy.build_preflight(root)
+    by_adapter = {item["adapter_id"]: item for item in report["providers"]}
+
+    assert by_adapter["glm_copilot_cli"]["coverage_required"] is False
+    assert by_adapter["glm_copilot_cli"]["launchable"] is False
+    assert by_adapter["glm_copilot_cli"]["status"] == "repository_model_policy_disabled"
+    assert not any(
+        item["adapter_id"] == "glm_copilot_cli"
+        for item in report["provider_summary"]["unavailable_routes"]
+    )
+    assert any(
+        item["adapter_id"] == "glm_copilot_cli"
+        and item["exclusion"] == "repository_model_policy"
+        for item in report["provider_summary"]["excluded_routes"]
+    )
 
 
 def test_windows_finalization_probe_blocks_false_ready(monkeypatch, tmp_path):

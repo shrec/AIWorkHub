@@ -28,6 +28,15 @@ SETTINGS_RELATIVE_PATH = Path(".aiworkhub/config/models.json")
 MAX_SETTINGS_BYTES = 64 * 1024
 MAX_IDENTITY_CHARS = 128
 DEFAULT_ENABLED = True
+_EDITOR_POLICY_ADAPTERS = frozenset(
+    {"vscode_lm", "deepseek_vscode_lm", "glm_vscode_lm"}
+)
+_ADAPTER_PROVIDERS = {
+    "claude_cli": "anthropic",
+    "codex_cli": "openai",
+    "deepseek_copilot_cli": "deepseek",
+    "glm_copilot_cli": "zhipu",
+}
 _STORED_FIELDS = frozenset(
     {"schema_id", "revision", "updated_at", "providers", "adapters", "models"}
 )
@@ -35,6 +44,29 @@ _STORED_FIELDS = frozenset(
 
 class ModelSettingsError(RuntimeError):
     """Malformed, stale or unsafe repository model settings."""
+
+
+def policy_route_identity(provider: str, adapter: str) -> tuple[str, str]:
+    """Return the repository-policy owner for one effective launch route."""
+
+    normalized_adapter = _validate_identity(adapter, "adapter")
+    if normalized_adapter in _EDITOR_POLICY_ADAPTERS:
+        return "copilot", "vscode_lm"
+    return _validate_identity(provider, "provider").lower(), normalized_adapter
+
+
+def policy_identity_for_adapter(adapter: str) -> tuple[str, str]:
+    """Resolve a runtime adapter to its repository model-policy identity."""
+
+    normalized_adapter = _validate_identity(adapter, "adapter")
+    if normalized_adapter in _EDITOR_POLICY_ADAPTERS:
+        return "copilot", "vscode_lm"
+    provider = _ADAPTER_PROVIDERS.get(normalized_adapter)
+    if provider is None:
+        raise ModelSettingsError(
+            f"model_settings_adapter_provider_unknown:{normalized_adapter}"
+        )
+    return provider, normalized_adapter
 
 
 def settings_path(repo_root: Path | str) -> Path:
