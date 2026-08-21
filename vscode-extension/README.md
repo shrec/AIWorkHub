@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.34
+
+- Sparse pytest workspaces retain repository-local configuration, so parent
+  repository discovery cannot redirect imports away from candidate `src`.
+- Validation-only replays authenticate inherited Python delta bytes against
+  their canonical parent baseline.
+
 ## What's new in 0.10.33
 
 - Rework claims now bind launch and terminal evidence to the exact committed

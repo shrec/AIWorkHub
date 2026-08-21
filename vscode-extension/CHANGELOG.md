@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.34 — 2026-08-21
+
+### Fixed
+
+- Sparse pytest and retained validation-only replays now import the exact
+  candidate package rather than resolving through the parent canonical tree.
+
 ## 0.10.33 — 2026-08-21
 
 ### Fixed

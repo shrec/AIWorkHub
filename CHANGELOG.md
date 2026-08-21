@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.34] - 2026-08-21
+
+### Fixed
+
+- Sparse Python validation now carries its own `pyproject.toml`, preventing
+  pytest from walking into the parent canonical repository and importing the
+  wrong `src` tree.
+- Provider-free validation replays include hash-pinned inherited Python files
+  in candidate import authority by comparing them with the canonical parent
+  baseline instead of the already-overlaid workspace baseline.
+
 ## [0.10.33] - 2026-08-21
 
 ### Fixed

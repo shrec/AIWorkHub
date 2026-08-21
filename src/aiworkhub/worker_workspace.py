@@ -178,6 +178,11 @@ SANDBOX_AUTHORITY_REPO = "/authority-repo"
 SANDBOX_PACKAGE_IMPORT_ROOT = "/aiworkhub-package-root"
 MAX_SEED_FILES = 20_000
 _VALIDATION_WORKER_PACKAGE_SUPPORT = (
+    # Keep pytest configuration inside the sparse worktree.  Without this
+    # anchor pytest walks up through ``.aiworkhub/runtime/worktrees`` and
+    # discovers the canonical repository's pyproject.toml, so ``pythonpath =
+    # [\"src\"]`` resolves to canonical code instead of the retained candidate.
+    "pyproject.toml",
     "src/aiworkhub/__init__.py",
     "src/aiworkhub/_version.py",
     "src/aiworkhub/platform_io.py",
@@ -989,10 +994,19 @@ def _python_candidate_authority_rows(
         return []
     current = _worktree_manifest(workspace.path)
     rows: list[dict[str, str]] = []
-    for relative in sorted(set(workspace.tree_baseline) | set(current)):
+    inherited = set(workspace.inherited_rework_paths)
+    for relative in sorted(set(workspace.tree_baseline) | set(current) | inherited):
         if not relative.endswith(".py"):
             continue
-        before = workspace.tree_baseline.get(relative)
+        # Retained predecessor bytes are applied while the successor workspace
+        # is provisioned, before ``tree_baseline`` is recorded.  Compare those
+        # exact paths to the canonical parent baseline or they disappear from
+        # Python import authority during provider-free validation replays.
+        before = (
+            workspace.parent_baseline.get(relative)
+            if relative in inherited
+            else workspace.tree_baseline.get(relative)
+        )
         after = current.get(relative)
         if before == after:
             continue

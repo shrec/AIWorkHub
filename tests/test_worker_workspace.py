@@ -257,7 +257,29 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "print(os.environ.get(w.PYTHON_CANDIDATE_AUTHORITY_ENV, ''))\n",
         encoding="utf-8",
     )
-    assert _git(repo, "add", "src/aiworkhub", "probe_candidate_import.py").returncode == 0
+    (repo / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\npythonpath = ['src']\n",
+        encoding="utf-8",
+    )
+    candidate_test = repo / "tests/test_new_candidate_module.py"
+    candidate_test.parent.mkdir()
+    candidate_test.write_text(
+        "from aiworkhub.new_candidate_module import VALUE\n\n"
+        "def test_candidate_value():\n"
+        "    assert VALUE == 'candidate-new-module'\n",
+        encoding="utf-8",
+    )
+    assert (
+        _git(
+            repo,
+            "add",
+            "pyproject.toml",
+            "src/aiworkhub",
+            "tests/test_new_candidate_module.py",
+            "probe_candidate_import.py",
+        ).returncode
+        == 0
+    )
     assert _git(repo, "commit", "-qm", "validation worker package").returncode == 0
 
 
@@ -362,6 +384,59 @@ def test_python_validation_imports_new_sparse_candidate_module_without_pythonpat
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+def test_pytest_validation_resolves_sparse_candidate_config_inside_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    _commit_validation_worker_package(repo)
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "pytest-candidate-worktrees"),
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "pytest-candidate-import",
+        {
+            "allowed_writes": ["src/aiworkhub/new_candidate_module.py"],
+            "read_first": ["tests/test_new_candidate_module.py"],
+            "validation": [
+                "python3 -m pytest -q tests/test_new_candidate_module.py"
+            ],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        assert (workspace.path / "pyproject.toml").is_file()
+        (workspace.path / "src/aiworkhub/new_candidate_module.py").write_text(
+            "VALUE = 'candidate-new-module'\n", encoding="utf-8"
+        )
+
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["python3 -m pytest -q tests/test_new_candidate_module.py"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+
+        assert result["returncode"] == 0
+        assert "1 passed" in result["stdout_head"]
+        assert result["python_candidate_authority"]["sources"] == [
+            {
+                "path": "src/aiworkhub/new_candidate_module.py",
+                # Workspace provisioning creates a bounded empty placeholder
+                # for an exact new allowed output, so the later candidate
+                # bytes are mechanically a modification of that baseline.
+                "state": "modified",
+                "bytes_sha256": hashlib.sha256(
+                    b"VALUE = 'candidate-new-module'\n"
+                ).hexdigest(),
+            }
+        ]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
 def test_python_candidate_authority_tracks_added_modified_and_deleted_paths(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -404,6 +479,40 @@ def test_python_candidate_authority_tracks_added_modified_and_deleted_paths(
         assert set(authority["digest"]) <= set("0123456789abcdef")
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_python_candidate_authority_tracks_preapplied_inherited_rework(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    home = tmp_path / "home"
+    candidate = worktree / "src/aiworkhub/new_retained.py"
+    candidate.parent.mkdir(parents=True)
+    home.mkdir()
+    candidate.write_bytes(b"VALUE = 'retained'\n")
+    candidate_hash = worker_workspace._hash_path(candidate)
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="retained-python-authority",
+        repo=tmp_path,
+        path=worktree,
+        home=home,
+        allowed_writes=("src/aiworkhub/new_retained.py",),
+        parent_baseline={"src/aiworkhub/new_retained.py": None},
+        workspace_baseline={"src/aiworkhub/new_retained.py": candidate_hash},
+        tree_baseline={"src/aiworkhub/new_retained.py": candidate_hash},
+        inherited_rework_paths=("src/aiworkhub/new_retained.py",),
+    )
+
+    authority = worker_workspace.python_candidate_authority(workspace)
+
+    assert authority["sources"] == [
+        {
+            "path": "src/aiworkhub/new_retained.py",
+            "state": "added",
+            "bytes_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+        }
+    ]
+    assert len(authority["digest"]) == 64
 
 
 def test_zero_validation_workspace_does_not_seed_worker_package_support(
