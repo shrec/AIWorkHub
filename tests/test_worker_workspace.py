@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -99,6 +100,109 @@ def _workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, requ
         },
         "validation",
     )
+
+
+def _commit_validation_worker_package(repo: Path) -> None:
+    source_package = Path(worker_workspace.__file__).resolve().parent
+    destination_package = repo / "src" / "aiworkhub"
+    destination_package.mkdir(parents=True)
+    for name in (
+        "__init__.py",
+        "_version.py",
+        "platform_io.py",
+        "runtime_temp.py",
+        "validation_runner.py",
+        "worker_workspace.py",
+    ):
+        shutil.copyfile(source_package / name, destination_package / name)
+    (repo / "probe_candidate_import.py").write_text(
+        "from aiworkhub import worker_workspace as w\n"
+        "print(w.__file__)\n"
+        "print(w.NF376_CANDIDATE_SENTINEL)\n",
+        encoding="utf-8",
+    )
+    assert _git(repo, "add", "src/aiworkhub", "probe_candidate_import.py").returncode == 0
+    assert _git(repo, "commit", "-qm", "validation worker package").returncode == 0
+
+
+def test_validation_workspace_seeds_exact_worker_package_support_and_imports_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    _commit_validation_worker_package(repo)
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "validation-worktrees"),
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "candidate-support",
+        {
+            "allowed_writes": ["src/aiworkhub/worker_workspace.py"],
+            "read_first": [
+                "src/aiworkhub/worker_workspace.py",
+                "probe_candidate_import.py",
+            ],
+            "validation": ["PYTHONPATH=src python3 probe_candidate_import.py"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        for relative in worker_workspace._VALIDATION_WORKER_PACKAGE_SUPPORT:
+            candidate = workspace.path / relative
+            assert candidate.is_file()
+            assert not candidate.is_symlink()
+            assert hashlib.sha256(candidate.read_bytes()).digest() == hashlib.sha256(
+                (repo / relative).read_bytes()
+            ).digest()
+
+        candidate_module = workspace.path / "src/aiworkhub/worker_workspace.py"
+        with candidate_module.open("a", encoding="utf-8") as stream:
+            stream.write("\nNF376_CANDIDATE_SENTINEL = 'candidate-worktree'\n")
+
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["PYTHONPATH=src python3 probe_candidate_import.py"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+
+        assert result["returncode"] == 0
+        assert str(candidate_module) in result["stdout_head"]
+        assert "candidate-worktree" in result["stdout_head"]
+        assert worker_workspace.changed_paths(workspace) == [
+            "src/aiworkhub/worker_workspace.py"
+        ]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_zero_validation_workspace_does_not_seed_worker_package_support(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    _commit_validation_worker_package(repo)
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "zero-validation-worktrees"),
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "zero-validation-support",
+        {
+            "allowed_writes": ["src/aiworkhub/worker_workspace.py"],
+            "read_first": ["src/aiworkhub/worker_workspace.py"],
+            "validation": [],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        assert (workspace.path / "src/aiworkhub/worker_workspace.py").is_file()
+        assert not (workspace.path / "src/aiworkhub/__init__.py").exists()
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
 def test_default_workspace_root_is_repo_local_runtime_boundary(

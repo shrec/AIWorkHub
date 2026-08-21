@@ -177,6 +177,13 @@ SANDBOX_AUTHORITY_REPO = "/authority-repo"
 # than being expressed as an offset inside the authority_repo alias.
 SANDBOX_PACKAGE_IMPORT_ROOT = "/aiworkhub-package-root"
 MAX_SEED_FILES = 20_000
+_VALIDATION_WORKER_PACKAGE_SUPPORT = (
+    "src/aiworkhub/__init__.py",
+    "src/aiworkhub/_version.py",
+    "src/aiworkhub/platform_io.py",
+    "src/aiworkhub/runtime_temp.py",
+    "src/aiworkhub/validation_runner.py",
+)
 MAX_REWORK_OVERLAY_FILES = 512
 MAX_REWORK_OVERLAY_CONTENT_BYTES = 8 * 1024 * 1024
 MAX_VALIDATION_COMMANDS = 32
@@ -2079,8 +2086,21 @@ def create_workspace(
     provisioning_timings_ms: dict[str, float] = {}
 
     declared = list(card.get("read_first") or []) + list(card.get("immutable_inputs") or []) + list(allowed)
-    seeded = _expand_declared(repo, declared)
-    seeded = _resolve_local_quoted_includes(repo, seeded)
+    live_seeded = _expand_declared(repo, declared)
+    live_seeded = _resolve_local_quoted_includes(repo, live_seeded)
+    validation_rows = tuple(
+        row
+        for row in (card.get("validation") or [])
+        if isinstance(row, str) and row.strip()
+    )
+    support_seeded: tuple[str, ...] = ()
+    if validation_rows and "src/aiworkhub/worker_workspace.py" in live_seeded:
+        support_seeded = tuple(
+            relative
+            for relative in _VALIDATION_WORKER_PACKAGE_SUPPORT
+            if relative not in live_seeded
+        )
+    seeded = sorted(set(live_seeded) | set(support_seeded))
     # Git ignore rules participate in changed-path truth. Materialize the root
     # rule file and rules in ancestors of declared files without checking out
     # the rest of a potentially multi-gigabyte repository.
@@ -2090,14 +2110,13 @@ def create_workspace(
         while str(parent) not in {"", "."}:
             ignore_candidates.add((parent / ".gitignore").as_posix())
             parent = parent.parent
-    seeded = sorted(
-        set(seeded)
-        | {
+    ignore_seeded = {
             relative
             for relative in ignore_candidates
             if (repo / relative).is_file() and not (repo / relative).is_symlink()
         }
-    )
+    live_seeded = sorted(set(live_seeded) | ignore_seeded)
+    seeded = sorted(set(live_seeded) | set(support_seeded))
 
     try:
         phase_started = time.monotonic()
@@ -2152,11 +2171,22 @@ def create_workspace(
         raise WorkspaceError(f"git_worktree_add_failed:{result.stderr[-1000:]}")
     try:
         phase_started = time.monotonic()
-        for relative in seeded:
+        # Declared inputs intentionally reflect the live parent tree.  The
+        # package support closure is different: leave those paths exactly as
+        # checked out from the detached base commit, so an unrelated dirty
+        # parent file can never become validation authority.
+        for relative in live_seeded:
             destination = path / relative
             _require_beneath(path, destination)
             _require_beneath(repo, repo / relative)
             _copy_one(repo / relative, destination)
+        for relative in support_seeded:
+            support_path = path / relative
+            _require_beneath(path, support_path)
+            if support_path.is_symlink() or not support_path.is_file():
+                raise WorkspaceError(
+                    f"validation_worker_support_missing:{relative}"
+                )
         # Landlock can grant file-specific write rights without exposing the
         # worktree's .git pointer. Precreating exact new outputs makes those
         # file-specific rules possible; unchanged placeholders are filtered by
