@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.33] - 2026-08-21
+
+### Fixed
+
+- Worker launch metadata and rework-delta seals now use the exact task card
+  committed by `claim_start_exact`, with bool-safe epoch and request identity
+  validation instead of the stale pre-claim card.
+- Sparse Python validation workspaces seed the AIWorkHub package anchor for
+  every scoped package file and put candidate `src` bytes ahead of the
+  canonical editable install without allowing a candidate pytest shadow.
+
 ## [0.10.32] - 2026-08-21
 
 ### Fixed

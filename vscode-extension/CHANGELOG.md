@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.33 — 2026-08-21
+
+### Fixed
+
+- Rework launch/sealing uses the committed claim epoch, and sparse Python
+  validation imports candidate package bytes rather than canonical bytes.
+
 ## 0.10.32 — 2026-08-21
 
 ### Fixed

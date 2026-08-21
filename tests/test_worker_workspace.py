@@ -318,6 +318,50 @@ def test_validation_workspace_seeds_exact_worker_package_support_and_imports_can
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+def test_python_validation_imports_new_sparse_candidate_module_without_pythonpath(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    _commit_validation_worker_package(repo)
+    probe = repo / "probe_candidate_import.py"
+    probe.write_text(
+        "from aiworkhub.new_candidate_module import VALUE\nprint(VALUE)\n",
+        encoding="utf-8",
+    )
+    assert _git(repo, "add", "probe_candidate_import.py").returncode == 0
+    assert _git(repo, "commit", "-qm", "new module probe").returncode == 0
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "new-module-worktrees"),
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "new-module-import",
+        {
+            "allowed_writes": ["src/aiworkhub/new_candidate_module.py"],
+            "read_first": ["probe_candidate_import.py"],
+            "validation": ["python3 probe_candidate_import.py"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        assert (workspace.path / "src/aiworkhub/__init__.py").is_file()
+        (workspace.path / "src/aiworkhub/new_candidate_module.py").write_text(
+            "VALUE = 'candidate-new-module'\n", encoding="utf-8"
+        )
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["python3 probe_candidate_import.py"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+        assert result["returncode"] == 0
+        assert "candidate-new-module" in result["stdout_head"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
 def test_python_candidate_authority_tracks_added_modified_and_deleted_paths(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

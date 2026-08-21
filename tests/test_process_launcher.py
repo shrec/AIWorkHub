@@ -71,6 +71,59 @@ def _manager(tmp_path: Path, *, show_task, argv) -> process_launcher.ProcessMana
     )
 
 
+def _claim_receipt(*, epoch: object = 2, request_id: str = "req-claim") -> dict:
+    return {
+        "ok": True,
+        "returncode": 0,
+        "stdout": json.dumps(
+            {
+                "task_id": "TASK-CLAIM",
+                "runner": "runner-claim",
+                "topic": "topic-claim",
+                "launch_request_id": request_id,
+                "claim_epoch": epoch,
+            }
+        ),
+    }
+
+
+def test_committed_claim_card_binds_exact_current_epoch() -> None:
+    card = process_launcher._committed_claim_card(
+        _claim_receipt(),
+        request_id="req-claim",
+        task_id="TASK-CLAIM",
+        runner="runner-claim",
+        topic="topic-claim",
+    )
+    assert card["claim_epoch"] == 2
+    assert card["launch_request_id"] == "req-claim"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ({"epoch": True}, "claim_epoch"),
+        ({"epoch": 0}, "claim_epoch"),
+        ({"request_id": "wrong"}, "launch_request_id"),
+    ],
+)
+def test_committed_claim_card_rejects_tampered_identity(
+    mutation: dict[str, object], reason: str
+) -> None:
+    receipt = _claim_receipt(
+        epoch=mutation.get("epoch", 2),
+        request_id=str(mutation.get("request_id", "req-claim")),
+    )
+    with pytest.raises(process_launcher.LaunchRejected, match=reason):
+        process_launcher._committed_claim_card(
+            receipt,
+            request_id="req-claim",
+            task_id="TASK-CLAIM",
+            runner="runner-claim",
+            topic="topic-claim",
+        )
+
+
 def _open_gates(monkeypatch):
     monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
@@ -2218,7 +2271,20 @@ def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
     monkeypatch.setattr(
         process_launcher.task_engine,
         "claim_start_exact",
-        lambda *a, **k: {"ok": True},
+        lambda *a, **k: {
+            "ok": True,
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    **card,
+                    "task_id": a[1],
+                    "runner": a[2],
+                    "topic": a[3],
+                    "launch_request_id": k["request_id"],
+                    "claim_epoch": 7,
+                }
+            ),
+        },
     )
     finalized = []
     monkeypatch.setattr(

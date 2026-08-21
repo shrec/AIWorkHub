@@ -592,8 +592,14 @@ def test_isolated_launch_claims_and_passes_key_through_sandbox(monkeypatch, tmp_
         assert repo_root == repo
         assert request_id
         calls.append(("claim", task_id, runner, topic))
-        card.update({"status": "processing", "worker_status": "in_progress", "claimed_by": runner})
-        return {"ok": True}
+        card.update({
+            "status": "processing",
+            "worker_status": "in_progress",
+            "claimed_by": runner,
+            "launch_request_id": request_id,
+            "claim_epoch": 1,
+        })
+        return {"ok": True, "returncode": 0, "stdout": json.dumps(card)}
 
     def review(repo_root, task_id, runner, substatus, *, evidence=None):
         assert repo_root == repo

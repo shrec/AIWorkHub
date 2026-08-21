@@ -2976,6 +2976,50 @@ def _changed_path_hashes(
     return hashes
 
 
+def _committed_claim_card(
+    result: Mapping[str, Any],
+    *,
+    request_id: str,
+    task_id: str,
+    runner: str,
+    topic: str,
+) -> dict[str, Any]:
+    """Return the exact task card committed by ``claim_start_exact``."""
+    if not isinstance(result, Mapping):
+        raise LaunchRejected("claim_receipt_invalid:result_not_mapping")
+    if result.get("ok") is not True:
+        raise LaunchRejected("claim_receipt_invalid:claim_not_committed")
+    returncode = result.get("returncode")
+    if type(returncode) is not int or returncode != 0:
+        raise LaunchRejected("claim_receipt_invalid:returncode")
+    raw = result.get("stdout")
+    if not isinstance(raw, str) or not raw.strip():
+        raise LaunchRejected("claim_receipt_invalid:card_missing")
+    try:
+        card = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise LaunchRejected("claim_receipt_invalid:card_malformed") from exc
+    if not isinstance(card, dict):
+        raise LaunchRejected("claim_receipt_invalid:card_not_object")
+    expected = {
+        "task_id": task_id,
+        "runner": runner,
+        "topic": topic,
+        "launch_request_id": request_id,
+    }
+    mismatches = [
+        key for key, value in expected.items() if card.get(key) != value
+    ]
+    if mismatches:
+        raise LaunchRejected(
+            "claim_receipt_invalid:identity_mismatch:" + ",".join(mismatches)
+        )
+    claim_epoch = card.get("claim_epoch")
+    if type(claim_epoch) is not int or claim_epoch < 1:
+        raise LaunchRejected("claim_receipt_invalid:claim_epoch")
+    return card
+
+
 def _terminal_rework_delta_evidence(
     workspace: WorkerWorkspace,
     metadata: Mapping[str, Any],
@@ -5144,6 +5188,13 @@ class ProcessManager:
                         "claim_start_failed:"
                         + str(claim.get("stderr") or claim.get("stdout") or "")[:300]
                     )
+                card = _committed_claim_card(
+                    claim,
+                    request_id=request_id,
+                    task_id=task_id,
+                    runner=runner,
+                    topic=topic,
+                )
                 claimed = True
 
                 metadata = {
@@ -5152,7 +5203,7 @@ class ProcessManager:
                     "task_id": task_id,
                     "runner": runner,
                     "topic": topic,
-                    "claim_epoch": int(card.get("claim_epoch") or 0),
+                    "claim_epoch": card["claim_epoch"],
                     "rework_predecessor": dict(card["rework_predecessor"]),
                     "validation_only_replay_authorization": authorization,
                     "execution_mode": "validation_only_replay",
@@ -6812,6 +6863,13 @@ class ProcessManager:
                     raise LaunchRejected(
                         "claim_start_failed:" + str(claim.get("stderr") or claim.get("stdout") or "")[:300]
                     )
+                card = _committed_claim_card(
+                    claim,
+                    request_id=request_id,
+                    task_id=task_id,
+                    runner=runner,
+                    topic=topic,
+                )
                 claimed = True
 
                 prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -6822,7 +6880,7 @@ class ProcessManager:
                     "task_id": task_id,
                     "runner": runner,
                     "topic": topic,
-                    "claim_epoch": int(card.get("claim_epoch") or 0),
+                    "claim_epoch": card["claim_epoch"],
                     "rework_predecessor": (
                         dict(card["rework_predecessor"])
                         if isinstance(card.get("rework_predecessor"), dict)

@@ -181,8 +181,10 @@ def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]
             "status": "processing",
             "worker_status": "in_progress",
             "claimed_by": runner,
+            "launch_request_id": request_id,
+            "claim_epoch": 1,
         })
-        return {"ok": True}
+        return {"ok": True, "returncode": 0, "stdout": json.dumps(card)}
 
     def review(repo_root, task_id: str, runner: str, substatus: str, *, evidence=None) -> dict:
         calls.append(("review", task_id, runner, substatus))

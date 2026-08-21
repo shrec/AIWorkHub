@@ -35,6 +35,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -288,7 +289,15 @@ class DashboardSnapshotTests(unittest.TestCase):
             root = _make_legacy_fixture(Path(tmp))
             task_store.initialize_repository(root)
             provider = dashboard.DashboardProvider(repo_root=root)
-            snapshot = dashboard.build_snapshot(provider)
+            # Storage sizing is intentionally asynchronous. Keep this authority
+            # test independent from its daemon thread so the temporary repository
+            # cannot be removed while telemetry is still persisting its cache.
+            with patch.object(
+                dashboard.storage_observability,
+                "snapshot",
+                return_value={"schema_version": 1, "readonly": True},
+            ):
+                snapshot = dashboard.build_snapshot(provider)
             self.assertTrue(snapshot["storage"]["ready"])
             for status in dashboard.ALL_CANONICAL_STATUSES:
                 self.assertEqual(snapshot["status_counts"][status], 0)

@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.33
+
+- Rework claims now bind launch and terminal evidence to the exact committed
+  claim epoch instead of a stale pre-claim snapshot.
+- Sparse Python candidates validate against their own package bytes, including
+  newly created modules, without shadowing the trusted pytest runtime.
+
 ## What's new in 0.10.32
 
 - Retained-workspace quarantine validates canonical request IDs before creating

@@ -2329,7 +2329,9 @@ def create_workspace(
         if isinstance(row, str) and row.strip()
     )
     support_seeded: tuple[str, ...] = ()
-    if validation_rows and "src/aiworkhub/worker_workspace.py" in live_seeded:
+    if validation_rows and any(
+        relative.startswith("src/aiworkhub/") for relative in live_seeded
+    ):
         support_seeded = tuple(
             relative
             for relative in _VALIDATION_WORKER_PACKAGE_SUPPORT
@@ -5612,6 +5614,29 @@ def resolve_validation_pythonpath(
     return os.pathsep.join(resolved)
 
 
+def _candidate_pythonpath_components(
+    workspace: WorkerWorkspace, components: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Prepend the verified sparse candidate package root to Python imports."""
+    candidate_src = workspace.path / "src"
+    if not candidate_src.exists():
+        return components
+    if "src" in components:
+        return components
+    if candidate_src.is_symlink() or not candidate_src.is_dir():
+        raise WorkspaceError("python_candidate_import_root_invalid:src")
+    if _require_beneath(workspace.path, candidate_src) != candidate_src:
+        raise WorkspaceError("python_candidate_import_root_mismatch:src")
+    package_init = candidate_src / "aiworkhub" / "__init__.py"
+    if not (candidate_src / "aiworkhub").exists():
+        return components
+    if package_init.is_symlink() or not package_init.is_file():
+        raise WorkspaceError("python_candidate_package_anchor_missing:src/aiworkhub")
+    if (candidate_src / "pytest.py").exists() or (candidate_src / "pytest").exists():
+        raise WorkspaceError("python_candidate_pytest_shadow_forbidden")
+    return ("src", *components)
+
+
 def _resolve_validation_cwd(workspace: WorkerWorkspace, relative: str) -> str:
     """Fail-closed resolution of a ``cd`` prefix's target against the real
     workspace filesystem: rejects a symlinked path component or escape
@@ -5635,6 +5660,10 @@ def _is_pytest_validation_command(argv: list[str]) -> bool:
     if head == "pytest":
         return True
     return len(argv) >= 3 and head.startswith("python") and argv[1] == "-m" and argv[2] == "pytest"
+
+
+def _is_python_validation_command(argv: list[str]) -> bool:
+    return bool(argv) and Path(argv[0]).name.startswith("python")
 
 
 def _normalize_pytest_validation_argv(argv: list[str]) -> list[str]:
@@ -6232,6 +6261,10 @@ def run_validations(
                 pytest_root = resolve_trusted_pytest_runtime_root()
                 effective_components = (str(pytest_root),) + pythonpath_components
                 tokens = _normalize_pytest_validation_argv(tokens)
+            if _is_python_validation_command(tokens):
+                effective_components = _candidate_pythonpath_components(
+                    workspace, effective_components
+                )
             tokens, validation_executable_roots = (
                 _normalize_trusted_validation_executable_argv_with_roots(
                     tokens, workspace.repo
