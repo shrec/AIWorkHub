@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.39] - 2026-08-21
+
+### Fixed
+
+- Kilo's exact JSONL final-text event is now recognized as meaningful
+  read-only research output. Successful Grok workers no longer end in a false
+  `research_result_missing` validation failure, while tool chatter, reasoning,
+  malformed envelopes and arbitrary nested prose remain fail-closed.
+
 ## [0.10.38] - 2026-08-21
 
 ### Added

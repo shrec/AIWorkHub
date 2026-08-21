@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.39 — 2026-08-21
+
+### Fixed
+
+- Grok/Kilo read-only workers now reach review when their final result is
+  emitted through Kilo's structured JSONL text-part envelope.
+
 ## 0.10.38 — 2026-08-21
 
 ### Added

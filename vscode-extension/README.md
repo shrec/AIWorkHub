@@ -12,6 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.39
+
+- Grok/Kilo read-only results now finalize correctly from the exact structured
+  JSONL text envelope instead of being misclassified as missing output.
+
 ## What's new in 0.10.38
 
 - Grok 4.6 is available through the authenticated Kilo/xAI subscription route
