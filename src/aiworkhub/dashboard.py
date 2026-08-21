@@ -45,6 +45,7 @@ DEFAULT_TASK_LIMIT = 500
 DEFAULT_PROCESS_LIMIT = 200
 DEFAULT_SNAPSHOT_PROCESS_LIMIT = 50
 DEFAULT_KPI_HISTORY_PROCESS_LIMIT = 1000
+TASK_CARD_SNAPSHOT_LIMIT = 5000
 MAX_PROCESS_LOG_BYTES = 4 * 1024 * 1024
 MAX_KPI_HISTORY_LOG_BYTES = 16 * 1024 * 1024
 # Informational observability boundary, not an inactivity or policy verdict.
@@ -1720,7 +1721,12 @@ class DashboardProvider:
     def _task_cards(self) -> tuple[dict[str, Any], ...]:
         return self._snapshot_once(
             "task_cards",
-            lambda: tuple(task_store.list_task_cards(self.repo_root, limit=5000)),
+            lambda: tuple(
+                task_store.list_task_cards(
+                    self.repo_root,
+                    limit=TASK_CARD_SNAPSHOT_LIMIT,
+                )
+            ),
         )
 
     def _cost_ledger(self) -> dict[str, Any]:
@@ -1828,6 +1834,17 @@ class DashboardProvider:
     def get_manager_decision_counts(self) -> dict[str, int]:
         """Exact explicit accept/reject totals from canonical task events."""
         return task_store.manager_decision_counts(self.repo_root)
+
+    def get_needfix_snapshot(self) -> dict[str, Any]:
+        """NeedFix view derived from this dashboard snapshot's task cards."""
+        task_cards = self._task_cards()
+        return _build_needfix_snapshot(
+            self.repo_root,
+            task_cards_snapshot=task_cards,
+            task_cards_snapshot_complete=(
+                len(task_cards) < TASK_CARD_SNAPSHOT_LIMIT
+            ),
+        )
 
     def get_adapter_readiness(self) -> dict[str, Any]:
         """Read-only worker-adapter readiness (never exposes any secret)."""
@@ -2287,6 +2304,11 @@ def build_snapshot(
         lambda: {"bound_task_count": 0, "unbound_task_count": 0, "by_state": {}},
     )
     plan_reader = getattr(data_provider, "get_task_plan", lambda: {})
+    needfix_reader = getattr(
+        data_provider,
+        "get_needfix_snapshot",
+        partial(_build_needfix_snapshot, provider_root or _default_repo_root()),
+    )
     resolved_root = Path(provider_root or _default_repo_root()).resolve()
 
     read_operations: dict[str, tuple[str, Callable[[], Any], Any]] = {
@@ -2324,7 +2346,7 @@ def build_snapshot(
         ),
         "needfix": (
             "needfix",
-            partial(_build_needfix_snapshot, provider_root or _default_repo_root()),
+            needfix_reader,
             _needfix_unavailable(),
         ),
         "roadmap": ("roadmap", _build_roadmap_snapshot, _roadmap_unavailable()),
@@ -2636,7 +2658,12 @@ def _needfix_unavailable() -> dict[str, Any]:
     }
 
 
-def _build_needfix_snapshot(repo_root: Path) -> dict[str, Any]:
+def _build_needfix_snapshot(
+    repo_root: Path,
+    *,
+    task_cards_snapshot: tuple[dict[str, Any], ...] | None = None,
+    task_cards_snapshot_complete: bool = False,
+) -> dict[str, Any]:
     """Build a bounded NeedFix snapshot from the canonical store.
 
     Routes through ``needfix_ingest.list_active`` -- the derived-by-default
@@ -2654,6 +2681,8 @@ def _build_needfix_snapshot(repo_root: Path) -> dict[str, Any]:
     try:
         report = needfix_ingest.list_active(
             repo_root,
+            task_cards_snapshot=task_cards_snapshot,
+            task_cards_snapshot_complete=task_cards_snapshot_complete,
             include_archived=False,
             limit=NEEDFIX_SNAPSHOT_LIMIT,
             order_by="created_at",

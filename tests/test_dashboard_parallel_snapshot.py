@@ -57,6 +57,7 @@ def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tm
                 "cost": ("cost", provider.get_cost_ledger, {}),
                 "workforce": ("workforce", provider.get_workforce_catalog, {}),
                 "preflight": ("preflight", provider.get_environment_preflight, {}),
+                "needfix": ("needfix", provider.get_needfix_snapshot, {}),
                 "plan": ("plan", provider.get_task_plan, {}),
                 "collision": ("collision", provider.get_collision_report, {}),
             },
@@ -75,7 +76,9 @@ def test_dashboard_provider_singleflights_shared_snapshot_inputs(monkeypatch, tm
     provider.get_task_plan()
     provider.get_environment_preflight()
     provider.get_environment_preflight()
-    assert calls["cards"] == 3
+    provider.get_needfix_snapshot()
+    provider.get_needfix_snapshot()
+    assert calls["cards"] == 5
     assert calls["preflight"] == 3
 
 

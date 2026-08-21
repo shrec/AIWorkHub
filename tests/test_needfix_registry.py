@@ -1994,3 +1994,51 @@ class TestActiveListingProductionWiring:
         # records are derived closed; the point lookup count must still be zero.
         assert report["count"] == len(report["items"]) == 0
         assert calls == {"list": 1, "get": 0}
+
+    def test_active_listing_reuses_caller_task_snapshot(
+        self, tmp_path: Path, monkeypatch
+    ):
+        task_store.initialize_repository(tmp_path)
+        self._insert_task(tmp_path, "T-fin", "finished")
+        self._link(tmp_path, "landed", "T-fin")
+        task_cards = tuple(task_store.list_task_cards(tmp_path, limit=5000))
+
+        def unexpected_list(*_args, **_kwargs):
+            raise AssertionError("caller snapshot must avoid a second card query")
+
+        def unexpected_get(*_args, **_kwargs):
+            raise AssertionError("complete snapshot must prove task absence")
+
+        monkeypatch.setattr(task_store, "list_task_cards", unexpected_list)
+        monkeypatch.setattr(task_store, "get_task", unexpected_get)
+        report = needfix_ingest.list_active(
+            tmp_path,
+            task_cards_snapshot=task_cards,
+            task_cards_snapshot_complete=True,
+        )
+
+        assert report["derived"] is True
+        assert report["count"] == 0
+
+    def test_partial_caller_snapshot_keeps_point_lookup_fallback(
+        self, tmp_path: Path, monkeypatch
+    ):
+        task_store.initialize_repository(tmp_path)
+        self._insert_task(tmp_path, "T-fin", "finished")
+        self._link(tmp_path, "landed", "T-fin")
+        original_get = task_store.get_task
+        calls = {"get": 0}
+
+        def counted_get(*args, **kwargs):
+            calls["get"] += 1
+            return original_get(*args, **kwargs)
+
+        monkeypatch.setattr(task_store, "get_task", counted_get)
+        report = needfix_ingest.list_active(
+            tmp_path,
+            task_cards_snapshot=(),
+            task_cards_snapshot_complete=False,
+        )
+
+        assert report["count"] == 0
+        assert calls["get"] >= 1

@@ -424,7 +424,12 @@ def commit(
 _RECONCILE_CARD_SCAN_LIMIT: int = 5000
 
 
-def _resolve_active_state_hooks(repo: Path):
+def _resolve_active_state_hooks(
+    repo: Path,
+    *,
+    task_cards_snapshot: Sequence[Mapping[str, Any]] | None = None,
+    task_cards_snapshot_complete: bool = False,
+):
     """Bind the canonical task-store read hooks for read-time active derivation.
 
     Returns ``(get_task_fn, canonical_status_fn, list_task_cards_fn,
@@ -436,7 +441,8 @@ def _resolve_active_state_hooks(repo: Path):
     by default. ``list_task_cards_fn`` powers the explicit-reference link route
     for directly created merge/multi-finding cards; it is bounded (see
     ``_RECONCILE_CARD_SCAN_LIMIT``) because it runs on the read an operator
-    waits on.
+    waits on. A caller may supply the exact cards already read for the same
+    bounded snapshot; only an explicit complete flag may prove an absent id.
     """
     from . import task_store  # lazy: no import-time cost, no import cycle
 
@@ -449,15 +455,21 @@ def _resolve_active_state_hooks(repo: Path):
     if not ready:
         return None, None, None, f"task_store_not_ready:{reason}"
 
-    task_cards: list[dict[str, Any]] | None = None
-    task_by_id: dict[str, dict[str, Any]] = {}
+    task_cards: Sequence[Mapping[str, Any]] | None = task_cards_snapshot
+    task_cards_complete = bool(task_cards_snapshot_complete)
+    task_by_id: dict[str, Mapping[str, Any]] = {
+        str(card.get("task_id") or ""): card
+        for card in task_cards or ()
+        if card.get("task_id")
+    }
 
-    def load_task_cards() -> list[dict[str, Any]]:
-        nonlocal task_cards, task_by_id
+    def load_task_cards() -> Sequence[Mapping[str, Any]]:
+        nonlocal task_cards, task_by_id, task_cards_complete
         if task_cards is None:
             task_cards = task_store.list_task_cards(
                 repo, limit=_RECONCILE_CARD_SCAN_LIMIT
             )
+            task_cards_complete = len(task_cards) < _RECONCILE_CARD_SCAN_LIMIT
             task_by_id = {
                 str(card.get("task_id") or ""): card
                 for card in task_cards
@@ -469,8 +481,10 @@ def _resolve_active_state_hooks(repo: Path):
         load_task_cards()
         if task_id in task_by_id:
             return task_by_id[task_id]
-        # The bounded snapshot deliberately cannot prove absence beyond its
-        # limit. Preserve exact behavior with one point lookup for that case.
+        if task_cards_complete:
+            return None
+        # A capped or caller-declared partial snapshot cannot prove absence.
+        # Preserve exact behavior with one point lookup for that case.
         return task_store.get_task(repo, task_id)
 
     def list_task_cards_fn():
@@ -524,6 +538,8 @@ def _reconcile_links_on_read(
 def list_active(
     repo_root: str | Path,
     *,
+    task_cards_snapshot: Sequence[Mapping[str, Any]] | None = None,
+    task_cards_snapshot_complete: bool = False,
     include_archived: bool = False,
     limit: int = needfix_store.DEFAULT_LIST_LIMIT,
     offset: int = 0,
@@ -539,6 +555,10 @@ def list_active(
     total (independent of pagination) and agrees with :func:`count_active` under
     every filter, ``include_archived`` included.
 
+    ``task_cards_snapshot`` is an optional same-read-set optimization. It never
+    proves absence unless ``task_cards_snapshot_complete`` is explicitly true;
+    standalone callers therefore preserve the canonical point-lookup fallback.
+
     When the repository has no ready canonical task store the linked-card state
     cannot be resolved; the report is marked ``derived=False`` with a bounded
     ``underived_reason`` and carries the raw (non-derived) rows rather than
@@ -546,7 +566,11 @@ def list_active(
     """
     repo = Path(repo_root).resolve()
     get_task_fn, canonical_status_fn, list_task_cards_fn, underived_reason = (
-        _resolve_active_state_hooks(repo)
+        _resolve_active_state_hooks(
+            repo,
+            task_cards_snapshot=task_cards_snapshot,
+            task_cards_snapshot_complete=task_cards_snapshot_complete,
+        )
     )
     if underived_reason is not None:
         rows = needfix_store.list_needfix(

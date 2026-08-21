@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.18
+
+- Dashboard NeedFix derivation shares the refresh's task-card snapshot and
+  avoids redundant repository lookups when that bounded snapshot is complete.
+  Canonical full-snapshot median is now about 1.20 seconds, while later
+  refreshes and standalone NeedFix calls still read fresh state.
+
 ## What's new in 0.10.17
 
 - Dashboard review-decision metrics now use a measured set-based SQLite query,

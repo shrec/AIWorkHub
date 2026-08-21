@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.18] - 2026-08-21
+
+### Performance
+
+- Dashboard NeedFix derivation now reuses the exact task-card projection
+  already loaded for the same bounded refresh instead of querying and decoding
+  up to 5,000 cards a second time.
+- A complete, under-limit task-card snapshot now proves that a linked task is
+  absent without dozens of repository-routed point lookups. Capped or
+  caller-declared partial snapshots retain the canonical lookup fallback.
+- The canonical full dashboard snapshot measured about 1.20 seconds median,
+  down from 1.54 seconds in 0.10.17, with standalone NeedFix reads remaining
+  fresh and derived by default.
+
 ## [0.10.17] - 2026-08-21
 
 ### Performance

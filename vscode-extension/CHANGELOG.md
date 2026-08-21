@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.18 — 2026-08-21
+
+### Performance
+
+- NeedFix, Plan, Workforce and Collision now share one bounded task-card
+  projection during a dashboard refresh. Complete snapshots also avoid
+  redundant point lookups for historical links to absent tasks, while partial
+  snapshots preserve fail-safe canonical fallback behavior.
+
 ## 0.10.17 — 2026-08-21
 
 ### Performance
