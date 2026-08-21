@@ -78,6 +78,46 @@ def _open_gates(monkeypatch):
     # adapter command. Keep them independent of whether the CI host has a
     # first-party Claude subscription; auth failure/ready behavior has its own
     # focused tests in test_claude_vscode_lm_preference.py.
+
+
+def test_request_events_cache_is_request_scoped_and_invalidates_on_append(
+    tmp_path,
+    monkeypatch,
+):
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="processing")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    first_id = "1" * 32
+    second_id = "2" * 32
+    manager._append_event({"request_id": first_id, "state": "running"})
+    manager._append_event({"request_id": second_id, "state": "running"})
+
+    scans = 0
+    original_events = manager._events
+
+    def counted_events():
+        nonlocal scans
+        scans += 1
+        return original_events()
+
+    monkeypatch.setattr(manager, "_events", counted_events)
+
+    assert manager._request_events(first_id)[-1]["state"] == "running"
+    assert manager._request_events(first_id)[-1]["state"] == "running"
+    assert scans == 1
+
+    # A new request must never reuse another request's empty projection merely
+    # because the durable ledger fingerprint is unchanged.
+    assert manager._request_events(second_id)[-1]["state"] == "running"
+    assert manager._request_events(second_id)[-1]["request_id"] == second_id
+    assert manager._request_events(first_id)[-1]["request_id"] == first_id
+    assert scans == 2
+
+    manager._append_event({"request_id": first_id, "state": "review_ready"})
+    assert manager._request_events(first_id)[-1]["state"] == "review_ready"
+    assert scans == 3
     monkeypatch.setattr(
         process_launcher.claude_auth,
         "auth_status",

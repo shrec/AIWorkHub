@@ -7962,8 +7962,64 @@ class ProcessManager:
             return evidence_levels.EvidenceLevel.TESTED
         return evidence_levels.EvidenceLevel.STATIC_EVIDENCE
 
+    _REQUEST_EVENT_CACHE_LIMIT = 64
+
     def _request_events(self, request_id: str) -> list[dict[str, Any]]:
-        return [event for event in self._events() if event.get("request_id") == request_id]
+        """Return exact request history without replaying an unchanged ledger.
+
+        The worker-tool bridge asks for the same active request on every tool
+        turn.  Cache only that request-scoped projection and trust it only while
+        every authoritative ledger segment has the same filesystem identity and
+        byte length.  New requests are scanned once even when the ledger itself
+        is unchanged; an append, rotation, truncation, rewrite, or replacement
+        invalidates all projections.
+        """
+        cache = getattr(self, "_request_event_cache", None)
+        if cache is None or cache["path"] != self.process_log_path:
+            cache = {
+                "path": self.process_log_path,
+                "lock": threading.Lock(),
+                "fingerprint": None,
+                "requests": {},
+            }
+            self._request_event_cache = cache
+        with cache["lock"]:
+            fingerprint = self._event_ledger_fingerprint()
+            if fingerprint != cache["fingerprint"]:
+                cache["fingerprint"] = fingerprint
+                cache["requests"].clear()
+            requests = cache["requests"]
+            if request_id not in requests:
+                requests[request_id] = [
+                    event
+                    for event in self._events()
+                    if event.get("request_id") == request_id
+                ]
+            events = requests.pop(request_id)
+            requests[request_id] = events
+            while len(requests) > self._REQUEST_EVENT_CACHE_LIMIT:
+                requests.pop(next(iter(requests)))
+            return [dict(event) for event in events]
+
+    def _event_ledger_fingerprint(self) -> tuple[Any, ...]:
+        """Bounded metadata fingerprint for all durable ledger segments."""
+        marks: list[tuple[Any, ...]] = []
+        for segment in process_event_ledger.ledger_paths(self.process_log_path):
+            try:
+                info = segment.lstat()
+            except OSError:
+                return (("unreadable", str(segment)),)
+            if not stat.S_ISREG(info.st_mode):
+                return (("non_regular", str(segment)),)
+            marks.append((
+                segment.name,
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            ))
+        return tuple(marks)
 
     @staticmethod
     def _metadata_from_events(events: list[dict[str, Any]]) -> Path | None:
