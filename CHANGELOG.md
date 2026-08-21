@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.37] - 2026-08-21
+
+### Fixed
+
+- Authenticated, fresh Source Graph calls against a request-scoped rework
+  worktree now satisfy the live code-task gate instead of being misclassified
+  as injected-only context and forcing a false `validation_failed` loop.
+
 ## [0.10.36] - 2026-08-21
 
 ### Fixed

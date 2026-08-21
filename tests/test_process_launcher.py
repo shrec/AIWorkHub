@@ -3271,6 +3271,37 @@ def test_rework_overlay_counts_as_live_source_graph_call(tmp_path: Path) -> None
     )
 
 
+def test_rework_worktree_overlay_counts_as_live_source_graph_call(
+    tmp_path: Path,
+) -> None:
+    """The worker query surface relabels an applied predecessor overlay as
+    request_scoped_worktree; that authenticated authority is live too."""
+    key = os.urandom(32)
+    key_path = tmp_path / "audit.key"
+    key_path.write_bytes(key)
+
+    entry = _rework_entry(authority_state="request_scoped_worktree")
+    ledger_path = tmp_path / "audit.jsonl"
+    ledger_path.write_text(_sign_entry(entry, key), encoding="utf-8")
+
+    result = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger_path,
+        key_path,
+        task_id="TASK_NF129",
+        runner="test_runner",
+        topic="nf129_topic",
+        request_id="req-nf129",
+    )
+    assert result["ok"] is True
+    assert result["entries_verified"] == 1
+    assert result["live_source_graph_calls"] == 1
+    assert result["fresh_source_graph_calls"] == 1
+    assert (
+        "source_graph:rework_overlay:request_scoped_worktree:/test/repo"
+        in result["authority_index_identity"]
+    )
+
+
 def test_rework_overlay_rejected_with_wrong_hmac(tmp_path: Path) -> None:
     """A rework_overlay entry with a tampered/forged HMAC must be dropped,
     not counted as live."""

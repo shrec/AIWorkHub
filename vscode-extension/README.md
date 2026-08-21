@@ -12,6 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.37
+
+- Rework tasks now preserve authenticated Source Graph authority when the
+  predecessor overlay is materialized in the request-scoped worktree.
+
 ## What's new in 0.10.36
 
 - Release validation safely admits the active interpreter's exact pytest

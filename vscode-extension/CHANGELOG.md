@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.37 — 2026-08-21
+
+### Fixed
+
+- Rework-overlay Source Graph receipts from the active request worktree now
+  count as authenticated live calls, preventing false validation failures.
+
 ## 0.10.36 — 2026-08-21
 
 ### Fixed

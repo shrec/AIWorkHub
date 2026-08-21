@@ -1880,7 +1880,8 @@ def verify_audit_ledger(
             and authority_state == "quality_review_readonly"
         ) or (
             authority_source == "rework_overlay"
-            and authority_state == "request_scoped_predecessor"
+            and authority_state
+            in {"request_scoped_predecessor", "request_scoped_worktree"}
         )
         # A fresh call is real tool-use telemetry even when its bounded query
         # returns zero rows.  Result usefulness is reported independently by
