@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.24 — 2026-08-21
+
+### Added
+
+- Repository Settings exposes provider/model enablement controls that directly
+  gate workforce routing for the active repository.
+- A Context Graph header card reports durable manager query usage and graph
+  size without adding a separate dashboard round trip.
+
 ## 0.10.23 — 2026-08-21
 
 ### Fixed

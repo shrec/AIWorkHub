@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.24] - 2026-08-21
+
+### Added
+
+- Repository Settings now includes a Models tab with provider and exact-model
+  switches stored in `.aiworkhub/config/models.json`. Provider and adapter
+  disables are hard gates, and workforce ranking cannot select a disabled
+  route.
+- The dashboard header now reports durable Manager Context Graph query calls,
+  hits and returned bytes alongside graph event/node counts.
+
+### Fixed
+
+- Model-policy updates use revision compare-and-swap under a cross-process
+  advisory lock, preventing concurrent VS Code windows from losing changes.
+
 ## [0.10.23] - 2026-08-21
 
 ### Fixed
