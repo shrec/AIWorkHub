@@ -41,6 +41,7 @@ __all__ = [
     "KiloAuthSourceError",
     "MAX_SOURCE_BYTES",
     "PROVIDER_ID",
+    "auth_status",
     "project_xai_auth",
     "resolve_kilo_auth_source",
 ]
@@ -336,3 +337,40 @@ def resolve_kilo_auth_source(
                 "XDG data home must be an absolute normalized path"
             )
     return data_root / "kilo" / AUTH_FILENAME
+
+
+def auth_status(
+    *,
+    home: StrPath,
+    xdg_data_home: StrPath | None = None,
+    platform_name: str = "posix",
+) -> dict[str, object]:
+    """Return bounded, secret-free xAI credential readiness for Kilo."""
+
+    try:
+        source = resolve_kilo_auth_source(
+            home=home,
+            xdg_data_home=xdg_data_home,
+            platform_name=platform_name,
+        )
+        raw = _read_source_bytes(source)
+        _extract_xai_record(source, raw)
+    except KiloAuthError as exc:
+        return {
+            "launchable": False,
+            "authenticated": False,
+            "credential_present": False,
+            "access_observed": True,
+            "quota_observed": False,
+            "quota_state": "unavailable_from_provider_api",
+            "blocker_reason": f"grok_kilo_auth_unavailable:{exc.reason}",
+        }
+    return {
+        "launchable": True,
+        "authenticated": True,
+        "credential_present": True,
+        "access_observed": True,
+        "quota_observed": False,
+        "quota_state": "unavailable_from_provider_api",
+        "blocker_reason": "",
+    }

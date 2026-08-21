@@ -23,6 +23,7 @@ from aiworkhub.kilo_auth import (  # noqa: E402
     KiloAuthProviderMissing,
     KiloAuthSourceError,
     MAX_SOURCE_BYTES,
+    auth_status,
     project_xai_auth,
     resolve_kilo_auth_source,
 )
@@ -331,3 +332,37 @@ def test_failures_never_echo_secret_material(tmp_path):
 
     assert XAI_ACCESS_TOKEN not in str(excinfo.value)
     assert excinfo.value.reason == "source is not valid JSON"
+
+
+def test_auth_status_is_secret_free_and_matches_projection_source(tmp_path):
+    data_home = tmp_path / "data"
+    source = data_home / "kilo" / "auth.json"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        json.dumps({"xai": {"type": "oauth", "refresh": XAI_REFRESH_TOKEN}}),
+        encoding="utf-8",
+    )
+
+    status = auth_status(home=tmp_path, xdg_data_home=data_home)
+
+    assert status["launchable"] is True
+    assert status["authenticated"] is True
+    assert status["quota_observed"] is False
+    serialized = json.dumps(status, sort_keys=True)
+    assert XAI_REFRESH_TOKEN not in serialized
+    assert str(source) not in serialized
+
+
+def test_auth_status_names_missing_xai_without_leaking_source(tmp_path):
+    data_home = tmp_path / "data"
+    source = data_home / "kilo" / "auth.json"
+    source.parent.mkdir(parents=True)
+    source.write_text(json.dumps({"other": {"token": "hidden"}}), encoding="utf-8")
+
+    status = auth_status(home=tmp_path, xdg_data_home=data_home)
+
+    assert status["launchable"] is False
+    assert status["blocker_reason"] == (
+        "grok_kilo_auth_unavailable:source has no xai provider record"
+    )
+    assert str(source) not in json.dumps(status, sort_keys=True)

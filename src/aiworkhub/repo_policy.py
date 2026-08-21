@@ -19,6 +19,7 @@ from typing import Any, Mapping
 
 from . import (
     claude_auth,
+    kilo_auth,
     model_settings,
     quality_evidence,
     runtime_adapters,
@@ -68,6 +69,9 @@ DEFAULT_POLICY: dict[str, Any] = {
         "worktree_max_bytes": 5 * 1024 * 1024 * 1024,
     },
 }
+_PRE_GROK_LOCAL_ADAPTERS = frozenset(
+    set(runtime_adapters.LOCAL_ADAPTERS) - {runtime_adapters.GROK_KILO_ADAPTER}
+)
 
 
 class RepoPolicyError(RuntimeError):
@@ -179,7 +183,20 @@ def load_policy(repo_root: Path | str) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RepoPolicyError(f"policy_invalid_json:{type(exc).__name__}") from exc
-    return {**validate_policy(value), "configured": True}
+    policy = validate_policy(value)
+    allowed = list(policy["providers"]["allowed_adapters"])
+    if (
+        runtime_adapters.GROK_KILO_ADAPTER not in allowed
+        and _PRE_GROK_LOCAL_ADAPTERS.issubset(allowed)
+    ):
+        # Backward-compatible built-in migration: repositories that allowed
+        # every pre-Grok route receive the new route.  A repository that
+        # deliberately omitted any legacy route remains untouched/fail-closed.
+        policy["providers"]["allowed_adapters"] = [
+            name for name in runtime_adapters.LOCAL_ADAPTERS
+            if name in allowed or name == runtime_adapters.GROK_KILO_ADAPTER
+        ]
+    return {**policy, "configured": True}
 
 
 def ensure_policy(repo_root: Path | str) -> tuple[Path, bool]:
@@ -354,6 +371,12 @@ def _provider_status(
             )
         elif adapter_id == "claude_cli":
             readiness = claude_auth.auth_status(resolution.executable)
+        elif adapter_id == runtime_adapters.GROK_KILO_ADAPTER:
+            readiness = kilo_auth.auth_status(
+                home=Path.home(),
+                xdg_data_home=os.environ.get("XDG_DATA_HOME") or None,
+                platform_name=os.name,
+            )
     except (OSError, RuntimeError, ValueError):
         readiness = None
     if isinstance(readiness, Mapping):
@@ -855,6 +878,7 @@ _ROUTE_FAMILY_EDITOR = "editor_hosted_vscode_lm"
 _ROUTE_FAMILY_COPILOT = "copilot_byok_cli"
 _ROUTE_FAMILY_CLAUDE = "claude_cli"
 _ROUTE_FAMILY_CODEX = "codex_cli"
+_ROUTE_FAMILY_KILO = "kilo_xai_cli"
 _ROUTE_FAMILY_UNKNOWN = "unknown"
 
 _QUOTA_UNOBSERVABLE_REASON_BY_FAMILY: Mapping[str, str] = {
@@ -868,6 +892,9 @@ _QUOTA_UNOBSERVABLE_REASON_BY_FAMILY: Mapping[str, str] = {
         "claude_cli_exposes_subscription_auth_not_metered_token_quota"
     ),
     _ROUTE_FAMILY_CODEX: "codex_cli_exposes_no_quota_endpoint_to_this_host",
+    _ROUTE_FAMILY_KILO: (
+        "kilo_xai_subscription_exposes_local_auth_not_provider_side_quota"
+    ),
     _ROUTE_FAMILY_UNKNOWN: "adapter_family_unknown_quota_observability_undetermined",
 }
 
@@ -884,6 +911,8 @@ def _adapter_route_family(adapter_id: str) -> str:
         return _ROUTE_FAMILY_CLAUDE
     if adapter_id == "codex_cli":
         return _ROUTE_FAMILY_CODEX
+    if adapter_id == runtime_adapters.GROK_KILO_ADAPTER:
+        return _ROUTE_FAMILY_KILO
     return _ROUTE_FAMILY_UNKNOWN
 
 
@@ -1011,6 +1040,20 @@ def describe_provider_observability(
                 or status.get("launchable")
             )
             observable_signals.append("subscription_auth_state")
+    elif family == _ROUTE_FAMILY_KILO and installed:
+        status = kilo_auth.auth_status(
+            home=Path.home(),
+            xdg_data_home=os.environ.get("XDG_DATA_HOME") or None,
+            platform_name=os.name,
+        )
+        access_observed = bool(status.get("authenticated"))
+        reachable = bool(status.get("launchable"))
+        observable_signals.extend(
+            ["xai_auth_record_presence", "subscription_auth_state"]
+        )
+        reachability_evidence = (
+            f"{install_evidence}:xai_auth_present={access_observed}"
+        )[:200]
 
     return {
         "schema_id": PROVIDER_OBSERVABILITY_SCHEMA_ID,

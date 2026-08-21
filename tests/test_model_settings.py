@@ -17,6 +17,13 @@ if str(_SRC) not in sys.path:
 from aiworkhub import model_settings, task_store  # noqa: E402
 
 
+def test_grok_kilo_has_repository_local_xai_policy_identity() -> None:
+    assert model_settings.policy_identity_for_adapter("grok_kilo_cli") == (
+        "xai",
+        "grok_kilo_cli",
+    )
+
+
 def _repo(tmp_path: Path, name: str) -> Path:
     root = tmp_path / name
     root.mkdir()

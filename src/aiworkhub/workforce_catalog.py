@@ -45,6 +45,7 @@ AUDIT_RELATIVE_PATH = Path(".aiworkhub/config/workforce.audit.jsonl")
 MAX_CATALOG_BYTES = 256 * 1024
 MAX_WORKERS = 64
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,127}$")
 ROUTE_CIRCUIT_COOLDOWN_SECONDS = 600.0
 ROUTE_CIRCUIT_LOOKBACK_SECONDS = 86_400.0
 ROUTE_CIRCUIT_TRANSIENT_THRESHOLD = 2
@@ -78,6 +79,7 @@ def execution_runner(worker_id: str, adapter_id: str) -> str:
         "deepseek_manual": "deepseek",
         "glm_vscode_lm": "glm",
         "glm_copilot_cli": "glm",
+        "grok_kilo_cli": "grok",
         "vscode_lm": "copilot",
     }.get(str(adapter_id).strip(), "worker")
     slug = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(worker_id).strip()).strip("_.:-")
@@ -128,6 +130,7 @@ DEFAULT_WORKERS: tuple[dict[str, Any], ...] = (
     {"worker_id": "deepseek-v4-pro", "adapter_id": "deepseek_vscode_lm", "model": "deepseek-v4-pro", "provider": "deepseek", "supports": ["mechanical", "code", "research", "review"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 1_000_000, "max_risk": "high", "quality_ceiling": 0.96},
     {"worker_id": "deepseek-v4-flash", "adapter_id": "deepseek_vscode_lm", "model": "deepseek-v4-flash", "provider": "deepseek", "supports": ["mechanical", "code"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 1_000_000, "max_risk": "medium", "quality_ceiling": 0.86},
     {"worker_id": "glm-5.2", "adapter_id": "glm_vscode_lm", "model": "glm-5.2", "provider": "zhipu", "supports": ["mechanical", "code", "research", "review"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 1_000_000, "max_risk": "high", "quality_ceiling": 0.95},
+    {"worker_id": "grok-4.6", "adapter_id": "grok_kilo_cli", "model": "xai/grok-4.6", "provider": "xai", "supports": ["mechanical", "code", "research", "review"], "tools": ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"], "max_context_tokens": 256_000, "max_risk": "high", "quality_ceiling": 0.97},
 )
 
 
@@ -178,7 +181,10 @@ def _worker(value: Any) -> dict[str, Any]:
     adapter_id = str(value.get("adapter_id") or "").strip()
     model = str(value.get("model") or "").strip()
     provider = str(value.get("provider") or "").strip().lower()
-    if not all(_TOKEN_RE.fullmatch(item) for item in (worker_id, adapter_id, model, provider)):
+    if (
+        not all(_TOKEN_RE.fullmatch(item) for item in (worker_id, adapter_id, provider))
+        or not _MODEL_TOKEN_RE.fullmatch(model)
+    ):
         raise WorkforceCatalogError("worker_identity_invalid")
     if adapter_id not in repo_policy.DEFAULT_POLICY["providers"]["allowed_adapters"]:
         raise WorkforceCatalogError("worker_adapter_unsupported")
@@ -235,6 +241,26 @@ def _default_catalog() -> dict[str, Any]:
     return validate_catalog({"schema_id": SCHEMA_ID, "revision": 1, "workers": [dict(item, enabled=True, manager_score_adjustment=0.0) for item in DEFAULT_WORKERS]})
 
 
+def _merge_new_builtin_workers(catalog: dict[str, Any]) -> dict[str, Any]:
+    """Expose newly shipped built-ins without overwriting repository choices."""
+
+    existing = {str(row["worker_id"]) for row in catalog["workers"]}
+    additions = [
+        dict(item, enabled=True, manager_score_adjustment=0.0)
+        for item in DEFAULT_WORKERS
+        if str(item["worker_id"]) not in existing
+    ]
+    if not additions:
+        return catalog
+    return validate_catalog(
+        {
+            "schema_id": catalog["schema_id"],
+            "revision": catalog["revision"],
+            "workers": [*catalog["workers"], *additions],
+        }
+    )
+
+
 def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -274,7 +300,7 @@ def load_catalog(repo_root: Path | str) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise WorkforceCatalogError(f"catalog_invalid_json:{type(exc).__name__}") from exc
-    return {**validate_catalog(value), "configured": True}
+    return {**_merge_new_builtin_workers(validate_catalog(value)), "configured": True}
 
 
 def ensure_catalog(repo_root: Path | str) -> tuple[Path, bool]:

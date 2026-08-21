@@ -34,6 +34,62 @@ def test_ensure_policy_is_owner_only_idempotent_and_valid(tmp_path: Path) -> Non
     assert created_again is False
 
 
+def test_grok_kilo_preflight_uses_local_xai_auth_without_exposing_it(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = _initialized_root(tmp_path)
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: SimpleNamespace(ok=True, executable="kilo", reason="ready"),
+    )
+    monkeypatch.setattr(
+        repo_policy.kilo_auth,
+        "auth_status",
+        lambda **_kwargs: {
+            "launchable": True,
+            "authenticated": True,
+            "credential_present": True,
+            "access_observed": True,
+            "quota_observed": False,
+            "quota_state": "unavailable_from_provider_api",
+            "blocker_reason": "",
+        },
+    )
+
+    status = repo_policy._provider_status(
+        root,
+        "grok_kilo_cli",
+        repo_policy.load_policy(root),
+        "bubblewrap",
+        "",
+    )
+
+    assert status["launchable"] is True
+    assert status["access_observed"] is True
+    assert status["status"] == "ready_unverified"
+    assert status["policy_provider"] == "xai"
+    assert "token" not in json.dumps(status, sort_keys=True).lower()
+
+
+def test_legacy_allow_all_policy_gains_grok_but_custom_denial_does_not(
+    tmp_path: Path,
+) -> None:
+    root = _initialized_root(tmp_path)
+    legacy = json.loads(json.dumps(repo_policy.DEFAULT_POLICY))
+    legacy["providers"]["allowed_adapters"].remove("grok_kilo_cli")
+    path = repo_policy.policy_path(root)
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    migrated = repo_policy.load_policy(root)
+    assert "grok_kilo_cli" in migrated["providers"]["allowed_adapters"]
+
+    legacy["providers"]["allowed_adapters"].remove("claude_cli")
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    customized = repo_policy.load_policy(root)
+    assert "grok_kilo_cli" not in customized["providers"]["allowed_adapters"]
+
+
 def test_legacy_policy_without_worktree_cap_receives_safe_default(tmp_path: Path) -> None:
     root = _initialized_root(tmp_path)
     value = json.loads(json.dumps(repo_policy.DEFAULT_POLICY))

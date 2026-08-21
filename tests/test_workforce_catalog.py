@@ -429,6 +429,42 @@ def test_execution_runner_is_stable_and_never_uses_manager_identity() -> None:
     assert workforce_catalog.execution_runner("deepseek-v4-pro", "deepseek_vscode_lm") == "deepseek_v4-pro"
     assert workforce_catalog.execution_runner("gpt-5.5", "codex_cli") == "codex_gpt-5.5"
     assert workforce_catalog.execution_runner("any", "vscode_lm") == "copilot_any"
+    assert workforce_catalog.execution_runner("grok-4.6", "grok_kilo_cli") == "grok_4.6"
+
+
+def test_default_catalog_declares_exact_grok_kilo_route() -> None:
+    worker = next(
+        row
+        for row in workforce_catalog.DEFAULT_WORKERS
+        if row["worker_id"] == "grok-4.6"
+    )
+    assert worker["adapter_id"] == "grok_kilo_cli"
+    assert worker["model"] == "xai/grok-4.6"
+    assert worker["provider"] == "xai"
+
+
+def test_existing_catalog_gains_grok_without_overwriting_repository_choices(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    legacy = workforce_catalog._default_catalog()
+    legacy["workers"] = [
+        row for row in legacy["workers"] if row["worker_id"] != "grok-4.6"
+    ]
+    legacy["workers"][0]["enabled"] = False
+    path = workforce_catalog.catalog_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    loaded = workforce_catalog.load_catalog(root)
+
+    assert loaded["configured"] is True
+    assert next(
+        row for row in loaded["workers"] if row["worker_id"] == legacy["workers"][0]["worker_id"]
+    )["enabled"] is False
+    grok = next(row for row in loaded["workers"] if row["worker_id"] == "grok-4.6")
+    assert grok["adapter_id"] == "grok_kilo_cli"
+    assert grok["enabled"] is True
 
 
 def test_deepseek_uses_launchable_copilot_fallback_without_identity_drift(

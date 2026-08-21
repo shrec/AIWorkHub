@@ -36,6 +36,7 @@ _ADAPTER_PROVIDERS = {
     "codex_cli": "openai",
     "deepseek_copilot_cli": "deepseek",
     "glm_copilot_cli": "zhipu",
+    "grok_kilo_cli": "xai",
 }
 _STORED_FIELDS = frozenset(
     {"schema_id", "revision", "updated_at", "providers", "adapters", "models"}

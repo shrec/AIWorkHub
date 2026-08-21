@@ -21,6 +21,7 @@ SUPPORTED_MODELS: tuple[str, ...] = (
     "gpt-5.5",
     "deepseek-v4-pro",
     "glm-5.2",
+    "xai/grok-4.6",
     "claude",
 )
 SUPPORTED_ADAPTERS: tuple[str, ...] = (
@@ -30,6 +31,7 @@ SUPPORTED_ADAPTERS: tuple[str, ...] = (
     "deepseek_copilot_cli",
     "glm_vscode_lm",
     "glm_cli",
+    "grok_kilo_cli",
     "claude_cli",
     "manual",
 )
