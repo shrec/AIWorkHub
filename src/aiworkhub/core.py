@@ -3754,6 +3754,237 @@ def _reconcile_retained_workspaces(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _predecessor_request_id_from_evidence(evidence: Any) -> str:
+    if not isinstance(evidence, dict):
+        return ""
+    identity = evidence.get("request_identity")
+    if isinstance(identity, dict):
+        request_id = str(identity.get("request_id") or "").strip()
+        if request_id:
+            return request_id
+    workspace = evidence.get("workspace")
+    if isinstance(workspace, dict):
+        request_id = str(workspace.get("request_id") or "").strip()
+        if request_id:
+            return request_id
+    return str(evidence.get("request_id") or "").strip()
+
+
+def _bind_explicit_reject_review_predecessor(
+    *,
+    request_id: str,
+    task_id: str,
+    authority_repo: Path,
+    card_claim_epoch: Any,
+    workspace: Any,
+    hashes: Any,
+    changed_paths: Any,
+    identity: Any,
+    claim_epoch: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(identity, dict):
+        return None, "predecessor_request_id_missing_task_id"
+    raw_bound_task = identity.get("task_id")
+    if type(raw_bound_task) is not str or not raw_bound_task.strip():
+        return None, "predecessor_request_id_missing_task_id"
+    bound_task = raw_bound_task.strip()
+    if bound_task != task_id:
+        return None, (
+            f"predecessor_request_id_task_mismatch:expected={task_id}:got={bound_task}"
+        )
+    raw_bound_request = identity.get("request_id")
+    if type(raw_bound_request) is not str or not raw_bound_request.strip():
+        return None, (
+            f"predecessor_request_id {request_id} not found in retained review evidence"
+        )
+    if raw_bound_request.strip() != request_id:
+        return None, (
+            f"predecessor_request_id {request_id} not found in retained review evidence"
+        )
+
+    if not isinstance(workspace, dict):
+        return None, "predecessor_request_id_workspace_unretained"
+    raw_repo = workspace.get("repo")
+    if type(raw_repo) is not str or not raw_repo.strip():
+        return None, "predecessor_request_id_repo_mismatch"
+    try:
+        if Path(raw_repo).resolve(strict=False) != authority_repo.resolve(strict=False):
+            return None, "predecessor_request_id_repo_mismatch"
+    except (OSError, RuntimeError, ValueError):
+        return None, "predecessor_request_id_repo_mismatch"
+
+    workspace_request_id = workspace.get("request_id")
+    if type(workspace_request_id) is not str or not workspace_request_id.strip():
+        return None, (
+            f"predecessor_request_id {request_id} not found in retained review evidence"
+        )
+    if workspace_request_id.strip() != request_id:
+        return None, (
+            f"predecessor_request_id {request_id} not found in retained review evidence"
+        )
+
+    workspace_task = workspace.get("task_id")
+    if type(workspace_task) is not str or not workspace_task.strip():
+        return None, "predecessor_request_id_missing_task_id"
+    if workspace_task.strip() != task_id:
+        return None, (
+            f"predecessor_request_id_task_mismatch:expected={task_id}:got={workspace_task.strip()}"
+        )
+
+    workspace_path = workspace.get("path")
+    if type(workspace_path) is not str or not workspace_path.strip():
+        return None, "predecessor_request_id_workspace_unretained"
+    try:
+        retained = Path(workspace_path.strip())
+    except (OSError, RuntimeError, ValueError):
+        return None, "predecessor_request_id_workspace_unretained"
+    if retained.is_symlink() or not retained.is_dir():
+        return None, "predecessor_request_id_workspace_unretained"
+
+    if type(hashes) is not dict:
+        return None, "predecessor_request_id_missing_hashes"
+    if type(changed_paths) is not list:
+        return None, "predecessor_request_id_missing_hashes"
+    paths: list[str] = []
+    seen_paths: set[str] = set()
+    for item in changed_paths:
+        if type(item) is not str:
+            return None, "predecessor_request_id_missing_hashes"
+        normalized = item.strip().replace("\\", "/")
+        if (
+            not normalized
+            or normalized.startswith("/")
+            or "\x00" in normalized
+            or (len(normalized) >= 2 and normalized[1] == ":")
+        ):
+            return None, "predecessor_request_id_missing_hashes"
+        parts = normalized.split("/")
+        if any(part in {"", ".", ".."} for part in parts):
+            return None, "predecessor_request_id_missing_hashes"
+        if normalized in seen_paths:
+            return None, "predecessor_request_id_missing_hashes"
+        seen_paths.add(normalized)
+        paths.append(normalized)
+    hash_map: dict[str, str] = {}
+    for path, digest in hashes.items():
+        if type(path) is not str or not path.strip():
+            return None, "predecessor_request_id_missing_hashes"
+        if (
+            type(digest) is not str
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            return None, "predecessor_request_id_missing_hashes"
+        hash_map[path.strip()] = digest
+    if paths == []:
+        if hashes != {}:
+            return None, "predecessor_request_id_missing_hashes"
+    else:
+        for path in paths:
+            if path not in hash_map:
+                return None, "predecessor_request_id_missing_hashes"
+
+    if type(card_claim_epoch) is not int or card_claim_epoch < 1:
+        return None, (
+            "predecessor_request_id_claim_epoch_mismatch:"
+            f"expected={card_claim_epoch!s}:got={claim_epoch!s}"
+        )
+    if type(claim_epoch) is not int or claim_epoch < 1:
+        return None, (
+            "predecessor_request_id_claim_epoch_mismatch:"
+            f"expected={card_claim_epoch}:got={claim_epoch!s}"
+        )
+    if claim_epoch != card_claim_epoch:
+        return None, (
+            "predecessor_request_id_claim_epoch_mismatch:"
+            f"expected={card_claim_epoch}:got={claim_epoch}"
+        )
+
+    return {
+        "request_id": request_id,
+        "workspace": workspace,
+        "changed_path_hashes": hash_map,
+        "rework_delta": None,
+        "claim_epoch": claim_epoch,
+    }, None
+
+
+def _resolve_reject_review_predecessor(
+    card: Mapping[str, Any],
+    *,
+    task_id: str,
+    authority_repo: Path,
+    predecessor_request_id: str | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if predecessor_request_id is None:
+        return None, None
+    if not isinstance(predecessor_request_id, str):
+        return None, "predecessor_request_id_malformed"
+    stripped = predecessor_request_id.strip()
+    if not stripped:
+        return None, "predecessor_request_id must be a non-empty request id or omitted"
+    if not _TASK_ID_RE.fullmatch(stripped):
+        return None, f"predecessor_request_id_malformed:{stripped}"
+
+    existing = card.get("rework_predecessor")
+    terminal_review = card.get("terminal_review")
+    evidence = (
+        terminal_review.get("evidence")
+        if isinstance(terminal_review, dict)
+        else None
+    )
+    identity = evidence.get("request_identity") if isinstance(evidence, dict) else None
+    terminal_request_id = _predecessor_request_id_from_evidence(evidence)
+    card_epoch = card.get("claim_epoch")
+
+    if isinstance(existing, dict) and str(existing.get("request_id") or "").strip() == stripped:
+        existing_identity = {
+            "request_id": stripped,
+            "task_id": existing.get("task_id"),
+        }
+        return _bind_explicit_reject_review_predecessor(
+            request_id=stripped,
+            task_id=task_id,
+            authority_repo=authority_repo,
+            card_claim_epoch=card_epoch,
+            workspace=existing.get("workspace"),
+            hashes=existing.get("changed_path_hashes"),
+            changed_paths=list(existing.get("changed_path_hashes") or {}),
+            identity=existing_identity,
+            claim_epoch=existing.get("claim_epoch"),
+        )
+
+    if terminal_request_id == stripped:
+        terminal_epoch = (
+            terminal_review.get("claim_epoch")
+            if isinstance(terminal_review, dict)
+            else None
+        )
+        return _bind_explicit_reject_review_predecessor(
+            request_id=stripped,
+            task_id=task_id,
+            authority_repo=authority_repo,
+            card_claim_epoch=card_epoch,
+            workspace=evidence.get("workspace") if isinstance(evidence, dict) else None,
+            hashes=(
+                evidence.get("changed_path_hashes")
+                if isinstance(evidence, dict)
+                else None
+            ),
+            changed_paths=(
+                evidence.get("changed_paths") if isinstance(evidence, dict) else None
+            ),
+            identity=identity if isinstance(identity, dict) else None,
+            claim_epoch=terminal_epoch,
+        )
+
+    if terminal_request_id or (
+        isinstance(existing, dict) and str(existing.get("request_id") or "").strip()
+    ):
+        return None, f"predecessor_request_id_stale:{stripped}"
+    return None, f"predecessor_request_id {stripped} not found in retained review evidence"
+
+
 def reject_review(
     task_id: str,
     reason: str,
@@ -3898,13 +4129,21 @@ def reject_review(
         *,
         validate_delta: bool,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        if explicit is None:
-            return None, None  # default: current review
-        stripped = explicit.strip()
-        if not stripped:
-            return None, "predecessor_request_id must be a non-empty request id or omitted"
-        # Only card rework_predecessor (durably pinned from a prior cycle)
-        # and terminal_review.evidence (current cycle) are authoritative.
+        resolved, error = _resolve_reject_review_predecessor(
+            card,
+            task_id=task_id,
+            authority_repo=repo_root(),
+            predecessor_request_id=explicit,
+        )
+        if error or resolved is None:
+            return resolved, error
+        if not validate_delta:
+            return resolved, None
+        hash_map = resolved.get("changed_path_hashes") or {}
+        if not hash_map:
+            resolved = dict(resolved)
+            resolved["rework_delta"] = None
+            return resolved, None
         existing = card.get("rework_predecessor")
         terminal_review = card.get("terminal_review")
         evidence = (
@@ -3912,78 +4151,28 @@ def reject_review(
             if isinstance(terminal_review, dict)
             else None
         )
-        identity = evidence.get("request_identity") if isinstance(evidence, dict) else None
-        t_workspace = evidence.get("workspace") if isinstance(evidence, dict) else None
-        t_hashes = (
-            evidence.get("changed_path_hashes") if isinstance(evidence, dict) else None
-        )
-        # Check existing rework_predecessor
-        if isinstance(existing, dict):
-            er = str(existing.get("request_id") or "").strip()
-            ew = existing.get("workspace")
-            eh = existing.get("changed_path_hashes")
-            if (
-                er == stripped
-                and isinstance(ew, dict)
-                and str(ew.get("request_id") or "").strip() == stripped
-                and isinstance(eh, dict)
-                and eh
-            ):
-                existing_delta = None
-                if validate_delta:
-                    existing_delta, delta_error = _validated_rework_delta(
-                        existing.get("rework_delta"),
-                        expected_request_id=stripped,
-                        expected_claim_epoch=None,
-                    )
-                    if delta_error:
-                        return None, delta_error
-                return {
-                    "request_id": stripped,
-                    "workspace": ew,
-                    "changed_path_hashes": eh,
-                    "rework_delta": existing_delta,
-                }, None
-        # Check current terminal_review evidence
+        expected_epoch = resolved.get("claim_epoch")
+        if type(expected_epoch) is not int:
+            expected_epoch = None
         if (
-            isinstance(identity, dict)
-            and str(identity.get("request_id") or "").strip() == stripped
-            and isinstance(t_workspace, dict)
-            and str(t_workspace.get("request_id") or "").strip() == stripped
-            and isinstance(t_hashes, dict)
+            isinstance(existing, dict)
+            and str(existing.get("request_id") or "").strip() == resolved["request_id"]
         ):
-            terminal_epoch = terminal_review.get("claim_epoch")
-            if type(terminal_epoch) is not int or terminal_epoch < 1:
-                terminal_epoch = card.get("claim_epoch")
-            terminal_delta = None
-            if validate_delta:
-                raw_delta = evidence.get("rework_delta")
-                if (
-                    raw_delta is None
-                    and isinstance(terminal_review, dict)
-                    and terminal_review.get("substatus") == "validation_failed"
-                ):
-                    delta_error = "rework_delta_descriptor_missing"
-                else:
-                    terminal_delta, delta_error = _validated_rework_delta(
-                        raw_delta,
-                        expected_request_id=stripped,
-                        expected_claim_epoch=(
-                            terminal_epoch if type(terminal_epoch) is int else None
-                        ),
-                    )
-                if delta_error:
-                    return None, delta_error
-            return {
-                "request_id": stripped,
-                "workspace": t_workspace,
-                "changed_path_hashes": t_hashes,
-                "rework_delta": terminal_delta,
-            }, None
-        return (
-            None,
-            f"predecessor_request_id {stripped} not found in retained review evidence",
+            raw_delta = existing.get("rework_delta")
+        else:
+            raw_delta = evidence.get("rework_delta") if isinstance(evidence, dict) else None
+        if raw_delta is None:
+            return None, "predecessor_request_id_missing_delta"
+        terminal_delta, delta_error = _validated_rework_delta(
+            raw_delta,
+            expected_request_id=str(resolved["request_id"]),
+            expected_claim_epoch=expected_epoch,
         )
+        if delta_error:
+            return None, delta_error
+        resolved = dict(resolved)
+        resolved["rework_delta"] = terminal_delta
+        return resolved, None
 
     rework_delta_reuse_error: str | None = None
     resolved_predecessor, pred_error = _resolve_predecessor(

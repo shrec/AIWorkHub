@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.10.42";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.10.43";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -3828,6 +3828,82 @@ function createVscodeLmStagedEditCollector(request) {
   return { stage, finalize, hasChanges: () => edits.size > 0 || creates.size > 0 };
 }
 
+const VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL = "aiworkhub_worker_source_graph_query";
+const VSCODE_LM_WORKER_SOURCE_GRAPH_READY_TIMEOUT_MS = 2000;
+const VSCODE_LM_WORKER_SOURCE_GRAPH_READY_POLL_MS = 20;
+let vscodeLmWorkerSourceGraphReadyTimeoutMs = VSCODE_LM_WORKER_SOURCE_GRAPH_READY_TIMEOUT_MS;
+let vscodeLmWorkerSourceGraphReadinessArmed = false;
+let vscodeLmWorkerSourceGraphReadinessConsumed = false;
+let vscodeLmWorkerSourceGraphReadinessForceWaitForTest = false;
+const vscodeLmWorkerSourceGraphReadyWaiters = [];
+
+function vscodeLmProviderBridgeReady() {
+  return Boolean(mcpClient && activeRepoIdentity);
+}
+
+function armVscodeLmProviderBridgeReadiness(options = {}) {
+  vscodeLmWorkerSourceGraphReadinessArmed = true;
+  if (options && options.forceWaitForTest) {
+    vscodeLmWorkerSourceGraphReadinessForceWaitForTest = true;
+  }
+}
+
+function resolveVscodeLmProviderBridgeReadiness() {
+  const waiters = vscodeLmWorkerSourceGraphReadyWaiters.splice(0);
+  for (const waiter of waiters) waiter();
+}
+
+function bindVscodeLmProviderBridgeForTest(binding) {
+  mcpClient = binding && Object.prototype.hasOwnProperty.call(binding, "mcpClient")
+    ? binding.mcpClient
+    : null;
+  activeRepoIdentity = binding && Object.prototype.hasOwnProperty.call(binding, "activeRepoIdentity")
+    ? binding.activeRepoIdentity
+    : null;
+  if (vscodeLmProviderBridgeReady()) resolveVscodeLmProviderBridgeReadiness();
+}
+
+function resetVscodeLmWorkerSourceGraphReadinessForTest() {
+  vscodeLmWorkerSourceGraphReadinessArmed = false;
+  vscodeLmWorkerSourceGraphReadinessConsumed = false;
+  vscodeLmWorkerSourceGraphReadinessForceWaitForTest = false;
+  vscodeLmWorkerSourceGraphReadyTimeoutMs = VSCODE_LM_WORKER_SOURCE_GRAPH_READY_TIMEOUT_MS;
+  vscodeLmWorkerSourceGraphReadyWaiters.splice(0, vscodeLmWorkerSourceGraphReadyWaiters.length);
+  mcpClient = null;
+  activeRepoIdentity = null;
+}
+
+function setVscodeLmWorkerSourceGraphReadyTimeoutMsForTest(timeoutMs) {
+  const parsed = Number(timeoutMs);
+  vscodeLmWorkerSourceGraphReadyTimeoutMs = Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : VSCODE_LM_WORKER_SOURCE_GRAPH_READY_TIMEOUT_MS;
+}
+
+async function awaitVscodeLmWorkerSourceGraphReadinessOnce() {
+  if (vscodeLmProviderBridgeReady()) return;
+  if (vscodeLmWorkerSourceGraphReadinessConsumed) {
+    throw new Error("vscode_lm_mcp_unavailable");
+  }
+  if (!vscodeLmWorkerSourceGraphReadinessArmed) return;
+  if (!extensionContext && !vscodeLmWorkerSourceGraphReadinessForceWaitForTest) return;
+  vscodeLmWorkerSourceGraphReadinessConsumed = true;
+  try {
+    if (extensionContext) getMcpClient(extensionContext);
+  } catch (_err) { /* remain unbound until the window bind lands or the budget expires */ }
+  if (vscodeLmProviderBridgeReady()) return;
+  const deadline = Date.now() + vscodeLmWorkerSourceGraphReadyTimeoutMs;
+  while (Date.now() < deadline) {
+    if (vscodeLmProviderBridgeReady()) return;
+    await new Promise((resolve) => {
+      vscodeLmWorkerSourceGraphReadyWaiters.push(resolve);
+      setTimeout(resolve, VSCODE_LM_WORKER_SOURCE_GRAPH_READY_POLL_MS);
+    });
+  }
+  if (vscodeLmProviderBridgeReady()) return;
+  throw new Error("vscode_lm_mcp_unavailable");
+}
+
 async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdits) {
   const toolName = String(call && call.name || "").trim();
   if (toolName === VSCODE_LM_STAGE_EDIT_TOOL) {
@@ -3835,6 +3911,9 @@ async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdi
   }
   if (toolName === VSCODE_LM_FINALIZE_EDIT_TOOL) {
     return stagedEdits.finalize(call.input && call.input.summary);
+  }
+  if (toolName === VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL) {
+    await awaitVscodeLmWorkerSourceGraphReadinessOnce();
   }
   return invokeTool({ ...call, name: toolName }, requestId);
 }
@@ -4892,6 +4971,8 @@ class VscodeLmBridgeHost {
     this.stop();
     if (!repoInfo || !REAL_REPO_ID_RE.test(String(repoInfo.repoId || ""))) return;
     this.repoInfo = { ...repoInfo };
+    vscodeLmWorkerSourceGraphReadinessConsumed = false;
+    armVscodeLmProviderBridgeReadiness();
     // The broker is an optional execution route.  A malformed third-party
     // model catalog or a transient provider failure must never abort the
     // dashboard/MCP extension activation.  The timer retries and preflight
@@ -6842,6 +6923,7 @@ function getMcpClient(context) {
     activeRepoIdentity = identity;
     activeRepoLabel = displayLabel;
   }
+  if (vscodeLmProviderBridgeReady()) resolveVscodeLmProviderBridgeReadiness();
   return mcpClient;
 }
 
@@ -9637,6 +9719,12 @@ module.exports = {
     parseVscodeLmJsonEnvelope,
     validateVscodeLmFinalEnvelope,
     createVscodeLmStagedEditCollector,
+    invokeVscodeLmProtocolTool,
+    invokeVscodeLmPrivateTool,
+    armVscodeLmProviderBridgeReadiness,
+    bindVscodeLmProviderBridgeForTest,
+    resetVscodeLmWorkerSourceGraphReadinessForTest,
+    setVscodeLmWorkerSourceGraphReadyTimeoutMsForTest,
     vscodeLmProtocolToolTransport,
     vscodeLmPathMatchesPattern,
     vscodeLmToolsForRequest,
@@ -9655,6 +9743,7 @@ module.exports = {
       MCP_REQUEST_TIMEOUT_MS,
       MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS,
       VSCODE_LM_WORKER_TOOL_TIMEOUT_MS,
+      VSCODE_LM_WORKER_SOURCE_GRAPH_READY_TIMEOUT_MS,
       MCP_SNAPSHOT_RECOVERY_ATTEMPTS,
       MCP_MAX_RUNTIME_REPAIR_ATTEMPTS,
       EXPECTED_MCP_PACKAGE_VERSION,

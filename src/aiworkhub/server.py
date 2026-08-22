@@ -484,6 +484,7 @@ from . import quality_evidence
 from . import quality_calibration
 from . import repo_policy
 from . import shared_router
+from . import task_templates
 
 
 try:
@@ -1087,6 +1088,84 @@ def aiworkhub_task_create(
         validation_roles=validation_roles,
         risk_tier=risk_tier,
     )
+
+
+@mcp.tool()
+@_serialize_task_lifecycle_write
+def aiworkhub_task_create_from_template(
+    task_id: str,
+    title: str,
+    runner: str,
+    topic: str,
+    objective: str,
+    acceptance: list[str],
+    template_id: str,
+    production_paths: list[str] | None = None,
+    test_paths: list[str] | None = None,
+    forbidden: list[str] | None = None,
+    allow_empty_required_outputs: list[str] | None = None,
+    allow_unchanged_required_outputs: list[str] | None = None,
+    priority: str = "normal",
+    depends_on: list[str] | None = None,
+    immutable_inputs: list[str] | None = None,
+    max_live_tokens: int | None = None,
+    risk_tier: str | None = None,
+) -> dict[str, Any]:
+    """MANAGER WRITE: create one task from an authenticated template.
+
+    Callers supply routing fields, task text/acceptance, a template ID, and
+    explicit production/test paths. Generated ``allowed_writes``,
+    ``required_outputs``, ``read_first``, ``read_only``, ``task_type``,
+    ``work_kind``, ``validation`` and ``validation_roles`` are taken from
+    template expansion and cannot be overridden. Malformed, stale, or forged
+    template IDs and unsafe paths fail closed before ``create_task``.
+    """
+
+    card = task_templates.expand_template(
+        template_id,
+        production_paths=production_paths,
+        test_paths=test_paths,
+        title=title,
+        objective=objective,
+    )
+    quality_evidence.normalize_behavioral_contract(
+        card["work_kind"],
+        card["validation"],
+        card["validation_roles"],
+    )
+    created = core.create_task(
+        task_id=task_id,
+        title=card["title"],
+        runner=runner,
+        topic=topic,
+        objective=card["objective"],
+        acceptance=acceptance,
+        allowed_writes=card["allowed_writes"],
+        forbidden=forbidden,
+        required_outputs=card["required_outputs"],
+        allow_empty_required_outputs=allow_empty_required_outputs,
+        allow_unchanged_required_outputs=allow_unchanged_required_outputs,
+        validation=card["validation"],
+        priority=priority,
+        task_type=card["task_type"],
+        depends_on=depends_on,
+        read_first=card["read_first"],
+        immutable_inputs=immutable_inputs,
+        read_only=card["read_only"],
+        max_live_tokens=max_live_tokens,
+        work_kind=card["work_kind"],
+        validation_roles=card["validation_roles"],
+        risk_tier=risk_tier,
+    )
+    return {
+        **created,
+        "template_provenance": {
+            "schema_id": card["schema_id"],
+            "template_full_id": card["template_full_id"],
+            "registry_version": card["registry_version"],
+            "definition_digest": card["definition_digest"],
+        },
+    }
 
 
 def _compact_task_plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:

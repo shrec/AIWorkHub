@@ -2,8 +2,8 @@
 
 This module is additive and self-contained: it never imports or mutates
 ``core.py``, ``task_store.py`` or any other lifecycle module.  The output of
-``expand_template`` is plain data that a manager may feed into the existing,
-authoritative ``create_task`` card fields; no integration yet.
+``expand_template`` is plain data for the existing authoritative
+``create_task`` card, including one-to-one ``validation_roles``.
 
 Determinism contract:
 
@@ -19,10 +19,11 @@ Path contract (fail-closed, never coerced):
 
 * Path entries must be actual ``str`` instances.
 * Whitespace, control characters, backslashes, ``~``, glob characters,
-  absolute paths, ``.``/``..`` components, duplicates and any character
-  outside the safe POSIX token set are rejected with stable reasons before
-  any command is generated, so every generated validation command preserves
-  exact, deterministic argv tokenization (single-space split, no quoting).
+  absolute paths, ``.``/``..`` components, leading-hyphen tokens,
+  duplicates and any character outside the safe POSIX token set are
+  rejected with stable reasons before any command is generated, so every
+  generated validation command preserves exact, deterministic argv
+  tokenization (single-space split, no quoting).
 """
 
 from __future__ import annotations
@@ -180,7 +181,7 @@ _TEMPLATE_SPECS: dict[str, TaskTemplateSpec] = {
             "Update documentation at the explicit doc paths only; no code "
             "or test writes and no pytest or ruff re-run."
         ),
-        task_type="docs",
+        task_type="code",
         work_kind="docs",
         read_only=False,
         production_path_policy=_REQUIRED,
@@ -298,6 +299,8 @@ def _validated_path(entry: Any, field: str) -> str:
             raise TaskTemplateError(f"invalid_{field}_path_not_normalized")
         if component == "..":
             raise TaskTemplateError(f"invalid_{field}_path_escape")
+        if component.startswith("-"):
+            raise TaskTemplateError(f"invalid_{field}_path_leading_hyphen")
     return entry
 
 
@@ -346,6 +349,42 @@ def split_command_argv(command: str) -> list[str]:
     return command.split(" ")
 
 
+_CANONICAL_WORK_KINDS = frozenset({
+    "generic",
+    "bugfix",
+    "refactor",
+    "performance",
+    "security",
+    "data_ml",
+})
+_REQUIRED_VALIDATION_ROLES: dict[str, tuple[str, ...]] = {
+    "bugfix": ("reproduction", "regression"),
+    "refactor": ("parity",),
+    "performance": ("baseline", "delta"),
+    "security": ("negative_fixture",),
+    "data_ml": ("schema", "distribution"),
+}
+
+
+def _canonical_work_kind(work_kind: str) -> str:
+    if work_kind in _CANONICAL_WORK_KINDS:
+        return work_kind
+    return "generic"
+
+
+def _validation_roles_for(work_kind: str, validation: Sequence[str]) -> list[str]:
+    required = _REQUIRED_VALIDATION_ROLES.get(work_kind, ())
+    if len(required) > len(validation):
+        raise TaskTemplateError("validation_roles_unsatisfiable")
+    roles: list[str] = []
+    for index, _command in enumerate(validation):
+        if index < len(required):
+            roles.append(required[index])
+        else:
+            roles.append("generic")
+    return roles
+
+
 def expand_template(
     template_id: Any,
     *,
@@ -386,6 +425,8 @@ def expand_template(
         validation.append(DIFF_CHECK_COMMAND)
     resolved_title = spec.title if title is None else title
     resolved_objective = spec.objective if objective is None else objective
+    work_kind = _canonical_work_kind(spec.work_kind)
+    validation_roles = _validation_roles_for(work_kind, validation)
     return {
         "schema_id": SCHEMA_ID,
         "template_id": spec.name,
@@ -399,11 +440,12 @@ def expand_template(
             resolved_objective, "objective", MAX_OBJECTIVE_LENGTH
         ),
         "task_type": spec.task_type,
-        "work_kind": spec.work_kind,
+        "work_kind": work_kind,
         "read_only": spec.read_only,
         "read_first": read_first,
         "allowed_writes": list(write_set),
         "required_outputs": list(write_set),
         "write_set": list(write_set),
         "validation": validation,
+        "validation_roles": validation_roles,
     }

@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.43] - 2026-08-22
+
+### Added
+
+- Task creation now resolves deterministic contract templates through the
+  canonical registry, including exact read/write scope, required outputs and
+  validation roles.
+
+### Fixed
+
+- Explicit rework predecessors now bind to strict typed paths, hashes and the
+  current claim epoch before a retained delta can be consumed.
+- The first worker Source Graph call performs one bounded MCP-readiness wait
+  without replaying or duplicating the requested tool execution.
+- Reviewer findings accept canonical objects or one bounded JSON-object string;
+  rejected intents are HMAC-authenticated, never become verified payloads, and
+  a rejected finding cannot be replaced by an empty successful submission.
+
 ## [0.10.42] - 2026-08-22
 
 ### Added

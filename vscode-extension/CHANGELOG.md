@@ -1,5 +1,20 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.43 — 2026-08-22
+
+### Added
+
+- Task creation is wired to the deterministic contract-template registry.
+
+### Fixed
+
+- Retained rework deltas require exact predecessor and claim-epoch authority.
+- The first worker Source Graph call waits once for MCP readiness without
+  duplicate execution.
+- Reviewer finding JSON strings are normalized once, while rejected intents
+  remain authenticated, non-payload audit evidence and fail closed on empty
+  follow-up submissions.
+
 ## 0.10.42 — 2026-08-22
 
 ### Added

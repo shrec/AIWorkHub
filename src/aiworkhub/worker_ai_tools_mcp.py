@@ -3830,18 +3830,116 @@ def kb_write_intent(
     )
 
 
+MAX_FINDING_JSON_STRING_CHARS = 32_768
+
+
+def _decode_finding_json_object(raw: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Decode one bounded, one-level JSON-object finding input string."""
+    if len(raw) > MAX_FINDING_JSON_STRING_CHARS:
+        return None, "finding_json_object_string_too_large"
+    try:
+        decoded = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None, "finding_json_object_string_invalid"
+    if not isinstance(decoded, dict):
+        return None, "finding_json_object_string_invalid"
+    for value in decoded.values():
+        if value is not None and not isinstance(value, (bool, int, float, str)):
+            return None, "finding_json_object_string_invalid"
+    return decoded, None
+
+
+def _record_rejected_finding_intent(
+    ctx: WorkerToolContext,
+    tool: str,
+    reason: str,
+    *,
+    packet_sha256: str,
+    lens: str,
+    raw_findings: list[Any],
+) -> dict[str, Any]:
+    """Authenticate rejected intent without admitting it as verified payload."""
+    intent_bytes = json.dumps(
+        {
+            "findings": raw_findings,
+            "lens": lens,
+            "packet_sha256": packet_sha256,
+        },
+        default=str,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    intent_sha256 = hashlib.sha256(intent_bytes).hexdigest()
+    appended = _append_audit(
+        ctx,
+        tool=tool,
+        ok=False,
+        cache_hit=False,
+        hit_count=0,
+        bytes_returned=0,
+        violation=f"{reason}|rejected_intent_sha256={intent_sha256}",
+    )
+    authenticated = bool(appended)
+    has_audit = (
+        ctx.audit_ledger_path is not None and ctx.audit_hmac_key_path is not None
+    )
+    if appended and has_audit:
+        verification = verify_audit_ledger(
+            ctx.audit_ledger_path,
+            ctx.audit_hmac_key_path,
+            task_id=ctx.task_id,
+            runner=ctx.runner,
+            topic=ctx.topic,
+            request_id=ctx.request_id,
+        )
+        authenticated = bool(verification.get("ok")) and int(
+            verification.get("entries_tampered") or 0
+        ) == 0
+    return {
+        "ok": False,
+        "tool": tool,
+        "reason": reason,
+        "rejected_intent_authenticated": authenticated,
+        "rejected_intent_sha256": intent_sha256,
+    }
+
+
+def _prior_rejected_finding_intent(ctx: WorkerToolContext, tool: str) -> bool:
+    """Return true when this exact reviewer already submitted a rejected intent."""
+    if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
+        return False
+    verification = verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    if not verification.get("ok") or int(verification.get("entries_tampered") or 0):
+        return True
+    calls = verification.get("call_count_by_tool") or {}
+    return (
+        isinstance(calls, dict)
+        and int(calls.get(tool) or 0) > 0
+        and not verification.get("verified_payloads")
+    )
+
+
 def quality_review_submit(
     ctx: WorkerToolContext,
     *,
     packet_sha256: str,
     lens: str,
-    findings: list[quality_reviewer.QualityReviewFinding],
+    findings: list[quality_reviewer.QualityReviewFinding | str],
 ) -> dict[str, Any]:
     """Submit findings for the exact coordinator-bound review packet.
 
     Finding objects use the single canonical quality-review finding shape
     (see quality_reviewer.QUALITY_REVIEW_FINDING_SCHEMA_DOC). Undocumented
-    keys are rejected by name and an empty findings list is valid.
+    keys are rejected by name and an empty findings list is valid. A finding
+    may also be a bounded JSON string encoding one canonical finding object.
 
     This tool is inert for ordinary workers: the launcher must bind one
     immutable packet path into the worker runtime. The model cannot choose a
@@ -3867,11 +3965,27 @@ def quality_review_submit(
         return _violation(ctx, tool, "quality_review_packet_schema_mismatch")
     if packet.get("packet_sha256") != packet_sha256:
         return _violation(ctx, tool, "quality_review_packet_digest_mismatch")
+    decoded_findings: list[Any] = []
+    for raw_finding in findings:
+        if isinstance(raw_finding, str):
+            decoded, decode_reason = _decode_finding_json_object(raw_finding)
+            if decoded is None:
+                return _record_rejected_finding_intent(
+                    ctx,
+                    tool,
+                    decode_reason,
+                    packet_sha256=packet_sha256,
+                    lens=lens,
+                    raw_findings=list(findings),
+                )
+            decoded_findings.append(decoded)
+        else:
+            decoded_findings.append(raw_finding)
     try:
         normalized_findings = quality_reviewer.normalize_packet_findings(
             packet,
             lens=lens,
-            findings=findings,
+            findings=decoded_findings,
         )
         # Recompute the digest instead of trusting the file's digest field.
         quality_reviewer.verify_reviewer_receipt(
@@ -3899,7 +4013,14 @@ def quality_review_submit(
             audit_verified=True,
         )
     except quality_reviewer.ReviewerEvidenceError as exc:
-        return _violation(ctx, tool, str(exc))
+        return _record_rejected_finding_intent(
+            ctx,
+            tool,
+            str(exc),
+            packet_sha256=packet_sha256,
+            lens=lens,
+            raw_findings=list(findings),
+        )
     normalized, errors = quality_evidence.normalize_reviewer_reports(
         [
             {
@@ -3912,7 +4033,23 @@ def quality_review_submit(
         ]
     )
     if errors or len(normalized) != 1:
-        return _violation(ctx, tool, (errors[0] if errors else "reviewer_report_invalid"))
+        return _record_rejected_finding_intent(
+            ctx,
+            tool,
+            (errors[0] if errors else "reviewer_report_invalid"),
+            packet_sha256=packet_sha256,
+            lens=lens,
+            raw_findings=list(findings),
+        )
+    if not normalized_findings and _prior_rejected_finding_intent(ctx, tool):
+        return _record_rejected_finding_intent(
+            ctx,
+            tool,
+            "quality_review_empty_after_rejected_intent",
+            packet_sha256=packet_sha256,
+            lens=lens,
+            raw_findings=[],
+        )
     receipt = {
         "schema_id": quality_reviewer.RECEIPT_SCHEMA_ID,
         "packet_sha256": packet_sha256,

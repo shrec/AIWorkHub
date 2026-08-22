@@ -360,11 +360,14 @@ def _unsealed_rework_delta_card(coord: Path, task_id: str, request_id: str) -> d
     """Terminal review evidence whose retained ``rework_delta`` is present but
     unsealed -- the exact malformed evidence that once deadlocked blocked /
     archived / superseded dispositions behind a pending-only seal check."""
+    path = coord / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+    path.mkdir(parents=True, exist_ok=True)
     workspace = {
         "request_id": request_id,
+        "task_id": task_id,
         "repo": str(coord),
-        "path": f"/tmp/aiworkhub-worktrees/{request_id}/worktree",
-        "home": f"/tmp/aiworkhub-worktrees/{request_id}/home",
+        "path": str(path),
+        "home": str(path.parent / "home"),
         "allowed_writes": ["out/result.txt"],
         "parent_baseline": {},
         "workspace_baseline": {},
@@ -389,6 +392,7 @@ def _unsealed_rework_delta_card(coord: Path, task_id: str, request_id: str) -> d
             "evidence": {
                 "request_identity": {"request_id": request_id, "task_id": task_id},
                 "workspace": workspace,
+                "changed_paths": ["out/result.txt"],
                 "changed_path_hashes": {"out/result.txt": "c" * 64},
                 "rework_delta": descriptor,
             },
@@ -733,32 +737,82 @@ def test_callback_transition_map_is_exhaustive_for_blocked_substatuses():
 # --- V2: predecessor_request_id selection ----------------------------------
 
 
+def _strict_retained_workspace(
+    coord: Path,
+    task_id: str,
+    request_id: str,
+    allowed_writes: list[str],
+) -> dict:
+    path = coord / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+    path.mkdir(parents=True, exist_ok=True)
+    return {
+        "request_id": request_id,
+        "task_id": task_id,
+        "repo": str(coord),
+        "path": str(path),
+        "home": str(path.parent / "home"),
+        "allowed_writes": allowed_writes,
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+
+
+def _strict_delta_descriptor(
+    coord: Path,
+    task_id: str,
+    request_id: str,
+    path: str,
+    content: bytes,
+    *,
+    claim_epoch: int = 1,
+) -> tuple[dict, dict[str, str]]:
+    artifact = worker_workspace.seal_rework_delta_artifact(
+        authority_repo=coord,
+        task_id=task_id,
+        request_id=request_id,
+        claim_epoch=claim_epoch,
+        file_entries=[(path, content)],
+        artifact_dir=coord / ".aiworkhub" / "runtime" / "rework_deltas",
+    )
+    return {
+        "schema_id": "aiworkhub.rework_delta_descriptor.v1",
+        "sealed": True,
+        "authority_repo": str(coord.resolve()),
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": claim_epoch,
+        "artifact_path": artifact["path"],
+        "artifact_sha256": artifact["digest"],
+    }, {path: hashlib.sha256(content).hexdigest()}
+
+
 def test_reject_to_pending_explicit_predecessor_selects_retained_workspace(coord):
     """Explicit predecessor_request_id selects a durably-pinned retained
     workspace from a prior rework cycle rather than defaulting to the current
     terminal_review."""
     retained_request = "retained-request-A"
-    retained_workspace = {
-        "request_id": retained_request,
-        "repo": str(coord),
-        "path": f"/tmp/aiworkhub-worktrees/{retained_request}/worktree",
-        "home": f"/tmp/aiworkhub-worktrees/{retained_request}/home",
-        "allowed_writes": ["src/a.py"],
-        "parent_baseline": {},
-        "workspace_baseline": {},
-    }
-    retained_hashes = {"src/a.py": "a" * 64}
+    task_id = "T_V2_EXPLICIT"
+    retained_workspace = _strict_retained_workspace(
+        coord, task_id, retained_request, ["src/a.py"]
+    )
+    retained_delta, retained_hashes = _strict_delta_descriptor(
+        coord, task_id, retained_request, "src/a.py", b"retained A\n"
+    )
     # Card has a durably-pinned rework_predecessor from cycle A plus a current
     # terminal_review from cycle B (validation_failed).
     _insert(
         coord,
-        "T_V2_EXPLICIT",
+        task_id,
         card={
+            "claim_epoch": 1,
             "rework_predecessor": {
                 "schema_id": "aiworkhub.rework_predecessor.v1",
                 "request_id": retained_request,
+                "task_id": task_id,
+                "claim_epoch": 1,
                 "workspace": retained_workspace,
                 "changed_path_hashes": retained_hashes,
+                "rework_delta": retained_delta,
                 "residual_identities": [],
                 "pinned_at": "2026-07-19T00:00:00+00:00",
             },
@@ -782,14 +836,14 @@ def test_reject_to_pending_explicit_predecessor_selects_retained_workspace(coord
     )
 
     res = core.reject_review(
-        "T_V2_EXPLICIT",
+        task_id,
         "rework from retained A",
         to="pending",
         predecessor_request_id=retained_request,
     )
 
     assert res["ok"] is True, res
-    card = json.loads(_row(coord, "T_V2_EXPLICIT")["card_json"])
+    card = json.loads(_row(coord, task_id)["card_json"])
     assert card["rework_predecessor"]["request_id"] == retained_request
     assert card["rework_predecessor"]["changed_path_hashes"] == retained_hashes
     assert card["rework_predecessor"]["workspace"]["request_id"] == retained_request
@@ -802,23 +856,21 @@ def test_reject_to_blocked_explicit_predecessor_pins_selection(coord):
     """Blocked disposition with an explicit predecessor_request_id must pin
     the rework_predecessor identically to the pending case."""
     retained_request = "retained-blocked-A"
-    retained_workspace = {
-        "request_id": retained_request,
-        "repo": str(coord),
-        "path": f"/tmp/aiworkhub-worktrees/{retained_request}/worktree",
-        "home": f"/tmp/aiworkhub-worktrees/{retained_request}/home",
-        "allowed_writes": ["src/x.py"],
-        "parent_baseline": {},
-        "workspace_baseline": {},
-    }
-    retained_hashes = {"src/x.py": "x" * 64}
+    task_id = "T_V2_BLOCKED_PIN"
+    retained_workspace = _strict_retained_workspace(
+        coord, task_id, retained_request, ["src/x.py"]
+    )
+    retained_hashes = {"src/x.py": "c" * 64}
     _insert(
         coord,
-        "T_V2_BLOCKED_PIN",
+        task_id,
         card={
+            "claim_epoch": 1,
             "rework_predecessor": {
                 "schema_id": "aiworkhub.rework_predecessor.v1",
                 "request_id": retained_request,
+                "task_id": task_id,
+                "claim_epoch": 1,
                 "workspace": retained_workspace,
                 "changed_path_hashes": retained_hashes,
                 "residual_identities": [],
@@ -844,14 +896,14 @@ def test_reject_to_blocked_explicit_predecessor_pins_selection(coord):
     )
 
     res = core.reject_review(
-        "T_V2_BLOCKED_PIN",
+        task_id,
         "blocked with explicit A",
         to="blocked",
         predecessor_request_id=retained_request,
     )
 
     assert res["ok"] is True, res
-    row = _row(coord, "T_V2_BLOCKED_PIN")
+    row = _row(coord, task_id)
     assert row["status"] == "blocked"
     assert row["worker_status"] == "blocked"
     card = json.loads(row["card_json"])
@@ -864,24 +916,23 @@ def test_reject_explicit_current_zero_diff_predecessor_matches_automatic_resolut
     coord,
 ):
     request_id = "zero-diff-current-request"
-    workspace = {
-        "request_id": request_id,
-        "repo": str(coord),
-        "path": f"/tmp/aiworkhub-worktrees/{request_id}/worktree",
-        "home": f"/tmp/aiworkhub-worktrees/{request_id}/home",
-        "allowed_writes": [],
-        "parent_baseline": {},
-        "workspace_baseline": {},
-    }
+    task_id = "T_V2_ZERO_DIFF_EXPLICIT"
+    workspace = _strict_retained_workspace(coord, task_id, request_id, [])
     _insert(
         coord,
-        "T_V2_ZERO_DIFF_EXPLICIT",
+        task_id,
         card={
+            "claim_epoch": 1,
             "terminal_review": {
+                "claim_epoch": 1,
                 "substatus": "review_ready",
                 "evidence": {
-                    "request_identity": {"request_id": request_id},
+                    "request_identity": {
+                        "request_id": request_id,
+                        "task_id": task_id,
+                    },
                     "workspace": workspace,
+                    "changed_paths": [],
                     "changed_path_hashes": {},
                 },
             },
@@ -889,14 +940,14 @@ def test_reject_explicit_current_zero_diff_predecessor_matches_automatic_resolut
     )
 
     result = core.reject_review(
-        "T_V2_ZERO_DIFF_EXPLICIT",
+        task_id,
         "repeat the read-only audit",
         to="pending",
         predecessor_request_id=request_id,
     )
 
     assert result["ok"] is True, result
-    card = json.loads(_row(coord, "T_V2_ZERO_DIFF_EXPLICIT")["card_json"])
+    card = json.loads(_row(coord, task_id)["card_json"])
     assert card["review_feedback"]["predecessor_request_id"] == request_id
     assert card["review_feedback"]["predecessor_changed_paths"] == []
     assert "terminal_review" not in card
@@ -1025,7 +1076,7 @@ def test_reject_foreign_predecessor_fails_closed(coord):
     )
 
     assert res["ok"] is False
-    assert "not found" in (res.get("stderr") or "")
+    assert res["stderr"] == "predecessor_request_id_stale:unknown-foreign-request"
     row = _row(coord, "T_V2_FOREIGN")
     assert row["status"] == "review"
 
@@ -1035,28 +1086,29 @@ def test_reject_adversarial_ab_preserves_green_a_when_b_rejected(coord):
     current validation_failed review.  Explicitly selecting A as predecessor
     must preserve A's workspace while B is rejected."""
     green_request = "green-candidate-A"
-    green_workspace = {
-        "request_id": green_request,
-        "repo": str(coord),
-        "path": f"/tmp/aiworkhub-worktrees/{green_request}/worktree",
-        "home": f"/tmp/aiworkhub-worktrees/{green_request}/home",
-        "allowed_writes": ["src/green.py"],
-        "parent_baseline": {},
-        "workspace_baseline": {},
-    }
-    green_hashes = {"src/green.py": "g" * 64}
+    task_id = "T_V2_AB"
+    green_workspace = _strict_retained_workspace(
+        coord, task_id, green_request, ["src/green.py"]
+    )
+    green_delta, green_hashes = _strict_delta_descriptor(
+        coord, task_id, green_request, "src/green.py", b"green A\n"
+    )
     # Previously green review cycle produced a rework_predecessor for A.
     # The current (B) terminal_review is validation_failed with its own
     # workspace evidence.
     _insert(
         coord,
-        "T_V2_AB",
+        task_id,
         card={
+            "claim_epoch": 1,
             "rework_predecessor": {
                 "schema_id": "aiworkhub.rework_predecessor.v1",
                 "request_id": green_request,
+                "task_id": task_id,
+                "claim_epoch": 1,
                 "workspace": green_workspace,
                 "changed_path_hashes": green_hashes,
+                "rework_delta": green_delta,
                 "residual_identities": [],
                 "pinned_at": "2026-07-19T00:00:00+00:00",
             },
@@ -1080,14 +1132,14 @@ def test_reject_adversarial_ab_preserves_green_a_when_b_rejected(coord):
     )
 
     res = core.reject_review(
-        "T_V2_AB",
+        task_id,
         "rework from green A",
         to="pending",
         predecessor_request_id=green_request,
     )
 
     assert res["ok"] is True, res
-    card = json.loads(_row(coord, "T_V2_AB")["card_json"])
+    card = json.loads(_row(coord, task_id)["card_json"])
     # Green A's workspace must be durably pinned, not B's
     assert card["rework_predecessor"]["request_id"] == green_request
     assert card["rework_predecessor"]["changed_path_hashes"] == green_hashes
@@ -1160,22 +1212,21 @@ def test_reject_blocked_after_validation_failed_defaults_to_current(coord):
 def test_reject_explicit_nonmatching_hash_fails_closed(coord):
     """A predecessor_request_id that matches a stored request_id but whose
     workspace request_id does not agree fails closed."""
+    task_id = "T_V2_HASH_MISMATCH"
+    mismatched_workspace = _strict_retained_workspace(
+        coord, task_id, "different-workspace-req", ["src/m.py"]
+    )
     _insert(
         coord,
-        "T_V2_HASH_MISMATCH",
+        task_id,
         card={
+            "claim_epoch": 1,
             "rework_predecessor": {
                 "schema_id": "aiworkhub.rework_predecessor.v1",
                 "request_id": "hash-mismatch-req",
-                "workspace": {
-                    "request_id": "different-workspace-req",
-                    "repo": str(coord),
-                    "path": "/tmp/aiworkhub-worktrees/different-workspace-req/worktree",
-                    "home": "/tmp/aiworkhub-worktrees/different-workspace-req/home",
-                    "allowed_writes": ["src/m.py"],
-                    "parent_baseline": {},
-                    "workspace_baseline": {},
-                },
+                "task_id": task_id,
+                "claim_epoch": 1,
+                "workspace": mismatched_workspace,
                 "changed_path_hashes": {},
                 "residual_identities": [],
                 "pinned_at": "2026-07-19T00:00:00+00:00",
@@ -1184,7 +1235,7 @@ def test_reject_explicit_nonmatching_hash_fails_closed(coord):
     )
 
     res = core.reject_review(
-        "T_V2_HASH_MISMATCH",
+        task_id,
         "x",
         to="pending",
         predecessor_request_id="hash-mismatch-req",
@@ -1195,25 +1246,22 @@ def test_reject_explicit_nonmatching_hash_fails_closed(coord):
 
 
 def test_reject_workspace_missing_changed_hashes_not_selected(coord):
-    """A predecessor with empty changed_path_hashes is not selectable --
-    the coordinator must not guess at workspace identity."""
+    """A predecessor with malformed changed_path_hashes is not selectable."""
+    task_id = "T_V2_EMPTY_HASHES"
+    request_id = "empty-hash-req"
+    workspace = _strict_retained_workspace(coord, task_id, request_id, [])
     _insert(
         coord,
-        "T_V2_EMPTY_HASHES",
+        task_id,
         card={
+            "claim_epoch": 1,
             "rework_predecessor": {
                 "schema_id": "aiworkhub.rework_predecessor.v1",
-                "request_id": "empty-hash-req",
-                "workspace": {
-                    "request_id": "empty-hash-req",
-                    "repo": str(coord),
-                    "path": "/tmp/aiworkhub-worktrees/empty-hash-req/worktree",
-                    "home": "/tmp/aiworkhub-worktrees/empty-hash-req/home",
-                    "allowed_writes": [],
-                    "parent_baseline": {},
-                    "workspace_baseline": {},
-                },
-                "changed_path_hashes": {},
+                "request_id": request_id,
+                "task_id": task_id,
+                "claim_epoch": 1,
+                "workspace": workspace,
+                "changed_path_hashes": None,
                 "residual_identities": [],
                 "pinned_at": "2026-07-19T00:00:00+00:00",
             },
@@ -1221,14 +1269,14 @@ def test_reject_workspace_missing_changed_hashes_not_selected(coord):
     )
 
     res = core.reject_review(
-        "T_V2_EMPTY_HASHES",
+        task_id,
         "x",
         to="pending",
-        predecessor_request_id="empty-hash-req",
+        predecessor_request_id=request_id,
     )
 
     assert res["ok"] is False
-    assert "not found" in (res.get("stderr") or "")
+    assert res["stderr"] == "predecessor_request_id_missing_hashes"
 
 
 def test_reject_none_predecessor_omission_is_not_empty_selection(coord):

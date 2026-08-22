@@ -11,7 +11,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import task_engine, task_store  # noqa: E402
+from aiworkhub import core, task_engine, task_store  # noqa: E402
 
 
 def _repo_with_task(tmp_path: Path, *, status: str = "processing") -> Path:
@@ -519,3 +519,378 @@ def test_disposition_reviewer_children_ignores_request_mismatched_sibling(
     assert sibling is not None
     assert sibling["status"] == "review"
     assert sibling["worker_status"] == "review"
+
+
+_VALID_HASH = "a" * 64
+_REQ_OLD = "req-validation-old"
+_REQ_NEW = "req-validation-new"
+
+
+def _validation_failed_card(
+    tmp_path: Path,
+    *,
+    request_id: str = _REQ_OLD,
+    task_id: str = "TASK_B891",
+    claim_epoch: int = 3,
+    changed_paths: list[str] | None = None,
+    hashes: dict[str, str] | None = None,
+    workspace: dict[str, object] | None = None,
+    repo_path: Path | None = None,
+    retain_workspace: bool = True,
+) -> dict[str, object]:
+    authority = (repo_path or tmp_path).resolve()
+    if workspace is None:
+        ws_dir = tmp_path / f"ws-{request_id}"
+        if retain_workspace:
+            ws_dir.mkdir(parents=True, exist_ok=True)
+        workspace = {
+            "path": str(ws_dir),
+            "repo": str(authority),
+            "request_id": request_id,
+            "task_id": task_id,
+        }
+    if changed_paths is None:
+        changed_paths = []
+    if hashes is None:
+        hashes = {path: _VALID_HASH for path in changed_paths}
+    return {
+        "task_id": task_id,
+        "claim_epoch": claim_epoch,
+        "terminal_review": {
+            "substatus": "validation_failed",
+            "claim_epoch": claim_epoch,
+            "evidence": {
+                "changed_paths": list(changed_paths),
+                "changed_path_hashes": dict(hashes),
+                "request_id": request_id,
+                "request_identity": {
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "runner": "codex_worker_b891",
+                    "topic": "task_mcp",
+                },
+                "workspace": workspace,
+            },
+        },
+    }
+
+
+def _resolve(card: dict[str, object], predecessor: str | None, tmp_path: Path):
+    return core._resolve_reject_review_predecessor(
+        card,
+        task_id="TASK_B891",
+        authority_repo=tmp_path.resolve(),
+        predecessor_request_id=predecessor,
+    )
+
+
+def test_reject_review_predecessor_omitted_keeps_implicit_selection(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=["out.txt"])
+    resolved, error = _resolve(card, None, tmp_path)
+    assert (resolved, error) == (None, None)
+
+
+def test_reject_review_predecessor_validation_failed_empty_changed_paths(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=[], hashes={})
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert error is None
+    assert resolved is not None
+    assert resolved["request_id"] == _REQ_OLD
+    assert resolved["changed_path_hashes"] == {}
+
+
+def test_reject_review_predecessor_validation_failed_nonempty_hashes(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=["out.txt"])
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert error is None
+    assert resolved is not None
+    assert resolved["request_id"] == _REQ_OLD
+    assert resolved["changed_path_hashes"] == {"out.txt": _VALID_HASH}
+
+
+def test_reject_review_predecessor_wrong_task_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, task_id="OTHER_TASK")
+    card["task_id"] = "TASK_B891"
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_task_mismatch:expected=TASK_B891:got=OTHER_TASK"
+
+
+def test_reject_review_predecessor_wrong_repo_fails_closed(tmp_path: Path) -> None:
+    other = tmp_path / "other-repo"
+    other.mkdir()
+    card = _validation_failed_card(tmp_path, repo_path=other)
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_repo_mismatch"
+
+
+def test_reject_review_predecessor_claim_epoch_mismatch_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, claim_epoch=2)
+    card["claim_epoch"] = 4
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_claim_epoch_mismatch:expected=4:got=2"
+
+
+def test_reject_review_predecessor_missing_hashes_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=["out.txt"], hashes={})
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_missing_hashes"
+
+
+@pytest.mark.parametrize(
+    "changed_paths",
+    [None, {}, ("out.txt",), [1], ["out.txt", "out.txt"], ["/etc/passwd"], ["../secret"]],
+)
+def test_reject_review_predecessor_malformed_changed_paths_fail_closed(
+    tmp_path: Path, changed_paths: object
+) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=[], hashes={})
+    card["terminal_review"]["evidence"]["changed_paths"] = changed_paths
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_missing_hashes"
+
+
+def test_reject_review_predecessor_unretained_workspace_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(
+        tmp_path,
+        changed_paths=["out.txt"],
+        retain_workspace=False,
+    )
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_workspace_unretained"
+
+
+def test_reject_review_predecessor_stale_request_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, request_id=_REQ_NEW)
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == f"predecessor_request_id_stale:{_REQ_OLD}"
+
+
+def test_reject_review_predecessor_malformed_id_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path)
+    resolved, error = _resolve(card, "not a valid id", tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_malformed:not a valid id"
+
+
+def test_reject_review_predecessor_empty_id_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path)
+    resolved, error = _resolve(card, "", tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id must be a non-empty request id or omitted"
+
+
+def test_reject_review_predecessor_never_falls_back_to_newer_request(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, request_id=_REQ_NEW, changed_paths=["out.txt"])
+    card["rework_predecessor"] = {
+        "request_id": _REQ_OLD,
+        "task_id": "TASK_B891",
+        "claim_epoch": 3,
+        "workspace": {
+            "path": str(tmp_path / "missing-old"),
+            "repo": str(tmp_path.resolve()),
+            "request_id": _REQ_OLD,
+            "task_id": "TASK_B891",
+        },
+        "changed_path_hashes": {"out.txt": _VALID_HASH},
+    }
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_workspace_unretained"
+
+
+def test_reject_review_predecessor_missing_identity_task_id_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=[])
+    del card["terminal_review"]["evidence"]["request_identity"]["task_id"]
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_missing_task_id"
+
+
+def test_reject_review_predecessor_missing_identity_request_id_fails_closed(
+    tmp_path: Path,
+) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=[], hashes={})
+    del card["terminal_review"]["evidence"]["request_identity"]["request_id"]
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == f"predecessor_request_id {_REQ_OLD} not found in retained review evidence"
+
+
+def test_reject_review_predecessor_mismatched_identity_request_id_fails_closed(
+    tmp_path: Path,
+) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=[], hashes={})
+    card["terminal_review"]["evidence"]["request_identity"]["request_id"] = _REQ_NEW
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == f"predecessor_request_id_stale:{_REQ_OLD}"
+
+
+def test_reject_review_predecessor_missing_workspace_repo_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=[])
+    del card["terminal_review"]["evidence"]["workspace"]["repo"]
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_repo_mismatch"
+
+
+def test_reject_review_predecessor_missing_workspace_request_id_fails_closed(
+    tmp_path: Path,
+) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=[])
+    del card["terminal_review"]["evidence"]["workspace"]["request_id"]
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == f"predecessor_request_id {_REQ_OLD} not found in retained review evidence"
+
+
+def test_reject_review_predecessor_missing_workspace_task_id_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=[])
+    del card["terminal_review"]["evidence"]["workspace"]["task_id"]
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_missing_task_id"
+
+
+def test_reject_review_predecessor_bool_claim_epoch_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=[])
+    card["terminal_review"]["claim_epoch"] = True
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_claim_epoch_mismatch:expected=3:got=True"
+
+
+def test_reject_review_predecessor_mismatched_file_fails_closed(tmp_path: Path) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=["out.txt"])
+    workspace = Path(str(card["terminal_review"]["evidence"]["workspace"]["path"]))
+    (workspace / "out.txt").write_text("not-the-declared-digest", encoding="utf-8")
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert error is None
+    assert resolved is not None
+    assert resolved["changed_path_hashes"] == {"out.txt": _VALID_HASH}
+
+
+def _seed_validation_failed_review(
+    tmp_path: Path,
+    *,
+    changed_paths: list[str],
+    request_id: str = _REQ_OLD,
+    hashes: dict[str, str] | None = None,
+) -> Path:
+    repo = _repo_with_task(tmp_path, status="review")
+    _readiness, db_path = task_store._require_ready(repo)
+    card = _validation_failed_card(
+        tmp_path,
+        request_id=request_id,
+        changed_paths=changed_paths,
+        hashes=hashes,
+        repo_path=repo,
+    )
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET status='review', worker_status='review', card_json=? "
+            "WHERE task_id=?",
+            (json.dumps(card), "TASK_B891"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return repo
+
+
+def _patch_reject_review(monkeypatch: pytest.MonkeyPatch, repo: Path) -> None:
+    monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(repo.resolve()))
+    monkeypatch.setenv("AIWORKHUB_REPO", str(repo.resolve()))
+    monkeypatch.setattr(core, "_canonical_write_gate", lambda *args, **kwargs: None)
+    monkeypatch.setattr(core, "_verified_manager_actor", lambda: "codex")
+    monkeypatch.setattr(core, "_reconcile_retained_workspaces", lambda result: result)
+    monkeypatch.setattr(core, "_PROCESS_REPO_ROOT_OVERRIDE", repo.resolve())
+
+
+def test_reject_review_exact_predecessor_completes_validation_failed_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _seed_validation_failed_review(tmp_path, changed_paths=[])
+    _patch_reject_review(monkeypatch, repo)
+    result = core.reject_review(
+        "TASK_B891",
+        "rework validation",
+        predecessor_request_id=_REQ_OLD,
+    )
+    assert result["ok"] is True
+    card = task_store.get_task(repo, "TASK_B891")
+    assert card is not None
+    assert card["status"] == "pending"
+    assert card["review_feedback"]["predecessor_request_id"] == _REQ_OLD
+
+
+def test_reject_review_exact_predecessor_completes_validation_failed_nonempty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _seed_validation_failed_review(tmp_path, changed_paths=["out.txt"])
+    _patch_reject_review(monkeypatch, repo)
+    result = core.reject_review(
+        "TASK_B891",
+        "rework validation",
+        predecessor_request_id=_REQ_OLD,
+    )
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_missing_delta"
+    card = task_store.get_task(repo, "TASK_B891")
+    assert card is not None
+    assert card["status"] == "review"
+    assert "rework_predecessor" not in card
+
+
+def test_reject_review_exact_predecessor_missing_delta_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    payload = b"retained-candidate"
+    digest = hashlib.sha256(payload).hexdigest()
+    repo = _seed_validation_failed_review(
+        tmp_path,
+        changed_paths=["out.txt"],
+        hashes={"out.txt": digest},
+    )
+    (tmp_path / f"ws-{_REQ_OLD}" / "out.txt").write_bytes(payload)
+    _patch_reject_review(monkeypatch, repo)
+    result = core.reject_review(
+        "TASK_B891",
+        "rework validation",
+        predecessor_request_id=_REQ_OLD,
+    )
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_missing_delta"
+    card = task_store.get_task(repo, "TASK_B891")
+    assert card is not None
+    assert card["status"] == "review"
+    assert "rework_predecessor" not in card
+
+
+def test_reject_review_exact_predecessor_does_not_select_newer_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _seed_validation_failed_review(
+        tmp_path, changed_paths=["out.txt"], request_id=_REQ_NEW
+    )
+    _patch_reject_review(monkeypatch, repo)
+    result = core.reject_review(
+        "TASK_B891",
+        "rework validation",
+        predecessor_request_id=_REQ_OLD,
+    )
+    assert result["ok"] is False
+    assert result["stderr"] == f"predecessor_request_id_stale:{_REQ_OLD}"
+    card = task_store.get_task(repo, "TASK_B891")
+    assert card is not None
+    assert card["status"] == "review"

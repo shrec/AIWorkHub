@@ -2536,6 +2536,241 @@ async function nf169WorkerSourceGraphAck() {
   assert.strictEqual(contextlessCalls[0].name, "aiworkhub_worker_source_graph_query");
 }
 
+async function nf383McpFirstCallReadinessChecks() {
+  const requestId = "e".repeat(32);
+  const durableReceipt = { ok: true, durable: true, content: "graph" };
+  const finalResponse = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "readiness",
+    edits: [],
+    creates: [],
+  });
+  const workerSg = "aiworkhub_worker_source_graph_query";
+  const bindReady = () => internals.bindVscodeLmProviderBridgeForTest({
+    mcpClient: { repositoryRoot: "/tmp/nf383-repo" },
+    activeRepoIdentity: { root: "/tmp/nf383-repo" },
+  });
+  const collector = () => internals.createVscodeLmStagedEditCollector({
+    allowedWrites: ["out/result.json"],
+    path_contracts: {
+      "out/result.json": {
+        action: "create",
+        current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        line_count: 0,
+        parent_existed: false,
+      },
+    },
+  });
+  const runProtocol = async (kind, toolName, input, invokeTool, requestKind = "worker", extra = {}) => {
+    const request = {
+      requestId,
+      request_kind: requestKind,
+      prompt: "readiness",
+      allowedWrites: extra.allowedWrites || [],
+      path_contracts: extra.path_contracts || {},
+      initial_source_graph_request: extra.initial_source_graph_request,
+      initial_source_graph_result: extra.initial_source_graph_result,
+    };
+    if (kind === "text") {
+      const queued = [
+        JSON.stringify({
+          schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+          name: toolName,
+          input,
+        }),
+        extra.finalResponse || finalResponse,
+      ];
+      const model = {
+        capabilities: { toolCalling: false },
+        sendRequest: async () => ({
+          stream: (async function* stream() { yield { value: queued.shift() }; }()),
+        }),
+      };
+      return internals.runVscodeLmTextProtocol(model, request, undefined, invokeTool);
+    }
+    let turn = 0;
+    const model = {
+      capabilities: { toolCalling: true },
+      sendRequest: async () => {
+        turn += 1;
+        if (turn === 1) {
+          return {
+            stream: (async function* stream() {
+              yield { callId: "nf383-1", name: toolName, input };
+            }()),
+          };
+        }
+        return {
+          stream: (async function* stream() { yield { value: extra.finalResponse || finalResponse }; }()),
+        };
+      },
+    };
+    return internals.runVscodeLmAgent(model, request, undefined, invokeTool);
+  };
+
+  try {
+    for (const kind of ["native", "text"]) {
+      internals.resetVscodeLmWorkerSourceGraphReadinessForTest();
+      internals.armVscodeLmProviderBridgeReadiness({ forceWaitForTest: true });
+      internals.setVscodeLmWorkerSourceGraphReadyTimeoutMsForTest(200);
+      const successCalls = [];
+      const bindTimer = setTimeout(bindReady, 15);
+      const successResult = await runProtocol(
+        kind,
+        workerSg,
+        { mode: "focus", query: `nf383-${kind}-success` },
+        async (call) => {
+          successCalls.push(call.name);
+          return durableReceipt;
+        },
+      );
+      clearTimeout(bindTimer);
+      assert.strictEqual(successResult, finalResponse);
+      assert.deepStrictEqual(successCalls, [workerSg]);
+
+      internals.resetVscodeLmWorkerSourceGraphReadinessForTest();
+      internals.armVscodeLmProviderBridgeReadiness({ forceWaitForTest: true });
+      internals.setVscodeLmWorkerSourceGraphReadyTimeoutMsForTest(50);
+      const failCalls = [];
+      const failStarted = Date.now();
+      await assert.rejects(
+        runProtocol(
+          kind,
+          workerSg,
+          { mode: "focus", query: `nf383-${kind}-fail` },
+          async (call) => {
+            failCalls.push(call.name);
+            return durableReceipt;
+          },
+        ),
+        /vscode_lm_(mcp_unavailable|source_graph_not_acknowledged)/,
+      );
+      assert.deepStrictEqual(failCalls, []);
+      assert.ok(Date.now() - failStarted >= 40);
+
+      const laterCalls = [];
+      const laterStarted = Date.now();
+      await assert.rejects(
+        internals.invokeVscodeLmProtocolTool(
+          { name: workerSg, input: { mode: "focus", query: `nf383-${kind}-later` } },
+          requestId,
+          async (call) => {
+            laterCalls.push(call.name);
+            return durableReceipt;
+          },
+          collector(),
+        ),
+        /vscode_lm_mcp_unavailable/,
+      );
+      assert.deepStrictEqual(laterCalls, []);
+      assert.ok(Date.now() - laterStarted < 40);
+
+      internals.resetVscodeLmWorkerSourceGraphReadinessForTest();
+      internals.armVscodeLmProviderBridgeReadiness({ forceWaitForTest: true });
+      internals.setVscodeLmWorkerSourceGraphReadyTimeoutMsForTest(200);
+      const writePrefetch = {
+        initial_source_graph_request: { mode: "focus", query: `nf383-${kind}-prefetch` },
+        initial_source_graph_result: { ok: true, content: "prefetched graph" },
+      };
+      for (const [toolName, requestKind, input, extra] of [
+        ["aiworkhub_manager_source_graph_query", "manager", { mode: "focus", query: `nf383-${kind}-manager` }, {}],
+        ["aiworkhub_worker_session_write_intent", "worker", { action: "upsert", content: "x", idempotency_key: "k", provenance: "test" }, writePrefetch],
+      ]) {
+        const exclusionCalls = [];
+        const exclusionStarted = Date.now();
+        await runProtocol(
+          kind,
+          toolName,
+          input,
+          async (call) => {
+            exclusionCalls.push(call.name);
+            return durableReceipt;
+          },
+          requestKind,
+          extra,
+        );
+        assert.ok(Date.now() - exclusionStarted < 80, `${kind} ${toolName} waited for worker SG readiness`);
+        assert.deepStrictEqual(exclusionCalls, [toolName]);
+      }
+      const stageCalls = [];
+      const stageStarted = Date.now();
+      await internals.invokeVscodeLmProtocolTool(
+        {
+          name: "aiworkhub_manager_semantic_edit_stage",
+          input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+        },
+        requestId,
+        async (call) => {
+          stageCalls.push(call.name);
+          return durableReceipt;
+        },
+        collector(),
+      );
+      assert.ok(Date.now() - stageStarted < 80, `${kind} stage waited for worker SG readiness`);
+      assert.deepStrictEqual(stageCalls, []);
+    }
+
+    internals.resetVscodeLmWorkerSourceGraphReadinessForTest();
+    internals.armVscodeLmProviderBridgeReadiness({ forceWaitForTest: true });
+    internals.setVscodeLmWorkerSourceGraphReadyTimeoutMsForTest(50);
+    await assert.rejects(
+      internals.invokeVscodeLmProtocolTool(
+        { name: workerSg, input: { mode: "focus", query: "nf383-direct-fail" } },
+        requestId,
+        async () => durableReceipt,
+        collector(),
+      ),
+      /vscode_lm_mcp_unavailable/,
+    );
+
+    internals.resetVscodeLmWorkerSourceGraphReadinessForTest();
+    let privateCalls = 0;
+    internals.bindVscodeLmProviderBridgeForTest({
+      mcpClient: {
+        repositoryRoot: "/tmp/nf383-a",
+        callTool: async () => {
+          privateCalls += 1;
+          return durableReceipt;
+        },
+      },
+      activeRepoIdentity: { root: "/tmp/nf383-b" },
+    });
+    await assert.rejects(
+      internals.invokeVscodeLmProtocolTool(
+        { name: workerSg, input: { mode: "focus", query: "nf383-mismatch" } },
+        requestId,
+        internals.invokeVscodeLmPrivateTool,
+        collector(),
+      ),
+      /vscode_lm_mcp_repo_mismatch/,
+    );
+    assert.strictEqual(privateCalls, 0);
+
+    internals.resetVscodeLmWorkerSourceGraphReadinessForTest();
+    const host = new internals.VscodeLmBridgeHost({});
+    await host.start({ repoId: `repo_${"a".repeat(32)}`, root: "/tmp/nf383-host" });
+    internals.armVscodeLmProviderBridgeReadiness({ forceWaitForTest: true });
+    internals.setVscodeLmWorkerSourceGraphReadyTimeoutMsForTest(200);
+    const hostCalls = [];
+    const hostTimer = setTimeout(bindReady, 15);
+    const hostResult = await internals.invokeVscodeLmProtocolTool(
+      { name: workerSg, input: { mode: "focus", query: "nf383-host-arm" } },
+      requestId,
+      async (call) => {
+        hostCalls.push(call.name);
+        return durableReceipt;
+      },
+      collector(),
+    );
+    clearTimeout(hostTimer);
+    host.stop();
+    assert.deepStrictEqual(hostResult, durableReceipt);
+    assert.deepStrictEqual(hostCalls, [workerSg]);
+  } finally {
+    internals.resetVscodeLmWorkerSourceGraphReadinessForTest();
+  }
+}
+
 // NF-2026-00169: contextless worker native protocol regression test.
 // A worker request with no initial source graph context (null prefetch)
 // must correctly acknowledge the worker SG tool on the native path,
@@ -3417,6 +3652,7 @@ async function main() {
   await cancellationToolBoundaryChecks();
   await nf168ProviderHistoryValidation();
   await nf169WorkerSourceGraphAck();
+  await nf383McpFirstCallReadinessChecks();
   await nf168ForceFinalCallIdPairing();
   await nf169AuthorityRejection();
   await nf168ValidateProviderHistoryUnit();

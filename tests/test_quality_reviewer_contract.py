@@ -8,6 +8,287 @@ from pathlib import Path
 
 import pytest
 
+
+_R4_KEY = b"r4-audit-ledger-key"
+
+
+def _r4_signed_line(
+    entry: dict[str, object], *, key: bytes = _R4_KEY, tamper: bool = False
+) -> str:
+    body = dict(entry)
+    digest = "0" * 64 if tamper else worker_tools._hmac_entry(body, key)
+    return json.dumps(
+        {**body, "hmac_sha256": digest}, ensure_ascii=False, sort_keys=True
+    ) + "\n"
+
+
+def _r4_ledger(tmp_path: Path, lines: list[str]) -> tuple[Path, Path]:
+    key_path = tmp_path / "r4_audit_hmac.key"
+    key_path.write_bytes(_R4_KEY)
+    ledger = tmp_path / "r4_audit_ledger.jsonl"
+    ledger.write_text("".join(lines), encoding="utf-8")
+    return ledger, key_path
+
+
+def _r4_entry(
+    payload: dict[str, object] | None = None, **extra: object
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "schema_id": worker_tools.AUDIT_ENTRY_SCHEMA_ID,
+        "task_id": "TARGET_TASK_1",
+        "runner": "glm-5.3",
+        "topic": "review_reliability",
+        "request_id": "target-request-1",
+        "tool": "quality_review_submit",
+        "ok": True,
+        "cache_hit": False,
+        "hit_count": 1,
+        "bytes_returned": 256,
+        "violation": "",
+        "authority_source": "rework_overlay",
+        "authority_state": "request_scoped_worktree",
+        "authority_repo": "/home/shrek/AIWorkHub",
+    }
+    if payload is not None:
+        entry["payload"] = dict(payload)
+    entry.update(extra)
+    return entry
+
+
+def _r4_verify(ledger: Path, key_path: Path) -> dict[str, object]:
+    return worker_tools.verify_audit_ledger(
+        ledger,
+        key_path,
+        task_id="TARGET_TASK_1",
+        runner="glm-5.3",
+        topic="review_reliability",
+    )
+
+
+def _r4_finding(payload: object) -> object:
+    if isinstance(payload, dict):
+        return payload.get("finding", payload)
+    return payload
+
+
+def test_finding_input_normalizer_json_object_string_normalizes_once(
+    tmp_path: Path,
+) -> None:
+    string_finding = {
+        "id": "string-finding",
+        "severity": "high",
+        "summary": "gate",
+        "evidence": "src/aiworkhub/core.py:7",
+        "path": "src/aiworkhub/core.py",
+        "line_start": 7,
+        "line_end": 7,
+        "symbol": "src/aiworkhub/core.py.target",
+        "confidence": "high",
+        "evidence_level": "reproduced",
+        "required_validation": "run the focused regression",
+    }
+    object_finding = {**string_finding, "id": "object-finding"}
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+    result = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[json.dumps(string_finding, sort_keys=True), object_finding],
+    )
+    assert result["ok"] is True, result
+    report = worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    findings = report["verified_payloads"][0]["report"]["findings"]
+    assert len(findings) == 2
+    assert [item["summary"] for item in findings] == ["gate", "gate"]
+
+
+def test_finding_input_normalizer_rejects_malformed_scalar_nested_double_encoded(
+    tmp_path: Path,
+) -> None:
+    bad_values = [
+        "{not-json",
+        "42",
+        json.dumps(json.dumps({"severity": "high"})),
+        json.dumps([{"severity": "high"}]),
+    ]
+    for index, bad in enumerate(bad_values):
+        case = tmp_path / str(index)
+        case.mkdir()
+        packet = _packet()
+        packet_path = case / "review_packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        ctx = _worker_context(case, packet_path)
+        result = worker_tools.quality_review_submit(
+            ctx,
+            packet_sha256=str(packet["packet_sha256"]),
+            lens="correctness",
+            findings=[bad],
+        )
+        assert result["ok"] is False
+        assert result["reason"] == "finding_json_object_string_invalid"
+        report = worker_tools.verify_audit_ledger(
+            ctx.audit_ledger_path,
+            ctx.audit_hmac_key_path,
+            task_id=ctx.task_id,
+            runner=ctx.runner,
+            topic=ctx.topic,
+            request_id=ctx.request_id,
+        )
+        assert report["verified_payloads"] == []
+
+
+def test_forged_or_wrong_identity_rejections_never_satisfy_nonempty_finding_gate(
+    tmp_path: Path,
+) -> None:
+    finding = json.dumps(
+        {"severity": "high", "summary": "forged", "evidence": "exact line"}
+    )
+    ledger, key_path = _r4_ledger(
+        tmp_path,
+        [
+            _r4_signed_line(
+                _r4_entry(payload={"finding": finding, "intent": "reject"}),
+                tamper=True,
+            ),
+            _r4_signed_line(
+                _r4_entry(payload={"finding": finding}, task_id="OTHER_TASK_1")
+            ),
+        ],
+    )
+    report = _r4_verify(ledger, key_path)
+    assert report["entries_tampered"] == 1
+    assert report["entries_verified"] == 0
+    assert report["verified_payloads"] == []
+
+
+def test_rejected_nonempty_intent_then_valid_leaves_one_verified_payload(
+    tmp_path: Path,
+) -> None:
+    finding = {
+        "id": "late-finding",
+        "severity": "medium",
+        "summary": "late",
+        "evidence": "src/aiworkhub/core.py:7",
+        "path": "src/aiworkhub/core.py",
+        "line_start": 7,
+        "line_end": 7,
+        "symbol": "src/aiworkhub/core.py.target",
+        "confidence": "high",
+        "evidence_level": "reproduced",
+        "required_validation": "run the focused regression",
+    }
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+    rejected = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=["{not-json"],
+    )
+    assert rejected["ok"] is False
+    accepted = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[dict(finding)],
+    )
+    assert accepted["ok"] is True, accepted
+    report = worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    payloads = report["verified_payloads"]
+    assert len(payloads) == 1
+    assert payloads[0]["report"]["findings"][0]["summary"] == "late"
+
+
+def test_rejected_nonempty_intent_then_empty_finding_fails_closed(
+    tmp_path: Path,
+) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+    rejected = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=["{not-json"],
+    )
+    assert rejected["ok"] is False
+    empty = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[],
+    )
+    assert empty == {
+        "ok": False,
+        "tool": "quality_review_submit",
+        "reason": "quality_review_empty_after_rejected_intent",
+        "rejected_intent_authenticated": True,
+        "rejected_intent_sha256": empty["rejected_intent_sha256"],
+    }
+    report = worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    assert report["verified_payloads"] == []
+
+
+def test_invalid_hmac_forged_counts_every_line_regardless_of_payload_shape(
+    tmp_path: Path,
+) -> None:
+    shapes = [
+        {"finding": {"severity": "high", "summary": "s", "evidence": "e"}},
+        {"finding": json.dumps({"severity": "high", "summary": "s"})},
+        {"finding": "{not-json"},
+        {"finding": "42"},
+        {"finding": json.dumps(json.dumps({"severity": "high"}))},
+        {},
+    ]
+    ledger, key_path = _r4_ledger(
+        tmp_path,
+        [
+            *[
+                _r4_signed_line(_r4_entry(payload=dict(shape)), tamper=True)
+                for shape in shapes
+            ],
+            _r4_signed_line(
+                _r4_entry(
+                    payload={
+                        "finding": json.dumps(
+                            {"severity": "low", "summary": "s", "evidence": "e"}
+                        )
+                    }
+                )
+            ),
+        ],
+    )
+    report = _r4_verify(ledger, key_path)
+    assert report["entries_tampered"] == len(shapes)
+    assert len(report["verified_payloads"]) == 1
+
 from aiworkhub import quality_reviewer as qr
 from aiworkhub import process_launcher
 from aiworkhub import worker_ai_tools_mcp as worker_tools
