@@ -15,7 +15,7 @@ FIFO order the rest of AIWorkHub's queue already implies.
 
 import fnmatch
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
@@ -24,7 +24,305 @@ _GLOB_CHARS = frozenset("*?[")
 FINISHED_STATES = frozenset({"finished"})
 RETAINED_STATES = frozenset({"processing", "review"})
 ACTIVE_STATES = frozenset({"pending", "processing", "review"})
+TERMINAL_TARGET_STATUSES = frozenset({"accepted", "finished"})
+REOPEN_WITHOUT_SUCCESSOR_STATUSES = frozenset({
+    "cancelled",
+    "canceled",
+    "superseded",
+})
+REWORK_OR_UNRESOLVED_STATUSES = frozenset({
+    "rework",
+    "rework_required",
+    "unresolved",
+})
+MAX_TERMINAL_ARTIFACT_ROWS = 200
 _MAX_DEPENDS_ON = 64
+
+
+def _norm_status(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    if token in {"done", "completed", "stale_already_done"}:
+        return "finished"
+    return token
+
+
+def is_terminal_target_status(status: Any) -> bool:
+    return _norm_status(status) in TERMINAL_TARGET_STATUSES
+
+
+def is_rework_or_unresolved_status(status: Any) -> bool:
+    return _norm_status(status) in REWORK_OR_UNRESOLVED_STATUSES
+
+
+def card_status_evidence(card: Mapping[str, Any] | None) -> str:
+    if not isinstance(card, Mapping):
+        return ""
+    archive_op = _norm_status(card.get("archive_operation"))
+    if archive_op in REOPEN_WITHOUT_SUCCESSOR_STATUSES:
+        return archive_op
+    if (
+        str(card.get("accepted_request_id") or "").strip()
+        and str(card.get("accepted_by") or "").strip()
+        and str(card.get("accepted_at") or "").strip()
+        and isinstance(card.get("accept_evidence"), Mapping)
+    ):
+        return "accepted"
+    for key in ("status", "worker_status"):
+        token = _norm_status(card.get(key))
+        if (
+            is_terminal_target_status(token)
+            or is_rework_or_unresolved_status(token)
+            or token in REOPEN_WITHOUT_SUCCESSOR_STATUSES
+        ):
+            return token
+    return _norm_status(card.get("status"))
+
+
+def _as_mapping(value: Any) -> Mapping[str, Any] | None:
+    return value if isinstance(value, Mapping) else None
+
+
+def is_valid_task_id(value: Any) -> bool:
+    return bool(_TASK_ID_RE.fullmatch(str(value or "").strip()))
+
+
+def successor_task_id(card: Mapping[str, Any] | None) -> str:
+    if not isinstance(card, Mapping):
+        return ""
+    if str(card.get("archive_operation") or "").strip().lower() != "superseded":
+        return ""
+    replacement = str(card.get("superseded_by") or "").strip()
+    if replacement:
+        return replacement if is_valid_task_id(replacement) else ""
+    reason = str(card.get("archive_reason") or "")
+    if reason.startswith("superseded_by:"):
+        candidate = reason.removeprefix("superseded_by:").split(";", 1)[0].strip()
+        return candidate if is_valid_task_id(candidate) else ""
+    return ""
+
+
+def enqueue_unknown_task_id(
+    task_id: Any,
+    *,
+    known_ids: Mapping[str, Any],
+    seen: set[str],
+    pending: list[str],
+    limit: int = MAX_TERMINAL_ARTIFACT_ROWS,
+) -> bool:
+    tid = str(task_id or "").strip()
+    if not tid or not is_valid_task_id(tid) or tid in known_ids or tid in seen:
+        return True
+    if len(seen) >= limit:
+        return False
+    seen.add(tid)
+    pending.append(tid)
+    return True
+
+
+def has_landed_successor(
+    card: Mapping[str, Any] | None,
+    cards_by_id: Mapping[str, Mapping[str, Any]] | None,
+) -> bool:
+    if not isinstance(card, Mapping) or cards_by_id is None:
+        return False
+    seen: set[str] = set()
+    current: Mapping[str, Any] = card
+    for _ in range(MAX_TERMINAL_ARTIFACT_ROWS):
+        successor_id = successor_task_id(current)
+        if not successor_id or successor_id in seen:
+            return False
+        seen.add(successor_id)
+        successor = cards_by_id.get(successor_id)
+        if not isinstance(successor, Mapping):
+            return False
+        status = card_status_evidence(successor)
+        if is_terminal_target_status(status):
+            return True
+        if status in REOPEN_WITHOUT_SUCCESSOR_STATUSES:
+            current = successor
+            continue
+        return False
+    return False
+
+
+def exact_artifact_target(card: Mapping[str, Any]) -> tuple[str, str, str]:
+    quality = _as_mapping(card.get("quality_review"))
+    terminal = _as_mapping(card.get("terminal_review"))
+    terminal_evidence = _as_mapping(terminal.get("evidence") if terminal else None)
+    terminal_quality = _as_mapping(
+        terminal_evidence.get("quality_review") if terminal_evidence else None
+    )
+    implementation = _as_mapping(card.get("implementation"))
+    retry_target = _as_mapping(card.get("retry_target"))
+    if quality:
+        target_id = str(quality.get("target_task_id") or "").strip()
+        if target_id:
+            return target_id, _norm_status(quality.get("target_status")), "reviewer"
+    if terminal_quality:
+        target_id = str(terminal_quality.get("target_task_id") or "").strip()
+        if target_id:
+            return (
+                target_id,
+                _norm_status(terminal_quality.get("target_status")),
+                "reviewer",
+            )
+    if implementation:
+        target_id = str(implementation.get("target_task_id") or "").strip()
+        if target_id:
+            return (
+                target_id,
+                _norm_status(implementation.get("target_status")),
+                "implementation",
+            )
+    if retry_target:
+        target_id = str(
+            retry_target.get("target_task_id") or retry_target.get("task_id") or ""
+        ).strip()
+        if target_id:
+            kind = _norm_status(retry_target.get("kind"))
+            if kind not in {"reviewer", "implementation"}:
+                kind = "implementation"
+            return target_id, _norm_status(retry_target.get("target_status")), kind
+    return "", "", ""
+
+
+def prefetch_unknown_terminal_cards(
+    cards: Sequence[Mapping[str, Any]],
+    cards_by_id: dict[str, Any],
+    load_one,
+    *,
+    limit: int = MAX_TERMINAL_ARTIFACT_ROWS,
+) -> bool:
+    pending: list[str] = []
+    seen: set[str] = set()
+    complete = True
+
+    def enqueue(task_id: Any) -> None:
+        nonlocal complete
+        if not enqueue_unknown_task_id(
+            task_id,
+            known_ids=cards_by_id,
+            seen=seen,
+            pending=pending,
+            limit=limit,
+        ):
+            complete = False
+
+    seeds: list[Mapping[str, Any]] = [
+        card for card in cards if isinstance(card, Mapping)
+    ]
+    for known in list(cards_by_id.values()):
+        if isinstance(known, Mapping):
+            seeds.append(known)
+    for card in seeds:
+        target_id, _recorded, _kind = exact_artifact_target(card)
+        enqueue(target_id)
+        enqueue(successor_task_id(card))
+        known = cards_by_id.get(target_id) if target_id else None
+        if isinstance(known, Mapping):
+            enqueue(successor_task_id(known))
+
+    while pending:
+        pending.sort()
+        batch = pending
+        pending = []
+        for target_id in batch:
+            if target_id in cards_by_id:
+                continue
+            found = load_one(target_id)
+            if not isinstance(found, Mapping):
+                cards_by_id[target_id] = None
+                continue
+            cards_by_id[target_id] = found
+            enqueue(successor_task_id(found))
+    return complete
+
+
+def evaluate_terminal_artifact(
+    card: Mapping[str, Any],
+    cards_by_id: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    target_id, _recorded_status, kind = exact_artifact_target(card)
+    if not target_id or cards_by_id is None:
+        return None
+    candidate = cards_by_id.get(target_id)
+    if not isinstance(candidate, Mapping):
+        return None
+    target_status = card_status_evidence(candidate)
+    if is_rework_or_unresolved_status(target_status):
+        return None
+    if target_status in REOPEN_WITHOUT_SUCCESSOR_STATUSES:
+        if not has_landed_successor(candidate, cards_by_id):
+            return None
+    elif not is_terminal_target_status(target_status):
+        return None
+    return {
+        "task_id": str(card.get("task_id") or "").strip(),
+        "target_task_id": target_id,
+        "target_status": target_status,
+        "artifact_kind": kind,
+        "reason": "exact_target_terminal",
+    }
+
+
+def _terminal_artifact_state(
+    cards: Sequence[Mapping[str, Any]],
+    cards_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    by_id = cards_by_id
+    if by_id is None:
+        by_id = {
+            str(card.get("task_id") or ""): card
+            for card in cards
+            if isinstance(card, Mapping) and card.get("task_id")
+        }
+    rows: list[dict[str, Any]] = []
+    excluded: set[str] = set()
+    seen: set[str] = set()
+    for card in cards:
+        if not isinstance(card, Mapping):
+            continue
+        row = evaluate_terminal_artifact(card, by_id)
+        if row is None:
+            continue
+        task_id = str(row.get("task_id") or "").strip()
+        excluded.add(task_id)
+        key = task_id or f"{row['target_task_id']}:{row['artifact_kind']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
+    rows.sort(
+        key=lambda item: (
+            str(item.get("task_id") or ""),
+            str(item.get("target_task_id") or ""),
+        )
+    )
+    return rows, excluded
+
+
+def collect_terminal_artifacts(
+    cards: Sequence[Mapping[str, Any]],
+    cards_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    rows, _excluded = _terminal_artifact_state(cards, cards_by_id)
+    return rows[:MAX_TERMINAL_ARTIFACT_ROWS]
+
+
+def terminal_artifact_exclusion_ids(
+    cards: Sequence[Mapping[str, Any]],
+    cards_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+) -> set[str]:
+    _rows, excluded = _terminal_artifact_state(cards, cards_by_id)
+    return excluded
+
+
+def terminal_artifact_projection(
+    cards: Sequence[Mapping[str, Any]],
+    cards_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    rows, excluded = _terminal_artifact_state(cards, cards_by_id)
+    return rows[:MAX_TERMINAL_ARTIFACT_ROWS], excluded
 
 
 class TaskPlanError(ValueError):
@@ -32,21 +330,7 @@ class TaskPlanError(ValueError):
 
 
 def _superseded_replacement(card: dict[str, Any]) -> str:
-    """Return the explicit replacement id for one archived superseded card.
-
-    New cards persist ``superseded_by`` as structured audit metadata.  The
-    bounded ``archive_reason`` prefix remains a compatibility source for
-    cards archived before that field existed.
-    """
-    if str(card.get("archive_operation") or "").strip().lower() != "superseded":
-        return ""
-    replacement = str(card.get("superseded_by") or "").strip()
-    if replacement:
-        return replacement
-    reason = str(card.get("archive_reason") or "")
-    if not reason.startswith("superseded_by:"):
-        return ""
-    return reason.removeprefix("superseded_by:").split(";", 1)[0].strip()
+    return successor_task_id(card)
 
 
 def resolve_superseded_dependency(
@@ -78,11 +362,16 @@ def resolve_superseded_dependency(
         chain.append(current)
         if str(card.get("archive_operation") or "").strip().lower() != "superseded":
             return None, chain, f"__archived_dependency_not_superseded__:{current}"
-        replacement = _superseded_replacement(card)
+        replacement = successor_task_id(card)
         if not replacement:
+            raw = str(card.get("superseded_by") or "").strip()
+            if not raw:
+                reason = str(card.get("archive_reason") or "")
+                if reason.startswith("superseded_by:"):
+                    raw = reason.removeprefix("superseded_by:").split(";", 1)[0].strip()
+            if raw:
+                return None, chain, f"__invalid_superseded_replacement__:{current}"
             return None, chain, f"__superseded_dependency_without_replacement__:{current}"
-        if not _TASK_ID_RE.fullmatch(replacement):
-            return None, chain, f"__invalid_superseded_replacement__:{current}"
         current = replacement
 
 
@@ -96,7 +385,7 @@ def normalize_depends_on(depends_on: list[str] | None) -> list[str]:
     seen: set[str] = set()
     for item in depends_on:
         text = str(item or "").strip()
-        if not _TASK_ID_RE.fullmatch(text):
+        if not is_valid_task_id(text):
             raise TaskPlanError(f"invalid_dependency_id:{text}")
         if text not in seen:
             seen.add(text)
@@ -294,10 +583,13 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
     # them before constructing any derived structure so they cannot reappear
     # as pending/ready, block dependencies, or reserve write scope.
     all_by_id = {str(c["task_id"]): c for c in cards}
+    terminal_artifacts_excluded, excluded_ids = terminal_artifact_projection(
+        cards, all_by_id
+    )
     by_id = {
         str(c["task_id"]): c
         for c in cards
-        if lifecycle_state(c) != "archived"
+        if lifecycle_state(c) != "archived" and str(c["task_id"]) not in excluded_ids
     }
     lifecycle = {tid: lifecycle_state(c) for tid, c in by_id.items()}
 
@@ -318,11 +610,15 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         deps: list[str] = []
         resolution_errors: list[str] = []
         for dependency_id in raw_dependencies:
+            if dependency_id in excluded_ids:
+                continue
             resolved, chain, error = resolve_superseded_dependency(
                 dependency_id, all_by_id
             )
             if error is not None or resolved is None:
                 resolution_errors.append(error or "__dependency_resolution_failed__")
+                continue
+            if resolved in excluded_ids:
                 continue
             if chain:
                 dependency_replacements.setdefault(tid, {})[dependency_id] = {
@@ -559,6 +855,8 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "card_collision_free": card_collision_free,
         "card_collision_task_ids": card_collision_task_ids,
         "card_collision_paths": card_collision_paths,
+        "terminal_artifacts_excluded": terminal_artifacts_excluded,
+        "terminal_artifacts_excluded_count": len(excluded_ids),
     }
 
 
@@ -572,6 +870,8 @@ PLAN_SUMMARY_FIELDS = (
     "ready",
     "ready_capacity",
     "active_count",
+    "terminal_artifacts_excluded",
+    "terminal_artifacts_excluded_count",
     "blocked_count",
     "blocked_task_ids",
     "dependency_blocked_count",

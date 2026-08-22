@@ -705,12 +705,31 @@ def test_reject_review_predecessor_never_falls_back_to_newer_request(tmp_path: P
     assert error == "predecessor_request_id_workspace_unretained"
 
 
-def test_reject_review_predecessor_missing_identity_task_id_fails_closed(tmp_path: Path) -> None:
-    card = _validation_failed_card(tmp_path, changed_paths=[])
+def test_reject_review_predecessor_request_id_missing_task_id_optional_succeeds(
+    tmp_path: Path,
+) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=["out.txt"])
     del card["terminal_review"]["evidence"]["request_identity"]["task_id"]
+    del card["terminal_review"]["evidence"]["workspace"]["task_id"]
     resolved, error = _resolve(card, _REQ_OLD, tmp_path)
-    assert resolved is None
-    assert error == "predecessor_request_id_missing_task_id"
+    assert error is None
+    assert resolved is not None
+    assert resolved["request_id"] == _REQ_OLD
+    assert resolved["changed_path_hashes"] == {"out.txt": _VALID_HASH}
+
+
+def test_reject_review_predecessor_explicit_implicit_seal_identical_lineage(
+    tmp_path: Path,
+) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=["out.txt"])
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert error is None
+    assert resolved is not None
+    evidence = card["terminal_review"]["evidence"]
+    assert resolved["request_id"] == evidence["request_identity"]["request_id"]
+    assert resolved["workspace"] == evidence["workspace"]
+    assert resolved["changed_path_hashes"] == evidence["changed_path_hashes"]
+    assert resolved["claim_epoch"] == card["terminal_review"]["claim_epoch"]
 
 
 def test_reject_review_predecessor_missing_identity_request_id_fails_closed(
@@ -751,12 +770,21 @@ def test_reject_review_predecessor_missing_workspace_request_id_fails_closed(
     assert error == f"predecessor_request_id {_REQ_OLD} not found in retained review evidence"
 
 
-def test_reject_review_predecessor_missing_workspace_task_id_fails_closed(tmp_path: Path) -> None:
+@pytest.mark.parametrize("container", ["request_identity", "workspace"])
+@pytest.mark.parametrize(
+    "bad_task_id",
+    ["OTHER_TASK", "", True, 5, None, 3.14, ["TASK_B891"]],
+)
+def test_reject_review_predecessor_invalid_optional_task_id_fails_closed(
+    tmp_path: Path, container: str, bad_task_id: object
+) -> None:
     card = _validation_failed_card(tmp_path, changed_paths=[])
-    del card["terminal_review"]["evidence"]["workspace"]["task_id"]
+    card["terminal_review"]["evidence"][container]["task_id"] = bad_task_id
     resolved, error = _resolve(card, _REQ_OLD, tmp_path)
     assert resolved is None
-    assert error == "predecessor_request_id_missing_task_id"
+    assert error == (
+        f"predecessor_request_id_task_mismatch:expected=TASK_B891:got={bad_task_id!s}"
+    )
 
 
 def test_reject_review_predecessor_bool_claim_epoch_fails_closed(tmp_path: Path) -> None:
@@ -830,6 +858,35 @@ def test_reject_review_exact_predecessor_completes_validation_failed_empty(
     assert card is not None
     assert card["status"] == "pending"
     assert card["review_feedback"]["predecessor_request_id"] == _REQ_OLD
+
+
+def test_reject_review_omitted_duplicate_task_id_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo_with_task(tmp_path, status="review")
+    _readiness, db_path = task_store._require_ready(repo)
+    card = _validation_failed_card(tmp_path, changed_paths=[], repo_path=repo)
+    del card["terminal_review"]["evidence"]["request_identity"]["task_id"]
+    del card["terminal_review"]["evidence"]["workspace"]["task_id"]
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET status='review', worker_status='review', card_json=? "
+            "WHERE task_id=?",
+            (json.dumps(card), "TASK_B891"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _patch_reject_review(monkeypatch, repo)
+    result = core.reject_review(
+        "TASK_B891", "rework validation", predecessor_request_id=_REQ_OLD
+    )
+    assert result["ok"] is True
+    card2 = task_store.get_task(repo, "TASK_B891")
+    assert card2 is not None
+    assert card2["status"] == "pending"
+    assert card2["review_feedback"]["predecessor_request_id"] == _REQ_OLD
 
 
 def test_reject_review_exact_predecessor_completes_validation_failed_nonempty(

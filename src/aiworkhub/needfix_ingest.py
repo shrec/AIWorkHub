@@ -15,7 +15,7 @@ import stat
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from . import needfix_store
+from . import needfix_store, task_plan
 
 
 SCHEMA_ID = "aiworkhub.needfix_markdown_intake.v1"
@@ -424,6 +424,129 @@ def commit(
 _RECONCILE_CARD_SCAN_LIMIT: int = 5000
 
 
+def _wrap_canonical_status(canonical_status_fn, cards_by_id=None, ensure_cards=None):
+    def wrapped(card):
+        if ensure_cards is not None:
+            ensure_cards()
+        raw = task_plan.card_status_evidence(card)
+        if raw in needfix_store.REOPEN_CARD_STATUSES:
+            if task_plan.has_landed_successor(card, cards_by_id):
+                return "finished"
+            return raw
+        if task_plan.is_terminal_target_status(raw):
+            return "finished"
+        if task_plan.is_rework_or_unresolved_status(raw):
+            return raw
+        status = str(canonical_status_fn(card) or "").strip().lower()
+        if status in needfix_store.REOPEN_CARD_STATUSES:
+            if task_plan.has_landed_successor(card, cards_by_id):
+                return "finished"
+            return status
+        if task_plan.is_terminal_target_status(status):
+            return "finished"
+        return status
+
+    return wrapped
+
+
+def _cache_point_lookup_card(task_id: str, found: Any) -> Mapping[str, Any] | None:
+    if not isinstance(found, Mapping):
+        return None
+    returned_id = str(found.get("task_id") or "").strip()
+    if returned_id != str(task_id or "").strip():
+        return None
+    return found
+
+
+def _index_identity_checked_card(
+    cards_by_id: dict[str, Any],
+    listed_id: str,
+    card: Any,
+) -> None:
+    requested = str(listed_id or "").strip()
+    if not requested:
+        return
+    bound = _cache_point_lookup_card(requested, card)
+    if bound is None:
+        cards_by_id.setdefault(requested, None)
+        return
+    cards_by_id[requested] = bound
+
+
+def _index_listed_cards(cards: Iterable[Any]) -> dict[str, Any]:
+    cards_by_id: dict[str, Any] = {}
+    for card in cards:
+        if not isinstance(card, Mapping):
+            continue
+        listed_id = str(card.get("task_id") or "").strip()
+        _index_identity_checked_card(cards_by_id, listed_id, card)
+    return cards_by_id
+
+
+def _prefetch_successor_chain(
+    card: Mapping[str, Any],
+    cards_by_id: dict[str, Any],
+    load_one,
+) -> None:
+    task_plan.prefetch_unknown_terminal_cards(
+        [card],
+        cards_by_id,
+        lambda successor_id: _cache_point_lookup_card(
+            successor_id, load_one(successor_id)
+        ),
+    )
+
+
+def _prefetch_terminal_lookups(cards_by_id: dict[str, Any], get_task_fn) -> bool:
+    cards = [card for card in cards_by_id.values() if isinstance(card, Mapping)]
+    return not task_plan.prefetch_unknown_terminal_cards(
+        cards,
+        cards_by_id,
+        lambda target_id: _cache_point_lookup_card(target_id, get_task_fn(target_id)),
+    )
+
+
+def _snapshot_terminal_artifacts(
+    list_task_cards_fn,
+    get_task_fn=None,
+) -> tuple[list[dict[str, Any]], set[str], str | None]:
+    if list_task_cards_fn is None:
+        return [], set(), "list_task_cards_unavailable"
+    try:
+        cards = list(list_task_cards_fn() or ())
+    except Exception as exc:
+        return [], set(), f"list_task_cards_failed:{type(exc).__name__}"
+    cards_by_id = _index_listed_cards(cards)
+    if get_task_fn is not None:
+        try:
+            for listed_id in list(cards_by_id):
+                cached = cards_by_id.get(listed_id)
+                bound = _cache_point_lookup_card(listed_id, cached)
+                if bound is None:
+                    cards_by_id[listed_id] = None
+                    continue
+                verified = _cache_point_lookup_card(listed_id, get_task_fn(listed_id))
+                if verified is not None:
+                    cards_by_id[listed_id] = verified
+            if _prefetch_terminal_lookups(cards_by_id, get_task_fn):
+                return [], set(), "terminal_projection_incomplete"
+        except Exception as exc:
+            return [], set(), f"get_task_failed:{type(exc).__name__}"
+    rows, excluded_ids = task_plan.terminal_artifact_projection(cards, cards_by_id)
+    return rows, excluded_ids, None
+
+
+def _exclude_terminal_artifact_status(canonical_status_fn, excluded_ids: set[str]):
+    def wrapped(card):
+        if isinstance(card, Mapping):
+            task_id = str(card.get("task_id") or "").strip()
+            if task_id in excluded_ids:
+                return "finished"
+        return canonical_status_fn(card)
+
+    return wrapped
+
+
 def _resolve_active_state_hooks(
     repo: Path,
     *,
@@ -443,6 +566,10 @@ def _resolve_active_state_hooks(
     ``_RECONCILE_CARD_SCAN_LIMIT``) because it runs on the read an operator
     waits on. A caller may supply the exact cards already read for the same
     bounded snapshot; only an explicit complete flag may prove an absent id.
+    A complete identity-checked snapshot is the single authority and is never
+    re-read from the store. A partial snapshot still point-looks up missing
+    successor ids, including those carried only in ``archive_reason``. A store
+    miss fails closed instead of keeping stale cached data.
     """
     from . import task_store  # lazy: no import-time cost, no import cycle
 
@@ -457,42 +584,52 @@ def _resolve_active_state_hooks(
 
     task_cards: Sequence[Mapping[str, Any]] | None = task_cards_snapshot
     task_cards_complete = bool(task_cards_snapshot_complete)
-    task_by_id: dict[str, Mapping[str, Any]] = {
-        str(card.get("task_id") or ""): card
-        for card in task_cards or ()
-        if card.get("task_id")
-    }
+    task_by_id: dict[str, Any] = _index_listed_cards(task_cards or ())
 
     def load_task_cards() -> Sequence[Mapping[str, Any]]:
-        nonlocal task_cards, task_by_id, task_cards_complete
+        nonlocal task_cards, task_cards_complete
         if task_cards is None:
             task_cards = task_store.list_task_cards(
                 repo, limit=_RECONCILE_CARD_SCAN_LIMIT
             )
             task_cards_complete = len(task_cards) < _RECONCILE_CARD_SCAN_LIMIT
-            task_by_id = {
-                str(card.get("task_id") or ""): card
-                for card in task_cards
-                if card.get("task_id")
-            }
+            task_by_id.clear()
+            task_by_id.update(_index_listed_cards(task_cards))
         return task_cards
 
     def get_task_fn(task_id: str):
         load_task_cards()
-        if task_id in task_by_id:
-            return task_by_id[task_id]
+        requested = str(task_id or "").strip()
+        if requested in task_by_id:
+            return _cache_point_lookup_card(requested, task_by_id[requested])
         if task_cards_complete:
             return None
-        # A capped or caller-declared partial snapshot cannot prove absence.
-        # Preserve exact behavior with one point lookup for that case.
-        return task_store.get_task(repo, task_id)
+        found = _cache_point_lookup_card(requested, task_store.get_task(repo, requested))
+        if found is None:
+            return None
+        task_by_id[requested] = found
+        _prefetch_successor_chain(
+            found,
+            task_by_id,
+            lambda successor_id: task_store.get_task(repo, successor_id),
+        )
+        return found
 
     def list_task_cards_fn():
         # Bounded, single-snapshot card read; the store calls this lazily and at
         # most once per reconcile, only to reach the explicit-reference route.
         return load_task_cards()
 
-    return get_task_fn, task_store.canonical_status, list_task_cards_fn, None
+    return (
+        get_task_fn,
+        _wrap_canonical_status(
+            task_store.canonical_status,
+            task_by_id,
+            ensure_cards=load_task_cards,
+        ),
+        list_task_cards_fn,
+        None,
+    )
 
 
 def _reconcile_links_on_read(
@@ -535,6 +672,46 @@ def _reconcile_links_on_read(
         pass
 
 
+def _derive_active_surface(
+    repo: Path,
+    *,
+    task_cards_snapshot: Sequence[Mapping[str, Any]] | None = None,
+    task_cards_snapshot_complete: bool = False,
+    include_archived: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    get_task_fn, canonical_status_fn, list_task_cards_fn, underived_reason = (
+        _resolve_active_state_hooks(
+            repo,
+            task_cards_snapshot=task_cards_snapshot,
+            task_cards_snapshot_complete=task_cards_snapshot_complete,
+        )
+    )
+    if underived_reason is not None:
+        return None, underived_reason
+    excluded, excluded_ids, snapshot_error = _snapshot_terminal_artifacts(
+        list_task_cards_fn, get_task_fn
+    )
+    if snapshot_error is not None:
+        return None, snapshot_error
+    if excluded_ids:
+        canonical_status_fn = _exclude_terminal_artifact_status(
+            canonical_status_fn, excluded_ids
+        )
+    _reconcile_links_on_read(
+        repo,
+        get_task_fn,
+        canonical_status_fn,
+        list_task_cards_fn,
+        include_archived=include_archived,
+    )
+    return {
+        "get_task_fn": get_task_fn,
+        "canonical_status_fn": canonical_status_fn,
+        "excluded": excluded,
+        "excluded_ids": excluded_ids,
+    }, None
+
+
 def list_active(
     repo_root: str | Path,
     *,
@@ -565,12 +742,11 @@ def list_active(
     passing them off as an authoritative active set.
     """
     repo = Path(repo_root).resolve()
-    get_task_fn, canonical_status_fn, list_task_cards_fn, underived_reason = (
-        _resolve_active_state_hooks(
-            repo,
-            task_cards_snapshot=task_cards_snapshot,
-            task_cards_snapshot_complete=task_cards_snapshot_complete,
-        )
+    derived, underived_reason = _derive_active_surface(
+        repo,
+        task_cards_snapshot=task_cards_snapshot,
+        task_cards_snapshot_complete=task_cards_snapshot_complete,
+        include_archived=include_archived,
     )
     if underived_reason is not None:
         rows = needfix_store.list_needfix(
@@ -587,18 +763,14 @@ def list_active(
             "definition": needfix_store.ACTIVE_STATE_DEFINITION,
             "count": None,
             "items": rows,
+            "terminal_artifacts_excluded": [],
+            "terminal_artifacts_excluded_count": 0,
         }
-    _reconcile_links_on_read(
-        repo,
-        get_task_fn,
-        canonical_status_fn,
-        list_task_cards_fn,
-        include_archived=include_archived,
-    )
+    assert derived is not None
     report = needfix_store.list_active_needfix(
         repo,
-        get_task_fn=get_task_fn,
-        canonical_status_fn=canonical_status_fn,
+        get_task_fn=derived["get_task_fn"],
+        canonical_status_fn=derived["canonical_status_fn"],
         include_archived=include_archived,
         limit=limit,
         offset=offset,
@@ -607,24 +779,32 @@ def list_active(
     )
     report["derived"] = True
     report["underived_reason"] = None
+    report["terminal_artifacts_excluded"] = derived["excluded"]
+    report["terminal_artifacts_excluded_count"] = len(derived["excluded_ids"])
     return report
 
 
 def count_active(
     repo_root: str | Path,
     *,
+    task_cards_snapshot: Sequence[Mapping[str, Any]] | None = None,
+    task_cards_snapshot_complete: bool = False,
     include_archived: bool = False,
 ) -> dict[str, Any]:
     """Operator-facing active NeedFix count, derived at read time by default.
 
-    Uses the exact same resolved hooks and ``include_archived`` filter as
-    :func:`list_active`, so the count and the list describe the same set on
-    every axis (the count/list disagreement this closes). Underived (marked,
-    never silently authoritative) when the repository has no ready task store.
+    Uses the exact same resolved hooks, optional same-read-set snapshot, and
+    ``include_archived`` filter as :func:`list_active`, so the count and the
+    list describe the same set on every axis (the count/list disagreement
+    this closes). Underived (marked, never silently authoritative) when the
+    repository has no ready task store.
     """
     repo = Path(repo_root).resolve()
-    get_task_fn, canonical_status_fn, list_task_cards_fn, underived_reason = (
-        _resolve_active_state_hooks(repo)
+    derived, underived_reason = _derive_active_surface(
+        repo,
+        task_cards_snapshot=task_cards_snapshot,
+        task_cards_snapshot_complete=task_cards_snapshot_complete,
+        include_archived=include_archived,
     )
     if underived_reason is not None:
         return {
@@ -635,19 +815,15 @@ def count_active(
             "raw_total": needfix_store.count_needfix(
                 repo, include_archived=include_archived
             ),
+            "terminal_artifacts_excluded": [],
+            "terminal_artifacts_excluded_count": 0,
         }
-    _reconcile_links_on_read(
-        repo,
-        get_task_fn,
-        canonical_status_fn,
-        list_task_cards_fn,
-        include_archived=include_archived,
-    )
+    assert derived is not None
     active_count = needfix_store.count_needfix(
         repo,
         include_archived=include_archived,
-        get_task_fn=get_task_fn,
-        canonical_status_fn=canonical_status_fn,
+        get_task_fn=derived["get_task_fn"],
+        canonical_status_fn=derived["canonical_status_fn"],
         active_only=True,
     )
     return {
@@ -655,6 +831,8 @@ def count_active(
         "underived_reason": None,
         "definition": needfix_store.ACTIVE_STATE_DEFINITION,
         "count": active_count,
+        "terminal_artifacts_excluded": derived["excluded"],
+        "terminal_artifacts_excluded_count": len(derived["excluded_ids"]),
     }
 
 

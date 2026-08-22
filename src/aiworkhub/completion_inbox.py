@@ -11,11 +11,14 @@ queue into a single MCP tool:
   * latest_validation_facts    -- the most recently recorded test/verify
                                    status per task, as reported on the card.
   * read_errors (B280)         -- bounded, scoped taskctl list/show read
-                                   failures (nonzero returncode or a raised
-                                   exception), so a read-source outage never
-                                   silently reads as an empty queue and never
-                                   crosses this module's boundary as an
-                                   uncaught exception.
+                                   failures. ``error_kind`` is one of
+                                   ``nonzero_returncode``, ``exception``,
+                                   ``not_found``, ``json_parse_error``,
+                                   ``invalid_card``, or
+                                   ``task_identity_mismatch``. A read-source
+                                   outage never silently reads as an empty
+                                   queue and never crosses this module's
+                                   boundary as an uncaught exception.
 
 Read path: every facet is derived by shelling out to the existing read-only
 ``taskctl.py list``/``show`` subcommands via ``core.run_taskctl`` -- the
@@ -49,7 +52,9 @@ Hard invariants (asserted by tests):
     wrapped in ``try/except`` (see ``_fetch_full_cards``) so a subprocess-
     level failure degrades to a ``read_errors`` entry instead of an uncaught
     exception, and a non-zero LIST-call returncode is recorded instead of
-    silently parsing as zero rows. This adds no new authority: it is purely
+    silently parsing as zero rows. Identity-mismatched, unparsable, or
+    invalid live target cards fail closed (they do not authorize terminal
+    exclusion). This adds no new authority: it is purely
     evidence/degrade-bounding on the existing read-only path -- no write, no
     launch, ``_authority_flags`` unchanged (all False).
 """
@@ -61,7 +66,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from aiworkhub import core
+from aiworkhub import core, task_plan
 
 READONLY: bool = True
 LAUNCH_IMPLEMENTED: bool = False
@@ -186,6 +191,90 @@ def _result_fields(result: Any) -> tuple[Any, str, str]:
     )
 
 
+def _show_one_card(show_fn, task_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    try:
+        show_result = show_fn(task_id)
+    except Exception as exc:  # noqa: BLE001 -- bounded degrade, never re-raise
+        return None, {
+            "scope": "show",
+            "task_id": task_id,
+            "error_kind": "exception",
+            "error_message": str(exc)[:200],
+        }
+    returncode, stdout, stderr = _result_fields(show_result)
+    text = (stdout or "").strip()
+    full_stderr = str(stderr)
+    if returncode not in (0, None):
+        return None, {
+            "scope": "show",
+            "task_id": task_id,
+            "error_kind": "nonzero_returncode",
+            "error_message": full_stderr[:200],
+            "stderr": full_stderr,
+        }
+    if "Task not found:" in text:
+        return None, {
+            "scope": "show",
+            "task_id": task_id,
+            "error_kind": "not_found",
+            "error_message": "not_found_on_show",
+        }
+    if not text:
+        return None, {
+            "scope": "show",
+            "task_id": task_id,
+            "error_kind": "not_found",
+            "error_message": "not_found_on_show",
+        }
+    try:
+        card = json.loads(text)
+    except json.JSONDecodeError:
+        return None, {
+            "scope": "show",
+            "task_id": task_id,
+            "error_kind": "json_parse_error",
+            "error_message": "json_parse_error",
+        }
+    if isinstance(card, dict):
+        returned_id = str(card.get("task_id") or "").strip()
+        requested_id = str(task_id or "").strip()
+        if returned_id != requested_id:
+            return None, {
+                "scope": "show",
+                "task_id": requested_id,
+                "error_kind": "task_identity_mismatch",
+                "error_message": "task_identity_mismatch",
+            }
+        return card, None
+    return None, {
+        "scope": "show",
+        "task_id": task_id,
+        "error_kind": "invalid_card",
+        "error_message": "invalid_card",
+    }
+
+
+def _enrich_artifact_target_cards(
+    scanned_cards: list[dict[str, Any]],
+    cards_by_id: dict[str, Any],
+    show_fn,
+) -> tuple[list[dict[str, Any]], bool]:
+    read_errors: list[dict[str, Any]] = []
+
+    def load_one(target_id: str):
+        card, error = _show_one_card(show_fn, target_id)
+        if error is not None:
+            read_errors.append(error)
+        return card if isinstance(card, dict) else None
+
+    complete = task_plan.prefetch_unknown_terminal_cards(
+        scanned_cards,
+        cards_by_id,
+        load_one,
+    )
+    return read_errors, not complete
+
+
 def _fetch_full_cards(
     status: str,
     topic: str | None,
@@ -258,38 +347,33 @@ def _fetch_full_cards(
     fetch_errors: list[dict[str, Any]] = []
     for row in rows:
         tid = row["task_id"]
-        try:
-            show_result = show_fn(tid)
-        except Exception as exc:  # noqa: BLE001 -- bounded degrade, never re-raise
-            fetch_errors.append({"task_id": tid, "error": str(exc)[:200]})
-            read_errors.append({
+        card, error = _show_one_card(show_fn, tid)
+        if error is not None:
+            fetch_errors.append({
+                "task_id": tid,
+                "error": error.get("stderr")
+                or error.get("error_message")
+                or error.get("error_kind"),
+            })
+            read_errors.append(error)
+            continue
+        if not isinstance(card, dict):
+            continue
+        returned_id = str(card.get("task_id") or "").strip()
+        if returned_id != str(tid or "").strip():
+            mismatch = {
                 "scope": "show",
                 "task_id": tid,
-                "error_kind": "exception",
-                "error_message": str(exc)[:200],
-            })
-            continue
-
-        returncode, stdout, stderr = _result_fields(show_result)
-
-        if returncode not in (0, None):
-            fetch_errors.append({"task_id": tid, "error": stderr})
-            read_errors.append({
-                "scope": "show",
+                "error_kind": "task_identity_mismatch",
+                "error_message": "task_identity_mismatch",
+            }
+            fetch_errors.append({
                 "task_id": tid,
-                "error_kind": "nonzero_returncode",
-                "error_message": str(stderr)[:200],
+                "error": "task_identity_mismatch",
             })
+            read_errors.append(mismatch)
             continue
-
-        text = (stdout or "").strip()
-        if not text or "Task not found:" in text:
-            fetch_errors.append({"task_id": tid, "error": "not_found_on_show"})
-            continue
-        try:
-            cards.append(json.loads(text))
-        except json.JSONDecodeError:
-            fetch_errors.append({"task_id": tid, "error": "json_parse_error"})
+        cards.append(card)
     return cards, fetch_errors, read_errors
 
 
@@ -511,8 +595,11 @@ def build_completion_inbox(
         records -- ``scope: "list"`` for a failed/raising ``taskctl list``
         call (per canonical status queried) and ``scope: "show"`` for a
         failed/raising ``taskctl show <task_id>`` call. Each entry carries
-        ``error_kind`` (``"nonzero_returncode"`` or ``"exception"``) and a
-        truncated ``error_message``. This is what lets a caller distinguish
+        ``error_kind`` (``"nonzero_returncode"``, ``"exception"``,
+        ``"not_found"``, ``"json_parse_error"``, ``"invalid_card"``, or
+        ``"task_identity_mismatch"``) and a truncated ``error_message``.
+        Missing or unusable live target evidence fails closed and never
+        authorizes terminal exclusion. This is what lets a caller distinguish
         "the queue is genuinely empty" from "the read tool failed" -- neither
         case is ever an uncaught exception out of this function.
 
@@ -538,6 +625,33 @@ def build_completion_inbox(
         read_errors.extend(r_errs)
 
     cards_by_status = dict(buckets)
+    scanned_cards = [card for _status, cards in buckets for card in cards]
+    cards_by_id = {
+        str(card.get("task_id") or ""): card
+        for card in scanned_cards
+        if card.get("task_id")
+    }
+    show_fn = _show_task if _show_task is not None else core.show_task
+    enrich_errors, projection_incomplete = _enrich_artifact_target_cards(
+        scanned_cards, cards_by_id, show_fn
+    )
+    read_errors.extend(enrich_errors)
+    terminal_artifacts_excluded, excluded_ids = task_plan.terminal_artifact_projection(
+        scanned_cards, cards_by_id
+    )
+    if excluded_ids:
+        buckets = [
+            (
+                cstatus,
+                [
+                    card
+                    for card in cards
+                    if str(card.get("task_id") or "") not in excluded_ids
+                ],
+            )
+            for cstatus, cards in buckets
+        ]
+        cards_by_status = dict(buckets)
 
     review_entries = [
         _compact_review_entry(card, _runner_task_batch_mismatch(card))
@@ -620,6 +734,8 @@ def build_completion_inbox(
         "stale_processing": stale_processing,
         "runner_mismatch_warnings": runner_mismatch_warnings,
         "latest_validation_facts": latest_validation_facts,
+        "terminal_artifacts_excluded": terminal_artifacts_excluded,
+        "terminal_projection_incomplete": projection_incomplete,
         "counts": {
             "pending_scanned": len(cards_by_status["pending"]),
             "processing_scanned": len(cards_by_status["processing"]),
@@ -630,6 +746,7 @@ def build_completion_inbox(
             "stale_processing": len(stale_processing),
             "runner_mismatch_warnings": len(runner_mismatch_warnings),
             "latest_validation_facts": len(latest_validation_facts),
+            "terminal_artifacts_excluded": len(excluded_ids),
             "fetch_errors": len(fetch_errors),
             "read_errors": len(read_errors),
         },

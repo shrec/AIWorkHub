@@ -3784,14 +3784,18 @@ def _bind_explicit_reject_review_predecessor(
 ) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(identity, dict):
         return None, "predecessor_request_id_missing_task_id"
-    raw_bound_task = identity.get("task_id")
-    if type(raw_bound_task) is not str or not raw_bound_task.strip():
-        return None, "predecessor_request_id_missing_task_id"
-    bound_task = raw_bound_task.strip()
-    if bound_task != task_id:
-        return None, (
-            f"predecessor_request_id_task_mismatch:expected={task_id}:got={bound_task}"
-        )
+    if "task_id" in identity:
+        raw_bound_task = identity.get("task_id")
+        if type(raw_bound_task) is not str or not raw_bound_task.strip():
+            return None, (
+                "predecessor_request_id_task_mismatch:"
+                f"expected={task_id}:got={raw_bound_task!s}"
+            )
+        bound_task = raw_bound_task.strip()
+        if bound_task != task_id:
+            return None, (
+                f"predecessor_request_id_task_mismatch:expected={task_id}:got={bound_task}"
+            )
     raw_bound_request = identity.get("request_id")
     if type(raw_bound_request) is not str or not raw_bound_request.strip():
         return None, (
@@ -3823,13 +3827,17 @@ def _bind_explicit_reject_review_predecessor(
             f"predecessor_request_id {request_id} not found in retained review evidence"
         )
 
-    workspace_task = workspace.get("task_id")
-    if type(workspace_task) is not str or not workspace_task.strip():
-        return None, "predecessor_request_id_missing_task_id"
-    if workspace_task.strip() != task_id:
-        return None, (
-            f"predecessor_request_id_task_mismatch:expected={task_id}:got={workspace_task.strip()}"
-        )
+    if "task_id" in workspace:
+        workspace_task = workspace.get("task_id")
+        if type(workspace_task) is not str or not workspace_task.strip():
+            return None, (
+                "predecessor_request_id_task_mismatch:"
+                f"expected={task_id}:got={workspace_task!s}"
+            )
+        if workspace_task.strip() != task_id:
+            return None, (
+                f"predecessor_request_id_task_mismatch:expected={task_id}:got={workspace_task.strip()}"
+            )
 
     workspace_path = workspace.get("path")
     if type(workspace_path) is not str or not workspace_path.strip():
@@ -3938,10 +3946,9 @@ def _resolve_reject_review_predecessor(
     card_epoch = card.get("claim_epoch")
 
     if isinstance(existing, dict) and str(existing.get("request_id") or "").strip() == stripped:
-        existing_identity = {
-            "request_id": stripped,
-            "task_id": existing.get("task_id"),
-        }
+        existing_identity: dict[str, Any] = {"request_id": stripped}
+        if "task_id" in existing:
+            existing_identity["task_id"] = existing.get("task_id")
         return _bind_explicit_reject_review_predecessor(
             request_id=stripped,
             task_id=task_id,

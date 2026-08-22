@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.45
+
+- NeedFix, Task DAG and completion inbox now agree on exact terminal artifacts,
+  so landed reviewer/retry records disappear without hiding unresolved work.
+- Explicit predecessor-bound rework uses the supplied task identity correctly.
+
 ## What's new in 0.10.44
 
 - Canonical acceptance now releases retained predecessor pins and reclaims

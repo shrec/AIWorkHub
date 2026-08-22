@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.45 — 2026-08-22
+
+### Fixed
+
+- Explicit predecessor-bound rework now preserves the supplied task identity.
+- Completed reviewer and implementation retry artifacts are reconciled through
+  one fail-closed projection shared by NeedFix, the Task DAG and completion
+  inbox.
+
 ## 0.10.44 — 2026-08-22
 
 ### Fixed

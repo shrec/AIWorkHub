@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.45] - 2026-08-22
+
+### Fixed
+
+- Explicit rework rejection now binds a supplied predecessor request to the
+  supplied task identity instead of falsely reporting a missing `task_id`.
+- NeedFix, the Task DAG and completion inbox now share one bounded,
+  identity-checked terminal-artifact projection, automatically hiding landed
+  reviewer and implementation retries while retaining unresolved work.
+
 ## [0.10.44] - 2026-08-22
 
 ### Fixed
