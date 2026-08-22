@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -27,6 +29,7 @@ UNDO_DAYS = 7
 MAX_TASKS_PER_BATCH = 200
 MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 _BATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 
 
 class TaskRetentionError(RuntimeError):
@@ -402,12 +405,432 @@ def purge(root: Path | str, *, batch_id: str, confirm: bool = False) -> dict[str
     return {"ok": True, "purged": True, "batch_id": batch_id}
 
 
+ACCEPTED_CLEANUP_EVIDENCE_SCHEMA = "aiworkhub.accepted_cleanup_evidence.v1"
+_ARTIFACT_GC_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_FINISHED_CLEANUP_STATUSES = frozenset({"finished", "archived", "superseded"})
+_LIVE_PROCESS_STATUSES = frozenset({"processing", "review"})
+_LIVE_SUPERVISOR_STATUSES = frozenset({"claimed", "in_progress"})
+_CLEARED_PREDECESSOR_PHASES = frozenset(
+    {"predecessor_unpin_intent", "predecessor_unpinned", "completed"}
+)
+_ACCEPTED_EVIDENCE_KEYS = frozenset(
+    {"schema_id", "task_id", "request_id", "canonical_digest", "predecessor_request_id"}
+)
+_PROCESS_IDENTITY_KEYS = (
+    ("pid", "pid_start_ticks"),
+    ("provider_pid", "provider_pid_start_ticks"),
+    ("child_pid", "child_pid_start_ticks"),
+)
+_EVENT_IDENTITY_KEYS = (
+    "request_id",
+    "task_id",
+    "runner",
+    "topic",
+    "adapter_id",
+    "model",
+    "pid",
+    "pid_start_ticks",
+    "provider_pid",
+    "provider_pid_start_ticks",
+    "stdout_path",
+    "stderr_path",
+    "metadata_path",
+    "supervisor_status_path",
+    "cancel_path",
+    "sandbox_backend",
+    "exit_code",
+    "error",
+)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _normalize_predecessor_request_id(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def canonical_acceptance_digest(
+    *,
+    task_id: str,
+    request_id: str,
+    status: str,
+    accepted_request_id: str,
+    accept_evidence: Any,
+    predecessor_request_id: Any = "",
+) -> str:
+    payload = {
+        "accept_evidence": accept_evidence if isinstance(accept_evidence, dict) else {},
+        "accepted_request_id": str(accepted_request_id or ""),
+        "predecessor_request_id": _normalize_predecessor_request_id(predecessor_request_id),
+        "request_id": str(request_id or ""),
+        "status": str(status or ""),
+        "task_id": str(task_id or ""),
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _load_task_cleanup_row(root: Path | str, task_id: str) -> dict[str, Any] | None:
+    connection = _connect(root, readonly=True)
+    try:
+        row = connection.execute(
+            "SELECT task_id, status, worker_status, archived_at, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            card = json.loads(row["card_json"] or "{}")
+        except json.JSONDecodeError:
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        predecessor = card.get("rework_predecessor")
+        return {
+            "accept_evidence": (
+                card.get("accept_evidence")
+                if isinstance(card.get("accept_evidence"), dict)
+                else {}
+            ),
+            "accepted_request_id": str(card.get("accepted_request_id") or "").strip(),
+            "card": card,
+            "launch_request_id": str(card.get("launch_request_id") or "").strip(),
+            "predecessor_request_id": (
+                _normalize_predecessor_request_id(predecessor.get("request_id"))
+                if isinstance(predecessor, dict)
+                else ""
+            ),
+            "status": task_store.canonical_status(dict(row)),
+            "task_id": str(row["task_id"] or ""),
+        }
+    finally:
+        connection.close()
+
+
+def live_rework_references(root: Path | str, request_id: str) -> tuple[list[str], bool]:
+    if not _BATCH_ID_RE.fullmatch(str(request_id or "")):
+        return [], False
+    try:
+        connection = _connect(root, readonly=True)
+    except (task_store.TaskStoreError, sqlite3.Error, OSError):
+        return [], False
+    try:
+        rows = connection.execute(
+            "SELECT task_id, status, worker_status, archived_at, card_json FROM tasks"
+        ).fetchall()
+        pins: list[str] = []
+        for row in rows:
+            status = task_store.canonical_status(dict(row))
+            if status in _FINISHED_CLEANUP_STATUSES:
+                continue
+            try:
+                card = json.loads(row["card_json"] or "{}")
+            except json.JSONDecodeError:
+                return [], False
+            if not isinstance(card, dict):
+                return [], False
+            predecessor = card.get("rework_predecessor")
+            if (
+                isinstance(predecessor, dict)
+                and str(predecessor.get("request_id") or "").strip() == request_id
+            ):
+                card_id = str(row["task_id"] or "").strip()
+                if card_id:
+                    pins.append(card_id)
+        return sorted(set(pins)), True
+    except sqlite3.Error:
+        return [], False
+    finally:
+        connection.close()
+
+
+def _process_event_log_path(root: Path | str) -> Path:
+    from . import process_launcher
+
+    return Path(
+        os.environ.get(
+            process_launcher.PROCESS_LOG_ENV,
+            str(Path(root) / process_launcher.PROCESS_LOG_DEFAULT_REL),
+        )
+    )
+
+
+def _read_request_metadata(path: Path) -> Mapping[str, Any] | None:
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _merge_identity_fields(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+    for pid_key, ticks_key in _PROCESS_IDENTITY_KEYS:
+        for key in (pid_key, ticks_key):
+            if key in source:
+                target[key] = source[key]
+
+
+def _load_request_process_evidence(
+    root: Path | str,
+    request_id: str,
+) -> tuple[Mapping[str, Any] | None, bool]:
+    from . import process_event_ledger, process_launcher
+
+    merged: dict[str, Any] = {}
+    try:
+        for event in process_event_ledger.iter_events(_process_event_log_path(root)):
+            if not isinstance(event, Mapping):
+                return None, False
+            if str(event.get("request_id") or "").strip() != request_id:
+                continue
+            for key in _EVENT_IDENTITY_KEYS:
+                if event.get(key) is not None:
+                    merged[key] = event[key]
+    except OSError:
+        return None, False
+    metadata_raw = merged.get("metadata_path")
+    if metadata_raw:
+        metadata = _read_request_metadata(Path(str(metadata_raw)))
+        if metadata is None:
+            return None, False
+        _merge_identity_fields(merged, metadata)
+    status_raw = merged.get("supervisor_status_path")
+    if status_raw:
+        status = process_launcher.read_supervisor_status(Path(str(status_raw)))
+        if not status:
+            return None, False
+        _merge_identity_fields(merged, status)
+    return merged, True
+
+
+def _pid_role_state(pid: Any, ticks: Any) -> str:
+    from .process_launcher import PidIdentityVerdict, _pid_identity_evidence
+
+    evidence = _pid_identity_evidence(pid, ticks)
+    if evidence.verdict is PidIdentityVerdict.MATCH:
+        return "live"
+    if evidence.verdict is PidIdentityVerdict.UNKNOWN:
+        return "unknown"
+    if evidence.observed_start_ticks is not None:
+        return "unknown"
+    return "idle"
+
+
+def _request_process_identity_state(root: Path | str, request_id: str) -> tuple[str, bool]:
+    blob, verified = _load_request_process_evidence(root, request_id)
+    if not verified or blob is None:
+        return "unknown", False
+    state = "idle"
+    seen_identity = False
+    for pid_key, ticks_key in _PROCESS_IDENTITY_KEYS:
+        if pid_key not in blob and ticks_key not in blob:
+            continue
+        seen_identity = True
+        role_state = _pid_role_state(blob.get(pid_key), blob.get(ticks_key))
+        if role_state == "unknown":
+            return "unknown", False
+        if role_state == "live":
+            state = "live"
+    if not seen_identity:
+        return "unknown", False
+    return state, True
+
+
+def live_process_holders(root: Path | str, request_id: str) -> tuple[list[str], bool]:
+    if not _BATCH_ID_RE.fullmatch(str(request_id or "")):
+        return [], False
+    identity, identity_verified = _request_process_identity_state(root, request_id)
+    if not identity_verified:
+        return [], False
+    try:
+        connection = _connect(root, readonly=True)
+    except (task_store.TaskStoreError, sqlite3.Error, OSError):
+        return [], False
+    try:
+        rows = connection.execute(
+            "SELECT task_id, status, worker_status, archived_at, card_json FROM tasks"
+        ).fetchall()
+        holders: list[str] = []
+        for row in rows:
+            status = task_store.canonical_status(dict(row))
+            worker_status = str(row["worker_status"] or "").strip().lower()
+            supervisor_live = worker_status in _LIVE_SUPERVISOR_STATUSES
+            process_live = status in _LIVE_PROCESS_STATUSES
+            try:
+                card = json.loads(row["card_json"] or "{}")
+            except json.JSONDecodeError:
+                if process_live or supervisor_live:
+                    return [], False
+                continue
+            if not isinstance(card, dict):
+                if process_live or supervisor_live:
+                    return [], False
+                continue
+            bound_ids = {
+                str(card.get("launch_request_id") or "").strip(),
+                str(card.get("accepted_request_id") or "").strip(),
+            }
+            if request_id not in bound_ids:
+                continue
+            if not process_live and not supervisor_live and identity != "live":
+                continue
+            card_id = str(row["task_id"] or "").strip()
+            if card_id:
+                holders.append(card_id)
+        return sorted(set(holders)), True
+    except sqlite3.Error:
+        return [], False
+    finally:
+        connection.close()
+
+
+def phase_permits_cleared_predecessor(
+    phase_evidence: Mapping[str, Any] | None,
+    *,
+    request_id: str,
+    digest: str,
+    predecessor_request_id: str,
+) -> bool:
+    evidence_predecessor = _normalize_predecessor_request_id(predecessor_request_id)
+    if not evidence_predecessor or not isinstance(phase_evidence, Mapping):
+        return False
+    if str(phase_evidence.get("request_id") or "") != request_id:
+        return False
+    if str(phase_evidence.get("canonical_digest") or "") != digest:
+        return False
+    if str(phase_evidence.get("predecessor_unpinned") or "").strip() != evidence_predecessor:
+        return False
+    phase_name = str(phase_evidence.get("phase") or "")
+    if phase_name == "quarantined":
+        retry = phase_evidence.get("retry_evidence")
+        if not isinstance(retry, dict):
+            return False
+        phase_name = str(retry.get("phase") or "")
+    return phase_name in _CLEARED_PREDECESSOR_PHASES
+
+
+def validate_accepted_cleanup_evidence(
+    root: Path | str,
+    evidence: Mapping[str, Any] | None,
+    *,
+    phase_evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    failed = {
+        "canonical_digest": "",
+        "deleted": False,
+        "ok": False,
+        "predecessor_request_id": "",
+        "reason": "unknown_identity",
+        "request_id": "",
+        "schema_id": ACCEPTED_CLEANUP_EVIDENCE_SCHEMA,
+        "task_id": "",
+    }
+    if not isinstance(evidence, Mapping):
+        return dict(failed)
+    extra = set(evidence.keys()) - _ACCEPTED_EVIDENCE_KEYS
+    task_id = str(evidence.get("task_id") or "").strip()
+    request_id = str(evidence.get("request_id") or "").strip()
+    digest = str(evidence.get("canonical_digest") or "").strip().lower()
+    predecessor_request_id = _normalize_predecessor_request_id(
+        evidence.get("predecessor_request_id")
+    )
+    failed["predecessor_request_id"] = predecessor_request_id
+    failed["request_id"] = request_id
+    failed["task_id"] = task_id
+    if extra or str(evidence.get("schema_id") or "") != ACCEPTED_CLEANUP_EVIDENCE_SCHEMA:
+        return dict(failed)
+    if not _TASK_ID_RE.fullmatch(task_id) or not _BATCH_ID_RE.fullmatch(request_id):
+        return dict(failed)
+    if not _ARTIFACT_GC_DIGEST_RE.fullmatch(digest):
+        return dict(failed)
+    try:
+        row = _load_task_cleanup_row(root, task_id)
+    except (task_store.TaskStoreError, sqlite3.Error, OSError):
+        failed["reason"] = "unresolved_task"
+        return failed
+    if row is None:
+        failed["reason"] = "unresolved_task"
+        return failed
+    if row["status"] in _LIVE_PROCESS_STATUSES:
+        failed["reason"] = "live_process"
+        return failed
+    if row["status"] not in _FINISHED_CLEANUP_STATUSES:
+        failed["reason"] = "unresolved_task"
+        return failed
+    if row["accepted_request_id"] != request_id:
+        return dict(failed)
+    row_predecessor = _normalize_predecessor_request_id(row["predecessor_request_id"])
+    resolved_predecessor = row_predecessor
+    if predecessor_request_id != row_predecessor:
+        if row_predecessor:
+            return dict(failed)
+        if not phase_permits_cleared_predecessor(
+            phase_evidence,
+            request_id=request_id,
+            digest=digest,
+            predecessor_request_id=predecessor_request_id,
+        ):
+            return dict(failed)
+        resolved_predecessor = predecessor_request_id
+    expected = canonical_acceptance_digest(
+        accept_evidence=row["accept_evidence"],
+        accepted_request_id=row["accepted_request_id"],
+        predecessor_request_id=predecessor_request_id,
+        request_id=request_id,
+        status=row["status"],
+        task_id=task_id,
+    )
+    if expected != digest:
+        return dict(failed)
+    holders, process_verified = live_process_holders(root, request_id)
+    if not process_verified:
+        failed["reason"] = "ambiguous_ownership"
+        return failed
+    if holders:
+        failed["reason"] = "live_process"
+        return failed
+    pins, pin_verified = live_rework_references(root, request_id)
+    if not pin_verified:
+        failed["reason"] = "ambiguous_ownership"
+        return failed
+    if pins:
+        failed["reason"] = "active_rework"
+        return failed
+    return {
+        "accept_evidence": row["accept_evidence"],
+        "canonical_digest": digest,
+        "deleted": False,
+        "ok": True,
+        "predecessor_request_id": resolved_predecessor,
+        "reason": "",
+        "request_id": request_id,
+        "schema_id": ACCEPTED_CLEANUP_EVIDENCE_SCHEMA,
+        "status": row["status"],
+        "task_id": task_id,
+    }
+
+
 __all__ = [
     "SCHEMA_ID",
     "TaskRetentionError",
+    "canonical_acceptance_digest",
     "list_batches",
+    "live_process_holders",
+    "live_rework_references",
+    "phase_permits_cleared_predecessor",
     "preview",
     "purge",
     "quarantine",
     "restore",
+    "validate_accepted_cleanup_evidence",
 ]

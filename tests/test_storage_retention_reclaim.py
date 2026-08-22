@@ -20,6 +20,7 @@ would be untestable there (and in CI) regardless of correctness.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -28,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import storage_retention, task_store
+from aiworkhub import storage_retention, task_store, worktree_storage
 
 # terminal_runs_days defaults to 30; 31 real days pushes a worktree past the
 # default policy threshold without ever touching its on-disk mtime.
@@ -254,3 +255,136 @@ def test_live_worktree_protected_regardless_of_table_size(repo_with_worktrees) -
 
     candidate_ids = {item["id"] for item in preview["candidates"]}
     assert "live-processing" not in candidate_ids
+
+
+def _write_idle_process_identity(repo: Path, request_id: str) -> None:
+    from aiworkhub import process_event_ledger, process_launcher
+
+    log_path = repo / process_launcher.PROCESS_LOG_DEFAULT_REL
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    process_event_ledger.append_event(
+        log_path,
+        {
+            "pid": 1_000_000_001,
+            "pid_start_ticks": 1,
+            "request_id": request_id,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+        },
+    )
+
+
+def _accepted_cleanup_evidence(
+    task_id: str, request_id: str, predecessor_request_id: str = ""
+) -> dict[str, str]:
+    from aiworkhub import task_retention
+
+    predecessor = str(predecessor_request_id or "").strip()
+    return {
+        "schema_id": task_retention.ACCEPTED_CLEANUP_EVIDENCE_SCHEMA,
+        "task_id": task_id,
+        "request_id": request_id,
+        "predecessor_request_id": predecessor,
+        "canonical_digest": task_retention.canonical_acceptance_digest(
+            accept_evidence={},
+            accepted_request_id=request_id,
+            predecessor_request_id=predecessor,
+            request_id=request_id,
+            status="finished",
+            task_id=task_id,
+        ),
+    }
+
+
+def test_cleanup_unpins_predecessor_only_when_successor_accepted(repo_with_worktrees) -> None:
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    pred = _add_worktree(repo, base, "pred-landed", unpushed=True)
+    succ = _add_worktree(repo, base, "succ-accepted", unpushed=True)
+    (pred / "manifest.json").write_text("{}", encoding="utf-8")
+    (succ / "manifest.json").write_text("{}", encoding="utf-8")
+    db_path = task_store.canonical_db_path(repo)
+    now = datetime.now(timezone.utc).isoformat()
+    card = {
+        "accepted_request_id": "succ-accepted",
+        "rework_predecessor": {"request_id": "pred-landed"},
+    }
+    connection = sqlite3.connect(str(db_path))
+    try:
+        connection.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "card_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("TASK-SUCC", "claude", "storage", "finished", "unclaimed", json.dumps(card), now, now),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    _write_idle_process_identity(repo, "succ-accepted")
+    _write_idle_process_identity(repo, "pred-landed")
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_cleanup_evidence("TASK-SUCC", "succ-accepted", "pred-landed"),
+        base=base,
+    )
+
+    assert result["ok"] is True
+    assert result["predecessor_unpinned"] == "pred-landed"
+    assert not (succ / "worktree").exists()
+    assert not (pred / "worktree").exists()
+    assert (succ / "manifest.json").is_file()
+    assert (pred / "manifest.json").is_file()
+    connection = sqlite3.connect(str(db_path))
+    try:
+        stored = json.loads(
+            connection.execute(
+                "SELECT card_json FROM tasks WHERE task_id=?",
+                ("TASK-SUCC",),
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+    assert "rework_predecessor" not in stored
+
+
+def test_cleanup_does_not_prune_unrelated_stale_registration(repo_with_worktrees) -> None:
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    succ = _add_worktree(repo, base, "succ-keep-stale", unpushed=True)
+    stale = _add_worktree(repo, base, "stale-unrelated", unpushed=False)
+    (succ / "manifest.json").write_text("{}", encoding="utf-8")
+    shutil.rmtree(stale / "worktree")
+    before = worktree_storage.scan_worktree_registrations(repo, base)
+    assert before["ok"] is True
+    assert "stale-unrelated" in {item["id"] for item in before["stale_candidates"]}
+    now = datetime.now(timezone.utc).isoformat()
+    connection = sqlite3.connect(str(task_store.canonical_db_path(repo)))
+    try:
+        connection.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "card_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "TASK-KEEP-STALE",
+                "claude",
+                "storage",
+                "finished",
+                "unclaimed",
+                json.dumps({"accepted_request_id": "succ-keep-stale"}),
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    _write_idle_process_identity(repo, "succ-keep-stale")
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_cleanup_evidence("TASK-KEEP-STALE", "succ-keep-stale"),
+        base=base,
+    )
+
+    assert result["ok"] is True
+    assert not (succ / "worktree").exists()
+    after = worktree_storage.scan_worktree_registrations(repo, base)
+    assert after["ok"] is True
+    assert "stale-unrelated" in {item["id"] for item in after["stale_candidates"]}
+    assert after["stale_candidate_count"] >= 1

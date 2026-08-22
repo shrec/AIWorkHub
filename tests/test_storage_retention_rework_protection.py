@@ -1060,3 +1060,382 @@ def test_preview_ok_agrees_with_complete(repo_with_worktrees, monkeypatch) -> No
     assert incomplete["ok"] is False
     assert incomplete["ok"] == incomplete["complete"]
     assert incomplete["incomplete"] is True  # still distinguishable from a hard error
+
+
+def _write_idle_process_identity(repo: Path, request_id: str) -> None:
+    from aiworkhub import process_event_ledger, process_launcher
+
+    log_path = repo / process_launcher.PROCESS_LOG_DEFAULT_REL
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    process_event_ledger.append_event(
+        log_path,
+        {
+            "pid": 1_000_000_001,
+            "pid_start_ticks": 1,
+            "request_id": request_id,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+        },
+    )
+
+
+def _accepted_cleanup_evidence(
+    task_id: str, request_id: str, predecessor_request_id: str = ""
+) -> dict[str, str]:
+    from aiworkhub import task_retention
+
+    predecessor = str(predecessor_request_id or "").strip()
+    return {
+        "schema_id": task_retention.ACCEPTED_CLEANUP_EVIDENCE_SCHEMA,
+        "task_id": task_id,
+        "request_id": request_id,
+        "predecessor_request_id": predecessor,
+        "canonical_digest": task_retention.canonical_acceptance_digest(
+            accept_evidence={},
+            accepted_request_id=request_id,
+            predecessor_request_id=predecessor,
+            request_id=request_id,
+            status="finished",
+            task_id=task_id,
+        ),
+    }
+
+
+def test_cleanup_fail_closed_live_process_active_rework_and_symlink(repo_with_worktrees) -> None:
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    live = _add_worktree(repo, base, "live-attempt")
+    pinned = _add_worktree(repo, base, "pinned-pred")
+    accepted = _add_worktree(repo, base, "accepted-succ")
+    _write_idle_process_identity(repo, "live-attempt")
+    _write_idle_process_identity(repo, "accepted-succ")
+    _insert_card(repo, "TASK-LIVE", status="finished", accepted_request_id="live-attempt")
+    _insert_card(repo, "TASK-LIVE-HOLDER", status="processing", launch_request_id="live-attempt")
+    _insert_card(
+        repo,
+        "TASK-ACCEPTED",
+        status="finished",
+        accepted_request_id="accepted-succ",
+    )
+    _insert_card(
+        repo,
+        "TASK-REWORK",
+        status="pending",
+        rework_predecessor_request_id="accepted-succ",
+    )
+    live_result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_cleanup_evidence("TASK-LIVE", "live-attempt"),
+        base=base,
+    )
+    rework_result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_cleanup_evidence("TASK-ACCEPTED", "accepted-succ"),
+        base=base,
+    )
+    assert live_result["ok"] is False
+    assert live_result["reason"] == "live_process"
+    assert live_result["deleted"] is False
+    assert live.is_dir()
+    assert (live / "worktree").is_dir()
+    assert rework_result["ok"] is False
+    assert rework_result["reason"] == "active_rework"
+    assert rework_result["deleted"] is False
+    assert (accepted / "worktree").is_dir()
+    assert (pinned / "worktree").is_dir()
+
+    alias = base / "accepted-succ-alias"
+    alias.symlink_to(accepted)
+    _write_idle_process_identity(repo, "accepted-succ-alias")
+    _insert_card(
+        repo,
+        "TASK-ALIAS",
+        status="finished",
+        accepted_request_id="accepted-succ-alias",
+    )
+    ambiguous = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_cleanup_evidence("TASK-ALIAS", "accepted-succ-alias"),
+        base=base,
+    )
+    assert ambiguous["ok"] is False
+    assert ambiguous["reason"] == "ambiguous_ownership"
+    assert ambiguous["deleted"] is False
+    assert accepted.is_dir()
+
+
+def test_cleanup_fail_closed_claimed_supervisor_holder(repo_with_worktrees) -> None:
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    accepted = _add_worktree(repo, base, "accepted-held")
+    _write_idle_process_identity(repo, "accepted-held")
+    _insert_card(
+        repo,
+        "TASK-ACCEPTED-HELD",
+        status="finished",
+        accepted_request_id="accepted-held",
+    )
+    db_path = task_store.canonical_db_path(repo)
+    now = datetime.now(timezone.utc).isoformat()
+    connection = sqlite3.connect(str(db_path))
+    try:
+        connection.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "card_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "TASK-SUPERVISOR",
+                "claude",
+                "storage",
+                "pending",
+                "claimed",
+                json.dumps({"launch_request_id": "accepted-held"}),
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_cleanup_evidence("TASK-ACCEPTED-HELD", "accepted-held"),
+        base=base,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "live_process"
+    assert result["deleted"] is False
+    assert (accepted / "worktree").is_dir()
+
+
+def test_cleanup_fail_closed_finished_task_live_exact_process(repo_with_worktrees) -> None:
+    import os
+
+    from aiworkhub import process_event_ledger, process_launcher, runtime_temp
+
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    accepted = _add_worktree(repo, base, "finished-live")
+    pid = os.getpid()
+    ticks = runtime_temp.process_start_ticks(pid)
+    assert ticks is not None
+    now = datetime.now(timezone.utc).isoformat()
+    log_path = repo / process_launcher.PROCESS_LOG_DEFAULT_REL
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = log_path.parent / "finished-live.metadata.json"
+    supervisor_path = log_path.parent / "finished-live.supervisor.json"
+    metadata_path.write_text(
+        json.dumps({"provider_pid": pid, "provider_pid_start_ticks": ticks}),
+        encoding="utf-8",
+    )
+    supervisor_path.write_text(
+        json.dumps({"child_pid": pid, "child_pid_start_ticks": ticks}),
+        encoding="utf-8",
+    )
+    supervisor_path.chmod(0o600)
+    process_event_ledger.append_event(
+        log_path,
+        {
+            "metadata_path": str(metadata_path),
+            "pid": pid,
+            "pid_start_ticks": ticks,
+            "request_id": "finished-live",
+            "supervisor_status_path": str(supervisor_path),
+            "task_id": "TASK-FINISHED-LIVE",
+            "timestamp": now,
+        },
+    )
+    connection = sqlite3.connect(str(task_store.canonical_db_path(repo)))
+    try:
+        connection.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "card_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "TASK-FINISHED-LIVE",
+                "claude",
+                "storage",
+                "finished",
+                "unclaimed",
+                json.dumps({"accepted_request_id": "finished-live"}),
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_cleanup_evidence("TASK-FINISHED-LIVE", "finished-live"),
+        base=base,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "live_process"
+    assert result["deleted"] is False
+    assert accepted.is_dir()
+    assert (accepted / "worktree").is_dir()
+
+
+def _write_production_process_authority(
+    repo: Path,
+    request_id: str,
+    task_id: str,
+    *,
+    supervisor: dict[str, object] | str,
+) -> None:
+    import os
+
+    from aiworkhub import process_event_ledger, process_launcher, runtime_temp
+
+    pid = os.getpid()
+    ticks = runtime_temp.process_start_ticks(pid)
+    assert ticks is not None
+    now = datetime.now(timezone.utc).isoformat()
+    log_path = repo / process_launcher.PROCESS_LOG_DEFAULT_REL
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = log_path.parent / f"{request_id}.metadata.json"
+    supervisor_path = log_path.parent / f"{request_id}.supervisor.json"
+    metadata_path.write_text(
+        json.dumps({"provider_pid": pid, "provider_pid_start_ticks": ticks}),
+        encoding="utf-8",
+    )
+    if isinstance(supervisor, str):
+        supervisor_path.write_text(supervisor, encoding="utf-8")
+    else:
+        supervisor_path.write_text(json.dumps(supervisor), encoding="utf-8")
+        supervisor_path.chmod(0o600)
+    process_event_ledger.append_event(
+        log_path,
+        {
+            "metadata_path": str(metadata_path),
+            "pid": pid,
+            "pid_start_ticks": ticks,
+            "request_id": request_id,
+            "supervisor_status_path": str(supervisor_path),
+            "task_id": task_id,
+            "timestamp": now,
+        },
+    )
+
+
+def test_cleanup_fail_closed_predecessor_live_process_identity(
+    repo_with_worktrees,
+) -> None:
+    import os
+
+    from aiworkhub import runtime_temp
+
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    pred = _add_worktree(repo, base, "pred-live")
+    succ = _add_worktree(repo, base, "succ-accepted")
+    (pred / "manifest.json").write_text("{}", encoding="utf-8")
+    (succ / "manifest.json").write_text("{}", encoding="utf-8")
+    pid = os.getpid()
+    ticks = runtime_temp.process_start_ticks(pid)
+    assert ticks is not None
+    _write_production_process_authority(
+        repo,
+        "pred-live",
+        "TASK-PRED-LIVE",
+        supervisor={"child_pid": pid, "child_pid_start_ticks": ticks},
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    connection = sqlite3.connect(str(task_store.canonical_db_path(repo)))
+    try:
+        connection.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "card_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "TASK-SUCC-LIVE-PRED",
+                "claude",
+                "storage",
+                "finished",
+                "unclaimed",
+                json.dumps(
+                    {
+                        "accepted_request_id": "succ-accepted",
+                        "rework_predecessor": {"request_id": "pred-live"},
+                    }
+                ),
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    _write_idle_process_identity(repo, "succ-accepted")
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_cleanup_evidence("TASK-SUCC-LIVE-PRED", "succ-accepted", "pred-live"),
+        base=base,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "live_process"
+    assert result["deleted"] is False
+    assert result["predecessor_unpinned"] == ""
+    assert (pred / "worktree").is_dir()
+    connection = sqlite3.connect(str(task_store.canonical_db_path(repo)))
+    try:
+        stored = json.loads(
+            connection.execute(
+                "SELECT card_json FROM tasks WHERE task_id=?",
+                ("TASK-SUCC-LIVE-PRED",),
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+    assert stored["rework_predecessor"]["request_id"] == "pred-live"
+
+
+def test_cleanup_fail_closed_predecessor_unverified_process_identity(
+    repo_with_worktrees,
+) -> None:
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    pred = _add_worktree(repo, base, "pred-unverified")
+    succ = _add_worktree(repo, base, "succ-unverified")
+    (pred / "manifest.json").write_text("{}", encoding="utf-8")
+    (succ / "manifest.json").write_text("{}", encoding="utf-8")
+    _write_production_process_authority(
+        repo,
+        "pred-unverified",
+        "TASK-PRED-UNVERIFIED",
+        supervisor="not-a-mapping",
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    connection = sqlite3.connect(str(task_store.canonical_db_path(repo)))
+    try:
+        connection.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "card_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "TASK-SUCC-UNVERIFIED-PRED",
+                "claude",
+                "storage",
+                "finished",
+                "unclaimed",
+                json.dumps(
+                    {
+                        "accepted_request_id": "succ-unverified",
+                        "rework_predecessor": {"request_id": "pred-unverified"},
+                    }
+                ),
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    _write_idle_process_identity(repo, "succ-unverified")
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_cleanup_evidence(
+            "TASK-SUCC-UNVERIFIED-PRED", "succ-unverified", "pred-unverified"
+        ),
+        base=base,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "ambiguous_ownership"
+    assert result["deleted"] is False
+    assert result["predecessor_unpinned"] == ""
+    assert (pred / "worktree").is_dir()

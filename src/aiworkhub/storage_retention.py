@@ -2023,11 +2023,1028 @@ def recover_stranded_worktrees(
     return report
 
 
+ARTIFACT_GC_SCHEMA_ID = "aiworkhub.storage_retention.artifact_gc.v1"
+ARTIFACT_GC_PHASE_SCHEMA_ID = "aiworkhub.storage_retention.artifact_gc.phase.v1"
+_ARTIFACT_GC_PRESERVED_NAMES = frozenset({"manifest.json", "receipt.json", "receipts"})
+_ARTIFACT_GC_PHASE_ORDER = (
+    "validated",
+    "inventoried",
+    "ephemeral_removed",
+    "predecessor_unpin_intent",
+    "predecessor_unpinned",
+    "completed",
+)
+_ARTIFACT_GC_LOADABLE_PHASES = _ARTIFACT_GC_PHASE_ORDER + ("quarantined",)
+
+
+def _artifact_gc_phase_path(repo_root: Path, request_id: str) -> Path:
+    return repo_root / ".aiworkhub" / "runtime" / "storage" / "artifact-gc" / f"{request_id}.json"
+
+
+def _artifact_gc_receipt_path(entry: Path) -> Path:
+    return entry / "artifact-gc.receipt.json"
+
+
+def _artifact_gc_canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _artifact_gc_digest(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_artifact_gc_canonical_json(dict(value)).encode("utf-8")).hexdigest()
+
+
+def _artifact_gc_is_preserved(name: str) -> bool:
+    return name in _ARTIFACT_GC_PRESERVED_NAMES or name.endswith(".receipt.json")
+
+
+def _load_artifact_gc_phase(path: Path, request_id: str, digest: str) -> dict[str, Any] | None:
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("schema_id") != ARTIFACT_GC_PHASE_SCHEMA_ID:
+        return None
+    if str(raw.get("request_id") or "") != request_id:
+        return None
+    if str(raw.get("canonical_digest") or "") != digest:
+        return None
+    if str(raw.get("phase") or "") not in _ARTIFACT_GC_LOADABLE_PHASES:
+        return None
+    return raw
+
+
+def _write_artifact_gc_phase(path: Path, payload: Mapping[str, Any]) -> None:
+    _atomic_json(path, payload)
+
+
+def _exact_registered_checkout(repo_root: Path, checkout: Path) -> Path | None:
+    rc, output = worktree_storage._git(repo_root, "worktree", "list", "--porcelain")
+    if rc != 0:
+        raise StorageRetentionError("registered_worktree_list_failed")
+    wanted = {
+        os.path.normcase(str(checkout)),
+        os.path.normcase(str(checkout.resolve(strict=False))),
+    }
+    matches: list[Path] = []
+    for line in output.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        candidate = Path(line[len("worktree "):])
+        try:
+            resolved = os.path.normcase(str(candidate.resolve(strict=False)))
+        except OSError:
+            continue
+        if os.path.normcase(str(candidate)) in wanted or resolved in wanted:
+            matches.append(candidate)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for match in matches:
+        key = os.path.normcase(str(match.resolve(strict=False)))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(match)
+    if len(unique) > 1:
+        raise StorageRetentionError("registered_worktree_ambiguous")
+    return unique[0] if unique else None
+
+
+def _checkout_admin_dir(repo_root: Path, checkout: Path) -> Path | None:
+    common = worktree_storage._git_common_dir(repo_root)
+    if not common:
+        return None
+    admin_root = Path(common) / "worktrees"
+    if admin_root.is_symlink() or not admin_root.is_dir():
+        return None
+    expected = os.path.normcase(str((checkout / ".git").resolve(strict=False)))
+    matches: list[Path] = []
+    try:
+        entries = list(admin_root.iterdir())
+    except OSError as exc:
+        raise StorageRetentionError("registered_worktree_list_failed") from exc
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        gitdir_file = entry / "gitdir"
+        if gitdir_file.is_symlink() or not gitdir_file.is_file():
+            continue
+        try:
+            reverse = gitdir_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        reverse_path = Path(reverse)
+        if not reverse_path.is_absolute():
+            reverse_path = entry / reverse_path
+        if os.path.normcase(str(reverse_path.resolve(strict=False))) == expected:
+            matches.append(entry)
+    if len(matches) > 1:
+        raise StorageRetentionError("registered_worktree_ambiguous")
+    return matches[0] if matches else None
+
+
+def _artifact_gc_entry_reason(worktree_base: Path, entry: Path) -> str:
+    if entry.is_symlink() or (
+        entry.exists() and (entry.parent != worktree_base or not entry.is_dir())
+    ):
+        return "ambiguous_ownership"
+    return ""
+
+
+def _artifact_gc_checkout_reason(repo_root: Path, checkout: Path) -> str:
+    if checkout.is_symlink() or (checkout.exists() and not checkout.is_dir()):
+        return "ambiguous_ownership"
+    if checkout.exists():
+        repo_common = worktree_storage._git_common_dir(repo_root)
+        checkout_common = worktree_storage._git_common_dir(checkout)
+        if not repo_common or not checkout_common or checkout_common != repo_common:
+            return "ambiguous_ownership"
+        return ""
+    try:
+        _exact_registered_checkout(repo_root, checkout)
+    except StorageRetentionError:
+        return "ambiguous_ownership"
+    return ""
+
+
+def _artifact_gc_owned_paths_reason(
+    repo_root: Path, worktree_base: Path, entry: Path
+) -> str:
+    reason = _artifact_gc_entry_reason(worktree_base, entry)
+    if reason:
+        return reason
+    return _artifact_gc_checkout_reason(repo_root, entry / "worktree")
+
+
+def _inventory_request_entry(
+    entry: Path, repo_root: Path
+) -> tuple[list[str], list[str], str]:
+    ephemeral: list[str] = []
+    preserved: list[str] = []
+    if entry.exists():
+        if entry.is_symlink() or not entry.is_dir():
+            return [], [], "ambiguous_ownership"
+        try:
+            children = sorted(entry.iterdir(), key=lambda item: item.name)
+        except OSError:
+            return [], [], "ambiguous_ownership"
+        for child in children:
+            name = child.name
+            if child.is_symlink():
+                return [], [], "ambiguous_ownership"
+            if _artifact_gc_is_preserved(name):
+                preserved.append(name)
+            else:
+                ephemeral.append(name)
+    if "worktree" not in ephemeral and "worktree" not in preserved:
+        try:
+            registered = _exact_registered_checkout(repo_root, entry / "worktree")
+        except StorageRetentionError:
+            return [], [], "ambiguous_ownership"
+        if registered is not None:
+            ephemeral.append("worktree")
+            ephemeral.sort()
+    return ephemeral, preserved, ""
+
+
+def _remove_registered_checkout(repo_root: Path, checkout: Path) -> None:
+    if _artifact_gc_checkout_reason(repo_root, checkout):
+        raise StorageRetentionError("artifact_gc_identity_changed")
+    registered = _exact_registered_checkout(repo_root, checkout)
+    if registered is None and not checkout.exists():
+        return
+    target = registered if registered is not None else checkout
+    rc, _output = worktree_storage._git(
+        repo_root, "worktree", "remove", "--force", str(target)
+    )
+    still_registered = _exact_registered_checkout(repo_root, checkout) is not None
+    if rc == 0 and not checkout.exists() and not still_registered:
+        return
+    if not checkout.exists():
+        admin = _checkout_admin_dir(repo_root, checkout)
+        if admin is not None:
+            shutil.rmtree(admin)
+        if _exact_registered_checkout(repo_root, checkout) is None:
+            return
+    raise StorageRetentionError("registered_worktree_remove_failed")
+
+
+def _remove_ephemeral_names(
+    repo_root: Path, entry: Path, names: list[str], *, removed: list[str] | None = None
+) -> list[str]:
+    if removed is None:
+        removed = []
+    if entry.is_symlink() or (entry.exists() and not entry.is_dir()):
+        raise StorageRetentionError("artifact_gc_identity_changed")
+    recorded = set(removed)
+    for name in names:
+        if _artifact_gc_is_preserved(name) or name in {".", ".."} or "/" in name or "\\" in name:
+            continue
+        target = entry / name
+        if target.parent != entry:
+            raise StorageRetentionError("artifact_gc_identity_changed")
+        if name in recorded:
+            continue
+        if name == "worktree":
+            if _artifact_gc_checkout_reason(repo_root, target):
+                raise StorageRetentionError("artifact_gc_identity_changed")
+            _remove_registered_checkout(repo_root, target)
+            removed.append(name)
+            recorded.add(name)
+            continue
+        if not entry.is_dir():
+            removed.append(name)
+            recorded.add(name)
+            continue
+        if target.is_symlink():
+            raise StorageRetentionError("artifact_gc_identity_changed")
+        if not target.exists():
+            continue
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        removed.append(name)
+        recorded.add(name)
+    return removed
+
+
+def _artifact_gc_live_process_reason(repo_root: Path, request_id: str) -> str:
+    from . import task_retention
+
+    identity, identity_verified = task_retention._request_process_identity_state(
+        repo_root, request_id
+    )
+    if not identity_verified or identity == "unknown":
+        return "ambiguous_ownership"
+    if identity == "live":
+        return "live_process"
+    holders, verified = task_retention.live_process_holders(repo_root, request_id)
+    if not verified:
+        return "ambiguous_ownership"
+    if holders:
+        return "live_process"
+    return ""
+
+
+def _reclaim_predecessor_entry(
+    repo_root: Path,
+    worktree_base: Path,
+    predecessor_id: str,
+) -> str:
+    pred_entry = worktree_base / predecessor_id
+    if _artifact_gc_entry_reason(worktree_base, pred_entry):
+        return "predecessor_ambiguous_ownership"
+    if _artifact_gc_checkout_reason(repo_root, pred_entry / "worktree"):
+        return "predecessor_ambiguous_ownership"
+    pred_ephemeral, _pred_preserved, pred_ambiguous = _inventory_request_entry(
+        pred_entry, repo_root
+    )
+    if pred_ambiguous:
+        return pred_ambiguous
+    _remove_ephemeral_names(repo_root, pred_entry, pred_ephemeral)
+    return ""
+
+
+def _clear_predecessor_pin(repo_root: Path, task_id: str, predecessor_id: str) -> None:
+    db_path = task_store.canonical_db_path(repo_root)
+    connection = sqlite3.connect(str(db_path))
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            connection.commit()
+            return
+        try:
+            card = json.loads(row[0] or "{}")
+        except json.JSONDecodeError:
+            connection.commit()
+            return
+        if not isinstance(card, dict):
+            connection.commit()
+            return
+        predecessor = card.get("rework_predecessor")
+        if (
+            isinstance(predecessor, dict)
+            and str(predecessor.get("request_id") or "").strip() == predecessor_id
+        ):
+            updated = dict(card)
+            updated.pop("rework_predecessor", None)
+            connection.execute(
+                "UPDATE tasks SET card_json=? WHERE task_id=?",
+                (json.dumps(updated, ensure_ascii=False, sort_keys=True), task_id),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _fail_closed_artifact_gc(
+    *,
+    reason: str,
+    task_id: str,
+    request_id: str,
+    canonical_digest: str,
+    ephemeral: list[str] | None = None,
+    preserved: list[str] | None = None,
+    removed: list[str] | None = None,
+    predecessor_unpinned: str = "",
+) -> dict[str, Any]:
+    return {
+        "canonical_digest": canonical_digest,
+        "deleted": False,
+        "ephemeral": list(ephemeral or []),
+        "ok": False,
+        "predecessor_unpinned": predecessor_unpinned,
+        "preserved": list(preserved or []),
+        "reason": reason,
+        "receipt_digest": "",
+        "removed": list(removed or []),
+        "replayed": False,
+        "request_id": request_id,
+        "schema_id": ARTIFACT_GC_SCHEMA_ID,
+        "status": "failed_closed",
+        "task_id": task_id,
+    }
+
+
+def _restore_quarantined_request_entry(
+    repo_root: Path,
+    worktree_base: Path,
+    entry: Path,
+    *,
+    request_id: str,
+    batch_id: str,
+) -> str:
+    if entry.exists():
+        if entry.is_symlink() or entry.parent != worktree_base or not entry.is_dir():
+            return "ambiguous_ownership"
+        return ""
+    if not batch_id or not _ID_RE.fullmatch(batch_id):
+        return ""
+    qroot = _quarantine_root(repo_root, worktree_base)
+    quarantined = qroot / batch_id / request_id
+    if not quarantined.exists():
+        return ""
+    if (
+        quarantined.is_symlink()
+        or not quarantined.is_dir()
+        or quarantined.parent.parent != qroot
+        or quarantined.name != request_id
+    ):
+        return "ambiguous_ownership"
+    shutil.move(str(quarantined), str(entry))
+    return ""
+
+
+def _quarantine_failed_artifact_gc(
+    repo_root: Path,
+    worktree_base: Path,
+    entry: Path,
+    *,
+    task_id: str,
+    request_id: str,
+    canonical_digest: str,
+    phase: str,
+    error: str,
+    phase_path: Path,
+    ephemeral: list[str] | None = None,
+    preserved: list[str] | None = None,
+    removed: list[str] | None = None,
+    predecessor_unpinned: str = "",
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    batch_id = f"agc{now.strftime('%Y%m%dT%H%M%S')}-{request_id[:12]}"
+    resume_phase = phase if phase in _ARTIFACT_GC_PHASE_ORDER else "validated"
+    retry_evidence = {
+        "canonical_digest": canonical_digest,
+        "error": str(error)[:500],
+        "phase": resume_phase,
+        "request_id": request_id,
+        "retryable": True,
+        "schema_id": ARTIFACT_GC_PHASE_SCHEMA_ID,
+        "task_id": task_id,
+    }
+    moved = False
+    phase_written = False
+    quarantined: Path | None = None
+    try:
+        qroot = _ensure_quarantine_root(repo_root, worktree_base)
+        batch = qroot / batch_id
+        batch.mkdir(parents=True, exist_ok=False, mode=0o700)
+        quarantined = batch / request_id
+        if entry.exists() and entry.is_dir() and not entry.is_symlink() and entry.parent == worktree_base:
+            shutil.move(str(entry), str(quarantined))
+            moved = True
+        _atomic_json(
+            batch / MANIFEST_NAME,
+            {
+                "batch_id": batch_id,
+                "created_at": now.isoformat(),
+                "items": [{"id": request_id, "state": "quarantined_failed_cleanup"}],
+                "repo_id": _repo_id(repo_root),
+                "retry_evidence": retry_evidence,
+                "schema_id": SCHEMA_ID,
+                "status": "artifact_gc_failed",
+            },
+        )
+        _write_artifact_gc_phase(
+            phase_path,
+            {
+                "batch_id": batch_id,
+                "canonical_digest": canonical_digest,
+                "ephemeral": list(ephemeral or []),
+                "phase": "quarantined",
+                "predecessor_unpinned": predecessor_unpinned,
+                "preserved": list(preserved or []),
+                "removed": list(removed or []),
+                "request_id": request_id,
+                "retry_evidence": retry_evidence,
+                "schema_id": ARTIFACT_GC_PHASE_SCHEMA_ID,
+                "task_id": task_id,
+                "updated_at": now.isoformat(),
+            },
+        )
+        phase_written = True
+        _append_audit(
+            repo_root,
+            {
+                "action": "artifact_gc_quarantined",
+                "batch_id": batch_id,
+                "request_id": request_id,
+                "schema_id": "aiworkhub.storage_retention_audit.v1",
+                "task_id": task_id,
+                "timestamp": now.isoformat(),
+            },
+        )
+    except Exception:
+        retry_evidence = dict(
+            retry_evidence,
+            batch_id=batch_id,
+            error=str(error)[:500],
+            quarantine_failed=True,
+        )
+        if not phase_written:
+            if (
+                moved
+                and quarantined is not None
+                and quarantined.exists()
+                and not entry.exists()
+            ):
+                try:
+                    shutil.move(str(quarantined), str(entry))
+                except Exception:
+                    retry_evidence = dict(retry_evidence, restore_failed=True)
+            return {
+                "batch_id": "",
+                "canonical_digest": canonical_digest,
+                "deleted": False,
+                "ephemeral": list(ephemeral or []),
+                "ok": False,
+                "predecessor_unpinned": predecessor_unpinned,
+                "preserved": list(preserved or []),
+                "reason": "cleanup_failed",
+                "receipt_digest": "",
+                "removed": list(removed or []),
+                "replayed": False,
+                "request_id": request_id,
+                "retry_evidence": retry_evidence,
+                "schema_id": ARTIFACT_GC_SCHEMA_ID,
+                "status": "failed_closed",
+                "task_id": task_id,
+            }
+        return {
+            "batch_id": batch_id,
+            "canonical_digest": canonical_digest,
+            "deleted": False,
+            "ephemeral": list(ephemeral or []),
+            "ok": False,
+            "predecessor_unpinned": predecessor_unpinned,
+            "preserved": list(preserved or []),
+            "reason": "quarantine_audit_failed",
+            "receipt_digest": "",
+            "removed": list(removed or []),
+            "replayed": False,
+            "request_id": request_id,
+            "retry_evidence": retry_evidence,
+            "schema_id": ARTIFACT_GC_SCHEMA_ID,
+            "status": "failed_closed",
+            "task_id": task_id,
+        }
+    return {
+        "batch_id": batch_id,
+        "canonical_digest": canonical_digest,
+        "deleted": False,
+        "ephemeral": list(ephemeral or []),
+        "ok": False,
+        "predecessor_unpinned": predecessor_unpinned,
+        "preserved": list(preserved or []),
+        "reason": "cleanup_failed",
+        "receipt_digest": "",
+        "removed": list(removed or []),
+        "replayed": False,
+        "request_id": request_id,
+        "retry_evidence": retry_evidence,
+        "schema_id": ARTIFACT_GC_SCHEMA_ID,
+        "status": "quarantined",
+        "task_id": task_id,
+    }
+
+
+def _resume_quarantined_artifact_gc(
+    repo_root: Path,
+    worktree_base: Path,
+    entry: Path,
+    *,
+    request_id: str,
+    phase_state: Mapping[str, Any],
+) -> tuple[str, str]:
+    retry = phase_state.get("retry_evidence")
+    resume_phase = ""
+    if isinstance(retry, dict):
+        resume_phase = str(retry.get("phase") or "")
+    restore_error = _restore_quarantined_request_entry(
+        repo_root,
+        worktree_base,
+        entry,
+        request_id=request_id,
+        batch_id=str(phase_state.get("batch_id") or ""),
+    )
+    if restore_error:
+        return "", restore_error
+    owned = _artifact_gc_owned_paths_reason(repo_root, worktree_base, entry)
+    if owned:
+        return "", owned
+    if resume_phase in _ARTIFACT_GC_PHASE_ORDER and resume_phase != "completed":
+        return resume_phase, ""
+    return "validated", ""
+
+
+def _complete_artifact_gc(
+    repo_root: Path,
+    entry: Path,
+    phase_path: Path,
+    *,
+    task_id: str,
+    request_id: str,
+    digest: str,
+    removed: list[str],
+    preserved: list[str],
+    predecessor_unpinned: str,
+    ephemeral: list[str] | None = None,
+) -> dict[str, Any]:
+    status = "already_cleaned" if not removed else "cleaned"
+    receipt = {
+        "canonical_digest": digest,
+        "deleted": bool(removed),
+        "ephemeral": list(ephemeral or []),
+        "ok": True,
+        "predecessor_unpinned": predecessor_unpinned,
+        "preserved": list(preserved),
+        "reason": "",
+        "removed": list(removed),
+        "replayed": False,
+        "request_id": request_id,
+        "schema_id": ARTIFACT_GC_SCHEMA_ID,
+        "status": status,
+        "task_id": task_id,
+    }
+    receipt["receipt_digest"] = _artifact_gc_digest(
+        {key: value for key, value in receipt.items() if key != "receipt_digest"}
+    )
+    if entry.is_dir() and not entry.is_symlink():
+        _atomic_json(_artifact_gc_receipt_path(entry), receipt)
+    phase_payload = {
+        "canonical_digest": digest,
+        "ephemeral": list(ephemeral or []),
+        "phase": "completed",
+        "predecessor_unpinned": predecessor_unpinned,
+        "preserved": preserved,
+        "receipt": receipt,
+        "removed": removed,
+        "request_id": request_id,
+        "schema_id": ARTIFACT_GC_PHASE_SCHEMA_ID,
+        "task_id": task_id,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_artifact_gc_phase(phase_path, phase_payload)
+    return receipt
+
+
+def _load_replay_accepted_artifact_gc(
+    repo_root: Path | str,
+    evidence: Mapping[str, Any],
+    base: Path | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    from . import task_retention
+
+    root = Path(repo_root).resolve()
+    request_hint = ""
+    digest_hint = ""
+    if isinstance(evidence, Mapping):
+        request_hint = str(evidence.get("request_id") or "").strip()
+        digest_hint = str(evidence.get("canonical_digest") or "").strip().lower()
+    phase_hint = None
+    if request_hint and digest_hint:
+        hint_path = _artifact_gc_phase_path(root, request_hint)
+        if hint_path.is_file() and not hint_path.is_symlink():
+            phase_hint = _load_artifact_gc_phase(hint_path, request_hint, digest_hint)
+    verdict = task_retention.validate_accepted_cleanup_evidence(
+        root, evidence, phase_evidence=phase_hint
+    )
+    task_id = str(verdict.get("task_id") or "")
+    request_id = str(verdict.get("request_id") or "")
+    digest = str(verdict.get("canonical_digest") or "")
+    if not verdict.get("ok"):
+        return None, _fail_closed_artifact_gc(
+            reason=str(verdict.get("reason") or "unknown_identity"),
+            task_id=task_id,
+            request_id=request_id,
+            canonical_digest=digest,
+        )
+    worktree_base = (base or configured_worktree_root(root)).resolve()
+    entry = worktree_base / request_id
+    owned = _artifact_gc_owned_paths_reason(root, worktree_base, entry)
+    if owned:
+        return None, _fail_closed_artifact_gc(
+            reason=owned,
+            task_id=task_id,
+            request_id=request_id,
+            canonical_digest=digest,
+        )
+    phase_path = _artifact_gc_phase_path(root, request_id)
+    if phase_path.exists() and (phase_path.is_symlink() or not phase_path.is_file()):
+        return None, _fail_closed_artifact_gc(
+            reason="ambiguous_ownership",
+            task_id=task_id,
+            request_id=request_id,
+            canonical_digest=digest,
+        )
+    phase_state = _load_artifact_gc_phase(phase_path, request_id, digest)
+    if phase_path.is_file() and phase_state is None:
+        return None, _fail_closed_artifact_gc(
+            reason="ambiguous_ownership",
+            task_id=task_id,
+            request_id=request_id,
+            canonical_digest=digest,
+        )
+    if isinstance(phase_state, dict) and phase_state.get("phase") == "completed":
+        stored = phase_state.get("receipt")
+        if isinstance(stored, dict) and stored.get("schema_id") == ARTIFACT_GC_SCHEMA_ID:
+            expected_digest = _artifact_gc_digest(
+                {key: value for key, value in stored.items() if key != "receipt_digest"}
+            )
+            if str(stored.get("receipt_digest") or "") != expected_digest:
+                return None, _fail_closed_artifact_gc(
+                    reason="unknown_identity",
+                    task_id=task_id,
+                    request_id=request_id,
+                    canonical_digest=digest,
+                )
+            replayed = dict(stored)
+            replayed["replayed"] = True
+            return None, replayed
+    return {
+        "digest": digest,
+        "entry": entry,
+        "ephemeral": list((phase_state or {}).get("ephemeral") or []),
+        "phase": str((phase_state or {}).get("phase") or ""),
+        "phase_path": phase_path,
+        "phase_state": phase_state,
+        "predecessor_unpinned": str((phase_state or {}).get("predecessor_unpinned") or ""),
+        "preserved": list((phase_state or {}).get("preserved") or []),
+        "removed": list((phase_state or {}).get("removed") or []),
+        "request_id": request_id,
+        "root": root,
+        "task_id": task_id,
+        "verdict": verdict,
+        "worktree_base": worktree_base,
+    }, None
+
+
+def _artifact_gc_ctx_inventory(ctx: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "ephemeral": list(ctx.get("ephemeral") or []),
+        "predecessor_unpinned": str(ctx.get("predecessor_unpinned") or ""),
+        "preserved": list(ctx.get("preserved") or []),
+        "removed": list(ctx.get("removed") or []),
+    }
+
+
+def _resume_quarantined_or_validate_artifact_gc(ctx: dict[str, Any]) -> dict[str, Any] | None:
+    if ctx["phase"] == "quarantined":
+        phase, resume_error = _resume_quarantined_artifact_gc(
+            ctx["root"],
+            ctx["worktree_base"],
+            ctx["entry"],
+            request_id=ctx["request_id"],
+            phase_state=ctx["phase_state"] or {},
+        )
+        if resume_error:
+            return _fail_closed_artifact_gc(
+                reason=resume_error,
+                task_id=ctx["task_id"],
+                request_id=ctx["request_id"],
+                canonical_digest=ctx["digest"],
+                **_artifact_gc_ctx_inventory(ctx),
+            )
+        ctx["phase"] = phase
+    if ctx["phase"] not in _ARTIFACT_GC_PHASE_ORDER:
+        _write_artifact_gc_phase(
+            ctx["phase_path"],
+            {
+                "canonical_digest": ctx["digest"],
+                "ephemeral": ctx["ephemeral"],
+                "phase": "validated",
+                "predecessor_unpinned": ctx["predecessor_unpinned"],
+                "preserved": ctx["preserved"],
+                "removed": ctx["removed"],
+                "request_id": ctx["request_id"],
+                "schema_id": ARTIFACT_GC_PHASE_SCHEMA_ID,
+                "task_id": ctx["task_id"],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        ctx["phase"] = "validated"
+    return None
+
+
+def _inventory_accepted_artifact_gc(ctx: dict[str, Any]) -> dict[str, Any] | None:
+    if ctx["phase"] != "validated":
+        return None
+    ephemeral, preserved, ambiguous = _inventory_request_entry(ctx["entry"], ctx["root"])
+    if ambiguous:
+        return _fail_closed_artifact_gc(
+            reason=ambiguous,
+            task_id=ctx["task_id"],
+            request_id=ctx["request_id"],
+            canonical_digest=ctx["digest"],
+            **_artifact_gc_ctx_inventory(ctx),
+        )
+    _write_artifact_gc_phase(
+        ctx["phase_path"],
+        {
+            "canonical_digest": ctx["digest"],
+            "ephemeral": ephemeral,
+            "phase": "inventoried",
+            "predecessor_unpinned": ctx["predecessor_unpinned"],
+            "preserved": preserved,
+            "removed": ctx["removed"],
+            "request_id": ctx["request_id"],
+            "schema_id": ARTIFACT_GC_PHASE_SCHEMA_ID,
+            "task_id": ctx["task_id"],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    ctx["phase_state"] = {
+        "ephemeral": ephemeral,
+        "preserved": preserved,
+    }
+    ctx["ephemeral"] = ephemeral
+    ctx["preserved"] = preserved
+    ctx["phase"] = "inventoried"
+    return None
+
+
+def _delete_ephemeral_accepted_artifacts(ctx: dict[str, Any]) -> dict[str, Any] | None:
+    if ctx["phase"] != "inventoried":
+        return None
+    pending = list((ctx["phase_state"] or {}).get("ephemeral") or ctx.get("ephemeral") or [])
+    preserved = ctx["preserved"]
+    if not pending:
+        pending, preserved, ambiguous = _inventory_request_entry(ctx["entry"], ctx["root"])
+        if ambiguous:
+            return _fail_closed_artifact_gc(
+                reason=ambiguous,
+                task_id=ctx["task_id"],
+                request_id=ctx["request_id"],
+                canonical_digest=ctx["digest"],
+                **_artifact_gc_ctx_inventory(ctx),
+            )
+        ctx["ephemeral"] = pending
+        ctx["preserved"] = preserved
+    else:
+        ctx["ephemeral"] = pending
+    process_reason = _artifact_gc_live_process_reason(ctx["root"], ctx["request_id"])
+    if process_reason:
+        return _fail_closed_artifact_gc(
+            reason=process_reason,
+            task_id=ctx["task_id"],
+            request_id=ctx["request_id"],
+            canonical_digest=ctx["digest"],
+            **_artifact_gc_ctx_inventory(ctx),
+        )
+    removed = list(ctx.get("removed") or [])
+    try:
+        _remove_ephemeral_names(ctx["root"], ctx["entry"], pending, removed=removed)
+    except Exception as exc:
+        ctx["removed"] = removed
+        return _quarantine_failed_artifact_gc(
+            ctx["root"],
+            ctx["worktree_base"],
+            ctx["entry"],
+            task_id=ctx["task_id"],
+            request_id=ctx["request_id"],
+            canonical_digest=ctx["digest"],
+            phase=ctx["phase"],
+            error=str(exc),
+            phase_path=ctx["phase_path"],
+            **_artifact_gc_ctx_inventory(ctx),
+        )
+    _write_artifact_gc_phase(
+        ctx["phase_path"],
+        {
+            "canonical_digest": ctx["digest"],
+            "ephemeral": pending,
+            "phase": "ephemeral_removed",
+            "predecessor_unpinned": ctx["predecessor_unpinned"],
+            "preserved": preserved,
+            "removed": removed,
+            "request_id": ctx["request_id"],
+            "schema_id": ARTIFACT_GC_PHASE_SCHEMA_ID,
+            "task_id": ctx["task_id"],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    ctx["ephemeral"] = pending
+    ctx["preserved"] = preserved
+    ctx["removed"] = removed
+    ctx["phase"] = "ephemeral_removed"
+    return None
+
+
+def _reclaim_unpin_predecessor_artifacts(ctx: dict[str, Any]) -> dict[str, Any] | None:
+    from . import task_retention
+
+    if ctx["phase"] not in {"ephemeral_removed", "predecessor_unpin_intent"}:
+        return None
+    predecessor_id = str(ctx["verdict"].get("predecessor_request_id") or "").strip()
+    if not predecessor_id:
+        predecessor_id = str(ctx.get("predecessor_unpinned") or "").strip()
+    predecessor_unpinned = ""
+    if predecessor_id:
+        if not _ID_RE.fullmatch(predecessor_id):
+            return _fail_closed_artifact_gc(
+                reason="predecessor_identity_invalid",
+                task_id=ctx["task_id"],
+                request_id=ctx["request_id"],
+                canonical_digest=ctx["digest"],
+                **_artifact_gc_ctx_inventory(ctx),
+            )
+        pins, pin_verified = task_retention.live_rework_references(
+            ctx["root"], predecessor_id
+        )
+        if not pin_verified:
+            return _quarantine_failed_artifact_gc(
+                ctx["root"],
+                ctx["worktree_base"],
+                ctx["entry"],
+                task_id=ctx["task_id"],
+                request_id=ctx["request_id"],
+                canonical_digest=ctx["digest"],
+                phase=ctx["phase"],
+                error="predecessor_lineage_unverified",
+                phase_path=ctx["phase_path"],
+                **_artifact_gc_ctx_inventory(ctx),
+            )
+        if not pins:
+            pred_process_reason = _artifact_gc_live_process_reason(
+                ctx["root"], predecessor_id
+            )
+            if pred_process_reason:
+                return _fail_closed_artifact_gc(
+                    reason=pred_process_reason,
+                    task_id=ctx["task_id"],
+                    request_id=ctx["request_id"],
+                    canonical_digest=ctx["digest"],
+                    **_artifact_gc_ctx_inventory(ctx),
+                )
+            if ctx["phase"] != "predecessor_unpin_intent":
+                _write_artifact_gc_phase(
+                    ctx["phase_path"],
+                    {
+                        "canonical_digest": ctx["digest"],
+                        "ephemeral": ctx["ephemeral"],
+                        "phase": "predecessor_unpin_intent",
+                        "predecessor_unpinned": predecessor_id,
+                        "preserved": ctx["preserved"],
+                        "removed": ctx["removed"],
+                        "request_id": ctx["request_id"],
+                        "schema_id": ARTIFACT_GC_PHASE_SCHEMA_ID,
+                        "task_id": ctx["task_id"],
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                ctx["phase"] = "predecessor_unpin_intent"
+                ctx["predecessor_unpinned"] = predecessor_id
+            reclaim_error = _reclaim_predecessor_entry(
+                ctx["root"], ctx["worktree_base"], predecessor_id
+            )
+            if reclaim_error:
+                return _quarantine_failed_artifact_gc(
+                    ctx["root"],
+                    ctx["worktree_base"],
+                    ctx["entry"],
+                    task_id=ctx["task_id"],
+                    request_id=ctx["request_id"],
+                    canonical_digest=ctx["digest"],
+                    phase=ctx["phase"],
+                    error=reclaim_error,
+                    phase_path=ctx["phase_path"],
+                    **_artifact_gc_ctx_inventory(ctx),
+                )
+            _clear_predecessor_pin(ctx["root"], ctx["task_id"], predecessor_id)
+            predecessor_unpinned = predecessor_id
+    _write_artifact_gc_phase(
+        ctx["phase_path"],
+        {
+            "canonical_digest": ctx["digest"],
+            "ephemeral": ctx["ephemeral"],
+            "phase": "predecessor_unpinned",
+            "predecessor_unpinned": predecessor_unpinned,
+            "preserved": ctx["preserved"],
+            "removed": ctx["removed"],
+            "request_id": ctx["request_id"],
+            "schema_id": ARTIFACT_GC_PHASE_SCHEMA_ID,
+            "task_id": ctx["task_id"],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    ctx["predecessor_unpinned"] = predecessor_unpinned
+    ctx["phase"] = "predecessor_unpinned"
+    return None
+
+
+def cleanup_accepted_artifacts(
+    repo_root: Path | str,
+    *,
+    evidence: Mapping[str, Any],
+    base: Path | None = None,
+) -> dict[str, Any]:
+    ctx, early = _load_replay_accepted_artifact_gc(repo_root, evidence, base)
+    if ctx is None:
+        return early if early is not None else _fail_closed_artifact_gc(
+            reason="unknown_identity",
+            task_id="",
+            request_id="",
+            canonical_digest="",
+        )
+    try:
+        early = _resume_quarantined_or_validate_artifact_gc(ctx)
+        if early is not None:
+            return early
+        early = _inventory_accepted_artifact_gc(ctx)
+        if early is not None:
+            return early
+        early = _delete_ephemeral_accepted_artifacts(ctx)
+        if early is not None:
+            return early
+        early = _reclaim_unpin_predecessor_artifacts(ctx)
+        if early is not None:
+            return early
+        return _complete_artifact_gc(
+            ctx["root"],
+            ctx["entry"],
+            ctx["phase_path"],
+            task_id=ctx["task_id"],
+            request_id=ctx["request_id"],
+            digest=ctx["digest"],
+            removed=ctx["removed"],
+            preserved=ctx["preserved"],
+            predecessor_unpinned=ctx["predecessor_unpinned"],
+            ephemeral=ctx["ephemeral"],
+        )
+    except Exception as exc:
+        return _quarantine_failed_artifact_gc(
+            ctx["root"],
+            ctx["worktree_base"],
+            ctx["entry"],
+            task_id=ctx["task_id"],
+            request_id=ctx["request_id"],
+            canonical_digest=ctx["digest"],
+            phase=ctx["phase"],
+            error=str(exc),
+            phase_path=ctx["phase_path"],
+            **_artifact_gc_ctx_inventory(ctx),
+        )
+
+
 __all__ = [
+    "ARTIFACT_GC_SCHEMA_ID",
     "AUDIT_RELATIVE_PATH",
     "QUARANTINE_DIRNAME",
     "SCHEMA_ID",
     "StorageRetentionError",
+    "cleanup_accepted_artifacts",
     "list_batches",
     "plan_worktree_reclaim",
     "preview",

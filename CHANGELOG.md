@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.44] - 2026-08-22
+
+### Fixed
+
+- Accepted task artifacts now close through one crash-safe retention lifecycle:
+  retained predecessor pins are released only after canonical acceptance, and
+  protected review, replay and quarantine workspaces remain fail-closed.
+
 ## [0.10.43] - 2026-08-22
 
 ### Added

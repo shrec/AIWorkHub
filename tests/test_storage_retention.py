@@ -433,3 +433,803 @@ def test_registration_candidate_overflow_blocks_repository_wide_prune(tmp_path, 
             confirm=True,
             base=base,
         )
+
+
+def _finish_accepted_card(
+    repo: Path, task_id: str, request_id: str, *, predecessor: str = "", idle: bool = True
+) -> None:
+    import sqlite3
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    card: dict[str, object] = {"accepted_request_id": request_id}
+    if predecessor:
+        card["rework_predecessor"] = {"request_id": predecessor}
+    connection = sqlite3.connect(str(task_store.canonical_db_path(repo)))
+    try:
+        connection.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "card_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, "claude", "storage", "finished", "unclaimed", json.dumps(card), now, now),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    if idle:
+        _write_idle_process_identity(repo, request_id)
+        if predecessor:
+            _write_idle_process_identity(repo, predecessor)
+
+
+def _write_idle_process_identity(repo: Path, request_id: str) -> None:
+    from aiworkhub import process_event_ledger, process_launcher
+
+    log_path = repo / process_launcher.PROCESS_LOG_DEFAULT_REL
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    process_event_ledger.append_event(
+        log_path,
+        {
+            "pid": 1_000_000_001,
+            "pid_start_ticks": 1,
+            "request_id": request_id,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+        },
+    )
+
+
+def _accepted_evidence(
+    task_id: str, request_id: str, *, predecessor: str | None = ""
+) -> dict[str, str]:
+    from aiworkhub import task_retention
+
+    predecessor_request_id = "" if predecessor is None else str(predecessor).strip()
+    return {
+        "schema_id": task_retention.ACCEPTED_CLEANUP_EVIDENCE_SCHEMA,
+        "task_id": task_id,
+        "request_id": request_id,
+        "predecessor_request_id": predecessor_request_id,
+        "canonical_digest": task_retention.canonical_acceptance_digest(
+            accept_evidence={},
+            accepted_request_id=request_id,
+            predecessor_request_id=predecessor_request_id,
+            request_id=request_id,
+            status="finished",
+            task_id=task_id,
+        ),
+    }
+
+
+def test_cleanup_accepted_artifacts_removes_ephemeral_keeps_receipts(retained) -> None:
+    from aiworkhub import task_retention
+
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    (entry / "receipt.json").write_text('{"ok":true}', encoding="utf-8")
+    logs = entry / "logs"
+    logs.mkdir()
+    (logs / "out.log").write_text("ephemeral\n", encoding="utf-8")
+    _finish_accepted_card(repo, "TASK-SAFE", "request-safe")
+
+    first = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_evidence("TASK-SAFE", "request-safe"),
+        base=base,
+    )
+    second = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_evidence("TASK-SAFE", "request-safe"),
+        base=base,
+    )
+
+    assert first["ok"] is True
+    assert first["schema_id"] == storage_retention.ARTIFACT_GC_SCHEMA_ID
+    assert first["status"] == "cleaned"
+    assert first["replayed"] is False
+    assert "worktree" in first["removed"]
+    assert "logs" in first["removed"]
+    assert "manifest.json" in first["preserved"]
+    assert "receipt.json" in first["preserved"]
+    assert not (entry / "worktree").exists()
+    assert not logs.exists()
+    assert (entry / "manifest.json").is_file()
+    assert (entry / "receipt.json").is_file()
+    assert (entry / "artifact-gc.receipt.json").is_file()
+    assert second["ok"] is True
+    assert second["replayed"] is True
+    assert second["receipt_digest"] == first["receipt_digest"]
+    verdict = task_retention.validate_accepted_cleanup_evidence(
+        repo,
+        _accepted_evidence("TASK-SAFE", "request-safe"),
+    )
+    assert verdict["ok"] is True
+
+
+def test_cleanup_accepted_artifacts_resumes_from_phase_evidence(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "scratch.bin").write_bytes(b"tmp")
+    _finish_accepted_card(repo, "TASK-RESUME", "request-safe")
+    evidence = _accepted_evidence("TASK-RESUME", "request-safe")
+    phase_path = (
+        repo / ".aiworkhub" / "runtime" / "storage" / "artifact-gc" / "request-safe.json"
+    )
+    phase_path.parent.mkdir(parents=True, exist_ok=True)
+    phase_path.write_text(
+        json.dumps(
+            {
+                "canonical_digest": evidence["canonical_digest"],
+                "ephemeral": ["scratch.bin", "worktree"],
+                "phase": "inventoried",
+                "preserved": [],
+                "request_id": "request-safe",
+                "schema_id": storage_retention.ARTIFACT_GC_PHASE_SCHEMA_ID,
+                "task_id": "TASK-RESUME",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+
+    assert result["ok"] is True
+    assert result["status"] == "cleaned"
+    assert "scratch.bin" in result["removed"]
+    assert not (entry / "scratch.bin").exists()
+    assert not (entry / "worktree").exists()
+
+
+def test_cleanup_accepted_artifacts_fail_closed_unknown_and_unresolved(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    _finish_accepted_card(repo, "TASK-KNOWN", "request-safe")
+    missing = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_evidence("TASK-MISSING", "request-safe"),
+        base=base,
+    )
+    unknown = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence={
+            "schema_id": "aiworkhub.accepted_cleanup_evidence.v1",
+            "task_id": "TASK-KNOWN",
+            "request_id": "request-safe",
+            "canonical_digest": "0" * 64,
+        },
+        base=base,
+    )
+
+    assert missing["ok"] is False
+    assert missing["status"] == "failed_closed"
+    assert missing["reason"] == "unresolved_task"
+    assert missing["deleted"] is False
+    assert unknown["ok"] is False
+    assert unknown["reason"] == "unknown_identity"
+    assert unknown["deleted"] is False
+    assert entry.is_dir()
+    assert (entry / "worktree").is_dir()
+
+
+def test_cleanup_registered_worktree_prunes_git_registration(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    checkout = entry / "worktree"
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert str(checkout) in listed
+    _finish_accepted_card(repo, "TASK-REG", "request-safe")
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_evidence("TASK-REG", "request-safe"),
+        base=base,
+    )
+
+    assert result["ok"] is True
+    assert "worktree" in result["removed"]
+    assert not checkout.exists()
+    after = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert str(checkout) not in after
+
+
+def test_cleanup_resumes_from_quarantined_phase(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "scratch.bin").write_bytes(b"tmp")
+    _finish_accepted_card(repo, "TASK-Q", "request-safe")
+    evidence = _accepted_evidence("TASK-Q", "request-safe")
+    qroot = storage_retention._ensure_quarantine_root(repo, base)
+    batch_id = "agc20260101T000000-request-s"
+    batch = qroot / batch_id
+    batch.mkdir(parents=True)
+    shutil.move(str(entry), str(batch / "request-safe"))
+    phase_path = repo / ".aiworkhub" / "runtime" / "storage" / "artifact-gc" / "request-safe.json"
+    phase_path.parent.mkdir(parents=True, exist_ok=True)
+    phase_path.write_text(
+        json.dumps(
+            {
+                "batch_id": batch_id,
+                "canonical_digest": evidence["canonical_digest"],
+                "ephemeral": ["scratch.bin", "worktree"],
+                "phase": "quarantined",
+                "preserved": [],
+                "removed": [],
+                "request_id": "request-safe",
+                "retry_evidence": {
+                    "canonical_digest": evidence["canonical_digest"],
+                    "error": "simulated",
+                    "phase": "inventoried",
+                    "request_id": "request-safe",
+                    "retryable": True,
+                    "schema_id": storage_retention.ARTIFACT_GC_PHASE_SCHEMA_ID,
+                    "task_id": "TASK-Q",
+                },
+                "schema_id": storage_retention.ARTIFACT_GC_PHASE_SCHEMA_ID,
+                "task_id": "TASK-Q",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+
+    restored = base / "request-safe"
+    assert result["ok"] is True
+    assert result["status"] == "cleaned"
+    assert restored.is_dir()
+    assert not (restored / "scratch.bin").exists()
+    assert not (restored / "worktree").exists()
+    assert (restored / "artifact-gc.receipt.json").is_file()
+
+
+def _worktree_list(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def test_cleanup_missing_dir_stale_registration_unregisters_only_owned(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    checkout = entry / "worktree"
+    other_entry = base / "request-other"
+    other = other_entry / "worktree"
+    other_entry.mkdir()
+    _git(repo, "worktree", "add", "--detach", str(other), "HEAD")
+    shutil.rmtree(checkout)
+    listed = _worktree_list(repo)
+    assert str(checkout) in listed
+    assert str(other) in listed
+    _finish_accepted_card(repo, "TASK-STALE", "request-safe")
+    evidence = _accepted_evidence("TASK-STALE", "request-safe")
+    phase_path = (
+        repo / ".aiworkhub" / "runtime" / "storage" / "artifact-gc" / "request-safe.json"
+    )
+    phase_path.parent.mkdir(parents=True, exist_ok=True)
+    phase_path.write_text(
+        json.dumps(
+            {
+                "canonical_digest": evidence["canonical_digest"],
+                "ephemeral": ["worktree"],
+                "phase": "inventoried",
+                "preserved": [],
+                "request_id": "request-safe",
+                "schema_id": storage_retention.ARTIFACT_GC_PHASE_SCHEMA_ID,
+                "task_id": "TASK-STALE",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo, evidence=evidence, base=base
+    )
+
+    assert result["ok"] is True
+    assert result["schema_id"] == storage_retention.ARTIFACT_GC_SCHEMA_ID
+    assert "worktree" in result["removed"]
+    after = _worktree_list(repo)
+    assert str(checkout) not in after
+    assert str(other) in after
+    assert other.is_dir()
+    assert not checkout.exists()
+
+
+def test_cleanup_fail_closed_absent_process_ledger(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    _finish_accepted_card(repo, "TASK-NO-LEDGER", "request-safe", idle=False)
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_evidence("TASK-NO-LEDGER", "request-safe"),
+        base=base,
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "failed_closed"
+    assert result["reason"] == "ambiguous_ownership"
+    assert result["deleted"] is False
+    assert result["ephemeral"] == []
+    assert result["preserved"] == []
+    assert result["removed"] == []
+    assert result["predecessor_unpinned"] == ""
+    assert entry.is_dir()
+    assert (entry / "worktree").is_dir()
+
+
+def test_cleanup_partial_delete_quarantines_and_replays_inventory(retained, monkeypatch) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    logs = entry / "logs"
+    logs.mkdir()
+    (logs / "out.log").write_text("ephemeral\n", encoding="utf-8")
+    _finish_accepted_card(repo, "TASK-PARTIAL", "request-safe")
+    evidence = _accepted_evidence("TASK-PARTIAL", "request-safe")
+
+    def _boom(repo_root, checkout):
+        raise OSError("partial-delete")
+
+    monkeypatch.setattr(storage_retention, "_remove_registered_checkout", _boom)
+    first = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    monkeypatch.undo()
+
+    assert first["ok"] is False
+    assert first["status"] == "quarantined"
+    assert first["reason"] == "cleanup_failed"
+    assert first["deleted"] is False
+    assert "logs" in first["removed"]
+    assert "worktree" in first["ephemeral"]
+    assert "manifest.json" in first["preserved"]
+    assert first["predecessor_unpinned"] == ""
+    assert not logs.exists() or not (base / "request-safe" / "logs").exists()
+
+    second = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    restored = base / "request-safe"
+    assert second["ok"] is True
+    assert second["replayed"] is False
+    assert set(first["removed"]).issubset(second["removed"])
+    assert "logs" in second["removed"]
+    assert "worktree" in second["removed"]
+    assert "manifest.json" in second["preserved"]
+    assert second["predecessor_unpinned"] == ""
+    assert not (restored / "worktree").exists()
+    assert (restored / "manifest.json").is_file()
+
+    third = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    assert third["ok"] is True
+    assert third["replayed"] is True
+    assert set(first["removed"]).issubset(third["removed"])
+    assert "logs" in third["removed"]
+    assert "worktree" in third["removed"]
+    assert "manifest.json" in third["preserved"]
+    assert third["predecessor_unpinned"] == ""
+    assert third["receipt_digest"] == second["receipt_digest"]
+
+
+def test_cleanup_syncs_phase_after_predecessor_unpin(retained, monkeypatch) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    _finish_accepted_card(repo, "TASK-UNPIN-SYNC", "request-safe", predecessor="pred-ok")
+    evidence = _accepted_evidence("TASK-UNPIN-SYNC", "request-safe", predecessor="pred-ok")
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("complete-after-unpin")
+
+    monkeypatch.setattr(storage_retention, "_complete_artifact_gc", _boom)
+    first = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    monkeypatch.undo()
+
+    assert first["ok"] is False
+    assert first["status"] == "quarantined"
+    assert first["retry_evidence"]["phase"] == "predecessor_unpinned"
+    assert first["predecessor_unpinned"] == "pred-ok"
+    phase_path = repo / ".aiworkhub" / "runtime" / "storage" / "artifact-gc" / "request-safe.json"
+    stored = json.loads(phase_path.read_text(encoding="utf-8"))
+    assert stored["phase"] == "quarantined"
+    assert stored["predecessor_unpinned"] == "pred-ok"
+    assert stored["retry_evidence"]["phase"] == "predecessor_unpinned"
+
+    second = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    assert second["ok"] is True
+    assert second["replayed"] is False
+    assert second["predecessor_unpinned"] == "pred-ok"
+    third = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    assert third["ok"] is True
+    assert third["replayed"] is True
+    assert third["receipt_digest"] == second["receipt_digest"]
+
+
+def test_cleanup_resumes_after_crash_following_predecessor_row_clear(
+    retained, monkeypatch
+) -> None:
+    import sqlite3
+
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    _finish_accepted_card(repo, "TASK-UNPIN-CRASH", "request-safe", predecessor="pred-ok")
+    evidence = _accepted_evidence("TASK-UNPIN-CRASH", "request-safe", predecessor="pred-ok")
+    real_clear = storage_retention._clear_predecessor_pin
+
+    def _crash_after_clear(*args, **kwargs):
+        real_clear(*args, **kwargs)
+        raise OSError("crash-after-row-clear")
+
+    monkeypatch.setattr(storage_retention, "_clear_predecessor_pin", _crash_after_clear)
+    first = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    monkeypatch.undo()
+
+    assert first["ok"] is False
+    assert first["deleted"] is False
+    connection = sqlite3.connect(str(task_store.canonical_db_path(repo)))
+    try:
+        card = json.loads(
+            connection.execute(
+                "SELECT card_json FROM tasks WHERE task_id=?",
+                ("TASK-UNPIN-CRASH",),
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+    assert "rework_predecessor" not in card
+    phase_path = repo / ".aiworkhub" / "runtime" / "storage" / "artifact-gc" / "request-safe.json"
+    stored = json.loads(phase_path.read_text(encoding="utf-8"))
+    retry_phase = stored.get("phase")
+    if retry_phase == "quarantined":
+        retry_phase = (stored.get("retry_evidence") or {}).get("phase")
+    assert retry_phase == "predecessor_unpin_intent"
+    assert stored["predecessor_unpinned"] == "pred-ok"
+
+    second = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    assert second["ok"] is True
+    assert second["replayed"] is False
+    assert second["predecessor_unpinned"] == "pred-ok"
+    third = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    assert third["ok"] is True
+    assert third["replayed"] is True
+    assert third["receipt_digest"] == second["receipt_digest"]
+    assert third["predecessor_unpinned"] == "pred-ok"
+
+def test_cleanup_partial_quarantine_persist_fail_closed_and_replays(retained, monkeypatch) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    logs = entry / "logs"
+    logs.mkdir()
+    (logs / "out.log").write_text("ephemeral\n", encoding="utf-8")
+    _finish_accepted_card(repo, "TASK-QPERSIST", "request-safe")
+    evidence = _accepted_evidence("TASK-QPERSIST", "request-safe")
+    real_write = storage_retention._write_artifact_gc_phase
+
+    def _boom_checkout(repo_root, checkout):
+        raise OSError("partial-delete")
+
+    def _boom_phase(path, payload):
+        if payload.get("phase") == "quarantined":
+            raise OSError("phase-persist")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(storage_retention, "_remove_registered_checkout", _boom_checkout)
+    monkeypatch.setattr(storage_retention, "_write_artifact_gc_phase", _boom_phase)
+    first = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    monkeypatch.undo()
+
+    assert first["ok"] is False
+    assert first["status"] == "failed_closed"
+    assert first["reason"] == "cleanup_failed"
+    assert first["deleted"] is False
+    assert first["retry_evidence"]["quarantine_failed"] is True
+    assert first["retry_evidence"].get("restore_failed") is not True
+    restored = base / "request-safe"
+    assert restored.is_dir()
+    assert (restored / "manifest.json").is_file()
+    phase_path = repo / ".aiworkhub" / "runtime" / "storage" / "artifact-gc" / "request-safe.json"
+    stored = json.loads(phase_path.read_text(encoding="utf-8"))
+    assert stored["phase"] != "quarantined"
+
+    second = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    assert second["ok"] is True
+    assert second["replayed"] is False
+    assert "worktree" in second["removed"]
+    assert "manifest.json" in second["preserved"]
+    assert not (restored / "worktree").exists()
+    assert (restored / "manifest.json").is_file()
+    third = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    assert third["ok"] is True
+    assert third["replayed"] is True
+    assert third["receipt_digest"] == second["receipt_digest"]
+
+
+def test_cleanup_invalid_predecessor_fail_closed_no_quarantine_loop(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    _finish_accepted_card(repo, "TASK-BADPRED", "request-safe", predecessor="bad id")
+    evidence = _accepted_evidence("TASK-BADPRED", "request-safe", predecessor="bad id")
+    qroot = storage_retention._ensure_quarantine_root(repo, base)
+
+    first = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    second = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+
+    assert first["ok"] is False
+    assert first["status"] == "failed_closed"
+    assert first["reason"] == "predecessor_identity_invalid"
+    assert first["deleted"] is False
+    assert first["predecessor_unpinned"] == ""
+    assert second == first
+    assert (base / "request-safe").is_dir()
+    assert (base / "request-safe" / "manifest.json").is_file()
+    phase_path = repo / ".aiworkhub" / "runtime" / "storage" / "artifact-gc" / "request-safe.json"
+    stored = json.loads(phase_path.read_text(encoding="utf-8"))
+    assert stored["phase"] == "ephemeral_removed"
+    assert list(qroot.iterdir()) == []
+
+
+def test_cleanup_quarantine_audit_fault_fail_closed_and_replays(retained, monkeypatch) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    logs = entry / "logs"
+    logs.mkdir()
+    (logs / "out.log").write_text("ephemeral\n", encoding="utf-8")
+    _finish_accepted_card(repo, "TASK-QAUDIT", "request-safe")
+    evidence = _accepted_evidence("TASK-QAUDIT", "request-safe")
+    qroot = storage_retention._ensure_quarantine_root(repo, base)
+
+    def _boom_checkout(repo_root, checkout):
+        raise OSError("partial-delete")
+
+    def _boom_audit(*_args, **_kwargs):
+        raise OSError("quarantine-audit")
+
+    monkeypatch.setattr(storage_retention, "_remove_registered_checkout", _boom_checkout)
+    monkeypatch.setattr(storage_retention, "_append_audit", _boom_audit)
+    first = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    monkeypatch.undo()
+
+    assert first["ok"] is False
+    assert first["status"] == "failed_closed"
+    assert first["reason"] == "quarantine_audit_failed"
+    assert first["deleted"] is False
+    assert first["batch_id"]
+    assert first["retry_evidence"]["batch_id"] == first["batch_id"]
+    assert first["retry_evidence"]["quarantine_failed"] is True
+    assert first["retry_evidence"]["retryable"] is True
+    assert not (base / "request-safe").exists()
+    quarantined = qroot / first["batch_id"] / "request-safe"
+    assert quarantined.is_dir()
+    assert (quarantined / "manifest.json").is_file()
+    phase_path = repo / ".aiworkhub" / "runtime" / "storage" / "artifact-gc" / "request-safe.json"
+    stored = json.loads(phase_path.read_text(encoding="utf-8"))
+    assert stored["phase"] == "quarantined"
+    assert stored["batch_id"] == first["batch_id"]
+    assert stored["retry_evidence"]["retryable"] is True
+    audit_path = repo / storage_retention.AUDIT_RELATIVE_PATH
+    assert not audit_path.is_file() or "artifact_gc_quarantined" not in audit_path.read_text(
+        encoding="utf-8"
+    )
+
+    second = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    restored = base / "request-safe"
+    assert second["ok"] is True
+    assert second["replayed"] is False
+    assert "worktree" in second["removed"]
+    assert "manifest.json" in second["preserved"]
+    assert not (restored / "worktree").exists()
+    assert (restored / "manifest.json").is_file()
+
+    third = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    assert third["ok"] is True
+    assert third["replayed"] is True
+    assert third["receipt_digest"] == second["receipt_digest"]
+
+
+def test_cleanup_predecessor_substitution_fail_closed(retained) -> None:
+    import sqlite3
+    from aiworkhub import task_retention
+
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    _finish_accepted_card(repo, "TASK-SUB", "request-safe")
+    digest_empty = task_retention.canonical_acceptance_digest(
+        accept_evidence={},
+        accepted_request_id="request-safe",
+        predecessor_request_id="",
+        request_id="request-safe",
+        status="finished",
+        task_id="TASK-SUB",
+    )
+    digest_none = task_retention.canonical_acceptance_digest(
+        accept_evidence={},
+        accepted_request_id="request-safe",
+        predecessor_request_id=None,
+        request_id="request-safe",
+        status="finished",
+        task_id="TASK-SUB",
+    )
+    digest_omitted = task_retention.canonical_acceptance_digest(
+        accept_evidence={},
+        accepted_request_id="request-safe",
+        request_id="request-safe",
+        status="finished",
+        task_id="TASK-SUB",
+    )
+    assert digest_empty == digest_none == digest_omitted
+    base_evidence = {
+        "schema_id": task_retention.ACCEPTED_CLEANUP_EVIDENCE_SCHEMA,
+        "task_id": "TASK-SUB",
+        "request_id": "request-safe",
+        "canonical_digest": digest_empty,
+    }
+    assert task_retention.validate_accepted_cleanup_evidence(repo, base_evidence)["ok"] is True
+    assert (
+        task_retention.validate_accepted_cleanup_evidence(
+            repo, {**base_evidence, "predecessor_request_id": None}
+        )["ok"]
+        is True
+    )
+    assert (
+        task_retention.validate_accepted_cleanup_evidence(
+            repo, {**base_evidence, "predecessor_request_id": ""}
+        )["ok"]
+        is True
+    )
+
+    substituted = base / "pred-sub"
+    substituted.mkdir()
+    (substituted / "keep.bin").write_bytes(b"live")
+    _write_idle_process_identity(repo, "pred-sub")
+    connection = sqlite3.connect(str(task_store.canonical_db_path(repo)))
+    try:
+        row = connection.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", ("TASK-SUB",)
+        ).fetchone()
+        card = json.loads(row[0])
+        card["rework_predecessor"] = {"request_id": "pred-sub"}
+        connection.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card), "TASK-SUB"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_evidence("TASK-SUB", "request-safe"),
+        base=base,
+    )
+    assert result["ok"] is False
+    assert result["deleted"] is False
+    assert result["reason"] == "unknown_identity"
+    assert entry.is_dir()
+    assert (entry / "worktree").is_dir()
+    assert substituted.is_dir()
+    assert (substituted / "keep.bin").is_file()
+
+
+def test_cleanup_quarantine_resume_deduplicates_removed_names(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    _finish_accepted_card(repo, "TASK-DEDUPE", "request-safe")
+    evidence = _accepted_evidence("TASK-DEDUPE", "request-safe")
+    phase_path = (
+        repo / ".aiworkhub" / "runtime" / "storage" / "artifact-gc" / "request-safe.json"
+    )
+    phase_path.parent.mkdir(parents=True, exist_ok=True)
+    phase_path.write_text(
+        json.dumps(
+            {
+                "canonical_digest": evidence["canonical_digest"],
+                "ephemeral": ["logs", "scratch.bin", "worktree"],
+                "phase": "inventoried",
+                "preserved": ["manifest.json"],
+                "removed": ["logs"],
+                "request_id": "request-safe",
+                "schema_id": storage_retention.ARTIFACT_GC_PHASE_SCHEMA_ID,
+                "task_id": "TASK-DEDUPE",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+
+    assert result["ok"] is True
+    assert result["removed"] == ["logs", "worktree"]
+    assert result["removed"].count("logs") == 1
+    assert "scratch.bin" not in result["removed"]
+    assert not (entry / "worktree").exists()
+    assert (entry / "manifest.json").is_file()
+
+
+def test_cleanup_completed_replay_fail_closed_on_receipt_digest_mismatch(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    _finish_accepted_card(repo, "TASK-REPLAY-DIGEST", "request-safe")
+    evidence = _accepted_evidence("TASK-REPLAY-DIGEST", "request-safe")
+    first = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+    assert first["ok"] is True
+    assert first["replayed"] is False
+    phase_path = (
+        repo / ".aiworkhub" / "runtime" / "storage" / "artifact-gc" / "request-safe.json"
+    )
+    stored = json.loads(phase_path.read_text(encoding="utf-8"))
+    stored["receipt"]["receipt_digest"] = "0" * 64
+    phase_path.write_text(json.dumps(stored, sort_keys=True) + "\n", encoding="utf-8")
+
+    second = storage_retention.cleanup_accepted_artifacts(repo, evidence=evidence, base=base)
+
+    assert second["ok"] is False
+    assert second["deleted"] is False
+    assert second["replayed"] is False
+    assert second["reason"] == "unknown_identity"
+    assert (entry / "manifest.json").is_file()
+    assert (entry / "artifact-gc.receipt.json").is_file()
+
+
+def test_cleanup_accepted_artifacts_accepts_colon_bearing_task_id(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    task_id = "needfix:NF-2026-00385"
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    (entry / "receipt.json").write_text('{"ok":true}', encoding="utf-8")
+    _finish_accepted_card(repo, task_id, "request-safe")
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_evidence(task_id, "request-safe"),
+        base=base,
+    )
+
+    assert result["ok"] is True
+    assert result["task_id"] == task_id
+    assert result["status"] == "cleaned"
+    assert not (entry / "worktree").exists()
+    assert (entry / "manifest.json").is_file()
+    assert (entry / "receipt.json").is_file()
+
+
+def test_cleanup_accepted_artifacts_accepts_max_length_task_id(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    task_id = "T" + ("a" * 255)
+    (entry / "manifest.json").write_text('{"schema_id":"kept"}', encoding="utf-8")
+    _finish_accepted_card(repo, task_id, "request-safe")
+
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_evidence(task_id, "request-safe"),
+        base=base,
+    )
+
+    assert result["ok"] is True
+    assert result["task_id"] == task_id
+    assert result["status"] == "cleaned"
+    assert not (entry / "worktree").exists()
+    assert (entry / "manifest.json").is_file()
+
+
+def test_cleanup_accepted_artifacts_rejects_malformed_task_id(retained) -> None:
+    repo, base, entry = retained["repo"], retained["base"], retained["entry"]
+    _finish_accepted_card(repo, "TASK-KNOWN", "request-safe")
+    result = storage_retention.cleanup_accepted_artifacts(
+        repo,
+        evidence=_accepted_evidence("T" + ("a" * 256), "request-safe"),
+        base=base,
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "failed_closed"
+    assert result["reason"] == "unknown_identity"
+    assert result["deleted"] is False
+    assert entry.is_dir()
+    assert (entry / "worktree").is_dir()

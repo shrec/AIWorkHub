@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.44 — 2026-08-22
+
+### Fixed
+
+- Accepted task artifacts and retained predecessor pins now follow one
+  crash-safe cleanup lifecycle without deleting protected review, replay or
+  quarantine evidence.
+
 ## 0.10.43 — 2026-08-22
 
 ### Added

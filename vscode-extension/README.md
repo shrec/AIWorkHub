@@ -12,6 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.44
+
+- Canonical acceptance now releases retained predecessor pins and reclaims
+  eligible task artifacts through one crash-safe, protection-aware lifecycle.
+
 ## What's new in 0.10.43
 
 - Task creation now applies deterministic templates instead of relying on
