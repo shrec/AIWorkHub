@@ -1,5 +1,20 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.42 — 2026-08-22
+
+### Added
+
+- Deterministic task templates normalize recurring worker contracts before
+  launch.
+- Offline staged edits expose exact required-output progress and publish only
+  one complete atomic envelope.
+
+### Fixed
+
+- Cross-platform validation interpreter authority is normalized and recorded.
+- Missing required outputs get one bounded correction; extra paths and
+  exhausted corrections fail closed.
+
 ## 0.10.41 — 2026-08-21
 
 ### Fixed

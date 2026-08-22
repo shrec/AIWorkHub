@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.10.41";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.10.42";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -3647,6 +3647,33 @@ function createVscodeLmStagedEditCollector(request) {
   const contractByPath = vscodeLmContractMap(pathContracts);
   const edits = new Map();
   const creates = new Map();
+  const trackRequired = Array.isArray(request && request.required_outputs);
+  const requiredOutputs = [];
+  if (trackRequired) {
+    const seen = new Set();
+    for (const item of request.required_outputs) {
+      const filePath = vscodeLmNormalizedPath(item);
+      if (!filePath || seen.has(filePath)) continue;
+      seen.add(filePath);
+      requiredOutputs.push(filePath);
+    }
+  }
+  const requiredSet = new Set(requiredOutputs);
+  let incompleteFinalizeCount = 0;
+
+  const requiredProgress = () => {
+    if (!trackRequired) return {};
+    const staged = new Set([...edits.keys(), ...creates.keys()]);
+    const completed_outputs = requiredOutputs.filter((filePath) => staged.has(filePath));
+    const missing_outputs = requiredOutputs.filter((filePath) => !staged.has(filePath));
+    const required_output_count = requiredOutputs.length;
+    return {
+      required_output_count,
+      completed_outputs,
+      missing_outputs,
+      completion_rate: required_output_count === 0 ? 1 : completed_outputs.length / required_output_count,
+    };
+  };
 
   const boundedReceipt = (operation, filePath, content, extra = {}) => ({
     ok: true,
@@ -3656,9 +3683,14 @@ function createVscodeLmStagedEditCollector(request) {
     content_sha256: crypto.createHash("sha256").update(String(content), "utf8").digest("hex"),
     staged_path_count: new Set([...edits.keys(), ...creates.keys()]).size,
     ...extra,
+    ...requiredProgress(),
   });
 
-  const reject = (reason) => ({ ok: false, reason: `semantic_edit_stage_rejected:${reason}` });
+  const reject = (reason) => ({
+    ok: false,
+    reason: `semantic_edit_stage_rejected:${reason}`,
+    ...requiredProgress(),
+  });
 
   const stage = async (input) => {
     if (!input || typeof input !== "object" || Array.isArray(input)) return reject("input_invalid");
@@ -3666,6 +3698,12 @@ function createVscodeLmStagedEditCollector(request) {
     const filePath = vscodeLmNormalizedPath(input.file_path);
     if (!filePath || !allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(filePath, pattern))) {
       return reject(`path_not_allowed:${filePath || "missing"}`);
+    }
+    if (trackRequired && incompleteFinalizeCount >= 2) {
+      return reject("required_outputs_correction_exhausted");
+    }
+    if (trackRequired && !requiredSet.has(filePath)) {
+      return reject(`path_not_required:${filePath}`);
     }
     const contract = contractByPath.get(filePath);
     const unexpectedKeys = (candidate) => {
@@ -3750,6 +3788,24 @@ function createVscodeLmStagedEditCollector(request) {
   };
 
   const finalize = (summary) => {
+    const progress = requiredProgress();
+    if (trackRequired && incompleteFinalizeCount >= 2) {
+      return {
+        ok: false,
+        reason: "semantic_edit_required_outputs_correction_exhausted",
+        ...progress,
+      };
+    }
+    if (trackRequired && progress.missing_outputs.length > 0) {
+      incompleteFinalizeCount += 1;
+      return {
+        ok: false,
+        reason: incompleteFinalizeCount >= 2
+          ? "semantic_edit_required_outputs_correction_exhausted"
+          : "semantic_edit_required_outputs_incomplete",
+        ...progress,
+      };
+    }
     const envelope = {
       schema_id: VSCODE_LM_EDIT_RESPONSE_SCHEMA,
       summary: String(summary || "").trim(),
@@ -3757,13 +3813,14 @@ function createVscodeLmStagedEditCollector(request) {
       creates: [...creates.values()],
     };
     const error = validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts);
-    if (error) return { ok: false, reason: `semantic_edit_finalize_rejected:${error}` };
+    if (error) return { ok: false, reason: `semantic_edit_finalize_rejected:${error}`, ...progress };
     return {
       ok: true,
       schema_id: "aiworkhub.vscode_lm.staged_edit_finalize_receipt.v1",
       staged_path_count: new Set([...edits.keys(), ...creates.keys()]).size,
       staged_edit_count: [...edits.values()].reduce((total, edit) => total + edit.ranges.length, 0),
       staged_create_count: creates.size,
+      ...progress,
       __finalEnvelope: envelope,
     };
   };

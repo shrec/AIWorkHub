@@ -969,6 +969,10 @@ async function textProtocolChecks() {
   assert.strictEqual(atomicFinal.ok, true);
   assert.strictEqual(atomicFinal.__finalEnvelope.edits[0].ranges.length, 1);
   assert.strictEqual(atomicFinal.__finalEnvelope.edits[0].ranges[0].new, "return 4");
+  assert.ok(!Object.prototype.hasOwnProperty.call(atomicFinal, "required_output_count"));
+  assert.ok(!Object.prototype.hasOwnProperty.call(atomicFinal, "completed_outputs"));
+  assert.ok(!Object.prototype.hasOwnProperty.call(atomicFinal, "missing_outputs"));
+  assert.ok(!Object.prototype.hasOwnProperty.call(atomicFinal, "completion_rate"));
   const mixedCollector = internals.createVscodeLmStagedEditCollector({
     allowedWrites: ["src/app.py", "tests/created.py"],
     path_contracts: {
@@ -1020,6 +1024,136 @@ async function textProtocolChecks() {
   });
   assert.strictEqual(mixedOperationInvalid.ok, false);
   assert.match(mixedOperationInvalid.reason, /operation_invalid/);
+
+  const requiredContracts = {
+    ...editContract,
+    "tests/created.py": {
+      action: "create",
+      current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      line_count: 0,
+      parent_existed: false,
+    },
+  };
+  const requiredCollector = internals.createVscodeLmStagedEditCollector({
+    allowedWrites: ["src/app.py", "tests/created.py"],
+    path_contracts: requiredContracts,
+    required_outputs: ["src/app.py", "tests\\created.py", "src/app.py", ""],
+  });
+  const requiredStage1 = await requiredCollector.stage({
+    operation: "replace_range",
+    file_path: "src/app.py",
+    start_line: 2,
+    end_line: 2,
+    new: "return 10",
+  });
+  assert.strictEqual(requiredStage1.ok, true);
+  assert.strictEqual(requiredStage1.required_output_count, 2);
+  assert.deepStrictEqual(requiredStage1.completed_outputs, ["src/app.py"]);
+  assert.deepStrictEqual(requiredStage1.missing_outputs, ["tests/created.py"]);
+  assert.strictEqual(requiredStage1.completion_rate, 0.5);
+  const incompleteFinal = requiredCollector.finalize("missing required create");
+  assert.strictEqual(incompleteFinal.ok, false);
+  assert.strictEqual(incompleteFinal.reason, "semantic_edit_required_outputs_incomplete");
+  assert.strictEqual(incompleteFinal.required_output_count, 2);
+  assert.deepStrictEqual(incompleteFinal.completed_outputs, ["src/app.py"]);
+  assert.deepStrictEqual(incompleteFinal.missing_outputs, ["tests/created.py"]);
+  assert.strictEqual(incompleteFinal.completion_rate, 0.5);
+  assert.ok(!Object.prototype.hasOwnProperty.call(incompleteFinal, "__finalEnvelope"));
+  const requiredStage2 = await requiredCollector.stage({
+    operation: "create",
+    file_path: "tests/created.py",
+    content: "def created():\n    return True\n",
+  });
+  assert.strictEqual(requiredStage2.ok, true);
+  assert.strictEqual(requiredStage2.required_output_count, 2);
+  assert.deepStrictEqual(requiredStage2.completed_outputs, ["src/app.py", "tests/created.py"]);
+  assert.deepStrictEqual(requiredStage2.missing_outputs, []);
+  assert.strictEqual(requiredStage2.completion_rate, 1);
+  const completeRequiredFinal = requiredCollector.finalize("complete required outputs");
+  assert.strictEqual(completeRequiredFinal.ok, true);
+  assert.strictEqual(completeRequiredFinal.required_output_count, 2);
+  assert.deepStrictEqual(completeRequiredFinal.completed_outputs, ["src/app.py", "tests/created.py"]);
+  assert.deepStrictEqual(completeRequiredFinal.missing_outputs, []);
+  assert.strictEqual(completeRequiredFinal.completion_rate, 1);
+  assert.strictEqual(completeRequiredFinal.__finalEnvelope.edits.length, 1);
+  assert.strictEqual(completeRequiredFinal.__finalEnvelope.creates.length, 1);
+  assert.strictEqual(completeRequiredFinal.__finalEnvelope.edits[0].ranges[0].new, "return 10");
+
+  const extraPathCollector = internals.createVscodeLmStagedEditCollector({
+    allowedWrites: ["src/app.py", "tests/created.py"],
+    path_contracts: editContract,
+    required_outputs: ["src/app.py"],
+  });
+  assert.strictEqual((await extraPathCollector.stage({
+    operation: "replace_range",
+    file_path: "src/app.py",
+    start_line: 2,
+    end_line: 2,
+    new: "return 11",
+  })).ok, true);
+  const extraPathConflict = await extraPathCollector.stage({
+    operation: "create",
+    file_path: "src/app.py",
+    content: "conflict",
+  });
+  assert.strictEqual(extraPathConflict.ok, false);
+  assert.match(extraPathConflict.reason, /action_mismatch|path_conflict/);
+  const extraReplay = await extraPathCollector.stage({
+    operation: "replace_range",
+    file_path: "src/app.py",
+    start_line: 2,
+    end_line: 2,
+    new: "return 12",
+  });
+  assert.strictEqual(extraReplay.ok, false);
+  assert.match(extraReplay.reason, /range_conflict/);
+  const extraPathStage = await extraPathCollector.stage({
+    operation: "create",
+    file_path: "tests/created.py",
+    content: "def created():\n    return True\n",
+  });
+  assert.strictEqual(extraPathStage.ok, false);
+  assert.match(extraPathStage.reason, /path_not_required/);
+  assert.strictEqual(extraPathStage.required_output_count, 1);
+  assert.deepStrictEqual(extraPathStage.completed_outputs, ["src/app.py"]);
+  assert.deepStrictEqual(extraPathStage.missing_outputs, []);
+  const extraPathFinal = extraPathCollector.finalize("required path complete without extra create");
+  assert.strictEqual(extraPathFinal.ok, true);
+  assert.strictEqual(extraPathFinal.required_output_count, 1);
+  assert.deepStrictEqual(extraPathFinal.completed_outputs, ["src/app.py"]);
+  assert.deepStrictEqual(extraPathFinal.missing_outputs, []);
+  assert.strictEqual(extraPathFinal.completion_rate, 1);
+  assert.strictEqual(extraPathFinal.__finalEnvelope.creates.length, 0);
+
+  const boundedCorrectionCollector = internals.createVscodeLmStagedEditCollector({
+    allowedWrites: ["src/app.py", "tests/created.py"],
+    path_contracts: requiredContracts,
+    required_outputs: ["src/app.py", "tests/created.py"],
+  });
+  assert.strictEqual((await boundedCorrectionCollector.stage({
+    operation: "replace_range",
+    file_path: "src/app.py",
+    start_line: 2,
+    end_line: 2,
+    new: "return 13",
+  })).ok, true);
+  const firstIncomplete = boundedCorrectionCollector.finalize("first incomplete");
+  assert.strictEqual(firstIncomplete.ok, false);
+  assert.strictEqual(firstIncomplete.reason, "semantic_edit_required_outputs_incomplete");
+  const secondIncomplete = boundedCorrectionCollector.finalize("second incomplete");
+  assert.strictEqual(secondIncomplete.ok, false);
+  assert.strictEqual(secondIncomplete.reason, "semantic_edit_required_outputs_correction_exhausted");
+  assert.ok(!Object.prototype.hasOwnProperty.call(secondIncomplete, "__finalEnvelope"));
+  const lateStage = await boundedCorrectionCollector.stage({
+    operation: "create",
+    file_path: "tests/created.py",
+    content: "def created():\n    return True\n",
+  });
+  assert.strictEqual(lateStage.ok, false);
+  assert.match(lateStage.reason, /required_outputs_correction_exhausted/);
+  const terminalFinal = boundedCorrectionCollector.finalize("after exhausted");
+  assert.strictEqual(terminalFinal.ok, false);
+  assert.strictEqual(terminalFinal.reason, "semantic_edit_required_outputs_correction_exhausted");
 
   const copiedSentinelV3 = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,

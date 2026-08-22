@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.42] - 2026-08-22
+
+### Added
+
+- Added a deterministic task-template registry for common task classes, so
+  read/write scope, required outputs and validation contracts are normalized
+  before a worker is launched.
+- VS Code staged edits now carry exact required-output progress and finalize
+  only as one complete atomic envelope after every required path is staged.
+
+### Fixed
+
+- Python validation commands now resolve only recognized repository virtualenv
+  interpreter spellings across POSIX and Windows, with explicit interpreter
+  authority recorded in validation receipts.
+- Incomplete staged edits retain one bounded correction opportunity, reject
+  extra paths, and fail closed after the correction is exhausted.
+
 ## [0.10.41] - 2026-08-21
 
 ### Fixed

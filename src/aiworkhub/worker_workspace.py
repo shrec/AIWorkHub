@@ -4169,6 +4169,80 @@ def _resolve_repo_relative_trusted_validation_executable(
     return _trusted_validation_executable_from_resolved(stem, root, resolved)
 
 
+_RECOGNIZED_VENV_PYTHON_SPELLINGS = frozenset(
+    {".venv/bin/python", ".venv/Scripts/python.exe"}
+)
+_VALIDATION_INTERPRETER_AUTHORITY_SCHEMA = (
+    "aiworkhub.validation_interpreter_authority.v1"
+)
+
+
+def _recognized_venv_python_spelling(head: str) -> str | None:
+    if not head or Path(head).is_absolute():
+        return None
+    normalized = head.replace("\\", "/")
+    if normalized in _RECOGNIZED_VENV_PYTHON_SPELLINGS:
+        return normalized
+    return None
+
+
+def _verify_validation_interpreter(candidate: Path, bound_root: Path) -> Path:
+    bound = bound_root.resolve(strict=False)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceError("validation_environment:interpreter_missing") from exc
+    try:
+        resolved.relative_to(bound)
+    except ValueError as exc:
+        raise WorkspaceError(
+            "validation_environment:interpreter_symlink_escape"
+        ) from exc
+    if not resolved.is_file():
+        raise WorkspaceError("validation_environment:interpreter_missing")
+    if not os.access(resolved, os.X_OK):
+        raise WorkspaceError("validation_environment:interpreter_not_executable")
+    try:
+        info = resolved.stat()
+    except OSError as exc:
+        raise WorkspaceError("validation_environment:interpreter_missing") from exc
+    if os.name != "nt" and info.st_uid != os.getuid():
+        raise WorkspaceError("validation_environment:interpreter_untrusted_owner")
+    if posix_path_modes_supported(os.name) and stat.S_IMODE(info.st_mode) & 0o002:
+        raise WorkspaceError("validation_environment:interpreter_world_writable")
+    return resolved
+
+
+def _normalize_validation_interpreter_argv(
+    workspace: WorkerWorkspace, argv: list[str]
+) -> tuple[list[str], dict[str, Any] | None]:
+    if not argv:
+        return [], None
+    spelling = _recognized_venv_python_spelling(argv[0])
+    if spelling is None:
+        return list(argv), None
+    relative = Path(*PurePosixPath(spelling).parts)
+    local = workspace.path / relative
+    if local.exists() or local.is_symlink():
+        resolved = _verify_validation_interpreter(local, workspace.path)
+        return [str(resolved), *argv[1:]], {
+            "schema_id": _VALIDATION_INTERPRETER_AUTHORITY_SCHEMA,
+            "declared": argv[0],
+            "source": "workspace_local",
+            "resolved": str(resolved),
+        }
+    canonical = workspace.repo / relative
+    if canonical.exists() or canonical.is_symlink():
+        resolved = _verify_validation_interpreter(canonical, workspace.repo)
+        return [str(resolved), *argv[1:]], {
+            "schema_id": _VALIDATION_INTERPRETER_AUTHORITY_SCHEMA,
+            "declared": argv[0],
+            "source": "canonical_repository",
+            "resolved": str(resolved),
+        }
+    raise WorkspaceError("validation_environment:interpreter_missing")
+
+
 def _normalize_trusted_validation_executable_argv(
     argv: list[str], repo: Path | None = None
 ) -> list[str]:
@@ -6430,6 +6504,9 @@ def run_validations(
                 cd_relative,
             ) = _parse_validation_command_detailed(command)
             declared_argv = list(tokens)
+            tokens, interpreter_authority = _normalize_validation_interpreter_argv(
+                workspace, tokens
+            )
             candidate_authority = python_candidate_authority(workspace)
             effective_components = pythonpath_components
             if _is_candidate_pytest_wrapper_command(tokens):
@@ -6586,6 +6663,7 @@ def run_validations(
                         "sandbox_backend": selected_backend,
                         "execution_boundary": execution_boundary,
                         "python_candidate_authority": candidate_authority,
+                        "interpreter_authority": interpreter_authority,
                         "returncode": None,
                         "timed_out": True,
                         "duration_seconds": round(time.monotonic() - started, 6),
@@ -6619,6 +6697,7 @@ def run_validations(
                     "sandbox_backend": selected_backend,
                     "execution_boundary": execution_boundary,
                     "python_candidate_authority": candidate_authority,
+                    "interpreter_authority": interpreter_authority,
                     "returncode": None,
                     "timed_out": False,
                     "launch_error": type(exc).__name__,
@@ -6650,6 +6729,7 @@ def run_validations(
                 "sandbox_backend": selected_backend,
                 "execution_boundary": execution_boundary,
                 "python_candidate_authority": candidate_authority,
+                "interpreter_authority": interpreter_authority,
                 "returncode": result.returncode,
                 "duration_seconds": round(time.monotonic() - started, 6),
                 "stdout_head": stdout[:4_096],

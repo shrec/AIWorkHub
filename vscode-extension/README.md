@@ -12,6 +12,15 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.42
+
+- Common task classes now use deterministic contract templates, reducing
+  missing scope, required-output and validation fields.
+- Multi-file staged edits report exact completion and are published only as a
+  complete atomic envelope, with one bounded correction for missing outputs.
+- Python validation uses explicit cross-platform repository-interpreter
+  authority instead of ambiguous ambient interpreter spellings.
+
 ## What's new in 0.10.41
 
 - Repeated validation-only rework episodes are rebound to the current retained

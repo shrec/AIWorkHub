@@ -1832,3 +1832,136 @@ def test_quality_review_bridge_preserves_large_prompt_without_truncation(
     public_doc = json.loads(request.request_path.read_text(encoding="utf-8"))
     assert public_doc["prompt"] == large_prompt
     assert len(public_doc["prompt"].encode("utf-8")) == len(large_prompt.encode("utf-8"))
+
+
+def _required_output_request_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    request_id: str,
+) -> tuple[Path, Path, Path, Path]:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir(mode=0o700)
+    return root, repo, workspace, home
+
+
+def test_create_request_omits_required_outputs_when_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "e" * 32
+    _root, repo, workspace, home = _required_output_request_env(
+        tmp_path, monkeypatch, request_id=request_id
+    )
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="legacy request without required outputs",
+        model="glm-5.2",
+        allowed_writes=["src/app.py"],
+        timeout_seconds=30,
+    )
+    published = json.loads(request.request_path.read_text(encoding="utf-8"))
+    spec = json.loads(request.worker_spec_path.read_text(encoding="utf-8"))
+    assert "required_outputs" not in published
+    assert "required_outputs" not in spec
+
+
+def test_create_request_publishes_normalized_required_outputs_identically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "1" * 32
+    _root, repo, workspace, home = _required_output_request_env(
+        tmp_path, monkeypatch, request_id=request_id
+    )
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="stage required outputs",
+        model="glm-5.2",
+        allowed_writes=["./src/z.py", "src\\a.py", "docs/*.md"],
+        required_outputs=["src/z.py", "  ./src/a.py  "],
+        timeout_seconds=30,
+    )
+    published = json.loads(request.request_path.read_text(encoding="utf-8"))
+    spec = json.loads(request.worker_spec_path.read_text(encoding="utf-8"))
+    expected = ["src/a.py", "src/z.py"]
+    assert published["required_outputs"] == expected
+    assert spec["required_outputs"] == expected
+    assert published["required_outputs"] is not spec["required_outputs"]
+    assert published["required_outputs"] == spec["required_outputs"]
+
+
+@pytest.mark.parametrize(
+    ("required_outputs", "case_id"),
+    [
+        ("not-a-list", "non-list"),
+        ({"src/app.py"}, "non-list-set"),
+        ([1], "non-string"),
+        ([], "empty-list"),
+        ([""], "empty-path"),
+        (["   "], "empty-whitespace"),
+        (["src/app.py", "src/app.py"], "duplicate"),
+        (["src/app.py", "./src/app.py"], "duplicate-normalized"),
+        (["src/*.py"], "glob"),
+        (["src/app?.py"], "glob-question"),
+        (["/tmp/app.py"], "absolute"),
+        (["C:/tmp/app.py"], "absolute-drive"),
+        (["../secret.py"], "traversal"),
+        (["src/../secret.py"], "traversal-inner"),
+        (["src/missing.py"], "out-of-contract"),
+    ],
+    ids=[
+        "non-list",
+        "non-list-set",
+        "non-string",
+        "empty-list",
+        "empty-path",
+        "empty-whitespace",
+        "duplicate",
+        "duplicate-normalized",
+        "glob",
+        "glob-question",
+        "absolute",
+        "absolute-drive",
+        "traversal",
+        "traversal-inner",
+        "out-of-contract",
+    ],
+)
+def test_create_request_rejects_required_outputs_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    required_outputs: object,
+    case_id: str,
+) -> None:
+    request_id = hashlib.sha256(case_id.encode("utf-8")).hexdigest()[:32]
+    root, repo, workspace, home = _required_output_request_env(
+        tmp_path, monkeypatch, request_id=request_id
+    )
+    repo_id = repository_state.inspect_repository(repo).manifest.repo_id
+    with pytest.raises(
+        vscode_lm_bridge.BridgeError,
+        match="bridge_required_outputs_invalid",
+    ):
+        vscode_lm_bridge.create_request(
+            repo=repo,
+            request_id=request_id,
+            workspace_path=workspace,
+            workspace_home=home,
+            prompt="must not publish invalid required outputs",
+            model="glm-5.2",
+            allowed_writes=["src/app.py", "docs/*.md"],
+            required_outputs=required_outputs,  # type: ignore[arg-type]
+            timeout_seconds=30,
+        )
+    assert not (home / ".aiworkhub_vscode_lm_worker.json").exists()
+    assert not (root / "requests" / repo_id / f"{request_id}.json").exists()

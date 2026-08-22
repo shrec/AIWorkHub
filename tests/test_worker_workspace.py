@@ -4350,3 +4350,237 @@ def test_terminal_state_literals_match_validation_runner() -> None:
         worker_workspace.VALIDATION_ENVIRONMENT_BLOCKED
         == validation_runner.VALIDATION_ENVIRONMENT_BLOCKED
     )
+
+
+def _install_venv_python(root: Path, relative: str, marker: str) -> Path:
+    path = root.joinpath(*relative.replace("\\", "/").split("/"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\necho {marker}\nexit 0\n", encoding="utf-8")
+    os.chmod(path, 0o755)
+    return path.resolve()
+
+
+def _run_interpreter_validation(workspace, command: str):
+    return worker_workspace.run_validations(
+        workspace,
+        [command],
+        backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+        adapter_id="glm_vscode_lm",
+    )
+
+
+def test_run_validations_workspace_local_venv_python_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-python-local")
+    try:
+        expected = _install_venv_python(
+            workspace.path, ".venv/bin/python", "ran-workspace-local-python"
+        )
+        _install_venv_python(
+            workspace.repo, ".venv/bin/python", "ran-canonical-python"
+        )
+        (result,) = _run_interpreter_validation(
+            workspace, ".venv/bin/python -c pass"
+        )
+        assert result["returncode"] == 0, result["stderr_tail"]
+        assert result["declared_argv"] == [".venv/bin/python", "-c", "pass"]
+        assert result["executed_argv"] == [str(expected), "-c", "pass"]
+        assert result["argv"] == result["executed_argv"]
+        assert result["argv_rewritten"] is True
+        assert result["interpreter_authority"] == {
+            "schema_id": "aiworkhub.validation_interpreter_authority.v1",
+            "declared": ".venv/bin/python",
+            "source": "workspace_local",
+            "resolved": str(expected),
+        }
+        assert "ran-workspace-local-python" in result["stdout_tail"]
+        assert "ran-canonical-python" not in result["stdout_tail"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_run_validations_canonical_venv_python_when_workspace_local_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-python-canonical")
+    try:
+        expected = _install_venv_python(
+            workspace.repo, ".venv/bin/python", "ran-canonical-python"
+        )
+        (result,) = _run_interpreter_validation(
+            workspace, ".venv/bin/python -c pass"
+        )
+        assert result["returncode"] == 0, result["stderr_tail"]
+        assert result["declared_argv"] == [".venv/bin/python", "-c", "pass"]
+        assert result["executed_argv"] == [str(expected), "-c", "pass"]
+        assert result["interpreter_authority"]["source"] == "canonical_repository"
+        assert result["interpreter_authority"]["resolved"] == str(expected)
+        assert "ran-canonical-python" in result["stdout_tail"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_run_validations_windows_venv_python_spelling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-python-windows")
+    try:
+        expected = _install_venv_python(
+            workspace.path, ".venv/Scripts/python.exe", "ran-windows-python"
+        )
+        (result,) = _run_interpreter_validation(
+            workspace, ".venv/Scripts/python.exe -c pass"
+        )
+        assert result["returncode"] == 0, result["stderr_tail"]
+        assert result["declared_argv"] == [".venv/Scripts/python.exe", "-c", "pass"]
+        assert result["executed_argv"] == [str(expected), "-c", "pass"]
+        assert result["interpreter_authority"]["source"] == "workspace_local"
+        assert "ran-windows-python" in result["stdout_tail"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_run_validations_unrecognized_and_absolute_python_pass_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-python-passthrough")
+    try:
+        unrecognized = _install_venv_python(
+            workspace.path, ".venv/bin/python3", "ran-unrecognized-python3"
+        )
+        (relative_result,) = _run_interpreter_validation(
+            workspace, ".venv/bin/python3 -c pass"
+        )
+        assert relative_result["returncode"] == 0, relative_result["stderr_tail"]
+        assert relative_result["declared_argv"] == [".venv/bin/python3", "-c", "pass"]
+        assert relative_result["executed_argv"] == [".venv/bin/python3", "-c", "pass"]
+        assert relative_result["argv_rewritten"] is False
+        assert relative_result["interpreter_authority"] is None
+        assert "ran-unrecognized-python3" in relative_result["stdout_tail"]
+        assert unrecognized.name == "python3"
+
+        (absolute_result,) = _run_interpreter_validation(
+            workspace, f"{sys.executable} -c pass"
+        )
+        assert absolute_result["returncode"] == 0, absolute_result["stderr_tail"]
+        assert absolute_result["declared_argv"][0] == sys.executable
+        assert absolute_result["executed_argv"][0] == sys.executable
+        assert absolute_result["interpreter_authority"] is None
+
+        (non_leading,) = _run_interpreter_validation(
+            workspace, "echo .venv/bin/python"
+        )
+        assert non_leading["returncode"] == 0, non_leading["stderr_tail"]
+        assert non_leading["declared_argv"] == ["echo", ".venv/bin/python"]
+        assert non_leading["executed_argv"] == ["echo", ".venv/bin/python"]
+        assert non_leading["interpreter_authority"] is None
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_run_validations_shell_operator_is_not_rewritten_as_interpreter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-python-shell-op")
+    try:
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="validation_shell_syntax_forbidden",
+        ):
+            _run_interpreter_validation(
+                workspace, "echo hi && .venv/bin/python -c pass"
+            )
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_run_validations_missing_venv_python_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-python-missing")
+    try:
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="validation_environment:interpreter_missing",
+        ):
+            _run_interpreter_validation(workspace, ".venv/bin/python -c pass")
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable bit")
+def test_run_validations_non_executable_venv_python_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-python-noexec")
+    try:
+        path = _install_venv_python(
+            workspace.path, ".venv/bin/python", "should-not-run"
+        )
+        os.chmod(path, 0o644)
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="validation_environment:interpreter_not_executable",
+        ):
+            _run_interpreter_validation(workspace, ".venv/bin/python -c pass")
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_run_validations_symlink_escaping_venv_python_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-python-symlink")
+    try:
+        outside = tmp_path / "outside-python"
+        outside.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(outside, 0o755)
+        link = workspace.path / ".venv" / "bin" / "python"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(outside)
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="validation_environment:interpreter_symlink_escape",
+        ):
+            _run_interpreter_validation(workspace, ".venv/bin/python -c pass")
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owner metadata")
+def test_run_validations_wrong_owner_venv_python_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-python-owner")
+    try:
+        _install_venv_python(workspace.path, ".venv/bin/python", "should-not-run")
+        real_uid = os.getuid()
+        monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="validation_environment:interpreter_untrusted_owner",
+        ):
+            _run_interpreter_validation(workspace, ".venv/bin/python -c pass")
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+def test_run_validations_world_writable_venv_python_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-python-world")
+    try:
+        path = _install_venv_python(
+            workspace.path, ".venv/bin/python", "should-not-run"
+        )
+        os.chmod(path, 0o757)
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="validation_environment:interpreter_world_writable",
+        ):
+            _run_interpreter_validation(workspace, ".venv/bin/python -c pass")
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)

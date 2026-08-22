@@ -580,6 +580,54 @@ def bridge_readiness(
     }
 
 
+def _normalize_required_output_path(value: object) -> str:
+    if not isinstance(value, str):
+        raise BridgeError("bridge_required_outputs_invalid")
+    raw = value.replace("\\", "/").strip()
+    if not raw or any(marker in raw for marker in ("*", "?", "[")):
+        raise BridgeError("bridge_required_outputs_invalid")
+    if raw.startswith("/") or raw.startswith("//") or (len(raw) >= 2 and raw[1] == ":"):
+        raise BridgeError("bridge_required_outputs_invalid")
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise BridgeError("bridge_required_outputs_invalid")
+        parts.append(part)
+    if not parts:
+        raise BridgeError("bridge_required_outputs_invalid")
+    return "/".join(parts)
+
+
+def _normalize_required_outputs(
+    required_outputs: object,
+    allowed: list[str],
+) -> list[str] | None:
+    if required_outputs is None:
+        return None
+    if not isinstance(required_outputs, list) or not required_outputs:
+        raise BridgeError("bridge_required_outputs_invalid")
+    allowed_exact: set[str] = set()
+    for item in allowed:
+        if any(marker in item for marker in ("*", "?", "[")):
+            continue
+        try:
+            allowed_exact.add(_normalize_required_output_path(item))
+        except BridgeError:
+            continue
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for item in required_outputs:
+        path = _normalize_required_output_path(item)
+        if path in seen or path not in allowed_exact:
+            raise BridgeError("bridge_required_outputs_invalid")
+        seen.add(path)
+        normalized.append(path)
+    normalized.sort()
+    return normalized
+
+
 def create_request(
     *,
     repo: Path,
@@ -594,6 +642,7 @@ def create_request(
     source_graph_request: dict[str, Any] | None = None,
     source_graph_result: dict[str, Any] | None = None,
     request_kind: str = "worker",
+    required_outputs: list[str] | None = None,
 ) -> BridgeRequest:
     """Publish one repo-scoped request and private worker-side contract."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
@@ -630,6 +679,7 @@ def create_request(
     else:
         raise BridgeError("bridge_cancel_decision_exists")
     allowed = [str(value) for value in allowed_writes]
+    normalized_required_outputs = _normalize_required_outputs(required_outputs, allowed)
     parent_baseline = dict(workspace_parent_baseline or {})
     path_contracts: dict[str, dict[str, Any]] = {}
     create_paths: list[str] = []
@@ -783,6 +833,9 @@ def create_request(
         "timeout_seconds": int(timeout_seconds),
         "project_context_receipt": context_receipt,
     }
+    if normalized_required_outputs is not None:
+        shared["required_outputs"] = normalized_required_outputs
+        worker["required_outputs"] = normalized_required_outputs
     _atomic_json(worker_spec_path, worker)
     _atomic_json(request_path, shared, allow_owner_claim_move=True)
     return BridgeRequest(
