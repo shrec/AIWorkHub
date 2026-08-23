@@ -4596,6 +4596,10 @@ def test_run_validations_world_writable_venv_python_fails_closed(
     worker_workspace.landlock_abi_version() < 1,
     reason="Landlock is not supported by this kernel",
 )
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="GitHub hosted runners cannot execute nested Landlock Git helpers",
+)
 def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonical(
     tmp_path: Path,
 ) -> None:
