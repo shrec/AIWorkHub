@@ -525,13 +525,13 @@ def test_failure_outcome_reaches_blocked_without_ambient_writes_or_any_grant(tmp
 
     result = manager._finalize_isolated_request(request_id)
 
-    assert result["state"] == "timed_out"
+    assert result["state"] == "worker_failed"
     assert [(call[0], call[1], call[2], call[3]) for call in failure_calls] == [
-        (card["task_id"], card["runner"], "timed_out", request_id)
+        (card["task_id"], card["runner"], "worker_failed", request_id)
     ]
     assert failure_calls[0][4]["required_outputs"] == []
     assert card["status"] == "blocked"
-    assert card["worker_status"] == "timed_out"
+    assert card["worker_status"] == "worker_failed"
 
 
 def test_live_token_cap_outcome_reaches_truthful_blocked_state(tmp_path, monkeypatch):
@@ -666,10 +666,8 @@ def test_failure_outcome_preserves_already_finalized_task(
 
     result = manager._finalize_isolated_request(request_id)
 
-    assert result["state"] == "timed_out"
-    assert result["error"] == (
-        "worker_timed_out:timeout_seconds=unknown:exit_code=124"
-    )
+    assert result["state"] == "worker_failed"
+    assert result["error"] == "worker_failed:supervisor_state=timed_out:exit_code=124"
     assert result["release_transition_ok"] is True
     assert result["canonical_lifecycle"] == "archived"
     assert result["terminal_review_disposition"] == (
