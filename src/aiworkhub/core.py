@@ -2879,6 +2879,8 @@ def create_task(
     work_kind: str = "generic",
     validation_roles: list[str] | None = None,
     risk_tier: str | None = None,
+    template_provenance: Mapping[str, Any] | None = None,
+    custom_template_escape: str | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -2960,6 +2962,27 @@ def create_task(
                 raise ValueError(f"invalid_{name}")
             result.append(text)
         return result
+
+    from . import task_templates
+
+    if (
+        isinstance(validation, (list, tuple))
+        and len(validation) > task_templates.MAX_PATHS_PER_FIELD
+    ):
+        return _lifecycle_error("invalid_validation", 2)
+    if (
+        isinstance(validation_roles, (list, tuple))
+        and len(validation_roles) > task_templates.MAX_PATHS_PER_FIELD
+    ):
+        return _lifecycle_error("invalid_validation_roles", 2)
+
+    try:
+        task_templates.validate_custom_validation_roles(
+            validation if validation is not None else [],
+            validation_roles if validation_roles is not None else [],
+        )
+    except task_templates.TaskTemplateError as exc:
+        return _lifecycle_error(str(exc), 2)
 
     try:
         acceptance2 = bounded_strings(acceptance, "acceptance", required=True)
@@ -3305,6 +3328,46 @@ def create_task(
         "max_live_tokens": max_live_tokens,
     }
 
+    try:
+        task_templates.reject_unchanged_public_test_outputs(
+            allow_unchanged_outputs2, outputs2
+        )
+        if template_provenance is None:
+            bound_provenance = task_templates.classify_task_card(
+                allowed_writes=writes2,
+                required_outputs=outputs2,
+                validation=validation2,
+                validation_roles=validation_roles2,
+                work_kind=work_kind,
+                read_only=read_only,
+                read_first=read_first2,
+                allow_unchanged_required_outputs=allow_unchanged_outputs2,
+                custom_escape=custom_template_escape,
+            )
+        else:
+            bound_provenance = task_templates.validate_template_provenance(
+                template_provenance
+            )
+            expected_digest = task_templates.expanded_contract_digest(
+                {
+                    "allowed_writes": writes2,
+                    "required_outputs": outputs2,
+                    "validation": validation2,
+                    "validation_roles": validation_roles2,
+                    "work_kind": work_kind,
+                    "read_only": read_only,
+                    "read_first": read_first2,
+                }
+            )
+            if bound_provenance["expanded_contract_digest"] != expected_digest:
+                raise task_templates.TaskTemplateError(
+                    "template_expanded_digest_mismatch"
+                )
+    except task_templates.TaskTemplateError as exc:
+        return _lifecycle_error(str(exc), 2)
+    card["template_provenance"] = bound_provenance
+    requested_payload["template_provenance"] = bound_provenance
+
     def reconcile_existing(existing_json: Any) -> dict[str, Any]:
         try:
             existing_card = json.loads(existing_json or "{}")
@@ -3375,6 +3438,7 @@ def create_task(
                 if isinstance(existing_card.get("token_budget"), dict)
                 else None
             ),
+            "template_provenance": existing_card.get("template_provenance"),
         }
         if existing_payload == requested_payload:
             result = _canonical_result(
@@ -3884,13 +3948,8 @@ def _bind_explicit_reject_review_predecessor(
         ):
             return None, "predecessor_request_id_missing_hashes"
         hash_map[path.strip()] = digest
-    if paths == []:
-        if hashes != {}:
-            return None, "predecessor_request_id_missing_hashes"
-    else:
-        for path in paths:
-            if path not in hash_map:
-                return None, "predecessor_request_id_missing_hashes"
+    if set(hash_map) != set(paths):
+        return None, "predecessor_request_id_missing_hashes"
 
     if type(card_claim_epoch) is not int or card_claim_epoch < 1:
         return None, (

@@ -1020,6 +1020,7 @@ def aiworkhub_task_create(
     work_kind: str = "generic",
     validation_roles: list[str] | None = None,
     risk_tier: str | None = None,
+    custom_template_escape: str | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
@@ -1062,6 +1063,9 @@ def aiworkhub_task_create(
     and data_ml=schema+distribution. Missing roles are rejected before launch.
     ``risk_tier`` is optional explicit routing/economic evidence. It is never
     inferred from priority or prose; omitted historical cards remain unknown.
+    Default creation is template-first: generic Python production-plus-test
+    cards classify against the frozen registry, and unclassified raw cards
+    fail closed unless ``custom_template_escape`` is the audited token.
     """
 
     return core.create_task(
@@ -1087,6 +1091,7 @@ def aiworkhub_task_create(
         work_kind=work_kind,
         validation_roles=validation_roles,
         risk_tier=risk_tier,
+        custom_template_escape=custom_template_escape,
     )
 
 
@@ -1120,19 +1125,40 @@ def aiworkhub_task_create_from_template(
     template expansion and cannot be overridden. Malformed, stale, or forged
     template IDs and unsafe paths fail closed before ``create_task``.
     """
-
-    card = task_templates.expand_template(
-        template_id,
-        production_paths=production_paths,
-        test_paths=test_paths,
-        title=title,
-        objective=objective,
-    )
-    quality_evidence.normalize_behavioral_contract(
-        card["work_kind"],
-        card["validation"],
-        card["validation_roles"],
-    )
+    try:
+        card = task_templates.expand_template(
+            template_id,
+            production_paths=production_paths,
+            test_paths=test_paths,
+            title=title,
+            objective=objective,
+        )
+        quality_evidence.normalize_behavioral_contract(
+            card["work_kind"],
+            card["validation"],
+            card["validation_roles"],
+        )
+        provenance = task_templates.template_provenance_payload(
+            card, classification_reason="explicit_template"
+        )
+    except task_templates.TaskTemplateError as exc:
+        return {
+            "ok": False,
+            "returncode": 2,
+            "command": [],
+            "stdout": "",
+            "stderr": str(exc),
+        }
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "returncode": 2,
+            "command": [],
+            "stdout": "",
+            "stderr": str(exc),
+            "allowed_work_kinds": list(quality_evidence.WORK_KINDS),
+            "allowed_validation_roles": list(quality_evidence.VALIDATION_ROLES),
+        }
     created = core.create_task(
         task_id=task_id,
         title=card["title"],
@@ -1156,15 +1182,11 @@ def aiworkhub_task_create_from_template(
         work_kind=card["work_kind"],
         validation_roles=card["validation_roles"],
         risk_tier=risk_tier,
+        template_provenance=provenance,
     )
     return {
         **created,
-        "template_provenance": {
-            "schema_id": card["schema_id"],
-            "template_full_id": card["template_full_id"],
-            "registry_version": card["registry_version"],
-            "definition_digest": card["definition_digest"],
-        },
+        "template_provenance": provenance,
     }
 
 

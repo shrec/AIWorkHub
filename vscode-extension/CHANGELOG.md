@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.46 — 2026-08-23
+
+### Added
+
+- Template-first task creation atomically records exact template provenance on
+  every canonical task card.
+
+### Fixed
+
+- Generated task contracts now bound validation and role lists and keep Python
+  and Node validation commands aligned with their respective file types.
+
 ## 0.10.45 — 2026-08-22
 
 ### Fixed

@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.46
+
+- Template-first task creation now persists exact template provenance and a
+  normalized, bounded validation contract atomically with the task card.
+- Generated Python and Node validations stay language-correct, reducing
+  mechanical task failures before workers begin their implementation work.
+
 ## What's new in 0.10.45
 
 - NeedFix, Task DAG and completion inbox now agree on exact terminal artifacts,

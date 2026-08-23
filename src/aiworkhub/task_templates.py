@@ -33,26 +33,36 @@ import json
 import re
 from dataclasses import asdict, dataclass
 from types import MappingProxyType
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 __all__ = [
+    "AUDITED_CUSTOM_ESCAPE",
+    "COMMAND_NODE",
     "COMMAND_PYTHON",
     "DIFF_CHECK_COMMAND",
     "MAX_PATH_LENGTH",
     "MAX_PATHS_PER_FIELD",
+    "PROVENANCE_SCHEMA_ID",
     "REGISTRY_VERSION",
     "SCHEMA_ID",
     "TEMPLATE_IDS",
     "TEMPLATE_SPECS",
     "TaskTemplateError",
     "TaskTemplateSpec",
+    "classify_task_card",
     "expand_template",
+    "expanded_contract_digest",
+    "reject_unchanged_public_test_outputs",
     "resolve_template",
     "split_command_argv",
     "template_full_id",
+    "template_provenance_payload",
+    "validate_custom_validation_roles",
+    "validate_template_provenance",
 ]
 
 SCHEMA_ID = "aiworkhub.task_templates.v1"
+PROVENANCE_SCHEMA_ID = "aiworkhub.task_template_provenance.v1"
 REGISTRY_VERSION = 1
 REGISTRY_VERSION_TOKEN = f"v{REGISTRY_VERSION}"
 
@@ -62,17 +72,31 @@ MAX_TITLE_LENGTH = 300
 MAX_OBJECTIVE_LENGTH = 2000
 
 COMMAND_PYTHON = "python"
+COMMAND_NODE = "node"
 DIFF_CHECK_COMMAND = "git diff --check"
+AUDITED_CUSTOM_ESCAPE = "audited_custom_unclassified"
+CUSTOM_TEMPLATE_NAME = "custom"
 
 _HEX64_RE = re.compile(r"[0-9a-f]{64}")
 _VERSION_TOKEN_RE = re.compile(r"v[0-9]+")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 _GLOB_CHARS_RE = re.compile(r"[*?\[\]]")
 _UNSAFE_PATH_CHARS_RE = re.compile(r"[^A-Za-z0-9._+/-]")
+_PATH_LIKE_TOKEN_RE = re.compile(
+    r"^(?:\.\.?)$|[/\\]|::|\.(?:py|js|mjs|cjs|ts|tsx|jsx|json|md)$"
+)
+_PYTEST_NODEID_SELECTOR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PYTHON_SUFFIXES = (".py",)
+_NODE_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx")
+_NODE_TEST_MARKERS = (".test", ".spec")
+_NODE_TEST_SUFFIXES = tuple(
+    f"{marker}{suffix}" for marker in _NODE_TEST_MARKERS for suffix in _NODE_SUFFIXES
+)
 
 
 class TaskTemplateError(ValueError):
     """Fail-closed template rejection; ``str(exc)`` is a stable reason."""
+
 
 
 @dataclass(frozen=True)
@@ -202,6 +226,24 @@ _TEMPLATE_SPECS: dict[str, TaskTemplateSpec] = {
         work_kind="replay",
         read_only=True,
         production_path_policy=_OPTIONAL,
+        test_path_policy=_REQUIRED,
+        read_first_fields=("production", "test"),
+        generates_pytest=True,
+        generates_lint=True,
+        generates_diff_check=True,
+    ),
+    "cross_boundary_bugfix": TaskTemplateSpec(
+        name="cross_boundary_bugfix",
+        title="Cross-boundary bugfix",
+        objective=(
+            "Fix the defect across explicit Python and Node production "
+            "paths and cover each language with its own tests; Python "
+            "commands never include JavaScript paths."
+        ),
+        task_type="code",
+        work_kind="bugfix",
+        read_only=False,
+        production_path_policy=_REQUIRED,
         test_path_policy=_REQUIRED,
         read_first_fields=("production", "test"),
         generates_pytest=True,
@@ -385,6 +427,79 @@ def _validation_roles_for(work_kind: str, validation: Sequence[str]) -> list[str
     return roles
 
 
+def _is_python_path(path: str) -> bool:
+    return path.endswith(_PYTHON_SUFFIXES)
+
+
+def _is_node_path(path: str) -> bool:
+    return path.endswith(_NODE_SUFFIXES)
+
+
+def _canonical_repo_relative_path(path: str) -> str:
+    parts: list[str] = []
+    for part in path.replace("\\", "/").strip().split("/"):
+        if part in {"", "."}:
+            continue
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _is_public_test_path(path: str) -> bool:
+    return path.startswith("tests/")
+
+
+def _looks_like_test_path(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return (
+        _is_public_test_path(path)
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name.endswith(_NODE_TEST_SUFFIXES)
+    )
+
+
+
+def _validation_commands_for(
+    spec: TaskTemplateSpec, production: list[str], tests: list[str]
+) -> list[str]:
+    if spec.name == "cross_boundary_bugfix":
+        py_production = [path for path in production if _is_python_path(path)]
+        py_tests = [path for path in tests if _is_python_path(path)]
+        node_production = [path for path in production if _is_node_path(path)]
+        node_tests = [path for path in tests if _is_node_path(path)]
+        if not (py_production or py_tests) or not (node_production or node_tests):
+            raise TaskTemplateError("missing_cross_boundary_languages")
+        validation: list[str] = []
+        if spec.generates_pytest and py_tests:
+            validation.append(
+                " ".join([COMMAND_PYTHON, "-m", "pytest", "-q", *py_tests])
+            )
+        if spec.generates_lint and (py_production or py_tests):
+            validation.append(
+                " ".join(
+                    [COMMAND_PYTHON, "-m", "ruff", "check", *py_production, *py_tests]
+                )
+            )
+        if node_tests:
+            validation.append(" ".join([COMMAND_NODE, "--test", *node_tests]))
+        if spec.generates_diff_check:
+            validation.append(DIFF_CHECK_COMMAND)
+        return validation
+    lint_targets = [*production, *tests]
+    validation = []
+    if spec.generates_pytest and tests:
+        validation.append(
+            " ".join([COMMAND_PYTHON, "-m", "pytest", "-q", *tests])
+        )
+    if spec.generates_lint and lint_targets:
+        validation.append(
+            " ".join([COMMAND_PYTHON, "-m", "ruff", "check", *lint_targets])
+        )
+    if spec.generates_diff_check:
+        validation.append(DIFF_CHECK_COMMAND)
+    return validation
+
+
 def expand_template(
     template_id: Any,
     *,
@@ -411,18 +526,7 @@ def expand_template(
     read_first: list[str] = []
     for field_name in spec.read_first_fields:
         read_first.extend(production if field_name == "production" else tests)
-    lint_targets = [*production, *tests]
-    validation: list[str] = []
-    if spec.generates_pytest and tests:
-        validation.append(
-            " ".join([COMMAND_PYTHON, "-m", "pytest", "-q", *tests])
-        )
-    if spec.generates_lint and lint_targets:
-        validation.append(
-            " ".join([COMMAND_PYTHON, "-m", "ruff", "check", *lint_targets])
-        )
-    if spec.generates_diff_check:
-        validation.append(DIFF_CHECK_COMMAND)
+    validation = _validation_commands_for(spec, production, tests)
     resolved_title = spec.title if title is None else title
     resolved_objective = spec.objective if objective is None else objective
     work_kind = _canonical_work_kind(spec.work_kind)
@@ -449,3 +553,298 @@ def expand_template(
         "validation": validation,
         "validation_roles": validation_roles,
     }
+
+
+def expanded_contract_digest(card: Mapping[str, Any]) -> str:
+    payload = {
+        "allowed_writes": list(card.get("allowed_writes") or []),
+        "read_first": list(card.get("read_first") or []),
+        "read_only": bool(card.get("read_only")),
+        "required_outputs": list(card.get("required_outputs") or []),
+        "validation": list(card.get("validation") or []),
+        "validation_roles": list(card.get("validation_roles") or []),
+        "work_kind": str(card.get("work_kind") or "generic"),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def template_provenance_payload(
+    card: Mapping[str, Any], *, classification_reason: str
+) -> dict[str, Any]:
+    if not isinstance(classification_reason, str) or not classification_reason.strip():
+        raise TaskTemplateError("classification_reason_invalid")
+    name = str(card.get("template_id") or "")
+    digest = str(card.get("definition_digest") or "")
+    version = int(card.get("registry_version") or REGISTRY_VERSION)
+    return {
+        "schema_id": PROVENANCE_SCHEMA_ID,
+        "template_name": name,
+        "template_full_id": str(
+            card.get("template_full_id") or f"{name}@v{version}:{digest}"
+        ),
+        "registry_version": version,
+        "definition_digest": digest,
+        "classification_reason": classification_reason.strip(),
+        "expanded_contract_digest": expanded_contract_digest(card),
+    }
+
+
+def _validated_validation_token(token: str) -> None:
+    path_token = token
+    if "::" in token:
+        path_token, selector = token.split("::", 1)
+        if (
+            not path_token
+            or not selector
+            or ":" in path_token
+            or selector.startswith(":")
+            or selector.endswith(":")
+        ):
+            raise TaskTemplateError("invalid_validation_path_unsafe_token")
+        for part in selector.split("::"):
+            if not part or not _PYTEST_NODEID_SELECTOR_RE.fullmatch(part):
+                raise TaskTemplateError("invalid_validation_path_unsafe_token")
+    _validated_path(path_token, "validation")
+
+
+def validate_custom_validation_roles(
+    validation: Any, validation_roles: Any
+) -> None:
+    if isinstance(validation, (str, bytes)) or (
+        validation is not None and not isinstance(validation, (list, tuple))
+    ):
+        raise TaskTemplateError("invalid_validation_not_string")
+    if isinstance(validation_roles, (str, bytes)) or (
+        validation_roles is not None and not isinstance(validation_roles, (list, tuple))
+    ):
+        raise TaskTemplateError("invalid_validation_roles_not_string")
+    if validation is not None and len(validation) > MAX_PATHS_PER_FIELD:
+        raise TaskTemplateError("invalid_validation")
+    if validation_roles is not None and len(validation_roles) > MAX_PATHS_PER_FIELD:
+        raise TaskTemplateError("invalid_validation_roles")
+    for item in () if validation is None else validation:
+        if not isinstance(item, str):
+            raise TaskTemplateError("invalid_validation_not_string")
+        for token in item.split(" "):
+            if not token or not _PATH_LIKE_TOKEN_RE.search(token):
+                continue
+            try:
+                _validated_validation_token(token)
+            except TaskTemplateError as exc:
+                raise TaskTemplateError("invalid_validation_embedded_path") from exc
+    for item in () if validation_roles is None else validation_roles:
+        if not isinstance(item, str):
+            raise TaskTemplateError("invalid_validation_roles_not_string")
+
+
+def reject_unchanged_public_test_outputs(
+    allow_unchanged: Sequence[Any], required_outputs: Sequence[Any]
+) -> None:
+    required = {
+        _canonical_repo_relative_path(item)
+        for item in required_outputs
+        if isinstance(item, str)
+    }
+    required.discard("")
+    for item in allow_unchanged:
+        if not isinstance(item, str):
+            raise TaskTemplateError("unchanged_required_public_test_output")
+        normalized = _canonical_repo_relative_path(item)
+        if _is_public_test_path(normalized) and normalized in required:
+            raise TaskTemplateError("unchanged_required_public_test_output")
+
+
+def validate_template_provenance(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise TaskTemplateError("template_provenance_invalid")
+    required = (
+        "schema_id",
+        "template_name",
+        "template_full_id",
+        "registry_version",
+        "definition_digest",
+        "classification_reason",
+        "expanded_contract_digest",
+    )
+    if any(key not in payload for key in required):
+        raise TaskTemplateError("template_provenance_invalid")
+    name = payload["template_name"]
+    full_id = payload["template_full_id"]
+    version = payload["registry_version"]
+    definition_digest = payload["definition_digest"]
+    reason = payload["classification_reason"]
+    expanded_digest = payload["expanded_contract_digest"]
+    if payload["schema_id"] != PROVENANCE_SCHEMA_ID:
+        raise TaskTemplateError("template_provenance_schema_mismatch")
+    if not isinstance(name, str) or not name:
+        raise TaskTemplateError("template_provenance_invalid")
+    if not isinstance(full_id, str) or not full_id:
+        raise TaskTemplateError("template_provenance_invalid")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        raise TaskTemplateError("template_provenance_invalid")
+    if not isinstance(definition_digest, str) or not _HEX64_RE.fullmatch(
+        definition_digest
+    ):
+        raise TaskTemplateError("template_provenance_invalid")
+    if not isinstance(reason, str) or not reason.strip():
+        raise TaskTemplateError("classification_reason_invalid")
+    if not isinstance(expanded_digest, str) or not _HEX64_RE.fullmatch(
+        expanded_digest
+    ):
+        raise TaskTemplateError("template_provenance_invalid")
+    expected_full_id = f"{name}@v{version}:{definition_digest}"
+    if full_id != expected_full_id:
+        raise TaskTemplateError("template_provenance_identity_mismatch")
+    if name == CUSTOM_TEMPLATE_NAME:
+        if reason != "audited_custom_escape":
+            raise TaskTemplateError("template_provenance_invalid")
+        return {
+            "schema_id": PROVENANCE_SCHEMA_ID,
+            "template_name": name,
+            "template_full_id": full_id,
+            "registry_version": version,
+            "definition_digest": definition_digest,
+            "classification_reason": reason,
+            "expanded_contract_digest": expanded_digest,
+        }
+    if name not in _TEMPLATE_SPECS:
+        raise TaskTemplateError("template_unknown")
+    if version != REGISTRY_VERSION:
+        raise TaskTemplateError("template_version_stale")
+    spec = _TEMPLATE_SPECS[name]
+    if definition_digest != _definition_digest(spec):
+        raise TaskTemplateError("template_digest_mismatch")
+    return {
+        "schema_id": PROVENANCE_SCHEMA_ID,
+        "template_name": name,
+        "template_full_id": full_id,
+        "registry_version": version,
+        "definition_digest": definition_digest,
+        "classification_reason": reason.strip(),
+        "expanded_contract_digest": expanded_digest,
+    }
+
+
+def _partition_write_set(paths: Sequence[str]) -> tuple[list[str], list[str]]:
+    production: list[str] = []
+    tests: list[str] = []
+    for path in paths:
+        if _looks_like_test_path(path):
+            tests.append(path)
+        else:
+            production.append(path)
+    return production, tests
+
+
+def _custom_escape_provenance(card: Mapping[str, Any]) -> dict[str, Any]:
+    payload = {
+        "name": CUSTOM_TEMPLATE_NAME,
+        "registry_version": REGISTRY_VERSION,
+        "escape": AUDITED_CUSTOM_ESCAPE,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_id": PROVENANCE_SCHEMA_ID,
+        "template_name": CUSTOM_TEMPLATE_NAME,
+        "template_full_id": f"{CUSTOM_TEMPLATE_NAME}@{REGISTRY_VERSION_TOKEN}:{digest}",
+        "registry_version": REGISTRY_VERSION,
+        "definition_digest": digest,
+        "classification_reason": "audited_custom_escape",
+        "expanded_contract_digest": expanded_contract_digest(card),
+    }
+
+
+def classify_task_card(
+    *,
+    allowed_writes: Sequence[str],
+    required_outputs: Sequence[str],
+    validation: Sequence[str],
+    validation_roles: Sequence[str] | None = None,
+    work_kind: str = "generic",
+    read_only: bool = False,
+    read_first: Sequence[str] | None = None,
+    allow_unchanged_required_outputs: Sequence[str] | None = None,
+    custom_escape: str | None = None,
+) -> dict[str, Any]:
+    validate_custom_validation_roles(validation, validation_roles)
+    writes = list(allowed_writes)
+    outputs = list(required_outputs)
+    commands = list(validation)
+    roles = list(validation_roles or [])
+    first = list(read_first or [])
+    unchanged = (
+        ()
+        if allow_unchanged_required_outputs is None
+        else allow_unchanged_required_outputs
+    )
+    reject_unchanged_public_test_outputs(unchanged, outputs)
+    production, tests = _partition_write_set(writes)
+    has_python = any(_is_python_path(path) for path in writes)
+    has_node = any(_is_node_path(path) for path in writes)
+    candidates: list[tuple[str, str]] = []
+    if has_python and has_node:
+        candidates.append(
+            ("cross_boundary_bugfix", "compatible_cross_boundary_bugfix")
+        )
+    if work_kind == "bugfix":
+        candidates.append(
+            ("bugfix_with_regression", "compatible_bugfix_with_regression")
+        )
+    if (
+        work_kind in {"generic", "implementation"}
+        and has_python
+        and not has_node
+        and production
+        and tests
+        and not read_only
+    ):
+        candidates.append(
+            (
+                "implementation_with_tests",
+                "compatible_generic_python_production_plus_test",
+            )
+        )
+    seen = {name for name, _reason in candidates}
+    for name in TEMPLATE_IDS:
+        if name not in seen:
+            candidates.append((name, f"compatible_{name}"))
+    card_view = {
+        "allowed_writes": writes,
+        "required_outputs": outputs,
+        "validation": commands,
+        "validation_roles": roles,
+        "work_kind": work_kind,
+        "read_only": read_only,
+        "read_first": first,
+    }
+    for name, reason in candidates:
+        try:
+            expanded = expand_template(
+                name, production_paths=production, test_paths=tests
+            )
+        except TaskTemplateError:
+            continue
+        if (
+            expanded["allowed_writes"] != writes
+            or expanded["required_outputs"] != outputs
+            or expanded["validation"] != commands
+            or expanded["read_only"] is not read_only
+        ):
+            continue
+        if first != list(expanded["read_first"]):
+            continue
+        if roles != list(expanded["validation_roles"]):
+            continue
+        stored = dict(expanded)
+        stored.update(card_view)
+        return template_provenance_payload(stored, classification_reason=reason)
+    escape = "" if custom_escape is None else custom_escape
+    if escape == AUDITED_CUSTOM_ESCAPE:
+        return _custom_escape_provenance(card_view)
+    if escape:
+        raise TaskTemplateError("custom_escape_invalid")
+    raise TaskTemplateError("template_unclassified")

@@ -6,20 +6,32 @@ import pytest
 
 from aiworkhub.quality_evidence import normalize_behavioral_contract
 from aiworkhub.task_templates import (
+    AUDITED_CUSTOM_ESCAPE,
+    MAX_PATHS_PER_FIELD,
     REGISTRY_VERSION,
     SCHEMA_ID,
     TEMPLATE_IDS,
     TaskTemplateError,
+    _NODE_SUFFIXES,
+    _NODE_TEST_SUFFIXES,
     _canonical_work_kind,
+    _looks_like_test_path,
+    _partition_write_set,
     _validation_roles_for,
+    classify_task_card,
     expand_template,
+    expanded_contract_digest,
+    reject_unchanged_public_test_outputs,
     resolve_template,
     split_command_argv,
     template_full_id,
+    template_provenance_payload,
+    validate_custom_validation_roles,
+    validate_template_provenance,
 )
+from aiworkhub.worker_workspace import validation_argv
 
-
-def test_registry_has_exactly_six_stable_template_ids():
+def test_registry_has_exactly_seven_stable_template_ids():
     assert TEMPLATE_IDS == (
         "read_only_analysis",
         "bugfix_with_regression",
@@ -27,6 +39,7 @@ def test_registry_has_exactly_six_stable_template_ids():
         "test_only",
         "docs_change",
         "validation_replay",
+        "cross_boundary_bugfix",
     )
 
 
@@ -421,6 +434,10 @@ _TEMPLATE_PATHS = {
         "production_paths": ["src/a.py"],
         "test_paths": ["tests/test_a.py"],
     },
+    "cross_boundary_bugfix": {
+        "production_paths": ["src/a.py", "src/a.js"],
+        "test_paths": ["tests/test_a.py", "tests/a.test.js"],
+    },
 }
 
 
@@ -530,3 +547,342 @@ def test_leading_hyphen_path_tokens_fail_closed_before_command_generation(path):
             production_paths=[path],
             test_paths=["tests/test_a.py"],
         )
+
+
+def test_cross_boundary_bugfix_keeps_python_and_node_commands_separated():
+    card = expand_template(
+        "cross_boundary_bugfix",
+        production_paths=["src/a.py", "src/a.js"],
+        test_paths=["tests/test_a.py", "tests/a.test.js"],
+    )
+    assert card["validation"] == [
+        "python -m pytest -q tests/test_a.py",
+        "python -m ruff check src/a.py tests/test_a.py",
+        "node --test tests/a.test.js",
+        "git diff --check",
+    ]
+    python_commands = [command for command in card["validation"] if command.startswith("python ")]
+    node_commands = [command for command in card["validation"] if command.startswith("node ")]
+    assert all(".js" not in command for command in python_commands)
+    assert all(".py" not in command for command in node_commands)
+    assert card["work_kind"] == "bugfix"
+    assert "reproduction" in card["validation_roles"]
+    assert "regression" in card["validation_roles"]
+
+def test_generic_python_production_plus_test_classifies_compatibly():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/mod.py"],
+        test_paths=["tests/test_mod.py"],
+    )
+    generic_roles = ["generic"] * len(card["validation"])
+    assert generic_roles == card["validation_roles"]
+    provenance = classify_task_card(
+        allowed_writes=card["allowed_writes"],
+        required_outputs=card["required_outputs"],
+        validation=card["validation"],
+        validation_roles=generic_roles,
+        work_kind="generic",
+        read_only=False,
+        read_first=card["read_first"],
+    )
+    assert provenance["template_name"] == "implementation_with_tests"
+    assert provenance["template_full_id"] == card["template_full_id"]
+    assert provenance["registry_version"] == REGISTRY_VERSION
+    assert provenance["definition_digest"] == card["definition_digest"]
+    assert (
+        provenance["classification_reason"]
+        == "compatible_generic_python_production_plus_test"
+    )
+    assert provenance["expanded_contract_digest"] == expanded_contract_digest(card)
+    validate_template_provenance(provenance)
+    mismatched = ["reproduction"] + ["generic"] * (len(card["validation"]) - 1)
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(
+            allowed_writes=card["allowed_writes"],
+            required_outputs=card["required_outputs"],
+            validation=card["validation"],
+            validation_roles=mismatched,
+            work_kind="generic",
+            read_only=False,
+            read_first=card["read_first"],
+        )
+
+
+def test_unclassified_raw_card_fails_closed_without_audited_escape():
+    raw = {
+        "allowed_writes": ["src/odd.txt"],
+        "required_outputs": ["src/odd.txt"],
+        "validation": ["python -m pytest -q tests/test_missing.py"],
+        "work_kind": "generic",
+    }
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**raw)
+    with pytest.raises(TaskTemplateError, match="custom_escape_invalid"):
+        classify_task_card(**raw, custom_escape="not-audited")
+    provenance = classify_task_card(**raw, custom_escape=AUDITED_CUSTOM_ESCAPE)
+    assert provenance["template_name"] == "custom"
+    assert provenance["classification_reason"] == "audited_custom_escape"
+    validate_template_provenance(provenance)
+
+
+@pytest.mark.parametrize("bad", [7, None, {"cmd": "x"}, b"pytest"])
+def test_custom_validation_and_roles_reject_non_string_items(bad):
+    with pytest.raises(TaskTemplateError, match="invalid_validation_not_string"):
+        validate_custom_validation_roles([bad], ["generic"])
+    with pytest.raises(TaskTemplateError, match="invalid_validation_roles_not_string"):
+        validate_custom_validation_roles(["git diff --check"], [bad])
+
+
+def test_custom_validation_rejects_unsafe_embedded_paths():
+    with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+        validate_custom_validation_roles(
+            ["python -m pytest -q ../secret.py"], ["generic"]
+        )
+
+
+def test_custom_validation_rejects_bare_dot_token():
+    with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+        validate_custom_validation_roles(
+            ["python -m pytest -q ."], ["generic"]
+        )
+
+
+def test_custom_validation_rejects_bare_parent_token():
+    with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+        validate_custom_validation_roles(
+            ["python -m pytest -q .."], ["generic"]
+        )
+
+
+def test_custom_validation_allows_non_path_command_tokens():
+    validate_custom_validation_roles(["python -m pytest -q"], ["generic"])
+
+
+def test_custom_validation_and_validation_argv_accept_pytest_node_id():
+    command = "pytest tests/test_x.py::test_foo"
+    assert validation_argv(command) == ["pytest", "tests/test_x.py::test_foo"]
+    validate_custom_validation_roles([command], ["generic"])
+
+
+def test_custom_validation_rejects_node_id_traversal_and_spoofing():
+    for command in (
+        "pytest ../secret.py::test_foo",
+        "pytest tests/../secret.py::test_foo",
+        "pytest tests/test_x.py:test_foo",
+        "pytest tests/test_x.py::../test_foo",
+        "pytest tests/test_x.py::test_foo;id",
+    ):
+        with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+            validate_custom_validation_roles([command], ["generic"])
+
+
+def test_unchanged_required_public_test_outputs_fail_closed():
+    with pytest.raises(
+        TaskTemplateError, match="unchanged_required_public_test_output"
+    ):
+        reject_unchanged_public_test_outputs(
+            ["tests/test_a.py"], ["src/a.py", "tests/test_a.py"]
+        )
+
+
+@pytest.mark.parametrize(
+    ("allow_path", "required_path"),
+    [
+        ("./tests/test_a.py", "tests/test_a.py"),
+        ("tests//test_a.py", "tests/test_a.py"),
+        ("tests\\test_a.py", "tests/test_a.py"),
+        ("tests/test_a.py/", "tests/test_a.py"),
+        ("tests/test_a.py\\", "tests/test_a.py"),
+        ("tests/test_a.py", "./tests/test_a.py"),
+        ("tests/test_a.py", "tests//test_a.py"),
+        ("tests/test_a.py", "tests\\test_a.py"),
+        ("tests/test_a.py", "tests/test_a.py/"),
+    ],
+)
+def test_unchanged_required_public_test_equivalent_spellings_fail_closed(
+    allow_path, required_path
+):
+    with pytest.raises(
+        TaskTemplateError, match="unchanged_required_public_test_output"
+    ):
+        reject_unchanged_public_test_outputs(
+            [allow_path], ["src/a.py", required_path]
+        )
+
+
+def test_unchanged_required_non_test_output_is_allowed():
+    reject_unchanged_public_test_outputs(
+        ["./src//a.py"], ["src/a.py", "tests/test_a.py"]
+    )
+
+
+def test_template_provenance_payload_is_immutable_identity():
+    card = expand_template(
+        "bugfix_with_regression",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    payload = template_provenance_payload(card, classification_reason="explicit_template")
+    assert payload["schema_id"] == "aiworkhub.task_template_provenance.v1"
+    assert payload["template_name"] == "bugfix_with_regression"
+    assert payload["template_full_id"] == template_full_id("bugfix_with_regression")
+    assert SCHEMA_ID == "aiworkhub.task_templates.v1"
+    assert payload["expanded_contract_digest"] == expanded_contract_digest(card)
+    assert validate_template_provenance(payload) == payload
+
+
+def test_classify_empty_optional_fields_do_not_wildcard_digest():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/mod.py"],
+        test_paths=["tests/test_mod.py"],
+    )
+    stored = {
+        "allowed_writes": card["allowed_writes"],
+        "required_outputs": card["required_outputs"],
+        "validation": card["validation"],
+        "validation_roles": card["validation_roles"],
+        "work_kind": "generic",
+        "read_only": False,
+        "read_first": card["read_first"],
+    }
+    provenance = classify_task_card(**stored)
+    stored_digest = expanded_contract_digest(stored)
+    assert provenance["expanded_contract_digest"] == stored_digest
+    assert stored_digest == expanded_contract_digest(card)
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**{**stored, "read_first": []})
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**{**stored, "read_first": None})
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**{**stored, "validation_roles": []})
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**{**stored, "validation_roles": None})
+    omitted = dict(stored)
+    omitted.pop("read_first")
+    omitted.pop("validation_roles")
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**omitted)
+
+
+def test_classify_poisoned_live_template_does_not_reseal_stored_digest(monkeypatch):
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/mod.py"],
+        test_paths=["tests/test_mod.py"],
+    )
+    stored = {
+        "allowed_writes": card["allowed_writes"],
+        "required_outputs": card["required_outputs"],
+        "validation": card["validation"],
+        "validation_roles": card["validation_roles"],
+        "work_kind": "generic",
+        "read_only": False,
+        "read_first": card["read_first"],
+    }
+    original = classify_task_card(**stored)
+    stored_digest = expanded_contract_digest(stored)
+    assert original["expanded_contract_digest"] == stored_digest
+    real_expand = expand_template
+
+    def _poisoned_expand(template_id, **kwargs):
+        expanded = real_expand(template_id, **kwargs)
+        expanded["read_first"] = [*expanded["read_first"], "src/poison.py"]
+        expanded["validation_roles"] = [*expanded["validation_roles"], "poisoned"]
+        return expanded
+
+    monkeypatch.setattr(
+        "aiworkhub.task_templates.expand_template", _poisoned_expand
+    )
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**stored)
+    assert expanded_contract_digest(stored) == stored_digest
+    assert original["expanded_contract_digest"] == stored_digest
+
+
+_NODE_TEST_PATH_CASES = (
+    ("app.test.tsx", True),
+    ("foo.spec.mjs", True),
+    ("bar.test.jsx", True),
+    ("src/app.tsx", False),
+    ("lib/foo.mjs", False),
+    ("pkg/bar.jsx", False),
+)
+
+
+@pytest.mark.parametrize(("path", "is_test"), _NODE_TEST_PATH_CASES)
+def test_node_test_spec_suffixes_partition_and_classify(path, is_test):
+    assert _looks_like_test_path(path) is is_test
+    production, tests = _partition_write_set(
+        ["src/mod.py", "tests/test_mod.py", path]
+    )
+    if is_test:
+        assert path in tests
+        assert path not in production
+        card = expand_template(
+            "cross_boundary_bugfix",
+            production_paths=production,
+            test_paths=tests,
+        )
+        assert any(
+            command.startswith("node --test ") and path in command
+            for command in card["validation"]
+        )
+        provenance = classify_task_card(
+            allowed_writes=card["allowed_writes"],
+            required_outputs=card["required_outputs"],
+            validation=card["validation"],
+            validation_roles=card["validation_roles"],
+            work_kind=card["work_kind"],
+            read_only=card["read_only"],
+            read_first=card["read_first"],
+        )
+        assert provenance["template_name"] == "cross_boundary_bugfix"
+        return
+    assert path in production
+    assert path not in tests
+    card = expand_template(
+        "cross_boundary_bugfix",
+        production_paths=production,
+        test_paths=tests,
+    )
+    node_commands = [
+        command for command in card["validation"] if command.startswith("node ")
+    ]
+    assert all(path not in command for command in node_commands)
+    provenance = classify_task_card(
+        allowed_writes=card["allowed_writes"],
+        required_outputs=card["required_outputs"],
+        validation=card["validation"],
+        validation_roles=card["validation_roles"],
+        work_kind=card["work_kind"],
+        read_only=card["read_only"],
+        read_first=card["read_first"],
+    )
+    assert provenance["template_name"] == "cross_boundary_bugfix"
+
+
+def test_node_test_suffixes_derived_from_node_suffixes():
+    expected = tuple(
+        f"{marker}{suffix}"
+        for marker in (".test", ".spec")
+        for suffix in _NODE_SUFFIXES
+    )
+    assert _NODE_TEST_SUFFIXES == expected
+    for suffix in expected:
+        assert _looks_like_test_path(f"outside{suffix}")
+        assert not _looks_like_test_path(f"src/prod{suffix[suffix.rfind('.'):]}")
+
+
+def test_custom_validation_and_roles_reject_unbounded_lists():
+    too_many_commands = ["git diff --check"] * (MAX_PATHS_PER_FIELD + 1)
+    too_many_roles = ["generic"] * (MAX_PATHS_PER_FIELD + 1)
+    with pytest.raises(TaskTemplateError, match=r"^invalid_validation$"):
+        validate_custom_validation_roles(too_many_commands, ["generic"])
+    with pytest.raises(TaskTemplateError, match=r"^invalid_validation_roles$"):
+        validate_custom_validation_roles(["git diff --check"], too_many_roles)
+    validate_custom_validation_roles(
+        ["git diff --check"] * MAX_PATHS_PER_FIELD,
+        ["generic"] * MAX_PATHS_PER_FIELD,
+    )

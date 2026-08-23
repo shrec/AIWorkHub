@@ -537,6 +537,7 @@ def _validation_failed_card(
     workspace: dict[str, object] | None = None,
     repo_path: Path | None = None,
     retain_workspace: bool = True,
+    substatus: str = "validation_failed",
 ) -> dict[str, object]:
     authority = (repo_path or tmp_path).resolve()
     if workspace is None:
@@ -557,7 +558,7 @@ def _validation_failed_card(
         "task_id": task_id,
         "claim_epoch": claim_epoch,
         "terminal_review": {
-            "substatus": "validation_failed",
+            "substatus": substatus,
             "claim_epoch": claim_epoch,
             "evidence": {
                 "changed_paths": list(changed_paths),
@@ -590,13 +591,19 @@ def test_reject_review_predecessor_omitted_keeps_implicit_selection(tmp_path: Pa
     assert (resolved, error) == (None, None)
 
 
-def test_reject_review_predecessor_validation_failed_empty_changed_paths(tmp_path: Path) -> None:
-    card = _validation_failed_card(tmp_path, changed_paths=[], hashes={})
+@pytest.mark.parametrize("substatus", ["validation_failed", "review_ready"])
+def test_reject_review_predecessor_zero_diff_empty_maps(
+    tmp_path: Path, substatus: str
+) -> None:
+    card = _validation_failed_card(
+        tmp_path, changed_paths=[], hashes={}, substatus=substatus
+    )
     resolved, error = _resolve(card, _REQ_OLD, tmp_path)
     assert error is None
     assert resolved is not None
     assert resolved["request_id"] == _REQ_OLD
     assert resolved["changed_path_hashes"] == {}
+    assert card["terminal_review"]["substatus"] == substatus
 
 
 def test_reject_review_predecessor_validation_failed_nonempty_hashes(tmp_path: Path) -> None:
@@ -635,6 +642,24 @@ def test_reject_review_predecessor_claim_epoch_mismatch_fails_closed(tmp_path: P
 
 def test_reject_review_predecessor_missing_hashes_fails_closed(tmp_path: Path) -> None:
     card = _validation_failed_card(tmp_path, changed_paths=["out.txt"], hashes={})
+    resolved, error = _resolve(card, _REQ_OLD, tmp_path)
+    assert resolved is None
+    assert error == "predecessor_request_id_missing_hashes"
+
+
+@pytest.mark.parametrize(
+    "hashes",
+    [None, [], "deadbeef", {"out.txt": "not-a-digest"}, {"out.txt": _VALID_HASH}],
+)
+def test_reject_review_predecessor_hash_map_mutations_fail_closed(
+    tmp_path: Path, hashes: object
+) -> None:
+    card = _validation_failed_card(tmp_path, changed_paths=[], hashes={})
+    evidence = card["terminal_review"]["evidence"]
+    if hashes is None:
+        evidence.pop("changed_path_hashes")
+    else:
+        evidence["changed_path_hashes"] = hashes
     resolved, error = _resolve(card, _REQ_OLD, tmp_path)
     assert resolved is None
     assert error == "predecessor_request_id_missing_hashes"
@@ -846,7 +871,9 @@ def _patch_reject_review(monkeypatch: pytest.MonkeyPatch, repo: Path) -> None:
 def test_reject_review_exact_predecessor_completes_validation_failed_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo = _seed_validation_failed_review(tmp_path, changed_paths=[])
+    repo = _seed_validation_failed_review(
+        tmp_path, changed_paths=[], hashes={}
+    )
     _patch_reject_review(monkeypatch, repo)
     result = core.reject_review(
         "TASK_B891",
@@ -854,10 +881,12 @@ def test_reject_review_exact_predecessor_completes_validation_failed_empty(
         predecessor_request_id=_REQ_OLD,
     )
     assert result["ok"] is True
+    assert "missing_hashes" not in str(result.get("stderr") or "")
     card = task_store.get_task(repo, "TASK_B891")
     assert card is not None
     assert card["status"] == "pending"
     assert card["review_feedback"]["predecessor_request_id"] == _REQ_OLD
+    assert card["review_feedback"]["predecessor_changed_paths"] == []
 
 
 def test_reject_review_omitted_duplicate_task_id_completes(
@@ -951,3 +980,278 @@ def test_reject_review_exact_predecessor_does_not_select_newer_request(
     card = task_store.get_task(repo, "TASK_B891")
     assert card is not None
     assert card["status"] == "review"
+
+
+def _patch_create_task(monkeypatch: pytest.MonkeyPatch, repo: Path) -> None:
+    monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(repo.resolve()))
+    monkeypatch.setenv("AIWORKHUB_REPO", str(repo.resolve()))
+    monkeypatch.setattr(core, "_canonical_write_gate", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        core, "_verify_coordinator_capability", lambda *args, **kwargs: (True, "")
+    )
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": "01234567-89ab-4def-8123-456789abcdef",
+            "route_state": "verified",
+        },
+    )
+    monkeypatch.setattr(core, "_PROCESS_REPO_ROOT_OVERRIDE", repo.resolve())
+
+
+def _generic_python_card() -> dict[str, object]:
+    from aiworkhub.task_templates import expand_template
+
+    expanded = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/mod.py"],
+        test_paths=["tests/test_mod.py"],
+    )
+    return {
+        "title": "Persist template identity",
+        "runner": "codex_worker_nf390",
+        "topic": "task_mcp",
+        "objective": expanded["objective"],
+        "acceptance": ["persist exact template provenance"],
+        "allowed_writes": expanded["allowed_writes"],
+        "required_outputs": expanded["required_outputs"],
+        "validation": expanded["validation"],
+        "validation_roles": expanded["validation_roles"],
+        "read_first": expanded["read_first"],
+        "work_kind": "generic",
+        "read_only": False,
+        "expanded": expanded,
+    }
+
+
+def _create_generic_python_task(task_id: str, card: dict[str, object], **extra):
+    return core.create_task(
+        task_id=task_id,
+        title=str(card["title"]),
+        runner=str(card["runner"]),
+        topic=str(card["topic"]),
+        objective=str(card["objective"]),
+        acceptance=list(card["acceptance"]),  # type: ignore[arg-type]
+        allowed_writes=list(card["allowed_writes"]),  # type: ignore[arg-type]
+        required_outputs=list(card["required_outputs"]),  # type: ignore[arg-type]
+        validation=list(card["validation"]),  # type: ignore[arg-type]
+        validation_roles=list(card["validation_roles"]),  # type: ignore[arg-type]
+        read_first=list(card["read_first"]),  # type: ignore[arg-type]
+        work_kind=str(card["work_kind"]),
+        callback_required=False,
+        **extra,
+    )
+
+
+def test_create_task_persists_template_provenance_before_insert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _patch_create_task(monkeypatch, repo)
+    card = _generic_python_card()
+    result = _create_generic_python_task("TASK_NF390_PERSIST", card)
+    assert result["ok"] is True
+    assert result["created"] is True
+    created = json.loads(result["stdout"])
+    provenance = created["template_provenance"]
+    assert provenance["template_name"] == "implementation_with_tests"
+    assert provenance["template_full_id"] == card["expanded"]["template_full_id"]
+    assert provenance["registry_version"] == card["expanded"]["registry_version"]
+    assert provenance["definition_digest"] == card["expanded"]["definition_digest"]
+    assert (
+        provenance["classification_reason"]
+        == "compatible_generic_python_production_plus_test"
+    )
+    from aiworkhub.task_templates import expanded_contract_digest
+
+    assert provenance["expanded_contract_digest"] == expanded_contract_digest(
+        {
+            "allowed_writes": card["allowed_writes"],
+            "required_outputs": card["required_outputs"],
+            "validation": card["validation"],
+            "validation_roles": card["validation_roles"],
+            "work_kind": card["work_kind"],
+            "read_only": False,
+            "read_first": card["read_first"],
+        }
+    )
+    stored = task_store.get_task(repo, "TASK_NF390_PERSIST")
+    assert stored is not None
+    assert stored["template_provenance"] == provenance
+
+
+def test_lost_ack_reconciles_identical_template_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aiworkhub.task_templates import template_provenance_payload
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _patch_create_task(monkeypatch, repo)
+    card = _generic_python_card()
+    provenance = template_provenance_payload(
+        card["expanded"],  # type: ignore[arg-type]
+        classification_reason="explicit_template",
+    )
+    first = _create_generic_python_task(
+        "TASK_NF390_ACK", card, template_provenance=provenance
+    )
+    assert first["created"] is True
+    retry = _create_generic_python_task(
+        "TASK_NF390_ACK", card, template_provenance=provenance
+    )
+    assert retry["ok"] is True
+    assert retry["created"] is False
+    assert retry["reconciled"] is True
+    assert retry["receipt_state"] == "existing_identical"
+    custom_digest = __import__("hashlib").sha256(
+        __import__("json").dumps(
+            {
+                "escape": "audited_custom_unclassified",
+                "name": "custom",
+                "registry_version": 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    custom = {
+        "schema_id": "aiworkhub.task_template_provenance.v1",
+        "template_name": "custom",
+        "template_full_id": f"custom@v1:{custom_digest}",
+        "registry_version": 1,
+        "definition_digest": custom_digest,
+        "classification_reason": "audited_custom_escape",
+        "expanded_contract_digest": provenance["expanded_contract_digest"],
+    }
+    conflict = _create_generic_python_task(
+        "TASK_NF390_ACK", card, template_provenance=custom
+    )
+    assert conflict["ok"] is False
+    assert conflict["reconciled"] is False
+    assert "template_provenance" in conflict["conflict_fields"]
+    assert conflict["stderr"] == "task_already_exists:TASK_NF390_ACK"
+
+
+def test_create_task_persisted_provenance_survives_poisoned_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aiworkhub import task_templates
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _patch_create_task(monkeypatch, repo)
+    card = _generic_python_card()
+    created = _create_generic_python_task("TASK_NF390_POISON", card)
+    assert created["ok"] is True
+    created.pop("stdout", None)
+    stored = task_store.get_task(repo, "TASK_NF390_POISON")
+    assert stored is not None
+    original = dict(stored["template_provenance"])
+    monkeypatch.setattr(
+        task_templates, "_definition_digest", lambda spec: "ab" * 32
+    )
+    monkeypatch.setattr(
+        task_templates,
+        "classify_task_card",
+        lambda **kwargs: {
+            "schema_id": task_templates.PROVENANCE_SCHEMA_ID,
+            "template_name": "poisoned",
+            "template_full_id": "poisoned@v99:" + ("cd" * 32),
+            "registry_version": 99,
+            "definition_digest": "cd" * 32,
+            "classification_reason": "poisoned_live_classifier",
+            "expanded_contract_digest": "ef" * 32,
+        },
+    )
+    shown = core.show_task("TASK_NF390_POISON")
+    assert shown["ok"] is True
+    reloaded = json.loads(shown["stdout"])
+    assert reloaded["template_provenance"] == original
+    assert reloaded["template_provenance"]["template_name"] == "implementation_with_tests"
+    assert reloaded["template_provenance"]["classification_reason"] == (
+        "compatible_generic_python_production_plus_test"
+    )
+    assert reloaded["template_provenance"]["definition_digest"] != "ab" * 32
+    assert reloaded["template_provenance"]["expanded_contract_digest"] == (
+        task_templates.expanded_contract_digest(
+            {
+                "allowed_writes": card["allowed_writes"],
+                "required_outputs": card["required_outputs"],
+                "validation": card["validation"],
+                "validation_roles": card["validation_roles"],
+                "work_kind": card["work_kind"],
+                "read_only": False,
+                "read_first": card["read_first"],
+            }
+        )
+    )
+
+
+def test_create_task_empty_optional_fields_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aiworkhub import task_templates
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _patch_create_task(monkeypatch, repo)
+    empty_first = _generic_python_card()
+    empty_first["read_first"] = []
+    missing_first = _create_generic_python_task("TASK_NF390_EMPTY_FIRST", empty_first)
+    assert missing_first["ok"] is False
+    assert missing_first["stderr"] == "template_unclassified"
+    empty_roles = _generic_python_card()
+    expected_roles = list(empty_roles["validation_roles"])
+    empty_roles["validation_roles"] = []
+    filled_roles = _create_generic_python_task("TASK_NF390_EMPTY_ROLES", empty_roles)
+    assert filled_roles["ok"] is True
+    stored = task_store.get_task(repo, "TASK_NF390_EMPTY_ROLES")
+    assert stored is not None
+    assert stored["validation_roles"] == expected_roles
+    assert stored["read_first"] == empty_roles["read_first"]
+    assert stored["template_provenance"]["expanded_contract_digest"] == (
+        task_templates.expanded_contract_digest(
+            {
+                "allowed_writes": stored["allowed_writes"],
+                "required_outputs": stored["required_outputs"],
+                "validation": stored["validation"],
+                "validation_roles": stored["validation_roles"],
+                "work_kind": stored["work_kind"],
+                "read_only": stored["read_only"],
+                "read_first": stored["read_first"],
+            }
+        )
+    )
+
+
+def test_create_task_rejects_unbounded_validation_and_roles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aiworkhub.task_templates import MAX_PATHS_PER_FIELD
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _patch_create_task(monkeypatch, repo)
+    too_many_validation = _generic_python_card()
+    too_many_validation["validation"] = ["git diff --check"] * (MAX_PATHS_PER_FIELD + 1)
+    invalid_validation = _create_generic_python_task(
+        "TASK_NF390_TOO_MANY_VALIDATION", too_many_validation
+    )
+    assert invalid_validation["ok"] is False
+    assert invalid_validation["stderr"] == "invalid_validation"
+    too_many_roles = _generic_python_card()
+    too_many_roles["validation_roles"] = ["generic"] * (MAX_PATHS_PER_FIELD + 1)
+    invalid_roles = _create_generic_python_task(
+        "TASK_NF390_TOO_MANY_ROLES", too_many_roles
+    )
+    assert invalid_roles["ok"] is False
+    assert invalid_roles["stderr"] == "invalid_validation_roles"

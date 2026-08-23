@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.46] - 2026-08-23
+
+### Added
+
+- Template-first task creation now persists the exact template identity and
+  normalized contract provenance atomically with the canonical task card.
+
+### Fixed
+
+- Template-derived validation, role and required-output contracts are bounded
+  and language-correct before task insertion, eliminating partial cards and
+  mechanical cross-language validation failures.
+
 ## [0.10.45] - 2026-08-22
 
 ### Fixed
