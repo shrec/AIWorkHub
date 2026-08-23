@@ -170,6 +170,7 @@ def test_validation_only_replay_accepts_deterministic_lane_without_provider_reru
     assert route == {
         "backend": "vscode_lm_in_process",
         "adapter_id": "vscode_lm",
+        "outer_validation_authority": True,
     }
 
 
