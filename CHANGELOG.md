@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.47] - 2026-08-23
+
+### Fixed
+
+- Worker MCP audit evidence now binds every accepted provider tool call to an
+  authenticated provider-call identity and explicit live provenance across
+  the Python and VS Code execution paths.
+- Concurrent duplicate tool events are sealed once through deterministic
+  single-flight accounting, while prefetch, cache and live calls remain
+  distinct in audit metrics and required-tool gates.
+- HMAC-valid rows with malformed identity or provenance now fail closed before
+  aggregation and cannot inflate tool-use evidence.
+
 ## [0.10.46] - 2026-08-23
 
 ### Added

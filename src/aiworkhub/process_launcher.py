@@ -85,6 +85,13 @@ from . import quality_reviewer
 from . import terminal_authority
 from . import vscode_lm_bridge
 from . import worker_ai_tools_mcp
+# NF389: bounded, authenticated provider-call identity and provenance. These
+# re-exports give the ProcessManager (and the completion gate) the exact same
+# fail-closed validators the worker audit ledger uses, so spoofed or oversized
+# values are rejected with a named error instead of reaching the ledger.
+validate_provider_call_id = worker_ai_tools_mcp.validate_provider_call_id
+validate_provenance = worker_ai_tools_mcp.validate_provenance
+WorkerToolError = worker_ai_tools_mcp.WorkerToolError
 try:
     from . import deepseek_credentials
 except ImportError:  # optional host-only credential helper in some worktrees
@@ -6785,6 +6792,7 @@ class ProcessManager:
                         quality_review_packet_path=review_packet_path,
                         rework_overlay_packet=rework_overlay_packet,
                         rework_overlay_packet_path=rework_overlay_path,
+                        provenance="prefetch",
                     )
                     vscode_source_graph_result = worker_ai_tools_mcp.source_graph_query(
                         prefetch_ctx,
@@ -10257,6 +10265,36 @@ class ProcessManager:
             return {"ok": False, "reason": "worker_bridge_input_invalid"}
         if len(json.dumps(tool_input, ensure_ascii=False).encode("utf-8")) > 16 * 1024:
             return {"ok": False, "reason": "worker_bridge_input_too_large"}
+        # NF389: bind the bridge's authenticated provider-call identity into the
+        # exact worker audit context. A PRESENT value -- even an explicit empty
+        # string -- must pass the same fail-closed validator the ledger uses;
+        # only an ABSENT key retains the backward-compatible empty sentinel.
+        # ``provenance`` is provider-call provenance ONLY for the Source Graph
+        # dispatch (where ``source_graph_query`` would otherwise default it to
+        # ``live``). Every other tool keeps its own write-intent ``provenance``
+        # field untouched in tool_input (a distinct concept).
+        provider_call_id = ""
+        provenance = ""
+        is_source_graph = tool_name == "aiworkhub_manager_source_graph_query"
+        # NF389 sealed correction: consume (remove) the authenticated identity
+        # from the tool input here so it can never leak into the
+        # ``source_graph_query(ctx, **tool_input)`` dispatch (which would raise
+        # ``TypeError``), while still binding the validated value into the exact
+        # worker audit context below.
+        if "provider_call_id" in tool_input:
+            raw_provider_call_id = tool_input.pop("provider_call_id")
+            try:
+                provider_call_id = worker_ai_tools_mcp.validate_provider_call_id(
+                    raw_provider_call_id
+                )
+            except worker_ai_tools_mcp.WorkerToolError as exc:
+                return {"ok": False, "reason": str(exc)}
+        if is_source_graph and "provenance" in tool_input:
+            raw_provenance = tool_input.pop("provenance")
+            try:
+                provenance = worker_ai_tools_mcp.validate_provenance(raw_provenance)
+            except worker_ai_tools_mcp.WorkerToolError as exc:
+                return {"ok": False, "reason": str(exc)}
         events = self._request_events(request_id)
         if not events:
             return {"ok": False, "reason": "worker_bridge_request_not_found"}
@@ -10403,6 +10441,8 @@ class ProcessManager:
                 ),
                 rework_overlay_packet=rework_overlay_packet,
                 rework_overlay_packet_path=rework_overlay_packet_path,
+                provider_call_id=provider_call_id,
+                provenance=provenance,
             )
         except (KeyError, TypeError, ValueError):
             return {"ok": False, "reason": "worker_bridge_context_invalid"}

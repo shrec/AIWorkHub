@@ -232,6 +232,8 @@ def _fake_repo(tmp_path: Path, *, name: str = "repo") -> Path:
 def _ctx(
     repo: Path, *, home: Path, targets: tuple[str, ...] = (), request_id: str = "req1",
     authority_repo: Path | None = None,
+    provider_call_id: str | None = None,
+    provenance: str | None = None,
 ) -> w.WorkerToolContext:
     authority_repo = authority_repo if authority_repo is not None else repo
     runtime = w.generate_worker_mcp_runtime(
@@ -239,12 +241,16 @@ def _ctx(
         topic="task_mcp", repo=repo, authority_repo=authority_repo,
         source_graph_targets=list(targets), session_topic="AIWorkHub dynamic worker MCP B833",
         package_import_root=w.resolve_host_package_import_root(),
+        provider_call_id=provider_call_id,
+        provenance=provenance,
     )
     return w.WorkerToolContext(
         task_id="TASK_B833", runner="claude_b833", topic="task_mcp", request_id=request_id,
         repo=repo, authority_repo=authority_repo, source_graph_targets=targets,
         session_topic="AIWorkHub dynamic worker MCP B833",
         audit_ledger_path=runtime.audit_ledger_path, audit_hmac_key_path=runtime.audit_hmac_key_path,
+        provider_call_id=provider_call_id or "",
+        provenance=provenance or "",
     )
 
 
@@ -276,6 +282,92 @@ def test_load_context_from_env_binds_exact_identity(tmp_path: Path) -> None:
     assert ctx.authority_repo == tmp_path.resolve()
     assert ctx.source_graph_targets == ("a.py", "b.py")
     assert ctx.session_topic == "custom-topic"
+
+
+def test_load_context_from_env_binds_bounded_provider_identity(tmp_path: Path) -> None:
+    base = {
+        w.ENV_TASK_ID: "TASK_B833", w.ENV_RUNNER: "claude_b833", w.ENV_TOPIC: "task_mcp",
+        w.ENV_REPO: str(tmp_path), w.ENV_AUTHORITY_REPO: str(tmp_path),
+        w.ENV_SESSION_TOPIC: "custom-topic",
+        w.ENV_PROVIDER_CALL_ID: "pci_deepseek_42",
+        w.ENV_PROVENANCE: "live",
+    }
+    ctx = w.load_context_from_env(base)
+    assert ctx.provider_call_id == "pci_deepseek_42"
+    assert ctx.provenance == "live"
+
+    # Absent optional identity binds to empty strings (never spoofed).
+    minimal = {k: v for k, v in base.items() if k not in (w.ENV_PROVIDER_CALL_ID, w.ENV_PROVENANCE)}
+    ctx_min = w.load_context_from_env(minimal)
+    assert ctx_min.provider_call_id == ""
+    assert ctx_min.provenance == ""
+
+
+def test_load_context_from_env_rejects_spoofed_provider_identity(tmp_path: Path) -> None:
+    base = {
+        w.ENV_TASK_ID: "TASK_B833", w.ENV_RUNNER: "claude_b833", w.ENV_TOPIC: "task_mcp",
+        w.ENV_REPO: str(tmp_path), w.ENV_AUTHORITY_REPO: str(tmp_path),
+        w.ENV_SESSION_TOPIC: "custom-topic",
+    }
+    for bad_call_id in ("has space", "x" * 33):
+        with pytest.raises(w.WorkerToolError) as exc:
+            w.load_context_from_env({**base, w.ENV_PROVIDER_CALL_ID: bad_call_id})
+        assert "worker_mcp_provider_call_id" in str(exc.value)
+    with pytest.raises(w.WorkerToolError) as exc:
+        w.load_context_from_env({**base, w.ENV_PROVENANCE: "spoofed"})
+    assert "worker_mcp_provenance" in str(exc.value)
+
+
+def test_load_context_from_env_rejects_non_string_scalar_identity(tmp_path: Path) -> None:
+    base = {
+        w.ENV_TASK_ID: "TASK_B833", w.ENV_RUNNER: "claude_b833", w.ENV_TOPIC: "task_mcp",
+        w.ENV_REPO: str(tmp_path), w.ENV_AUTHORITY_REPO: str(tmp_path),
+        w.ENV_SESSION_TOPIC: "custom-topic",
+    }
+    # Raw non-string scalars and objects must fail closed with the named
+    # malformed/invalid error -- never be str()-coerced into the ledger.
+    call_id_negatives = (
+        True, False, 0, 12345,
+        {"pci": "spoofed"}, ["pci_deepseek_42"], object(),
+    )
+    for bad_call_id in call_id_negatives:
+        with pytest.raises(w.WorkerToolError) as exc:
+            w.load_context_from_env({**base, w.ENV_PROVIDER_CALL_ID: bad_call_id})
+        assert "worker_mcp_provider_call_id_malformed" in str(exc.value)
+    provenance_negatives = (
+        True, False, 0, 12345,
+        {"p": "live"}, ["live"], object(),
+    )
+    for bad_provenance in provenance_negatives:
+        with pytest.raises(w.WorkerToolError) as exc:
+            w.load_context_from_env({**base, w.ENV_PROVENANCE: bad_provenance})
+        assert "worker_mcp_provenance_invalid" in str(exc.value)
+
+
+def test_load_context_from_env_preserves_exact_valid_string_identity(tmp_path: Path) -> None:
+    base = {
+        w.ENV_TASK_ID: "TASK_B833", w.ENV_RUNNER: "claude_b833", w.ENV_TOPIC: "task_mcp",
+        w.ENV_REPO: str(tmp_path), w.ENV_AUTHORITY_REPO: str(tmp_path),
+        w.ENV_SESSION_TOPIC: "custom-topic",
+    }
+    for prov in ("prefetch", "live", "cache"):
+        ctx = w.load_context_from_env({**base, w.ENV_PROVENANCE: prov})
+        assert ctx.provenance == prov
+    for call_id in ("pci_deepseek_42", "codex_abc", "claude_xyz"):
+        ctx = w.load_context_from_env({**base, w.ENV_PROVIDER_CALL_ID: call_id})
+        assert ctx.provider_call_id == call_id
+    # NF389/r6: an ABSENT key binds the empty sentinel (never spoofed); a
+    # PRESENT-but-empty key is explicit empty identity and must fail closed
+    # with the named error.
+    ctx_absent = w.load_context_from_env(base)
+    assert ctx_absent.provider_call_id == ""
+    assert ctx_absent.provenance == ""
+    with pytest.raises(w.WorkerToolError) as exc:
+        w.load_context_from_env({**base, w.ENV_PROVIDER_CALL_ID: ""})
+    assert "worker_mcp_provider_call_id_empty" in str(exc.value)
+    with pytest.raises(w.WorkerToolError) as exc:
+        w.load_context_from_env({**base, w.ENV_PROVENANCE: ""})
+    assert "worker_mcp_provenance_invalid" in str(exc.value)
 
 
 def test_source_graph_query_rejects_target_outside_declared_allowlist(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -414,6 +506,103 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
         "deps_after_trace": False,
         "query_identity_coverage": {"observed": 2, "expected": 2},
     }
+
+
+def _live_gate_metadata(ctx: w.WorkerToolContext) -> dict:
+    """Production-shaped completion-gate metadata for a ``code`` task whose only
+    required tool is Source Graph (no injected bundle, no extra sections)."""
+    return {
+        "task_id": ctx.task_id,
+        "runner": ctx.runner,
+        "topic": ctx.topic,
+        "worker_mcp": {
+            "audit_ledger_path": str(ctx.audit_ledger_path),
+            "audit_hmac_key_path": str(ctx.audit_hmac_key_path),
+        },
+        "project_context": {
+            "task_context_policy": {"task_type": "code"},
+            "sections": [],
+        },
+    }
+
+
+def test_prefetch_provenance_is_auditable_but_never_satisfies_live_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """NF389/r6: a launch-time Source Graph prefetch is auditable but must never
+    be credited as a live worker call, and a genuine worker call counts once.
+
+    Exercises the real ``source_graph_query`` -> authenticated ledger ->
+    ``verify_audit_ledger`` -> ``_worker_mcp_live_call_gate`` production path
+    (not a mocked ledger), on one shared request-scoped runtime.
+    """
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    home = tmp_path / "home"
+
+    # Coordinator launch-time prefetch: provenance bound exactly to "prefetch".
+    prefetch_ctx = _ctx(
+        repo, home=home, targets=("AITools/source_graph.py",),
+        request_id="req-nf389", provenance="prefetch",
+    )
+    prefetch = w.source_graph_query(
+        prefetch_ctx, mode="focus", query="prefetch-orientation", budget=32,
+        workflow_stage="orientation",
+    )
+    assert prefetch["ok"] is True
+    assert prefetch["cache_hit"] is False
+
+    verification = w.verify_audit_ledger(
+        prefetch_ctx.audit_ledger_path, prefetch_ctx.audit_hmac_key_path,
+        task_id=prefetch_ctx.task_id, runner=prefetch_ctx.runner,
+        topic=prefetch_ctx.topic, request_id=prefetch_ctx.request_id,
+    )
+    # The prefetch is auditable and authoritative...
+    assert verification["provenance_counts"] == {"prefetch": 1}
+    assert verification["successful_call_count_by_tool"]["source_graph"] == 1
+    assert verification["call_count_by_tool"]["source_graph"] == 1
+    # ...but it contributes zero live/fresh Source Graph calls.
+    assert verification["live_source_graph_calls"] == 0
+    assert verification["fresh_source_graph_calls"] == 0
+
+    # Prefetch alone fails the production live-call gate closed.
+    metadata = _live_gate_metadata(prefetch_ctx)
+    gate = process_launcher._worker_mcp_live_call_gate(metadata, prefetch_ctx.request_id)
+    assert gate["gated"] is True
+    assert gate["satisfied"] is False
+    assert gate["satisfaction_by_tool"]["source_graph"] == "stale_or_cached"
+    assert "source_graph" in gate["stale_tools"]
+    assert "source_graph_live_call" not in gate.get("missing_tools", [])
+
+    # A genuine provider-originated worker call on the same identity counts
+    # exactly once (the prefetch row is not double-counted as live).
+    live_ctx = _ctx(
+        repo, home=home, targets=("AITools/source_graph.py",),
+        request_id="req-nf389",
+    )
+    live = w.source_graph_query(
+        live_ctx, mode="focus", query="genuine-live-call", budget=32,
+        workflow_stage="validation",
+    )
+    assert live["ok"] is True
+    assert live["cache_hit"] is False
+
+    verification2 = w.verify_audit_ledger(
+        live_ctx.audit_ledger_path, live_ctx.audit_hmac_key_path,
+        task_id=live_ctx.task_id, runner=live_ctx.runner,
+        topic=live_ctx.topic, request_id=live_ctx.request_id,
+    )
+    assert verification2["provenance_counts"] == {"prefetch": 1, "live": 1}
+    assert verification2["live_source_graph_calls"] == 1
+    assert verification2["fresh_source_graph_calls"] == 1
+    assert verification2["successful_call_count_by_tool"]["source_graph"] == 2
+
+    gate2 = process_launcher._worker_mcp_live_call_gate(metadata, live_ctx.request_id)
+    assert gate2["satisfied"] is True
+    assert gate2["satisfaction_by_tool"]["source_graph"] == "live_worker_call"
+    assert gate2["missing_tools"] == []
+    assert gate2["stale_tools"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -776,6 +965,310 @@ def test_verify_audit_ledger_drops_tampered_and_forged_entries(monkeypatch: pyte
     assert verification["live_source_graph_calls"] == 1
 
 
+def test_validate_provider_call_id_and_provenance_fail_closed() -> None:
+    # Bounded provider_call_id: exactly one bounded, authenticated value.
+    assert w.validate_provider_call_id("pci_abcd1234") == "pci_abcd1234"
+    assert w.validate_provider_call_id("provider_0123456789abcdef0123456") == \
+        "provider_0123456789abcdef0123456"  # exactly MAX_PROVIDER_CALL_ID_LEN (32) chars
+    for bad in (
+        None, "", "x" * 33, "has space", "-leading", "bad$char", "pci\x00null",
+        "pci_abcd1234\n", "pci_abcd1234\r\n", "pci_abcd1234 ",
+        123, True, 3.14, ["pci"], {"id": "pci"},
+    ):
+        with pytest.raises(w.WorkerToolError) as exc:
+            w.validate_provider_call_id(bad)
+        assert "worker_mcp_provider_call_id" in str(exc.value)
+
+    assert w.validate_provenance("prefetch") == "prefetch"
+    assert w.validate_provenance("live") == "live"
+    assert w.validate_provenance("cache") == "cache"
+    for bad in (None, "", "spoofed", "LIVE", "prefetch;DROP", 123, True, 3.14, ["live"], {"p": "live"}):
+        with pytest.raises(w.WorkerToolError) as exc:
+            w.validate_provenance(bad)
+        assert "worker_mcp_provenance" in str(exc.value)
+
+    # A custom __str__ must never be coerced into a valid provenance label.
+    class _StrLive:
+        def __str__(self) -> str:
+            return "live"
+
+    with pytest.raises(w.WorkerToolError) as exc:
+        w.validate_provenance(_StrLive())
+    assert "worker_mcp_provenance" in str(exc.value)
+
+
+def test_audit_rows_carry_bounded_provider_call_id_and_provenance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(
+        repo, home=tmp_path / "home", targets=("AITools/source_graph.py",),
+        provider_call_id="pci_deepseek_42", provenance="live",
+    )
+    w.source_graph_query(ctx, mode="focus", query="ignored")
+
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    assert verification["provider_call_id_by_tool"]["source_graph"] == ["pci_deepseek_42"]
+    assert verification["provenance_counts"]["live"] == 1
+    assert verification["live_source_graph_calls"] == 1
+    # Exact valid rows: the ledger verifies clean, with no identity violations.
+    assert verification["ok"] is True
+    assert verification["entries_tampered"] == 0
+    assert verification["entries_invalid_identity"] == 0
+
+
+def test_hmac_negative_fixture_distinguishes_invalid_provenance_from_tampering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """NF389/r6: authenticated-invalid identity is NOT an HMAC tamper.
+
+    An entry that carries the correct HMAC but an invalid provenance must fail
+    closed as an authenticated identity violation (never counted, never copied
+    raw into ``provenance_counts``, never credited as live), while a tampered
+    entry (wrong HMAC) is dropped as tampered. The two failures are distinct
+    and both stay out of the live Source Graph gate.
+    """
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
+    w.source_graph_query(ctx, mode="focus", query="ignored")
+
+    key_bytes = ctx.audit_hmac_key_path.read_bytes()
+    authenticated_invalid = {
+        "schema_id": w.AUDIT_ENTRY_SCHEMA_ID, "timestamp": "2026-01-01T00:00:00+00:00",
+        "task_id": ctx.task_id, "runner": ctx.runner, "topic": ctx.topic, "request_id": ctx.request_id,
+        "tool": "source_graph", "ok": True, "cache_hit": False, "hit_count": 1,
+        "bytes_returned": 1, "violation": "",
+        "authority_source": "canonical", "authority_state": "sole_authority",
+        "authority_repo": str(ctx.authority_repo),
+        "provider_call_id": "pci_bad_provenance", "provenance": "spoofed",
+    }
+    authenticated_invalid["hmac_sha256"] = w._hmac_entry(authenticated_invalid, key_bytes)
+
+    tampered = dict(authenticated_invalid)
+    tampered["hmac_sha256"] = "0" * 64
+
+    with ctx.audit_ledger_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(authenticated_invalid) + "\n")
+        handle.write(json.dumps(tampered) + "\n")
+
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    assert verification["ok"] is False
+    assert verification["entries_total"] == 3
+    assert verification["entries_tampered"] == 1
+    assert verification["entries_invalid_identity"] == 1
+    assert verification["entries_verified"] == 1  # only the genuine live row
+    # The authenticated-invalid row must never appear raw in the provenance map.
+    assert "spoofed" not in verification["provenance_counts"]
+    assert verification["live_source_graph_calls"] == 1  # only the genuine live row
+    assert "authenticated_ledger_identity_violation" in verification["reason"]
+    assert "tampered_receipts_observed" not in verification["reason"]
+
+
+def test_prefetch_and_cache_provenance_never_satisfy_live_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
+    key_bytes = ctx.audit_hmac_key_path.read_bytes()
+
+    def _entry(provenance: str, cache_hit: bool, pci: str) -> dict:
+        entry = {
+            "schema_id": w.AUDIT_ENTRY_SCHEMA_ID, "timestamp": "2026-01-01T00:00:00+00:00",
+            "task_id": ctx.task_id, "runner": ctx.runner, "topic": ctx.topic, "request_id": ctx.request_id,
+            "tool": "source_graph", "ok": True, "cache_hit": cache_hit, "hit_count": 1,
+            "bytes_returned": 1, "violation": "",
+            "authority_source": "canonical", "authority_state": "sole_authority",
+            "authority_repo": str(ctx.authority_repo),
+            "provider_call_id": pci, "provenance": provenance,
+        }
+        entry["hmac_sha256"] = w._hmac_entry(entry, key_bytes)
+        return entry
+
+    with ctx.audit_ledger_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_entry("prefetch", False, "pci_prefetch_1")) + "\n")
+        handle.write(json.dumps(_entry("cache", True, "pci_cache_1")) + "\n")
+        handle.write(json.dumps(_entry("live", False, "pci_live_1")) + "\n")
+
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    assert verification["entries_verified"] == 3
+    assert verification["provenance_counts"] == {"prefetch": 1, "cache": 1, "live": 1}
+    # Only the genuine "live" row satisfies the gate; prefetch and cache stay
+    # auditable but are never counted as a fresh/live provider call.
+    assert verification["fresh_source_graph_calls"] == 1
+    assert verification["live_source_graph_calls"] == 1
+
+
+def test_hmac_valid_empty_and_missing_provenance_never_satisfy_live_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """NF389/r6: absent vs empty provenance is the fail-closed boundary.
+
+    A MISSING provenance key is the backward-compatible empty sentinel (the row
+    is verified but never satisfies the live gate). A PRESENT-but-empty
+    provenance is an authenticated identity violation that fails the whole
+    ledger closed; it is never copied into ``provenance_counts`` and never
+    credited as live. Only the exact ``"live"`` row satisfies the gate.
+    """
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
+    key_bytes = ctx.audit_hmac_key_path.read_bytes()
+
+    def _entry(provenance_value: object, pci: str) -> dict:
+        entry = {
+            "schema_id": w.AUDIT_ENTRY_SCHEMA_ID, "timestamp": "2026-01-01T00:00:00+00:00",
+            "task_id": ctx.task_id, "runner": ctx.runner, "topic": ctx.topic, "request_id": ctx.request_id,
+            "tool": "source_graph", "ok": True, "cache_hit": False, "hit_count": 1,
+            "bytes_returned": 1, "violation": "",
+            "authority_source": "canonical", "authority_state": "sole_authority",
+            "authority_repo": str(ctx.authority_repo),
+            "provider_call_id": pci,
+        }
+        if provenance_value is not None:
+            entry["provenance"] = provenance_value
+        entry["hmac_sha256"] = w._hmac_entry(entry, key_bytes)
+        return entry
+
+    with ctx.audit_ledger_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_entry("", "pci_empty_provenance")) + "\n")
+        handle.write(json.dumps(_entry(None, "pci_missing_provenance")) + "\n")
+        handle.write(json.dumps(_entry("live", "pci_live_ok")) + "\n")
+
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    assert verification["ok"] is False
+    assert verification["entries_total"] == 3
+    assert verification["entries_tampered"] == 0
+    assert verification["entries_invalid_identity"] == 1
+    assert verification["entries_verified"] == 2  # missing-key + live rows
+    assert verification["provenance_counts"] == {"live": 1}
+    assert verification["fresh_source_graph_calls"] == 1
+    assert verification["live_source_graph_calls"] == 1
+    assert "authenticated_ledger_identity_violation" in verification["reason"]
+
+
+@pytest.mark.parametrize(
+    "bad_provider_call_id",
+    [
+        "",  # present-but-empty
+        "x" * (w.MAX_PROVIDER_CALL_ID_LEN + 1),  # oversized
+        "pci\x00control",  # control character
+        "bad$char",  # malformed punctuation
+        "has space",  # malformed whitespace
+    ],
+)
+def test_hmac_valid_invalid_provider_call_id_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_provider_call_id: str,
+) -> None:
+    """NF389/r6: an HMAC-valid but invalid provider_call_id is an authenticated
+    identity violation. The ledger fails closed and the raw value never reaches
+    provider_call_ids/provider_call_id_by_tool, provenance_counts, or the live
+    Source Graph gate."""
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
+    key_bytes = ctx.audit_hmac_key_path.read_bytes()
+
+    entry = {
+        "schema_id": w.AUDIT_ENTRY_SCHEMA_ID, "timestamp": "2026-01-01T00:00:00+00:00",
+        "task_id": ctx.task_id, "runner": ctx.runner, "topic": ctx.topic, "request_id": ctx.request_id,
+        "tool": "source_graph", "ok": True, "cache_hit": False, "hit_count": 1,
+        "bytes_returned": 1, "violation": "",
+        "authority_source": "canonical", "authority_state": "sole_authority",
+        "authority_repo": str(ctx.authority_repo),
+        "provider_call_id": bad_provider_call_id, "provenance": "live",
+    }
+    entry["hmac_sha256"] = w._hmac_entry(entry, key_bytes)
+    with ctx.audit_ledger_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry) + "\n")
+
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    assert verification["ok"] is False
+    assert verification["entries_total"] == 1
+    assert verification["entries_tampered"] == 0
+    assert verification["entries_invalid_identity"] == 1
+    assert verification["entries_verified"] == 0
+    assert verification["provider_call_ids"] == []
+    assert verification["provider_call_id_by_tool"] == {}
+    assert verification["provenance_counts"] == {}
+    assert verification["fresh_source_graph_calls"] == 0
+    assert verification["live_source_graph_calls"] == 0
+    assert "authenticated_ledger_identity_violation" in verification["reason"]
+    if bad_provider_call_id:
+        assert bad_provider_call_id not in verification["reason"]
+
+
+@pytest.mark.parametrize(
+    "bad_provenance",
+    ["", "spoofed", "LIVE", "prefetch;DROP", "cache\x00"],
+)
+def test_hmac_valid_invalid_provenance_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_provenance: str,
+) -> None:
+    """NF389/r6: an HMAC-valid but invalid provenance (empty, spoofed, wrong
+    case, or control-bearing) is an authenticated identity violation. The
+    ledger fails closed and the raw label never reaches provenance_counts or
+    the live Source Graph gate."""
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
+    key_bytes = ctx.audit_hmac_key_path.read_bytes()
+
+    entry = {
+        "schema_id": w.AUDIT_ENTRY_SCHEMA_ID, "timestamp": "2026-01-01T00:00:00+00:00",
+        "task_id": ctx.task_id, "runner": ctx.runner, "topic": ctx.topic, "request_id": ctx.request_id,
+        "tool": "source_graph", "ok": True, "cache_hit": False, "hit_count": 1,
+        "bytes_returned": 1, "violation": "",
+        "authority_source": "canonical", "authority_state": "sole_authority",
+        "authority_repo": str(ctx.authority_repo),
+        "provider_call_id": "pci_valid_1", "provenance": bad_provenance,
+    }
+    entry["hmac_sha256"] = w._hmac_entry(entry, key_bytes)
+    with ctx.audit_ledger_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry) + "\n")
+
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    assert verification["ok"] is False
+    assert verification["entries_total"] == 1
+    assert verification["entries_tampered"] == 0
+    assert verification["entries_invalid_identity"] == 1
+    assert verification["entries_verified"] == 0
+    assert verification["provider_call_ids"] == []
+    assert verification["provider_call_id_by_tool"] == {}
+    assert verification["provenance_counts"] == {}
+    assert verification["fresh_source_graph_calls"] == 0
+    assert verification["live_source_graph_calls"] == 0
+    assert "authenticated_ledger_identity_violation" in verification["reason"]
+    if bad_provenance:
+        assert bad_provenance not in verification["reason"]
+
+
 def test_verify_audit_ledger_ignores_calls_from_a_different_task(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
@@ -949,7 +1442,49 @@ def test_generate_worker_mcp_runtime_writes_three_adapter_config_shapes(monkeypa
     # No credential leakage: the runtime env never carries a provider secret.
     assert "ANTHROPIC_API_KEY" not in runtime.env
     assert "COPILOT_PROVIDER_API_KEY" not in runtime.env
-    assert all(name in runtime.env for name in w.BOUND_ENV_VARS)
+    # Optional per-call identity (provider_call_id/provenance) is only bound
+    # when a non-empty value is supplied; assert presence only for the
+    # bootstrap-required bound variables.
+    required_bound_vars = tuple(
+        name for name in w.BOUND_ENV_VARS
+        if name not in (w.ENV_PROVIDER_CALL_ID, w.ENV_PROVENANCE)
+    )
+    assert all(name in runtime.env for name in required_bound_vars)
+
+
+def test_generate_worker_mcp_runtime_absent_vs_empty_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """NF389/r6: runtime env generation must distinguish an absent identity
+    (backward-compatible unbound sentinel) from an explicit empty value, which
+    fails closed with the named error."""
+    _mute_chmod(monkeypatch)
+    home = tmp_path / "home"
+    repo = _fake_repo(tmp_path)
+    kwargs = dict(
+        home=home, request_id="req42", task_id="TASK_B833", runner="claude_b833",
+        topic="task_mcp", repo=repo, authority_repo=repo,
+        source_graph_targets=["AITools/source_graph.py"],
+        session_topic="AIWorkHub dynamic worker MCP B833",
+        package_import_root=w.resolve_host_package_import_root(),
+    )
+    # Absent identity: the runtime env never binds provider_call_id/provenance.
+    runtime_absent = w.generate_worker_mcp_runtime(**kwargs)
+    assert w.ENV_PROVIDER_CALL_ID not in runtime_absent.env
+    assert w.ENV_PROVENANCE not in runtime_absent.env
+    # Present valid identity: bound exactly once into the runtime env.
+    runtime_present = w.generate_worker_mcp_runtime(
+        **kwargs, provider_call_id="pci_deepseek_42", provenance="prefetch",
+    )
+    assert runtime_present.env[w.ENV_PROVIDER_CALL_ID] == "pci_deepseek_42"
+    assert runtime_present.env[w.ENV_PROVENANCE] == "prefetch"
+    # Explicit empty identity/provenance fails closed with the named error.
+    with pytest.raises(w.WorkerToolError) as exc:
+        w.generate_worker_mcp_runtime(**kwargs, provider_call_id="")
+    assert "worker_mcp_provider_call_id_empty" in str(exc.value)
+    with pytest.raises(w.WorkerToolError) as exc:
+        w.generate_worker_mcp_runtime(**kwargs, provenance="")
+    assert "worker_mcp_provenance_invalid" in str(exc.value)
 
 
 def test_generate_worker_mcp_runtime_is_idempotent_on_the_audit_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

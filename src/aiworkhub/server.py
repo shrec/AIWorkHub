@@ -479,6 +479,11 @@ from . import task_plan
 from . import task_reconciler
 from . import terminal_log_retention
 from . import worker_ai_tools_mcp
+# NF389: single source of truth for bounded provider-call identity and
+# provenance. Manager write tools already accept provenance; these re-exports
+# make the fail-closed validators available to the Server surface (and tests).
+validate_provider_call_id = worker_ai_tools_mcp.validate_provider_call_id
+validate_provenance = worker_ai_tools_mcp.validate_provenance
 from . import dependency_autolaunch
 from . import quality_evidence
 from . import quality_calibration

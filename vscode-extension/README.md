@@ -12,6 +12,15 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.47
+
+- Provider tool calls now retain authenticated call identity and explicit
+  provenance across the extension and Python worker boundary.
+- Single-flight audit accounting removes concurrent duplicate evidence while
+  preserving the distinction between live, prefetched and cached calls.
+- Malformed authenticated identity records fail closed before aggregation or
+  required-tool gate evaluation.
+
 ## What's new in 0.10.46
 
 - Template-first task creation now persists exact template provenance and a

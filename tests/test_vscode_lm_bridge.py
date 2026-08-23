@@ -1965,3 +1965,364 @@ def test_create_request_rejects_required_outputs_before_publication(
         )
     assert not (home / ".aiworkhub_vscode_lm_worker.json").exists()
     assert not (root / "requests" / repo_id / f"{request_id}.json").exists()
+
+
+def test_bridge_validates_and_forwards_provider_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF389: the ProcessManager bridge exposes the exact fail-closed
+    provider_call_id/provenance validators the worker audit ledger uses, and
+    forwards validated provenance through the write-intent tool. Empty,
+    oversized, malformed or spoofed identity fails closed with a named error
+    before it can reach any audit row."""
+    # 1. The bridge surface shares the worker ledger's fail-closed validators.
+    assert (
+        process_launcher.validate_provider_call_id
+        is worker_ai_tools_mcp.validate_provider_call_id
+    )
+    assert process_launcher.validate_provenance is worker_ai_tools_mcp.validate_provenance
+    assert process_launcher.validate_provider_call_id("pci_bridge_1") == "pci_bridge_1"
+    assert process_launcher.validate_provenance("live") == "live"
+
+    # 2. Empty/oversized/malformed provider_call_id and spoofed provenance fail
+    #    closed with a named error at the bridge surface.
+    for bad in (
+        None, "", "x" * 33, "has space", "bad$char", "pci_bridge_1\n",
+        "pci_bridge_1 ", 123, True, 3.14, ["pci"], {"id": "pci"},
+    ):
+        with pytest.raises(process_launcher.WorkerToolError) as exc:
+            process_launcher.validate_provider_call_id(bad)
+        assert "worker_mcp_provider_call_id" in str(exc.value)
+    for bad in (None, "", "spoofed", "LIVE", "cached", 123, True, 3.14, ["live"], {"p": "live"}):
+        with pytest.raises(process_launcher.WorkerToolError) as exc:
+            process_launcher.validate_provenance(bad)
+        assert "worker_mcp_provenance" in str(exc.value)
+
+    class _StrLive:
+        def __str__(self) -> str:
+            return "live"
+
+    with pytest.raises(process_launcher.WorkerToolError) as exc:
+        process_launcher.validate_provenance(_StrLive())
+    assert "worker_mcp_provenance" in str(exc.value)
+
+    # 3. Validated provenance is forwarded through the bridge write-intent tool.
+    repo = _repo(tmp_path)
+    process_dir = repo / ".aiworkhub" / "runtime" / "processes"
+    process_dir.mkdir(parents=True)
+    request_id = "d" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    ledger = home / "audit.jsonl"
+    key = home / "audit.key"
+    ledger.write_text("", encoding="utf-8")
+    key.write_bytes(b"k" * 32)
+    metadata_path = process_dir / f"{request_id}.request.json"
+    metadata_path.write_text(json.dumps({
+        "request_id": request_id,
+        "task_id": "GLM_BRIDGE_TEST",
+        "runner": "glm52_bridge_test",
+        "topic": "bridge_test",
+        "adapter_id": "glm_vscode_lm",
+        "workspace": {"path": str(workspace), "home": str(home)},
+        "worker_mcp": {
+            "authority_repo": str(repo),
+            "source_graph_targets": ["src/aiworkhub"],
+            "allowed_writes": ["src/*.py"],
+            "session_topic": "bounded bridge test",
+            "audit_ledger_path": str(ledger),
+            "audit_hmac_key_path": str(key),
+        },
+    }), encoding="utf-8")
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=process_dir,
+        isolation_enabled=False,
+    )
+    event = {
+        "request_id": request_id,
+        "adapter_id": "glm_vscode_lm",
+        "state": "running",
+        "metadata_path": str(metadata_path),
+    }
+    monkeypatch.setattr(manager, "_request_events", lambda _rid: [event])
+
+    observed: dict[str, object] = {}
+
+    def _session_intent(
+        bound_ctx: worker_ai_tools_mcp.WorkerToolContext, **kwargs: object,
+    ) -> dict[str, object]:
+        observed.update({"ctx": bound_ctx, "kwargs": kwargs})
+        return {"ok": True, "status": "pending_manager_review", "intent_id": "f" * 64}
+
+    monkeypatch.setattr(worker_ai_tools_mcp, "session_write_intent", _session_intent)
+    intent = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_session_write_intent",
+        {
+            "action": "checkpoint",
+            "content": "bounded",
+            "idempotency_key": "session:bridge:nf389",
+            "provenance": "live",
+        },
+    )
+    assert intent["status"] == "pending_manager_review"
+    assert observed["kwargs"]["provenance"] == "live"
+
+
+def test_bridge_source_graph_dispatch_consumes_provider_call_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF389 sealed correction: the bridge strips the authenticated
+    provider_call_id from tool_input before dispatching source_graph_query, so
+    the native call never raises TypeError, while the exact id still lands in
+    the HMAC-covered audit row."""
+    repo = _repo(tmp_path)
+    process_dir = repo / ".aiworkhub" / "runtime" / "processes"
+    process_dir.mkdir(parents=True)
+    request_id = "e" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    ledger = home / "audit.jsonl"
+    key = home / "audit.key"
+    # Create the audit ledger/key with the same 0600 mode the coordinator
+    # provisions (chmod/fchmod is seccomp-blocked in this sandbox, so the
+    # mode must be set atomically at creation time).
+    ledger_fd = os.open(ledger, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    os.close(ledger_fd)
+    key_fd = os.open(key, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    os.write(key_fd, b"k" * 32)
+    os.close(key_fd)
+    metadata_path = process_dir / f"{request_id}.request.json"
+    metadata_path.write_text(json.dumps({
+        "request_id": request_id,
+        "task_id": "GLM_BRIDGE_DISPATCH_TEST",
+        "runner": "glm52_bridge_test",
+        "topic": "bridge_test",
+        "adapter_id": "glm_vscode_lm",
+        "workspace": {"path": str(workspace), "home": str(home)},
+        "worker_mcp": {
+            "authority_repo": str(repo),
+            "source_graph_targets": ["src/aiworkhub"],
+            "allowed_writes": ["src/*.py"],
+            "session_topic": "bounded bridge test",
+            "audit_ledger_path": str(ledger),
+            "audit_hmac_key_path": str(key),
+        },
+    }), encoding="utf-8")
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=process_dir,
+        isolation_enabled=False,
+    )
+    event = {
+        "request_id": request_id,
+        "adapter_id": "glm_vscode_lm",
+        "state": "running",
+        "metadata_path": str(metadata_path),
+    }
+    monkeypatch.setattr(manager, "_request_events", lambda _rid: [event])
+
+    observed: dict[str, object] = {}
+
+    def _fake_source_graph(
+        bound_ctx: worker_ai_tools_mcp.WorkerToolContext, **kwargs: object,
+    ) -> dict[str, object]:
+        observed["ctx"] = bound_ctx
+        observed["kwargs"] = kwargs
+        worker_ai_tools_mcp._append_audit(
+            bound_ctx,
+            tool="source_graph",
+            ok=True,
+            cache_hit=False,
+            hit_count=0,
+            bytes_returned=0,
+            provenance="live",
+        )
+        return {"ok": True, "tool": "source_graph", "content": "{}", "hit_count": 0}
+
+    monkeypatch.setattr(worker_ai_tools_mcp, "source_graph_query", _fake_source_graph)
+    result = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_source_graph_query",
+        {
+            "mode": "focus",
+            "query": "nf389 dispatch",
+            "provider_call_id": "pci_dispatch_id",
+        },
+    )
+    assert result.get("ok") is True
+    # No TypeError: the authenticated identity was consumed, not forwarded.
+    assert "provider_call_id" not in observed["kwargs"]
+    assert observed["kwargs"]["mode"] == "focus"
+    assert observed["kwargs"]["query"] == "nf389 dispatch"
+
+    verification = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger,
+        key,
+        task_id="GLM_BRIDGE_DISPATCH_TEST",
+        runner="glm52_bridge_test",
+        topic="bridge_test",
+        request_id=request_id,
+    )
+    assert verification["entries_tampered"] == 0
+    assert verification["provider_call_ids"] == ["pci_dispatch_id"]
+
+
+def test_bridge_absent_vs_explicit_empty_identity(tmp_path: Path) -> None:
+    """NF389/r6: an absent provider_call_id/provenance binds the empty sentinel,
+    while an explicit empty value fails closed with the named error before any
+    audit row can be reached."""
+    repo = _repo(tmp_path)
+    process_dir = repo / ".aiworkhub" / "runtime" / "processes"
+    process_dir.mkdir(parents=True)
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=process_dir,
+        isolation_enabled=False,
+    )
+    # Explicit empty provider_call_id fails closed at the bridge surface.
+    result = manager.invoke_vscode_lm_worker_tool(
+        "e" * 32,
+        "aiworkhub_manager_source_graph_query",
+        {"mode": "focus", "query": "x", "provider_call_id": ""},
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "worker_mcp_provider_call_id_empty"
+    # Explicit empty provenance on the Source Graph dispatch fails closed.
+    result = manager.invoke_vscode_lm_worker_tool(
+        "e" * 32,
+        "aiworkhub_manager_source_graph_query",
+        {"mode": "focus", "query": "x", "provenance": ""},
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "worker_mcp_provenance_invalid"
+
+
+def test_bridge_prefetch_provenance_auditable_never_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF389/r6: the extension fallback prefetch propagates provenance="prefetch"
+    through the bridge into the worker audit context, so it is auditable but
+    never increments live_source_graph_calls; a genuine provider call (absent
+    provenance -> live default) counts exactly once."""
+    repo = _repo(tmp_path)
+    process_dir = repo / ".aiworkhub" / "runtime" / "processes"
+    process_dir.mkdir(parents=True)
+    request_id = "f" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    ledger = home / "audit.jsonl"
+    key = home / "audit.key"
+    ledger_fd = os.open(ledger, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    os.close(ledger_fd)
+    key_fd = os.open(key, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    os.write(key_fd, b"k" * 32)
+    os.close(key_fd)
+    metadata_path = process_dir / f"{request_id}.request.json"
+    metadata_path.write_text(json.dumps({
+        "request_id": request_id,
+        "task_id": "GLM_BRIDGE_PREFETCH_TEST",
+        "runner": "glm52_bridge_test",
+        "topic": "bridge_test",
+        "adapter_id": "glm_vscode_lm",
+        "workspace": {"path": str(workspace), "home": str(home)},
+        "worker_mcp": {
+            "authority_repo": str(repo),
+            "source_graph_targets": ["src/aiworkhub"],
+            "allowed_writes": ["src/*.py"],
+            "session_topic": "bounded bridge test",
+            "audit_ledger_path": str(ledger),
+            "audit_hmac_key_path": str(key),
+        },
+    }), encoding="utf-8")
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=process_dir,
+        isolation_enabled=False,
+    )
+    event = {
+        "request_id": request_id,
+        "adapter_id": "glm_vscode_lm",
+        "state": "running",
+        "metadata_path": str(metadata_path),
+    }
+    monkeypatch.setattr(manager, "_request_events", lambda _rid: [event])
+
+    observed_ctxs: list[worker_ai_tools_mcp.WorkerToolContext] = []
+    observed_kwargs: list[dict[str, object]] = []
+
+    def _fake_source_graph(
+        bound_ctx: worker_ai_tools_mcp.WorkerToolContext, **kwargs: object,
+    ) -> dict[str, object]:
+        observed_ctxs.append(bound_ctx)
+        observed_kwargs.append(kwargs)
+        worker_ai_tools_mcp._append_audit(
+            bound_ctx,
+            tool="source_graph",
+            ok=True,
+            cache_hit=False,
+            hit_count=0,
+            bytes_returned=0,
+            authority_source="canonical",
+            authority_state="canonical_active",
+            provenance=bound_ctx.provenance or "live",
+        )
+        return {"ok": True, "tool": "source_graph", "content": "{}", "hit_count": 0}
+
+    monkeypatch.setattr(worker_ai_tools_mcp, "source_graph_query", _fake_source_graph)
+
+    # 1. Prefetch branch: provenance="prefetch" is consumed and bound, never
+    #    forwarded into the source_graph_query kwargs.
+    prefetch = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_source_graph_query",
+        {"mode": "focus", "query": "nf389 prefetch", "provenance": "prefetch"},
+    )
+    assert prefetch.get("ok") is True
+    assert observed_ctxs[-1].provenance == "prefetch"
+    assert "provenance" not in observed_kwargs[-1]
+
+    verification = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger,
+        key,
+        task_id="GLM_BRIDGE_PREFETCH_TEST",
+        runner="glm52_bridge_test",
+        topic="bridge_test",
+        request_id=request_id,
+    )
+    assert verification["entries_tampered"] == 0
+    assert verification["provenance_counts"] == {"prefetch": 1}
+    assert verification["live_source_graph_calls"] == 0
+    assert verification["fresh_source_graph_calls"] == 0
+
+    # 2. Genuine provider call (absent provenance -> live default) counts once.
+    live = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_source_graph_query",
+        {"mode": "focus", "query": "nf389 genuine"},
+    )
+    assert live.get("ok") is True
+    assert observed_ctxs[-1].provenance == ""
+
+    verification2 = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger,
+        key,
+        task_id="GLM_BRIDGE_PREFETCH_TEST",
+        runner="glm52_bridge_test",
+        topic="bridge_test",
+        request_id=request_id,
+    )
+    assert verification2["provenance_counts"] == {"prefetch": 1, "live": 1}
+    assert verification2["live_source_graph_calls"] == 1
+    assert verification2["fresh_source_graph_calls"] == 1

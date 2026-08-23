@@ -3461,6 +3461,8 @@ def _rework_entry(**overrides: object) -> dict:
         "authority_source": "rework_overlay",
         "authority_state": "request_scoped_predecessor",
         "authority_repo": "/test/repo",
+        "provider_call_id": "pci_rework_overlay_1",
+        "provenance": "live",
     }
     return {**defaults, **overrides}
 

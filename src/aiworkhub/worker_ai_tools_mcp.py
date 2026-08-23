@@ -127,6 +127,8 @@ ENV_AUDIT_LEDGER_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_LEDGER_PATH"
 ENV_AUDIT_HMAC_KEY_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_HMAC_KEY_PATH"
 ENV_QUALITY_REVIEW_PACKET_PATH = "AIWORKHUB_WORKER_MCP_QUALITY_REVIEW_PACKET_PATH"
 ENV_REWORK_OVERLAY_PATH = "AIWORKHUB_REWORK_OVERLAY_PATH"
+ENV_PROVIDER_CALL_ID = "AIWORKHUB_WORKER_MCP_PROVIDER_CALL_ID"
+ENV_PROVENANCE = "AIWORKHUB_WORKER_MCP_PROVENANCE"
 # The interpreter's own import-path variable (never an AIWORKHUB_* identity
 # binding) -- carries the portable ".../src" import root so `python -m
 # aiworkhub.worker_ai_tools_mcp` resolves regardless of the launcher's cwd.
@@ -136,7 +138,64 @@ BOUND_ENV_VARS: tuple[str, ...] = (
     ENV_TASK_ID, ENV_RUNNER, ENV_TOPIC, ENV_REQUEST_ID, ENV_REPO, ENV_AUTHORITY_REPO,
     ENV_SOURCE_GRAPH_TARGETS, ENV_ALLOWED_WRITES, ENV_SESSION_TOPIC,
     ENV_AUDIT_LEDGER_PATH, ENV_AUDIT_HMAC_KEY_PATH,
+    ENV_PROVIDER_CALL_ID, ENV_PROVENANCE,
 )
+
+# Bounded identity: a provider_call_id must be a short, printable, non-empty
+# string with no control/space characters. This mirrors route_identity.py's
+# ``_MAX_PROVIDER_LEN = 32`` so native and text paths share one bound.
+MAX_PROVIDER_CALL_ID_LEN = 32
+PROVENANCE_VALUES: frozenset[str] = frozenset({"prefetch", "live", "cache"})
+
+# ``\Z`` (not ``$``) and ``fullmatch`` together reject any trailing newline or
+# whitespace so a spoofed identity like ``pci_ok\n`` can never reach the ledger.
+_UID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,%d}\Z" % (MAX_PROVIDER_CALL_ID_LEN - 1))
+
+
+def validate_provider_call_id(value: object) -> str:
+    """Return a bounded, authenticated-shaped ``provider_call_id`` or fail closed.
+
+    Accepts an existing provider identifier (``codex``/``claude``/``copilot``
+    call ids, ``pci_...`` synthesized ids) as long as it is bounded and
+    printable. Only a genuine ``str`` is accepted; scalar values (``int``,
+    ``bool``, ``float``) fail closed so a spoofed numeric identity can never be
+    coerced into the ledger. Rejects empty, oversized, malformed or
+    whitespace-bearing values with a named error.
+    """
+
+    if value is None:
+        raise WorkerToolError("worker_mcp_provider_call_id_missing")
+    if type(value) is not str:
+        raise WorkerToolError("worker_mcp_provider_call_id_malformed")
+    text = value
+    if not text:
+        raise WorkerToolError("worker_mcp_provider_call_id_empty")
+    if len(text) > MAX_PROVIDER_CALL_ID_LEN:
+        raise WorkerToolError("worker_mcp_provider_call_id_oversized")
+    if not _UID_RE.fullmatch(text):
+        raise WorkerToolError("worker_mcp_provider_call_id_malformed")
+    return text
+
+
+def validate_provenance(value: object) -> str:
+    """Return a bounded provenance label or fail closed.
+
+    Only ``prefetch`` (injected/predictive observations), ``live`` (a genuine
+    provider call) and ``cache`` (a replayed result) are accepted; empty or
+    spoofed provenance is rejected with a named error. Provenance is auditable
+    but never satisfies the live Source Graph gate by itself. Only a genuine
+    ``str`` is accepted — scalar values (``int``, ``bool``, ``float``) and any
+    object with a custom ``__str__`` fail closed so a spoofed value can never
+    be coerced into the ledger, mirroring ``validate_provider_call_id``.
+    """
+
+    if value is None:
+        raise WorkerToolError("worker_mcp_provenance_missing")
+    if type(value) is not str:
+        raise WorkerToolError("worker_mcp_provenance_invalid")
+    if value not in PROVENANCE_VALUES:
+        raise WorkerToolError("worker_mcp_provenance_invalid")
+    return value
 
 STORAGE_REGISTRY_RELATIVE_PATH = Path(".aiworkhub") / "config" / "storage.json"
 
@@ -260,6 +319,8 @@ class WorkerToolContext:
     allowed_writes: tuple[str, ...] = ()
     rework_overlay_packet: dict[str, Any] | None = None
     rework_overlay_packet_path: Path | None = None
+    provider_call_id: str = ""
+    provenance: str = ""
 
 
 def load_context_from_env(env: Any = None) -> WorkerToolContext:
@@ -325,6 +386,16 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
             str(source[ENV_RUNNER]),
             authority_repo,
         )
+    # NF389/r6: only an ABSENT key retains the backward-compatible empty
+    # sentinel. A PRESENT key -- even an explicit empty string -- must route
+    # through the fail-closed validators so an empty/spoofed identity can never
+    # be silently coerced into the audit context.
+    provider_call_id = ""
+    if ENV_PROVIDER_CALL_ID in source:
+        provider_call_id = validate_provider_call_id(source.get(ENV_PROVIDER_CALL_ID))
+    provenance = ""
+    if ENV_PROVENANCE in source:
+        provenance = validate_provenance(source.get(ENV_PROVENANCE))
     return WorkerToolContext(
         task_id=str(source[ENV_TASK_ID]),
         runner=str(source[ENV_RUNNER]),
@@ -342,6 +413,8 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
         ),
         rework_overlay_packet=rework_packet,
         rework_overlay_packet_path=(overlay_path if rework_overlay_raw else None),
+        provider_call_id=provider_call_id,
+        provenance=provenance,
     )
 
 
@@ -1554,6 +1627,8 @@ def _append_audit(
     authority_state: str = "",
     authority_repo: Path | None = None,
     payload: Mapping[str, Any] | None = None,
+    provider_call_id: str = "",
+    provenance: str = "",
 ) -> bool:
     if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
         return False
@@ -1561,6 +1636,20 @@ def _append_audit(
         key = ctx.audit_hmac_key_path.read_bytes()
     except OSError:
         return False
+    effective_provider_call_id = provider_call_id or ctx.provider_call_id
+    effective_provenance = provenance or ctx.provenance
+    if effective_provider_call_id:
+        try:
+            effective_provider_call_id = validate_provider_call_id(
+                effective_provider_call_id
+            )
+        except WorkerToolError:
+            return False
+    if effective_provenance:
+        try:
+            effective_provenance = validate_provenance(effective_provenance)
+        except WorkerToolError:
+            return False
     entry = {
         "schema_id": AUDIT_ENTRY_SCHEMA_ID,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1578,6 +1667,14 @@ def _append_audit(
         "authority_state": authority_state[:64],
         "authority_repo": str(authority_repo or ctx.authority_repo),
     }
+    # NF389/r6: an unbound (empty) identity stays ABSENT from the authenticated
+    # ledger. The verifier's absent-vs-empty distinction then treats a missing
+    # key as the backward-compatible empty sentinel while a PRESENT-but-empty
+    # (or otherwise invalid) value is a hard, fail-closed identity violation.
+    if effective_provider_call_id:
+        entry["provider_call_id"] = effective_provider_call_id[:MAX_PROVIDER_CALL_ID_LEN]
+    if effective_provenance:
+        entry["provenance"] = effective_provenance
     if payload is not None:
         encoded_payload = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
@@ -1617,6 +1714,7 @@ def verify_audit_ledger(
         "entries_total": 0,
         "entries_verified": 0,
         "entries_tampered": 0,
+        "entries_invalid_identity": 0,
         "call_count_by_tool": {},
         "successful_call_count_by_tool": {},
         "bounded_bytes_returned": 0,
@@ -1661,6 +1759,9 @@ def verify_audit_ledger(
         "authority_index_identity": [],
         "verified_payloads": [],
         "semantic_edit_apply_receipts": [],
+        "provider_call_ids": [],
+        "provenance_counts": {},
+        "provider_call_id_by_tool": {},
         "reason": "",
     }
     try:
@@ -1679,6 +1780,7 @@ def verify_audit_ledger(
     bounded_bytes_by_tool: dict[str, int] = {}
     cache_hits_by_tool: dict[str, int] = {}
     authority_seen: set[tuple[str, str, str, str]] = set()
+    invalid_identity_codes: list[str] = []
     source_graph_latencies: list[float] = []
     source_graph_call_times: list[float] = []
     for raw_line in lines:
@@ -1708,9 +1810,42 @@ def verify_audit_ledger(
             or (request_id is not None and str(entry.get("request_id")) != request_id)
         ):
             continue
+        # NF389/r6: an HMAC-valid entry is authenticated but not yet
+        # schema-valid. Re-run the exact bounded identity validators on the
+        # authenticated fields BEFORE any aggregation or gate counting. An
+        # ABSENT key is the backward-compatible empty sentinel; a PRESENT-but-
+        # invalid value (empty, oversized, malformed, control characters, or a
+        # provenance outside {prefetch, live, cache}) is an authenticated
+        # identity violation -- fail closed, never copied raw, never counted.
+        try:
+            provider_call_id = (
+                validate_provider_call_id(entry["provider_call_id"])
+                if "provider_call_id" in entry
+                else ""
+            )
+            provenance = (
+                validate_provenance(entry["provenance"])
+                if "provenance" in entry
+                else ""
+            )
+        except WorkerToolError as exc:
+            result["entries_invalid_identity"] += 1
+            if str(exc) not in invalid_identity_codes:
+                invalid_identity_codes.append(str(exc))
+            continue
         result["entries_verified"] += 1
         tool = str(entry.get("tool") or "unknown")
         call_count[tool] = call_count.get(tool, 0) + 1
+        if provider_call_id:
+            if len(result["provider_call_ids"]) < 128:
+                result["provider_call_ids"].append(provider_call_id)
+            by_tool = result["provider_call_id_by_tool"].setdefault(tool, [])
+            if len(by_tool) < 128:
+                by_tool.append(provider_call_id)
+        if provenance:
+            result["provenance_counts"][provenance] = int(
+                result["provenance_counts"].get(provenance) or 0
+            ) + 1
         payload = entry.get("payload")
         if tool == "source_graph":
             source_hits = max(0, int(entry.get("hit_count") or 0))
@@ -1892,6 +2027,7 @@ def verify_audit_ledger(
             and entry.get("ok")
             and not entry.get("violation")
             and not entry.get("cache_hit")
+            and provenance == "live"
             and authoritative_source_graph
         ):
             result["fresh_source_graph_calls"] += 1
@@ -1904,6 +2040,7 @@ def verify_audit_ledger(
             and entry.get("ok")
             and not entry.get("violation")
             and not entry.get("cache_hit")
+            and provenance == "live"
             and authoritative_source_graph
         ):
             result["live_source_graph_calls"] += 1
@@ -1959,7 +2096,14 @@ def verify_audit_ledger(
             "samples_seconds": gaps[:64],
             "samples_truncated": len(gaps) > 64,
         }
-    result["ok"] = True
+    if result["entries_invalid_identity"]:
+        result["ok"] = False
+        result["reason"] = (
+            "authenticated_ledger_identity_violation:"
+            + ",".join(invalid_identity_codes)
+        )
+    else:
+        result["ok"] = True
     result["receipt_conformance"] = receipt_conformance_report(result)
     result["tool_discipline"] = tool_discipline_report(result)
     return result
@@ -1999,10 +2143,15 @@ def receipt_conformance_report(verification: Mapping[str, Any]) -> dict[str, Any
         blockers.append("fresh_source_graph_revision_missing")
     if int(verification.get("entries_tampered") or 0):
         blockers.append("tampered_receipts_observed")
+    if int(verification.get("entries_invalid_identity") or 0):
+        blockers.append("invalid_authenticated_identity_observed")
 
     checks = {
         "authenticated_entries": int(verification.get("entries_verified") or 0),
         "tampered_entries": int(verification.get("entries_tampered") or 0),
+        "invalid_authenticated_identity_entries": int(
+            verification.get("entries_invalid_identity") or 0
+        ),
         "call_accounting_coherent": not any(
             item.startswith("successful_calls_exceed_calls:") for item in blockers
         ),
@@ -2818,6 +2967,7 @@ def source_graph_query(
             hit_count=cached["hit_count"], bytes_returned=returned_bytes,
             authority_source=cached["authority_source"], authority_state=cached["authority_state"],
             authority_repo=query_repo,
+            provenance="cache",
             payload={
                 "mode": mode,
                 "query_sha256": query_sha256,
@@ -3093,6 +3243,10 @@ def source_graph_query(
         authority_source=result["authority_source"],
         authority_state=result["authority_state"],
         authority_repo=query_repo,
+        # A fresh, authoritative, non-cache result is a live provider call by
+        # default, but a coordinator-side launch-time prefetch carries
+        # ctx.provenance == "prefetch" and must never be credited as live.
+        provenance=ctx.provenance or "live",
         payload={
             "mode": mode,
             "query_sha256": query_sha256,
@@ -4429,6 +4583,8 @@ def generate_worker_mcp_runtime(
     python_executable: str | None = None,
     quality_review_packet_path: Path | None = None,
     rework_overlay_path: Path | None = None,
+    provider_call_id: str | None = None,
+    provenance: str | None = None,
 ) -> WorkerMcpRuntime:
     """Provision this request's isolated MCP config, env and audit ledger.
 
@@ -4503,6 +4659,13 @@ def generate_worker_mcp_runtime(
         env[ENV_QUALITY_REVIEW_PACKET_PATH] = str(quality_review_packet_path)
     if rework_overlay_path is not None:
         env[ENV_REWORK_OVERLAY_PATH] = str(rework_overlay_path)
+    # NF389/r6: absent (None) identity stays unbound; a present value -- even an
+    # explicit empty string -- fails closed instead of silently dropping the
+    # binding.
+    if provider_call_id is not None:
+        env[ENV_PROVIDER_CALL_ID] = validate_provider_call_id(provider_call_id)
+    if provenance is not None:
+        env[ENV_PROVENANCE] = validate_provenance(provenance)
 
     module_file = Path(__file__).resolve()
     package_module = f"{module_file.parent.name}.{module_file.stem}"

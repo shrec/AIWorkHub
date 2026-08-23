@@ -335,3 +335,30 @@ def test_gate_result_never_leaks_paths(tmp_path, monkeypatch):
     blob = json.dumps(gate, default=str)
     assert str(stdout) not in blob
     assert str(tmp_path) not in blob
+
+
+def test_prefetch_and_cache_provenance_never_satisfy_live_gate(tmp_path, monkeypatch):
+    # A ledger full of auditable prefetch/cache observations (zero genuine live
+    # calls) must still fail the gate: provenance is auditable, never
+    # authoritative. One genuine provider call counts exactly once.
+    def fake_verify(*_a, **_k):
+        return {
+            "ok": True,
+            "reason": "",
+            "live_source_graph_calls": 0,
+            "fresh_source_graph_calls": 0,
+            "provenance_counts": {"prefetch": 5, "cache": 3},
+            "successful_call_count_by_tool": {"source_graph": 8},
+            "policy_violations": 0,
+        }
+
+    monkeypatch.setattr(pl.worker_ai_tools_mcp, "verify_audit_ledger", fake_verify)
+    bundle = _sha()
+    stdout = _write_receipt(tmp_path, bundle, section_count=1)
+    sections = _sections(("source_graph", True, 3, ""))
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req",
+    )
+    assert gate["satisfied"] is False
+    assert gate["missing_tools"] == ["source_graph_live_call"]
+    assert gate["satisfaction_by_tool"]["source_graph"] == "injected_only_not_sufficient"

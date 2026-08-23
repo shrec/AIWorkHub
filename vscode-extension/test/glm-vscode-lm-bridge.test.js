@@ -743,6 +743,9 @@ async function textProtocolChecks() {
   assert.strictEqual(prefetchedResult, finalResponse);
   assert.strictEqual(prefetchedCalls.length, 1);
   assert.strictEqual(prefetchedCalls[0].name, "aiworkhub_manager_source_graph_query");
+  // NF389/r6: the launch-time fallback prefetch tags itself provenance="prefetch"
+  // so the worker bridge binds it as auditable-but-never-live.
+  assert.strictEqual(prefetchedCalls[0].input.provenance, "prefetch");
   assert.ok(String(prefetchedOptions[0].messages[0].content).includes("INITIAL_SOURCE_GRAPH_RESULT"));
   assert.ok(String(prefetchedOptions[0].messages[0].content).includes('"action":"create"'));
   assert.ok(String(prefetchedOptions[0].messages[0].content).includes("e3b0c44298fc1c149"));
@@ -4082,6 +4085,196 @@ async function progressReceiptChecks() {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+
+  // NF389: deterministic bounded provider-call id synthesis for the text and
+  // native bridge paths. Same (request, turn, canonical messages) → same id;
+  // different turn or input → different id; always bounded and printable.
+  const canonicalA = internals.canonicalizeVscodeLmMessages([
+    { role: "user", content: "hello" },
+  ]);
+  const canonicalB = internals.canonicalizeVscodeLmMessages([
+    { role: "user", content: "world" },
+  ]);
+  assert.strictEqual(canonicalA, canonicalA);
+  assert.notStrictEqual(canonicalA, canonicalB);
+  const pci1 = internals.synthesizeVscodeLmProviderCallId("req-1", 0, canonicalA);
+  const pci1Repeat = internals.synthesizeVscodeLmProviderCallId("req-1", 0, canonicalA);
+  const pci2 = internals.synthesizeVscodeLmProviderCallId("req-1", 1, canonicalA);
+  const pci3 = internals.synthesizeVscodeLmProviderCallId("req-2", 0, canonicalA);
+  assert.strictEqual(pci1, pci1Repeat);
+  assert.notStrictEqual(pci1, pci2);
+  assert.notStrictEqual(pci1, pci3);
+  for (const pci of [pci1, pci2, pci3]) {
+    assert.match(pci, /^pci_[a-z0-9]+$/);
+    assert.ok(pci.length <= 32, `provider_call_id must be bounded, got ${pci}`);
+    // NF389 rework: the 28 base36 characters after the `pci_` prefix carry
+    // ~144 bits of SHA-256-derived identity — at least the 128-bit floor.
+    assert.strictEqual(pci.length, 32, `provider_call_id must carry ≥128 bits, got ${pci}`);
+  }
+  // NF389 sealed correction: model identity and canonical options/tool context
+  // participate in the synthesized identity (aligned with the single-flight key).
+  const canonicalOptsA = internals.canonicalizeVscodeLmOptions({ justification: "a" });
+  const canonicalOptsB = internals.canonicalizeVscodeLmOptions({ justification: "b" });
+  const pciModelA = internals.synthesizeVscodeLmProviderCallId("req-1", 0, canonicalA, "model-a", canonicalOptsA);
+  const pciModelB = internals.synthesizeVscodeLmProviderCallId("req-1", 0, canonicalA, "model-b", canonicalOptsA);
+  const pciOptsB = internals.synthesizeVscodeLmProviderCallId("req-1", 0, canonicalA, "model-a", canonicalOptsB);
+  assert.notStrictEqual(pciModelA, pciModelB, "distinct model must yield a distinct id");
+  assert.notStrictEqual(pciModelA, pciOptsB, "distinct canonical options must yield a distinct id");
+  assert.strictEqual(
+    pciModelA,
+    internals.synthesizeVscodeLmProviderCallId("req-1", 0, canonicalA, "model-a", canonicalOptsA),
+    "same model/options must remain deterministic",
+  );
+
+  // NF389: atomic single-flight dedup — concurrent identical calls execute
+  // once, waiters replay, and state is removed on success and on failure.
+  internals.clearVscodeLmInFlightCalls();
+  let sendCount = 0;
+  let pendingResolve = null;
+  let pendingReject = null;
+  const fakeModel = {
+    id: "deepseek-v4-pro",
+    sendRequest: () => {
+      sendCount += 1;
+      return new Promise((resolve, reject) => {
+        pendingResolve = resolve;
+        pendingReject = reject;
+      });
+    },
+  };
+  const messages = [{ role: "user", content: "dedupe me" }];
+  const options = { justification: "test" };
+  const first = internals.dedupeVscodeLmSendRequest(fakeModel, messages, options, undefined, "req-dedupe", 0);
+  const second = internals.dedupeVscodeLmSendRequest(fakeModel, messages, options, undefined, "req-dedupe", 0);
+  assert.strictEqual(first.promise, second.promise, "concurrent identical calls must share one in-flight promise");
+  assert.strictEqual(sendCount, 1, "identical concurrent call must execute exactly once");
+  assert.strictEqual(internals.vscodeLmInFlightCallsSize(), 1);
+  // The single-flight entry preserves the deterministic bounded provider-call
+  // id it was synthesized from (request, turn, canonical messages).
+  const expectedPci = internals.synthesizeVscodeLmProviderCallId(
+    "req-dedupe", 0, internals.canonicalizeVscodeLmMessages(messages),
+    fakeModel.id, internals.canonicalizeVscodeLmOptions(options),
+  );
+  assert.strictEqual(first.providerCallId, expectedPci);
+  assert.strictEqual(second.providerCallId, expectedPci);
+  assert.match(first.providerCallId, /^pci_[a-z0-9]+$/);
+  assert.ok(first.providerCallId.length <= 32);
+  pendingResolve({ stream: [] });
+  await first.promise;
+  await second.promise;
+  assert.strictEqual(sendCount, 1);
+  assert.strictEqual(internals.vscodeLmInFlightCallsSize(), 0, "success must remove in-flight state");
+  // A fresh identical call after settle re-executes (failure retry path) and
+  // removes its own in-flight state on rejection.
+  const retry = internals.dedupeVscodeLmSendRequest(fakeModel, messages, options, undefined, "req-dedupe", 0);
+  assert.strictEqual(sendCount, 2, "failure must retry (re-execute after settle)");
+  assert.strictEqual(internals.vscodeLmInFlightCallsSize(), 1);
+  let retryRejected = false;
+  pendingReject(new Error("boom")); // reject the retry promise so it settles
+  await retry.promise.catch(() => { retryRejected = true; });
+  assert.strictEqual(retryRejected, true);
+  assert.strictEqual(internals.vscodeLmInFlightCallsSize(), 0, "failure must remove in-flight state");
+  internals.clearVscodeLmInFlightCalls();
+
+  // NF389 rework: cancellation releases the exact single-flight entry even when
+  // the provider ignores cancellation and the promise stays pending; an
+  // immediate identical retry must therefore execute a fresh request instead of
+  // replaying the stale pending entry.
+  internals.clearVscodeLmInFlightCalls();
+  let cancelSendCount = 0;
+  let cancelListeners = [];
+  const cancelToken = {
+    onCancellationRequested: (listener) => {
+      cancelListeners.push(listener);
+      return { dispose: () => { cancelListeners = cancelListeners.filter((l) => l !== listener); } };
+    },
+  };
+  const ignoringModel = {
+    id: "deepseek-v4-pro",
+    sendRequest: () => {
+      cancelSendCount += 1;
+      return new Promise(() => {}); // never settles: provider ignores cancellation
+    },
+  };
+  const pendingCall = internals.dedupeVscodeLmSendRequest(
+    ignoringModel, messages, options, cancelToken, "req-cancel", 0,
+  );
+  assert.strictEqual(cancelSendCount, 1);
+  assert.strictEqual(internals.vscodeLmInFlightCallsSize(), 1);
+  assert.strictEqual(cancelListeners.length, 1);
+  // Fire cancellation; the provider never settles, but the entry must release.
+  cancelListeners[0]();
+  assert.strictEqual(internals.vscodeLmInFlightCallsSize(), 0, "cancellation must release the pending entry");
+  // Immediate identical retry must execute a fresh provider call.
+  const retryAfterCancel = internals.dedupeVscodeLmSendRequest(
+    ignoringModel, messages, options, cancelToken, "req-cancel", 0,
+  );
+  assert.strictEqual(cancelSendCount, 2, "identical retry after cancellation must re-execute");
+  assert.notStrictEqual(retryAfterCancel.promise, pendingCall.promise);
+  assert.strictEqual(internals.vscodeLmInFlightCallsSize(), 1);
+  // Firing the stale first cancellation listener again must NOT delete the
+  // newer replacement entry (exact-entry release).
+  cancelListeners[0]();
+  assert.strictEqual(internals.vscodeLmInFlightCallsSize(), 1, "stale cancellation must not drop the replacement");
+  internals.clearVscodeLmInFlightCalls();
+
+  // NF389 sealed correction #3: single-flight equivalence includes canonical
+  // options/tool context and turn, so distinct calls never collapse.
+  let distinctSendCount = 0;
+  const distinctModel = {
+    id: "deepseek-v4-pro",
+    sendRequest: () => {
+      distinctSendCount += 1;
+      return Promise.resolve({ stream: [] });
+    },
+  };
+  const optionsA = { justification: "test", tools: [{ name: "t1", inputSchema: {} }], toolMode: 1 };
+  const optionsB = { justification: "test", tools: [{ name: "t2", inputSchema: {} }], toolMode: 1 };
+  const d1 = internals.dedupeVscodeLmSendRequest(distinctModel, messages, optionsA, undefined, "req-distinct", 0);
+  const d2 = internals.dedupeVscodeLmSendRequest(distinctModel, messages, optionsB, undefined, "req-distinct", 0);
+  assert.notStrictEqual(d1.promise, d2.promise, "different tool context must not collapse");
+  assert.strictEqual(distinctSendCount, 2);
+  const d3 = internals.dedupeVscodeLmSendRequest(distinctModel, messages, optionsA, undefined, "req-distinct", 1);
+  assert.notStrictEqual(d1.promise, d3.promise, "different turn must not collapse");
+  assert.strictEqual(distinctSendCount, 3);
+  await Promise.all([d1.promise, d2.promise, d3.promise]);
+  assert.strictEqual(internals.vscodeLmInFlightCallsSize(), 0);
+  internals.clearVscodeLmInFlightCalls();
+
+  // NF389 sealed correction #2: the synthesized provider-call id is consumed
+  // and forwarded through the native/text worker invocation into the
+  // authenticated audit identity (tool_input.provider_call_id), not left as an
+  // unused Promise property.
+  let forwardedToolInput = null;
+  let forwardedToolName = null;
+  internals.bindVscodeLmProviderBridgeForTest({
+    mcpClient: {
+      repositoryRoot: "/tmp/nf389-forward",
+      callTool: async (name, args) => {
+        forwardedToolName = name;
+        forwardedToolInput = args.tool_input;
+        return { ok: true };
+      },
+    },
+    activeRepoIdentity: { root: "/tmp/nf389-forward" },
+  });
+  const privateResult = await internals.invokeVscodeLmPrivateTool(
+    { name: "aiworkhub_worker_source_graph_query", input: { mode: "focus", query: "nf389" } },
+    "f".repeat(32),
+    expectedPci,
+  );
+  assert.deepStrictEqual(privateResult, { ok: true });
+  assert.strictEqual(forwardedToolName, "aiworkhub_vscode_lm_worker_tool");
+  assert.strictEqual(forwardedToolInput.provider_call_id, expectedPci);
+  assert.strictEqual(forwardedToolInput.mode, "focus");
+  // A call without a synthesized id (older transport) must not fabricate one.
+  forwardedToolInput = null;
+  await internals.invokeVscodeLmPrivateTool(
+    { name: "aiworkhub_worker_source_graph_query", input: { mode: "focus", query: "nf389-legacy" } },
+    "f".repeat(32),
+  );
+  assert.strictEqual(forwardedToolInput.provider_call_id, undefined);
+  internals.resetVscodeLmWorkerSourceGraphReadinessForTest();
 }
 
 main().then(() => {

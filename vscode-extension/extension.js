@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.10.46";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.10.47";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -3354,7 +3354,7 @@ function validateProviderHistory(messages) {
   return unmatched;
 }
 
-async function invokeVscodeLmPrivateTool(call, requestId = "") {
+async function invokeVscodeLmPrivateTool(call, requestId = "", providerCallId = "") {
   const toolName = String(call && call.name || "");
   const permitted = VSCODE_LM_PRIVATE_TOOLS.find((tool) => tool.name === toolName);
   if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(call.name || "")}`);
@@ -3368,10 +3368,15 @@ async function invokeVscodeLmPrivateTool(call, requestId = "") {
   const normalizedName = toolName.startsWith(VSCODE_LM_WORKER_PREFIX) && toolName !== "aiworkhub_worker_quality_review_submit"
     ? VSCODE_LM_MANAGER_PREFIX + toolName.slice(VSCODE_LM_WORKER_PREFIX.length)
     : toolName;
+  const toolInput = { ...(call.input || {}) };
+  // NF389: forward the deterministic bounded provider-call id into the
+  // authenticated worker audit identity. It is consumed from the synthesized
+  // single-flight entry, not left as an unused Promise property.
+  if (providerCallId) toolInput.provider_call_id = providerCallId;
   return mcpClient.callTool("aiworkhub_vscode_lm_worker_tool", {
     request_id: requestId,
     tool_name: normalizedName,
-    tool_input: call.input || {},
+    tool_input: toolInput,
   }, VSCODE_LM_WORKER_TOOL_TIMEOUT_MS);
 }
 
@@ -3904,7 +3909,7 @@ async function awaitVscodeLmWorkerSourceGraphReadinessOnce() {
   throw new Error("vscode_lm_mcp_unavailable");
 }
 
-async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdits) {
+async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdits, providerCallId = "") {
   const toolName = String(call && call.name || "").trim();
   if (toolName === VSCODE_LM_STAGE_EDIT_TOOL) {
     return stagedEdits.stage(call.input);
@@ -3915,7 +3920,7 @@ async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdi
   if (toolName === VSCODE_LM_WORKER_SOURCE_GRAPH_TOOL) {
     await awaitVscodeLmWorkerSourceGraphReadinessOnce();
   }
-  return invokeTool({ ...call, name: toolName }, requestId);
+  return invokeTool({ ...call, name: toolName }, requestId, providerCallId);
 }
 
 function vscodeLmProtocolToolTransport(toolName) {
@@ -4203,6 +4208,103 @@ function throwIfVscodeLmCancelled(cancellationToken) {
   }
 }
 
+// NF389: atomic single-flight dedup + deterministic bounded provider-call id.
+// Concurrent identical sendRequest calls (same requestId + model + canonical
+// messages) execute exactly once; waiters replay the same Promise. State is
+// removed on settle (success, failure or cancellation) so failures retry.
+const vscodeLmInFlightCalls = new Map();
+
+function canonicalizeVscodeLmMessages(messages) {
+  return JSON.stringify(
+    (Array.isArray(messages) ? messages : []).map((message) => {
+      if (!message || typeof message !== "object") return { role: "unknown" };
+      return { role: message.role, content: message.content };
+    }),
+  );
+}
+
+function synthesizeVscodeLmProviderCallId(requestId, turn, canonicalMessages, modelKey, canonicalOptions) {
+  // NF389 sealed correction: the synthesized identity is aligned with the
+  // single-flight key — model identity and canonical options/tool context
+  // participate, so a different model or tool set cannot collapse into the
+  // same provider-call id.
+  const raw = [
+    String(requestId || ""),
+    String(turn),
+    String(canonicalMessages || ""),
+    String(modelKey || ""),
+    String(canonicalOptions || ""),
+  ].join("\n");
+  // NF389 rework: SHA-256 replaces the 32-bit FNV-1a so the synthesized id is
+  // collision-resistant. 28 base36 characters carry ~144 bits of the digest
+  // (above the 128-bit floor) and stay within the 32-character Python bound.
+  const digest = crypto.createHash("sha256").update(raw, "utf8").digest("hex");
+  const base36 = BigInt(`0x${digest}`).toString(36).padStart(28, "0");
+  return `pci_${base36.slice(0, 28)}`;
+}
+
+function canonicalizeVscodeLmOptions(options) {
+  if (!options || typeof options !== "object") return "";
+  const normalized = {};
+  for (const key of Object.keys(options).sort()) {
+    const value = options[key];
+    if (key === "tools" && Array.isArray(value)) {
+      normalized[key] = value.map((tool) => ({
+        name: String((tool && tool.name) || ""),
+        inputSchema: (tool && typeof tool === "object") ? (tool.inputSchema || {}) : {},
+      })).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    } else {
+      normalized[key] = value;
+    }
+  }
+  try {
+    return JSON.stringify(normalized);
+  } catch (_err) {
+    return "";
+  }
+}
+
+function dedupeVscodeLmSendRequest(model, messages, options, cancellationToken, requestId, turn) {
+  const modelKey = (model && (model.id || model.family || model.name)) || "model";
+  const canonical = canonicalizeVscodeLmMessages(messages);
+  // NF389 sealed correction: single-flight equivalence includes the canonical
+  // options/tool context and the turn so distinct calls (different tool set,
+  // different toolMode, different turn) can never collapse into one in-flight
+  // request.
+  const canonicalOptions = canonicalizeVscodeLmOptions(options);
+  const key = `${String(requestId || "")}\u0000${modelKey}\u0000${String(turn)}\u0000${canonicalOptions}\u0000${canonical}`;
+  const existing = vscodeLmInFlightCalls.get(key);
+  if (existing) return existing;
+  const providerCallId = synthesizeVscodeLmProviderCallId(requestId, turn, canonical, modelKey, canonicalOptions);
+  const promise = model.sendRequest(messages, options, cancellationToken);
+  // The provider-call id is returned alongside the promise so callers consume
+  // it and forward it into the authenticated worker audit identity; it is not
+  // left dangling as an unused Promise property.
+  const entry = { promise, providerCallId, key };
+  vscodeLmInFlightCalls.set(key, entry);
+  const release = () => {
+    // Delete only THIS entry; a newer identical call must never be dropped.
+    if (vscodeLmInFlightCalls.get(key) === entry) {
+      vscodeLmInFlightCalls.delete(key);
+    }
+  };
+  // NF389 rework: cancellation must release the exact single-flight entry even
+  // when the provider ignores it and the promise stays pending — otherwise an
+  // identical retry would reuse a stale entry forever.
+  let cancelDisposable = null;
+  if (cancellationToken && typeof cancellationToken.onCancellationRequested === "function") {
+    cancelDisposable = cancellationToken.onCancellationRequested(release);
+  }
+  const settle = () => {
+    if (cancelDisposable && typeof cancelDisposable.dispose === "function") {
+      cancelDisposable.dispose();
+    }
+    release();
+  };
+  promise.then(settle, settle);
+  return entry;
+}
+
 async function runVscodeLmTextProtocol(
   model,
   request,
@@ -4227,9 +4329,13 @@ async function runVscodeLmTextProtocol(
       try {
         assertRequestActive();
         const prefetchToolName = expectedSgTool;
+        // NF389/r6: the launch-time fallback prefetch is an injected
+        // coordinator-side observation. Tag it provenance="prefetch" so the
+        // worker bridge binds it as auditable-but-never-live instead of
+        // defaulting the Source Graph call to provenance="live".
         initialSourceGraphResult = await raceVscodeLmCancellation(invokeTool({
           name: prefetchToolName,
-          input: request.initial_source_graph_request,
+          input: { ...request.initial_source_graph_request, provenance: "prefetch" },
         }, request.requestId), cancellationToken);
         assertRequestActive();
       } catch (cause) {
@@ -4342,9 +4448,18 @@ async function runVscodeLmTextProtocol(
       );
     }
     assertRequestActive();
-    const response = await raceVscodeLmCancellation(model.sendRequest(messages, {
-      justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
-    }, cancellationToken), cancellationToken);
+    const sendRequest = dedupeVscodeLmSendRequest(
+      model,
+      messages,
+      {
+        justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
+      },
+      cancellationToken,
+      request.requestId,
+      turn,
+    );
+    const turnProviderCallId = sendRequest.providerCallId || "";
+    const response = await raceVscodeLmCancellation(sendRequest.promise, cancellationToken);
     assertRequestActive();
     let text;
     try {
@@ -4547,6 +4662,7 @@ async function runVscodeLmTextProtocol(
           request.requestId,
           invokeTool,
           stagedEdits,
+          turnProviderCallId,
         ),
         cancellationToken,
       );
@@ -4715,9 +4831,11 @@ async function runVscodeLmAgent(
       );
     }
     assertRequestActive();
-    const response = await raceVscodeLmCancellation(
-      model.sendRequest(messages, options, cancellationToken), cancellationToken,
+    const sendRequest = dedupeVscodeLmSendRequest(
+      model, messages, options, cancellationToken, request.requestId, turn,
     );
+    const turnProviderCallId = sendRequest.providerCallId || "";
+    const response = await raceVscodeLmCancellation(sendRequest.promise, cancellationToken);
     assertRequestActive();
     const assistantParts = [];
     const textParts = [];
@@ -4903,7 +5021,7 @@ async function runVscodeLmAgent(
       try {
         assertRequestActive();
         result = await raceVscodeLmCancellation(
-          invokeVscodeLmProtocolTool(call, request.requestId, invokeTool, stagedEdits), cancellationToken,
+          invokeVscodeLmProtocolTool(call, request.requestId, invokeTool, stagedEdits, turnProviderCallId), cancellationToken,
         );
         assertRequestActive();
       } catch (err) {
@@ -9739,6 +9857,12 @@ module.exports = {
     filterOutToolCallParts,
     isLanguageModelToolCallPart,
     validateProviderHistory,
+    canonicalizeVscodeLmMessages,
+    canonicalizeVscodeLmOptions,
+    synthesizeVscodeLmProviderCallId,
+    dedupeVscodeLmSendRequest,
+    vscodeLmInFlightCallsSize: () => vscodeLmInFlightCalls.size,
+    clearVscodeLmInFlightCalls: () => vscodeLmInFlightCalls.clear(),
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
       MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS,

@@ -153,3 +153,25 @@ def test_stdout_window_merge_dedupes_overlap_but_joins_disjoint() -> None:
     assert qe._merge_stdout_windows("abc", "abc") == "abc"
     assert qe._merge_stdout_windows("hello wor", "o world") == "hello world"
     assert qe._merge_stdout_windows("aaa", "bbb") == "aaa\nbbb"
+
+
+def test_server_and_process_manager_share_one_fail_closed_provider_identity() -> None:
+    """NF389: Server and ProcessManager accept the exact same bounded,
+    authenticated provider_call_id + provenance validators as the worker
+    ledger. Empty/oversized/malformed/spoofed values fail closed with named
+    errors at both surfaces instead of reaching any audit row."""
+    from aiworkhub import server  # deferred: server imports the MCP SDK lazily
+
+    for surface in (pl, server):
+        assert surface.validate_provider_call_id is pl.worker_ai_tools_mcp.validate_provider_call_id
+        assert surface.validate_provenance is pl.worker_ai_tools_mcp.validate_provenance
+        assert surface.validate_provider_call_id("pci_ok_1") == "pci_ok_1"
+        assert surface.validate_provenance("live") == "live"
+        for bad in (None, "", "x" * 33, "has space", "bad$char", "pci_ok_1\n", "pci_ok_1 "):
+            with pytest.raises(pl.WorkerToolError) as exc:
+                surface.validate_provider_call_id(bad)
+            assert "worker_mcp_provider_call_id" in str(exc.value)
+        for bad in (None, "", "spoofed", 123, True, 3.14, ["live"], {"p": "live"}):
+            with pytest.raises(pl.WorkerToolError) as exc:
+                surface.validate_provenance(bad)
+            assert "worker_mcp_provenance" in str(exc.value)

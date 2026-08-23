@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.47 — 2026-08-23
+
+### Fixed
+
+- Provider tool-call receipts now carry authenticated call identity and live
+  provenance end to end.
+- Concurrent duplicate calls are accounted for once without conflating live,
+  prefetched or cached evidence.
+- Malformed authenticated identity rows fail closed before they can satisfy a
+  required-tool gate.
+
 ## 0.10.46 — 2026-08-23
 
 ### Added
