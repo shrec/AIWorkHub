@@ -1811,8 +1811,9 @@ def test_promotion_is_scope_checked_parent_guarded_and_restart_idempotent(
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    worker_workspace.nested_sandbox_requires_host_boundary(),
-    reason="Authenticated outer validation Landlock cannot execute nested sandbox workers",
+    os.environ.get("GITHUB_ACTIONS") == "true"
+    or worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="The current host boundary cannot execute nested Landlock workers",
 )
 def test_landlock_fallback_allows_declared_output_and_denies_parent_and_git_metadata(
     monkeypatch: pytest.MonkeyPatch,
@@ -1873,8 +1874,9 @@ print('landlock-denied-parent-git-and-metadata')
     reason="Root-file replacement requires Landlock truncate support",
 )
 @pytest.mark.skipif(
-    worker_workspace.nested_sandbox_requires_host_boundary(),
-    reason="Authenticated outer validation Landlock cannot execute nested sandbox workers",
+    os.environ.get("GITHUB_ACTIONS") == "true"
+    or worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="The current host boundary cannot execute nested Landlock workers",
 )
 def test_landlock_root_file_allows_in_place_save_but_denies_sibling_temp(
     monkeypatch: pytest.MonkeyPatch,
@@ -2558,8 +2560,9 @@ def test_validation_pythonpath_resolution_is_beneath_worktree(
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    worker_workspace.nested_sandbox_requires_host_boundary(),
-    reason="Authenticated outer validation Landlock cannot execute nested sandbox validations",
+    os.environ.get("GITHUB_ACTIONS") == "true"
+    or worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="The current host boundary cannot execute nested Landlock validations",
 )
 def test_validation_pythonpath_override_is_scoped_to_one_subprocess(
     monkeypatch: pytest.MonkeyPatch,
@@ -2778,8 +2781,9 @@ def test_validation_cd_prefix_sets_bubblewrap_chdir_beneath_workspace(
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    worker_workspace.nested_sandbox_requires_host_boundary(),
-    reason="Authenticated outer validation Landlock cannot execute nested sandbox validations",
+    os.environ.get("GITHUB_ACTIONS") == "true"
+    or worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="The current host boundary cannot execute nested Landlock validations",
 )
 def test_validation_cd_prefix_changes_child_cwd_under_landlock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
@@ -2997,8 +3001,9 @@ def test_repo_relative_executable_passes_through_unrelated_and_rejects_untrusted
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    worker_workspace.nested_sandbox_requires_host_boundary(),
-    reason="Authenticated outer validation Landlock cannot execute nested sandbox validations",
+    os.environ.get("GITHUB_ACTIONS") == "true"
+    or worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="The current host boundary cannot execute nested Landlock validations",
 )
 def test_run_validations_declared_vs_executed_relative_venv_receipt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
