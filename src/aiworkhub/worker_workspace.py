@@ -6581,6 +6581,12 @@ def run_validations(
             env["TMPDIR"] = scratch_env_value
             env["TMP"] = scratch_env_value
             env["TEMP"] = scratch_env_value
+            # Nested validation helpers must provision beneath this same exact
+            # request-owned scratch root.  Without the explicit authority,
+            # candidate tests that create temporary Git repositories fall back
+            # to a sibling repo temp path that the outer Landlock/seccomp broker
+            # cannot authorize, producing false config.lock/chmod failures.
+            env[VALIDATION_EXEC_SCRATCH_ROOT_ENV] = scratch_env_value
             # Ruff writes its cache below the current working tree by default.
             # Validation worktrees are intentionally read-only, so that
             # default turns a clean lint result into a false permission

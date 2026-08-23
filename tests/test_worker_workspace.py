@@ -4584,3 +4584,91 @@ def test_run_validations_world_writable_venv_python_fails_closed(
             _run_interpreter_validation(workspace, ".venv/bin/python -c pass")
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Landlock validation sandbox")
+@pytest.mark.skipif(
+    worker_workspace.landlock_abi_version() < 1,
+    reason="Landlock is not supported by this kernel",
+)
+def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonical(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "fake_repo"
+    repo.mkdir()
+    secret = repo / "canonical-secret.txt"
+    secret.write_text("keep\n", encoding="utf-8")
+    base = tmp_path / "worktrees" / "nf395-nested-git"
+    path = base / "worktree"
+    home = base / "home"
+    path.mkdir(parents=True)
+    home.mkdir(parents=True, mode=0o700)
+    (home / "tmp").mkdir(mode=0o700)
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="nf395-nested-git",
+        repo=repo,
+        path=path,
+        home=home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    (path / "helper.py").write_text(
+        "import os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "root = Path(os.environ['TMPDIR']) / 'pytest-tmp' / 'nested-git'\n"
+        "root.mkdir(parents=True)\n"
+        "def git(*args):\n"
+        "    return subprocess.run(\n"
+        "        ['git', *args], cwd=root, text=True,\n"
+        "        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,\n"
+        "    )\n"
+        "init = git('init', '-b', 'main')\n"
+        "if init.returncode != 0:\n"
+        "    sys.stderr.write(init.stderr)\n"
+        "    sys.exit(20)\n"
+        "(root / 'src').mkdir()\n"
+        "(root / 'src' / 'tracked.txt').write_text('ok\\n', encoding='utf-8')\n"
+        "git('config', 'user.email', 'nf395@example.invalid')\n"
+        "git('config', 'user.name', 'NF395')\n"
+        "if git('add', 'src/tracked.txt').returncode != 0:\n"
+        "    sys.exit(21)\n"
+        "if git('commit', '-m', 'init').returncode != 0:\n"
+        "    sys.exit(22)\n"
+        "sparse = git('sparse-checkout', 'init', '--cone')\n"
+        "if sparse.returncode != 0:\n"
+        "    sys.stderr.write(sparse.stderr)\n"
+        "    sys.exit(23)\n"
+        "if git('sparse-checkout', 'set', 'src').returncode != 0:\n"
+        "    sys.exit(24)\n"
+        "linked = root.parent / 'linked-worktree'\n"
+        "wt = git('worktree', 'add', '--detach', str(linked), 'HEAD')\n"
+        "if wt.returncode != 0:\n"
+        "    sys.stderr.write(wt.stderr)\n"
+        "    sys.exit(27)\n"
+        "denied = Path(sys.argv[1])\n"
+        "try:\n"
+        "    denied.write_text('mutated\\n', encoding='utf-8')\n"
+        "    sys.exit(25)\n"
+        "except PermissionError:\n"
+        "    pass\n"
+        "try:\n"
+        "    os.chmod(denied, 0o600)\n"
+        "    sys.exit(26)\n"
+        "except PermissionError:\n"
+        "    pass\n"
+        "print('nested-git-sparse-ok')\n"
+        "print('scratch=' + os.environ['TMPDIR'])\n",
+        encoding="utf-8",
+    )
+    try:
+        result, = worker_workspace.run_validations(
+            workspace,
+            [f"python3 helper.py {secret}"],
+            backend="landlock",
+        )
+        assert result["returncode"] == 0, result["stderr_tail"]
+        assert "nested-git-sparse-ok" in result["stdout_tail"]
+        assert secret.read_text(encoding="utf-8") == "keep\n"
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)

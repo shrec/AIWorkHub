@@ -483,8 +483,6 @@ def supervise(spec: dict[str, Any]) -> int:
     supervisor_pid = os.getpid()
     supervisor_pid_start_ticks = _pid_start_ticks(supervisor_pid)
     started_epoch = time.time()
-    deadline_epoch = started_epoch + timeout
-    deadline_monotonic = time.monotonic() + timeout
     cancel_requested = False
     child: subprocess.Popen[bytes] | None = None
     windows_job: _WindowsKillOnCloseJob | None = None
@@ -502,8 +500,9 @@ def supervise(spec: dict[str, Any]) -> int:
         "supervisor_pid": supervisor_pid,
         "supervisor_pid_start_ticks": supervisor_pid_start_ticks,
         "started_at_epoch": started_epoch,
-        "deadline_epoch": deadline_epoch,
+        "deadline_epoch": None,
         "timeout_seconds": timeout,
+        "timeout_enforced": False,
     })
 
     try:
@@ -540,7 +539,9 @@ def supervise(spec: dict[str, Any]) -> int:
                 "error": f"{type(exc).__name__}:{exc}"[:500],
                 "started_at_epoch": started_epoch,
                 "finished_at_epoch": time.time(),
+                "deadline_epoch": None,
                 "timeout_seconds": timeout,
+                "timeout_enforced": False,
             })
             return 126
 
@@ -573,8 +574,9 @@ def supervise(spec: dict[str, Any]) -> int:
             "child_pid": child.pid,
             "child_pid_start_ticks": child_start_ticks,
             "started_at_epoch": started_epoch,
-            "deadline_epoch": deadline_epoch,
+            "deadline_epoch": None,
             "timeout_seconds": timeout,
+            "timeout_enforced": False,
             "heartbeat_seq": heartbeat_seq,
             "heartbeat_at_epoch": time.time(),
             "stdout_bytes": last_stdout_bytes,
@@ -594,10 +596,6 @@ def supervise(spec: dict[str, Any]) -> int:
                 break
             if cancel_requested or cancel_path.exists():
                 final_state = "cancelled"
-                returncode = _terminate_child(child)
-                break
-            if time.monotonic() >= deadline_monotonic:
-                final_state = "timed_out"
                 returncode = _terminate_child(child)
                 break
             now_monotonic = time.monotonic()
@@ -659,8 +657,9 @@ def supervise(spec: dict[str, Any]) -> int:
                     "child_pid": child.pid,
                     "child_pid_start_ticks": child_start_ticks,
                     "started_at_epoch": started_epoch,
-                    "deadline_epoch": deadline_epoch,
+                    "deadline_epoch": None,
                     "timeout_seconds": timeout,
+                    "timeout_enforced": False,
                     "heartbeat_seq": heartbeat_seq,
                     "heartbeat_at_epoch": time.time(),
                     "stdout_bytes": last_stdout_bytes,
@@ -754,7 +753,9 @@ def supervise(spec: dict[str, Any]) -> int:
             "exit_code": returncode,
             "started_at_epoch": started_epoch,
             "finished_at_epoch": time.time(),
+            "deadline_epoch": None,
             "timeout_seconds": timeout,
+            "timeout_enforced": False,
             "heartbeat_seq": heartbeat_seq,
             "heartbeat_at_epoch": time.time(),
             "stdout_bytes": final_stdout_bytes,
@@ -826,7 +827,9 @@ def supervise(spec: dict[str, Any]) -> int:
                 "error": f"{type(exc).__name__}:{exc}"[:500],
                 "started_at_epoch": started_epoch,
                 "finished_at_epoch": time.time(),
+                "deadline_epoch": None,
                 "timeout_seconds": timeout,
+                "timeout_enforced": False,
             })
         except Exception:
             # Status artifact itself is unwritable (e.g. a nested read-only

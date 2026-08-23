@@ -1544,3 +1544,365 @@ def test_recover_blocked_rework_ordinary_recovery_regression(tmp_path):
     assert card.get("claim_epoch") == 2
     assert card.get("recovered_by") == "coordinator"
     assert "validation_only_replay_authorization" not in card
+
+
+def _persist_required_outputs(root, task_id, outputs):
+    card = task_store.get_task(root, task_id)
+    assert card is not None
+    card["required_outputs"] = list(outputs)
+    _readiness, db_path = task_store._require_ready(root)
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (
+                json.dumps(
+                    task_store.persistable_card_payload(card),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                task_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return task_store.get_task(root, task_id)
+
+
+def _consume_event_count(root, task_id):
+    return sum(
+        event["event"] == "blocked_rework_validation_replay_authorization_consumed"
+        for event in task_store.get_task_events(root, task_id)
+    )
+
+
+def _probe_process_manager_launch_lane(root, task_id, tmp_path, monkeypatch):
+    selected = []
+
+    def _preflight(self, probed_task_id, runner, topic, adapter_id):
+        assert probed_task_id == task_id
+        current = task_store.get_task(root, probed_task_id)
+        assert current is not None
+        return task_store.persistable_card_payload(current)
+
+    def _replay(self, **kwargs):
+        selected.append("validation_only_replay")
+        return {
+            "ok": True,
+            "execution_mode": "validation_only_replay",
+            "provider_launched": False,
+        }
+
+    def _provider_dirs(card, adapter_id):
+        selected.append("provider")
+        raise process_launcher.LaunchRejected("provider_lane_selected")
+
+    monkeypatch.setattr(process_launcher, "launch_gates_open", lambda: True)
+    monkeypatch.setattr(
+        process_launcher, "_validate_adapter_identity", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_enforce_quality_review_launch_binding",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        process_launcher.ProcessManager, "_preflight_card", _preflight
+    )
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_launch_validation_only_replay",
+        _replay,
+    )
+    monkeypatch.setattr(
+        process_launcher, "_external_readonly_dirs", _provider_dirs
+    )
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "record_launch_blocker",
+        lambda *a, **k: {"ok": True},
+    )
+    manager = process_launcher.ProcessManager(
+        repo=Path(root),
+        isolation_enabled=False,
+        process_dir=tmp_path / "nf393-process",
+        process_log_path=tmp_path / "nf393-process.log",
+        collision_guard=lambda **kwargs: {"returncode": 0},
+    )
+    result = manager._launch_isolated(
+        task_id=task_id,
+        runner="codex_coding",
+        topic="nf50",
+        adapter_id="codex_cli",
+        model=None,
+        owner_prompt="",
+        timeout_seconds=30,
+    )
+    return selected, result
+
+
+def test_pending_ordinary_recovery_consumes_stale_validation_only_replay_authorization(
+    tmp_path,
+):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    request_id = "a" * 32
+    path_hash = "d" * 64
+    task_id = _make_blocked_rework_task_with_terminal_review(
+        root,
+        task_id="nf393-ordinary-consume-token",
+        request_id=request_id,
+        changed_path_hashes={"src/example.py": path_hash},
+    )
+    actor = core.CODEX_RUNNER
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=actor,
+        feedback_reason="replay validation",
+        validation_only_replay=True,
+    )
+    assert (ok, state) == (True, "recovered")
+    first = task_store.get_task(root, task_id)
+    assert first is not None
+    first_auth = first["validation_only_replay_authorization"]
+    claim_epoch = first["claim_epoch"]
+    assert claim_epoch == first_auth["next_claim_epoch"] == 2
+
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=actor,
+        feedback_reason="switch to ordinary rework",
+        validation_only_replay=False,
+        clean_root_if_predecessor_missing=False,
+    )
+    assert (ok, state) == (
+        True,
+        "consumed_stale_validation_only_replay_authorization",
+    )
+    consumed = task_store.get_task(root, task_id)
+    assert consumed is not None
+    assert "validation_only_replay_authorization" not in consumed
+    assert consumed["claim_epoch"] == claim_epoch
+    assert _consume_event_count(root, task_id) == 1
+    consume_events = [
+        event
+        for event in task_store.get_task_events(root, task_id)
+        if event["event"]
+        == "blocked_rework_validation_replay_authorization_consumed"
+    ]
+    payload = json.loads(consume_events[0]["payload"])
+    assert payload["claim_epoch"] == claim_epoch
+    assert payload["consumed_authorization"]["next_claim_epoch"] == 2
+    assert payload["consumed_authorization"]["predecessor_request_id"] == request_id
+
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=actor,
+        feedback_reason="switch to ordinary rework",
+        validation_only_replay=False,
+    )
+    assert (ok, state) == (True, "already_recovered")
+    assert "validation_only_replay_authorization" not in task_store.get_task(
+        root, task_id
+    )
+    assert _consume_event_count(root, task_id) == 1
+
+
+def test_pending_ordinary_recovery_absent_authorization_already_recovered(tmp_path):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    task_id = _make_blocked_rework_task_with_terminal_review(
+        root, task_id="nf393-absent-authorization"
+    )
+    ok, state = task_store.recover_blocked_rework(
+        root, task_id, actor="coordinator", feedback_reason="ordinary recover"
+    )
+    assert (ok, state) == (True, "recovered")
+    assert "validation_only_replay_authorization" not in task_store.get_task(
+        root, task_id
+    )
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor="coordinator",
+        feedback_reason="ordinary recover",
+        validation_only_replay=False,
+        clean_root_if_predecessor_missing=False,
+    )
+    assert (ok, state) == (True, "already_recovered")
+    assert _consume_event_count(root, task_id) == 0
+
+
+def test_ordinary_consume_selects_process_manager_provider_launch_lane(
+    tmp_path, monkeypatch
+):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    request_id = "a" * 32
+    path_hash = "d" * 64
+    task_id = _make_blocked_rework_task_with_terminal_review(
+        root,
+        task_id="nf393-process-manager-lane",
+        request_id=request_id,
+        changed_path_hashes={"src/example.py": path_hash},
+    )
+    actor = core.CODEX_RUNNER
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=actor,
+        feedback_reason="replay validation",
+        validation_only_replay=True,
+    )
+    assert (ok, state) == (True, "recovered")
+    _persist_required_outputs(root, task_id, ["src/example.py"])
+    before, replay_result = _probe_process_manager_launch_lane(
+        root, task_id, tmp_path, monkeypatch
+    )
+    assert before == ["validation_only_replay"]
+    assert replay_result["execution_mode"] == "validation_only_replay"
+    assert replay_result["provider_launched"] is False
+
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=actor,
+        feedback_reason="switch to ordinary rework",
+        validation_only_replay=False,
+        clean_root_if_predecessor_missing=False,
+    )
+    assert (ok, state) == (
+        True,
+        "consumed_stale_validation_only_replay_authorization",
+    )
+    after, provider_result = _probe_process_manager_launch_lane(
+        root, task_id, tmp_path, monkeypatch
+    )
+    assert after == ["provider"]
+    assert provider_result["ok"] is False
+    assert "provider_lane_selected" in str(provider_result.get("blocked_reason") or "")
+    assert process_launcher._validation_only_replay_authorization(
+        task_store.get_task(root, task_id), task_id
+    ) is None
+
+
+def test_second_block_ordinary_recovery_fences_claim_epoch_and_launch(
+    tmp_path, monkeypatch
+):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    request_id = "a" * 32
+    path_hash = "d" * 64
+    task_id = _make_blocked_rework_task_with_terminal_review(
+        root,
+        task_id="nf393-second-block-ordinary",
+        request_id=request_id,
+        changed_path_hashes={"src/example.py": path_hash},
+    )
+    actor = core.CODEX_RUNNER
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=actor,
+        feedback_reason="replay validation",
+        validation_only_replay=True,
+    )
+    assert (ok, state) == (True, "recovered")
+    first = _persist_required_outputs(root, task_id, ["src/example.py"])
+    first_auth = dict(first["validation_only_replay_authorization"])
+    assert first_auth["next_claim_epoch"] == 2
+    first_lane, _ = _probe_process_manager_launch_lane(
+        root, task_id, tmp_path, monkeypatch
+    )
+    assert first_lane == ["validation_only_replay"]
+
+    _readiness, db_path = task_store._require_ready(root)
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET status='blocked', worker_status='blocked' "
+            "WHERE task_id=?",
+            (task_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=actor,
+        feedback_reason="second block",
+        validation_only_replay=True,
+    )
+    assert (ok, state) == (True, "recovered")
+    second = _persist_required_outputs(root, task_id, ["src/example.py"])
+    assert second["claim_epoch"] == 3
+    assert second["validation_only_replay_authorization"]["next_claim_epoch"] == 3
+    assert second["claim_epoch"] != first_auth["next_claim_epoch"]
+
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=actor,
+        feedback_reason="ordinary after second block",
+        validation_only_replay=False,
+        clean_root_if_predecessor_missing=False,
+    )
+    assert (ok, state) == (
+        True,
+        "consumed_stale_validation_only_replay_authorization",
+    )
+    consumed = task_store.get_task(root, task_id)
+    assert consumed is not None
+    assert "validation_only_replay_authorization" not in consumed
+    assert consumed["claim_epoch"] == 3
+    assert _consume_event_count(root, task_id) == 1
+    after, _ = _probe_process_manager_launch_lane(
+        root, task_id, tmp_path, monkeypatch
+    )
+    assert after == ["provider"]
+
+    copied = task_store.persistable_card_payload(consumed)
+    copied["validation_only_replay_authorization"] = first_auth
+    with pytest.raises(process_launcher.LaunchRejected) as excinfo:
+        process_launcher._validation_only_replay_authorization(copied, task_id)
+    assert "claim_epoch_mismatch" in str(excinfo.value)
+
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=actor,
+        feedback_reason="rebind current episode",
+        validation_only_replay=True,
+    )
+    assert (ok, state) == (True, "recovered_validation_only_replay")
+    rebound = task_store.get_task(root, task_id)
+    auth = rebound["validation_only_replay_authorization"]
+    assert auth["predecessor_request_id"] == request_id
+    assert auth["changed_path_hashes"] == {"src/example.py": path_hash}
+    assert auth["next_claim_epoch"] == rebound["claim_epoch"] == 3
+    assert auth["next_claim_epoch"] != first_auth["next_claim_epoch"]
+
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor=actor,
+        feedback_reason="clean root unchanged",
+        clean_root_if_predecessor_missing=True,
+    )
+    assert ok is False
+    assert state in {
+        "clean_root_rework_predecessor_invalid",
+        "clean_root_rework_workspace_invalid",
+        "clean_root_rework_identity_mismatch",
+        "clean_root_rework_workspace_still_available",
+    }
+    after_clean_root = task_store.get_task(root, task_id)
+    assert after_clean_root is not None
+    assert after_clean_root["claim_epoch"] == 3
+    assert _consume_event_count(root, task_id) == 1

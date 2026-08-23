@@ -569,3 +569,43 @@ def test_concurrent_provisioning_produces_distinct_named_directories(
     finally:
         for path in results.values():
             worker_workspace.cleanup_validation_exec_scratch(path)
+
+
+def test_metadata_probe_requires_successful_chmod(tmp_path: Path) -> None:
+    assert worker_workspace._probe_metadata_capable_dir(tmp_path) is True
+
+
+def test_run_validations_pins_request_local_scratch_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo, workspace = _manual_workspace(tmp_path, "nf395-pin-scratch")
+    scratch_dir = tmp_path / f"{worker_workspace._EXEC_SCRATCH_NAME_PREFIX}nf395-pin-scratch"
+    scratch_dir.mkdir()
+    captured: dict[str, str] = {}
+
+    def _capture_run(argv, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "landlock")
+    monkeypatch.setattr(
+        worker_workspace, "provision_validation_exec_scratch", lambda _ws: scratch_dir
+    )
+    monkeypatch.setattr(worker_workspace, "cleanup_validation_exec_scratch", lambda _p: None)
+    monkeypatch.setattr(
+        worker_workspace,
+        "sandbox_argv",
+        lambda _workspace, _adapter, argv, **_kwargs: list(argv),
+    )
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _capture_run)
+    _write_helper_script(workspace, "print('ok')\n")
+    try:
+        worker_workspace.run_validations(workspace, ["python3 helper.py"])
+        scratch = captured["TMPDIR"]
+        assert scratch == str(scratch_dir)
+        assert captured["TMP"] == scratch
+        assert captured["TEMP"] == scratch
+        assert captured[worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV] == scratch
+        assert worker_workspace._EXEC_SCRATCH_NAME_PREFIX in Path(scratch).name
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)

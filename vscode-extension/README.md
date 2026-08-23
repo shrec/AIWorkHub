@@ -12,6 +12,15 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.48
+
+- Live provider work is no longer terminated by an elapsed legacy timeout;
+  terminal evidence, exact exit, explicit cancellation and enforceable budgets
+  remain the lifecycle authorities.
+- Nested validation Git operations use request-owned scratch without gaining
+  write access to the canonical repository.
+- Ordinary rework no longer falls back into a stale validation-only replay.
+
 ## What's new in 0.10.47
 
 - Provider tool calls now retain authenticated call identity and explicit

@@ -2670,7 +2670,51 @@ def recover_blocked_rework(
                     conn.commit()
                     return True, "recovered_validation_only_replay"
                 if not clean_root_if_predecessor_missing:
-                    return True, "already_recovered"
+                    stale_authorization = card.get(
+                        "validation_only_replay_authorization"
+                    )
+                    if not isinstance(stale_authorization, dict):
+                        return True, "already_recovered"
+                    now = datetime.now(timezone.utc).isoformat()
+                    card.pop("validation_only_replay_authorization", None)
+                    card.pop("operational_blocker", None)
+                    cur = conn.execute(
+                        "UPDATE tasks SET updated_at=?, card_json=? "
+                        "WHERE task_id=? AND status='pending'",
+                        (
+                            now,
+                            json.dumps(
+                                card, ensure_ascii=False, sort_keys=True
+                            ),
+                            task_id,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        conn.rollback()
+                        return False, "ordinary_rework_authorization_consume_conflict"
+                    conn.execute(
+                        "INSERT INTO task_events(task_id, event, runner, "
+                        "payload_json, created_at) VALUES "
+                        "(?, 'blocked_rework_validation_replay_authorization_consumed', "
+                        "?, ?, ?)",
+                        (
+                            task_id,
+                            actor[:120],
+                            json.dumps(
+                                {
+                                    "actor": actor[:120],
+                                    "claim_epoch": card.get("claim_epoch"),
+                                    "consumed_authorization": stale_authorization,
+                                    "recorded_at": now,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            now,
+                        ),
+                    )
+                    conn.commit()
+                    return True, "consumed_stale_validation_only_replay_authorization"
                 allowed, reason, clean_root_evidence = missing_predecessor_authority()
                 if not allowed:
                     return False, reason

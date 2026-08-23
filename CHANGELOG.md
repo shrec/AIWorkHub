@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.48] - 2026-08-23
+
+### Fixed
+
+- Worker supervision no longer treats an elapsed legacy timeout as provider
+  death; live workers continue until an authenticated terminal result, exact
+  process exit, explicit cancellation or an enforceable token-budget event.
+- Nested validation helpers now inherit the exact request-owned scratch root,
+  preventing false Landlock denials for temporary Git repositories while
+  canonical repository writes remain forbidden.
+- Switching a pending rework from validation-only replay to an ordinary worker
+  consumes the stale one-episode replay authorization atomically instead of
+  routing the next launch back into the completed replay lane.
+
 ## [0.10.47] - 2026-08-23
 
 ### Fixed

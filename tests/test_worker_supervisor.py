@@ -60,6 +60,37 @@ def _read_status(path: Path) -> dict:
             time.sleep(0.01)
 
 
+class _FakeClock:
+    def __init__(self) -> None:
+        self.epoch = 1_700_000_000.0
+        self.mono = 1_000.0
+
+    def time(self) -> float:
+        return self.epoch
+
+    def monotonic(self) -> float:
+        return self.mono
+
+    def sleep(self, seconds: float) -> None:
+        delta = float(seconds)
+        self.epoch += delta
+        self.mono += delta
+
+
+def _assert_timeout_not_enforced(status: dict, timeout_seconds: int) -> None:
+    assert status["deadline_epoch"] is None
+    assert status["timeout_enforced"] is False
+    assert status["timeout_seconds"] == timeout_seconds
+
+
+def _install_fake_clock(
+    monkeypatch: pytest.MonkeyPatch, clock: _FakeClock
+) -> None:
+    monkeypatch.setattr(worker_supervisor.time, "time", clock.time)
+    monkeypatch.setattr(worker_supervisor.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(worker_supervisor.time, "sleep", clock.sleep)
+
+
 def test_supervisor_success_persists_status_and_private_logs(tmp_path: Path) -> None:
     spec_path, spec = _spec(
         tmp_path,
@@ -71,6 +102,7 @@ def test_supervisor_success_persists_status_and_private_logs(tmp_path: Path) -> 
     status = _read_status(Path(spec["status_path"]))
     assert status["state"] == "exited"
     assert status["exit_code"] == 0
+    _assert_timeout_not_enforced(status, 10)
     assert status["token_budget"]["telemetry_authority"] == "telemetry_unavailable"
     assert status["token_budget"]["telemetry_observed"] is False
     assert status["token_budget"]["telemetry_reason"] == "no_provider_usage_report_observed"
@@ -88,6 +120,7 @@ def test_supervisor_spawn_failure_is_never_reported_as_success(tmp_path: Path) -
     status = _read_status(Path(spec["status_path"]))
     assert status["state"] == "spawn_failed"
     assert status["exit_code"] == 126
+    _assert_timeout_not_enforced(status, 10)
     assert "FileNotFoundError" in status["error"]
 
 
@@ -356,19 +389,66 @@ def test_supervisor_bounds_verbose_output_and_keeps_tail(tmp_path: Path) -> None
     assert status["stdout_dropped_bytes"] > 0
 
 
-def test_supervisor_timeout_kills_child_and_persists_timeout(tmp_path: Path) -> None:
-    spec_path, spec = _spec(
+def test_fake_clock_past_legacy_timeout_does_not_kill_live_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _FakeClock()
+    _install_fake_clock(monkeypatch, clock)
+    timeout_seconds = 2
+    _, spec = _spec(
         tmp_path,
         [sys.executable, "-c", "import time; time.sleep(30)"],
-        timeout=1,
+        timeout=timeout_seconds,
     )
-    started = time.monotonic()
-    result = _run_supervisor(spec_path)
-    assert result.returncode == 124
-    assert time.monotonic() - started < 5
-    status = _read_status(Path(spec["status_path"]))
-    assert status["state"] == "timed_out"
-    assert status["exit_code"] != 0
+    spec["heartbeat_interval_seconds"] = 0.05
+    started_mono = clock.mono
+    payloads: list[dict] = []
+    terminate_calls = {"n": 0}
+    saw_running_past_timeout = False
+    original_write = worker_supervisor._write_json_0600
+    original_terminate = worker_supervisor._terminate_child
+
+    def capturing_write(path: Path, payload: dict) -> None:
+        payloads.append(dict(payload))
+        original_write(path, payload)
+
+    def wrapped_terminate(child):
+        terminate_calls["n"] += 1
+        return original_terminate(child)
+
+    def fake_sleep(seconds: float) -> None:
+        nonlocal saw_running_past_timeout
+        clock.sleep(seconds)
+        status_path = Path(spec["status_path"])
+        if not status_path.is_file() or saw_running_past_timeout:
+            return
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        if status.get("state") != "running":
+            return
+        if clock.mono - started_mono <= timeout_seconds:
+            return
+        _assert_timeout_not_enforced(status, timeout_seconds)
+        os.kill(int(status["child_pid"]), 0)
+        saw_running_past_timeout = True
+        write_json_0600(Path(spec["cancel_path"]), {"reason": "after-fake-timeout"})
+
+    monkeypatch.setattr(worker_supervisor.time, "sleep", fake_sleep)
+    monkeypatch.setattr(worker_supervisor, "_write_json_0600", capturing_write)
+    monkeypatch.setattr(worker_supervisor, "_terminate_child", wrapped_terminate)
+
+    code = worker_supervisor.supervise(spec)
+
+    assert saw_running_past_timeout
+    assert clock.mono - started_mono > timeout_seconds
+    assert code == 125
+    assert terminate_calls["n"] == 1
+    states = [payload["state"] for payload in payloads]
+    assert "starting" in states
+    assert "running" in states
+    assert states[-1] == "cancelled"
+    assert "timed_out" not in states
+    for payload in payloads:
+        _assert_timeout_not_enforced(payload, timeout_seconds)
 
 
 def test_supervisor_enforces_provider_reported_live_token_cap(tmp_path: Path) -> None:
@@ -390,6 +470,7 @@ def test_supervisor_enforces_provider_reported_live_token_cap(tmp_path: Path) ->
     assert result.returncode == 122, result.stderr.decode()
     status = _read_status(Path(spec["status_path"]))
     assert status["state"] == "token_budget_exceeded"
+    _assert_timeout_not_enforced(status, 10)
     assert status["token_budget"]["cap_tokens"] == 10
     assert status["token_budget"]["enforceable_live_tokens"] == 13
     assert status["token_budget"]["events"][-1]["cap_enforceable"] is True
@@ -429,6 +510,7 @@ def test_supervisor_sums_claude_completed_turn_usage_for_live_cap(
     assert result.returncode == 122, result.stderr.decode()
     status = _read_status(Path(spec["status_path"]))
     assert status["state"] == "token_budget_exceeded"
+    _assert_timeout_not_enforced(status, 10)
     assert status["token_budget"]["enforceable_live_tokens"] == 112
     assert status["token_budget"]["events"][-1]["cap_enforceable"] is True
 
@@ -436,13 +518,7 @@ def test_supervisor_sums_claude_completed_turn_usage_for_live_cap(
 def test_supervisor_does_not_terminate_on_output_bytes(
     tmp_path: Path,
 ) -> None:
-    # Byte-count telemetry must not stop the child. This fixture deliberately
-    # sleeps after emitting more than the threshold, so timeout is the sole
-    # authoritative terminal reason.
-    script = (
-        "import sys,time; "
-        "sys.stdout.write('x' * 4096); sys.stdout.flush(); time.sleep(30)"
-    )
+    script = "import sys; sys.stdout.write('x' * 4096); sys.stdout.flush()"
     spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
     spec.update(
         max_total_output_bytes=2048,
@@ -453,10 +529,11 @@ def test_supervisor_does_not_terminate_on_output_bytes(
 
     result = _run_supervisor(spec_path)
 
-    assert result.returncode == 124, result.stderr.decode()
+    assert result.returncode == 0, result.stderr.decode()
     status = _read_status(Path(spec["status_path"]))
-    assert status["state"] == "timed_out"
+    assert status["state"] == "exited"
     assert status["state"] != "output_budget_exceeded"
+    _assert_timeout_not_enforced(status, 1)
     assert status["output_budget"]["cap_bytes"] == 2048
     assert status["output_budget"]["observed_bytes"] >= 4096
     assert status["output_budget"]["byte_labels_are_token_truth"] is False
@@ -478,6 +555,7 @@ def test_terminal_only_usage_is_posthoc_and_never_claimed_enforced(tmp_path: Pat
     assert result.returncode == 0, result.stderr.decode()
     status = _read_status(Path(spec["status_path"]))
     assert status["state"] == "exited"
+    _assert_timeout_not_enforced(status, 10)
     assert status["token_budget"]["accepted_total_tokens"] == 13
     assert status["token_budget"]["enforceable_live_tokens"] == 0
     assert status["token_budget"]["events"][-1]["cap_enforceable"] is False
@@ -510,6 +588,7 @@ def test_cancel_marker_and_signal_survive_manager_restart_boundary(tmp_path: Pat
                 break
         time.sleep(0.02)
     assert status.get("state") == "running"
+    _assert_timeout_not_enforced(status, 10)
     child_pid = int(status["child_pid"])
 
     cancel_path = Path(spec["cancel_path"])
@@ -519,6 +598,7 @@ def test_cancel_marker_and_signal_survive_manager_restart_boundary(tmp_path: Pat
     assert process.wait(timeout=5) == 125
     final = _read_status(status_path)
     assert final["state"] == "cancelled"
+    _assert_timeout_not_enforced(final, 10)
     assert final["child_pid"] == child_pid
     assert os.name == "nt" or stat.S_IMODE(status_path.stat().st_mode) == 0o600
     assert not cancel_path.exists()
@@ -663,3 +743,118 @@ def test_supervisor_survives_deeply_nested_stdout_line(tmp_path: Path) -> None:
     status = _read_status(Path(spec["status_path"]))
     assert status["state"] == "exited"
     assert status["exit_code"] == 0
+    _assert_timeout_not_enforced(status, 10)
+
+
+def test_fake_clock_explicit_cancel_is_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _FakeClock()
+    _install_fake_clock(monkeypatch, clock)
+    _, spec = _spec(
+        tmp_path,
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        timeout=30,
+    )
+    spec["heartbeat_interval_seconds"] = 0.05
+    terminate_calls = {"n": 0}
+    original_terminate = worker_supervisor._terminate_child
+
+    def wrapped_terminate(child):
+        terminate_calls["n"] += 1
+        return original_terminate(child)
+
+    def fake_sleep(seconds: float) -> None:
+        clock.sleep(seconds)
+        cancel_path = Path(spec["cancel_path"])
+        if not cancel_path.exists():
+            write_json_0600(cancel_path, {"reason": "explicit-cancel"})
+
+    monkeypatch.setattr(worker_supervisor.time, "sleep", fake_sleep)
+    monkeypatch.setattr(worker_supervisor, "_terminate_child", wrapped_terminate)
+
+    code = worker_supervisor.supervise(spec)
+
+    assert code == 125
+    assert terminate_calls["n"] == 1
+    status = json.loads(Path(spec["status_path"]).read_text(encoding="utf-8"))
+    assert status["state"] == "cancelled"
+    _assert_timeout_not_enforced(status, 30)
+
+
+def test_fake_clock_exact_child_exit_is_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _FakeClock()
+    _install_fake_clock(monkeypatch, clock)
+    timeout_seconds = 2
+    marker = tmp_path / "exit.marker"
+    script = (
+        "import pathlib\n"
+        f"marker=pathlib.Path({str(marker)!r})\n"
+        "while not marker.exists():\n"
+        "    pass\n"
+    )
+    _, spec = _spec(tmp_path, [sys.executable, "-c", script], timeout=timeout_seconds)
+    spec["heartbeat_interval_seconds"] = 0.05
+    started_mono = clock.mono
+    terminate_calls = {"n": 0}
+    original_terminate = worker_supervisor._terminate_child
+
+    def wrapped_terminate(child):
+        terminate_calls["n"] += 1
+        return original_terminate(child)
+
+    def fake_sleep(seconds: float) -> None:
+        clock.sleep(seconds)
+        if clock.mono - started_mono > timeout_seconds and not marker.exists():
+            marker.write_text("exit", encoding="utf-8")
+
+    monkeypatch.setattr(worker_supervisor.time, "sleep", fake_sleep)
+    monkeypatch.setattr(worker_supervisor, "_terminate_child", wrapped_terminate)
+
+    code = worker_supervisor.supervise(spec)
+
+    assert clock.mono - started_mono > timeout_seconds
+    assert code == 0
+    assert terminate_calls["n"] == 0
+    status = json.loads(Path(spec["status_path"]).read_text(encoding="utf-8"))
+    assert status["state"] == "exited"
+    assert status["exit_code"] == 0
+    _assert_timeout_not_enforced(status, timeout_seconds)
+
+
+def test_fake_clock_token_budget_termination_is_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _FakeClock()
+    _install_fake_clock(monkeypatch, clock)
+    timeout_seconds = 2
+    script = (
+        "import json,time; "
+        "print(json.dumps({'usage': {'input_tokens': 9, 'output_tokens': 4}}), flush=True); "
+        "time.sleep(30)"
+    )
+    _, spec = _spec(tmp_path, [sys.executable, "-c", script], timeout=timeout_seconds)
+    spec.update(
+        adapter_id="vscode_lm",
+        token_budget={"cap_tokens": 10},
+        heartbeat_interval_seconds=0.05,
+    )
+    terminate_calls = {"n": 0}
+    original_terminate = worker_supervisor._terminate_child
+
+    def wrapped_terminate(child):
+        terminate_calls["n"] += 1
+        return original_terminate(child)
+
+    monkeypatch.setattr(worker_supervisor, "_terminate_child", wrapped_terminate)
+
+    code = worker_supervisor.supervise(spec)
+
+    assert code == 122
+    assert terminate_calls["n"] == 1
+    status = json.loads(Path(spec["status_path"]).read_text(encoding="utf-8"))
+    assert status["state"] == "token_budget_exceeded"
+    _assert_timeout_not_enforced(status, timeout_seconds)
+    assert status["token_budget"]["events"][-1]["cap_enforceable"] is True

@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.48 — 2026-08-23
+
+### Fixed
+
+- Live workers are no longer killed merely because a legacy wall-clock timeout
+  elapsed; explicit cancellation and authenticated terminal outcomes remain
+  authoritative.
+- Request-local validation scratch is propagated to nested Git helpers without
+  weakening canonical repository write isolation.
+- Ordinary rework launches atomically discard stale validation-replay authority
+  and select the intended provider lane.
+
 ## 0.10.47 — 2026-08-23
 
 ### Fixed
