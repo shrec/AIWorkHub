@@ -6,11 +6,13 @@ import pytest
 
 from aiworkhub import server
 from aiworkhub.task_templates import (
+    PROVENANCE_SCHEMA_ID,
     REGISTRY_VERSION,
     SCHEMA_ID,
     TEMPLATE_IDS,
     TaskTemplateError,
     expand_template,
+    template_provenance_payload,
     template_full_id,
 )
 
@@ -67,6 +69,7 @@ def test_task_create_schema_remains_unchanged():
         "work_kind",
         "validation_roles",
         "risk_tier",
+        "custom_template_escape",
     ]
 
 
@@ -126,12 +129,9 @@ def test_create_from_template_bugfix_forwards_generated_fields(monkeypatch):
     assert captured["priority"] == "high"
     assert captured["risk_tier"] == "high"
     assert result["ok"] is True
-    assert result["template_provenance"] == {
-        "schema_id": SCHEMA_ID,
-        "template_full_id": template_full_id("bugfix_with_regression"),
-        "registry_version": REGISTRY_VERSION,
-        "definition_digest": template_full_id("bugfix_with_regression").split(":", 1)[1],
-    }
+    assert result["template_provenance"] == template_provenance_payload(
+        card, classification_reason="explicit_template"
+    )
 
 
 def test_create_from_template_read_only_analysis(monkeypatch):
@@ -159,7 +159,7 @@ def test_create_from_template_read_only_analysis(monkeypatch):
     assert captured["validation_roles"] == []
     assert captured["work_kind"] == "generic"
     assert captured["read_first"] == ["src/a.py"]
-    assert result["template_provenance"]["schema_id"] == SCHEMA_ID
+    assert result["template_provenance"]["schema_id"] == PROVENANCE_SCHEMA_ID
 
 
 def test_create_from_template_rejects_malformed_and_unsafe_before_create(monkeypatch):
@@ -184,16 +184,22 @@ def test_create_from_template_rejects_malformed_and_unsafe_before_create(monkeyp
         "production_paths": ["src/a.py"],
         "test_paths": ["tests/test_a.py"],
     }
-    with pytest.raises(TaskTemplateError, match="template_id_malformed"):
-        server.aiworkhub_task_create_from_template(
-            template_id="bugfix_with_regression@v1", **kwargs
-        )
-    with pytest.raises(TaskTemplateError, match="template_digest_mismatch"):
-        server.aiworkhub_task_create_from_template(template_id=forged, **kwargs)
-    with pytest.raises(TaskTemplateError, match="template_version_stale"):
-        server.aiworkhub_task_create_from_template(template_id=stale, **kwargs)
-    with pytest.raises(TaskTemplateError, match="invalid_production_path"):
-        server.aiworkhub_task_create_from_template(
+    malformed = server.aiworkhub_task_create_from_template(
+        template_id="bugfix_with_regression@v1", **kwargs
+    )
+    assert malformed["ok"] is False
+    assert malformed["stderr"] == "template_id_malformed"
+    digest_mismatch = server.aiworkhub_task_create_from_template(
+        template_id=forged, **kwargs
+    )
+    assert digest_mismatch["ok"] is False
+    assert digest_mismatch["stderr"] == "template_digest_mismatch"
+    stale_result = server.aiworkhub_task_create_from_template(
+        template_id=stale, **kwargs
+    )
+    assert stale_result["ok"] is False
+    assert stale_result["stderr"] == "template_version_stale"
+    unsafe = server.aiworkhub_task_create_from_template(
             template_id="bugfix_with_regression",
             task_id="TASK_TEMPLATE_REJECT",
             title="Should fail",
@@ -203,7 +209,9 @@ def test_create_from_template_rejects_malformed_and_unsafe_before_create(monkeyp
             acceptance=["No card."],
             production_paths=["../escape.py"],
             test_paths=["tests/test_a.py"],
-        )
+    )
+    assert unsafe["ok"] is False
+    assert unsafe["stderr"].startswith("invalid_production_path")
     assert calls == []
 
 
@@ -274,6 +282,10 @@ _TEMPLATE_PATHS = {
     "validation_replay": {
         "production_paths": ["src/a.py"],
         "test_paths": ["tests/test_a.py"],
+    },
+    "cross_boundary_bugfix": {
+        "production_paths": ["src/a.py", "src/a.js"],
+        "test_paths": ["tests/test_a.py", "tests/a.test.js"],
     },
 }
 
@@ -352,20 +364,20 @@ def test_create_from_template_rejects_leading_hyphen_paths_before_create(
         "objective": "Must not persist.",
         "acceptance": ["No card."],
     }
-    with pytest.raises(
-        TaskTemplateError, match="invalid_production_path_leading_hyphen"
-    ):
-        server.aiworkhub_task_create_from_template(
+    production = server.aiworkhub_task_create_from_template(
             template_id="bugfix_with_regression",
             production_paths=[path],
             test_paths=["tests/test_a.py"],
             **kwargs,
-        )
-    with pytest.raises(TaskTemplateError, match="invalid_test_path_leading_hyphen"):
-        server.aiworkhub_task_create_from_template(
+    )
+    assert production["ok"] is False
+    assert production["stderr"] == "invalid_production_path_leading_hyphen"
+    test_path = server.aiworkhub_task_create_from_template(
             template_id="bugfix_with_regression",
             production_paths=["src/a.py"],
             test_paths=[path],
             **kwargs,
-        )
+    )
+    assert test_path["ok"] is False
+    assert test_path["stderr"] == "invalid_test_path_leading_hyphen"
     assert calls == []

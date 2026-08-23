@@ -56,6 +56,7 @@ def _create(coord, **overrides):
         required_outputs=["src/aiworkhub/foo.py"],
         validation=["pytest -q tests/test_foo.py"],
         callback_required=False,
+        custom_template_escape="audited_custom_unclassified",
     )
     kwargs.update(overrides)
     return core.create_task(**kwargs)

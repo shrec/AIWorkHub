@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import aiworkhub.task_templates as task_templates_module
 
 from aiworkhub.quality_evidence import normalize_behavioral_contract
 from aiworkhub.task_templates import (
@@ -792,9 +793,7 @@ def test_classify_poisoned_live_template_does_not_reseal_stored_digest(monkeypat
         expanded["validation_roles"] = [*expanded["validation_roles"], "poisoned"]
         return expanded
 
-    monkeypatch.setattr(
-        "aiworkhub.task_templates.expand_template", _poisoned_expand
-    )
+    monkeypatch.setattr(task_templates_module, "expand_template", _poisoned_expand)
     with pytest.raises(TaskTemplateError, match="template_unclassified"):
         classify_task_card(**stored)
     assert expanded_contract_digest(stored) == stored_digest

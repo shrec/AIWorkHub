@@ -63,6 +63,7 @@ def _create() -> dict:
             ["qualification-evidence.json"],
             required_outputs=["qualification-evidence.json"],
             validation=["python -c \"print('qualification')\""],
+            custom_template_escape="audited_custom_unclassified",
     )
     assert result["ok"] is True, result
     return json.loads(result["stdout"])

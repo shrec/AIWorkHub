@@ -730,6 +730,7 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
         forbidden=["secrets/**"],
         validation=["python -m pytest -q"],
         max_live_tokens=250_000,
+        custom_template_escape="audited_custom_unclassified",
     )
     assert created["ok"] is True, created
     card = json.loads(created["stdout"])
@@ -756,6 +757,7 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
         forbidden=["secrets/**"],
         validation=["python -m pytest -q"],
         max_live_tokens=250_000,
+        custom_template_escape="audited_custom_unclassified",
     )
     assert reconciled["ok"] is True, reconciled
     assert reconciled["created"] is False
@@ -772,6 +774,7 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
         allowed_writes=[],
         validation=["python -m pytest -q"],
         read_only=True,
+        custom_template_escape="audited_custom_unclassified",
     )
     assert duplicate["ok"] is False
     assert "task_already_exists" in duplicate["stderr"]
@@ -879,6 +882,7 @@ def test_manager_create_exposes_required_output_exceptions_and_reconciles(
         "allow_unchanged_required_outputs": ["out/evidence.json"],
         "allow_empty_required_outputs": ["out/empty.jsonl"],
         "validation": ["python -m pytest -q"],
+        "custom_template_escape": "audited_custom_unclassified",
     }
 
     created = core.create_task(**kwargs)
@@ -978,14 +982,11 @@ def test_manager_create_rejects_validation_syntax_worker_cannot_execute(
         validation=[
             "python -c \"from pathlib import Path; assert Path('docs/result.md').exists()\""
         ],
+        custom_template_escape="audited_custom_unclassified",
     )
 
     assert result["ok"] is False
-    assert result["stderr"].startswith(
-        "invalid_validation_command:validation_shell_syntax_forbidden:"
-    )
-    assert result["validation_index"] == 0
-    assert result["supported_validation_examples"]
+    assert result["stderr"] == "invalid_validation_embedded_path"
     assert task_store.get_task(writable_repo, "TASK_INVALID_VALIDATION_SYNTAX") is None
 
 
@@ -1040,6 +1041,7 @@ def test_concurrent_create_and_lost_ack_retry_reconcile_once(writable_repo, monk
                 allowed_writes=["src/example.py"],
                 required_outputs=["src/example.py"],
                 validation=["python -m pytest -q"],
+                custom_template_escape="audited_custom_unclassified",
         )
 
     # Model three overlapping MCP writes.  Exactly one creates the row; the

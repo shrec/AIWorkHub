@@ -88,6 +88,7 @@ def _create_args(task_id):
         allowed_writes=["src/aiworkhub/example_target.py"],
         required_outputs=["src/aiworkhub/example_target.py"],
         validation=["pytest -q tests/test_example_target.py"],
+        custom_template_escape="audited_custom_unclassified",
         callback_required=False,
     )
 

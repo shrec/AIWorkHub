@@ -565,6 +565,7 @@ def test_task_create_persists_required_project_context(tmp_path, monkeypatch):
         required_outputs=["research/context_default.json"],
         validation=["python3 -m json.tool research/context_default.json"],
         risk_tier="high",
+        custom_template_escape="audited_custom_unclassified",
     )
     assert result["ok"] is True, result
     card = json.loads(result["stdout"])
