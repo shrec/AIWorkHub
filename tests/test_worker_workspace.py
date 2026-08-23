@@ -4613,41 +4613,29 @@ def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonic
         parent_baseline={},
         workspace_baseline={},
     )
-    (path / "nested_git.py").write_text(
-        "import os, subprocess, sys\n"
+    (path / "exec_git.py").write_text(
+        "import os, sys\n"
         "from pathlib import Path\n"
         "root = Path(os.environ['TMPDIR']) / 'pytest-tmp' / 'nested-git'\n"
-        "root.mkdir(parents=True)\n"
-        "def git(*args):\n"
-        "    return subprocess.run(\n"
-        "        ['git', *args], cwd=root, text=True,\n"
-        "        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,\n"
-        "    )\n"
-        "init = git('init', '-b', 'main')\n"
-        "if init.returncode != 0:\n"
-        "    sys.stderr.write(init.stderr)\n"
-        "    sys.exit(20)\n"
+        "root.mkdir(parents=True, exist_ok=True)\n"
+        "args = [str(root.parent / 'linked-worktree') if value == '__LINKED__' else value for value in sys.argv[1:]]\n"
+        "os.chdir(root)\n"
+        "os.execvp('git', ['git', *args])\n",
+        encoding="utf-8",
+    )
+    (path / "prepare_nested_git.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "root = Path(os.environ['TMPDIR']) / 'pytest-tmp' / 'nested-git'\n"
         "(root / 'src').mkdir()\n"
-        "(root / 'src' / 'tracked.txt').write_text('ok\\n', encoding='utf-8')\n"
-        "git('config', 'user.email', 'nf395@example.invalid')\n"
-        "git('config', 'user.name', 'NF395')\n"
-        "added = git('add', 'src/tracked.txt')\n"
-        "if added.returncode != 0:\n"
-        "    sys.exit(21)\n"
-        "committed = git('commit', '-m', 'init')\n"
-        "if committed.returncode != 0:\n"
-        "    sys.exit(22)\n"
-        "sparse = git('sparse-checkout', 'init', '--cone')\n"
-        "if sparse.returncode != 0:\n"
-        "    sys.stderr.write(sparse.stderr)\n"
-        "    sys.exit(23)\n"
-        "if git('sparse-checkout', 'set', 'src').returncode != 0:\n"
-        "    sys.exit(24)\n"
+        "(root / 'src' / 'tracked.txt').write_text('ok\\n', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    (path / "verify_nested_git.py").write_text(
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "root = Path(os.environ['TMPDIR']) / 'pytest-tmp' / 'nested-git'\n"
         "linked = root.parent / 'linked-worktree'\n"
-        "wt = git('worktree', 'add', '--detach', str(linked), 'HEAD')\n"
-        "if wt.returncode != 0:\n"
-        "    sys.stderr.write(wt.stderr)\n"
-        "    sys.exit(27)\n"
         "if not (linked / 'src' / 'tracked.txt').is_file():\n"
         "    sys.exit(31)\n"
         "print('nested-git-sparse-ok')\n"
@@ -4679,19 +4667,30 @@ def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonic
         encoding="utf-8",
     )
     try:
-        git_result, deny_result = worker_workspace.run_validations(
+        *git_results, deny_result = worker_workspace.run_validations(
             workspace,
             [
-                "python3 nested_git.py",
+                "python3 exec_git.py init -b main",
+                "python3 prepare_nested_git.py",
+                "python3 exec_git.py config user.email nf395@example.invalid",
+                "python3 exec_git.py config user.name NF395",
+                "python3 exec_git.py add src/tracked.txt",
+                "python3 exec_git.py commit -m init",
+                "python3 exec_git.py sparse-checkout init --cone",
+                "python3 exec_git.py sparse-checkout set src",
+                "python3 exec_git.py worktree add --detach __LINKED__ HEAD",
+                "python3 verify_nested_git.py",
                 f"python3 deny_canonical.py {secret}",
             ],
             backend="landlock",
         )
-        assert isinstance(git_result["returncode"], int)
-        assert git_result["returncode"] >= 0, git_result
-        assert git_result["returncode"] < 128, git_result
-        assert git_result["returncode"] == 0, git_result["stderr_tail"]
-        assert "nested-git-sparse-ok" in git_result["stdout_tail"]
+        assert len(git_results) == 10
+        for git_result in git_results:
+            assert isinstance(git_result["returncode"], int)
+            assert git_result["returncode"] >= 0, git_result
+            assert git_result["returncode"] < 128, git_result
+            assert git_result["returncode"] == 0, git_result["stderr_tail"]
+        assert "nested-git-sparse-ok" in git_results[-1]["stdout_tail"]
         assert isinstance(deny_result["returncode"], int)
         assert deny_result["returncode"] >= 0, deny_result
         assert deny_result["returncode"] < 128, deny_result
