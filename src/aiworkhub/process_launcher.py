@@ -364,7 +364,7 @@ def _sandbox_backend_for_adapter(adapter_id: str) -> str:
     return select_sandbox_backend()
 
 
-def _validation_route_kwargs(metadata: Mapping[str, Any]) -> dict[str, str]:
+def _validation_route_kwargs(metadata: Mapping[str, Any]) -> dict[str, Any]:
     """Return the exact launch-bound validation route, failing on drift.
 
     Finalization must not rediscover a host-native sandbox for an editor-hosted
@@ -381,17 +381,27 @@ def _validation_route_kwargs(metadata: Mapping[str, Any]) -> dict[str, str]:
     expected_backend = _sandbox_backend_for_adapter(adapter_id)
     recorded_backend = str(metadata.get("sandbox_backend") or "").strip()
     execution_mode = str(metadata.get("execution_mode") or "").strip()
-    if (
-        execution_mode == "validation_only_replay"
-        and recorded_backend == "deterministic_validation"
-    ):
-        return {"backend": expected_backend, "adapter_id": adapter_id}
+    route: dict[str, Any] = {
+        "backend": expected_backend,
+        "adapter_id": adapter_id,
+    }
+    if execution_mode == "validation_only_replay":
+        if recorded_backend and recorded_backend not in {
+            expected_backend,
+            "deterministic_validation",
+        }:
+            raise WorkspaceError(
+                "validation_route_backend_mismatch:"
+                f"expected={expected_backend}:recorded={recorded_backend}"
+            )
+        route["outer_validation_authority"] = True
+        return route
     if recorded_backend and recorded_backend != expected_backend:
         raise WorkspaceError(
             "validation_route_backend_mismatch:"
             f"expected={expected_backend}:recorded={recorded_backend}"
         )
-    return {"backend": expected_backend, "adapter_id": adapter_id}
+    return route
 
 
 def _declared_validation_commands(authority: Mapping[str, Any]) -> list[str]:

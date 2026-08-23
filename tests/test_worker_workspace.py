@@ -1811,8 +1811,8 @@ def test_promotion_is_scope_checked_parent_guarded_and_restart_idempotent(
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="GitHub hosted runners cannot execute nested Landlock workers",
+    worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="Authenticated outer validation Landlock cannot execute nested sandbox workers",
 )
 def test_landlock_fallback_allows_declared_output_and_denies_parent_and_git_metadata(
     monkeypatch: pytest.MonkeyPatch,
@@ -1873,8 +1873,8 @@ print('landlock-denied-parent-git-and-metadata')
     reason="Root-file replacement requires Landlock truncate support",
 )
 @pytest.mark.skipif(
-    os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="GitHub hosted runners cannot execute nested Landlock workers",
+    worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="Authenticated outer validation Landlock cannot execute nested sandbox workers",
 )
 def test_landlock_root_file_allows_in_place_save_but_denies_sibling_temp(
     monkeypatch: pytest.MonkeyPatch,
@@ -2558,8 +2558,8 @@ def test_validation_pythonpath_resolution_is_beneath_worktree(
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="GitHub hosted runners cannot execute nested Landlock validations",
+    worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="Authenticated outer validation Landlock cannot execute nested sandbox validations",
 )
 def test_validation_pythonpath_override_is_scoped_to_one_subprocess(
     monkeypatch: pytest.MonkeyPatch,
@@ -2778,8 +2778,8 @@ def test_validation_cd_prefix_sets_bubblewrap_chdir_beneath_workspace(
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="GitHub hosted runners cannot execute nested Landlock validations",
+    worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="Authenticated outer validation Landlock cannot execute nested sandbox validations",
 )
 def test_validation_cd_prefix_changes_child_cwd_under_landlock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
@@ -2997,8 +2997,8 @@ def test_repo_relative_executable_passes_through_unrelated_and_rejects_untrusted
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="GitHub hosted runners cannot execute nested Landlock validations",
+    worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="Authenticated outer validation Landlock cannot execute nested sandbox validations",
 )
 def test_run_validations_declared_vs_executed_relative_venv_receipt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
@@ -4699,5 +4699,87 @@ def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonic
         assert "write-denied" in deny_result["stdout_tail"]
         assert "chmod-denied" in deny_result["stdout_tail"]
         assert secret.read_text(encoding="utf-8") == "keep\n"
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_outer_validation_authority_ignores_candidate_env_and_writable_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("AIWORKHUB_OUTER_VALIDATION_AUTHORITY", "1")
+    monkeypatch.setenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, str(tmp_path))
+    assert worker_workspace.authenticated_outer_validation_context() is None
+    assert worker_workspace.nested_sandbox_requires_host_boundary() is False
+
+    planted = worker_workspace.plant_outer_validation_authority(
+        tmp_path, exec_scratch=tmp_path / "scratch"
+    )
+    assert planted.is_file()
+    assert worker_workspace.verify_outer_validation_authority_file(planted) is None
+    assert worker_workspace.authenticated_outer_validation_context() is None
+
+    forged = tmp_path / worker_workspace.OUTER_VALIDATION_AUTHORITY_RELATIVE
+    payload = json.loads(forged.read_text(encoding="utf-8"))
+    payload["mac"] = "0" * 64
+    forged.chmod(0o600)
+    forged.write_text(json.dumps(payload), encoding="utf-8")
+    assert worker_workspace.verify_outer_validation_authority_file(forged) is None
+
+
+def test_outer_validation_authority_requires_landlock_denied_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    planted = worker_workspace.plant_outer_validation_authority(
+        tmp_path, exec_scratch=tmp_path / "scratch"
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "_directory_write_denied_by_landlock",
+        lambda _directory: True,
+    )
+    verified = worker_workspace.verify_outer_validation_authority_file(planted)
+    assert verified is not None
+    assert verified["schema_id"] == worker_workspace.OUTER_VALIDATION_AUTHORITY_SCHEMA
+    assert verified["exec_scratch"] == str((tmp_path / "scratch").resolve())
+    assert worker_workspace.authenticated_outer_validation_context() == verified
+    assert worker_workspace.nested_sandbox_requires_host_boundary() is True
+
+    outside = tmp_path / "outside-worktrees"
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(outside))
+    redirected = worker_workspace.configured_worktree_root(tmp_path)
+    assert redirected == (tmp_path / "scratch" / "nested-worktrees").resolve()
+
+    inside = tmp_path / "scratch" / "local-worktrees"
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(inside))
+    assert worker_workspace.configured_worktree_root(tmp_path) == inside.resolve()
+
+
+def test_sandbox_argv_plants_outer_authority_only_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "outer-auth-flag")
+    try:
+        plain = worker_workspace.sandbox_argv(
+            workspace,
+            "validation",
+            [sys.executable, "-c", "print(1)"],
+            backend="landlock",
+        )
+        assert "--outer-validation-authority" not in plain
+        flagged = worker_workspace.sandbox_argv(
+            workspace,
+            "validation",
+            [sys.executable, "-c", "print(1)"],
+            backend="landlock",
+            outer_validation_authority=True,
+        )
+        assert "--outer-validation-authority" in flagged
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)

@@ -242,8 +242,8 @@ def _wait_terminal(manager: process_launcher.ProcessManager, request_id: str) ->
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="GitHub hosted runners cannot execute nested Landlock workers",
+    worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="Authenticated outer validation Landlock cannot execute nested sandbox workers",
 )
 def test_production_launch_owns_exact_claim_promotion_and_review(
     monkeypatch: pytest.MonkeyPatch,
@@ -289,8 +289,8 @@ def test_production_launch_owns_exact_claim_promotion_and_review(
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="GitHub hosted runners cannot execute nested Landlock workers",
+    worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="Authenticated outer validation Landlock cannot execute nested sandbox workers",
 )
 def test_cancel_from_restarted_manager_is_durable_and_releases_exact_owner(
     monkeypatch: pytest.MonkeyPatch,
@@ -1259,3 +1259,73 @@ def test_required_ignored_output_promoted_in_full_finalize_flow(
     assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
     assert reviews == [(card["task_id"], card["runner"], "review_ready")]
     assert workspace.path.exists()
+
+
+def test_validation_only_replay_route_is_explicit_and_not_env_spoofable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("AIWORKHUB_OUTER_VALIDATION_AUTHORITY", "1")
+    replay = process_launcher._validation_route_kwargs(
+        {
+            "adapter_id": "claude_cli",
+            "sandbox_backend": "deterministic_validation",
+            "execution_mode": "validation_only_replay",
+        }
+    )
+    assert replay["outer_validation_authority"] is True
+    assert replay["backend"] in {"landlock", "bubblewrap"}
+
+    provider = process_launcher._validation_route_kwargs(
+        {
+            "adapter_id": "claude_cli",
+            "sandbox_backend": replay["backend"],
+            "execution_mode": "provider_worker",
+        }
+    )
+    assert "outer_validation_authority" not in provider
+
+
+def test_workspace_error_terminal_states_keep_candidate_failures_and_signals() -> None:
+    failed = worker_workspace.ValidationRunError(
+        "validation_failed:python -m pytest:rc=1:stdout=:stderr=failed",
+        [{"returncode": 1, "command": "python -m pytest"}],
+    )
+    signaled = worker_workspace.ValidationRunError(
+        "validation_failed:python -m pytest:rc=-9:stdout=:stderr=killed",
+        [{"returncode": -9, "command": "python -m pytest"}],
+    )
+    blocked = worker_workspace.ValidationEnvironmentBlocked(
+        "validation_environment_blocked:missing_interpreter:python:restrictions=missing_interpreter:stderr=",
+        [{"returncode": 127, "command": "python"}],
+        restriction="missing_interpreter",
+    )
+    assert process_launcher._terminal_state_for_workspace_error(failed) == "validation_failed"
+    assert process_launcher._terminal_state_for_workspace_error(signaled) == "validation_failed"
+    assert process_launcher._terminal_state_for_workspace_error(blocked) == "finalize_failed"
+    assert (
+        process_launcher._terminal_state_for_workspace_error(
+            worker_workspace.WorkspaceError("scope_violation:out/secret.txt")
+        )
+        == "scope_rejected"
+    )
+    assert (
+        process_launcher._terminal_state_for_workspace_error(
+            worker_workspace.WorkspaceError("required_output_missing:out/result.txt")
+        )
+        == "validation_failed"
+    )
+    assert (
+        process_launcher._terminal_state_for_workspace_error(
+            worker_workspace.WorkspaceError(
+                "validation_unsupported_in_sandbox:secure_sandbox_unavailable"
+            )
+        )
+        == "finalize_failed"
+    )
+    assert (
+        process_launcher._terminal_state_for_workspace_error(
+            worker_workspace.WorkspaceError("landlock_target_not_regular:out/result.txt")
+        )
+        == "finalize_failed"
+    )

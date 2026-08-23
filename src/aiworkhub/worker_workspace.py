@@ -17,6 +17,7 @@ import errno
 import base64
 import fnmatch
 import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -92,6 +93,12 @@ VALIDATION_ENVIRONMENT_BLOCKED = "validation_environment_blocked"
 # ``VALIDATION_FAILED``, and always preserving the retained workspace/hashes for
 # a provider-free ``retry_finalization``.
 VALIDATION_UNSUPPORTED_IN_SANDBOX = "validation_unsupported_in_sandbox"
+OUTER_VALIDATION_AUTHORITY_SCHEMA = "aiworkhub.outer_validation_authority.v1"
+OUTER_VALIDATION_AUTHORITY_RELATIVE = (
+    ".aiworkhub/outer_validation_authority.v1.json"
+)
+_OUTER_VALIDATION_AUTHORITY_KIND = "coordinator_outer_validation"
+_OUTER_VALIDATION_HMAC_KEY = b"aiworkhub.outer_validation_authority.v1.landlock"
 
 
 def _load_runtime_temp():
@@ -2386,17 +2393,36 @@ def configured_runtime_root(repo: Path | None = None) -> Path:
 
 def configured_worktree_root(repo: Path | None = None) -> Path:
     """Return the single configured root for isolated worker workspaces."""
+    context = authenticated_outer_validation_context()
+    authorized_scratch = (
+        Path(context["exec_scratch"]).resolve()
+        if context and context.get("exec_scratch")
+        else None
+    )
     override = os.environ.get(WORKTREE_ROOT_ENV, "").strip()
     if override:
-        return Path(override).expanduser().resolve()
+        resolved = Path(override).expanduser().resolve()
+        if authorized_scratch is None or _path_is_relative_to(
+            resolved, authorized_scratch
+        ):
+            return resolved
+        return (authorized_scratch / "nested-worktrees").resolve()
     if repo is None and not os.environ.get(RUNTIME_ROOT_ENV, "").strip():
         env_repo = (
             os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
             or os.environ.get("AIWORKHUB_REPO", "").strip()
         )
         if not env_repo and not (Path.cwd() / ".aiworkhub" / "project.json").is_file():
-            return (Path(tempfile.gettempdir()) / "aiworkhub-worktrees").resolve()
-    return (configured_runtime_root(repo) / "worktrees").resolve()
+            fallback = (Path(tempfile.gettempdir()) / "aiworkhub-worktrees").resolve()
+            if authorized_scratch is None or _path_is_relative_to(
+                fallback, authorized_scratch
+            ):
+                return fallback
+            return (authorized_scratch / "nested-worktrees").resolve()
+    default = (configured_runtime_root(repo) / "worktrees").resolve()
+    if authorized_scratch is None or _path_is_relative_to(default, authorized_scratch):
+        return default
+    return (authorized_scratch / "nested-worktrees").resolve()
 
 
 def configured_temp_root(repo: Path | None = None) -> Path:
@@ -2407,6 +2433,139 @@ def configured_temp_root(repo: Path | None = None) -> Path:
     closed via :func:`aiworkhub.runtime_temp.temp_root`.
     """
     return runtime_temp.temp_root(repo)
+
+
+def _outer_validation_authority_mac(payload: Mapping[str, str]) -> str:
+    material = "\n".join(
+        f"{key}={payload[key]}" for key in sorted(payload)
+    ).encode("utf-8")
+    return hmac.new(_OUTER_VALIDATION_HMAC_KEY, material, hashlib.sha256).hexdigest()
+
+
+def _directory_write_denied_by_landlock(directory: Path) -> bool:
+    try:
+        status = directory.stat()
+    except OSError:
+        return False
+    if not stat.S_ISDIR(status.st_mode):
+        return False
+    if status.st_uid != os.geteuid():
+        return False
+    if stat.S_IMODE(status.st_mode) & 0o200 == 0:
+        return False
+    probe = directory / f".aiworkhub_outer_validation_probe_{os.getpid()}"
+    try:
+        fd = os.open(str(probe), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    os.close(fd)
+    try:
+        os.unlink(probe)
+    except OSError:
+        pass
+    return False
+
+
+def plant_outer_validation_authority(
+    workspace: Path,
+    *,
+    exec_scratch: Path | None = None,
+) -> Path:
+    """Write the coordinator-only outer validation authority file."""
+    workspace = Path(workspace).resolve()
+    path = workspace / OUTER_VALIDATION_AUTHORITY_RELATIVE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_id": OUTER_VALIDATION_AUTHORITY_SCHEMA,
+        "kind": _OUTER_VALIDATION_AUTHORITY_KIND,
+        "workspace": str(workspace),
+    }
+    if exec_scratch is not None:
+        payload["exec_scratch"] = str(Path(exec_scratch).resolve())
+    document = {
+        **payload,
+        "mac": _outer_validation_authority_mac(payload),
+    }
+    path.write_text(
+        json.dumps(document, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+    chmod_path(path, 0o444)
+    return path
+
+
+def verify_outer_validation_authority_file(path: Path) -> dict[str, str] | None:
+    """Return the verified payload or None. Env and prose cannot mint this."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    schema_id = str(raw.get("schema_id") or "")
+    kind = str(raw.get("kind") or "")
+    workspace = str(raw.get("workspace") or "")
+    exec_scratch = str(raw.get("exec_scratch") or "")
+    mac = str(raw.get("mac") or "")
+    if (
+        schema_id != OUTER_VALIDATION_AUTHORITY_SCHEMA
+        or kind != _OUTER_VALIDATION_AUTHORITY_KIND
+        or not workspace
+        or not re.fullmatch(r"[0-9a-f]{64}", mac)
+    ):
+        return None
+    payload = {
+        "schema_id": schema_id,
+        "kind": kind,
+        "workspace": workspace,
+    }
+    if exec_scratch:
+        payload["exec_scratch"] = exec_scratch
+    expected = _outer_validation_authority_mac(payload)
+    if not hmac.compare_digest(mac, expected):
+        return None
+    try:
+        resolved_file = path.resolve()
+        resolved_workspace = Path(workspace).resolve()
+    except OSError:
+        return None
+    if not _path_is_relative_to(resolved_file, resolved_workspace):
+        return None
+    if not _directory_write_denied_by_landlock(resolved_file.parent):
+        return None
+    return payload
+
+
+def authenticated_outer_validation_context() -> dict[str, str] | None:
+    """Return the coordinator outer-validation context when it is authentic.
+
+    Candidate environment variables and output text cannot create this
+    context. The reserved authority file must verify HMAC and live in a
+    directory this process owns and that is mode-writable, yet Landlock
+    still denies creating a sibling.
+    """
+    current = Path.cwd().resolve()
+    seen: set[Path] = set()
+    while current not in seen:
+        seen.add(current)
+        candidate = current / OUTER_VALIDATION_AUTHORITY_RELATIVE
+        verified = verify_outer_validation_authority_file(candidate)
+        if verified is not None:
+            return verified
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+def nested_sandbox_requires_host_boundary() -> bool:
+    """True only inside the authenticated coordinator validation sandbox."""
+    return authenticated_outer_validation_context() is not None
 
 
 def _legacy_worktree_root() -> Path:
@@ -3703,6 +3862,9 @@ def sanitized_env(
 
 
 def _exec_scratch_candidate_roots() -> tuple[Path, ...]:
+    context = authenticated_outer_validation_context()
+    if context and context.get("exec_scratch"):
+        return (Path(context["exec_scratch"]),)
     override = os.environ.get(VALIDATION_EXEC_SCRATCH_ROOT_ENV, "").strip()
     if override:
         # An explicit admin override is authoritative: no silent fallback to
@@ -4305,6 +4467,7 @@ def sandbox_argv(
     package_import_root: Path | None = None,
     validation_cwd: str | None = None,
     validation_executable_roots: tuple[Path, ...] = (),
+    outer_validation_authority: bool = False,
 ) -> list[str]:
     if not adapter_argv:
         raise WorkspaceError("adapter_argv_empty")
@@ -4344,6 +4507,9 @@ def sandbox_argv(
         cwd_flags = (
             ["--cwd", resolved_cwd_relative] if resolved_cwd_relative is not None else []
         )
+        authority_flags = (
+            ["--outer-validation-authority"] if outer_validation_authority else []
+        )
         return [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -4353,6 +4519,7 @@ def sandbox_argv(
             *(value for pattern in workspace.allowed_writes for value in ("--allow", pattern)),
             *exec_scratch_flags,
             *cwd_flags,
+            *authority_flags,
             "--",
             *adapter_argv,
         ]
@@ -5524,6 +5691,7 @@ def _landlock_exec(argv: list[str]) -> int:
     parser.add_argument("--allow", action="append", default=[])
     parser.add_argument("--exec-scratch", default=None)
     parser.add_argument("--cwd", default=None)
+    parser.add_argument("--outer-validation-authority", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = list(args.command)
@@ -5534,6 +5702,8 @@ def _landlock_exec(argv: list[str]) -> int:
     workspace = Path(args.workspace).resolve()
     home = Path(args.home).resolve()
     exec_scratch = Path(args.exec_scratch).resolve() if args.exec_scratch else None
+    if args.outer_validation_authority:
+        plant_outer_validation_authority(workspace, exec_scratch=exec_scratch)
     _apply_landlock(workspace, home, args.allow, exec_scratch)
     if args.cwd is not None:
         # Re-validate against this exec'd child's own view of the workspace
@@ -6444,6 +6614,7 @@ def run_validations(
     timeout_seconds: int = MAX_VALIDATION_SECONDS,
     backend: str | None = None,
     adapter_id: str = "",
+    outer_validation_authority: bool = False,
 ) -> list[dict[str, Any]]:
     rows = list(commands)
     if len(rows) > MAX_VALIDATION_COMMANDS:
@@ -6569,6 +6740,7 @@ def run_validations(
                     validation_exec_scratch=scratch_dir,
                     validation_cwd=cd_relative,
                     validation_executable_roots=validation_executable_roots,
+                    outer_validation_authority=outer_validation_authority,
                 )
                 subprocess_cwd = "/"
                 execution_boundary = "os_sandbox"

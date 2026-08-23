@@ -1521,3 +1521,31 @@ def test_terminal_supervisor_status_bypasses_unknown_pid_and_finalizes_once(
     assert first["state"] == "cancelled"
     assert second == first
     assert releases == [(request_id, "cancelled")]
+
+
+def test_liveness_terminal_mapping_ignores_env_and_keeps_candidate_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("CI", "true")
+    assert worker_workspace.authenticated_outer_validation_context() is None
+    assert (
+        process_launcher._terminal_state_for_workspace_error(
+            worker_workspace.ValidationRunError(
+                "validation_failed:python -m pytest:rc=2:stdout=:stderr=failed",
+                [{"returncode": 2, "command": "python -m pytest"}],
+            )
+        )
+        == "validation_failed"
+    )
+    assert (
+        process_launcher._terminal_state_for_workspace_error(
+            worker_workspace.ValidationRunError(
+                "validation_failed:python -m pytest:rc=-15:stdout=:stderr=terminated",
+                [{"returncode": -15, "command": "python -m pytest"}],
+            )
+        )
+        == "validation_failed"
+    )
+    assert isinstance(_chmod_blocked_by_sandbox(), bool)
+    assert worker_workspace.nested_sandbox_requires_host_boundary() is False
