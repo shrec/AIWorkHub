@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.49 — 2026-08-23
+
+### Fixed
+
+- Worker and reviewer wall-clock inputs are compatibility metadata only and no
+  longer create provider-death authority.
+- Exact process exit, authenticated terminal output and explicit owner cancel
+  remain authoritative when legacy timeout-shaped evidence is present.
+- Authenticated nested-validation replay no longer confuses outer Landlock
+  restrictions with candidate validation failures.
+
 ## 0.10.48 — 2026-08-23
 
 ### Fixed

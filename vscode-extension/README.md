@@ -12,6 +12,15 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.49
+
+- Live workers and reviewers are governed by exact process/result evidence and
+  explicit cancellation, not legacy elapsed or quiet-time thresholds.
+- Timeout-shaped VS Code/provider text cannot independently terminalize a
+  request as timed out.
+- Authenticated validation replay separates outer sandbox restrictions from
+  candidate failures while retaining real local Landlock coverage.
+
 ## What's new in 0.10.48
 
 - Live provider work is no longer terminated by an elapsed legacy timeout;

@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.49] - 2026-08-23
+
+### Fixed
+
+- Provider and quality-review launch timeouts are now explicitly retained as
+  non-enforcing compatibility metadata; an exact live process is never killed
+  or terminalized merely because elapsed or quiet time crossed a legacy bound.
+- Legacy VS Code LM timeout text and unauthenticated supervisor `timed_out`
+  state can no longer override exact process/result evidence.
+- Nested validation replay now uses an authenticated coordinator-planted
+  authority marker, while GitHub-hosted Landlock limitations remain isolated
+  from real local sandbox regressions across the Python matrix.
+
 ## [0.10.48] - 2026-08-23
 
 ### Fixed
