@@ -2139,10 +2139,12 @@ def aiworkhub_agent_launch_task(
     validated before a shell-free child process can start.
     Use the exact ``launch_contract`` returned by workforce ranking; the
     manager identity ``codex`` is never a worker runner.
+    ``timeout_seconds`` is retained only as non-enforcing compatibility
+    metadata; this API never installs a provider wall-clock deadline.
     """
 
     core.scrub_coordinator_capability_from_environment()
-    return process_launcher.default_manager().launch(
+    result = process_launcher.default_manager().launch(
         task_id=task_id,
         runner=runner,
         topic=topic,
@@ -2151,6 +2153,10 @@ def aiworkhub_agent_launch_task(
         owner_prompt=owner_prompt,
         timeout_seconds=timeout_seconds,
     )
+    if isinstance(result, dict):
+        result["timeout_seconds"] = timeout_seconds
+        result["timeout_enforced"] = False
+    return result
 
 
 @mcp.tool()
@@ -2165,9 +2171,13 @@ def aiworkhub_quality_reviewer_launch(
     model: str | None = None,
     timeout_seconds: int = 1800,
 ) -> dict[str, Any]:
-    """DUAL-GATED: launch one independent anti-anchored quality reviewer."""
+    """DUAL-GATED: launch one independent anti-anchored quality reviewer.
 
-    return process_launcher.default_manager().launch_quality_reviewer(
+    ``timeout_seconds`` is retained only as non-enforcing compatibility
+    metadata; this API never installs a reviewer wall-clock deadline.
+    """
+
+    result = process_launcher.default_manager().launch_quality_reviewer(
         target_request_id=target_request_id,
         target_task_id=target_task_id,
         reviewer_task_id=reviewer_task_id,
@@ -2177,6 +2187,10 @@ def aiworkhub_quality_reviewer_launch(
         model=model,
         timeout_seconds=timeout_seconds,
     )
+    if isinstance(result, dict):
+        result["timeout_seconds"] = timeout_seconds
+        result["timeout_enforced"] = False
+    return result
 
 
 @mcp.tool()

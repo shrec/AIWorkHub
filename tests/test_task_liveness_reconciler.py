@@ -820,7 +820,7 @@ def test_successful_exit_reconciled_after_launcher_disappearance_runs_each_step_
 @pytest.mark.parametrize(
     "supervisor_state,expected_terminal",
     [
-        ("timed_out", "timed_out"),
+        ("timed_out", "worker_failed"),
         ("cancelled", "cancelled"),
         ("spawn_failed", "worker_failed"),
     ],
@@ -1549,3 +1549,102 @@ def test_liveness_terminal_mapping_ignores_env_and_keeps_candidate_failures(
     )
     assert isinstance(_chmod_blocked_by_sandbox(), bool)
     assert worker_workspace.nested_sandbox_requires_host_boundary() is False
+
+
+def test_live_provider_stays_non_terminal_past_600s_elapsed_quiet_and_stall(
+    tmp_path, monkeypatch,
+):
+    card = _card(task_id="TASK_FAKE_CLOCK", runner="deepseek_worker_clock")
+    fake_supervisor = _spawn_sleeper()
+    terminated: list[int] = []
+    clock = {"now": 1_700_000_000.0}
+    try:
+        manager = _build_manager(tmp_path, card)
+        monkeypatch.setattr(process_launcher.time, "time", lambda: clock["now"])
+        monkeypatch.setattr(
+            process_launcher,
+            "_terminate_process_group",
+            lambda pid, grace_seconds: terminated.append(pid),
+        )
+        ticks = process_launcher._pid_start_ticks(fake_supervisor.pid)
+        _seed_request(
+            manager, tmp_path, card,
+            request_id="req-fake-clock-600",
+            supervisor_pid=fake_supervisor.pid,
+            supervisor_ticks=ticks,
+            supervisor_status={
+                "state": "running",
+                "heartbeat_at_epoch": clock["now"],
+                "heartbeat_seq": 3,
+                "last_output_change_epoch": clock["now"] - 600,
+                "last_meaningful_progress_epoch": clock["now"] - 600,
+                "last_meaningful_phase": "tool_turn",
+                "child_pid": 0,
+            },
+        )
+
+        first = manager._finalize_isolated_request("req-fake-clock-600")
+        clock["now"] += 600.0
+        status_path = tmp_path / "processes" / "req-fake-clock-600.supervisor.json"
+        _write_status(status_path, {
+            "state": "running",
+            "heartbeat_at_epoch": clock["now"],
+            "heartbeat_seq": 4,
+            "last_output_change_epoch": clock["now"] - 1200,
+            "last_meaningful_progress_epoch": clock["now"] - 1200,
+            "last_meaningful_phase": "tool_turn",
+            "child_pid": 0,
+        })
+        second = manager._finalize_isolated_request("req-fake-clock-600")
+
+        assert first is None
+        assert second is None
+        assert terminated == []
+        assert fake_supervisor.poll() is None
+    finally:
+        _kill_if_alive(fake_supervisor)
+
+
+def test_legacy_supervisor_timed_out_is_not_authoritative_without_enforcement(
+    tmp_path, monkeypatch,
+):
+    card = _card(task_id="TASK_LEGACY_TO", runner="deepseek_worker_legacy")
+    manager = _build_manager(tmp_path, card)
+    releases: list[tuple[str, str]] = []
+
+    def fake_terminal_failure(
+        repo, task_id, runner, substatus, *, evidence=None, request_id=""
+    ):
+        releases.append((task_id, substatus))
+        card.update({"status": "blocked", "worker_status": substatus})
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        process_launcher.task_engine, "mark_terminal_failure", fake_terminal_failure,
+    )
+    _seed_request(
+        manager, tmp_path, card,
+        request_id="req-legacy-timed-out",
+        supervisor_pid=999_999_999,
+        supervisor_ticks=1,
+        supervisor_status={
+            "state": "timed_out",
+            "exit_code": 124,
+            "timeout_seconds": 30,
+            "timeout_enforced": False,
+        },
+    )
+    metadata_path = tmp_path / "processes" / "req-legacy-timed-out.request.json"
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    payload["timeout_seconds"] = 30
+    payload["timeout_enforced"] = False
+    worker_workspace.write_json_0600(metadata_path, payload)
+
+    event = manager._finalize_isolated_request(
+        "req-legacy-timed-out", supervisor_returncode=124
+    )
+
+    assert event is not None
+    assert event["state"] == "worker_failed"
+    assert event["state"] != "timed_out"
+    assert releases == [(card["task_id"], "worker_failed")]

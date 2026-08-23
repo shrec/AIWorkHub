@@ -796,7 +796,7 @@ def test_status_does_not_wait_when_release_pending_finalizer_owns_request_lock(
     assert result["latest_event"]["reconciliation_deferred"] == "request_lock_busy"
 
 
-def test_vscode_lm_structured_response_timeout_is_terminal_timeout(
+def test_vscode_lm_structured_response_timeout_is_not_authoritative(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     repo: Path,
@@ -837,9 +837,10 @@ def test_vscode_lm_structured_response_timeout_is_terminal_timeout(
 
     event = manager._finalize_isolated_request(request_id, supervisor_returncode=1)
 
-    assert event["state"] == "timed_out"
-    assert "source=vscode_lm_response_timeout" in event["error"]
-    assert releases == [(card["task_id"], card["runner"], "timed_out")]
+    assert event["state"] == "worker_failed"
+    assert event["state"] != "timed_out"
+    assert "source=vscode_lm_response_timeout" not in str(event.get("error") or "")
+    assert releases == [(card["task_id"], card["runner"], "worker_failed")]
     assert workspace.path.exists()
 
 
@@ -1331,3 +1332,91 @@ def test_workspace_error_terminal_states_keep_candidate_failures_and_signals() -
         )
         == "finalize_failed"
     )
+
+
+def test_legacy_timeout_fields_are_non_enforcing() -> None:
+    fields = process_launcher._legacy_timeout_fields(7200)
+    assert fields == {"timeout_seconds": 7200, "timeout_enforced": False}
+    fields = process_launcher._legacy_timeout_fields(1800)
+    assert fields["timeout_enforced"] is False
+
+
+def test_launch_apis_expose_legacy_timeout_as_non_enforcing_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect
+
+    from aiworkhub import server
+
+    worker_sig = inspect.signature(server.aiworkhub_agent_launch_task)
+    reviewer_sig = inspect.signature(server.aiworkhub_quality_reviewer_launch)
+    assert worker_sig.parameters["timeout_seconds"].default == 7200
+    assert reviewer_sig.parameters["timeout_seconds"].default == 1800
+
+    class FakeManager:
+        def launch(self, **kwargs):
+            return {"ok": True, "state": "running"}
+
+        def launch_quality_reviewer(self, **kwargs):
+            return {"ok": True, "state": "starting"}
+
+    monkeypatch.setattr(server.process_launcher, "default_manager", lambda: FakeManager())
+    worker = server.aiworkhub_agent_launch_task("T1", "r", "coding", "claude_cli")
+    reviewer = server.aiworkhub_quality_reviewer_launch(
+        "req", "T1", "R1", "r", "claude_cli", "correctness",
+    )
+    assert worker["timeout_enforced"] is False
+    assert worker["timeout_seconds"] == 7200
+    assert reviewer["timeout_enforced"] is False
+    assert reviewer["timeout_seconds"] == 1800
+
+
+def test_monitor_does_not_enforce_legacy_provider_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[object] = []
+
+    class FakeProc:
+        pid = 1
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return 0
+
+        def poll(self):
+            return 0
+
+    manager = process_launcher.ProcessManager(
+        repo=tmp_path / "repo",
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        isolation_enabled=True,
+        show_task=lambda _tid: {"returncode": 0, "stdout": "{}", "stderr": ""},
+        collision_guard=lambda **_k: {"returncode": 0, "stdout": "{}", "stderr": ""},
+        adapter_builder=lambda **_k: SimpleNamespace(
+            argv=[], cwd=str(tmp_path), launchable=True
+        ),
+    )
+    monkeypatch.setattr(manager, "_finalize_after_process_exit", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        manager,
+        "_publish_bridge_cancellation_before_finalization",
+        lambda *_a, **_k: "",
+    )
+    live = process_launcher._LiveProcess(
+        request_id="req-monitor",
+        task_id="TASK_B1",
+        runner="r",
+        topic="t",
+        adapter_id="claude_cli",
+        model=None,
+        process=FakeProc(),
+        stdout_path=tmp_path / "out.log",
+        stderr_path=tmp_path / "err.log",
+        started_at="t",
+        timeout_seconds=30,
+        isolated=True,
+    )
+    manager._monitor(live)
+    assert waits == [None]

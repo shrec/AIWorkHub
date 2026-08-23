@@ -1163,6 +1163,13 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _legacy_timeout_fields(timeout_seconds: int) -> dict[str, Any]:
+    return {
+        "timeout_seconds": int(timeout_seconds),
+        "timeout_enforced": False,
+    }
+
+
 def launch_gates_open() -> bool:
     return (
         os.environ.get(ALLOW_LAUNCH_ENV, "0") == "1"
@@ -6464,6 +6471,7 @@ class ProcessManager:
             "deferred": True,
             "already_reserved": False,
             "shell": False,
+            **_legacy_timeout_fields(timeout_seconds),
         }
 
     def _launch_isolated(
@@ -6980,7 +6988,7 @@ class ProcessManager:
                         if include_partial_messages
                         else "terminal_events"
                     ),
-                    "timeout_seconds": timeout_seconds,
+                    **_legacy_timeout_fields(timeout_seconds),
                     "token_budget": (
                         dict(token_budget_value)
                         if isinstance(
@@ -7136,7 +7144,7 @@ class ProcessManager:
                 write_json_0600(spec_path, {
                     "argv": worker_argv,
                     "cwd": launch_cwd,
-                    "timeout_seconds": timeout_seconds,
+                    **_legacy_timeout_fields(timeout_seconds),
                     "status_path": str(status_path),
                     "cancel_path": str(cancel_path),
                     "stdout_path": str(stdout_path),
@@ -7274,6 +7282,7 @@ class ProcessManager:
                 "sandbox_backend": sandbox_backend,
                 "prompt_budget": prompt_budget,
                 "shell": False,
+                **_legacy_timeout_fields(timeout_seconds),
             }
         except _ReviewerReservationTerminalized:
             return _abandon_terminalized_reviewer()
@@ -7622,9 +7631,7 @@ class ProcessManager:
     def _monitor(self, live: _LiveProcess) -> None:
         if live.isolated:
             try:
-                live.process.wait(timeout=live.timeout_seconds + SUPERVISOR_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                _terminate_process_group(live.process.pid, grace_seconds=5.0)
+                live.process.wait()
             except Exception as exc:
                 self._append_event({
                     "request_id": live.request_id,
@@ -7771,14 +7778,9 @@ class ProcessManager:
         raise _BridgeCancellationDeferred(error[:500])
 
     def _monitor_direct_for_tests(self, live: _LiveProcess) -> None:
-        timed_out = False
         returncode: int | None
         try:
-            returncode = live.process.wait(timeout=live.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate_process_group(live.process.pid, grace_seconds=5.0)
-            returncode = live.process.poll()
+            returncode = live.process.wait()
         except Exception as exc:  # bounded background failure record
             returncode = live.process.poll()
             self._append_event({
@@ -7808,10 +7810,10 @@ class ProcessManager:
             task_state = "unknown"
         with self._lock:
             was_cancelled = live.request_id in self._cancelled
-        state = "cancelled" if was_cancelled else "timed_out" if timed_out else "exited"
-        if not timed_out and not was_cancelled and returncode == 0 and task_state == "review":
+        state = "cancelled" if was_cancelled else "exited"
+        if not was_cancelled and returncode == 0 and task_state == "review":
             state = "review_ready"
-        elif not timed_out and not was_cancelled and returncode == 0 and task_state != "review":
+        elif not was_cancelled and returncode == 0 and task_state != "review":
             state = "exited_without_review"
         usage, usage_recorded, usage_error = self._record_usage(
             live.request_id,
@@ -9239,7 +9241,7 @@ class ProcessManager:
             error = stall_error or str(supervisor_status.get("error") or "")[:500]
             if liveness_lost and not error:
                 error = f"liveness_lost:heartbeat_lease_and_recovery_grace_exceeded:rc={supervisor_returncode}"
-            if supervisor_state == "timed_out":
+            if supervisor_state == "timed_out" and metadata.get("timeout_enforced") is True:
                 terminal_state = "timed_out"
                 error = error or (
                     "worker_timed_out:timeout_seconds="
@@ -9278,7 +9280,7 @@ class ProcessManager:
                 error = error or "worker_cancelled"
             elif supervisor_state == "exited" and exit_code == 0:
                 terminal_state = "exited"
-            elif supervisor_state in {"exited", "spawn_failed", "supervisor_error"}:
+            elif supervisor_state in {"exited", "spawn_failed", "supervisor_error", "timed_out"}:
                 terminal_state = "worker_failed"
                 error = error or (
                     f"worker_failed:supervisor_state={supervisor_state}:exit_code={exit_code}"
@@ -9298,22 +9300,9 @@ class ProcessManager:
             provider_launch_failure = None
             if terminal_state == "worker_failed":
                 provider_output_path = Path(str(metadata["stdout_path"]))
-                provider_timeout_failure = _provider_timeout_failure_from_output(
+                provider_launch_failure = _provider_auth_failure_from_output(
                     provider_output_path
                 )
-                if provider_timeout_failure is not None:
-                    terminal_state = "timed_out"
-                    error = (
-                        "worker_timed_out:source="
-                        + str(provider_timeout_failure["reason"])
-                        + ":timeout_seconds="
-                        + str(metadata.get("timeout_seconds") or "unknown")
-                        + f":exit_code={exit_code}"
-                    )
-                else:
-                    provider_launch_failure = _provider_auth_failure_from_output(
-                        provider_output_path
-                    )
                 if provider_launch_failure is not None:
                     http_status = int(provider_launch_failure["http_status"])
                     # The auth-readiness circuit is a claim about the credential,
