@@ -4613,7 +4613,7 @@ def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonic
         parent_baseline={},
         workspace_baseline={},
     )
-    (path / "helper.py").write_text(
+    (path / "nested_git.py").write_text(
         "import os, subprocess, sys\n"
         "from pathlib import Path\n"
         "root = Path(os.environ['TMPDIR']) / 'pytest-tmp' / 'nested-git'\n"
@@ -4631,9 +4631,11 @@ def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonic
         "(root / 'src' / 'tracked.txt').write_text('ok\\n', encoding='utf-8')\n"
         "git('config', 'user.email', 'nf395@example.invalid')\n"
         "git('config', 'user.name', 'NF395')\n"
-        "if git('add', 'src/tracked.txt').returncode != 0:\n"
+        "added = git('add', 'src/tracked.txt')\n"
+        "if added.returncode != 0:\n"
         "    sys.exit(21)\n"
-        "if git('commit', '-m', 'init').returncode != 0:\n"
+        "committed = git('commit', '-m', 'init')\n"
+        "if committed.returncode != 0:\n"
         "    sys.exit(22)\n"
         "sparse = git('sparse-checkout', 'init', '--cone')\n"
         "if sparse.returncode != 0:\n"
@@ -4646,29 +4648,56 @@ def test_run_validations_nested_git_sparse_checkout_under_scratch_denies_canonic
         "if wt.returncode != 0:\n"
         "    sys.stderr.write(wt.stderr)\n"
         "    sys.exit(27)\n"
-        "denied = Path(sys.argv[1])\n"
-        "try:\n"
-        "    denied.write_text('mutated\\n', encoding='utf-8')\n"
-        "    sys.exit(25)\n"
-        "except PermissionError:\n"
-        "    pass\n"
-        "try:\n"
-        "    os.chmod(denied, 0o600)\n"
-        "    sys.exit(26)\n"
-        "except PermissionError:\n"
-        "    pass\n"
+        "if not (linked / 'src' / 'tracked.txt').is_file():\n"
+        "    sys.exit(31)\n"
         "print('nested-git-sparse-ok')\n"
         "print('scratch=' + os.environ['TMPDIR'])\n",
         encoding="utf-8",
     )
+    (path / "deny_canonical.py").write_text(
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "denied = Path(sys.argv[1])\n"
+        "try:\n"
+        "    denied.write_text('mutated\\n', encoding='utf-8')\n"
+        "except PermissionError:\n"
+        "    print('write-denied')\n"
+        "except Exception as exc:\n"
+        "    sys.stderr.write(type(exc).__name__ + ':' + str(exc) + '\\n')\n"
+        "    sys.exit(28)\n"
+        "else:\n"
+        "    sys.exit(25)\n"
+        "try:\n"
+        "    os.chmod(denied, 0o600)\n"
+        "except PermissionError:\n"
+        "    print('chmod-denied')\n"
+        "except Exception as exc:\n"
+        "    sys.stderr.write(type(exc).__name__ + ':' + str(exc) + '\\n')\n"
+        "    sys.exit(29)\n"
+        "else:\n"
+        "    sys.exit(26)\n",
+        encoding="utf-8",
+    )
     try:
-        result, = worker_workspace.run_validations(
+        git_result, deny_result = worker_workspace.run_validations(
             workspace,
-            [f"python3 helper.py {secret}"],
+            [
+                "python3 nested_git.py",
+                f"python3 deny_canonical.py {secret}",
+            ],
             backend="landlock",
         )
-        assert result["returncode"] == 0, result["stderr_tail"]
-        assert "nested-git-sparse-ok" in result["stdout_tail"]
+        assert isinstance(git_result["returncode"], int)
+        assert git_result["returncode"] >= 0, git_result
+        assert git_result["returncode"] < 128, git_result
+        assert git_result["returncode"] == 0, git_result["stderr_tail"]
+        assert "nested-git-sparse-ok" in git_result["stdout_tail"]
+        assert isinstance(deny_result["returncode"], int)
+        assert deny_result["returncode"] >= 0, deny_result
+        assert deny_result["returncode"] < 128, deny_result
+        assert deny_result["returncode"] == 0, deny_result["stderr_tail"]
+        assert "write-denied" in deny_result["stdout_tail"]
+        assert "chmod-denied" in deny_result["stdout_tail"]
         assert secret.read_text(encoding="utf-8") == "keep\n"
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
