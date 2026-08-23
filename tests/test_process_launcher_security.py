@@ -242,8 +242,9 @@ def _wait_terminal(manager: process_launcher.ProcessManager, request_id: str) ->
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    worker_workspace.nested_sandbox_requires_host_boundary(),
-    reason="Authenticated outer validation Landlock cannot execute nested sandbox workers",
+    os.environ.get("GITHUB_ACTIONS") == "true"
+    or worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="The current host boundary cannot execute nested Landlock workers",
 )
 def test_production_launch_owns_exact_claim_promotion_and_review(
     monkeypatch: pytest.MonkeyPatch,
@@ -289,8 +290,9 @@ def test_production_launch_owns_exact_claim_promotion_and_review(
     reason="Landlock is not supported by this kernel",
 )
 @pytest.mark.skipif(
-    worker_workspace.nested_sandbox_requires_host_boundary(),
-    reason="Authenticated outer validation Landlock cannot execute nested sandbox workers",
+    os.environ.get("GITHUB_ACTIONS") == "true"
+    or worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="The current host boundary cannot execute nested Landlock workers",
 )
 def test_cancel_from_restarted_manager_is_durable_and_releases_exact_owner(
     monkeypatch: pytest.MonkeyPatch,
