@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.10.52";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.10.53";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -8631,6 +8631,216 @@ function applyWebviewOptions(webview, extensionUri) {
   };
 }
 
+const CODING_FOUNDATION_CARD_KEYS = ["development_rules", "skills", "tool_recipes"];
+const CODING_FOUNDATION_SCHEMAS = {
+  development_rules: "aiworkhub.dashboard.development_rules.v1",
+  skills: "aiworkhub.dashboard.skills.v1",
+  tool_recipes: "aiworkhub.dashboard.tool_recipes.v1",
+};
+const CODING_FOUNDATION_LABELS = {
+  development_rules: "Development Rules",
+  skills: "Skills",
+  tool_recipes: "Tool Recipes",
+};
+
+function codingFoundationBoundedCount(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+    return null;
+  }
+  return value;
+}
+
+function codingFoundationBoundText(value, limit) {
+  const text = String(value == null ? "" : value);
+  const max = limit || 80;
+  if (text.length <= max) return text;
+  return text.slice(0, Math.max(0, max - 1)) + "…";
+}
+
+function codingFoundationJoinParts(parts) {
+  const kept = [];
+  for (let i = 0; i < parts.length; i += 1) {
+    if (typeof parts[i] === "string" && parts[i]) kept.push(parts[i]);
+  }
+  return codingFoundationBoundText(kept.join(" · "));
+}
+
+function codingFoundationMeasuredCount(projection, keys) {
+  if (!projection || typeof projection !== "object") return null;
+  for (let i = 0; i < keys.length; i += 1) {
+    const counted = codingFoundationBoundedCount(projection[keys[i]]);
+    if (counted != null) return counted;
+  }
+  return null;
+}
+
+function codingFoundationCardModel(kind, projection) {
+  if (!projection || typeof projection !== "object" || Array.isArray(projection)) return null;
+  if (projection.schema_id != null && projection.schema_id !== CODING_FOUNDATION_SCHEMAS[kind]) return null;
+  const state = projection.state;
+  if (typeof state !== "string" || !state) return null;
+  const label = CODING_FOUNDATION_LABELS[kind] || kind;
+  if (state === "no_sample") {
+    return { state: state, value: "No sample", detail: "No evidence", title: label + ": no sample" };
+  }
+  if (state === "unavailable") {
+    const reason = typeof projection.reason === "string" && projection.reason
+      ? codingFoundationBoundText(projection.reason, 48)
+      : "No evidence";
+    return { state: state, value: "Unavailable", detail: reason, title: label + " unavailable" };
+  }
+  if (state === "invalid") {
+    return { state: state, value: "Unavailable", detail: "Invalid evidence", title: label + " invalid" };
+  }
+  if (state !== "measured") return null;
+  if (kind === "development_rules") {
+    const declared = codingFoundationBoundedCount(projection.declared_rule_count);
+    const resolved = codingFoundationBoundedCount(projection.resolved_rule_count);
+    const violations = projection.violation_evidence_state === "measured"
+      ? codingFoundationBoundedCount(projection.violation_count)
+      : null;
+    const version = typeof projection.version === "string" ? codingFoundationBoundText(projection.version, 16) : "";
+    return {
+      state: state,
+      value: declared == null ? "Measured" : declared + " rules",
+      detail: codingFoundationJoinParts([
+        resolved == null ? "" : resolved + " resolved",
+        violations == null ? "" : violations + " viol",
+        version,
+      ]) || "Measured",
+      title: label + " measured",
+    };
+  }
+  if (kind === "skills") {
+    const count = codingFoundationMeasuredCount(projection, ["count", "returned_count"]);
+    const lifecycle = projection.lifecycle && typeof projection.lifecycle === "object"
+      ? projection.lifecycle
+      : null;
+    const proposed = lifecycle ? codingFoundationBoundedCount(lifecycle.proposed) : null;
+    const active = lifecycle ? codingFoundationBoundedCount(lifecycle.active) : null;
+    const retired = lifecycle ? codingFoundationBoundedCount(lifecycle.retired) : null;
+    const selection = projection.selection && projection.selection.state === "measured"
+      ? codingFoundationMeasuredCount(projection.selection, ["count", "returned_count"])
+      : null;
+    const invocation = projection.invocation && projection.invocation.state === "measured"
+      ? codingFoundationMeasuredCount(projection.invocation, ["count", "returned_count"])
+      : null;
+    const outcome = projection.outcome && projection.outcome.state === "measured"
+      ? codingFoundationMeasuredCount(projection.outcome, ["count", "returned_count"])
+      : null;
+    return {
+      state: state,
+      value: count == null ? "Measured" : count + " skills",
+      detail: codingFoundationJoinParts([
+        proposed == null || active == null || retired == null
+          ? ""
+          : proposed + " proposed · " + active + " active · " + retired + " retired",
+        selection == null ? "" : selection + " sel",
+        invocation == null ? "" : invocation + " inv",
+        outcome == null ? "" : outcome + " out",
+      ]) || "Measured",
+      title: label + " measured",
+    };
+  }
+  const count = codingFoundationMeasuredCount(projection, ["count", "registry_count", "returned_count"]);
+  const discovery = codingFoundationBoundedCount(projection.discovery_count);
+  const uses = projection.invocation && projection.invocation.state === "measured"
+    ? codingFoundationMeasuredCount(projection.invocation, ["count", "returned_count"])
+    : null;
+  const cache = projection.cache && projection.cache.state === "measured" ? projection.cache : null;
+  const eligible = cache ? codingFoundationBoundedCount(cache.eligible_count) : null;
+  return {
+    state: state,
+    value: count == null ? "Measured" : count + " recipes",
+    detail: codingFoundationJoinParts([
+      uses == null ? "" : uses + " uses",
+      eligible == null ? "" : eligible + " cache-ok",
+      discovery == null ? "" : discovery + " discovered",
+    ]) || "Measured",
+    title: label + " measured",
+  };
+}
+
+function renderCodingFoundationCards(snapshot, elements) {
+  if (!elements || typeof elements !== "object") return;
+  const snap = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot) ? snapshot : {};
+  for (let i = 0; i < CODING_FOUNDATION_CARD_KEYS.length; i += 1) {
+    const kind = CODING_FOUNDATION_CARD_KEYS[i];
+    const slot = elements[kind];
+    if (!slot || !slot.value || !slot.detail) continue;
+    const model = codingFoundationCardModel(kind, snap[kind]);
+    if (!model) continue;
+    slot.value.textContent = model.value;
+    slot.detail.textContent = model.detail;
+    if (slot.card) {
+      slot.card.title = model.title;
+      if (typeof slot.card.setAttribute === "function") slot.card.setAttribute("data-state", model.state);
+    }
+  }
+}
+
+function bindCodingFoundationDashboard(doc) {
+  const root = doc || (typeof document !== "undefined" ? document : null);
+  if (!root || typeof root.getElementById !== "function") return null;
+  const elements = {};
+  for (let i = 0; i < CODING_FOUNDATION_CARD_KEYS.length; i += 1) {
+    const kind = CODING_FOUNDATION_CARD_KEYS[i];
+    const id = "header-" + kind.replace(/_/g, "-");
+    elements[kind] = {
+      card: root.getElementById(id),
+      value: root.getElementById(id + "-value"),
+      detail: root.getElementById(id + "-detail"),
+    };
+  }
+  const apply = function applyCodingFoundationSnapshot(snapshot) {
+    renderCodingFoundationCards(snapshot, elements);
+  };
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("message", function onCodingFoundationSnapshot(event) {
+      const message = event && event.data ? event.data : {};
+      if (message.type !== "snapshot" && message.type !== "snapshotSummary") return;
+      apply(message.payload || {});
+    });
+  }
+  return { elements: elements, apply: apply };
+}
+
+function codingFoundationHeaderMarkup() {
+  return [
+    '<div class="header-insight-card" id="header-development-rules" data-state="no_sample" title="Development Rules snapshot projection">',
+    '<span class="header-storage-label">Development Rules</span>',
+    '<strong id="header-development-rules-value">No sample</strong>',
+    '<span class="header-insight-detail" id="header-development-rules-detail">No evidence</span>',
+    "</div>",
+    '<div class="header-insight-card" id="header-skills" data-state="no_sample" title="Skills snapshot projection">',
+    '<span class="header-storage-label">Skills</span>',
+    '<strong id="header-skills-value">No sample</strong>',
+    '<span class="header-insight-detail" id="header-skills-detail">No evidence</span>',
+    "</div>",
+    '<div class="header-insight-card" id="header-tool-recipes" data-state="no_sample" title="Tool Recipes snapshot projection">',
+    '<span class="header-storage-label">Tool Recipes</span>',
+    '<strong id="header-tool-recipes-value">No sample</strong>',
+    '<span class="header-insight-detail" id="header-tool-recipes-detail">No evidence</span>',
+    "</div>",
+  ].join("");
+}
+
+function codingFoundationDashboardSource() {
+  return [
+    "const CODING_FOUNDATION_CARD_KEYS = " + JSON.stringify(CODING_FOUNDATION_CARD_KEYS) + ";",
+    "const CODING_FOUNDATION_SCHEMAS = " + JSON.stringify(CODING_FOUNDATION_SCHEMAS) + ";",
+    "const CODING_FOUNDATION_LABELS = " + JSON.stringify(CODING_FOUNDATION_LABELS) + ";",
+    codingFoundationBoundedCount.toString(),
+    codingFoundationBoundText.toString(),
+    codingFoundationJoinParts.toString(),
+    codingFoundationMeasuredCount.toString(),
+    codingFoundationCardModel.toString(),
+    renderCodingFoundationCards.toString(),
+    bindCodingFoundationDashboard.toString(),
+    "bindCodingFoundationDashboard();",
+  ].join("\n");
+}
+
 // Strict nonce CSP: only webview.cspSource + this exact nonce may run/style
 // the page -- no remote origin, no inline handler, no eval, no embedded frame.
 function getHtmlForWebview(webview, extensionUri) {
@@ -8753,6 +8963,7 @@ function getHtmlForWebview(webview, extensionUri) {
         <strong id="header-preflight-value">Checking</strong>
         <span class="header-insight-detail" id="header-preflight-detail">No evidence</span>
       </div>
+      ${codingFoundationHeaderMarkup()}
     </div>
   </header>
 
@@ -9192,6 +9403,7 @@ function getHtmlForWebview(webview, extensionUri) {
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <script nonce="${nonceValue}">${codingFoundationDashboardSource()}</script>
   <script nonce="${nonceValue}" src="${scriptUri}"></script>
 </body>
 </html>`;
@@ -9745,6 +9957,13 @@ module.exports = {
   activate,
   deactivate,
   __testInternals: {
+    CODING_FOUNDATION_CARD_KEYS,
+    CODING_FOUNDATION_SCHEMAS,
+    codingFoundationCardModel,
+    renderCodingFoundationCards,
+    bindCodingFoundationDashboard,
+    codingFoundationHeaderMarkup,
+    getHtmlForWebview,
     McpStdioClient,
     ViewState,
     pushSnapshot,

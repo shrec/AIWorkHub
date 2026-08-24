@@ -15,6 +15,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -23,6 +25,7 @@ if str(_SRC) not in sys.path:
 
 from aiworkhub import process_launcher as pl  # noqa: E402
 from aiworkhub import project_context  # noqa: E402
+from aiworkhub import worker_ai_tools_mcp as wm  # noqa: E402
 
 
 def _sha(text: str = "bundle-b954") -> str:
@@ -362,3 +365,370 @@ def test_prefetch_and_cache_provenance_never_satisfy_live_gate(tmp_path, monkeyp
     assert gate["satisfied"] is False
     assert gate["missing_tools"] == ["source_graph_live_call"]
     assert gate["satisfaction_by_tool"]["source_graph"] == "injected_only_not_sufficient"
+
+
+# --- Source Graph cache: generation bound, capacity bound, race safety -----
+#
+# The measured defect: ``_CACHE`` was an unbounded plain dict, so a long-lived
+# worker process kept every entry it ever produced -- including entries from
+# index generations that a rebuild or exact-file mutation had already
+# superseded -- and concurrent tool calls mutated it without a lock. These lock
+# the replacement: obsolete generations are evicted deterministically, the
+# total stays capped, a late store from a superseded generation can never
+# supersede a newer one, an ambiguous (degraded) index identity is never cached
+# or replayed at all, and current-generation exact-key hits still return the
+# stored entry unchanged.
+
+
+def _key(
+    *,
+    task_id: str = "TASK_B954",
+    request_id: str = "req-1",
+    repo: str = "/repo",
+    mode: str = "focus",
+    query: str = "q",
+    target: str | None = None,
+    cursor: str | None = None,
+    budget: int = 48,
+    bundle_type: str = "explore",
+    packet_sha256: str = "",
+    overlay_sha256: str = "",
+    build_revision: str = "rev-1",
+    finished_at: str = "2026-08-24T00:00:00+00:00",
+):
+    """Build a key through the SAME production helper ``source_graph_query`` uses.
+
+    Deliberately not a hand-copied tuple literal: if the key layout changes,
+    these tests move with production instead of silently drifting.
+    """
+    return wm._source_graph_cache_key(
+        task_id=task_id, request_id=request_id, repo=repo, mode=mode,
+        query=query, target=target, cursor=cursor, budget=budget,
+        bundle_type=bundle_type, packet_sha256=packet_sha256,
+        overlay_sha256=overlay_sha256,
+        index_identity={"build_revision": build_revision, "finished_at": finished_at},
+    )
+
+
+def _ctx(tmp_path: Path) -> "wm.WorkerToolContext":
+    return wm.WorkerToolContext(
+        task_id="TASK_B954", runner="claude", topic="cache", request_id="req-1",
+        repo=tmp_path, authority_repo=tmp_path,
+        source_graph_targets=(), session_topic="cache",
+        audit_ledger_path=None, audit_hmac_key_path=None,
+    )
+
+
+def _stub_engine(monkeypatch, *, identity: dict, payloads: list[dict]) -> list[str]:
+    """Drive a real ``source_graph_query`` call off a stubbed engine.
+
+    Everything below the cache is replaced -- feature flag, authority binding,
+    index identity, database context and the engine call itself -- so what the
+    tests observe is the production caching decision, not sqlite behaviour.
+    Returns the list of live engine calls actually made.
+    """
+    from aiworkhub import feature_settings, source_graph
+
+    monkeypatch.setattr(feature_settings, "enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        wm, "_resolve_source_graph_db",
+        lambda ctx: wm.AuthorityBinding(
+            db_path=Path("/nonexistent/source_graph.db"),
+            authority_source="canonical",
+            authority_state="canonical_active",
+            authority_repo=ctx.authority_repo,
+        ),
+    )
+    monkeypatch.setattr(
+        wm, "_source_graph_index_identity", lambda *_a, **_k: dict(identity),
+    )
+
+    @contextmanager
+    def _no_db(*_a, **_k):
+        yield
+
+    monkeypatch.setattr(wm, "_with_source_graph_db", _no_db)
+    live: list[str] = []
+
+    def _focus(_repo, query, _budget):
+        live.append(query)
+        return dict(payloads[min(len(live) - 1, len(payloads) - 1)])
+
+    monkeypatch.setattr(source_graph, "focus", _focus)
+    return live
+
+
+# --- the production invocation actually caches under the named key ---------
+
+def test_source_graph_query_caches_under_the_named_production_key(tmp_path, monkeypatch):
+    wm._source_graph_cache_clear()
+    identity = {"build_revision": "rev-1", "finished_at": "2026-08-24T00:00:00+00:00"}
+    # Big enough that the compact replay receipt is genuinely smaller than the
+    # cached bytes, so the hit exercises the real receipt path rather than the
+    # replay-verbatim fallback.
+    payload = {"matches": [{"file": f"pkg/module_{i}.py", "symbol": f"sym_{i}"} for i in range(24)]}
+    live = _stub_engine(monkeypatch, identity=identity, payloads=[payload])
+
+    first = wm.source_graph_query(_ctx(tmp_path), mode="focus", query="q", budget=48)
+    assert first["cache_hit"] is False
+    assert live == ["q"]
+
+    expected = _key(repo=str(tmp_path), build_revision="rev-1", finished_at=identity["finished_at"])
+    assert list(wm._CACHE) == [expected]
+    assert isinstance(expected, wm._SourceGraphCacheKey)
+    assert expected.authority == (
+        "source_graph", "TASK_B954", "req-1", str(tmp_path), "", "",
+    )
+    assert expected.generation == (identity["finished_at"], "rev-1")
+
+    second = wm.source_graph_query(_ctx(tmp_path), mode="focus", query="q", budget=48)
+    assert second["cache_hit"] is True
+    assert second["cache_receipt"] is True
+    assert second["content_sha256"] == first["content_sha256"]
+    assert second["replay_original_bytes"] == first["bytes"]
+    assert second["hit_count"] == first["hit_count"]
+    assert json.loads(second["content"])["content_sha256"] == first["content_sha256"]
+    assert live == ["q"], "a current-generation exact-key hit must not re-query"
+
+
+def test_a_degraded_index_identity_is_never_cached_or_replayed(tmp_path, monkeypatch):
+    # Empty ``finished_at`` is what ``_source_graph_index_identity`` returns for
+    # an unreadable/missing ``meta`` row: two different index states alias to it,
+    # so caching under it could replay pre-mutation bytes as current.
+    wm._source_graph_cache_clear()
+    live = _stub_engine(
+        monkeypatch,
+        identity={"build_revision": "rev-1", "finished_at": ""},
+        payloads=[{"matches": [{"file": "before.py"}]}, {"matches": [{"file": "after.py"}]}],
+    )
+
+    first = wm.source_graph_query(_ctx(tmp_path), mode="focus", query="q", budget=48)
+    assert wm._CACHE == {}
+
+    second = wm.source_graph_query(_ctx(tmp_path), mode="focus", query="q", budget=48)
+    assert second["cache_hit"] is False
+    assert live == ["q", "q"], "an ambiguous generation must fall back to a live query"
+    assert "after.py" in second["content"]
+    assert second["content_sha256"] != first["content_sha256"]
+    assert wm._CACHE == {}
+
+
+def test_sentinel_and_unreadable_generations_are_all_indefinite():
+    definite = wm._source_graph_generation_is_definite
+    assert definite({"build_revision": "rev-1", "finished_at": "2026-08-24T00:00:00+00:00"}) is True
+    assert definite({"build_revision": "rev-1", "finished_at": ""}) is False
+    assert definite({"build_revision": "rev-1", "finished_at": "  "}) is False
+    assert definite({"build_revision": "rev-1", "finished_at": "UNKNOWN"}) is False
+    assert definite({"build_revision": "rev-1", "finished_at": None}) is False
+    assert definite({"build_revision": "", "finished_at": "2026-08-24T00:00:00+00:00"}) is False
+    assert definite({}) is False
+
+
+# --- generation rollover is deterministic and authority-scoped -------------
+
+def test_obsolete_generation_entries_are_evicted_on_rollover():
+    wm._source_graph_cache_clear()
+    stale = [_key(query=f"q{i}", finished_at="t1") for i in range(5)]
+    for key in stale:
+        wm._source_graph_cache_store(key, {"content_sha256": "old"})
+    assert len(wm._CACHE) == 5
+
+    rolled = _key(query="q0", build_revision="rev-2", finished_at="t2")
+    assert wm._source_graph_cache_store(rolled, {"content_sha256": "new"}) is True
+
+    assert list(wm._CACHE) == [rolled]
+    for key in stale:
+        assert wm._source_graph_cache_get(key) is None
+    assert wm._source_graph_cache_get(rolled)["content_sha256"] == "new"
+
+
+def test_a_changed_build_revision_alone_is_a_rollover():
+    wm._source_graph_cache_clear()
+    before = _key(build_revision="rev-1", finished_at="t1")
+    wm._source_graph_cache_store(before, {"content_sha256": "old"})
+    after = _key(build_revision="rev-2", finished_at="t1")
+    assert wm._source_graph_cache_store(after, {"content_sha256": "new"}) is True
+    assert list(wm._CACHE) == [after]
+
+
+def test_rollover_eviction_is_authority_scoped():
+    wm._source_graph_cache_clear()
+    peers = {
+        "task": _key(task_id="OTHER_TASK", finished_at="t1"),
+        "request": _key(request_id="req-2", finished_at="t1"),
+        "repo": _key(repo="/other-repo", finished_at="t1"),
+        "packet": _key(packet_sha256="packet-sha", finished_at="t1"),
+        "overlay": _key(overlay_sha256="overlay-sha", finished_at="t1"),
+    }
+    mine = _key(finished_at="t1")
+    for key in (*peers.values(), mine):
+        wm._source_graph_cache_store(key, {"content_sha256": "old"})
+
+    wm._source_graph_cache_store(_key(finished_at="t2"), {"content_sha256": "new"})
+
+    assert wm._source_graph_cache_get(mine) is None
+    for name, key in peers.items():
+        assert wm._source_graph_cache_get(key) is not None, f"{name} scope was cross-evicted"
+
+
+# --- the generation fence: a late old-generation store changes nothing -----
+
+def test_a_late_old_generation_store_never_supersedes_a_newer_one():
+    wm._source_graph_cache_clear()
+    current = _key(query="q", finished_at="t2")
+    wm._source_graph_cache_store(current, {"content_sha256": "new"})
+
+    late = _key(query="q-late", finished_at="t1")
+    assert wm._source_graph_cache_store(late, {"content_sha256": "old"}) is False
+    assert list(wm._CACHE) == [current]
+    assert wm._source_graph_cache_get(late) is None
+    assert wm._source_graph_cache_get(current)["content_sha256"] == "new"
+
+
+def test_a_late_old_generation_store_is_fenced_per_authority():
+    # The fence is scoped like the eviction it protects: another authority's
+    # older generation is still perfectly current FOR THAT AUTHORITY.
+    wm._source_graph_cache_clear()
+    wm._source_graph_cache_store(_key(finished_at="t2"), {"content_sha256": "mine-new"})
+    peer = _key(request_id="req-2", finished_at="t1")
+    assert wm._source_graph_cache_store(peer, {"content_sha256": "peer-old"}) is True
+    assert wm._source_graph_cache_get(peer)["content_sha256"] == "peer-old"
+
+
+def test_concurrent_generation_stores_settle_on_the_newest_deterministically():
+    wm._source_graph_cache_clear()
+    stamps = [f"t{n:02d}" for n in range(16)]
+    start = threading.Barrier(len(stamps))
+
+    def roll(stamp: str) -> None:
+        start.wait()
+        for i in range(4):
+            wm._source_graph_cache_store(
+                _key(query=f"q{i}", finished_at=stamp), {"content_sha256": stamp},
+            )
+
+    threads = [threading.Thread(target=roll, args=(stamp,)) for stamp in stamps]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    # Whatever the interleaving, the newest generation wins and no older one
+    # survives beside it or replaces it after arriving late.
+    assert {key.generation for key in wm._CACHE} == {(stamps[-1], "rev-1")}
+    assert len(wm._CACHE) == 4
+    assert all(entry["content_sha256"] == stamps[-1] for entry in wm._CACHE.values())
+
+
+# --- capacity bound, and what it may and may not do -----------------------
+
+def test_total_entries_stay_bounded_and_drop_least_recently_used_first():
+    wm._source_graph_cache_clear()
+    cap = wm._MAX_SOURCE_GRAPH_CACHE_ENTRIES
+    assert cap == 256
+    keys = [_key(query=f"q{i}") for i in range(cap * 3)]
+    for key in keys:
+        wm._source_graph_cache_store(key, {"content_sha256": key.query})
+
+    assert len(wm._CACHE) == cap
+    assert list(wm._CACHE) == keys[-cap:]
+    assert wm._source_graph_cache_get(keys[0]) is None
+
+
+def test_capacity_may_evict_another_authority_only_as_a_harmless_miss():
+    wm._source_graph_cache_clear()
+    cap = wm._MAX_SOURCE_GRAPH_CACHE_ENTRIES
+    victim = _key(request_id="req-victim", query="q")
+    wm._source_graph_cache_store(victim, {"content_sha256": "victim"})
+    for i in range(cap):
+        wm._source_graph_cache_store(
+            _key(request_id="req-flood", query=f"q{i}"), {"content_sha256": f"flood{i}"},
+        )
+
+    assert len(wm._CACHE) == cap
+    # A miss, never a crossed read: the evicted authority gets None and the
+    # flooding authority's bytes are never handed back under the victim's key.
+    assert wm._source_graph_cache_get(victim) is None
+    assert all(key.request_id == "req-flood" for key in wm._CACHE)
+
+
+def test_get_never_returns_another_authoritys_entry():
+    wm._source_graph_cache_clear()
+    identities = {
+        "mine": _key(),
+        "task": _key(task_id="OTHER_TASK"),
+        "request": _key(request_id="req-2"),
+        "repo": _key(repo="/other-repo"),
+        "packet": _key(packet_sha256="packet-sha"),
+        "overlay": _key(overlay_sha256="overlay-sha"),
+    }
+    # Same mode/query/budget everywhere: only the authority binding differs.
+    for name, key in identities.items():
+        wm._source_graph_cache_store(key, {"content_sha256": name})
+
+    for name, key in identities.items():
+        assert wm._source_graph_cache_get(key)["content_sha256"] == name
+    assert len({key.authority for key in wm._CACHE}) == len(identities)
+
+
+def test_current_generation_hit_returns_the_stored_entry_unchanged():
+    wm._source_graph_cache_clear()
+    cap = wm._MAX_SOURCE_GRAPH_CACHE_ENTRIES
+    hot = _key(query="hot")
+    entry = {
+        "result": {"content": "{}", "output_cap_bytes": 8192},
+        "hit_count": 3,
+        "bytes": 2,
+        "content_sha256": _sha("hot-content"),
+        "authority_source": "canonical",
+        "authority_state": "sole_authority",
+        "evidence_counts": {"entity_rows": 1},
+    }
+    wm._source_graph_cache_store(hot, entry)
+
+    # Reading keeps it hot, so capacity pressure evicts the cold entries first
+    # and the receipt fields a cache hit replays stay byte-identical.
+    for i in range(cap - 1):
+        wm._source_graph_cache_store(_key(query=f"cold{i}"), {"content_sha256": "cold"})
+        assert wm._source_graph_cache_get(hot) is entry
+    wm._source_graph_cache_store(_key(query="overflow"), {"content_sha256": "overflow"})
+
+    assert len(wm._CACHE) == cap
+    replayed = wm._source_graph_cache_get(hot)
+    assert replayed is entry
+    assert replayed["content_sha256"] == _sha("hot-content")
+    assert replayed["hit_count"] == 3
+    assert replayed["authority_state"] == "sole_authority"
+
+
+def test_concurrent_get_and_store_never_duplicate_or_cross_authorities():
+    wm._source_graph_cache_clear()
+    workers, per_worker = 8, 12
+    assert workers * per_worker <= wm._MAX_SOURCE_GRAPH_CACHE_ENTRIES
+    mismatches: list[str] = []
+    start = threading.Barrier(workers)
+
+    def hammer(n: int) -> None:
+        start.wait()
+        for i in range(per_worker):
+            key = _key(request_id=f"req-{n}", query=f"q{i}")
+            expected = f"{n}:{i}"
+            wm._source_graph_cache_store(key, {"content_sha256": expected})
+            for _ in range(25):
+                got = wm._source_graph_cache_get(key)
+                if got is None or got["content_sha256"] != expected:
+                    mismatches.append(f"{expected} -> {got}")
+                    return
+
+    threads = [threading.Thread(target=hammer, args=(n,)) for n in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert mismatches == []
+    assert len(wm._CACHE) == workers * per_worker
+    for n in range(workers):
+        for i in range(per_worker):
+            key = _key(request_id=f"req-{n}", query=f"q{i}")
+            assert wm._CACHE[key]["content_sha256"] == f"{n}:{i}"

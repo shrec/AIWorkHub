@@ -13,7 +13,11 @@ rule) -- no test shares a canonical DB or daemon-registry key with another.
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
 import sys
+import textwrap
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -934,3 +938,657 @@ def test_health_exposes_hash_and_noop_reuse_telemetry_on_unchanged_refresh(
         assert recommendation["ok"] is True
     finally:
         daemon.stop()
+
+
+# ---------------------------------------------------------------------------
+# 10. Bounded process-tree shutdown: cancelling/stopping a build must
+#     terminate and reap the ENTIRE owned build tree -- including
+#     ProcessPoolExecutor-style grandchildren that inherit the daemon's
+#     stdout/stderr pipes -- with only bounded waits, using exact process
+#     identity so a recycled PID never targets an unrelated process/group.
+# ---------------------------------------------------------------------------
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _procfs_available() -> bool:
+    """True when this host exposes a Linux-style ``/proc`` filesystem.
+
+    macOS has no ``/proc`` at all, so a missing ``/proc/<pid>/stat`` there
+    means procfs is unavailable -- not that the PID is dead. Probing
+    ``/proc/self`` distinguishes "procfs present, this PID has no entry"
+    (a truly gone PID) from "procfs absent" (must fall back to liveness).
+    """
+    return os.path.isdir("/proc/self")
+
+
+def _terminated(pid: int) -> bool:
+    """True when ``pid`` is gone or a not-yet-reaped zombie (i.e. dead).
+
+    On a procfs host we can tell a not-yet-reaped zombie from a fully gone
+    PID: a killed grandchild whose parent we already reaped is reparented
+    and may briefly linger as a zombie before the OS reaper collects it, and
+    a zombie is terminated, not running. A missing ``/proc/<pid>/stat`` there
+    means the PID has no entry -- it is gone.
+
+    On a host without procfs (e.g. macOS, where ``/proc`` is absent entirely)
+    a missing path proves nothing about the PID, so we fall back to exact PID
+    liveness and treat the PID as terminated only once it has actually
+    disappeared -- never misclassifying a live PID as dead.
+    """
+    if not _procfs_available():
+        return not _alive(pid)
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+            state = handle.read().rsplit(")", 1)[1].split()[0]
+        return state == "Z"
+    except FileNotFoundError:
+        # Procfs is present but this PID has no entry -> it is gone.
+        return True
+    except OSError:
+        return not _alive(pid)
+
+
+def _tree_probe_script(pidfile: Path) -> str:
+    """A build-subprocess stand-in that spawns a pipe-inheriting grandchild.
+
+    The grandchild inherits the daemon's stdout/stderr pipes (default fd
+    inheritance) and holds them open by sleeping, so a parent-only kill would
+    deadlock ``communicate()``. Both PIDs are written to ``pidfile`` so the
+    test can prove the exact tree is reaped.
+    """
+    return textwrap.dedent(
+        f"""
+        import os, subprocess, sys, time
+        gc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        with open({str(pidfile)!r}, "w") as fh:
+            fh.write(str(os.getpid()) + " " + str(gc.pid))
+            fh.flush()
+            os.fsync(fh.fileno())
+        time.sleep(120)
+        """
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group reaping")
+def test_stop_reaps_entire_build_tree_including_pipe_inheriting_grandchild(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    root = _init_repo(tmp_path, "tree_kill")
+    cleanup_daemons.append(root)
+    # Force the production dedicated-subprocess path (the autouse fixture
+    # pins in-process THREAD execution for monkeypatch-based unit tests).
+    monkeypatch.setenv(
+        source_graph_daemon.BUILD_EXECUTION_ENV,
+        source_graph_daemon.BUILD_EXECUTION_SUBPROCESS,
+    )
+    pidfile = tmp_path / "tree_pids.txt"
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    assert daemon._build_execution == source_graph_daemon.BUILD_EXECUTION_SUBPROCESS
+    monkeypatch.setattr(
+        daemon,
+        "_build_subprocess_command",
+        lambda *, incremental: [sys.executable, "-c", _tree_probe_script(pidfile)],
+    )
+
+    daemon.start()
+
+    parent_pid = grandchild_pid = None
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if pidfile.is_file():
+            parts = pidfile.read_text(encoding="ascii").split()
+            if len(parts) == 2:
+                parent_pid, grandchild_pid = int(parts[0]), int(parts[1])
+                break
+        time.sleep(0.02)
+    assert parent_pid and grandchild_pid, "build tree never reported its PIDs"
+    assert _alive(parent_pid) and _alive(grandchild_pid), "tree not alive pre-stop"
+    # The child leads its own session; the grandchild shares that group.
+    assert os.getpgid(parent_pid) == parent_pid
+
+    started = time.monotonic()
+    daemon.stop(timeout=10.0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 8.0, f"stop() was not bounded: {elapsed:.2f}s"
+    assert daemon.is_running() is False
+    for pid in (parent_pid, grandchild_pid):
+        for _ in range(250):
+            if _terminated(pid):
+                break
+            time.sleep(0.02)
+        assert _terminated(pid), f"pid {pid} survived stop()"
+
+
+def _tree_probe_script_sigterm_ignoring_grandchild(pidfile: Path) -> str:
+    """A build stand-in whose grandchild ignores SIGTERM and inherits pipes.
+
+    The group leader spawns a pipe-inheriting grandchild that installs a
+    SIGTERM-ignoring handler, waits for it to settle, records both PIDs, then
+    blocks on the default SIGTERM handler. On a group SIGTERM the leader exits
+    immediately -- the graceful-leader wait succeeds -- but the grandchild
+    survives and keeps the inherited stdout/stderr open, proving leader exit is
+    NOT whole-tree death. Only the group SIGKILL escalation reaps it.
+    """
+    return textwrap.dedent(
+        f"""
+        import os, subprocess, sys, time
+        gc = subprocess.Popen([
+            sys.executable, "-c",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(120)",
+        ])
+        # Let the grandchild install its SIGTERM-ignoring handler before the
+        # test can observe the PIDs and stop the daemon, so the group SIGTERM is
+        # reliably ignored and the fix's SIGKILL escalation is what reaps it.
+        time.sleep(0.5)
+        with open({str(pidfile)!r}, "w") as fh:
+            fh.write(str(os.getpid()) + " " + str(gc.pid))
+            fh.flush()
+            os.fsync(fh.fileno())
+        time.sleep(120)
+        """
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group reaping")
+def test_stop_reaps_sigterm_ignoring_pipe_inheriting_grandchild(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    """Graceful leader exit is not whole-tree death: a pipe-inheriting
+    grandchild that ignores SIGTERM must still be escalated to a group SIGKILL
+    and reaped within a bounded stop()."""
+    root = _init_repo(tmp_path, "sigterm_ignoring_gc")
+    cleanup_daemons.append(root)
+    monkeypatch.setenv(
+        source_graph_daemon.BUILD_EXECUTION_ENV,
+        source_graph_daemon.BUILD_EXECUTION_SUBPROCESS,
+    )
+    pidfile = tmp_path / "sigterm_ignoring_pids.txt"
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    assert daemon._build_execution == source_graph_daemon.BUILD_EXECUTION_SUBPROCESS
+    monkeypatch.setattr(
+        daemon,
+        "_build_subprocess_command",
+        lambda *, incremental: [
+            sys.executable, "-c",
+            _tree_probe_script_sigterm_ignoring_grandchild(pidfile),
+        ],
+    )
+
+    daemon.start()
+
+    parent_pid = grandchild_pid = None
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if pidfile.is_file():
+            parts = pidfile.read_text(encoding="ascii").split()
+            if len(parts) == 2:
+                parent_pid, grandchild_pid = int(parts[0]), int(parts[1])
+                break
+        time.sleep(0.02)
+    assert parent_pid and grandchild_pid, "build tree never reported its PIDs"
+    assert _alive(parent_pid) and _alive(grandchild_pid), "tree not alive pre-stop"
+    # The leader leads its own session; the SIGTERM-ignoring grandchild shares
+    # exactly that owned group, so the group SIGKILL escalation targets it.
+    assert os.getpgid(parent_pid) == parent_pid
+    assert os.getpgid(grandchild_pid) == parent_pid
+
+    started = time.monotonic()
+    daemon.stop(timeout=10.0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 8.0, f"stop() was not bounded: {elapsed:.2f}s"
+    assert daemon.is_running() is False
+    # The leader exits on the group SIGTERM (graceful-leader wait succeeds); the
+    # grandchild is reaped only because that path escalates the exact owned
+    # group to SIGKILL and boundedly waits for its inherited pipes to close.
+    for pid in (parent_pid, grandchild_pid):
+        for _ in range(250):
+            if _terminated(pid):
+                break
+            time.sleep(0.02)
+        assert _terminated(pid), f"pid {pid} survived stop()"
+
+
+def _tree_probe_script_leader_exits(pidfile: Path) -> str:
+    """A build stand-in whose group leader exits while its grandchild lives.
+
+    The group leader spawns a grandchild that inherits the daemon's
+    stdout/stderr pipes, records both PIDs, then exits immediately. The
+    grandchild keeps the inherited pipes open by sleeping, so a leader-only
+    reap would strand ``communicate`` and a since-reaped leader PID must
+    never be widened into an unrelated group. The still-alive grandchild
+    keeps the owned pgid reserved, so the bounded drain-time group SIGKILL
+    reaps exactly it.
+    """
+    return textwrap.dedent(
+        f"""
+        import os, subprocess, sys, time
+        gc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        with open({str(pidfile)!r}, "w") as fh:
+            fh.write(str(os.getpid()) + " " + str(gc.pid))
+            fh.flush()
+            os.fsync(fh.fileno())
+        # Group leader exits now; the pipe-inheriting grandchild survives.
+        """
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group reaping")
+def test_stop_is_bounded_when_group_leader_exits_but_grandchild_survives(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    root = _init_repo(tmp_path, "leader_exit")
+    cleanup_daemons.append(root)
+    monkeypatch.setenv(
+        source_graph_daemon.BUILD_EXECUTION_ENV,
+        source_graph_daemon.BUILD_EXECUTION_SUBPROCESS,
+    )
+    pidfile = tmp_path / "leader_exit_pids.txt"
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    monkeypatch.setattr(
+        daemon,
+        "_build_subprocess_command",
+        lambda *, incremental: [
+            sys.executable, "-c", _tree_probe_script_leader_exits(pidfile),
+        ],
+    )
+
+    daemon.start()
+
+    parent_pid = grandchild_pid = None
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if pidfile.is_file():
+            parts = pidfile.read_text(encoding="ascii").split()
+            if len(parts) == 2:
+                parent_pid, grandchild_pid = int(parts[0]), int(parts[1])
+                break
+        time.sleep(0.02)
+    assert parent_pid and grandchild_pid, "build tree never reported its PIDs"
+
+    # Wait until the owned group leader has exited (zombie or gone) while the
+    # pipe-inheriting grandchild is still alive -- the exact residual case.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if _terminated(parent_pid) and not _terminated(grandchild_pid):
+            break
+        time.sleep(0.02)
+    assert _terminated(parent_pid), "group leader never exited"
+    assert not _terminated(grandchild_pid), "grandchild died before stop()"
+    # The surviving grandchild still names the owned group by the leader's pid.
+    assert os.getpgid(grandchild_pid) == parent_pid
+
+    started = time.monotonic()
+    daemon.stop(timeout=10.0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 8.0, f"stop() drain was not bounded: {elapsed:.2f}s"
+    assert daemon.is_running() is False
+    for _ in range(250):
+        if _terminated(grandchild_pid):
+            break
+        time.sleep(0.02)
+    assert _terminated(grandchild_pid), "grandchild survived stop() after leader exit"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group reaping")
+def test_exited_group_leader_pipe_inheriting_grandchild(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    """``_terminate_build_process`` alone reaps the exact owned group when the
+    leader has already exited but a same-group, pipe-inheriting grandchild
+    survives -- without relying on the drain loop and without ever widening to
+    a since-reaped leader's recycled PID.
+    """
+    root = _init_repo(tmp_path, "exited_leader_grandchild")
+    cleanup_daemons.append(root)
+    pidfile = tmp_path / "exited_leader_direct_pids.txt"
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+
+    # Spawn the exact residual tree directly and register it as the owned build
+    # process (leading its own session, holding real stdout/stderr pipes), so
+    # the reaping authority under test is _terminate_build_process itself.
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _tree_probe_script_leader_exits(pidfile)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    daemon._build_process = proc
+    daemon._build_pgid = proc.pid
+    try:
+        parent_pid = grandchild_pid = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if pidfile.is_file():
+                parts = pidfile.read_text(encoding="ascii").split()
+                if len(parts) == 2:
+                    parent_pid, grandchild_pid = int(parts[0]), int(parts[1])
+                    break
+            time.sleep(0.02)
+        assert parent_pid and grandchild_pid, "build tree never reported its PIDs"
+        assert proc.pid == parent_pid
+
+        # Reach the exact residual state: owned leader exited (zombie/gone)
+        # while the pipe-inheriting grandchild still names the owned group.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if _terminated(parent_pid) and not _terminated(grandchild_pid):
+                break
+            time.sleep(0.02)
+        assert _terminated(parent_pid), "group leader never exited"
+        assert not _terminated(grandchild_pid), "grandchild died before terminate"
+        assert os.getpgid(grandchild_pid) == parent_pid
+
+        started = time.monotonic()
+        daemon._terminate_build_process()
+        elapsed = time.monotonic() - started
+        assert elapsed < 6.0, f"_terminate_build_process was not bounded: {elapsed:.2f}s"
+
+        for _ in range(250):
+            if _terminated(grandchild_pid):
+                break
+            time.sleep(0.02)
+        assert _terminated(grandchild_pid), (
+            "grandchild survived _terminate_build_process() after leader exit"
+        )
+    finally:
+        # Bounded drain closes the residual pipes; the group is already dead.
+        daemon._drain_after_stop(proc, proc.pid)
+
+
+def test_new_process_group_popen_kwargs_is_platform_appropriate(monkeypatch):
+    monkeypatch.setattr(source_graph_daemon.os, "name", "posix")
+    assert (
+        source_graph_daemon.SourceGraphDaemon._new_process_group_popen_kwargs()
+        == {"start_new_session": True}
+    )
+
+    monkeypatch.setattr(source_graph_daemon.os, "name", "nt")
+    win_kwargs = source_graph_daemon.SourceGraphDaemon._new_process_group_popen_kwargs()
+    assert set(win_kwargs) == {"creationflags"}
+    assert win_kwargs["creationflags"] == getattr(
+        source_graph_daemon.subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+    )
+
+
+class _FakeLiveProcess:
+    """A live, un-reaped child stand-in for platform-branch signalling tests."""
+
+    def __init__(self, pid: int, events: list) -> None:
+        self.pid = pid
+        self.returncode = None
+        self._events = events
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self._events.append("terminate")
+
+    def kill(self):
+        self._events.append("kill")
+
+
+def test_posix_and_macos_stop_signals_exact_owned_process_group(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "posix_group")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    monkeypatch.setattr(source_graph_daemon.os, "name", "posix")
+    # Simulated macOS shares the POSIX killpg path (Linux vs. Darwin alike).
+    monkeypatch.setattr(source_graph_daemon.sys, "platform", "darwin")
+    sent: list = []
+    monkeypatch.setattr(
+        source_graph_daemon.os, "killpg", lambda pgid, sig: sent.append((pgid, sig))
+    )
+    proc = _FakeLiveProcess(909, sent)
+
+    daemon._signal_process_tree(proc, 909, graceful=True)
+    daemon._signal_process_tree(proc, 909, graceful=False)
+
+    # Exactly the owned group, escalating SIGTERM -> SIGKILL; the single-child
+    # fallback (terminate/kill) is never used when the group identity is known.
+    assert sent == [(909, signal.SIGTERM), (909, signal.SIGKILL)]
+
+
+def test_windows_stop_signals_tree_via_taskkill(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "win_group")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    monkeypatch.setattr(source_graph_daemon.os, "name", "nt")
+    calls: list = []
+    monkeypatch.setattr(
+        source_graph_daemon.subprocess,
+        "run",
+        lambda args, **kwargs: calls.append(list(args)),
+    )
+    proc = _FakeLiveProcess(4321, calls)
+
+    daemon._signal_process_tree(proc, None, graceful=True)
+    daemon._signal_process_tree(proc, None, graceful=False)
+
+    # /T reaps the whole tree; /F escalates. Exact owned PID, never a guess.
+    assert calls == [
+        ["taskkill", "/T", "/PID", "4321"],
+        ["taskkill", "/F", "/T", "/PID", "4321"],
+    ]
+
+
+def test_terminate_is_noop_without_owned_process(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "no_owned_proc")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    signalled: list = []
+    monkeypatch.setattr(
+        source_graph_daemon.os, "killpg", lambda *a: signalled.append(a)
+    )
+
+    daemon._build_process = None
+    daemon._terminate_build_process()  # must not raise, must signal nothing
+
+    assert signalled == []
+
+
+def test_terminate_fails_closed_on_already_exited_process(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "exited_proc")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    signalled: list = []
+    monkeypatch.setattr(
+        source_graph_daemon.os, "killpg", lambda *a: signalled.append(("killpg", a))
+    )
+
+    class _ExitedProcess:
+        pid = 777
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            signalled.append("terminate")
+
+        def kill(self):
+            signalled.append("kill")
+
+    daemon._build_process = _ExitedProcess()  # type: ignore[assignment]
+    # A since-recycled group identity must never be targeted once the owned
+    # child has exited/been reaped.
+    daemon._build_pgid = 777
+    daemon._terminate_build_process()
+
+    assert signalled == []
+
+
+class _FakeDrainStream:
+    """A pipe stand-in that records whether the bounded drain closed it."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _DrainProbeProcess:
+    """A ``Popen`` stand-in whose ``communicate`` always times out.
+
+    This forces ``_drain_after_stop`` down its lingering-writer branch so the
+    force-signal decision is driven purely by whether the leader is still exact
+    live and un-reaped (``poll() is None``) -- the drain-after-stop-pid-reuse
+    guard under test. ``wait`` never blocks so the bounded reap is observable.
+    """
+
+    def __init__(self, *, pid: int, alive: bool) -> None:
+        self.pid = pid
+        self._alive = alive
+        self.returncode = None if alive else 0
+        self.stdout = _FakeDrainStream()
+        self.stderr = _FakeDrainStream()
+        self.wait_calls: list = []
+
+    def communicate(self, timeout=None):
+        raise subprocess.TimeoutExpired(cmd="build-drain", timeout=timeout)
+
+    def poll(self):
+        return None if self._alive else self.returncode
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        return self.returncode if self.returncode is not None else 0
+
+
+def test_drain_after_stop_force_signals_only_live_leader_posix(tmp_path, monkeypatch):
+    """POSIX positive path: a still-live, un-reaped leader may be group-killed
+    one final time when a writer lingers past the drain timeout -- its PID (==
+    the owned pgid) is provably still reserved, so the signal cannot recycle."""
+    root = _init_repo(tmp_path, "drain_posix_live")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    monkeypatch.setattr(source_graph_daemon.os, "name", "posix")
+    signalled: list = []
+    monkeypatch.setattr(
+        source_graph_daemon.os, "killpg", lambda pgid, sig: signalled.append((pgid, sig))
+    )
+    proc = _DrainProbeProcess(pid=909, alive=True)
+
+    daemon._drain_after_stop(proc, 909, timeout=0.01)
+
+    assert signalled == [(909, signal.SIGKILL)]
+    # The bounded drain still closes the residual pipes and reaps the leader.
+    assert proc.stdout.closed and proc.stderr.closed
+    assert proc.wait_calls
+
+
+def test_drain_after_stop_never_signals_reaped_leader_posix(tmp_path, monkeypatch):
+    """POSIX regression: leader already reaped while a descendant keeps the
+    inherited pipes open (communicate times out). The since-reaped leader's
+    PID/PGID may already name an unrelated group, so NO second, stale group
+    signal is issued -- the drain still fails closed and bounded."""
+    root = _init_repo(tmp_path, "drain_posix_reaped")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    monkeypatch.setattr(source_graph_daemon.os, "name", "posix")
+    signalled: list = []
+    monkeypatch.setattr(
+        source_graph_daemon.os, "killpg", lambda *a: signalled.append(a)
+    )
+    proc = _DrainProbeProcess(pid=909, alive=False)
+
+    daemon._drain_after_stop(proc, 909, timeout=0.01)
+
+    assert signalled == []
+    # Bounded descendant-pipe drain still runs: pipes closed, leader reaped.
+    assert proc.stdout.closed and proc.stderr.closed
+    assert proc.wait_calls
+
+
+def test_drain_after_stop_force_signals_only_live_leader_windows(tmp_path, monkeypatch):
+    """Windows positive path: a still-live, un-reaped leader may be tree-killed
+    via ``taskkill /F /T`` one final time on a lingering writer."""
+    root = _init_repo(tmp_path, "drain_win_live")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    monkeypatch.setattr(source_graph_daemon.os, "name", "nt")
+    calls: list = []
+    monkeypatch.setattr(
+        source_graph_daemon.subprocess,
+        "run",
+        lambda args, **kwargs: calls.append(list(args)),
+    )
+    proc = _DrainProbeProcess(pid=4321, alive=True)
+
+    daemon._drain_after_stop(proc, None, timeout=0.01)
+
+    assert calls == [["taskkill", "/F", "/T", "/PID", "4321"]]
+    assert proc.stdout.closed and proc.stderr.closed
+
+
+def test_drain_after_stop_never_signals_reaped_leader_windows(tmp_path, monkeypatch):
+    """Windows regression: a since-reaped leader's PID may already be recycled,
+    so ``taskkill /F /T`` must never fire a second time after the drain
+    timeout; the drain still closes the residual pipes and reaps bounded."""
+    root = _init_repo(tmp_path, "drain_win_reaped")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    monkeypatch.setattr(source_graph_daemon.os, "name", "nt")
+    calls: list = []
+    monkeypatch.setattr(
+        source_graph_daemon.subprocess,
+        "run",
+        lambda args, **kwargs: calls.append(list(args)),
+    )
+    proc = _DrainProbeProcess(pid=4321, alive=False)
+
+    daemon._drain_after_stop(proc, None, timeout=0.01)
+
+    assert calls == []
+    assert proc.stdout.closed and proc.stderr.closed
+    assert proc.wait_calls
+
+
+# ---------------------------------------------------------------------------
+# 11. Cross-platform ``_terminated`` portability: on a host without a Linux
+#     ``/proc`` filesystem (e.g. macOS) a missing ``/proc/<pid>/stat`` proves
+#     nothing about the PID, so the probe must fall back to exact PID liveness
+#     and only declare a PID terminated once it has actually disappeared --
+#     never misclassifying a live PID as dead.
+# ---------------------------------------------------------------------------
+
+
+_THIS_MODULE = sys.modules[__name__]
+
+
+def test_terminated_without_procfs_falls_back_to_exact_pid_liveness(monkeypatch):
+    """No procfs -> exact liveness, never procfs FileNotFoundError as dead."""
+    monkeypatch.setattr(_THIS_MODULE, "_procfs_available", lambda: False)
+    live: set[int] = {4242}
+    monkeypatch.setattr(_THIS_MODULE, "_alive", lambda pid: pid in live)
+
+    # A live PID is NOT terminated when procfs is unavailable, even though
+    # ``open("/proc/<pid>/stat")`` would raise FileNotFoundError here.
+    assert _terminated(4242) is False
+    # It becomes terminated only once the PID has actually disappeared.
+    live.discard(4242)
+    assert _terminated(4242) is True
+
+
+def test_terminated_on_procfs_host_reports_missing_pid_entry_as_gone(monkeypatch):
+    """Procfs present but PID entry absent -> gone; a live entry -> not gone."""
+    monkeypatch.setattr(_THIS_MODULE, "_procfs_available", lambda: True)
+
+    # An impossible/never-allocated PID has no ``/proc`` entry on a procfs
+    # host, which is an unambiguous "gone" -- FileNotFoundError means absent.
+    assert _terminated(2**31 - 1) is True
+    # The running test process itself has a live, non-zombie ``/proc`` entry.
+    assert _terminated(os.getpid()) is False
+
+
+def test_procfs_available_matches_this_host():
+    """The procfs probe agrees with the host it actually runs on."""
+    assert _procfs_available() is os.path.isdir("/proc/self")

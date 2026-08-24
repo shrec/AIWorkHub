@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import errno
 import fnmatch
 import hashlib
 import json
@@ -221,6 +222,42 @@ class SourceGraphBuildInProgressError(SourceGraphError):
     """Another process currently owns this repository's index writer lease."""
 
 
+class SourceGraphLockUnavailableError(SourceGraphError):
+    """Advisory lock failed for a reason other than genuine contention."""
+
+    def __init__(
+        self,
+        *,
+        operation: str,
+        errno_value: int | None,
+        path: str,
+        phase: str = "acquire",
+    ) -> None:
+        self.operation = operation
+        self.errno = errno_value
+        self.path = path
+        self.phase = phase
+        if errno_value is None:
+            self.errno_name = "unknown"
+        else:
+            self.errno_name = errno.errorcode.get(errno_value, str(errno_value))
+        super().__init__(
+            "source_graph_lock_unavailable:"
+            f"phase={phase} operation={operation} "
+            f"errno={self.errno_name} path={path}"
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "reason": "source_graph_lock_unavailable",
+            "phase": self.phase,
+            "operation": self.operation,
+            "errno": self.errno_name,
+            "errno_value": self.errno,
+            "path": self.path,
+        }
+
+
 class SourceGraphBuildFailedError(SourceGraphError):
     """A build's per-file write containment tripped its floor.
 
@@ -330,6 +367,43 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     return conn
 
 
+_LOCK_CONTENTION_ERRNOS = {errno.EACCES, errno.EAGAIN}
+for _lock_errno_name in ("EWOULDBLOCK", "EDEADLK", "EDEADLOCK"):
+    _lock_errno_value = getattr(errno, _lock_errno_name, None)
+    if _lock_errno_value is not None:
+        _LOCK_CONTENTION_ERRNOS.add(_lock_errno_value)
+
+
+def _portable_lock_path(repo_root: Path, lock_path: Path) -> str:
+    try:
+        return lock_path.resolve().relative_to(Path(repo_root).resolve()).as_posix()
+    except ValueError:
+        return lock_path.name
+
+
+def _is_lock_contention(exc: BaseException) -> bool:
+    if isinstance(exc, BlockingIOError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return exc.errno in _LOCK_CONTENTION_ERRNOS
+
+
+def _lock_unavailable(
+    exc: OSError, *, repo_root: Path, lock_path: Path, operation: str
+) -> SourceGraphLockUnavailableError:
+    return SourceGraphLockUnavailableError(
+        operation=operation,
+        errno_value=getattr(exc, "errno", None),
+        path=_portable_lock_path(repo_root, lock_path),
+        phase="acquire",
+    )
+
+
+def _index_write_lease_platform() -> str:
+    return os.name
+
+
 @contextmanager
 def index_write_lease(repo_root: Path):
     """Try to own the single cross-process writer lease for ``repo_root``.
@@ -337,6 +411,8 @@ def index_write_lease(repo_root: Path):
     OS advisory locks are released automatically when a process exits, so a
     crashed/reloaded VS Code child cannot leave stale ownership. The lock is
     repository-local and therefore preserves multi-repository isolation.
+    Genuine nonblocking contention yields False; unsupported or broken lock
+    backends raise SourceGraphLockUnavailableError and never proceed unlocked.
     """
 
     lock_path = resolve_db_path(repo_root).with_name("index.lock")
@@ -350,20 +426,27 @@ def index_write_lease(repo_root: Path):
             handle.flush()
         handle.seek(0)
         try:
-            if os.name == "nt":
+            if _index_write_lease_platform() == "nt":
                 import msvcrt
 
                 # Windows may retain a byte-range lock for a very short window
                 # while another build handle is closing. Avoid surfacing that
                 # release race as a false permanent build-in-progress state,
                 # while remaining bounded when another writer is genuinely
-                # active.
+                # active. Non-contention failures fail immediately.
                 deadline = time.monotonic() + 1.0
                 while True:
                     try:
                         msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                         break
-                    except OSError:
+                    except OSError as exc:
+                        if not _is_lock_contention(exc):
+                            raise _lock_unavailable(
+                                exc,
+                                repo_root=repo_root,
+                                lock_path=lock_path,
+                                operation="msvcrt.locking",
+                            ) from exc
                         if time.monotonic() >= deadline:
                             raise
                         time.sleep(0.01)
@@ -373,14 +456,28 @@ def index_write_lease(repo_root: Path):
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
-        except (BlockingIOError, OSError):
+        except BlockingIOError:
             acquired = False
+        except OSError as exc:
+            if _is_lock_contention(exc):
+                acquired = False
+            else:
+                raise _lock_unavailable(
+                    exc,
+                    repo_root=repo_root,
+                    lock_path=lock_path,
+                    operation=(
+                        "msvcrt.locking"
+                        if _index_write_lease_platform() == "nt"
+                        else "flock"
+                    ),
+                ) from exc
         yield acquired
     finally:
         if acquired:
             try:
                 handle.seek(0)
-                if os.name == "nt":
+                if _index_write_lease_platform() == "nt":
                     import msvcrt
 
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
@@ -2311,6 +2408,11 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
 # of after_file" -- used to resume strictly past a file that was fully scanned
 # (e.g. the last file before the scan-file cap) without re-emitting its matches.
 _BODYGREP_SKIP_ALL_LINES = 1 << 62
+# ``int()`` enforces Python's default max-str-digits limit (4300), but the
+# cursor line offset is at most ``_BODYGREP_SKIP_ALL_LINES`` (19 decimal
+# digits).  A longer ASCII-decimal field is always forged, so bound it here
+# and never hand it to ``int()``.
+_BODYGREP_MAX_CURSOR_LINE_DIGITS = len(str(_BODYGREP_SKIP_ALL_LINES))
 
 
 def _bodygrep_cursor_digest(term: str, target: str, budget: int) -> str:
@@ -2337,8 +2439,12 @@ def _decode_bodygrep_cursor(
     if len(parts) != 3:
         raise SourceGraphError("invalid_cursor")
     af_hex, after_line_text, digest = parts
+    # ``str.isdigit()`` accepts Unicode digits (e.g. U+00B2, U+2464) that
+    # ``int()`` cannot convert; require an exact ASCII-decimal field so the
+    # line offset is always int-convertible and never leaks a ValueError.
     if (
-        not after_line_text.isdigit()
+        len(after_line_text) > _BODYGREP_MAX_CURSOR_LINE_DIGITS
+        or not (after_line_text.isascii() and after_line_text.isdigit())
         or digest != _bodygrep_cursor_digest(term, target, budget)
     ):
         raise SourceGraphError("invalid_cursor")
@@ -2346,7 +2452,87 @@ def _decode_bodygrep_cursor(
         after_file = bytes.fromhex(af_hex).decode("utf-8")
     except (ValueError, UnicodeDecodeError) as exc:
         raise SourceGraphError("invalid_cursor") from exc
-    return (after_file, int(after_line_text))
+    # ``after_line_text`` is already a bounded ASCII-decimal field (the guard
+    # above rejects anything else), so this conversion cannot raise.
+    after_line = int(after_line_text)
+    return (after_file, after_line)
+
+
+# Line boundaries ``str.splitlines()`` recognizes.  ``\r\n`` is the only
+# two-code-point boundary; every other boundary is a single code point.
+_BODYGREP_LINE_BOUNDARY_CHARS = (
+    "\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029",
+)
+# Maximum characters handed to ``str.splitlines(keepends=True)`` at a time.
+# This keeps only a bounded number of line objects alive while staying on the
+# C-level splitter instead of a per-code-point Python loop.
+_BODYGREP_SPLIT_CHUNK_CHARS = 16384
+
+
+def _iter_splitlines(text: str):
+    """Yield lines lazily, exactly matching ``str.splitlines()``.
+
+    The bodygrep hot path must not materialize a full ``splitlines`` list while
+    the full decoded string is still alive.  Chunking the text and delegating
+    each chunk to the C-level ``str.splitlines(keepends=True)`` keeps the hot
+    loop fast (a per-code-point Python loop is ~40x slower on non-ASCII text)
+    while only a bounded number of line objects exist at once.
+
+    Absolute ``text`` indices are tracked so a single very long line is never
+    rebuilt incrementally (which would be O(n^2)); it is sliced once when it
+    terminates.  The one multi-code-point boundary ``\r\n`` is re-joined when a
+    chunk ends in a bare ``\r`` and the next begins with ``\n``.
+    """
+    length = len(text)
+    if length == 0:
+        return
+    chunk = _BODYGREP_SPLIT_CHUNK_CHARS
+    line_start = 0
+    prev_cr = False
+    for start in range(0, length, chunk):
+        pos = start
+        for part in text[start:start + chunk].splitlines(keepends=True):
+            part_len = len(part)
+            if prev_cr and part.startswith("\n"):
+                # The previous chunk ended in a bare ``\r``; this ``\n``
+                # completes a single ``\r\n`` boundary, so no empty line begins
+                # here -- just consume the ``\n`` as half of that boundary.
+                prev_cr = False
+                line_start = pos + part_len
+            elif part.endswith(_BODYGREP_LINE_BOUNDARY_CHARS):
+                terminator_len = 2 if part.endswith("\r\n") else 1
+                yield text[line_start:pos + part_len - terminator_len]
+                line_start = pos + part_len
+                # A bare ``\r`` terminator at a chunk edge pairs with the next
+                # chunk's leading ``\n`` into one ``\r\n`` boundary; a part
+                # already ending in ``\r\n`` ends in ``\n`` and cannot set this.
+                prev_cr = part.endswith("\r")
+            else:
+                # Unterminated tail: the line continues into the next chunk.
+                prev_cr = False
+            pos += part_len
+    if line_start < length:
+        yield text[line_start:length]
+
+
+def _bodygrep_bytes_proves_no_match(needle: str, raw: bytes) -> bool:
+    """Return True only when ``raw`` provably cannot hold a casefold match.
+
+    This is the sound pre-decode rejection for the scan hot path.  When both the
+    (already casefolded) needle and the raw bytes are pure ASCII,
+    ``str.casefold()`` on any line is exactly ASCII lowercasing, so a
+    case-insensitive ASCII byte substring search is exact: absent there means no
+    line can match.  The search is a copy-free ``re.IGNORECASE`` bytes scan
+    (bytes patterns fold only ASCII letters), so no full-size lowercase copy of
+    ``raw`` is ever materialized on the rejection path.  Any non-ASCII needle or
+    non-ASCII bytes cannot be proven
+    absent this way (casefold can expand ``\\u00df`` to ``ss`` or map ``U+212A``
+    to ``k``), so those candidates fall through to the decode path and keep
+    Unicode casefold semantics exact.
+    """
+    if not needle.isascii() or not raw.isascii():
+        return False
+    return re.search(re.escape(needle.encode("ascii")), raw, re.IGNORECASE) is None
 
 
 def bodygrep_query(
@@ -2468,14 +2654,27 @@ def bodygrep_query(
         bytes_scanned += len(raw)
         files_scanned += 1
         last_scanned_file = file_path
-        # Skip lines already returned on a prior page for the resume file.
-        start_after = resume_line if file_path == resume_file else 0
+        # Reject files that provably cannot match before paying for a UTF-8
+        # decode (or any line split), falling back to decode whenever the byte
+        # filter cannot prove absence so Unicode casefold semantics stay exact.
+        if _bodygrep_bytes_proves_no_match(needle, raw):
+            # Release the candidate before the next read so two raw buffers are
+            # never simultaneously live on the no-match fast path.
+            del raw
+            continue
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
+            del raw
             continue
+        # Drop the raw bytes now: a matching file no longer needs them, and
+        # holding raw + full decoded text + a splitlines list simultaneously is
+        # the allocation shape this hot path must avoid.
+        del raw
+        # Skip lines already returned on a prior page for the resume file.
+        start_after = resume_line if file_path == resume_file else 0
         hit_budget = False
-        for line_number, line in enumerate(text.splitlines(), start=1):
+        for line_number, line in enumerate(_iter_splitlines(text), start=1):
             if line_number <= start_after:
                 continue
             if needle not in line.casefold():
@@ -2501,6 +2700,10 @@ def bodygrep_query(
                     term=term, target=normalized_target, budget=budget,
                 )
                 break
+        # End the decoded string's lifetime before the next candidate is read:
+        # a matching file's full text must not stay live alongside the next
+        # candidate's raw bytes (and, once decoded, its text).
+        del text
         if hit_budget:
             break
     if next_cursor is None and scan_truncated and last_scanned_file is not None:

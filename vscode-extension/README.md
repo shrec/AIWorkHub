@@ -12,10 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.52
+## What's new in 0.10.53
 
-- Skill Runtime Packets now reject every Unicode format character, closing
-  invisible ZWJ, ZWNJ, word-joiner and BOM secret-key splitting bypasses.
+- Source Graph body search avoids persistent scan-sized heap growth, query
+  caches evict old index generations and daemon shutdown reaps its process
+  tree. The dashboard also exposes repository coding-foundation evidence.
 
 ## Architecture at a glance
 

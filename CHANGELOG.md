@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.53] - 2026-08-24
+
+### Added
+
+- Dashboard coding-foundation cards expose repository rules, skills and typed
+  tool-recipe evidence without replacing truthful unavailable states.
+
+### Fixed
+
+- Source Graph `bodygrep` now filters on bytes before decoding and streams
+  matching lines, preventing repeated 32 MiB scan bursts from permanently
+  inflating the long-lived MCP server heap.
+- Source Graph query caching is bounded and evicts obsolete index generations
+  instead of retaining unreachable results after each daemon refresh.
+- Source Graph daemon shutdown terminates and reaps the exact spawned process
+  tree, including abnormal and interrupted lifecycle paths.
+
 ## [0.10.52] - 2026-08-24
 
 ### Fixed

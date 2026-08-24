@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import json
 import os
+import select
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -184,6 +186,12 @@ class SourceGraphDaemon:
         )
         self._process_lock = threading.Lock()
         self._build_process: subprocess.Popen[str] | None = None
+        # Exact owned process-group identity of ``_build_process`` (its
+        # session/group-leader pid on POSIX; ``None`` on Windows, where the
+        # tree is reaped by PID via ``taskkill /T``). Captured while the child
+        # is un-reaped so a later PID reuse can never target an unrelated
+        # process or group. See ``_terminate_build_process``.
+        self._build_pgid: int | None = None
         # Power-loss recovery: single-flight writable recovery before any
         # readonly probe when a non-empty SQLite journal/WAL exists.
         self._recovery_lock = threading.Lock()
@@ -310,17 +318,279 @@ class SourceGraphDaemon:
             return "succeeded", ""
         return "failed", error or f"refresh_terminal_status:{status}"
 
+    @staticmethod
+    def _new_process_group_popen_kwargs() -> dict[str, Any]:
+        """Platform-appropriate ``Popen`` kwargs that make the build subprocess
+        the leader of a fresh, owned process group/session.
+
+        A dedicated group/session is what lets ``stop()`` reap the ENTIRE build
+        tree -- including ``ProcessPoolExecutor`` workers that inherit this
+        daemon's stdout/stderr pipes -- as a single unit. Without it, killing
+        only the parent leaves those grandchildren holding the pipe write-ends
+        open, which would deadlock any subsequent ``communicate()``.
+        """
+        if os.name == "nt":
+            # A new process group is required for a tree ``taskkill /T`` and
+            # for CTRL-BREAK signalling. ``CREATE_NEW_PROCESS_GROUP`` only
+            # exists on Windows; fall back to ``0`` so the simulated-Windows
+            # branch is importable/exercisable on POSIX test hosts.
+            return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+        # ``start_new_session`` runs ``setsid()`` in the child, making it a
+        # session/group leader whose pgid equals its pid -- the exact owned
+        # identity ``os.killpg`` targets.
+        return {"start_new_session": True}
+
+    def _signal_process_tree(
+        self,
+        process: subprocess.Popen[str],
+        pgid: int | None,
+        *,
+        graceful: bool,
+    ) -> None:
+        """Signal the entire owned build tree, never an unrelated process/group.
+
+        Callers guarantee ``process`` is still live and un-reaped (its PID
+        therefore cannot have been reused), so signalling the exact captured
+        group is safe. If the owned identity is unknown, this fails closed to
+        the single child handle rather than guessing another group.
+        """
+        if os.name == "nt":
+            args = ["taskkill", "/T", "/PID", str(process.pid)]
+            if not graceful:
+                args.insert(1, "/F")
+            try:
+                subprocess.run(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5.0,
+                    check=False,
+                )
+                return
+            except (OSError, subprocess.SubprocessError):
+                # taskkill unavailable -- fall back to the exact child handle.
+                self._signal_single_child(process, graceful=graceful)
+                return
+        if pgid is None or pgid <= 0:
+            # Unknown owned identity: fail closed to the exact child only.
+            self._signal_single_child(process, graceful=graceful)
+            return
+        sig = signal.SIGTERM if graceful else signal.SIGKILL
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            # The group is gone or not ours to signal -- never widen the blast
+            # radius; fall back to the exact child handle we still own.
+            self._signal_single_child(process, graceful=graceful)
+
+    @staticmethod
+    def _signal_single_child(
+        process: subprocess.Popen[str], *, graceful: bool
+    ) -> None:
+        try:
+            if graceful:
+                process.terminate()
+            else:
+                process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+    @staticmethod
+    def _wait_bounded(process: subprocess.Popen[str], *, timeout: float) -> bool:
+        try:
+            process.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
+    @staticmethod
+    def _pipe_write_end_still_open(process: subprocess.Popen[str]) -> bool:
+        """True iff a live process still holds the write-end of an inherited
+        stdout/stderr pipe -- i.e. a same-group descendant we spawned is alive.
+
+        This daemon's build pipes are private: only the build subprocess and
+        the descendants that inherited its file descriptors can hold their
+        write-ends. Once the group leader has exited, a still-open write-end is
+        therefore race-free proof that an owned grandchild survives and keeps
+        the owned process group non-empty (which reserves the leader's
+        PID/PGID against reuse). ``select.poll`` reports ``POLLHUP`` on the
+        read-end exactly when every write-end is closed, so this is
+        non-destructive (no bytes are consumed) and never blocks. Windows lacks
+        ``select.poll``; there we cannot make this determination and
+        conservatively report "open" so no separate reuse guard weakens.
+        """
+        if os.name == "nt" or not hasattr(select, "poll"):
+            return True
+        poller = select.poll()
+        registered = 0
+        for stream in (getattr(process, "stdout", None), getattr(process, "stderr", None)):
+            if stream is None:
+                continue
+            try:
+                if stream.closed:
+                    continue
+                fd = stream.fileno()
+            except (ValueError, OSError):
+                continue
+            poller.register(fd, select.POLLIN)
+            registered += 1
+        if registered == 0:
+            return False
+        hangups = 0
+        for _fd, event in poller.poll(0):
+            if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                hangups += 1
+        # A pipe with an open, idle write-end yields no poll event at all; only
+        # a fully-closed write-end reports a hangup. If every registered pipe
+        # hung up, no owned descendant remains.
+        return hangups < registered
+
+    def _wait_owned_group_pipes_closed(
+        self, process: subprocess.Popen[str], *, timeout: float
+    ) -> bool:
+        """Bounded wait until no owned descendant holds an inherited pipe open.
+
+        Used only after the group has been signalled: the SIGKILL closes the
+        surviving grandchild's inherited write-ends promptly, so this converges
+        near-instantly and is capped by ``timeout`` regardless.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self._pipe_write_end_still_open(process):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+        return True
+
+    def _reap_owned_group_descendants(
+        self,
+        process: subprocess.Popen[str],
+        pgid: int | None,
+        *,
+        grace_first: bool,
+    ) -> None:
+        """Reap any owned descendant that outlived the exited group leader.
+
+        The leader's exit is NOT proof the whole tree died: a same-group
+        descendant that inherited this daemon's stdout/stderr pipes may still
+        be alive. A still-open inherited pipe write-end is race-free proof that
+        such a descendant survives, which keeps the owned process group
+        non-empty and therefore reserves the leader's PID/PGID against reuse --
+        so signalling the exact captured group is still safe. Fails closed
+        (signals nothing) when no such descendant survives, the owned identity
+        is unknown, or on Windows (no reserved-group guarantee). ``grace_first``
+        gives a descendant that has not yet received a group SIGTERM a graceful
+        chance before the group SIGKILL; when the group was already SIGTERM'd it
+        is ``False`` so a signal-ignoring descendant is escalated immediately.
+        """
+        if os.name == "nt" or pgid is None or pgid <= 0:
+            return
+        if not self._pipe_write_end_still_open(process):
+            return
+        if grace_first:
+            self._signal_process_tree(process, pgid, graceful=True)
+            if self._wait_owned_group_pipes_closed(process, timeout=2.0):
+                return
+        self._signal_process_tree(process, pgid, graceful=False)
+        self._wait_owned_group_pipes_closed(process, timeout=2.0)
+
     def _terminate_build_process(self) -> None:
+        """Terminate and reap the ENTIRE owned build process tree with bounded
+        waits.
+
+        The build subprocess leads its own process group/session (see
+        ``_run_build_subprocess``), so a graceful group SIGTERM followed, only
+        if needed, by a group SIGKILL kills its ``ProcessPoolExecutor`` workers
+        too. Fails closed when no owned identity survives so a reused PID/PGID
+        is never targeted.
+        """
         with self._process_lock:
             process = self._build_process
-        if process is None or process.poll() is not None:
+            pgid = self._build_pgid
+        if process is None:
             return
-        process.terminate()
+        if process.poll() is None:
+            # The leader is still live and un-reaped, so its PID (== the owned
+            # pgid) cannot have been recycled: signal the exact owned group and
+            # bound each wait on the leader itself.
+            self._signal_process_tree(process, pgid, graceful=True)
+            if self._wait_bounded(process, timeout=2.0):
+                # The leader exited, but that is not proof the whole tree died:
+                # a pipe-inheriting grandchild can ignore the group SIGTERM and
+                # outlive it. It already received that group SIGTERM, so escalate
+                # any survivor straight to a group SIGKILL and bound the wait on
+                # inherited-pipe closure.
+                self._reap_owned_group_descendants(process, pgid, grace_first=False)
+                return
+            self._signal_process_tree(process, pgid, graceful=False)
+            self._wait_bounded(process, timeout=2.0)
+            # The group SIGKILL should have taken the whole tree, but confirm no
+            # pipe-holding descendant outlived it before returning.
+            self._reap_owned_group_descendants(process, pgid, grace_first=False)
+            return
+        # The leader has already exited/been reaped, so its PID -- and thus the
+        # owned pgid -- is now eligible for reuse; a blind ``killpg`` could hit
+        # an unrelated group. But a same-group descendant that inherited this
+        # daemon's stdout/stderr pipes may still be alive, holding the drain
+        # open and keeping the owned group non-empty. A non-empty owned group
+        # reserves the leader PID/PGID against reuse for exactly as long as
+        # that descendant lives, and a still-open inherited pipe write-end is
+        # race-free proof that the descendant -- and therefore the exact owned
+        # group -- is still ours. The leader never received our group SIGTERM,
+        # so give a survivor a graceful chance first; otherwise (no such
+        # descendant, unknown identity, or Windows, which has no reserved-group
+        # guarantee) fail closed and signal nothing.
+        self._reap_owned_group_descendants(process, pgid, grace_first=True)
+
+    def _drain_after_stop(
+        self,
+        process: subprocess.Popen[str],
+        pgid: int | None,
+        *,
+        timeout: float = 2.0,
+    ) -> None:
+        """Reap residual stdout/stderr after the tree is terminated, bounded.
+
+        The owned tree is already dead, so its inherited pipe write-ends are
+        closed and ``communicate`` reaches EOF promptly. If a writer somehow
+        lingers past the timeout, force one final tree kill -- but ONLY while
+        the original leader is still exact live and un-reaped, so its PID (==
+        the owned pgid) is provably still reserved and the group signal cannot
+        land on a recycled PID/PGID. Once the leader has been reaped that
+        identity is eligible for reuse, so we never issue a second, stale group
+        signal; we fail closed, close the pipes, and give up bounded rather
+        than block the daemon thread forever.
+        """
         try:
-            process.wait(timeout=2.0)
+            process.communicate(timeout=timeout)
+            return
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=2.0)
+            pass
+        # Establish exact live/un-reaped leader identity before force-signalling:
+        # a since-reaped leader's PID (== the owned pgid) may already have been
+        # recycled onto an unrelated process/group, so signalling it would widen
+        # the blast radius. Fail closed and only drain when it cannot be proven
+        # live and un-reaped.
+        if process.poll() is None:
+            self._signal_process_tree(process, pgid, graceful=False)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        self._wait_bounded(process, timeout=timeout)
+
+    def _build_subprocess_command(self, *, incremental: bool) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "aiworkhub.source_graph_daemon",
+            "--build-once",
+            str(self.repo_root),
+            "--incremental" if incremental else "--full",
+        ]
 
     def _has_pending_journal(self) -> bool:
         """True when a non-empty SQLite journal or WAL sidecar exists for the
@@ -569,14 +839,7 @@ class SourceGraphDaemon:
             self._recovery_lock.release()
 
     def _run_build_subprocess(self, *, incremental: bool) -> dict[str, Any]:
-        command = [
-            sys.executable,
-            "-m",
-            "aiworkhub.source_graph_daemon",
-            "--build-once",
-            str(self.repo_root),
-            "--incremental" if incremental else "--full",
-        ]
+        command = self._build_subprocess_command(incremental=incremental)
         child_env = os.environ.copy()
         # A source checkout may be imported by pytest/editor tooling without
         # being installed into ``sys.executable``. Preserve the exact package
@@ -594,9 +857,15 @@ class SourceGraphDaemon:
             stderr=subprocess.PIPE,
             text=True,
             env=child_env,
+            **self._new_process_group_popen_kwargs(),
         )
+        # A session/group-leader's pgid equals its pid. Capture that exact
+        # owned identity now, while the child is un-reaped, so termination can
+        # never target a recycled PID's unrelated process group.
+        pgid = None if os.name == "nt" else process.pid
         with self._process_lock:
             self._build_process = process
+            self._build_pgid = pgid
         try:
             while True:
                 try:
@@ -604,8 +873,12 @@ class SourceGraphDaemon:
                     break
                 except subprocess.TimeoutExpired:
                     if self._stop_event.is_set():
+                        # Reap the WHOLE owned tree first so no inherited-pipe
+                        # grandchild keeps the drain open, then drain residual
+                        # output with bounded waits -- never an unbounded
+                        # communicate().
                         self._terminate_build_process()
-                        stdout, stderr = process.communicate()
+                        self._drain_after_stop(process, pgid)
                         return {"kind": "stopped"}
             if process.returncode != 0:
                 detail = (stderr or stdout or f"exit_{process.returncode}").strip()
@@ -623,6 +896,7 @@ class SourceGraphDaemon:
             with self._process_lock:
                 if self._build_process is process:
                     self._build_process = None
+                    self._build_pgid = None
 
     def _execute_build(self, *, incremental: bool) -> dict[str, Any]:
         if self._build_execution == BUILD_EXECUTION_THREAD:

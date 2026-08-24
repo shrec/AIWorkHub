@@ -20,12 +20,17 @@ Run: PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q
 
 from __future__ import annotations
 
+import errno
+import inspect
 import json
+import os
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1142,6 +1147,129 @@ def test_repository_writer_lease_rejects_overlapping_build(tmp_path):
         assert acquired is True
         with pytest.raises(sg.SourceGraphBuildInProgressError, match="source_graph_build_in_progress"):
             sg.build_index(repo, incremental=True)
+
+
+def _assert_lock_unavailable(exc, *, errno_name, repo):
+    assert isinstance(exc, sg.SourceGraphLockUnavailableError)
+    text = str(exc)
+    assert "source_graph_lock_unavailable" in text
+    assert f"errno={errno_name}" in text
+    assert "operation=" in text
+    assert "phase=" in text
+    assert str(repo.resolve()) not in text
+    assert not any(part.startswith("/") and part != "/" for part in text.replace(",", " ").split())
+    assert exc.errno_name == errno_name
+    payload = exc.to_json()
+    assert payload["reason"] == "source_graph_lock_unavailable"
+    assert payload["errno"] == errno_name
+    assert payload["operation"]
+    assert payload["phase"]
+    assert str(repo.resolve()) not in json.dumps(payload)
+
+
+def test_posix_eagain_eacces_remain_build_in_progress(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "posix_contention")
+    _write(repo / "src" / "live.py", "def live():\n    return 1\n")
+    import fcntl
+
+    def _raise_eagain(*_args, **_kwargs):
+        raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(fcntl, "flock", _raise_eagain)
+    with sg.index_write_lease(repo) as acquired:
+        assert acquired is False
+    with pytest.raises(sg.SourceGraphBuildInProgressError, match="source_graph_build_in_progress"):
+        sg.build_index(repo, incremental=True)
+
+    def _raise_eacces(*_args, **_kwargs):
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(fcntl, "flock", _raise_eacces)
+    with sg.index_write_lease(repo) as acquired:
+        assert acquired is False
+    with pytest.raises(sg.SourceGraphBuildInProgressError, match="source_graph_build_in_progress"):
+        sg.build_index(repo, incremental=True)
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        errno.ENOLCK,
+        errno.EOPNOTSUPP,
+        errno.ENOSYS,
+        errno.EINVAL,
+    ],
+)
+def test_posix_non_contention_lock_errors_are_lock_unavailable(tmp_path, monkeypatch, err):
+    repo = _new_repo(tmp_path, f"posix_lock_{err}")
+    _write(repo / "src" / "live.py", "def live():\n    return 1\n")
+    import fcntl
+
+    def _raise_lock(*_args, **_kwargs):
+        raise OSError(err, os.strerror(err))
+
+    monkeypatch.setattr(fcntl, "flock", _raise_lock)
+    with pytest.raises(sg.SourceGraphLockUnavailableError) as lease_info:
+        with sg.index_write_lease(repo) as acquired:
+            raise AssertionError(f"must not proceed unlocked: {acquired}")
+    _assert_lock_unavailable(lease_info.value, errno_name=errno.errorcode[err], repo=repo)
+    with pytest.raises(sg.SourceGraphLockUnavailableError) as build_info:
+        sg.build_index(repo, incremental=True)
+    _assert_lock_unavailable(build_info.value, errno_name=errno.errorcode[err], repo=repo)
+
+
+def test_windows_byte_range_contention_stays_bounded_build_in_progress(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "windows_contention")
+    _write(repo / "src" / "live.py", "def live():\n    return 1\n")
+    calls = {"n": 0}
+
+    def locking(_fd, mode, _nbytes):
+        if mode == 2:
+            return None
+        calls["n"] += 1
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(sg, "_index_write_lease_platform", lambda: "nt")
+    monkeypatch.setitem(
+        sys.modules,
+        "msvcrt",
+        SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=locking),
+    )
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    clock = {"now": 0.0}
+
+    def monotonic():
+        clock["now"] += 0.2
+        return clock["now"]
+
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    with sg.index_write_lease(repo) as acquired:
+        assert acquired is False
+    assert calls["n"] >= 1
+    with pytest.raises(sg.SourceGraphBuildInProgressError, match="source_graph_build_in_progress"):
+        sg.build_index(repo, incremental=True)
+
+
+def test_windows_unsupported_lock_is_not_build_in_progress(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "windows_unsupported")
+    _write(repo / "src" / "live.py", "def live():\n    return 1\n")
+
+    def locking(_fd, mode, _nbytes):
+        if mode == 2:
+            return None
+        raise OSError(errno.ENOSYS, "Function not implemented")
+
+    monkeypatch.setattr(sg, "_index_write_lease_platform", lambda: "nt")
+    monkeypatch.setitem(
+        sys.modules,
+        "msvcrt",
+        SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=locking),
+    )
+    with pytest.raises(sg.SourceGraphLockUnavailableError) as info:
+        with sg.index_write_lease(repo) as acquired:
+            raise AssertionError(f"must not proceed unlocked: {acquired}")
+    _assert_lock_unavailable(info.value, errno_name="ENOSYS", repo=repo)
+    assert info.value.operation == "msvcrt.locking"
 
 
 def test_wal_readonly_query_can_read_during_writer_transaction(tmp_path):
@@ -3361,3 +3489,429 @@ def test_live_like_noop_refresh_stays_fast_with_hash_and_quality_reuse(tmp_path)
     assert r2.hash_reused == 60
     assert r2.quality_reused is True
     assert elapsed < 15.0, f"no-op refresh with hash reconciliation took {elapsed:.2f}s"
+
+
+# ---------------------------------------------------------------------------
+# Bodygrep allocation-bounded hot path (needfix-NF-2026-00414)
+# ---------------------------------------------------------------------------
+
+def test_iter_splitlines_matches_str_splitlines_byte_for_byte():
+    """The lazy splitter must reproduce ``str.splitlines()`` exactly.
+
+    Line numbers and match text depend on this being byte-for-byte identical,
+    including the ``\\r\\n`` single-boundary rule and the CPython-only single
+    code-point boundaries (``\\x1c``..``\\x85`` and the Unicode line separators).
+    """
+    corpus = [
+        "",
+        "a",
+        "a\n",
+        "\n",
+        "abc",
+        "a\nb",
+        "a\rb",
+        "a\r\nb",
+        "a\r\n",
+        "\r\n",
+        "a\vb\fc",
+        "a\x1cb",
+        "a\x1db",
+        "a\x1eb",
+        "a\x85b",
+        "a\u2028b",
+        "a\u2029b",
+        "line1\nline2\nline3\n",
+        "trailing\n",
+        "\n\n\n",
+        "x\r\ny\r\nz",
+        "no newline at end",
+        "mixed\r\nwindows\nunix\rmac",
+    ]
+    for text in corpus:
+        assert list(sg._iter_splitlines(text)) == text.splitlines(), repr(text)
+
+    boundaries = ["\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+    for left in boundaries:
+        for right in boundaries:
+            for prefix in ("", "x", "xy"):
+                for suffix in ("", "z", "zz"):
+                    text = prefix + left + "mid" + right + suffix
+                    assert list(sg._iter_splitlines(text)) == text.splitlines(), repr(text)
+
+
+def test_iter_splitlines_chunked_matches_str_splitlines_across_edges(monkeypatch):
+    """Chunked C-level splitting preserves every boundary, including CRLF.
+
+    The splitter chunks text and hands each chunk to ``str.splitlines``; a bare
+    ``\r`` at a chunk edge must re-join the next chunk's ``\n`` into one
+    ``\r\n`` boundary.  Tiny chunk sizes force boundaries onto chunk edges at
+    many offsets while byte-for-byte parity with ``str.splitlines()`` holds.
+    """
+    import random
+
+    boundaries = [
+        "\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e",
+        "\x85", "\u2028", "\u2029",
+    ]
+    atoms = ["", "a", "ab", "x", "yy", "\r", "\n", "\r\n", *boundaries]
+    rng = random.Random(20260824)
+    for chunk in (1, 2, 3, 4, 5, 7):
+        monkeypatch.setattr(sg, "_BODYGREP_SPLIT_CHUNK_CHARS", chunk)
+        for _ in range(2000):
+            text = "".join(rng.choice(atoms) for _ in range(rng.randint(0, 40)))
+            assert list(sg._iter_splitlines(text)) == text.splitlines(), repr(text)
+    # A single very long line is sliced once, not rebuilt incrementally.
+    long_line = "z" * 100_000 + "\n"
+    assert list(sg._iter_splitlines(long_line)) == long_line.splitlines()
+
+
+def test_iter_splitlines_boundary_set_property_tested_across_code_points():
+    """The boundary set must be discovered from str.splitlines(), not mirrored.
+
+    Every ASCII control code point plus the Unicode line/paragraph separators
+    is fed through ``str.splitlines()`` and ``_iter_splitlines``; the lazy
+    splitter must agree byte-for-byte on each, so the hard-coded boundary tuple
+    can never drift from the C-level truth.  A deterministic random mix over a
+    wider code-point alphabet then exercises multi-boundary and CRLF-adjacent
+    combinations without hard-coding the boundary tuple again.
+    """
+    import random
+
+    boundary_cps = list(range(0x00, 0x20)) + [0x7F, 0x85, 0x2028, 0x2029]
+    for cp in boundary_cps:
+        ch = chr(cp)
+        for text in (ch, "a" + ch, ch + "b", "a" + ch + "b", ch + ch + "a"):
+            assert list(sg._iter_splitlines(text)) == text.splitlines(), repr(text)
+
+    rng = random.Random(20260824)
+    alphabet = [chr(cp) for cp in boundary_cps] + list("abXY019 \t")
+    for _ in range(3000):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 30)))
+        assert list(sg._iter_splitlines(text)) == text.splitlines(), repr(text)
+
+
+def test_bodygrep_bytes_proves_no_match_is_sound():
+    """The pre-decode reject must only fire when absence is provable."""
+    # ASCII needle + ASCII bytes: exact case-insensitive byte search.
+    assert sg._bodygrep_bytes_proves_no_match("needle", b"no match here") is True
+    assert sg._bodygrep_bytes_proves_no_match("needle", b"the NEEDLE is here") is False
+    # Non-ASCII bytes can casefold-expand, so absence is never provable.
+    assert sg._bodygrep_bytes_proves_no_match("needle", "caf\u00e9".encode("utf-8")) is False
+    # A casefolded needle that is ASCII but whose source text is non-ASCII is
+    # not provable either (Kelvin sign U+212A casefolds to 'k').
+    assert sg._bodygrep_bytes_proves_no_match("k", "300 \u212a".encode("utf-8")) is False
+
+
+def test_bodygrep_large_no_match_file_rejected_before_decode_and_split(tmp_path, monkeypatch):
+    """Large ASCII no-match bytes must be rejected before decode/split."""
+    repo = _new_repo(tmp_path, "bodygrep_no_match_reject")
+    big = repo / "big.md"
+    big.write_text("padding line\n" * 120_000 + "still absent here\n", encoding="utf-8")
+    _write(repo / "hit.md", "the needle appears here\n")
+    sg.build_index(repo, incremental=False)
+
+    seen = []
+    real_iter = sg._iter_splitlines
+
+    def tracking_iter(text):
+        seen.append(len(text))
+        yield from real_iter(text)
+
+    monkeypatch.setattr(sg, "_iter_splitlines", tracking_iter)
+
+    result = sg.bodygrep_query(repo, "needle", budget=16)
+
+    assert [m["file_path"] for m in result["matches"]] == ["hit.md"]
+    big_len = len(big.read_text(encoding="utf-8"))
+    hit_len = len((repo / "hit.md").read_text(encoding="utf-8"))
+    # The large no-match file never reached the decode/split path.
+    assert big_len not in seen
+    assert seen == [hit_len]
+
+
+def test_bodygrep_unicode_casefold_fallback_decodes_when_bytes_cannot_prove_absence(
+    tmp_path, monkeypatch,
+):
+    """Non-ASCII candidates must fall through to decode for exact casefold."""
+    repo = _new_repo(tmp_path, "bodygrep_unicode_fallback")
+    _write(repo / "u.md", "Die Stra\u00dfe ist lang\nplain\n")
+    sg.build_index(repo, incremental=False)
+
+    decoded = []
+    real_iter = sg._iter_splitlines
+
+    def tracking_iter(text):
+        decoded.append(text)
+        yield from real_iter(text)
+
+    monkeypatch.setattr(sg, "_iter_splitlines", tracking_iter)
+
+    assert sg.bodygrep_query(repo, "stra\u00dfe", budget=16)["matches"]
+    assert sg.bodygrep_query(repo, "STRASSE", budget=16)["matches"]
+    assert decoded, "Unicode-ambiguous candidates must reach the decode path"
+    assert any("Stra\u00dfe" in text for text in decoded)
+
+
+def test_bodygrep_unicode_casefold_equivalence_preserved(tmp_path):
+    """Byte filtering must not weaken Unicode casefold equivalence."""
+    repo = _new_repo(tmp_path, "bodygrep_unicode_casefold")
+    # Kelvin sign U+212A casefolds to 'k'; sharp-s U+00DF casefolds to 'ss'.
+    _write(repo / "k.md", "temperature 300 \u212a\n")
+    _write(repo / "s.md", "Die Stra\u00dfe ist lang\n")
+    sg.build_index(repo, incremental=False)
+
+    assert [m["file_path"] for m in sg.bodygrep_query(repo, "k", budget=16)["matches"]] == ["k.md"]
+    assert [m["file_path"] for m in sg.bodygrep_query(repo, "stra\u00dfe", budget=16)["matches"]] == ["s.md"]
+    assert [m["file_path"] for m in sg.bodygrep_query(repo, "STRASSE", budget=16)["matches"]] == ["s.md"]
+
+
+def test_bodygrep_match_output_byte_for_byte_parity(tmp_path):
+    """Match rows must stay identical to the replaced list-based splitter."""
+    repo = _new_repo(tmp_path, "bodygrep_parity")
+    text = (
+        "def find_needle():\n    return 'needle'\n\n"
+        "another needle here\nlast line no match\n"
+    )
+    _write(repo / "code.py", text)
+    sg.build_index(repo, incremental=False)
+
+    result = sg.bodygrep_query(repo, "needle", budget=64)
+
+    expected = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if "needle" in line.casefold():
+            expected.append({
+                "file_path": "code.py",
+                "kind": "body_match",
+                "name": "needle",
+                "qualname": f"code.py:{line_number}",
+                "line_start": line_number,
+                "line_end": line_number,
+                "signature": line.strip()[:320],
+                "evidence_label": "EXTRACTED",
+                "confidence": 1.0,
+            })
+    assert result["matches"] == expected
+
+
+def test_bodygrep_invalid_utf8_file_is_skipped_but_counted(tmp_path):
+    """Invalid UTF-8 still decodes-then-skips and is counted in files_scanned."""
+    repo = _new_repo(tmp_path, "bodygrep_invalid_utf8")
+    _write(repo / "good.md", "needle present\n")
+    (repo / "bad.md").write_bytes(b"needle here\nbad \xff\xfe bytes\n")
+    sg.build_index(repo, incremental=False)
+
+    result = sg.bodygrep_query(repo, "needle", budget=16)
+
+    assert [m["file_path"] for m in result["matches"]] == ["good.md"]
+    assert result["files_scanned"] == 2
+
+
+def test_bodygrep_oversized_file_cursor_advances_forward(tmp_path):
+    """A file larger than the byte cap must still let the cursor move on."""
+    repo = _new_repo(tmp_path, "bodygrep_oversized_cursor")
+    (repo / "000-oversized.md").write_text("x" * (1024 * 1024 + 128), encoding="utf-8")
+    _write(repo / "001-hit.md", "the needle is here\n")
+    sg.build_index(repo, incremental=False)
+
+    first = sg.bodygrep_query(repo, "needle", budget=2)
+    assert first["files_scanned"] == 1
+    assert first["scan_truncated"] is True
+    assert first["matches"] == []
+    assert first["next_cursor"]
+
+    second = sg.bodygrep_query(repo, "needle", budget=2, cursor=first["next_cursor"])
+    assert [m["file_path"] for m in second["matches"]] == ["001-hit.md"]
+
+
+def test_bodygrep_cursor_rejects_unicode_digit_line_fields(tmp_path):
+    """A cursor line field that isdigit()s but is not ASCII-decimal is invalid.
+
+    ``str.isdigit()`` accepts superscript/circled digits (U+00B2, U+2464) that
+    ``int()`` cannot convert; the decoder must reject them as invalid_cursor
+    instead of leaking an uncaught ValueError.
+    """
+    repo = _new_repo(tmp_path, "bodygrep_cursor_unicode_digit")
+    _write(repo / "a.md", "needle one\nneedle two\nneedle three\n")
+    sg.build_index(repo, incremental=False)
+
+    first = sg.bodygrep_query(repo, "needle", budget=1)
+    assert first["next_cursor"]
+    af_hex, _after_line_text, digest = first["next_cursor"].split("-")
+    for bad in ("\u00b2", "\u2464", "\u00b3"):
+        forged = f"{af_hex}-{bad}-{digest}"
+        with pytest.raises(sg.SourceGraphError) as excinfo:
+            sg.bodygrep_query(repo, "needle", budget=1, cursor=forged)
+        assert str(excinfo.value) == "invalid_cursor"
+
+
+def test_bodygrep_cursor_rejects_overlong_digit_line_field(tmp_path):
+    """A line field longer than Python's int digit limit must be invalid.
+
+    ``int()`` defaults to a 4300-digit cap on decimal strings; a forged cursor
+    whose line field exceeds that must return ``invalid_cursor`` instead of
+    leaking an uncaught ValueError.  The digest stays valid so the length guard
+    is the only thing that rejects it.
+    """
+    repo = _new_repo(tmp_path, "bodygrep_cursor_overlong_digit")
+    _write(repo / "a.md", "needle one\nneedle two\nneedle three\n")
+    sg.build_index(repo, incremental=False)
+
+    first = sg.bodygrep_query(repo, "needle", budget=1)
+    assert first["next_cursor"]
+    af_hex, _after_line_text, digest = first["next_cursor"].split("-")
+    forged = f"{af_hex}-{'1' * 5000}-{digest}"
+    with pytest.raises(sg.SourceGraphError) as excinfo:
+        sg.bodygrep_query(repo, "needle", budget=1, cursor=forged)
+    assert str(excinfo.value) == "invalid_cursor"
+
+
+def test_bodygrep_hot_path_splitter_is_lazy_generator():
+    """The hot loop streams lines lazily instead of materializing a list.
+
+    The allocation shape is asserted behaviorally: the splitter must be a
+    generator (so a full splitlines list is never held alongside the decoded
+    text) and reproduce ``str.splitlines`` exactly.  Peak-memory shape is
+    enforced separately by the multi-file and subprocess measurements.
+    """
+    gen = sg._iter_splitlines("a\nb\nc")
+    assert inspect.isgenerator(gen)
+    assert next(gen) == "a"
+    assert list(gen) == ["b", "c"]
+
+
+def test_bodygrep_repeated_calls_have_bounded_live_objects_subprocess(tmp_path):
+    """Peak live objects stay bounded across repeated no-match scans.
+
+    Runs in a subprocess so a memory regression cannot corrupt the pytest
+    process.  tracemalloc (deterministic and platform-independent) is the
+    primary signal; the candidate bytes may be held once, but a decoded string
+    plus a splitlines list would push peak well past the tolerant bound.
+    """
+    repo = _new_repo(tmp_path, "bodygrep_memory_subprocess")
+    big = repo / "big.md"
+    big.write_text("padding line\n" * 200_000, encoding="utf-8")
+    sg.build_index(repo, incremental=False)
+
+    script = """
+import sys
+from pathlib import Path
+import aiworkhub.source_graph as sg
+
+root = Path(sys.argv[1])
+size = (root / "big.md").stat().st_size
+peak = -1
+try:
+    import tracemalloc
+except ImportError:
+    tracemalloc = None
+
+if tracemalloc is not None:
+    tracemalloc.start()
+try:
+    # The scan itself must always run: execution errors (including these
+    # assertions) must fail the subprocess, not be swallowed by the import
+    # guard above.
+    for _ in range(5):
+        result = sg.bodygrep_query(root, "needle", budget=16)
+        assert result["matches"] == []
+        assert result["files_scanned"] == 1
+finally:
+    if tracemalloc is not None:
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+rss = -1
+if sys.platform.startswith("linux"):
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        rss = -1
+print(f"{size} {peak} {rss}")
+"""
+    src_dir = str(Path(sg.__file__).resolve().parents[1])
+    env = dict(os.environ)
+    env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(repo)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    size, peak, rss = (int(part) for part in proc.stdout.split())
+    assert size > 1_000_000, "fixture must be meaningfully large"
+    if peak >= 0:
+        # Tolerant: one copy of the candidate bytes is allowed; adding a full
+        # decoded string + splitlines list would exceed this by a wide margin.
+        assert peak < size * 3, f"peak traced memory {peak} exceeds {size * 3}"
+    if rss > 0:
+        # ru_maxrss is KiB on Linux; a loose ceiling only catches catastrophic
+        # regressions and is skipped on platforms without a KiB RSS figure.
+        assert rss < 256 * 1024, f"peak RSS {rss} KiB unexpectedly large"
+
+
+def test_bodygrep_multi_file_no_match_peak_keeps_single_raw_buffer(tmp_path):
+    """The no-match byte filter must be copy-free and hold one raw buffer.
+
+    Each file is rejected by the byte filter before decode; the prior
+    candidate's raw bytes must be released before the next file is read, and
+    the case-insensitive byte scan must not materialize a full-size lowercase
+    copy of ``raw``.  A full-size lowered copy (or two simultaneously-live raw
+    buffers) would push peak to ~2x one file, which this bound rejects.
+    """
+    import tracemalloc
+
+    repo = _new_repo(tmp_path, "bodygrep_multi_file_peak")
+    line = "padding line\n"
+    per_file = 2 * 1024 * 1024
+    for name in ("000-a.md", "001-b.md"):
+        _write(repo / name, line * (per_file // len(line)))
+    sg.build_index(repo, incremental=False)
+    size = (repo / "000-a.md").stat().st_size
+
+    tracemalloc.start()
+    try:
+        result = sg.bodygrep_query(repo, "zzzabsentneedle", budget=32)
+    finally:
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+    assert result["matches"] == []
+    assert result["files_scanned"] == 2
+    assert size > 1_000_000, "fixture must be meaningfully large"
+    assert peak < size * 1.5, f"peak traced memory {peak} exceeds {size * 1.5}"
+
+
+def test_bodygrep_multi_file_matching_path_peak_releases_previous_text(tmp_path):
+    """A matching file's decoded text must not outlive the next candidate.
+
+    The matching path decodes each file; the previous file's full decoded
+    string must be released before the next candidate's raw bytes (and then its
+    decoded text) are allocated.  Holding the previous text alongside the next
+    decode would push peak to ~3x one file, which this bound rejects.
+    """
+    import tracemalloc
+
+    repo = _new_repo(tmp_path, "bodygrep_multi_file_match_peak")
+    padding = "filler row with no match here\n"
+    per_file = 2 * 1024 * 1024
+    # Both files match exactly once, so both decode and the scan crosses from
+    # the first decoded text into the second candidate's read/decode.
+    body = "needle once here\n" + padding * (per_file // len(padding))
+    for name in ("000-a.md", "001-b.md"):
+        _write(repo / name, body)
+    sg.build_index(repo, incremental=False)
+    size = (repo / "000-a.md").stat().st_size
+
+    tracemalloc.start()
+    try:
+        result = sg.bodygrep_query(repo, "needle", budget=32)
+    finally:
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+    assert [m["file_path"] for m in result["matches"]] == ["000-a.md", "001-b.md"]
+    assert result["files_scanned"] == 2
+    assert size > 1_000_000, "fixture must be meaningfully large"
+    assert peak < size * 2.5, f"peak traced memory {peak} exceeds {size * 2.5}"

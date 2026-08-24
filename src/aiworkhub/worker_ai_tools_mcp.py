@@ -92,7 +92,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, NamedTuple, Sequence
 
 try:
     from .platform_io import chmod_fd
@@ -2227,7 +2227,205 @@ def tool_discipline_report(verification: Mapping[str, Any]) -> dict[str, Any]:
 # Bounded worker-safe tool implementations (pure functions of an explicit ctx)
 # ---------------------------------------------------------------------------
 
-_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_MAX_SOURCE_GRAPH_CACHE_ENTRIES = 256
+
+# Values a degraded index meta row can leave in an identity field.
+# ``_source_graph_index_identity`` deliberately answers a missing/malformed
+# ``meta`` row with an EMPTY ``finished_at`` rather than failing a supported
+# query, so an empty or sentinel value is a truthful "generation unknown", not
+# a generation: two genuinely different index states collapse onto the same
+# value. Nothing is cached or replayed under one -- see
+# ``_source_graph_generation_is_definite``.
+_DEGRADED_INDEX_GENERATION_VALUES: frozenset[str] = frozenset({
+    "", "-", "0", "n/a", "nan", "nat", "nil", "none", "null", "pending",
+    "unknown", "unset",
+})
+
+
+class _SourceGraphCacheKey(NamedTuple):
+    """The full identity one cached Source Graph result answers for.
+
+    A ``NamedTuple`` rather than a bare positional tuple: it is still hashable
+    and ordered (so it works as a dict key), but the two projections below read
+    the slots they mean by NAME instead of re-deriving them from position.
+    ``_source_graph_cache_key`` is the single production constructor -- every
+    caller, including the tests, builds keys through it, so the layout can
+    never be hand-copied out of sync.
+    """
+
+    kind: str
+    task_id: str
+    request_id: str
+    repo: str
+    mode: str
+    query: str
+    target: str | None
+    cursor: str | None
+    budget: int
+    bundle_type: str
+    packet_sha256: str
+    overlay_sha256: str
+    build_revision: str
+    index_finished_at: str
+
+    @property
+    def authority(self) -> tuple[str, ...]:
+        """The task/request/repo/packet/overlay identity this entry is bound to.
+
+        Entries differing in ANY of these fields answer different authorities
+        and are never interchangeable.
+        """
+
+        return (
+            self.kind, self.task_id, self.request_id, self.repo,
+            self.packet_sha256, self.overlay_sha256,
+        )
+
+    @property
+    def generation(self) -> tuple[str, str]:
+        """Which index generation produced the entry, as an ORDERED pair.
+
+        ``finished_at`` leads so generations compare by index time, with
+        ``build_revision`` only as a deterministic tie-break -- the same
+        ordering ``_source_graph_index_identity`` already uses to select the
+        newest meta row. This makes "newer generation" a total comparison
+        rather than a function of arrival order.
+        """
+
+        return (self.index_finished_at, self.build_revision)
+
+
+_CACHE: dict[_SourceGraphCacheKey, dict[str, Any]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _source_graph_cache_key(
+    *,
+    task_id: Any,
+    request_id: Any,
+    repo: Any,
+    mode: str,
+    query: str,
+    target: str | None,
+    cursor: str | None,
+    budget: int,
+    bundle_type: str,
+    packet_sha256: str,
+    overlay_sha256: str,
+    index_identity: Mapping[str, Any],
+) -> _SourceGraphCacheKey:
+    """Build the one production Source Graph cache key.
+
+    ``source_graph_query`` calls exactly this helper, so the key layout has a
+    single definition: authority binding (task/request/repo/packet/overlay),
+    the query identity that was actually evaluated, and the index generation
+    that produced it. Widening the key here widens it everywhere.
+    """
+
+    return _SourceGraphCacheKey(
+        kind="source_graph",
+        task_id=str(task_id),
+        request_id=str(request_id),
+        repo=str(repo),
+        mode=str(mode),
+        query=str(query),
+        target=target,
+        cursor=cursor,
+        budget=int(budget),
+        bundle_type=str(bundle_type),
+        packet_sha256=str(packet_sha256),
+        overlay_sha256=str(overlay_sha256),
+        build_revision=str(index_identity.get("build_revision") or ""),
+        index_finished_at=str(index_identity.get("finished_at") or ""),
+    )
+
+
+def _source_graph_generation_is_definite(index_identity: Mapping[str, Any]) -> bool:
+    """Is this index identity a real, distinguishable generation?
+
+    Fail-closed: an unreadable ``meta`` table, a missing row or a sentinel
+    timestamp all yield the SAME identity for two different index states, so a
+    result cached under one could be replayed after a mutation the key cannot
+    see. Callers must then neither read nor write the cache and simply re-run
+    the live query.
+    """
+
+    for value in (
+        str(index_identity.get("build_revision") or "").strip(),
+        str(index_identity.get("finished_at") or "").strip(),
+    ):
+        if value.lower() in _DEGRADED_INDEX_GENERATION_VALUES:
+            return False
+    return True
+
+
+def _source_graph_cache_get(key: _SourceGraphCacheKey) -> dict[str, Any] | None:
+    """Return the entry stored under EXACTLY this key, refreshing its recency.
+
+    Reads are exact-key only. Authority binding and index generation are both
+    part of the key, so a lookup made under a different task/request/repo/
+    packet/overlay -- or after a generation rollover -- simply misses. No read
+    can ever be answered with another authority's bytes or a stale
+    generation's bytes.
+    """
+
+    with _CACHE_LOCK:
+        entry = _CACHE.pop(key, None)
+        if entry is None:
+            return None
+        _CACHE[key] = entry  # reinsert at the most-recently-used tail
+        return entry
+
+
+def _source_graph_cache_store(
+    key: _SourceGraphCacheKey, entry: dict[str, Any],
+) -> bool:
+    """Record ``entry`` under ``key``; return whether it was recorded.
+
+    Three deterministic rules, all applied under one lock so concurrent
+    callers observe the same order:
+
+      * generation fence -- a store whose generation is OLDER than the one
+        currently resident for the SAME authority is a late write from an index
+        state that has already been superseded. It is declined outright: it
+        neither evicts nor supersedes the newer generation. Its caller keeps
+        the live result it already computed; only caching it is refused.
+      * rollover eviction -- a store whose generation is NEWER retires every
+        resident entry of that SAME authority, so a rebuild or exact-file
+        mutation cannot leave the previous generation resident. This eviction
+        is AUTHORITY-SCOPED: it never touches another task/request/repo/packet/
+        overlay's entries.
+      * capacity -- the cache as a whole is then trimmed to
+        ``_MAX_SOURCE_GRAPH_CACHE_ENTRIES``, least-recently-used first, so a
+        long-lived worker process cannot grow it without limit. Unlike
+        rollover, this GLOBAL bound may drop an entry belonging to a different
+        authority. That is only a harmless cache miss -- the next call re-runs
+        the live query and gets the same bytes -- never a cross-authority read,
+        because every read is exact-key.
+    """
+
+    authority = key.authority
+    generation = key.generation
+    with _CACHE_LOCK:
+        resident = [other for other in _CACHE if other.authority == authority]
+        newest = max((other.generation for other in resident), default=None)
+        if newest is not None and generation < newest:
+            return False
+        if newest is not None and generation > newest:
+            for stale in resident:
+                del _CACHE[stale]
+        _CACHE.pop(key, None)
+        _CACHE[key] = entry
+        while len(_CACHE) > _MAX_SOURCE_GRAPH_CACHE_ENTRIES:
+            _CACHE.pop(next(iter(_CACHE)))
+        return True
+
+
+def _source_graph_cache_clear() -> None:
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
 _SESSION_DELTA_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MAX_SESSION_DELTA_ENTRIES = 256
 _SESSION_DELTA_LOCK = threading.Lock()
@@ -2936,14 +3134,29 @@ def source_graph_query(
     index_identity = _source_graph_index_identity(
         binding.db_path, default_revision=_source_graph_mod.BUILD_REVISION,
     )
-    cache_key = (
-        "source_graph", ctx.task_id, ctx.request_id, str(query_repo),
-        mode, bounded_query, scope, cursor, budget, bundle_type,
-        binding.packet_sha256,
-        overlay_view.snapshot_sha256 if overlay_view is not None else "",
-        index_identity["build_revision"], index_identity["finished_at"],
+    cache_key = _source_graph_cache_key(
+        task_id=ctx.task_id,
+        request_id=ctx.request_id,
+        repo=query_repo,
+        mode=mode,
+        query=bounded_query,
+        target=scope,
+        cursor=cursor,
+        budget=budget,
+        bundle_type=bundle_type,
+        packet_sha256=binding.packet_sha256,
+        overlay_sha256=(
+            overlay_view.snapshot_sha256 if overlay_view is not None else ""
+        ),
+        index_identity=index_identity,
     )
-    cached = _CACHE.get(cache_key)
+    # A degraded index identity is not a generation: an unreadable ``meta``
+    # table or an empty/sentinel ``finished_at`` makes two different index
+    # states collapse onto the same key, so a result cached under one could be
+    # replayed after a mutation the key cannot see. Neither read nor write the
+    # cache in that state -- fall back to the live query every time.
+    generation_is_definite = _source_graph_generation_is_definite(index_identity)
+    cached = _source_graph_cache_get(cache_key) if generation_is_definite else None
     if cached is not None:
         cached_result = cached["result"]
         receipt_content = json.dumps(
@@ -3231,13 +3444,14 @@ def source_graph_query(
         "index_finished_at": index_identity["finished_at"],
         "evidence_counts": evidence_counts,
     }
-    _CACHE[cache_key] = {
-        "result": result, "hit_count": hit_count, "bytes": bytes_returned,
-        "content_sha256": content_sha256,
-        "authority_source": result["authority_source"],
-        "authority_state": result["authority_state"],
-        "evidence_counts": evidence_counts,
-    }
+    if generation_is_definite:
+        _source_graph_cache_store(cache_key, {
+            "result": result, "hit_count": hit_count, "bytes": bytes_returned,
+            "content_sha256": content_sha256,
+            "authority_source": result["authority_source"],
+            "authority_state": result["authority_state"],
+            "evidence_counts": evidence_counts,
+        })
     _append_audit(
         ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
         authority_source=result["authority_source"],
