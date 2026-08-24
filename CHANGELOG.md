@@ -6,6 +6,21 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.51] - 2026-08-24
+
+### Added
+
+- Repository Skills now support deterministic, bounded task-aware selection
+  receipts with exact identity, version, digest and reason binding.
+- Selected ACTIVE skills can be resolved into canonical bounded runtime
+  packets without filesystem, database, network or execution side effects.
+
+### Fixed
+
+- Runtime-packet credential filtering now rejects Unicode whitespace and
+  fullwidth assignment delimiters in addition to fused, camel, Pascal,
+  snake, dotted and dashed secret-key families.
+
 ## [0.10.50] - 2026-08-24
 
 ### Added

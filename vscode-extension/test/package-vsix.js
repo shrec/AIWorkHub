@@ -22,6 +22,22 @@ const MUX_LAUNCHER_DEST = path.join(extensionDir, "bin", "aiworkhub-app-server-m
 const MUX_LAUNCHER_CMD_SRC = path.join(root, "..", "scripts", "aiworkhub-app-server-mux.cmd");
 const MUX_LAUNCHER_CMD_DEST = path.join(extensionDir, "bin", "aiworkhub-app-server-mux.cmd");
 const NATIVE_LAUNCHER_SRC = path.join(root, "native-launcher", "main.go");
+const PACKAGE_SOURCE_OVERRIDES = Object.freeze({
+  "media/aiworkhub-block-diagram.png": path.join(
+    root,
+    "..",
+    "docs",
+    "assets",
+    "aiworkhub-block-diagram.png",
+  ),
+  "media/aiworkhub-source-graph-architecture.png": path.join(
+    root,
+    "..",
+    "docs",
+    "assets",
+    "aiworkhub-source-graph-architecture.png",
+  ),
+});
 // Never bundle bytecode caches or OS cruft -- only the real package source
 // and its data assets (e.g. dashboard_static/*.css/.js/.html).
 const PY_RUNTIME_SKIP_DIRS = new Set(["__pycache__", ".pytest_cache"]);
@@ -392,7 +408,8 @@ function copyFile(rel, packageSourceText) {
   // description rather than duplicating a second copy inside
   // vscode-extension/) -- fall back to it only when no local override exists.
   const localPath = path.join(root, rel);
-  const source = rel === "README.md" && !fs.existsSync(localPath) ? path.join(root, "..", rel) : localPath;
+  const source = PACKAGE_SOURCE_OVERRIDES[rel]
+    || (rel === "README.md" && !fs.existsSync(localPath) ? path.join(root, "..", rel) : localPath);
   fs.writeFileSync(target, fs.readFileSync(source));
 }
 
@@ -434,6 +451,8 @@ for (const rel of [
   // editable master and is bundled alongside it.
   "media/aiworkhub-hero.svg",
   "media/aiworkhub-hero.png",
+  "media/aiworkhub-block-diagram.png",
+  "media/aiworkhub-source-graph-architecture.png",
 ]) {
   copyFile(rel, packageSnapshot.source);
 }

@@ -8,6 +8,8 @@ versions, and the manager-authority gate.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import aiworkhub.skill_registry as sr
@@ -759,6 +761,1257 @@ def test_registry_is_iterable_and_bounded_selection():
     assert registry.get("missing", "1.0.0") is None
     assert ("a", "1.0.0") in registry
     assert ("missing", "1.0.0") not in registry
+
+
+def _active(**overrides):
+    return base_record(lifecycle_state="active", **overrides)
+
+
+def _select_context(**overrides):
+    data = {
+        "task_family": "commit",
+        "path_or_symbol": "src/aiworkhub/skill_registry.py",
+        "risk": "medium",
+        "stage": "post-edit",
+        "triggers": ["commit"],
+    }
+    data.update(overrides)
+    return data
+
+
+def test_select_positive_active_match():
+    record = _active()
+    receipt = sr.select([record], _select_context())
+    assert len(receipt.selected) == 1
+    item = receipt.selected[0]
+    assert item.identity == "commit-msg-check"
+    assert item.version == "1.0.0"
+    assert item.digest == sr.skill_digest(record)
+    assert "lifecycle:active" in item.reasons
+    assert "task_family:exact" in item.reasons
+    assert "path_or_symbol:exact" in item.reasons
+
+
+def test_select_zero_match_is_empty():
+    record = _active(task_family="review")
+    receipt = sr.select([record], _select_context())
+    assert receipt.selected == ()
+    payload = receipt.as_mapping()
+    assert set(payload) == {"selected", "context", "context_seal"}
+    assert payload["selected"] == []
+    assert payload["context"]["task_family"] == "commit"
+    assert payload["context"]["path_or_symbol"] == "src/aiworkhub/skill_registry.py"
+    assert payload["context_seal"] == sr._receipt_context_seal(receipt.context, receipt.selected)
+    assert payload["context_seal"]
+
+
+def test_select_excludes_proposed_and_retired():
+    proposed = base_record(lifecycle_state="proposed")
+    retired = base_record(identity="retired-skill", lifecycle_state="retired")
+    active = _active(identity="active-skill")
+    receipt = sr.select([proposed, retired, active], _select_context())
+    assert [item.identity for item in receipt.selected] == ["active-skill"]
+
+
+def test_select_exact_versus_wildcard():
+    exact = _active(identity="exact-path")
+    wild = _active(identity="wild-path", path_or_symbol="*")
+    prefix = _active(identity="prefix-path", path_or_symbol="src/aiworkhub/*")
+    other = _active(identity="other-path", path_or_symbol="src/other.py")
+    substr = _active(identity="substr-path", path_or_symbol="skill_registry")
+    family_wild = _active(identity="wild-family", task_family="*")
+    trigger_wild = _active(identity="wild-trigger", triggers=["*"])
+    receipt = sr.select(
+        [exact, wild, prefix, other, substr, family_wild, trigger_wild],
+        _select_context(),
+    )
+    assert [item.identity for item in receipt.selected] == [
+        "wild-family",
+        "wild-path",
+        "prefix-path",
+        "exact-path",
+        "wild-trigger",
+    ]
+    kinds = {item.identity: item.reasons for item in receipt.selected}
+    assert "path_or_symbol:wildcard" in kinds["wild-path"]
+    assert "path_or_symbol:wildcard" in kinds["prefix-path"]
+    assert "path_or_symbol:exact" in kinds["exact-path"]
+    assert "task_family:wildcard" in kinds["wild-family"]
+    assert "triggers:wildcard" in kinds["wild-trigger"]
+
+
+def test_select_rejects_substring_authority():
+    record = _active()
+    assert sr.select([record], _select_context(task_family="commit-msg")).selected == ()
+    assert sr.select([record], _select_context(triggers=["commit-msg"])).selected == ()
+    assert sr.select([record], _select_context(path_or_symbol="src/aiworkhub")).selected == ()
+    constrained = _active(identity="py-only", applicability=["python"])
+    assert sr.select([constrained], _select_context()).selected == ()
+    assert [
+        item.identity
+        for item in sr.select([constrained], _select_context(applicability=["python"])).selected
+    ] == ["py-only"]
+    assert sr.select([constrained], _select_context(applicability=["rust"])).selected == ()
+
+
+def test_select_is_order_independent_and_tie_stable():
+    alpha = _active(
+        identity="alpha", task_family="t", path_or_symbol="p", risk="low", stage="s", triggers=()
+    )
+    beta = _active(
+        identity="beta", task_family="t", path_or_symbol="p", risk="low", stage="s", triggers=()
+    )
+    ctx = _select_context(task_family="t", path_or_symbol="p", risk="low", stage="s", triggers=())
+    first = sr.select([beta, alpha], ctx)
+    second = sr.select([alpha, beta], ctx)
+    assert [item.identity for item in first.selected] == ["alpha", "beta"]
+    assert first.selected == second.selected
+    assert first.as_mapping() == second.as_mapping()
+
+
+def test_select_enforces_positive_limit_and_clamps():
+    records = [
+        _active(
+            identity=f"skill{index:02d}",
+            task_family="t",
+            path_or_symbol="p",
+            risk="low",
+            stage="s",
+            triggers=(),
+        )
+        for index in range(5)
+    ]
+    ctx = _select_context(task_family="t", path_or_symbol="p", risk="low", stage="s", triggers=())
+    assert [item.identity for item in sr.select(records, ctx, limit=2).selected] == [
+        "skill00",
+        "skill01",
+    ]
+    assert len(sr.select(records, ctx, limit=sr.MAX_SELECT_LIMIT + 5).selected) == 5
+    assert_fails("skill_registry.invalid_value", lambda: sr.select(records, ctx, limit=0))
+    assert_fails("skill_registry.invalid_value", lambda: sr.select(records, ctx, limit=-1))
+    assert_fails("skill_registry.invalid_type", lambda: sr.select(records, ctx, limit=True))
+    assert_fails("skill_registry.invalid_type", lambda: sr.select(records, ctx, limit=1.5))
+    assert_fails("skill_registry.invalid_type", lambda: sr.select(records, ctx, limit=None))
+
+
+def test_select_malformed_inputs_fail_closed():
+    record = _active()
+    ctx = _select_context()
+    assert_fails("skill_registry.invalid_type", lambda: sr.select("nope", ctx))
+    assert_fails("skill_registry.invalid_type", lambda: sr.select([record, "bad"], ctx))
+    assert_fails("skill_registry.invalid_type", lambda: sr.select([record], "nope"))
+    assert_fails(
+        "skill_registry.unknown_key",
+        lambda: sr.select([record], {**ctx, "token": "secret"}),
+    )
+    assert_fails(
+        "skill_registry.missing_field",
+        lambda: sr.select([record], {"task_family": "commit"}),
+    )
+    assert_fails(
+        "skill_registry.unsafe_path",
+        lambda: sr.select([record], _select_context(path_or_symbol="/etc/passwd")),
+    )
+    assert_fails(
+        "skill_registry.unsafe_path",
+        lambda: sr.select([record], _select_context(path_or_symbol="C:\\Windows")),
+    )
+
+
+def test_select_receipt_redacts_bodies_secrets_and_host_paths():
+    record = _active(
+        procedure_steps=["run /home/secret/tool --token leaked-secret-value"],
+        preferred_tools=["/usr/bin/leaked"],
+        avoid_rules=["never print leaked-secret-value"],
+    )
+    receipt = sr.select([record], _select_context())
+    payload = sr.canonical_json(receipt.as_mapping())
+    text = str(receipt) + payload
+    assert "leaked-secret-value" not in text
+    assert "/home/secret" not in text
+    assert "procedure" not in payload
+    row = receipt.as_mapping()["selected"][0]
+    assert set(row) == {"identity", "version", "digest", "reasons"}
+    assert row["identity"] == "commit-msg-check"
+    assert row["digest"] == sr.skill_digest(record)
+    assert all(":" in token for token in row["reasons"])
+
+
+def test_select_does_not_mutate_registry_state():
+    registry = sr.SkillRegistry()
+    propose_with_accepted_evidence(registry)
+    active = registry.activate("commit-msg-check", "1.0.0", MANAGER)
+    before = registry.records()
+    before_state = (
+        active.lifecycle_state,
+        active.accepted_count,
+        active.negative_count,
+        active.evidence,
+        sr.skill_digest(active),
+    )
+    receipt = registry.select(_select_context())
+    after = registry.records()
+    assert before == after
+    assert all(left is right for left, right in zip(before, after))
+    current = registry.get("commit-msg-check", "1.0.0")
+    assert current is active
+    assert (
+        current.lifecycle_state,
+        current.accepted_count,
+        current.negative_count,
+        current.evidence,
+        sr.skill_digest(current),
+    ) == before_state
+    assert [item.identity for item in receipt.selected] == ["commit-msg-check"]
+    assert sr.select(registry, _select_context()).selected == receipt.selected
+
+
+
+def _packet_pair():
+    alpha = _active(
+        identity="alpha",
+        task_family="t",
+        path_or_symbol="p",
+        risk="low",
+        stage="s",
+        triggers=(),
+        applicability=("repo",),
+        procedure_steps=("inspect diff",),
+        avoid_rules=("do not rewrite history",),
+        preferred_tools=("git",),
+    )
+    beta = _active(
+        identity="beta",
+        task_family="t",
+        path_or_symbol="p",
+        risk="low",
+        stage="s",
+        triggers=(),
+        applicability=("repo",),
+        procedure_steps=("inspect status",),
+        avoid_rules=("do not rewrite history",),
+        preferred_tools=("git",),
+    )
+    ctx = _select_context(
+        task_family="t",
+        path_or_symbol="p",
+        risk="low",
+        stage="s",
+        triggers=(),
+        applicability=("repo",),
+    )
+    return alpha, beta, ctx
+
+
+_PACKET_REASONS = (
+    "lifecycle:active",
+    "task_family:exact",
+    "path_or_symbol:exact",
+    "risk:exact",
+    "stage:exact",
+    "triggers:exact",
+    "applicability:unconstrained",
+)
+_PACKET_EMITTED_FIELDS = (
+    "identity",
+    "version",
+    "digest",
+    "reasons",
+    "applicability",
+    "procedure_steps",
+    "avoid_rules",
+    "preferred_tools",
+)
+_PACKET_LIST_FIELDS = (
+    "reasons",
+    "applicability",
+    "procedure_steps",
+    "avoid_rules",
+    "preferred_tools",
+)
+
+
+def _record_select_context(record):
+    return {
+        "task_family": record.task_family,
+        "path_or_symbol": record.path_or_symbol,
+        "risk": record.risk,
+        "stage": record.stage,
+        "triggers": record.triggers,
+        "applicability": record.applicability,
+    }
+
+
+def _bound_receipt(record, reasons=_PACKET_REASONS, context=None):
+    if context is None:
+        context = _record_select_context(record)
+    selected = (
+        sr.SkillSelection(
+            identity=record.identity,
+            version=record.version,
+            digest=sr.skill_digest(record),
+            reasons=reasons,
+        ),
+    )
+    return sr.SkillSelectionReceipt(
+        selected=selected,
+        context=context,
+        context_seal=sr._receipt_context_seal(context, selected),
+    )
+
+
+def _packet_candidates_and_receipt(field, text):
+    if field == "reasons":
+        record = _active()
+        return [record], _bound_receipt(record, (text,))
+    record = _active(**{field: (text,)})
+    return [record], _bound_receipt(record)
+
+
+def test_runtime_packet_positive_and_exact_keys():
+    record = _active(
+        applicability=("commit-hook",),
+        procedure_steps=("check message length",),
+        avoid_rules=("do not rewrite history",),
+        preferred_tools=("git",),
+    )
+    record = with_evidence(
+        record,
+        [{"source": "src-a", "outcome": "accepted", "actor_id": "actor-a"}],
+    )
+    receipt = sr.select([record], _select_context(applicability=["commit-hook"]))
+    packet = sr.build_runtime_packet([record], receipt)
+    payload = packet.as_mapping()
+    assert packet.version == sr.RUNTIME_PACKET_VERSION
+    assert set(payload) == {"version", "skills"}
+    assert len(payload["skills"]) == 1
+    row = payload["skills"][0]
+    assert set(row) == {
+        "identity",
+        "version",
+        "digest",
+        "reasons",
+        "applicability",
+        "procedure_steps",
+        "avoid_rules",
+        "preferred_tools",
+    }
+    assert row["identity"] == "commit-msg-check"
+    assert row["version"] == "1.0.0"
+    assert row["digest"] == sr.skill_digest(record)
+    assert row["applicability"] == ["commit-hook"]
+    assert row["procedure_steps"] == ["check message length"]
+    assert row["avoid_rules"] == ["do not rewrite history"]
+    assert row["preferred_tools"] == ["git"]
+    text = sr.canonical_json(payload)
+    assert "evidence" not in text
+    assert "accepted_count" not in text
+    assert "negative_count" not in text
+    assert "actor-a" not in text
+    assert "src/aiworkhub/skill_registry.py" not in text
+    assert "lifecycle" not in "".join(row.keys())
+
+
+def test_runtime_packet_empty_is_truthful_and_versioned():
+    record = _active()
+    receipt = sr.select([record], _select_context(task_family="other"))
+    packet = sr.build_runtime_packet([record], receipt)
+    assert packet.skills == ()
+    assert packet.as_mapping() == {"version": sr.RUNTIME_PACKET_VERSION, "skills": []}
+    empty = sr.build_runtime_packet([], sr.SkillSelectionReceipt())
+    assert empty.as_mapping() == packet.as_mapping()
+
+
+def test_runtime_packet_order_follows_receipt_not_candidates():
+    alpha, beta, ctx = _packet_pair()
+    receipt = sr.select([beta, alpha], ctx)
+    first = sr.build_runtime_packet([beta, alpha], receipt)
+    second = sr.build_runtime_packet([alpha, beta], receipt)
+    assert [row.identity for row in first.skills] == ["alpha", "beta"]
+    assert [row.identity for row in second.skills] == ["alpha", "beta"]
+    assert first.as_mapping() == second.as_mapping()
+    assert first.skills[0].digest == sr.skill_digest(alpha)
+    assert first.skills[1].digest == sr.skill_digest(beta)
+
+
+def test_runtime_packet_binds_exact_digest():
+    record = _active()
+    receipt = sr.select([record], _select_context())
+    item = receipt.selected[0]
+    spoofed = sr.SkillSelectionReceipt(
+        selected=(
+            sr.SkillSelection(
+                identity=item.identity,
+                version=item.version,
+                digest="0" * 64,
+                reasons=item.reasons,
+            ),
+        )
+    )
+    assert_fails(
+        "skill_registry.digest_mismatch",
+        lambda: sr.build_runtime_packet([record], spoofed),
+    )
+
+
+def test_runtime_packet_rejects_lifecycle_duplicate_missing_and_spoof():
+    alpha, beta, ctx = _packet_pair()
+    receipt = sr.select([alpha, beta], ctx)
+    proposed = base_record(
+        identity="alpha", task_family="t", path_or_symbol="p", risk="low", stage="s", triggers=()
+    )
+    retired = base_record(
+        identity="alpha",
+        task_family="t",
+        path_or_symbol="p",
+        risk="low",
+        stage="s",
+        triggers=(),
+        lifecycle_state="retired",
+    )
+    assert_fails(
+        "skill_registry.invalid_lifecycle",
+        lambda: sr.build_runtime_packet([proposed], _bound_receipt(proposed)),
+    )
+    assert_fails(
+        "skill_registry.invalid_lifecycle",
+        lambda: sr.build_runtime_packet([retired], _bound_receipt(retired)),
+    )
+    assert_fails(
+        "skill_registry.duplicate_selection",
+        lambda: sr.build_runtime_packet([alpha, alpha], receipt),
+    )
+    assert_fails(
+        "skill_registry.duplicate_selection",
+        lambda: sr.build_runtime_packet(
+            [alpha],
+            sr.SkillSelectionReceipt(selected=(receipt.selected[0], receipt.selected[0])),
+        ),
+    )
+    assert_fails(
+        "skill_registry.not_found",
+        lambda: sr.build_runtime_packet([beta], receipt),
+    )
+    spoofed = sr.SkillSelectionReceipt(selected=(receipt.selected[1], receipt.selected[0]))
+    assert_fails(
+        "skill_registry.selection_spoofed",
+        lambda: sr.build_runtime_packet([alpha, beta], spoofed),
+    )
+
+    class ExtraReceipt(sr.SkillSelectionReceipt):
+        pass
+
+    assert_fails(
+        "skill_registry.receipt_extended",
+        lambda: sr.build_runtime_packet([alpha, beta], ExtraReceipt(selected=receipt.selected)),
+    )
+    assert_fails(
+        "skill_registry.invalid_type",
+        lambda: sr.build_runtime_packet([alpha], receipt.as_mapping()),
+    )
+
+
+def test_runtime_packet_enforces_all_bounds_and_malformed_limits():
+    alpha, beta, ctx = _packet_pair()
+    receipt = sr.select([alpha, beta], ctx)
+    assert_fails(
+        "skill_registry.packet_limit",
+        lambda: sr.build_runtime_packet([alpha, beta], receipt, max_selected=1),
+    )
+    assert_fails(
+        "skill_registry.packet_limit",
+        lambda: sr.build_runtime_packet([alpha, beta], receipt, max_list_items=1),
+    )
+    assert_fails(
+        "skill_registry.packet_limit",
+        lambda: sr.build_runtime_packet([alpha, beta], receipt, max_string_bytes=3),
+    )
+    assert_fails(
+        "skill_registry.packet_limit",
+        lambda: sr.build_runtime_packet([alpha, beta], receipt, max_packet_bytes=10),
+    )
+    assert_fails(
+        "skill_registry.invalid_type",
+        lambda: sr.build_runtime_packet([alpha], receipt, max_selected=True),
+    )
+    assert_fails(
+        "skill_registry.invalid_type",
+        lambda: sr.build_runtime_packet([alpha], receipt, max_list_items=1.5),
+    )
+    assert_fails(
+        "skill_registry.invalid_type",
+        lambda: sr.build_runtime_packet([alpha], receipt, max_string_bytes=None),
+    )
+    assert_fails(
+        "skill_registry.invalid_value",
+        lambda: sr.build_runtime_packet([alpha], receipt, max_packet_bytes=0),
+    )
+    assert_fails(
+        "skill_registry.invalid_value",
+        lambda: sr.build_runtime_packet([alpha], receipt, max_selected=-1),
+    )
+
+
+def test_runtime_packet_rejects_secrets_paths_and_controls():
+    cases = (
+        ("skill_registry.secret_rejected", {"procedure_steps": ["Authorization: Bearer leakedtoken"]}),
+        ("skill_registry.secret_rejected", {"procedure_steps": ["Bearer leakedtoken"]}),
+        ("skill_registry.secret_rejected", {"avoid_rules": ["-----BEGIN PRIVATE KEY-----"]}),
+        ("skill_registry.secret_rejected", {"preferred_tools": ["token=leakedvalue"]}),
+        ("skill_registry.secret_rejected", {"applicability": ["secret=leakedvalue"]}),
+        ("skill_registry.unsafe_path", {"procedure_steps": ["run /usr/bin/tool"]}),
+        ("skill_registry.unsafe_path", {"preferred_tools": [r"C:\Windows\tool.exe"]}),
+        ("skill_registry.invalid_value", {"avoid_rules": ["do not use \x00 null"]}),
+        ("skill_registry.invalid_value", {"procedure_steps": ["line\nbreak"]}),
+    )
+    for code, overrides in cases:
+        record = _active(**overrides)
+        assert_fails(code, lambda record=record: sr.build_runtime_packet([record], _bound_receipt(record)))
+
+
+def test_runtime_packet_rejects_prefixed_secrets_and_file_uris_on_every_field():
+    payloads = (
+        ("skill_registry.secret_rejected", "OPENAI_API_KEY=supersecret"),
+        ("skill_registry.secret_rejected", "AWS_SECRET_ACCESS_KEY=supersecret"),
+        ("skill_registry.secret_rejected", "GH_TOKEN=supersecret"),
+        ("skill_registry.secret_rejected", "DB_PASSWORD=supersecret"),
+        ("skill_registry.unsafe_path", "file:///etc/passwd"),
+        ("skill_registry.unsafe_path", "FILE://localhost/etc/passwd"),
+        ("skill_registry.unsafe_path", r"\\server\share\secret"),
+        ("skill_registry.unsafe_path", r"\\.\pipe\secret"),
+        ("skill_registry.unsafe_path", r"\\?\C:\Windows\system32"),
+        ("skill_registry.unsafe_path", "//./COM1"),
+        ("skill_registry.unsafe_path", "//?/C:/Windows"),
+    )
+    for field in _PACKET_EMITTED_FIELDS:
+        for code, text in payloads:
+            if field in _PACKET_LIST_FIELDS:
+                candidates, receipt = _packet_candidates_and_receipt(field, text)
+                assert_fails(
+                    code,
+                    lambda candidates=candidates, receipt=receipt: sr.build_runtime_packet(
+                        candidates, receipt
+                    ),
+                )
+            else:
+                assert_fails(
+                    code,
+                    lambda field=field, text=text: sr._bounded_packet_scalar(text, field, 256),
+                )
+    record = _active(procedure_steps=("set mode=strict", "retries=3"))
+    packet = sr.build_runtime_packet([record], _bound_receipt(record))
+    assert packet.skills[0].procedure_steps == ("set mode=strict", "retries=3")
+
+
+def test_runtime_packet_rejects_secret_assign_stem_swallow_bypasses():
+    cases = (
+        "SECRET_KEY=leakedvalue",
+        "secret_key=leakedvalue",
+        "export SECRET_KEY=leakedvalue",
+        "token_id=leakedvalue",
+        "password_hash=leakedvalue",
+    )
+    for text in cases:
+        record = _active(procedure_steps=(text,))
+        assert_fails(
+            "skill_registry.secret_rejected",
+            lambda record=record: sr.build_runtime_packet([record], _bound_receipt(record)),
+        )
+
+
+def test_runtime_packet_rejects_structural_assignment_secret_keys():
+    payloads = (
+        "SecretKey=leakedvalue",
+        "secretKey=leakedvalue",
+        "secrets=leakedvalue",
+        "tokenId=leakedvalue",
+        "tokenValue=leakedvalue",
+        "passwordHash=leakedvalue",
+    )
+    for field in _PACKET_EMITTED_FIELDS:
+        for text in payloads:
+            if field in _PACKET_LIST_FIELDS:
+                candidates, receipt = _packet_candidates_and_receipt(field, text)
+                assert_fails(
+                    "skill_registry.secret_rejected",
+                    lambda candidates=candidates, receipt=receipt: sr.build_runtime_packet(
+                        candidates, receipt
+                    ),
+                )
+            else:
+                assert_fails(
+                    "skill_registry.secret_rejected",
+                    lambda field=field, text=text: sr._bounded_packet_scalar(text, field, 256),
+                )
+    allowed = _active(
+        procedure_steps=(
+            "mention tokenId as a field name",
+            "set mode=strict",
+            "retries=3",
+        )
+    )
+    packet = sr.build_runtime_packet([allowed], _bound_receipt(allowed))
+    assert packet.skills[0].procedure_steps == (
+        "mention tokenId as a field name",
+        "set mode=strict",
+        "retries=3",
+    )
+
+
+def test_runtime_packet_rejects_fused_lowercase_secret_compounds():
+    assert sr._has_secret_assignment("apikey=leak")
+    assert sr._has_secret_assignment("accesskey=leak")
+    assert sr._has_secret_assignment("privatekey=leak")
+    assert sr._has_secret_assignment("secretkey=leak")
+    assert sr._has_secret_assignment("authtoken=leak")
+    assert sr._has_secret_assignment("apiKey=leak")
+    assert sr._has_secret_assignment("accessKey=leak")
+    assert sr._has_secret_assignment("privateKey=leak")
+    assert sr._has_secret_assignment("tokenid=leak")
+    assert sr._has_secret_assignment("tokenvalue=leak")
+    assert sr._has_secret_assignment("passwordhash=leak")
+    assert sr._has_secret_assignment("secretaccesskey=leak")
+    assert sr._has_secret_assignment("awssecretaccesskey=leak")
+    assert not sr._has_secret_assignment("monkey=banana")
+    assert not sr._has_secret_assignment("keyboard=qwerty")
+    assert not sr._has_secret_assignment("hockey=puck")
+    assert not sr._has_secret_assignment("tokenizer=bert")
+    assert not sr._has_secret_assignment("mode=strict")
+    assert not sr._has_secret_assignment("mention apikey in docs")
+    rejected = (
+        "apikey=leak",
+        "accesskey=leak",
+        "privatekey=leak",
+        "secretkey=leak",
+        "authkey=leak",
+        "authtoken=leak",
+        "accesstoken=leak",
+        "apitoken=leak",
+        "bearertoken=leak",
+        "clientsecret=leak",
+        "apisecret=leak",
+        "apiKey=leak",
+        "accessKey=leak",
+        "privateKey=leak",
+        "secretKey=leak",
+        "authToken=leak",
+        "api_key=leak",
+        "access_key=leak",
+        "private_key=leak",
+        "secret_key=leak",
+        "auth_token=leak",
+        "api.key=leak",
+        "access.key=leak",
+        "private.key=leak",
+        "api-key=leak",
+        "access-key=leak",
+        "private-key=leak",
+        "auth-token=leak",
+        "tokenid=leak",
+        "tokenvalue=leak",
+        "passwordhash=leak",
+        "secretaccesskey=leak",
+        "awssecretaccesskey=leak",
+    )
+    for field in _PACKET_EMITTED_FIELDS:
+        for text in rejected:
+            if field in _PACKET_LIST_FIELDS:
+                candidates, receipt = _packet_candidates_and_receipt(field, text)
+                assert_fails(
+                    "skill_registry.secret_rejected",
+                    lambda candidates=candidates, receipt=receipt: sr.build_runtime_packet(
+                        candidates, receipt
+                    ),
+                )
+            else:
+                assert_fails(
+                    "skill_registry.secret_rejected",
+                    lambda field=field, text=text: sr._bounded_packet_scalar(text, field, 256),
+                )
+    allowed = _active(
+        procedure_steps=(
+            "monkey=banana",
+            "keyboard=qwerty",
+            "hockey=puck",
+            "tokenizer=bert",
+            "mode=strict",
+            "mention apikey in docs",
+            "discuss accesskey naming",
+            "privatekey is a field name",
+        )
+    )
+    packet = sr.build_runtime_packet([allowed], _bound_receipt(allowed))
+    assert packet.skills[0].procedure_steps == (
+        "monkey=banana",
+        "keyboard=qwerty",
+        "hockey=puck",
+        "tokenizer=bert",
+        "mode=strict",
+        "mention apikey in docs",
+        "discuss accesskey naming",
+        "privatekey is a field name",
+    )
+
+
+def _secret_family_surface_keys() -> tuple[str, ...]:
+    families = (
+        ("api", "key"),
+        ("access", "key"),
+        ("access", "id"),
+        ("private", "key"),
+        ("secret", "key"),
+        ("secret", "access", "key"),
+        ("auth", "token"),
+        ("auth", "key"),
+        ("bearer", "token"),
+        ("client", "secret"),
+        ("token", "id"),
+        ("token", "value"),
+        ("password", "hash"),
+        ("credential",),
+        ("client", "credential"),
+        ("aws", "secret", "access", "key"),
+        ("aws", "access", "key"),
+        ("aws", "access", "key", "id"),
+    )
+    keys: list[str] = []
+    for parts in families:
+        fused = "".join(parts)
+        camel = parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+        pascal = "".join(part[:1].upper() + part[1:] for part in parts)
+        keys.extend(
+            (
+                fused,
+                camel,
+                pascal,
+                "_".join(parts),
+                ".".join(parts),
+                "-".join(parts),
+            )
+        )
+    return tuple(keys)
+
+
+def test_runtime_packet_rejects_secret_key_family_surfaces():
+    for key in _secret_family_surface_keys():
+        text = f"{key}=leak"
+        assert sr._has_secret_assignment(text), text
+        for field in _PACKET_EMITTED_FIELDS:
+            if field in _PACKET_LIST_FIELDS:
+                candidates, receipt = _packet_candidates_and_receipt(field, text)
+                assert_fails(
+                    "skill_registry.secret_rejected",
+                    lambda candidates=candidates, receipt=receipt: sr.build_runtime_packet(
+                        candidates, receipt
+                    ),
+                )
+            else:
+                assert_fails(
+                    "skill_registry.secret_rejected",
+                    lambda field=field, text=text: sr._bounded_packet_scalar(text, field, 256),
+                )
+    benign = (
+        "monkey=banana",
+        "keyboard=qwerty",
+        "hockey=puck",
+        "tokenizer=bert",
+        "mode=strict",
+        "mention tokenId as a field name",
+        "mention apikey in docs",
+    )
+    for text in benign:
+        assert not sr._has_secret_assignment(text), text
+    allowed = _active(procedure_steps=benign)
+    packet = sr.build_runtime_packet([allowed], _bound_receipt(allowed))
+    assert packet.skills[0].procedure_steps == benign
+
+
+def test_runtime_packet_rejects_bearer_colon_form():
+    record = _active(procedure_steps=("Bearer: leakedtoken",))
+    assert_fails(
+        "skill_registry.secret_rejected",
+        lambda: sr.build_runtime_packet([record], _bound_receipt(record)),
+    )
+
+
+def test_runtime_packet_rejects_bearer_assignment_forms():
+    payloads = (
+        "bearer=leakedtoken",
+        "Bearer=leakedtoken",
+        "BEARER=leakedtoken",
+    )
+    for field in _PACKET_EMITTED_FIELDS:
+        for text in payloads:
+            if field in _PACKET_LIST_FIELDS:
+                candidates, receipt = _packet_candidates_and_receipt(field, text)
+                assert_fails(
+                    "skill_registry.secret_rejected",
+                    lambda candidates=candidates, receipt=receipt: sr.build_runtime_packet(
+                        candidates, receipt
+                    ),
+                )
+            else:
+                assert_fails(
+                    "skill_registry.secret_rejected",
+                    lambda field=field, text=text: sr._bounded_packet_scalar(text, field, 256),
+                )
+
+
+def test_runtime_packet_rejects_pgp_private_key_block():
+    payloads = (
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+        "-----begin pgp private key block-----",
+    )
+    for text in payloads:
+        for field in _PACKET_LIST_FIELDS:
+            candidates, receipt = _packet_candidates_and_receipt(field, text)
+            assert_fails(
+                "skill_registry.secret_rejected",
+                lambda candidates=candidates, receipt=receipt: sr.build_runtime_packet(
+                    candidates, receipt
+                ),
+            )
+
+
+def test_runtime_packet_rejects_assignment_style_private_and_cloud_keys():
+    cases = (
+        "private_key=MIIEowIBAAKCAQEA",
+        "secret.key=leakedvalue",
+        "aws_access_key_id=AKIALEAKED",
+        "AWS_ACCESS_KEY_ID=AKIALEAKED",
+    )
+    for text in cases:
+        for field in _PACKET_LIST_FIELDS:
+            candidates, receipt = _packet_candidates_and_receipt(field, text)
+            assert_fails(
+                "skill_registry.secret_rejected",
+                lambda candidates=candidates, receipt=receipt: sr.build_runtime_packet(
+                    candidates, receipt
+                ),
+            )
+    allowed = _active(
+        procedure_steps=(
+            "rotate credentials without embedding values",
+            "mention aws_access_key_id only as a field name",
+            "never paste a private_key block",
+            "secret.key names are not credentials",
+        )
+    )
+    packet = sr.build_runtime_packet([allowed], _bound_receipt(allowed))
+    assert packet.skills[0].procedure_steps == allowed.procedure_steps
+
+
+def test_select_to_build_rejects_duplicate_identity_version_candidates():
+    record = _active()
+    duplicate = _active()
+    candidates = [record, duplicate]
+    assert_fails(
+        "skill_registry.duplicate_selection",
+        lambda: sr.select(candidates, _select_context()),
+    )
+    receipt = sr.select([record], _select_context())
+    assert_fails(
+        "skill_registry.duplicate_selection",
+        lambda: sr.build_runtime_packet(candidates, receipt),
+    )
+
+
+def test_runtime_packet_rejects_windows_root_relative_path_not_relative_tools():
+    record = _active(procedure_steps=(r"\Windows\system32\cmd.exe",))
+    assert_fails(
+        "skill_registry.unsafe_path",
+        lambda: sr.build_runtime_packet([record], _bound_receipt(record)),
+    )
+    allowed = _active(preferred_tools=("git", "rg", r"tools\rg"))
+    packet = sr.build_runtime_packet([allowed], _bound_receipt(allowed))
+    assert packet.skills[0].preferred_tools == ("git", "rg", r"tools\rg")
+
+
+def test_runtime_packet_rejects_punctuated_and_encoded_posix_paths():
+    payloads = (
+        "/'etc/passwd",
+        '/"etc/passwd',
+        "/%2e%2e/etc/passwd",
+    )
+    for field in _PACKET_EMITTED_FIELDS:
+        for text in payloads:
+            if field in _PACKET_LIST_FIELDS:
+                candidates, receipt = _packet_candidates_and_receipt(field, text)
+                assert_fails(
+                    "skill_registry.unsafe_path",
+                    lambda candidates=candidates, receipt=receipt: sr.build_runtime_packet(
+                        candidates, receipt
+                    ),
+                )
+            else:
+                assert_fails(
+                    "skill_registry.unsafe_path",
+                    lambda field=field, text=text: sr._bounded_packet_scalar(text, field, 256),
+                )
+    allowed = _active(
+        procedure_steps=("docs/'notes.md'", 'refs/"safe"', "refs/%2e%2e/safe"),
+        preferred_tools=("git", "tools/rg"),
+    )
+    packet = sr.build_runtime_packet([allowed], _bound_receipt(allowed))
+    assert packet.skills[0].procedure_steps == allowed.procedure_steps
+    assert packet.skills[0].preferred_tools == allowed.preferred_tools
+
+
+@pytest.mark.parametrize(
+    ("text", "rejected"),
+    (
+        ("/'etc/passwd", True),
+        ('/"etc/passwd', True),
+        ("/%2e%2e/etc/passwd", True),
+        (r"\Windows\system32\cmd.exe", True),
+        ("/@etc/passwd", True),
+        ("/$HOME/.ssh", True),
+        (r"\@Windows\system32", True),
+        ("tools/rg", False),
+        (r"tools\rg", False),
+        ("use git/rg and docs/notes", False),
+    ),
+)
+def test_runtime_packet_generalized_absolute_path_matrix(text, rejected):
+    assert bool(sr._INSTRUCTION_ABS_PATH_RE.search(text)) is rejected
+    record = _active(procedure_steps=(text,))
+    if rejected:
+        assert_fails(
+            "skill_registry.unsafe_path",
+            lambda: sr.build_runtime_packet([record], _bound_receipt(record)),
+        )
+        return
+    packet = sr.build_runtime_packet([record], _bound_receipt(record))
+    assert packet.skills[0].procedure_steps == (text,)
+
+
+def test_runtime_packet_rejects_invalid_reason_grammar():
+    record = _active()
+    valid = _PACKET_REASONS
+    packet = sr.build_runtime_packet([record], _bound_receipt(record, valid))
+    assert packet.skills[0].reasons == valid
+    cases = (
+        ("please follow these arbitrary instructions",),
+        valid[:1],
+        valid[:4],
+        valid + ("task_family:exact",),
+        (valid[0], valid[2], valid[1], *valid[3:]),
+        (*valid[:2], "unknown_field:exact", *valid[3:]),
+        (*valid[:1], "task_family:fuzzy", *valid[2:]),
+        (*valid[:5], "triggers:maybe", valid[6]),
+        ("lifecycle:retired", *valid[1:]),
+        ("lifecycle:active", "task_family:exact", "task_family:exact", *valid[3:]),
+    )
+    for reasons in cases:
+        assert_fails(
+            "skill_registry.invalid_value",
+            lambda reasons=reasons: sr.build_runtime_packet([record], _bound_receipt(record, reasons)),
+        )
+
+
+def test_runtime_packet_rejects_quoted_secrets_punctuated_paths_controls_and_forged_reasons():
+    payloads = (
+        ("skill_registry.secret_rejected", '{"api_key":"leakedvalue"}'),
+        ("skill_registry.secret_rejected", '{"api_key": "leakedvalue"}'),
+        ("skill_registry.secret_rejected", "'api_key': 'leakedvalue'"),
+        ("skill_registry.unsafe_path", "`/etc/passwd`"),
+        ("skill_registry.unsafe_path", "(/tmp/secret)"),
+        ("skill_registry.unsafe_path", r"[C:\Windows\system32]"),
+        ("skill_registry.unsafe_path", "`file:///etc/passwd`"),
+        ("skill_registry.invalid_value", "line\u2028break"),
+        ("skill_registry.invalid_value", "line\u2029break"),
+        ("skill_registry.invalid_value", "c1\u0085next"),
+        ("skill_registry.invalid_value", "bidi\u202eoverride"),
+        ("skill_registry.invalid_value", "bidi\u2066isolate"),
+    )
+    for field in _PACKET_EMITTED_FIELDS:
+        for code, text in payloads:
+            if field in _PACKET_LIST_FIELDS:
+                candidates, receipt = _packet_candidates_and_receipt(field, text)
+                assert_fails(
+                    code,
+                    lambda candidates=candidates, receipt=receipt: sr.build_runtime_packet(
+                        candidates, receipt
+                    ),
+                )
+            else:
+                assert_fails(
+                    code,
+                    lambda field=field, text=text: sr._bounded_packet_scalar(text, field, 256),
+                )
+    record = _active()
+    forged = (
+        "lifecycle:active",
+        "task_family:wildcard",
+        "path_or_symbol:wildcard",
+        "risk:wildcard",
+        "stage:wildcard",
+        "triggers:wildcard",
+        "applicability:wildcard",
+    )
+    assert_fails(
+        "skill_registry.invalid_value",
+        lambda: sr.build_runtime_packet([record], _bound_receipt(record, forged)),
+    )
+    mixed = (*_PACKET_REASONS[:1], "task_family:wildcard", *_PACKET_REASONS[2:])
+    assert_fails(
+        "skill_registry.invalid_value",
+        lambda: sr.build_runtime_packet([record], _bound_receipt(record, mixed)),
+    )
+
+
+def test_runtime_packet_rejects_camelcase_secret_access_key_assignments():
+    payloads = (
+        '{"secretAccessKey":"leakedvalue"}',
+        '{"awsSecretAccessKey":"leakedvalue"}',
+    )
+    for text in payloads:
+        record = _active(procedure_steps=(text,))
+        assert_fails(
+            "skill_registry.secret_rejected",
+            lambda record=record: sr.build_runtime_packet([record], _bound_receipt(record)),
+        )
+
+
+def test_runtime_packet_rejects_format_char_split_secret_tokens():
+    payloads = (
+        "pass\u200bword=leakedvalue",
+        "Bea\u200brer leakedtoken",
+        "-----BEGIN PRI\u200bVATE KEY-----",
+        "pass\u00adword=leakedvalue",
+        "Bea\u00adrer leakedtoken",
+        "-----BEGIN PRI\u00adVATE KEY-----",
+    )
+    for text in payloads:
+        record = _active(procedure_steps=(text,))
+        assert_fails(
+            "skill_registry.invalid_value",
+            lambda record=record: sr.build_runtime_packet([record], _bound_receipt(record)),
+        )
+
+
+def test_runtime_packet_rejects_unicode_whitespace_and_fullwidth_assignment_delimiters():
+    payloads = (
+        "password\u00a0=leakedvalue",
+        "password=\u00a0leakedvalue",
+        "api_key\uff1aleakedvalue",
+    )
+    for text in payloads:
+        assert sr._has_secret_assignment(text), text
+    for field in _PACKET_EMITTED_FIELDS:
+        for text in payloads:
+            if field in _PACKET_LIST_FIELDS:
+                candidates, receipt = _packet_candidates_and_receipt(field, text)
+                assert_fails(
+                    "skill_registry.secret_rejected",
+                    lambda candidates=candidates, receipt=receipt: sr.build_runtime_packet(
+                        candidates, receipt
+                    ),
+                )
+            else:
+                assert_fails(
+                    "skill_registry.secret_rejected",
+                    lambda field=field, text=text: sr._bounded_packet_scalar(text, field, 256),
+                )
+
+
+def test_runtime_packet_canonical_bytes_are_stable():
+    alpha, beta, ctx = _packet_pair()
+    receipt_beta_first = sr.select([beta, alpha], ctx)
+    receipt_alpha_first = sr.select([alpha, beta], ctx)
+    from_beta_first = sr.build_runtime_packet([beta, alpha], receipt_beta_first)
+    from_alpha_first = sr.build_runtime_packet([alpha, beta], receipt_alpha_first)
+    expected_reasons = [
+        "lifecycle:active",
+        "task_family:exact",
+        "path_or_symbol:exact",
+        "risk:exact",
+        "stage:exact",
+        "triggers:unconstrained",
+        "applicability:exact",
+    ]
+
+    def _expected_row(record, procedure_steps):
+        return {
+            "preferred_tools": ["git"],
+            "avoid_rules": ["do not rewrite history"],
+            "procedure_steps": list(procedure_steps),
+            "applicability": ["repo"],
+            "reasons": list(expected_reasons),
+            "digest": sr.skill_digest(record),
+            "version": record.version,
+            "identity": record.identity,
+        }
+
+    expected_skills_first_order = {
+        "skills": [
+            _expected_row(alpha, ("inspect diff",)),
+            _expected_row(beta, ("inspect status",)),
+        ],
+        "version": sr.RUNTIME_PACKET_VERSION,
+    }
+    expected_skills_second_order = {
+        "version": sr.RUNTIME_PACKET_VERSION,
+        "skills": [
+            {
+                "identity": alpha.identity,
+                "version": alpha.version,
+                "digest": sr.skill_digest(alpha),
+                "reasons": list(expected_reasons),
+                "applicability": ["repo"],
+                "procedure_steps": ["inspect diff"],
+                "avoid_rules": ["do not rewrite history"],
+                "preferred_tools": ["git"],
+            },
+            {
+                "identity": beta.identity,
+                "version": beta.version,
+                "digest": sr.skill_digest(beta),
+                "reasons": list(expected_reasons),
+                "applicability": ["repo"],
+                "procedure_steps": ["inspect status"],
+                "avoid_rules": ["do not rewrite history"],
+                "preferred_tools": ["git"],
+            },
+        ],
+    }
+    expected_bytes = json.dumps(
+        expected_skills_first_order, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    reordered_bytes = json.dumps(
+        expected_skills_second_order, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    assert expected_bytes == reordered_bytes
+    assert sr.canonical_json(from_beta_first).encode("utf-8") == expected_bytes
+    assert sr.canonical_json(from_alpha_first).encode("utf-8") == expected_bytes
+    assert sr.canonical_json(from_beta_first.as_mapping()).encode("utf-8") == expected_bytes
+
+
+def test_runtime_packet_does_not_mutate_inputs_or_registry():
+    registry = sr.SkillRegistry()
+    propose_with_accepted_evidence(registry)
+    active = registry.activate("commit-msg-check", "1.0.0", MANAGER)
+    receipt = registry.select(_select_context())
+    before_records = registry.records()
+    before_selected = receipt.selected
+    before_steps = active.procedure_steps
+    packet = sr.build_runtime_packet(registry, receipt)
+    again = registry.build_runtime_packet(receipt)
+    assert registry.records() == before_records
+    assert all(left is right for left, right in zip(registry.records(), before_records))
+    assert receipt.selected is before_selected
+    assert active.procedure_steps is before_steps
+    assert registry.get("commit-msg-check", "1.0.0") is active
+    assert packet.as_mapping() == again.as_mapping()
+    assert [row.identity for row in packet.skills] == ["commit-msg-check"]
+
+
+def test_runtime_packet_round_trips_select_reason_kinds():
+    exact = _active()
+    exact_receipt = sr.select([exact], _select_context())
+    exact_packet = sr.build_runtime_packet([exact], exact_receipt)
+    assert "task_family:exact" in exact_packet.skills[0].reasons
+    assert "path_or_symbol:exact" in exact_packet.skills[0].reasons
+    assert exact_packet.skills[0].reasons == exact_receipt.selected[0].reasons
+
+    wild = _active()
+    wild_receipt = sr.select([wild], _select_context(task_family="*"))
+    assert "task_family:wildcard" in wild_receipt.selected[0].reasons
+    wild_packet = sr.build_runtime_packet([wild], wild_receipt)
+    assert wild_packet.skills[0].reasons == wild_receipt.selected[0].reasons
+
+    prefix = _active(path_or_symbol="src/aiworkhub/*")
+    prefix_receipt = sr.select([prefix], _select_context())
+    assert "path_or_symbol:wildcard" in prefix_receipt.selected[0].reasons
+    prefix_packet = sr.build_runtime_packet([prefix], prefix_receipt)
+    assert prefix_packet.skills[0].reasons == prefix_receipt.selected[0].reasons
+
+    open_record = _active(triggers=(), applicability=())
+    open_receipt = sr.select([open_record], _select_context(triggers=(), applicability=()))
+    assert "triggers:unconstrained" in open_receipt.selected[0].reasons
+    assert "applicability:unconstrained" in open_receipt.selected[0].reasons
+    open_packet = sr.build_runtime_packet([open_record], open_receipt)
+    assert open_packet.skills[0].reasons == open_receipt.selected[0].reasons
+
+
+def test_runtime_packet_rejects_mutated_reasons_or_bound_context():
+    record = _active()
+    receipt = sr.select([record], _select_context(task_family="*"))
+    item = receipt.selected[0]
+    assert item.digest == sr.skill_digest(record)
+    assert "task_family:wildcard" in item.reasons
+    mixed = (*item.reasons[:1], "task_family:exact", *item.reasons[2:])
+    mutated_reasons = sr.replace(receipt, selected=(sr.replace(item, reasons=mixed),))
+    assert mutated_reasons.selected[0].digest == item.digest
+    assert_fails(
+        "skill_registry.invalid_value",
+        lambda: sr.build_runtime_packet([record], mutated_reasons),
+    )
+    mutated_context = sr.replace(
+        receipt,
+        context={**dict(receipt.context), "task_family": record.task_family},
+    )
+    assert mutated_context.selected[0].digest == item.digest
+    assert_fails(
+        "skill_registry.invalid_value",
+        lambda: sr.build_runtime_packet([record], mutated_context),
+    )
+    forged = sr.replace(
+        receipt,
+        context={**dict(receipt.context), "task_family": record.task_family},
+        selected=(sr.replace(item, reasons=mixed),),
+    )
+    assert forged.selected[0].digest == item.digest
+    assert forged.context_seal == receipt.context_seal
+    assert_fails(
+        "skill_registry.invalid_value",
+        lambda: sr.build_runtime_packet([record], forged),
+    )
+    assert_fails(
+        "skill_registry.invalid_value",
+        lambda: sr.build_runtime_packet(
+            [record], sr.replace(receipt, context_seal="0" * 64)
+        ),
+    )
+    assert_fails(
+        "skill_registry.invalid_value",
+        lambda: sr.build_runtime_packet([record], sr.replace(receipt, context_seal="")),
+    )
+    assert_fails(
+        "skill_registry.invalid_value",
+        lambda: sr.build_runtime_packet(
+            [record], sr.replace(receipt, context_seal=receipt.context_seal + "ff")
+        ),
+    )
+    assert_fails(
+        "skill_registry.receipt_extended",
+        lambda: sr.build_runtime_packet(
+            [record],
+            sr.replace(
+                receipt,
+                context={**dict(receipt.context), "context_seal": receipt.context_seal},
+            ),
+        ),
+    )
+    manual = sr.SkillSelectionReceipt(selected=receipt.selected, context=receipt.context)
+    assert manual.context_seal == ""
+    assert_fails(
+        "skill_registry.invalid_value",
+        lambda: sr.build_runtime_packet([record], manual),
+    )
+    empty = sr.SkillSelectionReceipt()
+    assert empty.as_mapping() == {"selected": [], "context": {}, "context_seal": ""}
+    assert sr.build_runtime_packet([], empty).skills == ()
+    with pytest.raises(TypeError):
+        empty.context["task_family"] = "commit"
+
+
+def test_selection_receipt_empty_context_is_immutable():
+    empty = sr.SkillSelectionReceipt()
+    assert empty.as_mapping() == {"selected": [], "context": {}, "context_seal": ""}
+    assert not isinstance(empty.context, dict)
+    with pytest.raises(TypeError):
+        empty.context["task_family"] = "commit"
 
 
 def test_propose_requires_proposed_state():

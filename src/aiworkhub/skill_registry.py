@@ -39,10 +39,10 @@ import json
 import math
 import re
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, NoReturn, TypeVar
-
 _IDENTITY_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _VERSION_RE = re.compile(
     r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
@@ -635,6 +635,19 @@ def _canonical(value: Any) -> Any:
                 "note": value.note,
             }
         )
+    if isinstance(
+        value, (SkillSelectionReceipt, SkillRuntimePacket, SkillRuntimePacketRow)
+    ):
+        return _canonical(value.as_mapping())
+    if isinstance(value, SkillSelection):
+        return _canonical(
+            {
+                "identity": value.identity,
+                "version": value.version,
+                "digest": value.digest,
+                "reasons": list(value.reasons),
+            }
+        )
     _fail("skill_registry.invalid_type", f"cannot canonicalize {type(value).__name__}")
 
 
@@ -774,6 +787,109 @@ def _rank_key(record: SkillRecord) -> tuple[Any, ...]:
 # requested limit is deterministically clamped to it.
 MAX_RANK_LIMIT = 1000
 
+# Hard ceiling and default for bounded task-aware selection. ``select`` requires
+# a positive int (bools fail closed) and clamps any larger request to this cap.
+MAX_SELECT_LIMIT = 32
+DEFAULT_SELECT_LIMIT = 8
+SELECT_WILDCARD = "*"
+_SELECT_REASON_LIMIT = 8
+_SELECT_CONTEXT_REQUIRED = ("task_family", "path_or_symbol", "risk", "stage")
+_SELECT_CONTEXT_ALLOWED = frozenset((*_SELECT_CONTEXT_REQUIRED, "triggers", "applicability"))
+_SELECT_REASON_FIELDS = (*_SELECT_CONTEXT_REQUIRED, "triggers", "applicability")
+_SELECT_REASON_HEAD = "lifecycle:active"
+_SELECT_REASON_KINDS = {
+    "task_family": frozenset({"exact", "wildcard"}),
+    "path_or_symbol": frozenset({"exact", "wildcard"}),
+    "risk": frozenset({"exact", "wildcard"}),
+    "stage": frozenset({"exact", "wildcard"}),
+    "triggers": frozenset({"exact", "wildcard", "unconstrained"}),
+    "applicability": frozenset({"exact", "wildcard", "unconstrained"}),
+}
+
+RUNTIME_PACKET_VERSION = "1.0.0"
+MAX_PACKET_SELECTED = 32
+MAX_PACKET_LIST_ITEMS = 16
+MAX_PACKET_STRING_BYTES = 256
+MAX_PACKET_BYTES = 8192
+_PACKET_ROW_KEYS = frozenset(
+    {
+        "identity",
+        "version",
+        "digest",
+        "reasons",
+        "applicability",
+        "procedure_steps",
+        "avoid_rules",
+        "preferred_tools",
+    }
+)
+_PACKET_KEYS = frozenset({"version", "skills"})
+_CONTROL_CHAR_RE = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u00ad\u061c\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]"
+)
+_SECRET_PROVIDER_PREFIXES: tuple[str, ...] = ("aws", "openai", "github")
+_SECRET_KEY_FAMILIES: tuple[tuple[str, ...], ...] = (
+    ("password",),
+    ("passwd",),
+    ("pwd",),
+    ("secret",),
+    ("token",),
+    ("authorization",),
+    ("credential",),
+    ("bearer",),
+    ("key",),
+    ("private",),
+    ("api", "key"),
+    ("access", "key"),
+    ("access", "id"),
+    ("access", "key", "id"),
+    ("private", "key"),
+    ("secret", "key"),
+    ("secret", "access", "key"),
+    ("auth", "key"),
+    ("auth", "token"),
+    ("bearer", "token"),
+    ("client", "secret"),
+    ("api", "secret"),
+    ("api", "token"),
+    ("access", "token"),
+    ("token", "id"),
+    ("token", "value"),
+    ("password", "hash"),
+    ("client", "credential"),
+    ("credential", "id"),
+    ("credential", "key"),
+    ("credential", "token"),
+    ("credential", "secret"),
+    ("credential", "hash"),
+)
+
+
+def _secret_family_catalog() -> tuple[frozenset[str], frozenset[tuple[str, ...]], frozenset[str]]:
+    fused: set[str] = set()
+    sequences: set[tuple[str, ...]] = set()
+    atoms: set[str] = set(_SECRET_PROVIDER_PREFIXES)
+    for family in _SECRET_KEY_FAMILIES:
+        sequences.add(family)
+        fused.add("".join(family))
+        atoms.update(family)
+        for prefix in _SECRET_PROVIDER_PREFIXES:
+            sequences.add((prefix, *family))
+            fused.add(f"{prefix}{''.join(family)}")
+    return frozenset(fused), frozenset(sequences), frozenset(atoms)
+
+
+_SECRET_FAMILY_FORMS, _SECRET_FAMILY_SEQUENCES, _SECRET_FAMILY_ATOMS = _secret_family_catalog()
+_KEY_SEP_RE = re.compile(r"[._-]+")
+_CAMEL_SPLIT_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+_MAX_ASSIGNMENT_KEY_CHARS = 128
+_BEARER_RE = re.compile(r"(?i)\b(?:authorization\s*:|bearer\s*(?::\s*|=\s*|\s+)\S+)")
+_PRIVATE_KEY_RE = re.compile(r"(?i)-----BEGIN[ A-Z]*PRIVATE KEY(?: BLOCK)?-----")
+_INSTRUCTION_ABS_PATH_RE = re.compile(
+    r"(?i)(?:file:[\\/]+|(?<![A-Za-z0-9._~-])/[^\s]|"
+    r"[A-Za-z]:[\\/]|\\\\|(?<![A-Za-z0-9])//[.?A-Za-z]|"
+    r"(?<![A-Za-z0-9._~-])\\[^\s])"
+)
 
 def rank(candidates: Iterable[SkillRecord], limit: int | None = None) -> list[SkillRecord]:
     """Return a deterministic, bounded ranking of candidate records.
@@ -813,6 +929,624 @@ def rank(candidates: Iterable[SkillRecord], limit: int | None = None) -> list[Sk
             pass
         return []
     return heapq.nsmallest(limit, _validated(), key=_rank_key)
+
+
+@dataclass(frozen=True)
+class SkillSelection:
+    """Compact selected-skill row: identity, version, digest, reason tokens."""
+
+    identity: str
+    version: str
+    digest: str
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SkillSelectionReceipt:
+    """Bounded read-only receipt. Never carries procedure bodies or secrets."""
+
+    selected: tuple[SkillSelection, ...] = ()
+    context: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    context_seal: str = ""
+
+    def as_mapping(self) -> dict[str, Any]:
+        return {
+            "selected": [
+                {
+                    "identity": item.identity,
+                    "version": item.version,
+                    "digest": item.digest,
+                    "reasons": list(item.reasons),
+                }
+                for item in self.selected
+            ],
+            "context": _receipt_context_as_mapping(self.context),
+            "context_seal": self.context_seal,
+        }
+
+
+@dataclass(frozen=True)
+class SkillRuntimePacketRow:
+    """Bounded runtime instruction row. No evidence, counters, or host paths."""
+
+    identity: str
+    version: str
+    digest: str
+    reasons: tuple[str, ...]
+    applicability: tuple[str, ...]
+    procedure_steps: tuple[str, ...]
+    avoid_rules: tuple[str, ...]
+    preferred_tools: tuple[str, ...]
+
+    def as_mapping(self) -> dict[str, Any]:
+        return {
+            "identity": self.identity,
+            "version": self.version,
+            "digest": self.digest,
+            "reasons": list(self.reasons),
+            "applicability": list(self.applicability),
+            "procedure_steps": list(self.procedure_steps),
+            "avoid_rules": list(self.avoid_rules),
+            "preferred_tools": list(self.preferred_tools),
+        }
+
+
+@dataclass(frozen=True)
+class SkillRuntimePacket:
+    """Versioned, bounded runtime instruction packet for later prompt injection."""
+
+    version: str = RUNTIME_PACKET_VERSION
+    skills: tuple[SkillRuntimePacketRow, ...] = ()
+
+    def as_mapping(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "skills": [row.as_mapping() for row in self.skills],
+        }
+
+
+def _normalize_select_context(context: Any) -> dict[str, Any]:
+    if not isinstance(context, Mapping):
+        _fail("skill_registry.invalid_type", "selection context must be a mapping")
+    unknown = [key for key in context if key not in _SELECT_CONTEXT_ALLOWED]
+    if unknown:
+        _fail("skill_registry.unknown_key", f"unknown selection field: {sorted(unknown)[0]}")
+    missing = [key for key in _SELECT_CONTEXT_REQUIRED if key not in context]
+    if missing:
+        _fail("skill_registry.missing_field", f"missing required field: {sorted(missing)[0]}")
+    task_family = _require_nonempty_str(context["task_family"], "task_family")
+    raw_path = context["path_or_symbol"]
+    path_or_symbol = (
+        SELECT_WILDCARD if raw_path == SELECT_WILDCARD else _validate_path_or_symbol(raw_path)
+    )
+    raw_risk = context["risk"]
+    risk: Any
+    if raw_risk == SELECT_WILDCARD:
+        risk = SELECT_WILDCARD
+    else:
+        risk = _coerce_enum(raw_risk, RiskLevel, "risk", "skill_registry.invalid_risk")
+    stage = _require_nonempty_str(context["stage"], "stage")
+    triggers = _validate_string_tuple(context.get("triggers", ()), "triggers")
+    applicability = _validate_string_tuple(context.get("applicability", ()), "applicability")
+    return {
+        "task_family": task_family,
+        "path_or_symbol": path_or_symbol,
+        "risk": risk,
+        "stage": stage,
+        "triggers": triggers,
+        "applicability": applicability,
+    }
+
+
+def _canonical_select_context(normalized: Mapping[str, Any]) -> dict[str, Any]:
+    risk = normalized["risk"]
+    return {
+        "task_family": normalized["task_family"],
+        "path_or_symbol": normalized["path_or_symbol"],
+        "risk": risk.value if isinstance(risk, RiskLevel) else risk,
+        "stage": normalized["stage"],
+        "triggers": tuple(normalized["triggers"]),
+        "applicability": tuple(normalized["applicability"]),
+    }
+
+
+def _receipt_context_as_mapping(context: Any) -> dict[str, Any]:
+    if not isinstance(context, Mapping):
+        _fail("skill_registry.invalid_type", "receipt context must be a mapping")
+    if not context:
+        return {}
+    payload: dict[str, Any] = {}
+    for key, value in context.items():
+        if isinstance(value, tuple):
+            payload[key] = list(value)
+        elif isinstance(value, RiskLevel):
+            payload[key] = value.value
+        else:
+            payload[key] = value
+    return payload
+
+
+def _bind_receipt_context(context: Any, *, require: bool) -> dict[str, Any]:
+    if not isinstance(context, Mapping):
+        _fail("skill_registry.invalid_type", "receipt context must be a mapping")
+    if not context:
+        if require:
+            _fail("skill_registry.missing_field", "missing required field: context")
+        return {}
+    return _normalize_select_context(context)
+
+
+def _receipt_context_seal(
+    context: Any, selected: tuple[SkillSelection, ...] = ()
+) -> str:
+    payload = {
+        "context": _receipt_context_as_mapping(context),
+        "selected": [
+            {
+                "identity": item.identity,
+                "version": item.version,
+                "digest": item.digest,
+            }
+            for item in selected
+        ],
+    }
+    if not payload["context"] and not payload["selected"]:
+        return ""
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _verify_receipt_context_seal(receipt: SkillSelectionReceipt) -> None:
+    seal = receipt.context_seal
+    if isinstance(seal, bool) or not isinstance(seal, str):
+        _fail("skill_registry.invalid_type", "receipt context_seal must be a string")
+    expected = _receipt_context_seal(receipt.context, receipt.selected)
+    if seal != expected:
+        _fail("skill_registry.invalid_value", "receipt context seal does not match selection")
+
+
+def _scalar_match(pattern: str, value: str) -> str | None:
+    if pattern == SELECT_WILDCARD or value == SELECT_WILDCARD:
+        return "wildcard"
+    if pattern == value:
+        return "exact"
+    return None
+
+
+def _path_match(pattern: str, value: str) -> str | None:
+    kind = _scalar_match(pattern, value)
+    if kind is not None:
+        return kind
+    if pattern.endswith("/*"):
+        prefix = pattern[:-2]
+        if prefix and (value == prefix or value.startswith(prefix + "/")):
+            return "wildcard"
+    return None
+
+
+def _tuple_match(patterns: tuple[str, ...], values: tuple[str, ...]) -> str | None:
+    if not patterns:
+        return "unconstrained"
+    if SELECT_WILDCARD in patterns or SELECT_WILDCARD in values:
+        return "wildcard"
+    if not values:
+        return None
+    pattern_set = set(patterns)
+    if any(item in pattern_set for item in values):
+        return "exact"
+    return None
+
+
+def _selection_reasons(record: SkillRecord, context: Mapping[str, Any]) -> tuple[str, ...] | None:
+    checks = (
+        ("task_family", _scalar_match(record.task_family, context["task_family"])),
+        ("path_or_symbol", _path_match(record.path_or_symbol, context["path_or_symbol"])),
+        (
+            "risk",
+            "wildcard"
+            if context["risk"] == SELECT_WILDCARD
+            else ("exact" if record.risk == context["risk"] else None),
+        ),
+        ("stage", _scalar_match(record.stage, context["stage"])),
+        ("triggers", _tuple_match(record.triggers, context["triggers"])),
+        ("applicability", _tuple_match(record.applicability, context["applicability"])),
+    )
+    reasons: list[str] = ["lifecycle:active"]
+    for field, kind in checks:
+        if kind is None:
+            return None
+        reasons.append(f"{field}:{kind}")
+    return tuple(reasons[:_SELECT_REASON_LIMIT])
+
+
+def _validate_select_limit(limit: Any) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        _fail("skill_registry.invalid_type", "limit must be a positive int")
+    if limit < 1:
+        _fail("skill_registry.invalid_value", "limit must be a positive int")
+    if limit > MAX_SELECT_LIMIT:
+        return MAX_SELECT_LIMIT
+    return limit
+
+
+def select(
+    candidates: Iterable[SkillRecord],
+    context: Mapping[str, Any],
+    limit: int = DEFAULT_SELECT_LIMIT,
+) -> SkillSelectionReceipt:
+    """Return a deterministic, bounded, read-only ACTIVE skill selection receipt.
+
+    Only ``LifecycleState.ACTIVE`` records are eligible. Matching is exact after
+    normalization, plus the explicit wildcard ``*`` (and a trailing ``/*``
+    path prefix). Substring and fuzzy matching are not used. Ties use
+    :func:`_rank_key`. Candidate input order cannot change selected identities
+    or receipt ordering. ``limit`` must be a positive ``int`` and is clamped to
+    ``MAX_SELECT_LIMIT``. Zero matches yield an empty receipt. This function
+    never mutates records, registry state, files, or network state.
+    """
+    limit = _validate_select_limit(limit)
+    normalized = _normalize_select_context(context)
+    matched: list[tuple[tuple[Any, ...], SkillSelection]] = []
+    for record in _index_packet_candidates(candidates).values():
+        if record.lifecycle_state is not LifecycleState.ACTIVE:
+            continue
+        reasons = _selection_reasons(record, normalized)
+        if reasons is None:
+            continue
+        matched.append(
+            (
+                _rank_key(record),
+                SkillSelection(
+                    identity=record.identity,
+                    version=record.version,
+                    digest=skill_digest(record),
+                    reasons=reasons,
+                ),
+            )
+        )
+    matched.sort(key=lambda item: item[0])
+    selected = tuple(item[1] for item in matched[:limit])
+    bound_context = _canonical_select_context(normalized)
+    return SkillSelectionReceipt(
+        selected=selected,
+        context=MappingProxyType(bound_context),
+        context_seal=_receipt_context_seal(bound_context, selected),
+    )
+
+
+def _validate_positive_limit(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        _fail("skill_registry.invalid_type", f"{field} must be a positive int")
+    if value < 1:
+        _fail("skill_registry.invalid_value", f"{field} must be a positive int")
+    return value
+
+
+_ASSIGNMENT_DELIMITERS = frozenset("=:\uff1a\uff1d")
+_ASSIGNMENT_LINE_BREAKS = frozenset("\n\r\v\f\u0085\u2028\u2029")
+
+
+def _is_assignment_padding(char: str) -> bool:
+    return char.isspace() and char not in _ASSIGNMENT_LINE_BREAKS
+
+
+def _is_assignment_key_char(char: str) -> bool:
+    return char.isascii() and (char.isalnum() or char in "._-")
+
+
+def _assignment_keys(text: str) -> Iterator[str]:
+    length = len(text)
+    index = 0
+    while index < length:
+        if text[index] not in _ASSIGNMENT_DELIMITERS:
+            index += 1
+            continue
+        value_at = index + 1
+        while value_at < length and _is_assignment_padding(text[value_at]):
+            value_at += 1
+        if value_at >= length or text[value_at].isspace():
+            index += 1
+            continue
+        cursor = index - 1
+        while cursor >= 0 and _is_assignment_padding(text[cursor]):
+            cursor -= 1
+        if cursor >= 0 and text[cursor] in "'\"":
+            cursor -= 1
+        end = cursor + 1
+        while cursor >= 0 and _is_assignment_key_char(text[cursor]):
+            cursor -= 1
+        start = cursor + 1
+        key_len = end - start
+        if 1 <= key_len <= _MAX_ASSIGNMENT_KEY_CHARS:
+            first = text[start]
+            if first.isascii() and (first.isalpha() or first == "_"):
+                yield text[start:end]
+        index += 1
+
+
+def _assignment_key_tokens(key: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    for chunk in _KEY_SEP_RE.split(key):
+        if not chunk:
+            continue
+        parts = _CAMEL_SPLIT_RE.findall(chunk)
+        if not parts:
+            tokens.append(chunk.lower())
+            continue
+        tokens.extend(part.lower() for part in parts)
+    return tuple(tokens)
+
+
+def _canonical_family_token(token: str) -> str:
+    if token in _SECRET_FAMILY_ATOMS:
+        return token
+    if token.endswith("s"):
+        stem = token[:-1]
+        if stem in _SECRET_FAMILY_ATOMS:
+            return stem
+    return token
+
+
+def _token_is_secret_bearing(token: str) -> bool:
+    if token in _SECRET_FAMILY_FORMS:
+        return True
+    if not token.endswith("s"):
+        return False
+    return token[:-1] in _SECRET_FAMILY_FORMS
+
+
+def _assignment_tokens_are_secret(tokens: tuple[str, ...]) -> bool:
+    if any(_token_is_secret_bearing(token) for token in tokens):
+        return True
+    canonical = tuple(_canonical_family_token(token) for token in tokens)
+    length = len(canonical)
+    for start in range(length):
+        for end in range(start + 1, length + 1):
+            if canonical[start:end] in _SECRET_FAMILY_SEQUENCES:
+                return True
+    return False
+
+
+def _has_secret_assignment(text: str) -> bool:
+    for key in _assignment_keys(text):
+        if _assignment_tokens_are_secret(_assignment_key_tokens(key)):
+            return True
+    return False
+
+
+def _reject_instruction_string(text: str, field: str) -> None:
+    if _CONTROL_CHAR_RE.search(text):
+        _fail("skill_registry.invalid_value", f"{field} contains a control character")
+    if _PRIVATE_KEY_RE.search(text) or _BEARER_RE.search(text) or _has_secret_assignment(text):
+        _fail("skill_registry.secret_rejected", f"{field} contains credential material")
+    if _INSTRUCTION_ABS_PATH_RE.search(text):
+        _fail("skill_registry.unsafe_path", f"{field} contains an absolute host path")
+
+
+def _bounded_packet_strings(
+    values: tuple[str, ...],
+    field: str,
+    max_list_items: int,
+    max_string_bytes: int,
+) -> tuple[str, ...]:
+    if not isinstance(values, tuple):
+        _fail("skill_registry.invalid_type", f"{field} must be a tuple of strings")
+    if len(values) > max_list_items:
+        _fail("skill_registry.packet_limit", f"{field} exceeds max list items")
+    for item in values:
+        if isinstance(item, bool) or not isinstance(item, str):
+            _fail("skill_registry.invalid_type", f"{field} entries must be strings")
+        if len(item.encode("utf-8")) > max_string_bytes:
+            _fail("skill_registry.packet_limit", f"{field} entry exceeds max string bytes")
+        _reject_instruction_string(item, field)
+    return values
+
+
+def _bounded_packet_scalar(value: str, field: str, max_string_bytes: int) -> str:
+    if isinstance(value, bool) or not isinstance(value, str):
+        _fail("skill_registry.invalid_type", f"{field} must be a string")
+    if len(value.encode("utf-8")) > max_string_bytes:
+        _fail("skill_registry.packet_limit", f"{field} exceeds max string bytes")
+    _reject_instruction_string(value, field)
+    return value
+
+
+def _validate_packet_reasons(reasons: tuple[str, ...]) -> tuple[str, ...]:
+    expected = 1 + len(_SELECT_REASON_FIELDS)
+    if len(reasons) != expected:
+        _fail("skill_registry.invalid_value", "reasons violate selector grammar")
+    if reasons[0] != _SELECT_REASON_HEAD:
+        _fail("skill_registry.invalid_value", "reasons violate selector grammar")
+    seen: set[str] = set()
+    for index, token in enumerate(reasons[1:]):
+        field, sep, kind = token.partition(":")
+        allowed = _SELECT_REASON_KINDS.get(field)
+        if sep != ":" or not field or ":" in kind or allowed is None or kind not in allowed:
+            _fail("skill_registry.invalid_value", "reasons violate selector grammar")
+        if field in seen:
+            _fail("skill_registry.invalid_value", "reasons violate selector grammar")
+        if field != _SELECT_REASON_FIELDS[index]:
+            _fail("skill_registry.invalid_value", "reasons violate selector grammar")
+        seen.add(field)
+    return reasons
+
+
+def _bind_canonical_packet_reasons(
+    reasons: tuple[str, ...], record: SkillRecord, context: Mapping[str, Any]
+) -> tuple[str, ...]:
+    derived = _selection_reasons(record, context)
+    if derived is None or reasons != derived:
+        _fail("skill_registry.invalid_value", "reasons do not match selected record")
+    return derived
+
+
+def _index_packet_candidates(candidates: Iterable[SkillRecord]) -> dict[tuple[str, str], SkillRecord]:
+    if isinstance(candidates, (str, bytes)) or not isinstance(candidates, Iterable):
+        _fail("skill_registry.invalid_type", "candidates must be an iterable of SkillRecord")
+    index: dict[tuple[str, str], SkillRecord] = {}
+    for record in candidates:
+        if not isinstance(record, SkillRecord):
+            _fail("skill_registry.invalid_type", "candidates must contain only SkillRecord")
+        record = validate_record(record)
+        key = (record.identity, record.version)
+        if key in index:
+            _fail(
+                "skill_registry.duplicate_selection",
+                f"duplicate candidate {record.identity!r}@{record.version!r}",
+            )
+        index[key] = record
+    return index
+
+
+def _authenticate_selection_receipt(receipt: Any) -> SkillSelectionReceipt:
+    if type(receipt) is not SkillSelectionReceipt:
+        if isinstance(receipt, SkillSelectionReceipt):
+            _fail("skill_registry.receipt_extended", "receipt type must be exactly SkillSelectionReceipt")
+        _fail("skill_registry.invalid_type", "receipt must be a SkillSelectionReceipt")
+    receipt_map = receipt.as_mapping()
+    if set(receipt_map) != {"selected", "context", "context_seal"}:
+        _fail("skill_registry.receipt_extended", "receipt mapping has unexpected keys")
+    if set(vars(receipt)) != {"selected", "context", "context_seal"}:
+        _fail("skill_registry.receipt_extended", "receipt has unexpected fields")
+    if not isinstance(receipt.context, Mapping):
+        _fail("skill_registry.invalid_type", "receipt context must be a mapping")
+    if receipt_map["context"] and set(receipt_map["context"]) != set(_SELECT_REASON_FIELDS):
+        _fail("skill_registry.receipt_extended", "receipt context has unexpected keys")
+    if not isinstance(receipt.selected, tuple):
+        _fail("skill_registry.invalid_type", "receipt.selected must be a tuple")
+    return receipt
+
+
+def _resolve_selected_records(
+    candidates: Iterable[SkillRecord],
+    receipt: SkillSelectionReceipt,
+) -> list[tuple[SkillSelection, SkillRecord]]:
+    index = _index_packet_candidates(candidates)
+    resolved: list[tuple[SkillSelection, SkillRecord]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in receipt.selected:
+        if type(item) is not SkillSelection:
+            if isinstance(item, SkillSelection):
+                _fail("skill_registry.receipt_extended", "selection row type must be exactly SkillSelection")
+            _fail("skill_registry.invalid_type", "receipt rows must be SkillSelection")
+        row_keys = {"identity", "version", "digest", "reasons"}
+        if set(vars(item)) != row_keys:
+            _fail("skill_registry.receipt_extended", "selection row has unexpected fields")
+        key = (item.identity, item.version)
+        if key in seen:
+            _fail(
+                "skill_registry.duplicate_selection",
+                f"duplicate selection {item.identity!r}@{item.version!r}",
+            )
+        seen.add(key)
+        match = index.get(key)
+        if match is None:
+            _fail(
+                "skill_registry.not_found",
+                f"no candidate for selected {item.identity!r}@{item.version!r}",
+            )
+        digest = skill_digest(match)
+        if digest != item.digest:
+            _fail(
+                "skill_registry.digest_mismatch",
+                f"digest mismatch for {item.identity!r}@{item.version!r}",
+            )
+        if match.lifecycle_state is not LifecycleState.ACTIVE:
+            _fail(
+                "skill_registry.invalid_lifecycle",
+                f"selected {item.identity!r}@{item.version!r} is not ACTIVE",
+            )
+        resolved.append((item, match))
+    rank_keys = [_rank_key(record) for _, record in resolved]
+    if rank_keys != sorted(rank_keys):
+        _fail("skill_registry.selection_spoofed", "receipt order does not match deterministic rank order")
+    _verify_receipt_context_seal(receipt)
+    return resolved
+
+
+def _emit_runtime_packet(
+    resolved: list[tuple[SkillSelection, SkillRecord]],
+    bound_context: Mapping[str, Any],
+    *,
+    max_list_items: int,
+    max_string_bytes: int,
+    max_packet_bytes: int,
+) -> SkillRuntimePacket:
+    rows: list[SkillRuntimePacketRow] = []
+    for item, record in resolved:
+        identity = _bounded_packet_scalar(item.identity, "identity", max_string_bytes)
+        version = _bounded_packet_scalar(item.version, "version", max_string_bytes)
+        digest = _bounded_packet_scalar(item.digest, "digest", max_string_bytes)
+        claimed_reasons = _validate_packet_reasons(
+            _bounded_packet_strings(item.reasons, "reasons", max_list_items, max_string_bytes)
+        )
+        applicability = _bounded_packet_strings(
+            record.applicability, "applicability", max_list_items, max_string_bytes
+        )
+        procedure_steps = _bounded_packet_strings(
+            record.procedure_steps, "procedure_steps", max_list_items, max_string_bytes
+        )
+        avoid_rules = _bounded_packet_strings(
+            record.avoid_rules, "avoid_rules", max_list_items, max_string_bytes
+        )
+        preferred_tools = _bounded_packet_strings(
+            record.preferred_tools, "preferred_tools", max_list_items, max_string_bytes
+        )
+        row = SkillRuntimePacketRow(
+            identity=identity,
+            version=version,
+            digest=digest,
+            reasons=_bind_canonical_packet_reasons(claimed_reasons, record, bound_context),
+            applicability=applicability,
+            procedure_steps=procedure_steps,
+            avoid_rules=avoid_rules,
+            preferred_tools=preferred_tools,
+        )
+        if set(row.as_mapping()) != _PACKET_ROW_KEYS:
+            _fail("skill_registry.receipt_extended", "packet row has unexpected keys")
+        rows.append(row)
+    packet = SkillRuntimePacket(version=RUNTIME_PACKET_VERSION, skills=tuple(rows))
+    payload = packet.as_mapping()
+    if set(payload) != _PACKET_KEYS:
+        _fail("skill_registry.receipt_extended", "packet has unexpected keys")
+    encoded = canonical_json(payload).encode("utf-8")
+    if len(encoded) > max_packet_bytes:
+        _fail("skill_registry.packet_limit", "canonical packet exceeds max_packet_bytes")
+    return packet
+
+
+def build_runtime_packet(
+    candidates: Iterable[SkillRecord],
+    receipt: SkillSelectionReceipt,
+    *,
+    max_selected: int = MAX_PACKET_SELECTED,
+    max_list_items: int = MAX_PACKET_LIST_ITEMS,
+    max_string_bytes: int = MAX_PACKET_STRING_BYTES,
+    max_packet_bytes: int = MAX_PACKET_BYTES,
+) -> SkillRuntimePacket:
+    """Resolve a selection receipt to a bounded, safe runtime instruction packet.
+
+    Every selected identity/version/digest must bind to exactly one ACTIVE
+    candidate. Packet order follows the receipt and is independent of candidate
+    input order. Construction is pure: it never mutates inputs or I/O state.
+    """
+    receipt = _authenticate_selection_receipt(receipt)
+    max_selected = min(_validate_positive_limit(max_selected, "max_selected"), MAX_PACKET_SELECTED)
+    max_list_items = min(_validate_positive_limit(max_list_items, "max_list_items"), MAX_PACKET_LIST_ITEMS)
+    max_string_bytes = min(
+        _validate_positive_limit(max_string_bytes, "max_string_bytes"), MAX_PACKET_STRING_BYTES
+    )
+    max_packet_bytes = min(_validate_positive_limit(max_packet_bytes, "max_packet_bytes"), MAX_PACKET_BYTES)
+    if len(receipt.selected) > max_selected:
+        _fail("skill_registry.packet_limit", "selected rows exceed max_selected")
+    resolved = _resolve_selected_records(candidates, receipt)
+    bound_context = _bind_receipt_context(receipt.context, require=bool(resolved))
+    return _emit_runtime_packet(
+        resolved,
+        bound_context,
+        max_list_items=max_list_items,
+        max_string_bytes=max_string_bytes,
+        max_packet_bytes=max_packet_bytes,
+    )
 
 
 def _validate_authority(authority: Any) -> Authority:
@@ -999,20 +1733,58 @@ class SkillRegistry:
         self._digest_index[digest] = new_key
         return promoted
 
+    def select(
+        self, context: Mapping[str, Any], limit: int = DEFAULT_SELECT_LIMIT
+    ) -> SkillSelectionReceipt:
+        """Read-only ACTIVE skill selection. Never mutates registry state."""
+        return select(self.records(), context, limit=limit)
+
+    def build_runtime_packet(
+        self,
+        receipt: SkillSelectionReceipt,
+        *,
+        max_selected: int = MAX_PACKET_SELECTED,
+        max_list_items: int = MAX_PACKET_LIST_ITEMS,
+        max_string_bytes: int = MAX_PACKET_STRING_BYTES,
+        max_packet_bytes: int = MAX_PACKET_BYTES,
+    ) -> SkillRuntimePacket:
+        """Read-only runtime packet build. Never mutates registry state."""
+        return build_runtime_packet(
+            self.records(),
+            receipt,
+            max_selected=max_selected,
+            max_list_items=max_list_items,
+            max_string_bytes=max_string_bytes,
+            max_packet_bytes=max_packet_bytes,
+        )
+
 
 __all__ = [
     "Authority",
     "AuthorityRole",
+    "DEFAULT_SELECT_LIMIT",
     "EvidenceOutcome",
     "EvidenceRecord",
     "LifecycleState",
+    "MAX_PACKET_BYTES",
+    "MAX_PACKET_LIST_ITEMS",
+    "MAX_PACKET_SELECTED",
+    "MAX_PACKET_STRING_BYTES",
     "MAX_RANK_LIMIT",
+    "MAX_SELECT_LIMIT",
+    "RUNTIME_PACKET_VERSION",
     "RiskLevel",
+    "SELECT_WILDCARD",
     "SkillRecord",
     "SkillRegistry",
     "SkillRegistryError",
+    "SkillRuntimePacket",
+    "SkillRuntimePacketRow",
     "SkillScope",
+    "SkillSelection",
+    "SkillSelectionReceipt",
     "TransitionDecision",
+    "build_runtime_packet",
     "can_activate",
     "can_promote",
     "can_retire",
@@ -1021,6 +1793,7 @@ __all__ = [
     "independent_accepted_evidence_count",
     "normalize",
     "rank",
+    "select",
     "skill_digest",
     "transition_allowed",
     "unresolved_negative_evidence",
