@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.50] - 2026-08-24
+
+### Added
+
+- Repository-local Development Rules, Skill Registry and Typed Tool Recipe
+  foundations provide deterministic, versioned coding contracts without
+  repeating model-authored boilerplate.
+- Dashboard snapshots expose bounded, truthful evidence for rules, skills and
+  recipes while preserving unknown, unavailable and unmeasured states.
+
+### Fixed
+
+- Coding-foundation projections now derive structured-field and free-text
+  credential redaction from one taxonomy, including compound and
+  `secret_key` variants without hiding benign cache keys.
+- Bounded iterable projections distinguish an exact limit from truncation with
+  one extra probe and ignore untrusted length claims.
+
 ## [0.10.49] - 2026-08-23
 
 ### Fixed

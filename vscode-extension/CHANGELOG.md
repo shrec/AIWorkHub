@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.50 — 2026-08-24
+
+### Added
+
+- Repository coding foundations now include versioned Development Rules,
+  Skills and Typed Tool Recipes with bounded dashboard evidence.
+
+### Fixed
+
+- Coding-foundation evidence preserves unavailable and unknown states, bounds
+  collection work and redacts credential fields and assignments from one
+  shared taxonomy.
+
 ## 0.10.49 — 2026-08-23
 
 ### Fixed

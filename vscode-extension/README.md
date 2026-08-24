@@ -12,6 +12,15 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.50
+
+- Development Rules, repository Skills and Typed Tool Recipes provide
+  deterministic coding foundations with versioned repository-local contracts.
+- Dashboard evidence for those foundations is bounded and distinguishes
+  measured, unknown, unavailable and not-yet-wired states.
+- Shared credential redaction and exact-limit iterable handling close evidence
+  leaks and false truncation reports.
+
 ## What's new in 0.10.49
 
 - Live workers and reviewers are governed by exact process/result evidence and

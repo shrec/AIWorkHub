@@ -60,6 +60,26 @@ ACTIVE_STATUSES = ("pending", "processing", "review")
 # The full canonical-status taxonomy (AITools.taskdb.canonical_status), used
 # for exact whole-queue totals -- independent of any bounded row limit.
 ALL_CANONICAL_STATUSES = ("pending", "processing", "review", "blocked", "superseded", "finished", "archived")
+_CODING_FOUNDATION_KEYS = ("development_rules", "skills", "tool_recipes")
+_DIGEST_PREFIX_LEN = 12
+_PROJECTION_LIST_LIMIT = 8
+_PROJECTION_TEXT_LIMIT = 80
+_PROJECTION_SCHEMA_IDS = {
+    "development_rules": "aiworkhub.dashboard.development_rules.v1",
+    "skills": "aiworkhub.dashboard.skills.v1",
+    "tool_recipes": "aiworkhub.dashboard.tool_recipes.v1",
+}
+_RICH_PROJECTION_KEYS = frozenset(
+    {
+        "violations",
+        "selections",
+        "invocations",
+        "outcomes",
+        "receipts",
+        "items",
+        "evidence",
+    }
+)
 
 _LIST_LINE_RE = re.compile(
     r"^\s*\[(?P<status>[^\]]+)\]\s*"
@@ -73,13 +93,72 @@ _PORTABLE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _HOST_PATH_IN_TEXT_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|/)[^\s\"'`<>]+"
 )
+_CREDENTIAL_FIELD_REDACTION_MARKER = "<redacted>"
+_CREDENTIAL_FIELD_STEMS = (
+    "access_key",
+    "access_token",
+    "api_key",
+    "auth_token",
+    "authorization",
+    "aws_secret_access_key",
+    "bearer",
+    "bearer_token",
+    "client_secret",
+    "credential",
+    "credentials",
+    "id_token",
+    "passwd",
+    "password",
+    "private_key",
+    "refresh_token",
+    "secret",
+    "secret_access_key",
+    "secret_key",
+    "token",
+)
+_CREDENTIAL_FIELD_EXACT_NAMES = frozenset(
+    {stem for stem in _CREDENTIAL_FIELD_STEMS}
+    | {stem.replace("_", "") for stem in _CREDENTIAL_FIELD_STEMS}
+)
+_CREDENTIAL_FIELD_NAME_SUFFIXES = tuple(
+    f"_{stem}" for stem in _CREDENTIAL_FIELD_STEMS
+)
+_CREDENTIAL_ASSIGNMENT_NAMES = tuple(
+    "[_-]?".join(re.escape(part) for part in stem.split("_"))
+    for stem in sorted(_CREDENTIAL_FIELD_STEMS, key=len, reverse=True)
+)
+_CREDENTIAL_FIELD_NAME_SPLIT_RE = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
 _SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)\b(api[_-]?key|authorization|credential|password|secret|token)"
+    r"(?i)(?<![A-Za-z0-9])(" + "|".join(_CREDENTIAL_ASSIGNMENT_NAMES) + r")"
     r"\s*([:=])\s*([^\s,;]+)"
 )
 _BEARER_TOKEN_RE = re.compile(
     r"(?i)\b(authorization)\s*(:)\s*(bearer)\s+([^\s,;\"'`<>]+)"
 )
+
+
+def _normalize_credential_field_name(name: str) -> str:
+    split = _CREDENTIAL_FIELD_NAME_SPLIT_RE.sub("_", name.strip())
+    return re.sub(r"[\s\-]+", "_", split).lower()
+
+
+def _is_credential_field_name(name: str) -> bool:
+    if not isinstance(name, str):
+        return False
+    normalized = _normalize_credential_field_name(name)
+    if not normalized:
+        return False
+    compact = normalized.replace("_", "")
+    if (
+        normalized in _CREDENTIAL_FIELD_EXACT_NAMES
+        or compact in _CREDENTIAL_FIELD_EXACT_NAMES
+    ):
+        return True
+    return any(
+        normalized.endswith(suffix) for suffix in _CREDENTIAL_FIELD_NAME_SUFFIXES
+    )
 
 
 def _parallel_snapshot_reads(
@@ -1897,6 +1976,24 @@ class DashboardProvider:
             **task_plan.build_snapshot(cards),
         }
 
+    def get_development_rules_projection_input(self) -> Any | None:
+        api = _load_development_rules_api()
+        if api is None:
+            raise RuntimeError("development_rules_unavailable")
+        return None
+
+    def get_skills_projection_input(self) -> Any | None:
+        api = _load_skill_registry_api()
+        if api is None:
+            raise RuntimeError("skill_registry_unavailable")
+        return api.SkillRegistry()
+
+    def get_tool_recipes_projection_input(self) -> Any | None:
+        api = _load_tool_recipes_api()
+        if api is None:
+            raise RuntimeError("tool_recipes_unavailable")
+        return api.RecipeRegistry(())
+
 
 def _normalize_task_rows(value: Any, status: str) -> list[dict[str, Any]]:
     if not isinstance(value, list):
@@ -2045,6 +2142,900 @@ def _cost_totals(ledger: Mapping[str, Any] | None) -> dict[str, Any]:
     return totals
 
 
+def _projection_string(value: Any, limit: int = _PROJECTION_TEXT_LIMIT) -> str | None:
+    if not isinstance(value, str):
+        return None
+    source = value.strip()
+    body = source
+    lowered = source.lower()
+    if lowered.startswith("sha256:"):
+        body = source[7:]
+    elif lowered.startswith("0x"):
+        body = source[2:]
+    if body is not source and len(body) >= 32 and all(
+        ch in "0123456789abcdefABCDEF" for ch in body
+    ):
+        compact = "".join(ch for ch in source if ch.isalnum())
+        return compact[:_DIGEST_PREFIX_LEN] if compact else None
+    text = _portable_text(value, max(int(limit), _DIGEST_PREFIX_LEN))
+    stripped = text.strip()
+    if len(stripped) >= 32 and all(ch in "0123456789abcdefABCDEF" for ch in stripped):
+        return stripped[:_DIGEST_PREFIX_LEN]
+    bounded = text[: max(0, int(limit))]
+    return bounded or None
+
+
+def _projection_count(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _projection_denominator(value: Any) -> int | str:
+    if value is None or value == "unknown":
+        return "unknown"
+    count = _projection_count(value)
+    return "unknown" if count is None else count
+
+
+def _digest_prefix(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    compact = "".join(ch for ch in value if ch.isalnum())
+    if not compact:
+        return None
+    return compact[:_DIGEST_PREFIX_LEN]
+
+
+def _is_digest_identity_field_name(name: str) -> bool:
+    if not isinstance(name, str):
+        return False
+    normalized = _normalize_credential_field_name(name)
+    if not normalized:
+        return False
+    compact = normalized.replace("_", "")
+    if normalized in {"digest", "sha256", "recipe_digest"} or compact in {
+        "digest",
+        "sha256",
+        "recipedigest",
+    }:
+        return True
+    return normalized.endswith("_digest") or normalized.endswith("_sha256")
+
+
+def _projection_shell(kind: str, state: str, ownership: str) -> dict[str, Any]:
+    return {
+        "schema_id": _PROJECTION_SCHEMA_IDS[kind],
+        "state": state,
+        "ownership": ownership,
+        "availability": state,
+    }
+
+
+def _is_invocation_receipt(value: Any) -> bool:
+    return (
+        type(value).__name__ == "InvocationReceipt"
+        and hasattr(value, "recipe_id")
+        and hasattr(value, "recipe_version")
+        and hasattr(value, "digest")
+    )
+
+
+def _invocation_receipt_mapping(value: Any) -> dict[str, Any]:
+    item: dict[str, Any] = {}
+    recipe_id = _projection_string(getattr(value, "recipe_id", None), 40)
+    if recipe_id is not None:
+        item["recipe_id"] = recipe_id
+    version = _projection_string(getattr(value, "recipe_version", None), 40)
+    if version is not None:
+        item["recipe_version"] = version
+    prefix = _digest_prefix(getattr(value, "digest", None))
+    if prefix is not None:
+        item["digest_prefix"] = prefix
+    return item
+
+
+def _bounded_projection_items(
+    value: Any,
+) -> tuple[list[dict[str, Any]], bool, int | str] | None:
+    if not isinstance(value, list):
+        return None
+    raw_input_count = len(value)
+    truncated = raw_input_count > _PROJECTION_LIST_LIMIT
+    items: list[dict[str, Any]] = []
+    validated = True
+    inspected = 0
+    iterator = iter(value)
+    while inspected < _PROJECTION_LIST_LIMIT:
+        try:
+            raw = next(iterator)
+        except StopIteration:
+            break
+        inspected += 1
+        if _is_invocation_receipt(raw):
+            raw = _invocation_receipt_mapping(raw)
+        if not isinstance(raw, Mapping):
+            validated = False
+            continue
+        item: dict[str, Any] = {}
+        for key, field in raw.items():
+            if not isinstance(key, str):
+                continue
+            name = _projection_string(key, 40)
+            if name is None:
+                continue
+            if name == "cache_eligible" or key == "cache_eligible":
+                continue
+            if _is_credential_field_name(key) or _is_credential_field_name(name):
+                item[name] = _CREDENTIAL_FIELD_REDACTION_MARKER
+                continue
+            if isinstance(field, bool):
+                item[name] = field
+            elif isinstance(field, int) and not isinstance(field, bool):
+                if field >= 0:
+                    item[name] = field
+            elif isinstance(field, str):
+                if _is_digest_identity_field_name(key) or _is_digest_identity_field_name(
+                    name
+                ):
+                    text = _digest_prefix(field)
+                else:
+                    text = _projection_string(field)
+                if text is not None:
+                    item[name] = text
+        if item:
+            items.append(item)
+        else:
+            validated = False
+    total_count: int | str = len(items) if validated and not truncated else "unknown"
+    return items, truncated, total_count
+
+
+def _bounded_count_fields(
+    items: list[dict[str, Any]], total_count: int | str
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {"returned_count": len(items)}
+    if isinstance(total_count, int):
+        counted = _projection_count(total_count)
+        fields["count"] = counted if counted is not None else "unknown"
+    else:
+        fields["count"] = "unknown"
+    return fields
+
+
+def _bounded_primary_collection(
+    value: Any,
+) -> tuple[list[Any], bool, int | str] | None:
+    if value is None:
+        return [], False, 0
+    if isinstance(value, (str, bytes, bytearray, Mapping)):
+        return None
+    try:
+        iterator = iter(value)
+    except TypeError:
+        return None
+    value_type = type(value)
+    type_len = getattr(value_type, "__len__", None)
+    authoritative_len: int | None = None
+    if value_type is list or (
+        isinstance(value, list) and type_len is list.__len__
+    ) or value_type is tuple or (
+        isinstance(value, tuple) and type_len is tuple.__len__
+    ):
+        authoritative_len = len(value)
+    items: list[Any] = []
+    while len(items) < _PROJECTION_LIST_LIMIT:
+        try:
+            items.append(next(iterator))
+        except StopIteration:
+            break
+    observed = len(items)
+    if authoritative_len is None:
+        has_more = False
+        if observed == _PROJECTION_LIST_LIMIT:
+            try:
+                next(iterator)
+            except StopIteration:
+                has_more = False
+            else:
+                has_more = True
+        truncated = has_more
+        total_count: int | str = "unknown" if truncated else observed
+        return items, truncated, total_count
+    truncated = authoritative_len > _PROJECTION_LIST_LIMIT
+    total_count = observed if not truncated else "unknown"
+    return items, truncated, total_count
+
+
+def _primary_count_fields(
+    returned: int, total_count: int | str, truncated: bool
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {"returned_count": returned, "truncated": truncated}
+    if isinstance(total_count, int):
+        counted = _projection_count(total_count)
+        fields["count"] = counted if counted is not None else "unknown"
+    else:
+        fields["count"] = "unknown"
+    return fields
+
+
+def _cheap_projection(full: Mapping[str, Any]) -> dict[str, Any]:
+    cheap: dict[str, Any] = {}
+    for key, value in full.items():
+        if key in _RICH_PROJECTION_KEYS:
+            continue
+        if isinstance(value, Mapping):
+            nested = {
+                nested_key: nested_value
+                for nested_key, nested_value in value.items()
+                if nested_key not in _RICH_PROJECTION_KEYS
+            }
+            cheap[key] = nested
+        else:
+            cheap[key] = value
+    cheap["ownership"] = "summary"
+    return cheap
+
+
+_TOP_LEVEL_EVIDENCE_GOVERNING_KEYS = frozenset(
+    {
+        "state",
+        "availability",
+        "violation_evidence_state",
+        "violation_count",
+    }
+)
+_PRIMARY_COLLECTION_KEYS = frozenset(
+    {"returned_count", "count", "registry_count", "lifecycle"}
+)
+_NESTED_EVIDENCE_GOVERNING_KEYS = frozenset(
+    {"state", "count", "denominator", "returned_count"}
+)
+_RECEIPT_GOVERNED_SECTION_KEYS = frozenset({"cache", "context"})
+
+
+def _mapping_has_rich_evidence(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    for key, field in value.items():
+        if key in _RICH_PROJECTION_KEYS and isinstance(field, list) and field:
+            return True
+        if isinstance(field, Mapping) and _mapping_has_rich_evidence(field):
+            return True
+    return False
+
+
+def _should_preserve_governing(key: str, section: Any) -> bool:
+    if key not in _TOP_LEVEL_EVIDENCE_GOVERNING_KEYS and key not in _NESTED_EVIDENCE_GOVERNING_KEYS:
+        return False
+    return _mapping_has_rich_evidence(section)
+
+
+_PLACEHOLDER_PROJECTION_STATES = frozenset(
+    {"unavailable", "invalid", "not_wired", "no_sample", "unknown"}
+)
+
+
+def _nested_section_state(section: Any) -> str | None:
+    if not isinstance(section, Mapping):
+        return None
+    state = section.get("state")
+    return state if isinstance(state, str) else None
+
+
+def _should_preserve_nested_section(
+    prior: Any,
+    current: Any,
+    parent: Mapping[str, Any],
+) -> bool:
+    current_state = _nested_section_state(current)
+    if current_state not in _PLACEHOLDER_PROJECTION_STATES:
+        return False
+    prior_state = _nested_section_state(prior)
+    if prior_state == "measured":
+        return True
+    return prior_state == "unknown" and _mapping_has_rich_evidence(parent)
+
+
+def _exact_empty_receipt_replacement(current: Any) -> bool:
+    return isinstance(current, Mapping) and current.get("receipts") == []
+
+
+def _should_preserve_receipt_governed_section(
+    key: str,
+    prior: Any,
+    parent: Mapping[str, Any],
+    current_parent: Mapping[str, Any],
+) -> bool:
+    if key not in _RECEIPT_GOVERNED_SECTION_KEYS:
+        return False
+    if _exact_empty_receipt_replacement(current_parent):
+        return False
+    if not _mapping_has_rich_evidence(parent):
+        return False
+    return _nested_section_state(prior) in {"measured", "unknown"}
+
+
+def _merge_coding_foundation_projection(
+    previous: Any,
+    current: Any,
+) -> dict[str, Any]:
+    if not isinstance(current, Mapping) or not current:
+        return dict(previous) if isinstance(previous, Mapping) else {}
+    if (
+        isinstance(previous, Mapping)
+        and previous.get("ownership") == "full"
+        and current.get("ownership") == "summary"
+    ):
+        replace_empty_receipts = _exact_empty_receipt_replacement(current)
+        merged = dict(previous)
+        if replace_empty_receipts:
+            merged.pop("receipts", None)
+            merged.pop("receipts_truncated", None)
+        for key, value in current.items():
+            if key in _RICH_PROJECTION_KEYS:
+                continue
+            if key in _PRIMARY_COLLECTION_KEYS:
+                merged[key] = value
+                continue
+            if (
+                not replace_empty_receipts
+                and key in _TOP_LEVEL_EVIDENCE_GOVERNING_KEYS
+                and _should_preserve_governing(key, merged)
+            ):
+                continue
+            if isinstance(value, Mapping):
+                prior = merged.get(key)
+                if isinstance(prior, Mapping):
+                    if replace_empty_receipts and key in {
+                        "invocation",
+                        *_RECEIPT_GOVERNED_SECTION_KEYS,
+                    }:
+                        merged[key] = dict(value)
+                        continue
+                    if (
+                        not replace_empty_receipts
+                        and _should_preserve_receipt_governed_section(
+                            key, prior, merged, current
+                        )
+                    ):
+                        continue
+                    if _should_preserve_nested_section(prior, value, merged):
+                        continue
+                    if _nested_section_state(value) in _PLACEHOLDER_PROJECTION_STATES:
+                        merged[key] = dict(value)
+                        continue
+                    if not _mapping_has_rich_evidence(prior):
+                        merged[key] = dict(value)
+                        continue
+                    nested = dict(prior)
+                    for nested_key, nested_value in value.items():
+                        if nested_key in _RICH_PROJECTION_KEYS:
+                            continue
+                        if isinstance(nested_value, Mapping) and not nested_value:
+                            continue
+                        if (
+                            not replace_empty_receipts
+                            and nested_key in _NESTED_EVIDENCE_GOVERNING_KEYS
+                            and _should_preserve_governing(nested_key, prior)
+                        ):
+                            continue
+                        nested[nested_key] = nested_value
+                    merged[key] = nested
+                    continue
+                if not value:
+                    continue
+            merged[key] = value
+        merged["ownership"] = "full"
+        return merged
+    return dict(current)
+
+
+def _retain_coding_foundation_evidence(
+    snapshot: dict[str, Any],
+    previous: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(previous, Mapping):
+        return snapshot
+    for key in _CODING_FOUNDATION_KEYS:
+        current = snapshot.get(key)
+        prior = previous.get(key)
+        if _is_storage_not_ready_projection(current) and isinstance(prior, Mapping):
+            retained = dict(prior)
+            retained["state"] = "unavailable"
+            retained["availability"] = "unavailable"
+            retained["reason"] = "storage_not_ready"
+            snapshot[key] = retained
+            continue
+        snapshot[key] = _merge_coding_foundation_projection(prior, current)
+    return snapshot
+
+
+def _storage_not_ready_projection(kind: str, ownership: str = "full") -> dict[str, Any]:
+    projected = _projection_shell(kind, "unavailable", ownership)
+    projected["reason"] = "storage_not_ready"
+    return projected
+
+
+def _is_storage_not_ready_projection(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("state") == "unavailable"
+        and value.get("reason") == "storage_not_ready"
+    )
+
+
+def _provider_projection_input(provider: Any, attr: str) -> tuple[str, Any]:
+    getter = getattr(provider, attr, None)
+    if getter is None:
+        return "not_wired", None
+    if not callable(getter):
+        return "invalid", None
+    try:
+        payload = getter()
+    except Exception:
+        return "unavailable", None
+    if payload is None:
+        return "no_sample", None
+    return "present", payload
+
+
+def _load_development_rules_api() -> Any | None:
+    try:
+        from aiworkhub import development_rules as module
+    except ImportError:
+        return None
+    return module
+
+
+def _load_skill_registry_api() -> Any | None:
+    try:
+        from aiworkhub import skill_registry as module
+    except ImportError:
+        return None
+    return module
+
+
+def _load_tool_recipes_api() -> Any | None:
+    try:
+        from aiworkhub import tool_recipes as module
+    except ImportError:
+        return None
+    return module
+
+
+def _project_development_rules(
+    payload: Any,
+    *,
+    ownership: str,
+    input_state: str,
+) -> dict[str, Any]:
+    if input_state != "present":
+        return _projection_shell("development_rules", input_state, ownership)
+    api = _load_development_rules_api()
+    if api is None:
+        return _projection_shell("development_rules", "unavailable", ownership)
+    manifest_raw: Any = payload
+    resolve_raw: Any = None
+    has_violations = False
+    violations_raw: Any = None
+    if isinstance(payload, Mapping):
+        if "manifest" in payload:
+            manifest_raw = payload.get("manifest")
+        resolve_raw = payload.get("resolve")
+        has_violations = "violations" in payload
+        violations_raw = payload.get("violations")
+    if manifest_raw is None:
+        return _projection_shell("development_rules", "no_sample", ownership)
+    try:
+        if hasattr(manifest_raw, "schema_version") and hasattr(manifest_raw, "rules"):
+            manifest = manifest_raw
+        else:
+            manifest = api.parse_manifest(manifest_raw)
+        digest = api.canonical_digest(manifest)
+    except Exception:
+        return _projection_shell("development_rules", "invalid", ownership)
+    projected: dict[str, Any] = _projection_shell(
+        "development_rules", "measured", ownership
+    )
+    projected["availability"] = "available"
+    version = _projection_string(getattr(manifest, "schema_version", None), 32)
+    if version is not None:
+        projected["version"] = version
+    prefix = _digest_prefix(digest)
+    if prefix is not None:
+        projected["digest_prefix"] = prefix
+    declared = _projection_count(len(getattr(manifest, "rules", ())))
+    if declared is not None:
+        projected["declared_rule_count"] = declared
+    resolve_kwargs: dict[str, Any] = {}
+    if isinstance(resolve_raw, Mapping):
+        for key in ("language", "path", "task", "risk"):
+            value = resolve_raw.get(key)
+            if isinstance(value, str) and value:
+                resolve_kwargs[key] = value
+    try:
+        resolved = api.resolve(manifest, **resolve_kwargs)
+        resolved_count = _projection_count(len(getattr(resolved, "rules", ())))
+        if resolved_count is not None:
+            projected["resolved_rule_count"] = resolved_count
+    except Exception:
+        pass
+    if not has_violations:
+        projected["violation_evidence_state"] = "no_sample"
+    elif violations_raw is None or violations_raw == "unknown":
+        projected["violation_evidence_state"] = "unknown"
+    else:
+        bounded = _bounded_projection_items(violations_raw)
+        if bounded is None:
+            projected["violation_evidence_state"] = "invalid"
+        else:
+            items, truncated, total_count = bounded
+            projected["violation_evidence_state"] = "measured"
+            counts = _bounded_count_fields(items, total_count)
+            projected["returned_count"] = counts["returned_count"]
+            projected["violation_count"] = counts["count"]
+            if ownership == "full":
+                projected["violations"] = items
+                projected["violations_truncated"] = truncated
+    if ownership == "summary":
+        return _cheap_projection(projected)
+    return projected
+
+
+def _skill_records(
+    api: Any, payload: Any
+) -> tuple[list[Any], bool, int | str] | None:
+    if type(payload).__name__ == "SkillRegistry":
+        raw_records: Any = payload
+    elif hasattr(payload, "records") and callable(payload.records):
+        records = payload.records()
+        if not isinstance(records, list):
+            return None
+        raw_records = records
+    elif isinstance(payload, list):
+        raw_records = payload
+    elif isinstance(payload, Mapping):
+        raw_records = payload.get("records", payload.get("registry"))
+        if raw_records is None:
+            return [], False, 0
+    else:
+        return None
+    bounded = _bounded_primary_collection(raw_records)
+    if bounded is None:
+        return None
+    raw_items, truncated, total_count = bounded
+    parsed: list[Any] = []
+    for item in raw_items:
+        if hasattr(item, "lifecycle_state") and hasattr(item, "identity"):
+            parsed.append(item)
+            continue
+        if not isinstance(item, Mapping):
+            return None
+        parsed.append(api.SkillRecord.from_mapping(item))
+    if truncated:
+        return parsed, True, "unknown"
+    return parsed, False, len(parsed)
+
+
+def _evidence_section(
+    payload: Mapping[str, Any] | None,
+    key: str,
+    denominator_key: str,
+    *,
+    ownership: str,
+) -> dict[str, Any]:
+    if payload is None or key not in payload:
+        return {"state": "no_sample"}
+    raw = payload.get(key)
+    if raw is None or raw == "unknown":
+        section: dict[str, Any] = {"state": "unknown", "denominator": "unknown"}
+        if denominator_key in payload:
+            section["denominator"] = _projection_denominator(payload.get(denominator_key))
+        return section
+    bounded = _bounded_projection_items(raw)
+    if bounded is None:
+        return {"state": "invalid"}
+    items, truncated, total_count = bounded
+    section = {"state": "measured", **_bounded_count_fields(items, total_count)}
+    if denominator_key in payload:
+        section["denominator"] = _projection_denominator(payload.get(denominator_key))
+    else:
+        section["denominator"] = "unknown"
+    if ownership == "full":
+        section["items"] = items
+        section["truncated"] = truncated
+    return section
+
+
+def _project_skills(
+    payload: Any,
+    *,
+    ownership: str,
+    input_state: str,
+) -> dict[str, Any]:
+    if input_state != "present":
+        return _projection_shell("skills", input_state, ownership)
+    api = _load_skill_registry_api()
+    if api is None:
+        return _projection_shell("skills", "unavailable", ownership)
+    try:
+        parsed = _skill_records(api, payload)
+    except Exception:
+        return _projection_shell("skills", "invalid", ownership)
+    if parsed is None:
+        return _projection_shell("skills", "invalid", ownership)
+    records, truncated, total_count = parsed
+    mapping = payload if isinstance(payload, Mapping) else None
+    selection: dict[str, Any] | None = None
+    invocation: dict[str, Any] | None = None
+    outcome: dict[str, Any] | None = None
+    if mapping is not None:
+        selection = _evidence_section(
+            mapping, "selections", "selection_denominator", ownership=ownership
+        )
+        invocation = _evidence_section(
+            mapping, "invocations", "invocation_denominator", ownership=ownership
+        )
+        outcome = _evidence_section(
+            mapping, "outcomes", "outcome_denominator", ownership=ownership
+        )
+    nested_measured = bool(
+        selection is not None
+        and any(
+            section.get("state") == "measured"
+            for section in (selection, invocation, outcome)
+            if section is not None
+        )
+    )
+    if not records and not nested_measured:
+        projected = _projection_shell("skills", "no_sample", ownership)
+        if selection is not None and invocation is not None and outcome is not None:
+            projected["selection"] = selection
+            projected["invocation"] = invocation
+            projected["outcome"] = outcome
+        if ownership == "summary":
+            return _cheap_projection(projected)
+        return projected
+    projected = _projection_shell("skills", "measured", ownership)
+    projected["availability"] = "available"
+    projected.update(_primary_count_fields(len(records), total_count, truncated))
+    if records and not truncated and total_count != "unknown":
+        lifecycle = {"proposed": 0, "active": 0, "retired": 0}
+        for record in records:
+            state = getattr(getattr(record, "lifecycle_state", None), "value", None)
+            if state in lifecycle:
+                lifecycle[state] += 1
+        projected["lifecycle"] = lifecycle
+    if selection is not None and invocation is not None and outcome is not None:
+        projected["selection"] = selection
+        projected["invocation"] = invocation
+        projected["outcome"] = outcome
+    else:
+        projected["selection"] = {"state": "no_sample"}
+        projected["invocation"] = {"state": "no_sample"}
+        projected["outcome"] = {"state": "no_sample"}
+    if ownership == "summary":
+        return _cheap_projection(projected)
+    return projected
+
+
+def _recipe_registry(
+    api: Any, payload: Any
+) -> tuple[Any, bool, int | str] | None:
+    if type(payload).__name__ == "RecipeRegistry":
+        raw: Any = payload
+    elif isinstance(payload, Mapping):
+        raw = payload.get("registry", payload.get("recipes"))
+        if raw is None:
+            return api.RecipeRegistry(()), False, 0
+    elif isinstance(payload, list):
+        raw = payload
+    else:
+        return None
+    if type(raw).__name__ != "RecipeRegistry" and not isinstance(raw, list):
+        return None
+    bounded = _bounded_primary_collection(raw)
+    if bounded is None:
+        return None
+    items, truncated, _ = bounded
+    registry = api.RecipeRegistry(items)
+    if truncated:
+        return registry, True, "unknown"
+    return registry, False, len(registry)
+
+
+def _unknown_section() -> dict[str, Any]:
+    return {"state": "unknown", "denominator": "unknown"}
+
+
+def _cache_decision_eligible(api: Any, registry: Any, raw: Any) -> bool | None:
+    recipe_id: Any = None
+    version: Any = None
+    if _is_invocation_receipt(raw):
+        recipe_id = getattr(raw, "recipe_id", None)
+        version = getattr(raw, "recipe_version", None)
+    elif isinstance(raw, Mapping):
+        recipe_id = raw.get("recipe_id")
+        version = raw.get("recipe_version", raw.get("version"))
+    else:
+        return None
+    if not isinstance(recipe_id, str):
+        return None
+    recipe_version = version if isinstance(version, str) else None
+    try:
+        recipe = registry.get(recipe_id, recipe_version)
+        decision = api.cache_eligibility(recipe)
+    except Exception:
+        return None
+    eligible = getattr(decision, "eligible", None)
+    return eligible if isinstance(eligible, bool) else None
+
+
+def _measured_cache_decisions(
+    api: Any,
+    registry: Any,
+    receipts_raw: Any,
+    *,
+    item_count: int,
+    total_count: int | str,
+    truncated: bool,
+) -> list[bool] | None:
+    if total_count == "unknown" or truncated:
+        return None
+    if total_count == 0 and item_count == 0:
+        return []
+    if not isinstance(receipts_raw, list):
+        return None
+    decisions: list[bool] = []
+    inspected = 0
+    for raw in receipts_raw:
+        if inspected >= _PROJECTION_LIST_LIMIT:
+            break
+        inspected += 1
+        eligible = _cache_decision_eligible(api, registry, raw)
+        if eligible is None:
+            return None
+        decisions.append(eligible)
+    if len(decisions) != item_count:
+        return None
+    return decisions
+
+
+def _project_tool_recipes(
+    payload: Any,
+    *,
+    ownership: str,
+    input_state: str,
+) -> dict[str, Any]:
+    if input_state != "present":
+        return _projection_shell("tool_recipes", input_state, ownership)
+    api = _load_tool_recipes_api()
+    if api is None:
+        return _projection_shell("tool_recipes", "unavailable", ownership)
+    try:
+        parsed = _recipe_registry(api, payload)
+    except Exception:
+        return _projection_shell("tool_recipes", "invalid", ownership)
+    if parsed is None:
+        return _projection_shell("tool_recipes", "invalid", ownership)
+    registry, truncated, total_count = parsed
+    registry_count = (
+        _projection_count(total_count) if isinstance(total_count, int) else None
+    )
+    try:
+        discovered = api.discover(registry)
+        discovery_count = None if truncated else _projection_count(len(discovered))
+    except Exception:
+        discovery_count = None
+    mapping = payload if isinstance(payload, Mapping) else None
+    has_receipts = isinstance(mapping, Mapping) and "receipts" in mapping
+    projected = _projection_shell("tool_recipes", "measured", ownership)
+    projected["availability"] = "available"
+    projected.update(_primary_count_fields(len(registry), total_count, truncated))
+    if registry_count is not None:
+        projected["registry_count"] = registry_count
+    if discovery_count is not None:
+        projected["discovery_count"] = discovery_count
+    if not has_receipts:
+        projected["invocation"] = {"state": "no_sample"}
+        projected["cache"] = {"state": "no_sample"}
+        projected["context"] = {"state": "no_sample"}
+    else:
+        receipts_raw = mapping.get("receipts") if mapping is not None else None
+        if receipts_raw is None or receipts_raw == "unknown":
+            projected["invocation"] = _unknown_section()
+            projected["cache"] = _unknown_section()
+            projected["context"] = _unknown_section()
+        else:
+            bounded = _bounded_projection_items(receipts_raw)
+            if bounded is None:
+                projected["invocation"] = {"state": "invalid"}
+                projected["cache"] = {"state": "invalid"}
+                projected["context"] = {"state": "invalid"}
+            else:
+                items, receipts_truncated, receipts_total = bounded
+                projected["invocation"] = {
+                    "state": "measured",
+                    **_bounded_count_fields(items, receipts_total),
+                }
+                exact_empty = (
+                    receipts_total == 0 and not items and not receipts_truncated
+                )
+                if exact_empty:
+                    projected["cache"] = {
+                        "state": "measured",
+                        "eligible_count": 0,
+                        "ineligible_count": 0,
+                    }
+                    projected["context"] = {"state": "measured", "receipt_count": 0}
+                else:
+                    decisions = _measured_cache_decisions(
+                        api,
+                        registry,
+                        receipts_raw,
+                        item_count=len(items),
+                        total_count=receipts_total,
+                        truncated=receipts_truncated,
+                    )
+                    if decisions is None:
+                        projected["cache"] = _unknown_section()
+                    else:
+                        projected["cache"] = {
+                            "state": "measured",
+                            "eligible_count": sum(1 for flag in decisions if flag),
+                            "ineligible_count": sum(
+                                1 for flag in decisions if not flag
+                            ),
+                        }
+                        for item, flag in zip(items, decisions):
+                            item["cache_eligible"] = flag
+                    projected["context"] = _unknown_section()
+                if ownership == "full":
+                    projected["invocation"]["items"] = items
+                    projected["invocation"]["truncated"] = receipts_truncated
+                    projected["receipts"] = items
+                    projected["receipts_truncated"] = receipts_truncated
+    if registry_count == 0 and not has_receipts:
+        empty = _projection_shell("tool_recipes", "no_sample", ownership)
+        empty["invocation"] = {"state": "no_sample"}
+        empty["cache"] = {"state": "no_sample"}
+        empty["context"] = {"state": "no_sample"}
+        if ownership == "summary":
+            return _cheap_projection(empty)
+        return empty
+    if ownership == "summary":
+        return _cheap_projection(projected)
+    return projected
+
+
+def _coding_foundation_projections(
+    provider: Any,
+    *,
+    ownership: str,
+) -> dict[str, dict[str, Any]]:
+    rules_state, rules_payload = _provider_projection_input(
+        provider, "get_development_rules_projection_input"
+    )
+    skills_state, skills_payload = _provider_projection_input(
+        provider, "get_skills_projection_input"
+    )
+    recipes_state, recipes_payload = _provider_projection_input(
+        provider, "get_tool_recipes_projection_input"
+    )
+    return {
+        "development_rules": _project_development_rules(
+            rules_payload, ownership=ownership, input_state=rules_state
+        ),
+        "skills": _project_skills(
+            skills_payload, ownership=ownership, input_state=skills_state
+        ),
+        "tool_recipes": _project_tool_recipes(
+            recipes_payload, ownership=ownership, input_state=recipes_state
+        ),
+    }
+
+
 def _build_summary_snapshot(
     data_provider: Any,
     *,
@@ -2172,6 +3163,7 @@ def _build_summary_snapshot(
         for item in inbox.get("runner_mismatch_warnings", []) or []
         if isinstance(item, Mapping)
     ]
+    foundation = _coding_foundation_projections(data_provider, ownership="summary")
     return {
         "schema_version": 1,
         "generated_at": _utc_now(),
@@ -2213,11 +3205,17 @@ def _build_summary_snapshot(
         "task_plan": {},
         "needfix": {},
         "roadmap": {},
+        "development_rules": foundation["development_rules"],
+        "skills": foundation["skills"],
+        "tool_recipes": foundation["tool_recipes"],
     }
 
 
 def build_snapshot(
-    provider: Any | None = None, *, summary_only: bool = False
+    provider: Any | None = None,
+    *,
+    summary_only: bool = False,
+    previous: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one dashboard snapshot while isolating every provider failure.
 
@@ -2245,7 +3243,12 @@ def build_snapshot(
         zero_counts["stale"] = 0
         zero_counts["active"] = 0
         empty_tasks = {status: [] for status in (*ACTIVE_STATUSES, "blocked", "finished", "archived", "stale")}
-        return {
+        storage_not_ready = {
+            key: _storage_not_ready_projection(key, "full")
+            for key in _CODING_FOUNDATION_KEYS
+        }
+        return _retain_coding_foundation_evidence(
+            {
             "schema_version": 1,
             "generated_at": _utc_now(),
             "readonly": True,
@@ -2284,15 +3287,23 @@ def build_snapshot(
             "roadmap": _roadmap_unavailable(),
             "warnings": {"stale": [], "collisions": [], "runner_mismatches": []},
             "errors": [],
-        }
+            "development_rules": storage_not_ready["development_rules"],
+            "skills": storage_not_ready["skills"],
+            "tool_recipes": storage_not_ready["tool_recipes"],
+            },
+            previous,
+        )
 
     snapshot_scope = getattr(data_provider, "snapshot_read_scope", None)
     if summary_only:
         with snapshot_scope() if callable(snapshot_scope) else nullcontext():
-            return _build_summary_snapshot(
-                data_provider,
-                storage_state=storage_state,
-                storage_usage=storage_usage,
+            return _retain_coding_foundation_evidence(
+                _build_summary_snapshot(
+                    data_provider,
+                    storage_state=storage_state,
+                    storage_usage=storage_usage,
+                ),
+                previous,
             )
 
     errors: list[dict[str, str]] = []
@@ -2626,8 +3637,10 @@ def build_snapshot(
     )
     needfix_snapshot = reads["needfix"]
     roadmap_snapshot = reads["roadmap"]
+    foundation = _coding_foundation_projections(data_provider, ownership="full")
 
-    return {
+    return _retain_coding_foundation_evidence(
+        {
         "schema_version": 1,
         "generated_at": _utc_now(),
         "readonly": True,
@@ -2669,13 +3682,18 @@ def build_snapshot(
         "task_plan": dict(task_plan_snapshot),
         "needfix": needfix_snapshot,
         "roadmap": roadmap_snapshot,
+        "development_rules": foundation["development_rules"],
+        "skills": foundation["skills"],
+        "tool_recipes": foundation["tool_recipes"],
         "warnings": {
             "stale": stale_tasks,
             "collisions": collision_warnings,
             "runner_mismatches": mismatch_warnings,
         },
         "errors": errors,
-    }
+        },
+        previous,
+    )
 
 
 # Closed/resolved statuses: not counted as "open" intake NeedFix items.

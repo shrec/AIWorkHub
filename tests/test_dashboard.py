@@ -1628,3 +1628,1553 @@ def test_build_snapshot_includes_protocol_alert_telemetry_for_ready_repo(tmp_pat
     assert telemetry["alert_count"] == 2
     assert telemetry["latest_reason"] == "invalid_params:non_object:list"
     assert telemetry["latest_boundary"] == "app_server_mux_sideband"
+
+
+def _rules_manifest_mapping() -> dict:
+    from aiworkhub import development_rules as dr
+
+    return {
+        "schema": dr.SCHEMA_ID,
+        "schema_version": dr.SCHEMA_VERSION,
+        "languages": ["python"],
+        "rules": [
+            {
+                "id": "forbidden_pattern_rule",
+                "kind": "forbidden_pattern",
+                "applicability": {},
+                "forbid": ["eval_usage"],
+                "payload": {"severity": "error", "rationale_id": "security_risk"},
+            },
+            {
+                "id": "coding_convention_rule",
+                "kind": "coding_convention",
+                "applicability": {"paths": ["src/**/*.py"]},
+                "payload": {"guideline_ids": ["naming_snake_case"], "severity": "warning"},
+            },
+        ],
+    }
+
+
+def _skill_mapping(**overrides: object) -> dict:
+    data = {
+        "identity": "commit-msg-check",
+        "version": "1.0.0",
+        "scope": "repository",
+        "task_family": "commit",
+        "path_or_symbol": "src/aiworkhub/skill_registry.py",
+        "risk": "medium",
+        "stage": "post-edit",
+        "triggers": ["commit"],
+        "confidence": 0.9,
+    }
+    data.update(overrides)
+    return data
+
+
+def _echo_recipe():
+    from aiworkhub import tool_recipes as tr
+
+    return tr.Recipe(id="echo-tool", version="1.0.0", argv=(tr.lit("echo"),))
+
+
+class _FoundationProvider(FakeProvider):
+    def __init__(self, **inputs: object) -> None:
+        super().__init__()
+        self._inputs = inputs
+
+    def get_development_rules_projection_input(self):
+        if "development_rules" not in self._inputs:
+            raise AttributeError("development_rules")
+        return self._inputs["development_rules"]
+
+    def get_skills_projection_input(self):
+        if "skills" not in self._inputs:
+            raise AttributeError("skills")
+        return self._inputs["skills"]
+
+    def get_tool_recipes_projection_input(self):
+        if "tool_recipes" not in self._inputs:
+            raise AttributeError("tool_recipes")
+        return self._inputs["tool_recipes"]
+
+
+def test_coding_foundation_default_snapshot_is_not_wired() -> None:
+    snapshot = dashboard.build_snapshot(FakeProvider())
+    for key in ("development_rules", "skills", "tool_recipes"):
+        projection = snapshot[key]
+        assert projection["state"] == "not_wired"
+        assert projection["availability"] == "not_wired"
+        assert "declared_rule_count" not in projection
+        assert "registry_count" not in projection
+        assert projection["ownership"] == "full"
+
+
+def test_coding_foundation_positive_measured_projections() -> None:
+    provider = _FoundationProvider(
+        development_rules={
+            "manifest": _rules_manifest_mapping(),
+            "resolve": {"language": "python"},
+            "violations": [{"rule_id": "forbidden_pattern_rule", "result": "fail"}],
+        },
+        skills={
+            "records": [
+                _skill_mapping(),
+                _skill_mapping(
+                    identity="review-gate",
+                    version="1.1.0",
+                    lifecycle_state="active",
+                ),
+            ],
+            "selections": [{"identity": "review-gate"}],
+            "invocations": [{"identity": "review-gate", "result": "ok"}],
+            "outcomes": [{"identity": "review-gate", "outcome": "accepted"}],
+            "selection_denominator": 4,
+            "invocation_denominator": 4,
+            "outcome_denominator": 4,
+        },
+        tool_recipes={
+            "recipes": [_echo_recipe()],
+            "receipts": [
+                {
+                    "recipe_id": "echo-tool",
+                    "version": "1.0.0",
+                    "cache_eligible": False,
+                    "context_bytes": 12,
+                }
+            ],
+        },
+    )
+
+    snapshot = dashboard.build_snapshot(provider)
+    rules = snapshot["development_rules"]
+    assert rules["state"] == "measured"
+    assert rules["availability"] == "available"
+    assert rules["version"] == "1.0.0"
+    assert isinstance(rules["digest_prefix"], str)
+    assert len(rules["digest_prefix"]) == 12
+    assert len(rules["digest_prefix"]) < 64
+    assert rules["declared_rule_count"] == 2
+    assert rules["resolved_rule_count"] == 1
+    assert rules["violation_evidence_state"] == "measured"
+    assert rules["violations"][0]["rule_id"] == "forbidden_pattern_rule"
+
+    skills = snapshot["skills"]
+    assert skills["state"] == "measured"
+    assert skills["lifecycle"] == {"proposed": 1, "active": 1, "retired": 0}
+    assert skills["selection"]["state"] == "measured"
+    assert skills["selection"]["count"] == 1
+    assert skills["selection"]["denominator"] == 4
+    assert skills["invocation"]["state"] == "measured"
+    assert skills["outcome"]["state"] == "measured"
+
+    recipes = snapshot["tool_recipes"]
+    assert recipes["state"] == "measured"
+    assert recipes["registry_count"] == 1
+    assert recipes["discovery_count"] == 1
+    assert recipes["invocation"]["state"] == "measured"
+    assert recipes["cache"]["state"] == "measured"
+    assert recipes["cache"]["ineligible_count"] == 1
+    assert recipes["context"]["state"] == "unknown"
+
+def test_coding_foundation_malformed_inputs_are_invalid() -> None:
+    provider = _FoundationProvider(
+        development_rules={"manifest": {"schema": "nope"}},
+        skills={"records": [{"identity": 1}]},
+        tool_recipes={"recipes": ["not-a-recipe"]},
+    )
+    snapshot = dashboard.build_snapshot(provider)
+    assert snapshot["development_rules"]["state"] == "invalid"
+    assert "declared_rule_count" not in snapshot["development_rules"]
+    assert snapshot["skills"]["state"] == "invalid"
+    assert "lifecycle" not in snapshot["skills"]
+    assert snapshot["tool_recipes"]["state"] == "invalid"
+    assert "registry_count" not in snapshot["tool_recipes"]
+
+
+def test_coding_foundation_unavailable_is_not_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dashboard, "_load_development_rules_api", lambda: None)
+    monkeypatch.setattr(dashboard, "_load_skill_registry_api", lambda: None)
+    monkeypatch.setattr(dashboard, "_load_tool_recipes_api", lambda: None)
+    provider = _FoundationProvider(
+        development_rules={"manifest": _rules_manifest_mapping()},
+        skills={"records": [_skill_mapping()]},
+        tool_recipes={"recipes": [_echo_recipe()]},
+    )
+    snapshot = dashboard.build_snapshot(provider)
+    for key in ("development_rules", "skills", "tool_recipes"):
+        assert snapshot[key]["state"] == "unavailable"
+        assert snapshot[key]["availability"] == "unavailable"
+        assert 0 not in snapshot[key].values()
+
+
+def test_coding_foundation_no_sample_and_unknown_denominators() -> None:
+    provider = _FoundationProvider(
+        development_rules={"manifest": _rules_manifest_mapping(), "violations": "unknown"},
+        skills={
+            "records": [_skill_mapping()],
+            "selections": "unknown",
+            "invocation_denominator": "unknown",
+        },
+        tool_recipes={"recipes": [_echo_recipe()], "receipts": "unknown"},
+    )
+    snapshot = dashboard.build_snapshot(provider)
+    assert snapshot["development_rules"]["state"] == "measured"
+    assert snapshot["development_rules"]["violation_evidence_state"] == "unknown"
+    assert "violation_count" not in snapshot["development_rules"]
+    assert snapshot["skills"]["selection"]["state"] == "unknown"
+    assert snapshot["skills"]["selection"]["denominator"] == "unknown"
+    assert snapshot["skills"]["invocation"]["state"] == "no_sample"
+    assert snapshot["skills"]["outcome"]["state"] == "no_sample"
+    assert snapshot["tool_recipes"]["invocation"]["state"] == "unknown"
+    assert snapshot["tool_recipes"]["cache"]["denominator"] == "unknown"
+    assert snapshot["tool_recipes"]["context"]["state"] == "unknown"
+
+
+def test_coding_foundation_partial_summary_does_not_erase_rich_evidence() -> None:
+    full_provider = _FoundationProvider(
+        development_rules={
+            "manifest": _rules_manifest_mapping(),
+            "violations": [{"rule_id": "forbidden_pattern_rule", "result": "fail"}],
+        },
+        skills={
+            "records": [_skill_mapping()],
+            "selections": [{"identity": "commit-msg-check"}],
+            "selection_denominator": 3,
+        },
+        tool_recipes={
+            "recipes": [_echo_recipe()],
+            "receipts": [
+                {"recipe_id": "echo-tool", "cache_eligible": True, "context_bytes": 4}
+            ],
+        },
+    )
+    full = dashboard.build_snapshot(full_provider)
+    assert full["development_rules"]["violations"]
+    assert full["skills"]["selection"]["items"]
+    assert full["tool_recipes"]["receipts"]
+
+    summary_provider = _FoundationProvider(
+        development_rules={"manifest": _rules_manifest_mapping()},
+        skills={"records": [_skill_mapping()]},
+        tool_recipes={"recipes": [_echo_recipe()]},
+    )
+    summary = dashboard.build_snapshot(summary_provider, summary_only=True)
+    assert summary["development_rules"]["ownership"] == "summary"
+    assert "violations" not in summary["development_rules"]
+    assert "items" not in summary["skills"]["selection"]
+    assert "receipts" not in summary["tool_recipes"]
+
+    merged = dashboard.build_snapshot(
+        summary_provider, summary_only=True, previous=full
+    )
+    assert merged["development_rules"]["ownership"] == "full"
+    assert merged["development_rules"]["violations"][0]["rule_id"] == "forbidden_pattern_rule"
+    assert merged["skills"]["selection"]["items"][0]["identity"] == "commit-msg-check"
+    assert merged["tool_recipes"]["receipts"][0]["recipe_id"] == "echo-tool"
+    assert merged["development_rules"]["violation_evidence_state"] == "measured"
+    assert merged["development_rules"]["violation_count"] == 1
+    assert merged["skills"]["selection"]["state"] == "measured"
+    assert merged["skills"]["selection"]["count"] == 1
+    assert merged["skills"]["selection"]["denominator"] == 3
+    assert merged["tool_recipes"]["invocation"]["state"] == "measured"
+    assert merged["tool_recipes"]["invocation"]["count"] == 1
+
+
+def test_coding_foundation_summary_keeps_rules_state_with_violations() -> None:
+    full = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": [{"rule_id": "forbidden_pattern_rule", "result": "fail"}],
+            }
+        )
+    )
+    merged = dashboard.build_snapshot(
+        _FoundationProvider(development_rules={"manifest": _rules_manifest_mapping()}),
+        summary_only=True,
+        previous=full,
+    )
+    rules = merged["development_rules"]
+    assert rules["violations"]
+    assert rules["violation_evidence_state"] == "measured"
+    assert rules["violation_count"] == len(full["development_rules"]["violations"])
+    assert rules["violation_evidence_state"] not in {"no_sample", "unknown", "invalid"}
+
+
+def test_coding_foundation_summary_keeps_skills_state_with_items() -> None:
+    full = dashboard.build_snapshot(
+        _FoundationProvider(
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [{"identity": "commit-msg-check"}],
+                "selection_denominator": 3,
+            }
+        )
+    )
+    merged = dashboard.build_snapshot(
+        _FoundationProvider(skills={"records": [_skill_mapping()]}),
+        summary_only=True,
+        previous=full,
+    )
+    selection = merged["skills"]["selection"]
+    assert selection["items"]
+    assert selection["state"] == "measured"
+    assert selection["count"] == 1
+    assert selection["denominator"] == 3
+    assert selection["state"] not in {"no_sample", "unknown", "invalid"}
+
+
+def test_coding_foundation_summary_keeps_recipes_state_with_receipts() -> None:
+    full = dashboard.build_snapshot(
+        _FoundationProvider(
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [
+                    {"recipe_id": "echo-tool", "cache_eligible": True, "context_bytes": 4}
+                ],
+            }
+        )
+    )
+    merged = dashboard.build_snapshot(
+        _FoundationProvider(tool_recipes={"recipes": [_echo_recipe()]}),
+        summary_only=True,
+        previous=full,
+    )
+    recipes = merged["tool_recipes"]
+    assert recipes["receipts"]
+    assert recipes["invocation"]["state"] == "measured"
+    assert recipes["invocation"]["count"] == 1
+    assert recipes["invocation"]["state"] not in {"no_sample", "unknown", "invalid"}
+    assert recipes["invocation"]["items"]
+
+
+def test_coding_foundation_oversized_and_secret_fields_are_bounded() -> None:
+    secret_digest = "ab" * 32
+    oversized = [
+        {
+            "rule_id": f"rule-{index}",
+            "token": "secret=super-secret-value",
+            "path": "/home/shrek/hidden/file.py",
+            "digest": secret_digest,
+        }
+        for index in range(20)
+    ]
+    provider = _FoundationProvider(
+        development_rules={
+            "manifest": _rules_manifest_mapping(),
+            "violations": oversized,
+        },
+        skills={
+            "records": [_skill_mapping()],
+            "selections": oversized,
+            "selection_denominator": True,
+        },
+        tool_recipes={
+            "recipes": [_echo_recipe()],
+            "receipts": oversized,
+        },
+    )
+    snapshot = dashboard.build_snapshot(provider)
+    rules = snapshot["development_rules"]
+    assert rules["violations_truncated"] is True
+    assert len(rules["violations"]) == dashboard._PROJECTION_LIST_LIMIT
+    assert rules["returned_count"] == dashboard._PROJECTION_LIST_LIMIT
+    assert rules["violation_count"] == "unknown"
+    leaked = json.dumps(snapshot)
+    assert "super-secret-value" not in leaked
+    assert "/home/shrek/hidden/file.py" not in leaked
+    assert secret_digest not in leaked
+    selection = snapshot["skills"]["selection"]
+    assert selection["denominator"] == "unknown"
+    assert selection["truncated"] is True
+    assert selection["returned_count"] == dashboard._PROJECTION_LIST_LIMIT
+    assert selection["count"] == "unknown"
+    recipes = snapshot["tool_recipes"]
+    assert recipes["receipts_truncated"] is True
+    assert recipes["invocation"]["returned_count"] == dashboard._PROJECTION_LIST_LIMIT
+    assert recipes["invocation"]["count"] == "unknown"
+
+    mixed = list(oversized)
+    mixed[0] = "not-a-row"
+    unknown_snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": mixed,
+            },
+            skills={
+                "records": [_skill_mapping()],
+                "selections": mixed,
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": mixed,
+            },
+        )
+    )
+    assert unknown_snapshot["development_rules"]["violation_count"] == "unknown"
+    assert unknown_snapshot["development_rules"]["returned_count"] == 7
+    assert unknown_snapshot["skills"]["selection"]["count"] == "unknown"
+    assert unknown_snapshot["skills"]["selection"]["returned_count"] == 7
+    assert unknown_snapshot["tool_recipes"]["invocation"]["count"] == "unknown"
+    assert unknown_snapshot["tool_recipes"]["invocation"]["returned_count"] == 7
+
+
+def test_coding_foundation_structured_credential_fields_redacted() -> None:
+    plaintext = {
+        "token": "structured-token-secret-xyz",
+        "access_token": "structured-access-token-xyz",
+        "apiKey": "structured-camel-apikey-xyz",
+        "api_key": "structured-snake-apikey-xyz",
+        "authorization": "plain-authorization-header-xyz",
+        "password": "structured-password-secret-xyz",
+        "secret": "structured-secret-value-xyz",
+        "credential": "structured-credential-value-xyz",
+        "note": "Authorization: Bearer inline-bearer-secret-xyz",
+        "rule_id": "keep-rule-id",
+        "identity": "keep-identity",
+        "version": "1.2.3",
+    }
+    snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": [plaintext],
+            },
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [plaintext],
+                "invocations": [plaintext],
+                "outcomes": [plaintext],
+                "selection_denominator": True,
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [plaintext],
+            },
+        )
+    )
+    leaked = json.dumps(snapshot)
+    for secret in (
+        "structured-token-secret-xyz",
+        "structured-access-token-xyz",
+        "structured-camel-apikey-xyz",
+        "structured-snake-apikey-xyz",
+        "plain-authorization-header-xyz",
+        "structured-password-secret-xyz",
+        "structured-secret-value-xyz",
+        "structured-credential-value-xyz",
+        "inline-bearer-secret-xyz",
+        "Bearer inline-bearer-secret-xyz",
+    ):
+        assert secret not in leaked
+    rules_item = snapshot["development_rules"]["violations"][0]
+    skills_item = snapshot["skills"]["selection"]["items"][0]
+    recipes_item = snapshot["tool_recipes"]["receipts"][0]
+    for item in (rules_item, skills_item, recipes_item):
+        assert item["token"] == dashboard._CREDENTIAL_FIELD_REDACTION_MARKER
+        assert item["api_key"] == dashboard._CREDENTIAL_FIELD_REDACTION_MARKER
+        assert item["authorization"] == dashboard._CREDENTIAL_FIELD_REDACTION_MARKER
+        assert item["password"] == dashboard._CREDENTIAL_FIELD_REDACTION_MARKER
+        assert item["rule_id"] == "keep-rule-id"
+        assert item["identity"] == "keep-identity"
+        assert item["version"] == "1.2.3"
+
+
+def test_coding_foundation_access_key_fields_redacted_from_serialized_snapshot() -> None:
+    plaintext = {
+        "secret_access_key": "structured-secret-access-key-xyz",
+        "aws_secret_access_key": "structured-aws-secret-access-key-xyz",
+        "access_key": "structured-access-key-xyz",
+        "s3_access_key": "structured-s3-access-key-xyz",
+        "rule_id": "keep-rule-id",
+        "identity": "keep-identity",
+        "cache_key": "keep-cache-key",
+        "access_id": "keep-access-id",
+    }
+    snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": [plaintext],
+            },
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [plaintext],
+                "invocations": [plaintext],
+                "outcomes": [plaintext],
+                "selection_denominator": True,
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [plaintext],
+            },
+        )
+    )
+    leaked = json.dumps(snapshot)
+    for secret in (
+        "structured-secret-access-key-xyz",
+        "structured-aws-secret-access-key-xyz",
+        "structured-access-key-xyz",
+        "structured-s3-access-key-xyz",
+    ):
+        assert secret not in leaked
+    rules_item = snapshot["development_rules"]["violations"][0]
+    skills_item = snapshot["skills"]["selection"]["items"][0]
+    recipes_item = snapshot["tool_recipes"]["receipts"][0]
+    marker = dashboard._CREDENTIAL_FIELD_REDACTION_MARKER
+    for item in (rules_item, skills_item, recipes_item):
+        assert item["secret_access_key"] == marker
+        assert item["aws_secret_access_key"] == marker
+        assert item["access_key"] == marker
+        assert item["s3_access_key"] == marker
+        assert item["rule_id"] == "keep-rule-id"
+        assert item["identity"] == "keep-identity"
+        assert item["cache_key"] == "keep-cache-key"
+        assert item["access_id"] == "keep-access-id"
+
+
+def test_coding_foundation_compound_assignment_secrets_redacted_from_serialized_snapshot() -> None:
+    secrets = (
+        ("private_key", "compound-private-key-xyz"),
+        ("client_secret", "compound-client-secret-xyz"),
+        ("id_token", "compound-id-token-xyz"),
+        ("refresh_token", "compound-refresh-token-xyz"),
+        ("aws_secret_access_key", "compound-aws-secret-access-key-xyz"),
+    )
+    rows = [
+        {
+            "note": f"{name}={value}",
+            "message": f"{name}:{value}",
+            "rule_id": "keep-rule-id",
+        }
+        for name, value in secrets
+    ]
+    snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": rows,
+            },
+            skills={
+                "records": [_skill_mapping()],
+                "selections": rows,
+                "invocations": rows,
+                "outcomes": rows,
+                "selection_denominator": True,
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": rows,
+            },
+        )
+    )
+    leaked = json.dumps(snapshot)
+    for _name, value in secrets:
+        assert value not in leaked
+    rules_items = snapshot["development_rules"]["violations"]
+    skills_items = snapshot["skills"]["selection"]["items"]
+    recipes_items = snapshot["tool_recipes"]["receipts"]
+    for items in (rules_items, skills_items, recipes_items):
+        assert len(items) == len(secrets)
+        for item, (name, _value) in zip(items, secrets, strict=True):
+            assert item["note"] == f"{name}=<redacted>"
+            assert item["message"] == f"{name}:<redacted>"
+            assert item["rule_id"] == "keep-rule-id"
+
+
+def test_coding_foundation_labeled_and_0x_digest_fields_are_prefixed() -> None:
+    hex64 = "ab" * 32
+    labeled = f"sha256:{hex64}"
+    hex_0x = f"0x{hex64}"
+    plaintext = {
+        "digest": labeled,
+        "sha256": hex_0x,
+        "recipe_digest": labeled,
+        "hash": labeled,
+        "rule_id": "keep-rule-id",
+    }
+    snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": [plaintext],
+            },
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [plaintext],
+                "selection_denominator": True,
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [plaintext],
+            },
+        )
+    )
+    leaked = json.dumps(snapshot)
+    assert labeled not in leaked
+    assert hex_0x not in leaked
+    assert hex64 not in leaked
+    assert f'"hash": "{labeled}"' not in leaked
+    assert f'"hash": "{hex_0x}"' not in leaked
+    assert f'"hash": "{hex64}"' not in leaked
+    rules_item = snapshot["development_rules"]["violations"][0]
+    skills_item = snapshot["skills"]["selection"]["items"][0]
+    recipes_item = snapshot["tool_recipes"]["receipts"][0]
+    expected_labeled = dashboard._digest_prefix(labeled)
+    expected_0x = dashboard._digest_prefix(hex_0x)
+    assert expected_labeled is not None
+    assert expected_0x is not None
+    assert len(expected_labeled) <= dashboard._DIGEST_PREFIX_LEN
+    assert len(expected_0x) <= dashboard._DIGEST_PREFIX_LEN
+    assert dashboard._projection_string(labeled) == expected_labeled
+    assert dashboard._projection_string(hex_0x) == expected_0x
+    assert dashboard._projection_string("keep-rule-id") == "keep-rule-id"
+    for item in (rules_item, skills_item, recipes_item):
+        assert item["digest"] == expected_labeled
+        assert item["sha256"] == expected_0x
+        assert item["recipe_digest"] == expected_labeled
+        assert item["hash"] == expected_labeled
+        assert item["rule_id"] == "keep-rule-id"
+        assert hex64 not in item["digest"]
+        assert hex64 not in item["sha256"]
+        assert hex64 not in item["recipe_digest"]
+        assert hex64 not in item["hash"]
+        assert labeled not in item["hash"]
+        assert hex_0x not in item["hash"]
+
+def test_coding_foundation_summary_zero_or_different_counts_keep_prior_governing() -> None:
+    full = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": [{"rule_id": "forbidden_pattern_rule", "result": "fail"}],
+            },
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [{"identity": "commit-msg-check"}],
+                "selection_denominator": 3,
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [
+                    {"recipe_id": "echo-tool", "cache_eligible": True, "context_bytes": 4}
+                ],
+            },
+        )
+    )
+    zero = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={"manifest": _rules_manifest_mapping(), "violations": []},
+            skills={"records": [_skill_mapping()], "selections": []},
+            tool_recipes={"recipes": [_echo_recipe()], "receipts": []},
+        ),
+        summary_only=True,
+        previous=full,
+    )
+    assert zero["development_rules"]["violations"][0]["rule_id"] == "forbidden_pattern_rule"
+    assert zero["development_rules"]["violation_count"] == 1
+    assert zero["development_rules"]["violation_evidence_state"] == "measured"
+    assert zero["skills"]["selection"]["items"][0]["identity"] == "commit-msg-check"
+    assert zero["skills"]["selection"]["count"] == 1
+    assert zero["skills"]["selection"]["denominator"] == 3
+    assert zero["tool_recipes"]["receipts"][0]["recipe_id"] == "echo-tool"
+    assert zero["tool_recipes"]["invocation"]["count"] == 1
+    assert zero["tool_recipes"]["invocation"]["state"] == "measured"
+
+    different = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": [
+                    {"rule_id": "a", "result": "fail"},
+                    {"rule_id": "b", "result": "fail"},
+                ],
+            },
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [{"identity": "a"}, {"identity": "b"}],
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [
+                    {"recipe_id": "a", "cache_eligible": True, "context_bytes": 1},
+                    {"recipe_id": "b", "cache_eligible": False, "context_bytes": 2},
+                ],
+            },
+        ),
+        summary_only=True,
+        previous=full,
+    )
+    assert different["development_rules"]["violation_count"] == 1
+    assert len(different["development_rules"]["violations"]) == 1
+    assert different["skills"]["selection"]["count"] == 1
+    assert len(different["skills"]["selection"]["items"]) == 1
+    assert different["tool_recipes"]["invocation"]["count"] == 1
+    assert len(different["tool_recipes"]["receipts"]) == 1
+
+
+def test_coding_foundation_summary_unavailable_or_no_sample_keeps_prior_governing() -> None:
+    full = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": [{"rule_id": "forbidden_pattern_rule", "result": "fail"}],
+            },
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [{"identity": "commit-msg-check"}],
+                "selection_denominator": 3,
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [
+                    {"recipe_id": "echo-tool", "cache_eligible": True, "context_bytes": 4}
+                ],
+            },
+        )
+    )
+    for key, rich_path in (
+        ("development_rules", ("violations",)),
+        ("skills", ("selection", "items")),
+        ("tool_recipes", ("receipts",)),
+    ):
+        prior = full[key]
+        assert prior["state"] == "measured"
+        assert dashboard._mapping_has_rich_evidence(prior), sorted(prior)
+        assert "state" in dashboard._TOP_LEVEL_EVIDENCE_GOVERNING_KEYS
+        assert dashboard._should_preserve_governing("state", prior)
+        for state in ("unavailable", "no_sample"):
+            current = {
+                "schema_id": prior["schema_id"],
+                "state": state,
+                "ownership": "summary",
+                "availability": state,
+            }
+            merged = dashboard._merge_coding_foundation_projection(prior, current)
+            assert merged["state"] == "measured"
+            assert merged["availability"] == "available"
+            assert merged["ownership"] == "full"
+            cursor: object = merged
+            for part in rich_path:
+                assert isinstance(cursor, dict)
+                cursor = cursor[part]
+            assert cursor
+
+
+def test_coding_foundation_projection_items_bound_inspection_and_invalid_rows() -> None:
+    class _InspectedList(list):
+        def __init__(self, rows: list) -> None:
+            super().__init__(rows)
+            self.inspected = 0
+
+        def __iter__(self):
+            for row in list.__iter__(self):
+                self.inspected += 1
+                yield row
+
+    huge = _InspectedList([{"rule_id": f"rule-{index}"} for index in range(10_000)])
+    items, truncated, total = dashboard._bounded_projection_items(huge)
+    assert truncated is True
+    assert len(items) == dashboard._PROJECTION_LIST_LIMIT
+    assert total == "unknown"
+    assert huge.inspected <= dashboard._PROJECTION_LIST_LIMIT
+
+    empty_ok = [{}, {"rule_id": "ok"}, "nope"]
+    items, truncated, total = dashboard._bounded_projection_items(empty_ok)
+    assert items == [{"rule_id": "ok"}]
+    assert truncated is False
+    assert total == "unknown"
+
+    empty, empty_truncated, empty_total = dashboard._bounded_projection_items([])
+    assert empty == []
+    assert empty_truncated is False
+    assert empty_total == 0
+
+    snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": _InspectedList(
+                    [{"rule_id": f"rule-{index}"} for index in range(10_000)]
+                ),
+            },
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [{}, {"identity": "ok"}],
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [{}, {"recipe_id": "echo-tool"}],
+            },
+        )
+    )
+    assert snapshot["development_rules"]["violation_count"] == "unknown"
+    assert snapshot["skills"]["selection"]["count"] == "unknown"
+    assert snapshot["tool_recipes"]["invocation"]["count"] == "unknown"
+    assert snapshot["development_rules"]["violations"]
+    assert snapshot["skills"]["selection"]["items"] == [{"identity": "ok"}]
+    assert snapshot["tool_recipes"]["receipts"] == [{"recipe_id": "echo-tool"}]
+
+
+def test_cross_sibling_summary_full_evidence_merge_regression() -> None:
+    full_selection = dashboard.build_snapshot(
+        _FoundationProvider(
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [{"identity": "commit-msg-check"}],
+                "selection_denominator": 3,
+            }
+        )
+    )
+    assert full_selection["skills"]["selection"]["items"]
+    assert full_selection["skills"]["invocation"]["state"] == "no_sample"
+    invocation_summary = _FoundationProvider(
+        skills={
+            "records": [_skill_mapping()],
+            "invocations": [{"identity": "review-gate", "result": "ok"}],
+            "invocation_denominator": 5,
+        }
+    )
+    current_invocation = dashboard.build_snapshot(
+        invocation_summary, summary_only=True
+    )
+    assert current_invocation["skills"]["invocation"]["state"] == "measured"
+    assert current_invocation["skills"]["invocation"]["denominator"] == 5
+    merged = dashboard.build_snapshot(
+        invocation_summary, summary_only=True, previous=full_selection
+    )
+    assert merged["skills"]["selection"]["items"][0]["identity"] == "commit-msg-check"
+    assert merged["skills"]["selection"]["state"] == "measured"
+    assert merged["skills"]["selection"]["count"] == 1
+    assert merged["skills"]["selection"]["denominator"] == 3
+    assert merged["skills"]["invocation"]["state"] == "measured"
+    assert merged["skills"]["invocation"]["count"] == 1
+    assert merged["skills"]["invocation"]["denominator"] == 5
+    assert "items" not in merged["skills"]["invocation"]
+
+    full_invocation = dashboard.build_snapshot(
+        _FoundationProvider(
+            skills={
+                "records": [_skill_mapping()],
+                "invocations": [{"identity": "review-gate", "result": "ok"}],
+                "invocation_denominator": 4,
+            }
+        )
+    )
+    selection_summary = _FoundationProvider(
+        skills={
+            "records": [_skill_mapping()],
+            "selections": [{"identity": "commit-msg-check"}],
+            "selection_denominator": 5,
+        }
+    )
+    merged = dashboard.build_snapshot(
+        selection_summary, summary_only=True, previous=full_invocation
+    )
+    assert merged["skills"]["invocation"]["items"][0]["identity"] == "review-gate"
+    assert merged["skills"]["invocation"]["state"] == "measured"
+    assert merged["skills"]["invocation"]["denominator"] == 4
+    assert merged["skills"]["selection"]["state"] == "measured"
+    assert merged["skills"]["selection"]["count"] == 1
+    assert merged["skills"]["selection"]["denominator"] == 5
+
+    full_outcome = dashboard.build_snapshot(
+        _FoundationProvider(
+            skills={
+                "records": [_skill_mapping()],
+                "outcomes": [{"identity": "review-gate", "outcome": "accepted"}],
+                "outcome_denominator": 2,
+            }
+        )
+    )
+    merged = dashboard.build_snapshot(
+        invocation_summary, summary_only=True, previous=full_outcome
+    )
+    assert merged["skills"]["outcome"]["items"][0]["identity"] == "review-gate"
+    assert merged["skills"]["outcome"]["state"] == "measured"
+    assert merged["skills"]["outcome"]["denominator"] == 2
+    assert merged["skills"]["invocation"]["state"] == "measured"
+    assert merged["skills"]["invocation"]["denominator"] == 5
+    merged = dashboard.build_snapshot(
+        _FoundationProvider(
+            skills={
+                "records": [_skill_mapping()],
+                "outcomes": [{"identity": "review-gate", "outcome": "accepted"}],
+                "outcome_denominator": 5,
+            }
+        ),
+        summary_only=True,
+        previous=full_selection,
+    )
+    assert merged["skills"]["selection"]["items"][0]["identity"] == "commit-msg-check"
+    assert merged["skills"]["selection"]["denominator"] == 3
+    assert merged["skills"]["outcome"]["state"] == "measured"
+    assert merged["skills"]["outcome"]["denominator"] == 5
+
+    prior_recipes = {
+        "schema_id": dashboard._PROJECTION_SCHEMA_IDS["tool_recipes"],
+        "state": "measured",
+        "availability": "available",
+        "ownership": "full",
+        "receipts": [{"recipe_id": "echo-tool"}],
+        "invocation": {
+            "state": "measured",
+            "count": 1,
+            "items": [{"recipe_id": "echo-tool"}],
+        },
+        "cache": {"state": "no_sample"},
+        "context": {"state": "no_sample"},
+    }
+    current_recipes = {
+        "schema_id": dashboard._PROJECTION_SCHEMA_IDS["tool_recipes"],
+        "state": "measured",
+        "availability": "available",
+        "ownership": "summary",
+        "invocation": {"state": "no_sample"},
+        "cache": {"state": "measured", "eligible_count": 1, "ineligible_count": 0},
+        "context": {"state": "measured", "receipt_count": 1},
+    }
+    merged_recipes = dashboard._merge_coding_foundation_projection(
+        prior_recipes, current_recipes
+    )
+    assert merged_recipes["receipts"] == [{"recipe_id": "echo-tool"}]
+    assert merged_recipes["invocation"]["state"] == "measured"
+    assert merged_recipes["invocation"]["count"] == 1
+    assert merged_recipes["invocation"]["items"] == [{"recipe_id": "echo-tool"}]
+    assert merged_recipes["cache"] == {
+        "state": "measured",
+        "eligible_count": 1,
+        "ineligible_count": 0,
+    }
+    assert merged_recipes["context"] == {"state": "measured", "receipt_count": 1}
+
+    prior_cache_only = {
+        "schema_id": dashboard._PROJECTION_SCHEMA_IDS["tool_recipes"],
+        "state": "measured",
+        "availability": "available",
+        "ownership": "full",
+        "receipts": [{"recipe_id": "echo-tool"}],
+        "invocation": {"state": "no_sample"},
+        "cache": {"state": "measured", "eligible_count": 1, "ineligible_count": 0},
+        "context": {"state": "no_sample"},
+    }
+    current_invocation_only = {
+        "schema_id": dashboard._PROJECTION_SCHEMA_IDS["tool_recipes"],
+        "state": "measured",
+        "availability": "available",
+        "ownership": "summary",
+        "invocation": {"state": "measured", "count": 1, "denominator": 5},
+    }
+    merged_recipes = dashboard._merge_coding_foundation_projection(
+        prior_cache_only, current_invocation_only
+    )
+    assert merged_recipes["receipts"] == [{"recipe_id": "echo-tool"}]
+    assert merged_recipes["invocation"] == {
+        "state": "measured",
+        "count": 1,
+        "denominator": 5,
+    }
+    assert merged_recipes["cache"] == {
+        "state": "measured",
+        "eligible_count": 1,
+        "ineligible_count": 0,
+    }
+
+
+def test_coding_foundation_default_provider_is_wired_no_sample(tmp_path: Path) -> None:
+    root = _init_canonical_repo(tmp_path)
+    provider = dashboard.DashboardProvider(repo_root=root)
+    assert provider.get_development_rules_projection_input() is None
+    skills = provider.get_skills_projection_input()
+    assert len(list(skills)) == 0
+    recipes = provider.get_tool_recipes_projection_input()
+    assert len(recipes) == 0
+    snapshot = dashboard.build_snapshot(provider)
+    for key in ("development_rules", "skills", "tool_recipes"):
+        projection = snapshot[key]
+        assert projection["state"] == "no_sample"
+        assert projection["availability"] == "no_sample"
+        assert projection["state"] != "not_wired"
+
+
+def test_coding_foundation_projects_real_invocation_receipt_and_cache_decision() -> None:
+    from aiworkhub import tool_recipes as tr
+
+    recipe = _echo_recipe()
+    receipt = tr.build_receipt(tr.validate_invocation(recipe, {}))
+    decision = tr.cache_eligibility(recipe)
+    assert isinstance(receipt, tr.InvocationReceipt)
+    assert isinstance(decision, tr.CacheDecision)
+    assert decision.eligible is False
+    snapshot = dashboard.build_snapshot(
+        _FoundationProvider(tool_recipes={"recipes": [recipe], "receipts": [receipt]})
+    )
+    recipes = snapshot["tool_recipes"]
+    assert recipes["invocation"]["state"] == "measured"
+    assert recipes["invocation"]["count"] == 1
+    assert recipes["receipts"][0]["recipe_id"] == "echo-tool"
+    assert isinstance(recipes["receipts"][0].get("digest_prefix"), str)
+    assert recipes["cache"]["state"] == "measured"
+    assert recipes["cache"]["eligible_count"] == 0
+    assert recipes["cache"]["ineligible_count"] == 1
+    assert recipes["context"]["state"] == "unknown"
+    assert "receipt_count" not in recipes["context"]
+
+
+def test_coding_foundation_invalid_only_receipts_stay_unknown() -> None:
+    snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            tool_recipes={"recipes": [_echo_recipe()], "receipts": [{}, ""]}
+        )
+    )
+    recipes = snapshot["tool_recipes"]
+    assert recipes["invocation"]["count"] == "unknown"
+    assert recipes["cache"]["state"] == "unknown"
+    assert recipes["context"]["state"] == "unknown"
+    assert "eligible_count" not in recipes["cache"]
+    assert "ineligible_count" not in recipes["cache"]
+    assert "receipt_count" not in recipes["context"]
+
+
+def test_coding_foundation_exact_empty_receipts_are_measured_zero() -> None:
+    empty = dashboard.build_snapshot(
+        _FoundationProvider(tool_recipes={"recipes": [_echo_recipe()], "receipts": []})
+    )
+    recipes = empty["tool_recipes"]
+    assert recipes["invocation"]["state"] == "measured"
+    assert recipes["invocation"]["count"] == 0
+    assert recipes["cache"] == {
+        "state": "measured",
+        "eligible_count": 0,
+        "ineligible_count": 0,
+    }
+    assert recipes["context"] == {"state": "measured", "receipt_count": 0}
+    missing = dashboard.build_snapshot(
+        _FoundationProvider(tool_recipes={"recipes": [_echo_recipe()]})
+    )
+    assert missing["tool_recipes"]["invocation"]["state"] == "no_sample"
+    assert missing["tool_recipes"]["cache"]["state"] == "no_sample"
+    assert missing["tool_recipes"]["context"]["state"] == "no_sample"
+
+
+def test_coding_foundation_full_to_summary_keeps_nested_cache_context_coherent() -> None:
+    full = dashboard.build_snapshot(
+        _FoundationProvider(
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [
+                    {"recipe_id": "echo-tool", "cache_eligible": True, "context_bytes": 4}
+                ],
+            }
+        )
+    )
+    assert full["tool_recipes"]["cache"]["state"] == "measured"
+    assert full["tool_recipes"]["cache"]["eligible_count"] == 0
+    assert full["tool_recipes"]["cache"]["ineligible_count"] == 1
+    assert full["tool_recipes"]["context"]["state"] == "unknown"
+    assert full["tool_recipes"]["receipts"]
+    summary = dashboard.build_snapshot(
+        _FoundationProvider(tool_recipes={"recipes": [_echo_recipe()]}),
+        summary_only=True,
+    )
+    assert summary["tool_recipes"]["cache"]["state"] == "no_sample"
+    assert summary["tool_recipes"]["context"]["state"] == "no_sample"
+    assert "receipts" not in summary["tool_recipes"]
+    merged = dashboard.build_snapshot(
+        _FoundationProvider(tool_recipes={"recipes": [_echo_recipe()]}),
+        summary_only=True,
+        previous=full,
+    )
+    recipes = merged["tool_recipes"]
+    assert recipes["receipts"][0]["recipe_id"] == "echo-tool"
+    assert recipes["cache"] == {
+        "state": "measured",
+        "eligible_count": 0,
+        "ineligible_count": 1,
+    }
+    assert recipes["context"]["state"] == "unknown"
+    assert "eligible_count" not in recipes["context"]
+    prior_unit = {
+        "schema_id": dashboard._PROJECTION_SCHEMA_IDS["tool_recipes"],
+        "state": "measured",
+        "availability": "available",
+        "ownership": "full",
+        "receipts": [{"recipe_id": "echo-tool"}],
+        "invocation": {
+            "state": "measured",
+            "count": 1,
+            "items": [{"recipe_id": "echo-tool"}],
+        },
+        "cache": {"state": "measured", "eligible_count": 1, "ineligible_count": 0},
+        "context": {"state": "unknown", "denominator": "unknown"},
+    }
+    current_unit = {
+        "schema_id": dashboard._PROJECTION_SCHEMA_IDS["tool_recipes"],
+        "state": "measured",
+        "availability": "available",
+        "ownership": "summary",
+        "invocation": {"state": "no_sample"},
+        "cache": {"state": "no_sample"},
+        "context": {"state": "no_sample"},
+    }
+    merged_unit = dashboard._merge_coding_foundation_projection(prior_unit, current_unit)
+    assert merged_unit["receipts"] == [{"recipe_id": "echo-tool"}]
+    assert merged_unit["cache"] == {
+        "state": "measured",
+        "eligible_count": 1,
+        "ineligible_count": 0,
+    }
+    assert merged_unit["context"] == {"state": "unknown", "denominator": "unknown"}
+    assert merged_unit["invocation"]["state"] == "measured"
+
+
+def test_coding_foundation_full_to_summary_empty_receipts_stay_atomic() -> None:
+    full = dashboard.build_snapshot(
+        _FoundationProvider(
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [
+                    {"recipe_id": "echo-tool", "cache_eligible": True, "context_bytes": 4}
+                ],
+            }
+        )
+    )
+    prior = full["tool_recipes"]
+    assert prior["receipts"]
+    assert prior["invocation"]["state"] == "measured"
+    assert prior["invocation"]["count"] == 1
+    assert prior["cache"] == {
+        "state": "measured",
+        "eligible_count": 0,
+        "ineligible_count": 1,
+    }
+    assert prior["context"]["state"] == "unknown"
+    empty_summary_provider = _FoundationProvider(
+        tool_recipes={"recipes": [_echo_recipe()], "receipts": []}
+    )
+    summary = dashboard.build_snapshot(empty_summary_provider, summary_only=True)
+    assert "receipts" not in summary["tool_recipes"]
+    assert summary["tool_recipes"]["invocation"] == {
+        "state": "measured",
+        "count": 0,
+        "returned_count": 0,
+    }
+    assert summary["tool_recipes"]["cache"] == {
+        "state": "measured",
+        "eligible_count": 0,
+        "ineligible_count": 0,
+    }
+    assert summary["tool_recipes"]["context"] == {"state": "measured", "receipt_count": 0}
+    merged = dashboard.build_snapshot(
+        empty_summary_provider, summary_only=True, previous=full
+    )
+    recipes = merged["tool_recipes"]
+    assert recipes["receipts"][0]["recipe_id"] == "echo-tool"
+    assert recipes["invocation"]["state"] == prior["invocation"]["state"]
+    assert recipes["invocation"]["count"] == prior["invocation"]["count"]
+    assert recipes["cache"] == prior["cache"]
+    assert recipes["context"] == prior["context"]
+    assert recipes["invocation"]["count"] == len(recipes["receipts"])
+    current_empty = {
+        "schema_id": dashboard._PROJECTION_SCHEMA_IDS["tool_recipes"],
+        "state": "measured",
+        "availability": "available",
+        "ownership": "summary",
+        "receipts": [],
+        "invocation": {"state": "measured", "count": 0},
+        "cache": {"state": "measured", "eligible_count": 0, "ineligible_count": 0},
+        "context": {"state": "measured", "receipt_count": 0},
+    }
+    replaced = dashboard._merge_coding_foundation_projection(prior, current_empty)
+    assert "receipts" not in replaced
+    assert replaced["invocation"] == {"state": "measured", "count": 0}
+    assert replaced["cache"] == {
+        "state": "measured",
+        "eligible_count": 0,
+        "ineligible_count": 0,
+    }
+    assert replaced["context"] == {"state": "measured", "receipt_count": 0}
+
+
+def test_coding_foundation_resolve_uses_raw_hex_and_long_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hex_path = "0123456789abcdef0123456789abcdef"
+    long_path = "src/" + ("seg" * 40) + "/module.py"
+    assert len(hex_path) == 32
+    assert all(character in "0123456789abcdef" for character in hex_path)
+    assert len(long_path) > 120
+    assert dashboard._projection_string(hex_path, 120) != hex_path
+    assert dashboard._projection_string(long_path, 120) != long_path
+    real = dashboard._load_development_rules_api()
+    assert real is not None
+
+    class _Resolved:
+        def __init__(self, count: int) -> None:
+            self.rules = (None,) * count
+
+    class _Api:
+        parse_manifest = staticmethod(real.parse_manifest)
+        canonical_digest = staticmethod(real.canonical_digest)
+
+        @staticmethod
+        def resolve(manifest, **kwargs):  # noqa: ANN001, ARG004
+            path = kwargs.get("path")
+            if path == hex_path:
+                return _Resolved(1)
+            if path == long_path:
+                return _Resolved(2)
+            return _Resolved(0)
+
+    monkeypatch.setattr(dashboard, "_load_development_rules_api", lambda: _Api)
+    hex_snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "resolve": {"path": hex_path},
+            }
+        )
+    )
+    assert hex_snapshot["development_rules"]["resolved_rule_count"] == 1
+    long_snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "resolve": {"path": long_path},
+            }
+        )
+    )
+    assert long_snapshot["development_rules"]["resolved_rule_count"] == 2
+
+
+class _InspectedPrimary(list):
+    def __init__(self, rows: list) -> None:
+        super().__init__(rows)
+        self.inspected = 0
+
+    def __iter__(self):
+        for row in list.__iter__(self):
+            self.inspected += 1
+            yield row
+
+
+def test_coding_foundation_primary_skills_and_recipes_cap_inspection() -> None:
+    from aiworkhub import tool_recipes as tr
+
+    skill_rows = _InspectedPrimary(
+        [
+            _skill_mapping(identity=f"skill-{index}", version="1.0.0")
+            for index in range(20)
+        ]
+    )
+    recipe_rows = _InspectedPrimary(
+        [
+            tr.Recipe(id=f"echo-{index}", version="1.0.0", argv=(tr.lit("echo"),))
+            for index in range(20)
+        ]
+    )
+    snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            skills={"records": skill_rows},
+            tool_recipes={"recipes": recipe_rows},
+        )
+    )
+    skills = snapshot["skills"]
+    assert skills["state"] == "measured"
+    assert skills["truncated"] is True
+    assert skills["returned_count"] == dashboard._PROJECTION_LIST_LIMIT
+    assert skills["count"] == "unknown"
+    assert skill_rows.inspected <= dashboard._PROJECTION_LIST_LIMIT
+    recipes = snapshot["tool_recipes"]
+    assert recipes["state"] == "measured"
+    assert recipes["truncated"] is True
+    assert recipes["returned_count"] == dashboard._PROJECTION_LIST_LIMIT
+    assert recipes["count"] == "unknown"
+    assert "registry_count" not in recipes
+    assert recipe_rows.inspected <= dashboard._PROJECTION_LIST_LIMIT
+
+
+def test_coding_foundation_empty_skill_registry_keeps_measured_nested_evidence() -> None:
+    snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            skills={
+                "records": [],
+                "selections": [{"identity": "commit-msg-check"}],
+                "invocations": [{"identity": "commit-msg-check", "result": "ok"}],
+                "outcomes": [{"identity": "commit-msg-check", "outcome": "accepted"}],
+                "selection_denominator": 3,
+            }
+        )
+    )
+    skills = snapshot["skills"]
+    assert skills["state"] == "measured"
+    assert skills["availability"] == "available"
+    assert skills["state"] != "no_sample"
+    assert skills["selection"]["state"] == "measured"
+    assert skills["invocation"]["state"] == "measured"
+    assert skills["outcome"]["state"] == "measured"
+    assert skills["selection"]["count"] == 1
+    assert "lifecycle" not in skills
+
+
+def test_coding_foundation_cache_eligible_echo_matches_recomputed_section() -> None:
+    snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [
+                    {"recipe_id": "echo-tool", "cache_eligible": True, "context_bytes": 4}
+                ],
+            }
+        )
+    )
+    recipes = snapshot["tool_recipes"]
+    assert recipes["cache"]["state"] == "measured"
+    assert recipes["cache"]["eligible_count"] == 0
+    assert recipes["cache"]["ineligible_count"] == 1
+    echoed = [item.get("cache_eligible") for item in recipes["receipts"]]
+    assert True not in echoed
+    assert echoed == [False]
+    assert recipes["cache"]["eligible_count"] == sum(1 for flag in echoed if flag is True)
+    assert recipes["cache"]["ineligible_count"] == sum(
+        1 for flag in echoed if flag is False
+    )
+
+
+class _NotReadyReadiness:
+    ready = False
+    reason = "uninitialized"
+    repo_id = "not-ready"
+
+
+class _NotReadyProvider(_FoundationProvider):
+    def get_storage_readiness(self) -> _NotReadyReadiness:
+        return _NotReadyReadiness()
+
+
+def test_coding_foundation_measured_full_survives_storage_not_ready() -> None:
+    full = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": [{"rule_id": "forbidden_pattern_rule", "result": "fail"}],
+            },
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [{"identity": "commit-msg-check"}],
+                "selection_denominator": 3,
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [
+                    {"recipe_id": "echo-tool", "cache_eligible": True, "context_bytes": 4}
+                ],
+            },
+        )
+    )
+    assert full["development_rules"]["violations"]
+    assert full["skills"]["selection"]["items"]
+    assert full["tool_recipes"]["receipts"]
+    assert hasattr(_NotReadyProvider(), "get_development_rules_projection_input")
+    assert hasattr(_NotReadyProvider(), "get_skills_projection_input")
+    assert hasattr(_NotReadyProvider(), "get_tool_recipes_projection_input")
+
+    not_ready = dashboard.build_snapshot(_NotReadyProvider(), previous=full)
+    for key in ("development_rules", "skills", "tool_recipes"):
+        projection = not_ready[key]
+        assert projection["state"] == "unavailable"
+        assert projection["availability"] == "unavailable"
+        assert projection["reason"] == "storage_not_ready"
+        assert projection["state"] != "not_wired"
+        assert projection["availability"] != "not_wired"
+    assert not_ready["development_rules"]["violations"][0]["rule_id"] == "forbidden_pattern_rule"
+    assert not_ready["skills"]["selection"]["items"][0]["identity"] == "commit-msg-check"
+    assert not_ready["tool_recipes"]["receipts"][0]["recipe_id"] == "echo-tool"
+
+
+def test_coding_foundation_truncated_skills_omit_prefix_lifecycle() -> None:
+    rows = [
+        _skill_mapping(identity=f"skill-{index}", version="1.0.0")
+        for index in range(dashboard._PROJECTION_LIST_LIMIT)
+    ]
+    rows.append(_skill_mapping(identity="retired-late", lifecycle_state="retired"))
+    snapshot = dashboard.build_snapshot(_FoundationProvider(skills={"records": rows}))
+    skills = snapshot["skills"]
+    assert skills["truncated"] is True
+    assert skills["count"] == "unknown"
+    lifecycle = skills.get("lifecycle")
+    assert lifecycle is None or lifecycle.get("state") == "unknown"
+    if isinstance(lifecycle, dict):
+        assert lifecycle.get("retired") != 0
+
+
+def test_coding_foundation_summary_two_records_keeps_nested_rich_atomic_counts() -> None:
+    from aiworkhub import tool_recipes as tr
+
+    full = dashboard.build_snapshot(
+        _FoundationProvider(
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [{"identity": "commit-msg-check"}],
+                "selection_denominator": 3,
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [
+                    {"recipe_id": "echo-tool", "cache_eligible": True, "context_bytes": 4}
+                ],
+            },
+        )
+    )
+    assert full["skills"]["returned_count"] == 1
+    assert full["tool_recipes"]["returned_count"] == 1
+    merged = dashboard.build_snapshot(
+        _FoundationProvider(
+            skills={
+                "records": [
+                    _skill_mapping(),
+                    _skill_mapping(
+                        identity="review-gate",
+                        version="1.1.0",
+                        lifecycle_state="active",
+                    ),
+                ]
+            },
+            tool_recipes={
+                "recipes": [
+                    _echo_recipe(),
+                    tr.Recipe(id="echo-2", version="1.0.0", argv=(tr.lit("echo"),)),
+                ]
+            },
+        ),
+        summary_only=True,
+        previous=full,
+    )
+    skills = merged["skills"]
+    assert skills["returned_count"] == 2
+    assert skills["count"] == 2
+    assert skills["lifecycle"] == {"proposed": 1, "active": 1, "retired": 0}
+    assert skills["selection"]["items"][0]["identity"] == "commit-msg-check"
+    recipes = merged["tool_recipes"]
+    assert recipes["returned_count"] == 2
+    assert recipes["count"] == 2
+    assert recipes["registry_count"] == 2
+    assert recipes["receipts"][0]["recipe_id"] == "echo-tool"
+
+
+def test_coding_foundation_secret_key_variants_redacted_from_serialized_snapshot() -> None:
+    plaintext = {
+        "secret_key": "structured-secret-key-xyz",
+        "SECRET_KEY": "structured-SECRET-KEY-xyz",
+        "secret-key": "structured-secret-hyphen-key-xyz",
+        "cache_key": "keep-cache-key",
+        "rule_id": "keep-rule-id",
+        "identity": "keep-identity",
+        "note": "secret_key=free-text-secret-key-xyz",
+        "message": "SECRET_KEY:free-text-SECRET-KEY-xyz",
+        "detail": "secret-key=free-text-secret-hyphen-xyz",
+        "cache_note": "cache_key=keep-cache-assignment",
+    }
+    snapshot = dashboard.build_snapshot(
+        _FoundationProvider(
+            development_rules={
+                "manifest": _rules_manifest_mapping(),
+                "violations": [plaintext],
+            },
+            skills={
+                "records": [_skill_mapping()],
+                "selections": [plaintext],
+                "invocations": [plaintext],
+                "outcomes": [plaintext],
+                "selection_denominator": True,
+            },
+            tool_recipes={
+                "recipes": [_echo_recipe()],
+                "receipts": [plaintext],
+            },
+        )
+    )
+    leaked = json.dumps(snapshot)
+    for secret in (
+        "structured-secret-key-xyz",
+        "structured-SECRET-KEY-xyz",
+        "structured-secret-hyphen-key-xyz",
+        "free-text-secret-key-xyz",
+        "free-text-SECRET-KEY-xyz",
+        "free-text-secret-hyphen-xyz",
+    ):
+        assert secret not in leaked
+    assert "keep-cache-key" in leaked
+    assert "keep-cache-assignment" in leaked
+    rules_item = snapshot["development_rules"]["violations"][0]
+    skills_item = snapshot["skills"]["selection"]["items"][0]
+    recipes_item = snapshot["tool_recipes"]["receipts"][0]
+    marker = dashboard._CREDENTIAL_FIELD_REDACTION_MARKER
+    for item in (rules_item, skills_item, recipes_item):
+        assert item["secret_key"] == marker
+        assert item["SECRET_KEY"] == marker
+        assert item["secret-key"] == marker
+        assert item["cache_key"] == "keep-cache-key"
+        assert item["rule_id"] == "keep-rule-id"
+        assert item["identity"] == "keep-identity"
+        assert item["note"] == "secret_key=<redacted>"
+        assert item["message"] == "SECRET_KEY:<redacted>"
+        assert item["detail"] == "secret-key=<redacted>"
+        assert item["cache_note"] == "cache_key=keep-cache-assignment"
+
+
+def test_coding_foundation_primary_collection_generator_limit_and_misleading_len() -> None:
+    limit = dashboard._PROJECTION_LIST_LIMIT
+    exact = dashboard._bounded_primary_collection(iter(range(limit)))
+    assert exact is not None
+    items, truncated, total = exact
+    assert items == list(range(limit))
+    assert truncated is False
+    assert total == limit
+
+    oversized = dashboard._bounded_primary_collection(iter(range(limit + 1)))
+    assert oversized is not None
+    items, truncated, total = oversized
+    assert items == list(range(limit))
+    assert truncated is True
+    assert total == "unknown"
+
+    class _ShortLen:
+        def __len__(self) -> int:
+            return limit
+
+        def __iter__(self):
+            yield from range(limit + 1)
+
+    class _LongLen:
+        def __len__(self) -> int:
+            return limit + 5
+
+        def __iter__(self):
+            yield from range(limit)
+
+    class _LieList(list):
+        def __len__(self) -> int:
+            return 3
+
+    short = dashboard._bounded_primary_collection(_ShortLen())
+    assert short is not None
+    items, truncated, total = short
+    assert items == list(range(limit))
+    assert truncated is True
+    assert total == "unknown"
+
+    long = dashboard._bounded_primary_collection(_LongLen())
+    assert long is not None
+    items, truncated, total = long
+    assert items == list(range(limit))
+    assert truncated is False
+    assert total == limit
+
+    lie_list = dashboard._bounded_primary_collection(_LieList(range(limit)))
+    assert lie_list is not None
+    items, truncated, total = lie_list
+    assert items == list(range(limit))
+    assert truncated is False
+    assert total == limit
