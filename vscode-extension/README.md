@@ -12,14 +12,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.51
+## What's new in 0.10.52
 
-- Repository Skills can now be selected deterministically from task context
-  and converted into bounded digest-bound runtime instruction packets.
-- Packet construction remains pure and fail-closed across lifecycle, ordering,
-  size, host-path and credential checks.
-- Unicode whitespace and fullwidth assignment delimiters cannot bypass secret
-  filtering in emitted skill instructions.
+- Skill Runtime Packets now reject every Unicode format character, closing
+  invisible ZWJ, ZWNJ, word-joiner and BOM secret-key splitting bypasses.
 
 ## Architecture at a glance
 

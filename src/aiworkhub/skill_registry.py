@@ -38,6 +38,7 @@ import heapq
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -1314,7 +1315,9 @@ def _has_secret_assignment(text: str) -> bool:
 
 
 def _reject_instruction_string(text: str, field: str) -> None:
-    if _CONTROL_CHAR_RE.search(text):
+    if _CONTROL_CHAR_RE.search(text) or any(
+        unicodedata.category(char) == "Cf" for char in text
+    ):
         _fail("skill_registry.invalid_value", f"{field} contains a control character")
     if _PRIVATE_KEY_RE.search(text) or _BEARER_RE.search(text) or _has_secret_assignment(text):
         _fail("skill_registry.secret_rejected", f"{field} contains credential material")

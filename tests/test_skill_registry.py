@@ -1781,13 +1781,26 @@ def test_runtime_packet_rejects_format_char_split_secret_tokens():
         "pass\u00adword=leakedvalue",
         "Bea\u00adrer leakedtoken",
         "-----BEGIN PRI\u00adVATE KEY-----",
+        "pass\u200cword=leakedvalue",
+        "pass\u200dword=leakedvalue",
+        "pass\u2060word=leakedvalue",
+        "pass\ufeffword=leakedvalue",
     )
-    for text in payloads:
-        record = _active(procedure_steps=(text,))
-        assert_fails(
-            "skill_registry.invalid_value",
-            lambda record=record: sr.build_runtime_packet([record], _bound_receipt(record)),
-        )
+    for field in _PACKET_EMITTED_FIELDS:
+        for text in payloads:
+            if field in _PACKET_LIST_FIELDS:
+                candidates, receipt = _packet_candidates_and_receipt(field, text)
+                assert_fails(
+                    "skill_registry.invalid_value",
+                    lambda candidates=candidates, receipt=receipt: sr.build_runtime_packet(
+                        candidates, receipt
+                    ),
+                )
+            else:
+                assert_fails(
+                    "skill_registry.invalid_value",
+                    lambda field=field, text=text: sr._bounded_packet_scalar(text, field, 256),
+                )
 
 
 def test_runtime_packet_rejects_unicode_whitespace_and_fullwidth_assignment_delimiters():

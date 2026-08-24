@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.52] - 2026-08-24
+
+### Fixed
+
+- Skill Runtime Packet credential filtering now rejects every Unicode format
+  character, preventing ZWJ, ZWNJ, word-joiner and BOM key-splitting bypasses
+  across all emitted instruction fields.
+
 ## [0.10.51] - 2026-08-24
 
 ### Added
