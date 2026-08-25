@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.54] - 2026-08-25
+
+### Fixed
+
+- Model workers are uncapped by default end to end: supervisor and process
+  finalization no longer mint new token-budget terminal outcomes from legacy
+  metadata, while historical evidence remains readable.
+- Reviewer launch and terminal settlement preserve exactly-once intent across
+  ledger churn, stale reservations, callback recovery and interrupted manager
+  sessions instead of leaving review work stranded.
+- Explicit predecessor recovery now verifies true zero-diff retained
+  workspaces mechanically, allowing validation-failed rework without fabricated
+  hashes while retaining bounded fail-closed checks for drift and malformed
+  evidence.
+- Sparse validation workspaces seed current canonical Python dependencies and
+  carry nested-validator authority coherently, preventing stale-HEAD imports
+  from turning valid candidates into repeat validation loops.
+
 ## [0.10.53] - 2026-08-24
 
 ### Added

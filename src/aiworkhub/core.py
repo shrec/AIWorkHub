@@ -3818,6 +3818,276 @@ def _reconcile_retained_workspaces(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# Bounded, coordinator-side re-derivation of "this retained review changed
+# nothing".  Every cap below exists so one malformed card cannot turn a
+# rejection into an unbounded filesystem walk.
+_MAX_ZERO_DIFF_BASELINE_ENTRIES = 4096
+_MAX_ZERO_DIFF_TREE_ENTRIES = 20_000
+_MAX_ZERO_DIFF_TREE_BYTES = 512 * 1024 * 1024
+_ZERO_DIFF_IGNORE_TIMEOUT_SECONDS = 30
+
+# Distinct structured refusal reasons.  A rejection that fails closed must say
+# *why*: an operator reading ``tree_drift`` knows the retained worktree really
+# moved, ``unsealed_tree`` knows the evidence never carried a manifest, and
+# ``scan_failed`` knows nothing was proven either way.  Collapsing all of them
+# back into ``predecessor_request_id_missing_hashes`` is exactly what made the
+# original Windows failure undiagnosable.
+_ZERO_DIFF_PROVEN = ""
+_ZERO_DIFF_CAPABILITY_DENIED = "predecessor_request_id_zero_diff_capability_denied"
+_ZERO_DIFF_OUT_OF_ROOT = "predecessor_request_id_zero_diff_workspace_out_of_root"
+_ZERO_DIFF_IDENTITY_MISMATCH = "predecessor_request_id_zero_diff_identity_mismatch"
+_ZERO_DIFF_UNSEALED_BASELINE = "predecessor_request_id_zero_diff_unsealed_baseline"
+_ZERO_DIFF_UNSEALED_TREE = "predecessor_request_id_zero_diff_unsealed_tree"
+_ZERO_DIFF_BASELINE_DRIFT = "predecessor_request_id_zero_diff_baseline_drift"
+_ZERO_DIFF_TREE_DRIFT = "predecessor_request_id_zero_diff_tree_drift"
+_ZERO_DIFF_BUDGET_EXCEEDED = "predecessor_request_id_zero_diff_budget_exceeded"
+_ZERO_DIFF_SCAN_FAILED = "predecessor_request_id_zero_diff_scan_failed"
+_ZERO_DIFF_IGNORE_CHECK_FAILED = "predecessor_request_id_zero_diff_ignore_check_failed"
+
+
+class _ZeroDiffBudgetExceeded(Exception):
+    """The retained worktree exceeded the bounded zero-diff scan budget."""
+
+
+def _zero_diff_relative_path(raw: str) -> str:
+    """Normalize one repo-relative path the single Windows-safe way.
+
+    Evidence sealed on Windows carries ``src\\audited.py`` while a fresh scan of
+    that same file yields ``src/audited.py``.  Both sides of every comparison
+    below go through ``worker_workspace._relative_repo_path`` -- the exact
+    normalizer the manifest was sealed with -- so a separator difference can
+    never read as drift and ``..`` can never escape the root.  Raises
+    ``WorkspaceError`` on an unsafe or malformed path.
+    """
+    from . import worker_workspace
+
+    return worker_workspace._relative_repo_path(raw)
+
+
+def _bounded_worktree_manifest(root: Path) -> dict[str, str | None]:
+    """Hash the complete retained worktree under explicit entry/byte caps.
+
+    ``worker_workspace._worktree_manifest`` is deliberately unbounded: it runs
+    against a worktree this process just provisioned.  Here the root arrives on
+    a card, so the walk is capped and every failure raises -- a partial or
+    truncated manifest must never be able to read as "unchanged".  ``.git`` is
+    skipped for the same reason the provisioning manifest skips it: a linked
+    worktree's pointer is Git-owned administrative metadata, not candidate
+    content.
+    """
+    from . import worker_workspace
+
+    manifest: dict[str, str | None] = {}
+    total_bytes = 0
+    stack = [root]
+    while stack:
+        with os.scandir(stack.pop()) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                relative = _zero_diff_relative_path(
+                    path.relative_to(root).as_posix()
+                )
+                if relative == ".git":
+                    continue
+                if entry.is_symlink():
+                    pass
+                elif entry.is_dir(follow_symlinks=False):
+                    stack.append(path)
+                    continue
+                elif entry.is_file(follow_symlinks=False):
+                    total_bytes += entry.stat(follow_symlinks=False).st_size
+                else:
+                    raise worker_workspace.WorkspaceError(
+                        f"zero_diff_special_file:{relative}"
+                    )
+                if (
+                    len(manifest) >= _MAX_ZERO_DIFF_TREE_ENTRIES
+                    or total_bytes > _MAX_ZERO_DIFF_TREE_BYTES
+                ):
+                    raise _ZeroDiffBudgetExceeded(relative)
+                manifest[relative] = worker_workspace._hash_path(path)
+    return manifest
+
+
+def _git_ignored_subset(root: Path, candidates: Sequence[str]) -> set[str]:
+    """Ask git which of ``candidates`` its own ignore rules exclude.
+
+    The ``changed_paths`` on the evidence were produced by git (``git diff``
+    plus ``git ls-files --others --exclude-standard``), so an ignored, untracked
+    validation artifact -- ``__pycache__/``, ``.pytest_cache/``, ``.ruff_cache/``,
+    ``.coverage`` -- is absent from that list by construction.  A raw tree
+    manifest has no such notion, so without this filter a rejection that merely
+    ran the declared validation would report drift and fail closed.
+    ``check-ignore`` consults the index by default, so a *tracked* path that
+    also matches an ignore pattern is still correctly reported as not ignored.
+    Raises ``OSError``/``subprocess.SubprocessError`` -- never a silent empty
+    set, which would read as "nothing is ignored" and refuse a clean tree.
+    """
+    completed = subprocess.run(
+        ["git", "-C", str(root), "check-ignore", "-z", "--stdin"],
+        input="\0".join(candidates).encode("utf-8"),
+        capture_output=True,
+        timeout=_ZERO_DIFF_IGNORE_TIMEOUT_SECONDS,
+        check=False,
+    )
+    # 0 = at least one path is ignored, 1 = none are.  Anything else (128 = not
+    # a repository, bad usage) is an error and must not read as "not ignored".
+    if completed.returncode not in (0, 1):
+        raise OSError(f"git_check_ignore_failed:{completed.returncode}")
+    return {
+        row.decode("utf-8", "surrogateescape")
+        for row in completed.stdout.split(b"\0")
+        if row
+    }
+
+
+def _verify_retained_zero_diff(
+    *,
+    request_id: str,
+    task_id: str,
+    authority_repo: Path,
+    retained: Path,
+    workspace: Mapping[str, Any],
+    card_claim_epoch: Any,
+    claim_epoch: Any,
+) -> str:
+    """Mechanically re-derive "this retained review changed nothing".
+
+    Returns ``_ZERO_DIFF_PROVEN`` only when the empty diff is proven from the
+    filesystem, else the exact structured refusal reason.  Nothing the card
+    declares is authority here: an empty ``changed_paths`` only *selects* this
+    path, it never satisfies it.
+    """
+    from . import worker_workspace
+
+    # A card names the directory this walks and hashes.  Verify the coordinator
+    # capability before touching it, so a caller without that capability can
+    # neither trigger the scan nor observe a filesystem-derived verdict.
+    capability_ok, _capability_reason = _verify_coordinator_capability(CODEX_RUNNER)
+    if not capability_ok:
+        return _ZERO_DIFF_CAPABILITY_DENIED
+
+    # Identity binding before any hashing: the retained path must be the exact
+    # repository-scoped runtime worktree this request/task/claim episode owns.
+    if (
+        type(card_claim_epoch) is not int
+        or type(claim_epoch) is not int
+        or claim_epoch < 1
+        or claim_epoch != card_claim_epoch
+    ):
+        return _ZERO_DIFF_IDENTITY_MISMATCH
+    if str(workspace.get("request_id") or "").strip() != request_id:
+        return _ZERO_DIFF_IDENTITY_MISMATCH
+    bound_task = workspace.get("task_id")
+    if bound_task is not None and str(bound_task).strip() != task_id:
+        return _ZERO_DIFF_IDENTITY_MISMATCH
+    try:
+        worktrees_root = (
+            worker_workspace.configured_runtime_root(authority_repo) / "worktrees"
+        ).resolve(strict=False)
+        root = retained.resolve(strict=False)
+        within_root = root.relative_to(worktrees_root)
+    except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError):
+        return _ZERO_DIFF_OUT_OF_ROOT
+    # Provisioning lays every isolated worktree out as
+    # ``<runtime>/worktrees/<request_id>/worktree``, so the owning request id is
+    # a path component, not a claim in the payload beside it.
+    if not within_root.parts or within_root.parts[0] != request_id:
+        return _ZERO_DIFF_IDENTITY_MISMATCH
+
+    baseline = workspace.get("workspace_baseline")
+    allowed = workspace.get("allowed_writes")
+    tree_baseline = workspace.get("tree_baseline")
+    if type(baseline) is not dict or type(allowed) is not list:
+        return _ZERO_DIFF_UNSEALED_BASELINE
+    if len(baseline) > _MAX_ZERO_DIFF_BASELINE_ENTRIES:
+        return _ZERO_DIFF_BUDGET_EXCEEDED
+    if type(tree_baseline) is not dict:
+        return _ZERO_DIFF_UNSEALED_TREE
+
+    # (1) Per-path authority: ``workspace_baseline`` is the digest map sealed at
+    # provisioning for exactly the paths this worker was allowed to write.
+    # Recomputing it with the same hasher keeps a declared exact write the
+    # baseline never sealed unbindable, and a declared output is never excused
+    # by an ignore rule.
+    sealed: set[str] = set()
+    for relative, expected in baseline.items():
+        if type(relative) is not str or (
+            expected is not None and type(expected) is not str
+        ):
+            return _ZERO_DIFF_UNSEALED_BASELINE
+        try:
+            normalized = _zero_diff_relative_path(relative)
+            candidate = root / normalized
+            candidate.resolve(strict=False).relative_to(root)
+        except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError):
+            return _ZERO_DIFF_OUT_OF_ROOT
+        try:
+            observed = worker_workspace._hash_path(candidate)
+        except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError):
+            return _ZERO_DIFF_SCAN_FAILED
+        if observed != expected:
+            return _ZERO_DIFF_BASELINE_DRIFT
+        sealed.add(normalized)
+    for declared in allowed:
+        if type(declared) is not str or not declared.strip():
+            return _ZERO_DIFF_UNSEALED_BASELINE
+        if any(char in declared for char in "*?["):
+            # A glob is expanded against the worktree at provisioning time, so
+            # the per-path baseline cannot enumerate what it matched.  The tree
+            # comparison below -- not this pattern -- is the authority that
+            # nothing appeared under it.
+            continue
+        try:
+            normalized = _zero_diff_relative_path(declared)
+        except (ValueError, worker_workspace.WorkspaceError):
+            return _ZERO_DIFF_UNSEALED_BASELINE
+        if normalized not in sealed:
+            return _ZERO_DIFF_UNSEALED_BASELINE
+
+    # (2) Whole-tree authority: ``tree_baseline`` covers every file, so a path
+    # no per-path entry could enumerate -- notably one created after
+    # provisioning under a glob ``allowed_writes`` scope -- is still comparable.
+    normalized_tree: dict[str, str | None] = {}
+    for relative, expected in tree_baseline.items():
+        if type(relative) is not str or (
+            expected is not None and type(expected) is not str
+        ):
+            return _ZERO_DIFF_UNSEALED_TREE
+        try:
+            normalized_tree[_zero_diff_relative_path(relative)] = expected
+        except (ValueError, worker_workspace.WorkspaceError):
+            return _ZERO_DIFF_UNSEALED_TREE
+    if len(normalized_tree) > _MAX_ZERO_DIFF_TREE_ENTRIES:
+        return _ZERO_DIFF_BUDGET_EXCEEDED
+    try:
+        current = _bounded_worktree_manifest(root)
+    except _ZeroDiffBudgetExceeded:
+        return _ZERO_DIFF_BUDGET_EXCEEDED
+    except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError):
+        return _ZERO_DIFF_SCAN_FAILED
+    # This is tree-baseline drift and nothing else: the sealed provisioning
+    # manifest against what is on disk now.  It deliberately does not fold in
+    # the inherited-parent delta ``worker_workspace._manifest_changed_paths``
+    # adds for finalization.  Inherited rework bytes are already present when
+    # the tree manifest is sealed, so counting them again here would report an
+    # untouched rework worktree as drifted.
+    drifted = sorted(
+        relative
+        for relative in set(normalized_tree) | set(current)
+        if normalized_tree.get(relative) != current.get(relative)
+    )
+    if not drifted:
+        return _ZERO_DIFF_PROVEN
+    try:
+        ignored = _git_ignored_subset(root, drifted)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return _ZERO_DIFF_IGNORE_CHECK_FAILED
+    if any(relative not in ignored for relative in drifted):
+        return _ZERO_DIFF_TREE_DRIFT
+    return _ZERO_DIFF_PROVEN
+
+
 def _predecessor_request_id_from_evidence(evidence: Any) -> str:
     if not isinstance(evidence, dict):
         return ""
@@ -3843,6 +4113,10 @@ def _bind_explicit_reject_review_predecessor(
     workspace: Any,
     hashes: Any,
     changed_paths: Any,
+    # Only a terminal review states its own diff.  A pinned rework_predecessor
+    # derives changed_paths from its hash map, so an absent map there is still
+    # missing evidence, never a verifiable empty diff.
+    allow_verified_zero_diff: bool = False,
     identity: Any,
     claim_epoch: Any,
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -3912,6 +4186,33 @@ def _bind_explicit_reject_review_predecessor(
         return None, "predecessor_request_id_workspace_unretained"
     if retained.is_symlink() or not retained.is_dir():
         return None, "predecessor_request_id_workspace_unretained"
+
+    if (
+        allow_verified_zero_diff
+        and hashes is None
+        and type(changed_paths) is list
+        and not changed_paths
+    ):
+        # A validation_failed terminal review is sealed by
+        # ProcessManager._terminal_failure_exact, whose evidence carries
+        # changed_paths/promoted_paths but never a changed_path_hashes map, so
+        # an attempt that changed nothing arrives here with an absent map and
+        # an empty declared diff.  That declaration only selects this path; the
+        # empty map below is adopted solely because the verifier re-derived it
+        # from the retained worktree on disk, and every way that can fail keeps
+        # its own reason instead of collapsing into "missing hashes".
+        zero_diff_error = _verify_retained_zero_diff(
+            request_id=request_id,
+            task_id=task_id,
+            authority_repo=authority_repo,
+            retained=retained,
+            workspace=workspace,
+            card_claim_epoch=card_claim_epoch,
+            claim_epoch=claim_epoch,
+        )
+        if zero_diff_error:
+            return None, zero_diff_error
+        hashes = {}
 
     if type(hashes) is not dict:
         return None, "predecessor_request_id_missing_hashes"
@@ -4040,6 +4341,7 @@ def _resolve_reject_review_predecessor(
             changed_paths=(
                 evidence.get("changed_paths") if isinstance(evidence, dict) else None
             ),
+            allow_verified_zero_diff=True,
             identity=identity if isinstance(identity, dict) else None,
             claim_epoch=terminal_epoch,
         )

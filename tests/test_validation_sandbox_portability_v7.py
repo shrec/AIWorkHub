@@ -13,11 +13,13 @@ Landlock backend, or git.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import shlex
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path, PurePosixPath
@@ -994,3 +996,107 @@ class TestReviewOverlayContentOnlyCopy:
         (source / "subdir").mkdir()
         with pytest.raises(WorkspaceError, match="combined_tree_source_not_file"):
             worker_workspace._overlay_regular_path(source, target, "subdir")
+
+
+class TestCoherentDependencyGenerationPortability:
+    """NF-2026-00423: dependency closure is one coherent current-canonical
+    generation, seeded with a Landlock-boundary-safe content-only copy.
+
+    The seed path must not fall back to ``shutil.copy2`` / ``os.utime`` (both
+    denied inside the Landlock validation boundary), must materialize the exact
+    current-canonical bytes byte-for-byte (no newline/metadata drift), and must
+    keep the imported dependency read-only -- outside ``allowed_writes`` and
+    absent from the candidate delta -- so it can never be promoted. Requires
+    only ``git``; the Linux-only guard is the module-level ``pytestmark``.
+    """
+
+    @staticmethod
+    def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def _seed_repo(self, root: Path) -> None:
+        assert self._git(root, "init", "-q").returncode == 0
+        assert self._git(
+            root, "config", "user.email", "tests@example.invalid"
+        ).returncode == 0
+        assert self._git(root, "config", "user.name", "NF423 Tests").returncode == 0
+        package = root / "src/prodpkg"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_bytes(b"")
+        # HEAD generation: dependency lacks the symbol; launcher does not import
+        # it, so HEAD alone is internally consistent.
+        (package / "task_store.py").write_bytes(b"STORE = 'v1'\n")
+        (package / "process_launcher.py").write_bytes(b"LAUNCH_OK = False\n")
+        (root / "probe_launcher.py").write_bytes(
+            b"from prodpkg.process_launcher import LAUNCH_OK\n"
+            b"print('LAUNCH_OK', LAUNCH_OK)\n"
+        )
+        (root / "pyproject.toml").write_bytes(
+            b"[tool.pytest.ini_options]\npythonpath = ['src']\n"
+        )
+        assert self._git(
+            root, "add", "src/prodpkg", "probe_launcher.py", "pyproject.toml"
+        ).returncode == 0
+        assert self._git(root, "commit", "-qm", "head").returncode == 0
+        # Current canonical generation, uncommitted: detached HEAD differs.
+        (package / "task_store.py").write_bytes(
+            b"def is_bool_safe_int(value):\n"
+            b"    return isinstance(value, int) and not isinstance(value, bool)\n"
+        )
+        (package / "process_launcher.py").write_bytes(
+            b"from prodpkg.task_store import is_bool_safe_int\n"
+            b"LAUNCH_OK = is_bool_safe_int(5)\n"
+        )
+
+    def test_dependency_overlay_is_content_only_and_read_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if shutil.which("git") is None:
+            pytest.skip("git is not available on this host")
+        repo = tmp_path / "parent"
+        repo.mkdir()
+        self._seed_repo(repo)
+
+        def _reject_copy2(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("dependency seed must not use copy2")
+
+        monkeypatch.setattr(worker_workspace.shutil, "copy2", _reject_copy2)
+        monkeypatch.setenv(
+            worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+        )
+        workspace = worker_workspace.create_workspace(
+            repo,
+            "nf423-portability-dependency",
+            {
+                "allowed_writes": ["src/prodpkg/process_launcher.py"],
+                "read_first": [
+                    "src/prodpkg/process_launcher.py",
+                    "probe_launcher.py",
+                ],
+                "validation": ["PYTHONPATH=src python3 probe_launcher.py"],
+            },
+            "validation",
+        )
+        try:
+            dependency = workspace.path / "src/prodpkg/task_store.py"
+            current_bytes = (repo / "src/prodpkg/task_store.py").read_bytes()
+            # Byte-for-byte identical to the current canonical tree: coherent
+            # generation, no metadata/newline drift, content-only copy.
+            assert dependency.read_bytes() == current_bytes
+            assert hashlib.sha256(dependency.read_bytes()).digest() == hashlib.sha256(
+                current_bytes
+            ).digest()
+            assert b"is_bool_safe_int" in dependency.read_bytes()
+            # Read-only dependency: not writable, not a candidate change.
+            assert "src/prodpkg/task_store.py" not in workspace.allowed_writes
+            assert worker_workspace.changed_paths(workspace) == []
+        finally:
+            worker_workspace.cleanup_workspace(
+                repo, workspace.path, workspace.home
+            )

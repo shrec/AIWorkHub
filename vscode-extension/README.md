@@ -12,11 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.53
+## What's new in 0.10.54
 
-- Source Graph body search avoids persistent scan-sized heap growth, query
-  caches evict old index generations and daemon shutdown reaps its process
-  tree. The dashboard also exposes repository coding-foundation evidence.
+- Model workers are uncapped by default end to end. Reviewer terminal intent
+  settlement survives stale reservations and callback recovery, while
+  zero-diff rework and sparse validation use mechanically verified current
+  canonical evidence instead of entering stale-workspace retry loops.
 
 ## Architecture at a glance
 

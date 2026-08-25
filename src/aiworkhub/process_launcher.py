@@ -3130,10 +3130,34 @@ REVIEW_WORKSPACE_RETENTION_AUDIT_SCHEMA_ID = (
     "aiworkhub.review_workspace_retention_audit.v1"
 )
 
+# Durable declaration that one exact reviewer claim must be terminalized.  It
+# is written before the ledger event that terminalizes the reservation, so a
+# crash between the two durable stores stays recoverable instead of stranding
+# the reviewer card in ``processing``.
+REVIEWER_TERMINAL_INTENT_SCHEMA_ID = (
+    "aiworkhub.task_mcp.reviewer_terminal_intent.v1"
+)
+
+# One bounded operator-visible record per terminal intent that can never be
+# settled -- unreadable bytes, a foreign schema, or an identity that cannot be
+# bound to an exact task/request/claim epoch.  Such an intent is deliberately
+# never deleted and never acted on, so without this record it is silent: the
+# reviewer card stays in ``processing`` with nothing in any ledger saying why.
+REVIEWER_TERMINAL_INTENT_DIAGNOSTIC_SCHEMA_ID = (
+    "aiworkhub.task_mcp.reviewer_terminal_intent_diagnostic.v1"
+)
+
 
 def review_workspace_retention_audit_path(process_log_path: Path) -> Path:
     """Sibling append-only ledger recording every review-workspace removal."""
     return Path(process_log_path).with_name("review_workspace_retention_audit.jsonl")
+
+
+def reviewer_terminal_intent_diagnostic_path(process_log_path: Path) -> Path:
+    """Sibling append-only ledger of terminal intents that can never settle."""
+    return Path(process_log_path).with_name(
+        "reviewer_terminal_intent_diagnostics.jsonl"
+    )
 
 
 def record_review_workspace_retention_audit(
@@ -4002,9 +4026,11 @@ _QUALITY_REVIEW_AUTHORITY_KEYS = frozenset(
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 
-def _is_bool_safe_int(value: object) -> bool:
-    """True only for a plain ``int`` -- ``bool`` is explicitly rejected."""
-    return isinstance(value, int) and not isinstance(value, bool)
+# One authority for the bool-safe integer rule, owned by the store that binds
+# the claim epochs it guards.  A private copy here would silently stop matching
+# the store's rule and admit an epoch the store would reject -- visible only as
+# a terminal transition bound to the wrong episode.
+_is_bool_safe_int = task_store.is_bool_safe_int
 
 
 def _is_sha256_hex(value: object) -> bool:
@@ -4532,6 +4558,48 @@ class _QualityReviewPrepFlight:
 class ProcessManager:
     """Thread-safe local process registry with append-only lifecycle events."""
 
+    # Bounded replays allowed while proving a ledger snapshot was read under a
+    # single unchanged generation (see ``_latest_by_request_stable``).
+    _LEDGER_SNAPSHOT_MAX_ATTEMPTS = 8
+    _REVIEWER_TERMINAL_INTENT_SUFFIX = ".reviewer-terminal-intent.json"
+    # A committed reviewer whose owner/provider process is proven dead lost its
+    # liveness, which is exactly what this terminal substatus states.
+    _REVIEWER_TERMINAL_INTENT_SUBSTATUS = "liveness_lost"
+    # Dispositions proving the intent is on disk and settlement is guaranteed
+    # to be attempted; only these authorize the terminalizing ledger event.
+    _DURABLE_TERMINAL_INTENT_DISPOSITIONS = frozenset({"recorded", "already_recorded"})
+    # Sibling marker proving one unsettleable intent was already reported, so
+    # the diagnostic ledger records it once instead of growing without bound
+    # on every reconciliation pass for as long as the operator leaves it there.
+    _TERMINAL_INTENT_DIAGNOSED_SUFFIX = ".diagnosed"
+    # Sibling marker proving one retired-without-effect intent was already
+    # reported.  Distinct from the diagnosed marker so a repaired intent that
+    # later meets a final refusal still earns a line under its own reason.
+    _TERMINAL_INTENT_RETIRED_SUFFIX = ".retired"
+    # Ceiling on diagnostics emitted per settlement pass.  Undiagnosed intents
+    # keep their marker unwritten and are reported by a later pass, so the cap
+    # bounds one pass rather than silently dropping evidence.
+    _TERMINAL_INTENT_DIAGNOSTICS_PER_PASS = 8
+    # Store refusal strings carry the observed value after a colon, so the
+    # recorded reason is bounded rather than trusting the store's length.
+    _TERMINAL_INTENT_DIAGNOSTIC_REASON_MAX = 200
+    # Marker proving one proven-dead reservation whose identity could not be
+    # bound was already reported.  It sits beside the intent files rather than
+    # next to an intent, because the whole point is that no intent exists.
+    _IDENTITY_INCOMPLETE_DIAGNOSED_SUFFIX = ".identity-incomplete.diagnosed"
+    # Enough digest to separate distinct identity episodes for one request
+    # without letting an attacker-chosen field grow the filename without bound.
+    _IDENTITY_EPISODE_DIGEST_CHARS = 16
+    # Sibling marker naming one settlement pass that failed outright.  Keyed by
+    # exception type so a fault repeating on every pass is reported once, while
+    # a genuinely different fault is still worth a line of its own.
+    _SETTLEMENT_FAILURE_DIAGNOSED_SUFFIX = ".settlement-failed"
+    _SETTLEMENT_FAILURE_KIND_MAX = 64
+    # Marker naming one ledger segment whose generation can never be described.
+    # Keyed by a digest of the segment so the line is emitted once however many
+    # launches run against it, while a different bad segment still earns one.
+    _UNPROVABLE_LEDGER_DIAGNOSED_SUFFIX = ".unprovable-ledger.diagnosed"
+
     def __init__(
         self,
         *,
@@ -4692,12 +4760,47 @@ class ProcessManager:
             "state": "starting",
             "reservation_expires_at_epoch": time.time() + 120.0,
         }
-        with self._lock, self._registry_lock():
-            self._reconcile_expired_starting_reservations()
-            if self._active_count() >= _configured_limit():
-                raise LaunchRejected("concurrency_limit_reached")
-            self._assert_no_duplicate_task(str(event.get("task_id") or ""))
-            self._append_event(reservation)
+        # The stable snapshot may replay the whole ledger up to
+        # ``_LEDGER_SNAPSHOT_MAX_ATTEMPTS`` times.  Taking it here, before the
+        # cross-process registry lock, keeps that amplified work off every
+        # unrelated launch acknowledgement waiting on the same lock.
+        snapshot = self._latest_by_request_stable()
+        try:
+            with self._lock, self._registry_lock():
+                # ONE sweep re-proves the handed-in snapshot for this whole
+                # critical section.  Everything below decides admission from
+                # it and never re-parses: ``_append_event`` does not take this
+                # lock, so a plain parse here could be interleaved by another
+                # ProcessManager -- or by a supervisor publishing its
+                # ``running`` row -- and would simply not see the reservation
+                # or duplicate it is about to contradict.  Reconciliation
+                # mirrors the rows it retires back into the snapshot, so it
+                # keeps describing the ledger exactly across both halves.
+                latest, generation = self._resolved_reservation_snapshot(snapshot)
+                if generation is None:
+                    # No stable generation could be shown, so any row read
+                    # here may be one append behind.  Admitting on that could
+                    # duplicate a live task or overrun the limit, so the
+                    # launch defers instead of guessing.
+                    raise LaunchRejected("ledger_snapshot_unproven")
+                self._reconcile_expired_starting_reservations(
+                    (latest, generation), resolved=True
+                )
+                if self._active_count(latest) >= _configured_limit():
+                    raise LaunchRejected("concurrency_limit_reached")
+                self._assert_no_duplicate_task(
+                    str(event.get("task_id") or ""), latest
+                )
+                self._append_event(reservation)
+        finally:
+            # Reconciliation records terminal *intent* under the lock and
+            # settles it here, with the lock released.  A task-store read
+            # behind the outer registry lock would make an unrelated
+            # reservation acknowledgement wait on SQLite, which is exactly the
+            # queueing this reservation boundary exists to prevent.  Contained,
+            # because a settlement failure must never displace the
+            # ``LaunchRejected`` this block may be unwinding.
+            self._settle_reviewer_terminal_intents_contained()
         yield
 
     @contextmanager
@@ -4764,7 +4867,74 @@ class ProcessManager:
     def _events(self) -> list[dict[str, Any]]:
         return list(process_event_ledger.iter_events(self.process_log_path))
 
+    def _ledger_generation(self) -> tuple[tuple[str, int, int, int, int], ...] | None:
+        """Return the exact per-segment generation of the process ledger.
+
+        ``None`` means the ledger could not be described exactly (a segment
+        vanished or is not a regular file mid-read), which is never treated as
+        "unchanged".
+        """
+
+        signatures: list[tuple[str, int, int, int, int]] = []
+        for ledger in process_event_ledger.ledger_paths(self.process_log_path):
+            try:
+                info = ledger.lstat()
+            except OSError:
+                return None
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                return None
+            signatures.append((
+                str(ledger),
+                int(info.st_dev),
+                int(info.st_ino),
+                int(info.st_size),
+                int(info.st_mtime_ns),
+            ))
+        return tuple(signatures)
+
+    def _unprovable_ledger_segment_name(self) -> str:
+        """Name the segment behind an undescribable generation, if one shows.
+
+        ``_ledger_generation`` refuses a segment that is a symlink or not a
+        regular file, and refuses one whose ``lstat`` fails under it.  This
+        says WHICH, so the diagnostic sends an operator to a file instead of
+        to a directory.  It is naming only -- never the proof of anything --
+        so when the cause will not hold still long enough to be named it falls
+        back to the active ledger rather than inventing a verdict.
+        """
+
+        try:
+            segments = process_event_ledger.ledger_paths(self.process_log_path)
+        except OSError:
+            segments = []
+        for ledger in segments:
+            try:
+                info = ledger.lstat()
+            except OSError:
+                return ledger.name
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                return ledger.name
+        return self.process_log_path.name
+
     def _latest_by_request(self) -> dict[str, dict[str, Any]]:
+        """Latest event per request from a single UNPROVEN ledger pass.
+
+        This is a plain read and it carries no anti-hidden-append authority.
+        The registry lock does not supply one either: ``_append_event`` never
+        takes that lock, so a supervisor publishing its ``running`` row -- or
+        any other ProcessManager -- can land a write in the middle of this
+        parse, and the row that would contradict the reader is simply not
+        seen.  Holding the lock excludes other *lock takers*, not appenders.
+
+        So every caller whose decision a hidden append could falsify -- the
+        spawn/attach CAS and anything about to terminalize -- reads through
+        the bracketed generation proof (``_latest_by_request_stable``, or the
+        one-sweep re-proof in ``_resolved_reservation_snapshot``) and fails
+        closed when no stable generation can be shown.  What remains here is
+        the reporting path, where a snapshot one append behind is a stale
+        number rather than a false verdict.
+        """
+
         latest: dict[str, dict[str, Any]] = {}
         for event in self._events():
             request_id = str(event.get("request_id") or "")
@@ -4772,7 +4942,818 @@ class ProcessManager:
                 latest[request_id] = event
         return latest
 
-    def _reconcile_expired_starting_reservations(self) -> int:
+    def _latest_by_request_stable(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], tuple[Any, ...] | None]:
+        """Return the latest event per request plus the generation proving it.
+
+        A snapshot taken while another ProcessManager appends can observe the
+        ledger mid-write and silently hide the newer row -- and a hidden append
+        is precisely what turns a terminal verdict into a false one.  Bracket
+        the read with the exact per-segment generation and replay until the
+        pre- and post-read generations are identical.  The second element is
+        ``None`` when no stable read was obtained within the bounded attempts;
+        callers that terminalize must fail closed on it instead of treating an
+        unproven snapshot as evidence.
+        """
+
+        latest: dict[str, dict[str, Any]] = {}
+        for _attempt in range(self._LEDGER_SNAPSHOT_MAX_ATTEMPTS):
+            before = self._ledger_generation()
+            if before is None and self._ledger_generation() is None:
+                # Two undescribable reads back to back with NO parse between
+                # them.  A rotation landing mid-bracket cannot look like that;
+                # a segment that is a symlink or not a regular file looks like
+                # exactly that, forever.  Replaying the whole attempt budget
+                # against a standing condition costs a full parse and two
+                # sweeps of the entire ledger per attempt, on every launch,
+                # and can never end differently -- so stop at the proof it is
+                # standing and name it once.  The unproven ``None`` generation
+                # still goes back, so reconciliation stays exactly as
+                # fail-closed as it was.
+                self._diagnose_unprovable_ledger()
+                return latest, None
+            latest = self._latest_by_request()
+            after = self._ledger_generation()
+            if before is not None and before == after:
+                return latest, after
+        return latest, None
+
+    def _reviewer_terminal_intent_path(self, request_id: str) -> Path:
+        identity = hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()
+        return self.process_dir / f"{identity}{self._REVIEWER_TERMINAL_INTENT_SUFFIX}"
+
+    def _record_reviewer_terminal_intent(
+        self,
+        request_id: str,
+        event: Mapping[str, Any],
+        blocked_reason: str,
+    ) -> str:
+        """Durably declare a terminal transition before performing it.
+
+        The process ledger and the task store are two independent durable
+        stores and the registry lock deliberately does not span the second one.
+        Without a recorded intent, a crash between them strands the reviewer
+        card in ``processing`` with no evidence of what was meant to happen.
+        The intent names the exact task, request and claim epoch, so a later
+        pass finishes *that* transition instead of inventing a new one.
+
+        An intent is only recorded when the reservation carries the complete
+        identity: an incomplete identity fails closed and is never settled.
+        """
+
+        task_id = str(event.get("task_id") or "").strip()
+        runner = str(event.get("runner") or "").strip()
+        claim_epoch = event.get("reviewer_claim_epoch")
+        if not _is_bool_safe_int(claim_epoch):
+            return "identity_incomplete"
+        if not task_id or not runner or claim_epoch < 1:
+            return "identity_incomplete"
+        path = self._reviewer_terminal_intent_path(request_id)
+        if path.is_file():
+            return "already_recorded"
+        try:
+            write_json_0600(path, {
+                "schema_id": REVIEWER_TERMINAL_INTENT_SCHEMA_ID,
+                "request_id": str(request_id),
+                "task_id": task_id,
+                "runner": runner,
+                "reviewer_claim_epoch": claim_epoch,
+                "substatus": self._REVIEWER_TERMINAL_INTENT_SUBSTATUS,
+                "blocked_reason": blocked_reason,
+                "recorded_at": _utcnow(),
+            })
+        except OSError:
+            return "record_failed"
+        return "recorded"
+
+    def _resolved_reservation_snapshot(
+        self,
+        snapshot: tuple[
+            dict[str, dict[str, Any]], tuple[Any, ...] | None
+        ] | None,
+    ) -> tuple[dict[str, dict[str, Any]], tuple[Any, ...] | None]:
+        """Resolve the stable snapshot one reconciliation pass may act on.
+
+        ``_latest_by_request_stable`` replays until the bracketing generations
+        agree, so a busy ledger costs up to ``_LEDGER_SNAPSHOT_MAX_ATTEMPTS``
+        full parses and twice as many per-segment sweeps.  Paying that under
+        the cross-process registry lock made every unrelated reservation
+        acknowledgement queue behind an unbounded-looking read, which is the
+        exact serialization the reservation boundary exists to prevent.
+
+        So reservation callers take the snapshot with the lock RELEASED and
+        hand it in.  A single ``_ledger_generation`` sweep re-proves it here:
+        the snapshot is authority only while it still describes the exact
+        ledger this pass is about to append to.  That keeps the authority
+        identical to reading it inline -- a concurrent append between the
+        snapshot and the lock is seen and defers the pass, exactly as an
+        unstable bracketed read does -- while the work done under the lock is
+        one sweep and no parse at all.
+        """
+
+        if snapshot is None:
+            return self._latest_by_request_stable()
+        latest, generation = snapshot
+        if generation is None or self._ledger_generation() != generation:
+            # Either the caller never proved its snapshot, or the ledger moved
+            # while it waited for the lock.  Both may hide a row this pass
+            # would contradict, so it terminalizes nothing and retries later.
+            return latest, None
+        return latest, generation
+
+    def _proven_reservation_snapshot(
+        self,
+        snapshot: tuple[
+            dict[str, dict[str, Any]], tuple[Any, ...] | None
+        ] | None,
+    ) -> tuple[dict[str, dict[str, Any]], tuple[Any, ...]] | None:
+        """The one proven snapshot an in-lock decision may be taken from.
+
+        ``snapshot`` was taken with the registry lock RELEASED, so the cheap
+        path is the single sweep in ``_resolved_reservation_snapshot`` that
+        re-proves it.  That hand-off loses its race whenever a sibling attempt
+        appended while this one waited for the lock -- the ordinary case when
+        several reviewers commit or terminalize together -- and treating the
+        loss as "no authority" would make these one-shot decisions silently do
+        nothing at all.  So a lost hand-off falls back to a fresh bracketed
+        read, paid for only then, and the decision is still taken from a proven
+        generation rather than from a parse a hidden append could falsify.
+
+        ``None`` means no stable generation could be shown at all: an
+        undescribable segment, or a ledger churning faster than the bounded
+        attempts.  Every caller fails closed on it and decides nothing.
+        """
+
+        latest, generation = self._resolved_reservation_snapshot(snapshot)
+        if generation is None:
+            latest, generation = self._latest_by_request_stable()
+        if generation is None:
+            return None
+        return latest, generation
+
+    def _terminalize_committed_reservation(
+        self,
+        request_id: str,
+        event: Mapping[str, Any],
+        blocked_reason: str,
+        diagnostics_left: int,
+    ) -> tuple[bool, int]:
+        """Terminalize one proven-dead committed reservation, intent first.
+
+        The intent is written before the ledger event so that every point after
+        this line is recoverable: a crash leaves an exact, replayable record of
+        which claim still has to be released.  No task-store I/O happens here --
+        the caller may hold the outer registry lock, and SQLite must never be
+        reached from under it.
+
+        Returns ``(terminalized, diagnostics_left)``.  ``terminalized`` states
+        whether the reservation was terminalized in the ledger, which happens
+        only once the intent is durable.  The ``blocked`` event is what
+        releases the reservation: appending it with no intent on disk strands
+        the reviewer card in ``processing`` with nothing left to finish the
+        transition, and it erases the committed row a later pass would need in
+        order to try again.  Declining to append keeps the two durable stores
+        agreeing and makes a failed intent write retryable.
+
+        ``diagnostics_left`` is the caller's per-pass diagnostic budget,
+        threaded through so one pass over many unbindable rows emits a bounded
+        number of lines instead of one per row.
+        """
+
+        disposition = self._record_reviewer_terminal_intent(
+            request_id, event, blocked_reason
+        )
+        if disposition not in self._DURABLE_TERMINAL_INTENT_DISPOSITIONS:
+            if disposition == "identity_incomplete":
+                # No intent was written, and appending the terminalizing event
+                # without one is exactly what the docstring above forbids, so
+                # this reservation moves nowhere.  Every later pass re-derives
+                # the same refusal from the same unchanged row: a proven-dead
+                # reservation that is permanently unterminalizable, in total
+                # silence.  One bounded line keyed to this exact request and
+                # identity episode is the only evidence an operator gets that
+                # the card needs a hand repair.  ``record_failed`` is
+                # deliberately NOT reported here -- that write is transient and
+                # a later pass is expected to succeed, so naming it would turn
+                # a passing retry into permanent operator noise.
+                _recorded, diagnostics_left = (
+                    self._diagnose_identity_incomplete_reservation(
+                        request_id, event, blocked_reason, diagnostics_left
+                    )
+                )
+            return False, diagnostics_left
+        self._append_event({
+            "request_id": request_id,
+            "task_id": event.get("task_id"),
+            "runner": event.get("runner"),
+            "topic": event.get("topic"),
+            "adapter_id": event.get("adapter_id"),
+            "state": "blocked",
+            "blocked_reason": blocked_reason,
+            "reservation_expires_at_epoch": event.get(
+                "reservation_expires_at_epoch"
+            ),
+            "reviewer_claim_epoch": event.get("reviewer_claim_epoch"),
+            "terminal_intent": disposition,
+        })
+        return True, diagnostics_left
+
+    def _identity_incomplete_marker(
+        self, request_id: str, event: Mapping[str, Any], blocked_reason: str
+    ) -> Path:
+        """Marker naming one exact request AND the identity episode observed.
+
+        Keyed on the request the way the intent file is, plus a digest of the
+        identity fields that were actually present.  Keying on the request
+        alone would silence a genuinely different episode -- a re-claimed card
+        arriving with a new epoch, or a different blocked reason -- behind the
+        first line ever written for that request.  Keying on the epoch alone is
+        impossible here: a missing epoch is precisely the defect being named.
+        """
+
+        identity = hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()
+        episode = hashlib.sha256(
+            json.dumps(
+                [
+                    str(event.get("task_id") or ""),
+                    str(event.get("runner") or ""),
+                    repr(event.get("reviewer_claim_epoch")),
+                    str(blocked_reason),
+                ],
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[: self._IDENTITY_EPISODE_DIGEST_CHARS]
+        return self.process_dir / (
+            f"{identity}.{episode}{self._IDENTITY_INCOMPLETE_DIAGNOSED_SUFFIX}"
+        )
+
+    def _diagnose_identity_incomplete_reservation(
+        self,
+        request_id: str,
+        event: Mapping[str, Any],
+        blocked_reason: str,
+        remaining: int,
+    ) -> tuple[bool, int]:
+        """Name one proven-dead reservation whose identity cannot be bound.
+
+        The reservation is real and its owner is proven dead, but it carries no
+        task/runner/claim epoch to bind a terminal transition to, so it is
+        never terminalized and never released -- and, without this, never
+        mentioned either.  Claiming the marker with ``O_EXCL`` is what bounds
+        it: repeated passes and concurrent settlers in other processes find the
+        marker present and stay silent, so the ledger gets exactly one line per
+        request/episode however long the reservation sits there.  The marker is
+        released again if the line itself fails to land, so a transient
+        filesystem failure retries instead of suppressing the evidence forever.
+
+        ``remaining`` is the same per-pass ceiling settlement uses.  The marker
+        bounds one EPISODE for all time, but a reconciliation pass can meet
+        arbitrarily many distinct unbindable rows at once, and each first
+        sighting costs a marker plus a ledger line.  An episode left unreported
+        keeps its marker unclaimed, so a later pass names it rather than this
+        one emitting the whole pile.
+
+        This records evidence only.  It appends no process event and reaches no
+        task store, so the caller still fails closed and the reservation is
+        left exactly as it was found.
+
+        Returns ``(recorded, remaining)`` the way
+        ``_record_intent_diagnostic`` does: ``recorded`` states that
+        operator-visible evidence for this exact episode now exists, written
+        here or by an earlier pass.
+        """
+
+        if remaining <= 0:
+            return False, remaining
+        marker = self._identity_incomplete_marker(request_id, event, blocked_reason)
+        try:
+            self.process_dir.mkdir(parents=True, exist_ok=True)
+            os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except FileExistsError:
+            # Already reported for this exact episode, so the evidence exists
+            # and this pass spends none of its budget re-stating it.
+            return True, remaining
+        except OSError:
+            # Nothing here is writable, so nothing could be recorded.
+            return False, remaining
+        reason = f"identity_incomplete:{blocked_reason}"
+        if not self._append_intent_diagnostic({
+            "schema_id": REVIEWER_TERMINAL_INTENT_DIAGNOSTIC_SCHEMA_ID,
+            "recorded_at": _utcnow(),
+            # No intent file exists -- that is the defect -- so the line names
+            # the path one WOULD have occupied, which is derived from the exact
+            # request and ties the diagnostic back to it.
+            "intent_file": self._reviewer_terminal_intent_path(request_id).name,
+            "reason": reason[: self._TERMINAL_INTENT_DIAGNOSTIC_REASON_MAX],
+            "bytes": -1,
+            "sha256": "",
+        }):
+            unlink_if_regular(marker)
+            return False, remaining
+        return True, remaining - 1
+
+    @staticmethod
+    def _terminal_intent_is_resolved(state: str) -> bool:
+        """Return whether no future pass could still move this exact claim.
+
+        The vocabulary belongs to the store that produces these states, so it
+        is read from ``task_store`` rather than restated here: a copy would
+        silently stop matching the day a new fail-closed state is added, and
+        the intent would then be retried forever against a card it may never
+        legally move.
+        """
+
+        return task_store.terminal_failure_state_is_final(state)
+
+    def _terminal_intent_diagnosed_marker(self, path: Path) -> Path:
+        """Sibling marker proving one unusable intent was already reported."""
+        return path.with_name(path.name + self._TERMINAL_INTENT_DIAGNOSED_SUFFIX)
+
+    def _terminal_intent_retired_marker(self, path: Path) -> Path:
+        """Sibling marker proving one retired intent was already reported.
+
+        Kept distinct from the diagnosed marker so an intent that was once
+        unbindable, then repaired, still gets its own line when it later meets
+        a final refusal instead of being retired under the stale reason.
+        """
+        return path.with_name(path.name + self._TERMINAL_INTENT_RETIRED_SUFFIX)
+
+    def _append_intent_diagnostic(self, record: dict[str, Any]) -> bool:
+        """Append one line to the terminal-intent diagnostic ledger.
+
+        The single writer for every operator-visible line this settler emits,
+        so the ledger cannot grow a second shape.  The record deliberately
+        reaches neither the process event ledger nor the task store: it is
+        evidence about a claim, never an instruction to move one.  Returns
+        whether the line is durable, because callers use that to decide
+        whether they may retire the thing they were reporting.
+        """
+
+        audit_path = reviewer_terminal_intent_diagnostic_path(self.process_log_path)
+        try:
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError:
+            return False
+        return True
+
+    def _record_intent_diagnostic(
+        self, path: Path, reason: str, remaining: int, *, marker_suffix: str
+    ) -> tuple[bool, int]:
+        """Record one bounded operator-visible line about a single intent.
+
+        Creating the sibling marker with ``O_EXCL`` is what claims the right to
+        write the line, so a concurrent settler in another process cannot
+        double it, and the marker is released again if the write itself fails.
+        ``remaining`` caps how many lines one pass may emit; an intent left
+        unreported keeps no marker and is reported by a later pass instead of
+        being dropped.
+
+        Returns ``(recorded, remaining)``.  ``recorded`` states that
+        operator-visible evidence for this intent now exists -- written here or
+        by an earlier pass -- which is what lets a caller retire an intent only
+        once the reason it is going is on the record.
+        """
+
+        if remaining <= 0:
+            return False, remaining
+        marker = path.with_name(path.name + marker_suffix)
+        try:
+            os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except FileExistsError:
+            # An earlier pass, or a settler in another process, already put
+            # this intent on the record; the evidence exists either way.
+            return True, remaining
+        except OSError:
+            # The directory is unwritable, so nothing could be recorded and the
+            # caller must not treat this intent as reported.
+            return False, remaining
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            size = path.stat().st_size
+        except OSError:
+            digest = ""
+            size = -1
+        recorded = self._append_intent_diagnostic({
+            "schema_id": REVIEWER_TERMINAL_INTENT_DIAGNOSTIC_SCHEMA_ID,
+            "recorded_at": _utcnow(),
+            "intent_file": path.name,
+            "reason": str(reason)[: self._TERMINAL_INTENT_DIAGNOSTIC_REASON_MAX],
+            "bytes": size,
+            "sha256": digest,
+        })
+        if not recorded:
+            # The claim is worthless without the line it was claiming, so give
+            # it back rather than suppressing the diagnostic forever.
+            unlink_if_regular(marker)
+            return False, remaining
+        return True, remaining - 1
+
+    def _diagnose_unsettleable_intent(
+        self, path: Path, reason: str, remaining: int
+    ) -> tuple[bool, int]:
+        """Record one bounded line for an intent that can never be settled.
+
+        An intent whose bytes will not parse, whose schema is foreign, whose
+        declared substatus is not store vocabulary, or whose identity cannot be
+        bound to an exact task/request/claim epoch is deliberately never acted
+        on and never deleted -- which also makes it silent.  One line naming
+        the file, the reason and the bytes actually on disk is the only
+        evidence an operator gets that a reviewer card is waiting on a hand
+        repair.
+        """
+
+        return self._record_intent_diagnostic(
+            path,
+            reason,
+            remaining,
+            marker_suffix=self._TERMINAL_INTENT_DIAGNOSED_SUFFIX,
+        )
+
+    def _diagnose_retired_intent(
+        self, path: Path, state: str, remaining: int
+    ) -> tuple[bool, int]:
+        """Record one bounded line for an intent retired having moved no card.
+
+        A final refusal that is not this intent's own completed transition
+        proves no later pass could ever move the claim, so the ticket must go.
+        It moved nothing, though, so retiring it silently leaves an operator
+        unable to tell that outcome from a settlement that worked -- and the
+        reviewer card it names keeps whatever state some other authority left
+        it in with nothing saying why this intent gave up.
+        """
+
+        return self._record_intent_diagnostic(
+            path,
+            f"final_refusal:{state}",
+            remaining,
+            marker_suffix=self._TERMINAL_INTENT_RETIRED_SUFFIX,
+        )
+
+    def _diagnose_unroutable_callback(
+        self, path: Path, reason: str, remaining: int
+    ) -> tuple[bool, int]:
+        """Record one bounded line for a callback that can never be routed.
+
+        The transition this intent owns really did land, and the callback it
+        owes names an identity the store will never enqueue -- an unbound
+        origin thread or a provider outside its routing vocabulary.  Retrying
+        that forever strands the intent and the claim behind it, so the ticket
+        is retired; retiring it in silence would hide a manager wake that is
+        genuinely lost, so the truthful reason goes on the record first.
+
+        It shares the retired marker with ``_diagnose_retired_intent`` because
+        both describe the same event for one ticket -- this pass is retiring
+        it -- and a ticket may only ever be retired once.  ``reason`` comes
+        from the store's own fixed vocabulary, never from card content, so the
+        line stays bounded.
+        """
+
+        return self._record_intent_diagnostic(
+            path,
+            f"callback_unroutable:{reason}",
+            remaining,
+            marker_suffix=self._TERMINAL_INTENT_RETIRED_SUFFIX,
+        )
+
+    def _diagnose_settlement_pass_failure(self, error: BaseException) -> None:
+        """Name a settlement pass that failed outright, once per exception type.
+
+        Every store, filesystem and lock failure is already contained per
+        intent, so reaching here means a programming fault, or an
+        unavailability no per-intent guard covers.  The caller must still
+        return 0 -- its launch outcome may not be replaced by an unrelated
+        reservation error -- and 0 is exactly what "no intents were pending"
+        returns, so without this line a settler that can never run looks idle
+        forever.  One line per exception type keeps a fault that repeats on
+        every pass from growing the ledger without bound.
+        """
+
+        kind = "".join(
+            ch for ch in type(error).__name__ if ch.isalnum() or ch == "_"
+        )[: self._SETTLEMENT_FAILURE_KIND_MAX] or "unknown"
+        marker = self.process_dir / (
+            kind + self._SETTLEMENT_FAILURE_DIAGNOSED_SUFFIX
+        )
+        try:
+            self.process_dir.mkdir(parents=True, exist_ok=True)
+            os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except OSError:
+            # Already named once, or nothing here is writable.
+            return
+        if not self._append_intent_diagnostic({
+            "schema_id": REVIEWER_TERMINAL_INTENT_DIAGNOSTIC_SCHEMA_ID,
+            "recorded_at": _utcnow(),
+            "intent_file": "",
+            "reason": f"settlement_pass_failed:{kind}",
+            "bytes": -1,
+            "sha256": "",
+        }):
+            unlink_if_regular(marker)
+
+    def _diagnose_unprovable_ledger(self) -> None:
+        """Name a standing undescribable ledger segment exactly once.
+
+        ``_latest_by_request_stable`` stops replaying the moment the failure
+        is proved standing, so without this line every launch would fail
+        closed for good against a ledger nobody can repair because nobody is
+        told it is broken.  The marker is keyed by a bounded digest of the
+        segment, so the single line survives repeated launches while a
+        genuinely different unusable segment still earns one of its own.
+        """
+
+        segment = self._unprovable_ledger_segment_name()
+        digest = hashlib.sha256(segment.encode("utf-8", "surrogatepass")).hexdigest()
+        marker = self.process_dir / (
+            digest[: self._IDENTITY_EPISODE_DIGEST_CHARS]
+            + self._UNPROVABLE_LEDGER_DIAGNOSED_SUFFIX
+        )
+        try:
+            self.process_dir.mkdir(parents=True, exist_ok=True)
+            os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except OSError:
+            # Already named once, or nothing here is writable.
+            return
+        if not self._append_intent_diagnostic({
+            "schema_id": REVIEWER_TERMINAL_INTENT_DIAGNOSTIC_SCHEMA_ID,
+            "recorded_at": _utcnow(),
+            "intent_file": segment[: self._TERMINAL_INTENT_DIAGNOSTIC_REASON_MAX],
+            "reason": "ledger_generation_unprovable",
+            "bytes": -1,
+            "sha256": "",
+        }):
+            unlink_if_regular(marker)
+
+    def _settle_reviewer_terminal_intents(self) -> int:
+        """Complete every durable reviewer terminal intent exactly once.
+
+        This is the half of reconciliation that touches SQLite, so it runs with
+        no registry lock held.  Each intent is settled under its own request
+        lock and bound to the exact task/request/claim epoch it recorded: a
+        card that was released and re-claimed since fails closed and is never
+        terminalized.  The intent is removed only once the transition AND the
+        one callback it owes are both settled, so a transient store failure --
+        a locked store above all -- retries instead of stranding a processing
+        card or silently swallowing the callback.
+
+        Every store failure is contained per intent.  One contended card must
+        not abort settlement of the unrelated intents sitting beside it on
+        disk, which is the only reason they are all reached from one pass.
+
+        An intent that can never be bound at all is neither acted on nor
+        deleted; it is reported once to the diagnostic ledger so the stranded
+        card is visible to an operator rather than silent.  An intent that is
+        bindable but meets a final refusal really is retired -- no pass could
+        move it -- but never before that refusal is on the same record.
+        """
+
+        settled = 0
+        diagnostics_left = self._TERMINAL_INTENT_DIAGNOSTICS_PER_PASS
+        try:
+            intents = sorted(
+                self.process_dir.glob("*" + self._REVIEWER_TERMINAL_INTENT_SUFFIX)
+            )
+        except OSError:
+            return 0
+        for path in intents:
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                # The settler that won this intent retired it between the glob
+                # and this read.  That is the benign race the whole design
+                # expects, and it is not evidence that anything is unusable.
+                continue
+            except OSError:
+                # The intent is still THERE and its bytes cannot be read, so
+                # no pass will ever settle it while that lasts.  It is kept --
+                # never acted on, never deleted -- and named once, because
+                # treating it as the retired-by-the-winner case above would
+                # strand the card in silence for as long as the condition
+                # holds.
+                _recorded, diagnostics_left = self._diagnose_unsettleable_intent(
+                    path, "unreadable_bytes", diagnostics_left
+                )
+                continue
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                _recorded, diagnostics_left = self._diagnose_unsettleable_intent(
+                    path, "unparseable_json", diagnostics_left
+                )
+                continue
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema_id") != REVIEWER_TERMINAL_INTENT_SCHEMA_ID
+            ):
+                _recorded, diagnostics_left = self._diagnose_unsettleable_intent(
+                    path, "foreign_schema", diagnostics_left
+                )
+                continue
+            request_id = str(payload.get("request_id") or "")
+            task_id = str(payload.get("task_id") or "")
+            runner = str(payload.get("runner") or "")
+            claim_epoch = payload.get("reviewer_claim_epoch")
+            if (
+                not request_id
+                or not task_id
+                or not runner
+                or not _is_bool_safe_int(claim_epoch)
+                or claim_epoch < 1
+            ):
+                # An intent we cannot bind to an exact identity is never acted
+                # on and never deleted: it stays as evidence for an operator,
+                # and the diagnostic ledger says so out loud exactly once.
+                _recorded, diagnostics_left = self._diagnose_unsettleable_intent(
+                    path, "identity_unbindable", diagnostics_left
+                )
+                continue
+            substatus = str(
+                payload.get("substatus") or self._REVIEWER_TERMINAL_INTENT_SUBSTATUS
+            ).strip()
+            if substatus not in task_store.MARK_TERMINAL_FAILURE_SUBSTATUSES:
+                # The store would refuse this with a final
+                # ``unsupported_terminal_failure`` and the ticket would be
+                # retired having moved nothing.  A substatus outside the
+                # store's vocabulary is a malformed intent, so it is validated
+                # here and takes the same never-acted-on, never-deleted path as
+                # an unbindable identity rather than reaching SQLite at all.
+                # It earns its OWN reason, though: the identity here bound
+                # perfectly and only the declared substatus is unusable, so
+                # reporting it as ``identity_unbindable`` would send an
+                # operator to repair task/request/claim-epoch fields that are
+                # already correct.
+                _recorded, diagnostics_left = self._diagnose_unsettleable_intent(
+                    path, "substatus_unsupported", diagnostics_left
+                )
+                continue
+            owed = False
+            try:
+                with self._request_lock(request_id, blocking=False):
+                    # The intent file IS the claim ticket, and it is re-read,
+                    # settled and retired inside this lock.  A settler that
+                    # queued behind the winner therefore finds the ticket gone
+                    # and transitions nothing, instead of leaning on the
+                    # store's CAS to absorb a second attempt.
+                    try:
+                        held = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    if held != payload:
+                        continue
+                    ok, state = task_store.mark_terminal_failure(
+                        self.repo,
+                        task_id,
+                        runner=runner,
+                        substatus=substatus,
+                        evidence={
+                            "request_id": request_id,
+                            "error": str(payload.get("blocked_reason") or ""),
+                            "reviewer_claim_epoch": claim_epoch,
+                        },
+                        request_id=request_id,
+                        claim_epoch=claim_epoch,
+                    )
+                    if not ok and not self._terminal_intent_is_resolved(str(state)):
+                        # A transient CAS loss a later pass can still win, so
+                        # the ticket is kept rather than the transition dropped.
+                        continue
+                    # A final refusal can also mean this intent's OWN
+                    # transition already landed and only its callback is still
+                    # owed -- exactly what a crash, or a failed retire below,
+                    # leaves behind.  The store proves that from the card it
+                    # wrote rather than the launcher inferring it from a
+                    # refusal string.
+                    owed = ok or task_store.terminal_failure_already_applied(
+                        self.repo,
+                        task_id,
+                        str(state),
+                        runner=runner,
+                        substatus=substatus,
+                        request_id=request_id,
+                        claim_epoch=claim_epoch,
+                    )
+                    if not owed:
+                        # A final refusal that moved no card at all.  The
+                        # ticket is genuinely spent, but it may only be retired
+                        # once the refusal is durable evidence; when the line
+                        # cannot be written the intent is retained so a later
+                        # pass reports and retires it instead of it vanishing.
+                        recorded, diagnostics_left = self._diagnose_retired_intent(
+                            path, str(state), diagnostics_left
+                        )
+                        if not recorded:
+                            continue
+                    # The store owns the callback vocabulary, the episode
+                    # binding and the containment of its own unavailability, so
+                    # this is the single post-transition callback authority
+                    # rather than a launcher-private copy of the callback
+                    # database, and ``claim_epoch`` names the episode the
+                    # transition actually moved.  It runs BEFORE the ticket is
+                    # retired: the intent is the only thing that brings a later
+                    # pass back to this claim, so retiring first would lose the
+                    # callback whenever the enqueue could not be written.
+                    if owed and not task_store.enqueue_terminal_callback(
+                        self.repo,
+                        task_id,
+                        substatus=substatus,
+                        request_id=request_id,
+                        claim_epoch=claim_epoch,
+                    ) and not task_store.terminal_callback_already_durable(
+                        self.repo,
+                        task_id,
+                        substatus=substatus,
+                        request_id=request_id,
+                        claim_epoch=claim_epoch,
+                    ):
+                        # A refused enqueue is three different worlds, and only
+                        # the store can tell them apart.  "Not written yet" --
+                        # a locked or unreadable store -- keeps the ticket and
+                        # retries.  "Already durable" is what a crash between
+                        # a successful enqueue and this retire leaves behind;
+                        # every later pass would see the same duplicate
+                        # refusal, so reading it as "not written yet" would
+                        # strand this intent, and the processing claim behind
+                        # it, forever.  The proof is authenticated against the
+                        # exact task/request/episode/route this intent binds,
+                        # so an unknown or mismatched row never retires it.
+                        unroutable = (
+                            task_store.terminal_callback_identity_unroutable(
+                                self.repo, task_id, substatus=substatus,
+                            )
+                        )
+                        if not unroutable:
+                            continue
+                        # The third world: the transition IS durable and the
+                        # callback identity is one the store will never route,
+                        # so no pass could ever write the row and no proof
+                        # could ever appear.  Retiring it silently would hide a
+                        # manager wake that is genuinely lost, so the truthful
+                        # disposition goes on the record first and the ticket
+                        # is kept whenever that line cannot be written.
+                        recorded, diagnostics_left = (
+                            self._diagnose_unroutable_callback(
+                                path, unroutable, diagnostics_left
+                            )
+                        )
+                        if not recorded:
+                            continue
+                    unlink_if_regular(path)
+                    # A repaired intent may carry a marker from when it was
+                    # still unbindable, and a retired one carries the marker
+                    # that claimed its refusal line; retiring the ticket
+                    # retires both rather than leaving either behind.
+                    unlink_if_regular(self._terminal_intent_diagnosed_marker(path))
+                    unlink_if_regular(self._terminal_intent_retired_marker(path))
+            except (
+                AdvisoryLockTimeout,
+                OSError,
+                sqlite3.Error,
+                task_store.TaskStoreError,
+            ):
+                # Another settler owns this request, or the store is briefly
+                # unavailable or locked.  All retry on the next pass, and
+                # containing them per intent is what keeps one contended card
+                # from aborting settlement of every other intent on disk.
+                continue
+            if owed:
+                settled += 1
+        return settled
+
+    def _settle_reviewer_terminal_intents_contained(self) -> int:
+        """Settle terminal intents without ever masking the caller's outcome.
+
+        This is what the launch and reviewer reservation boundaries call from
+        their ``finally``.  Store, filesystem and lock failures are already
+        contained per intent; this is the last resort for anything else,
+        because a failure while settling somebody else's dead reservation has
+        nothing to do with the launch the caller is in the middle of, and
+        letting it escape a bare ``finally`` would replace an in-flight
+        ``LaunchRejected`` -- or an already-built launch receipt -- with an
+        unrelated error about a reservation the caller never touched.  The
+        intent stays durable, so absorbing the failure defers that settlement
+        to the next pass instead of losing it.
+
+        The 0 returned for such a failure is indistinguishable from the 0
+        returned for "nothing was pending", so the failure is named once in the
+        diagnostic ledger before it is absorbed.
+        """
+
+        try:
+            return self._settle_reviewer_terminal_intents()
+        except Exception as error:
+            self._diagnose_settlement_pass_failure(error)
+            return 0
+
+    def _reconcile_expired_starting_reservations(
+        self,
+        snapshot: tuple[
+            dict[str, dict[str, Any]], tuple[Any, ...] | None
+        ] | None = None,
+        *,
+        resolved: bool = False,
+    ) -> int:
         """Truthfully terminalize pid-null starting reservations that expired.
 
         A ``starting`` reservation with no pid belongs to a provisioner that
@@ -4788,11 +5769,45 @@ class ProcessManager:
         pid-null ``starting`` reservation whose exact owner is still live in the
         ``reviewer_source_graph_prewarm_started`` phase is likewise deferred
         rather than terminalized by its elapsed epoch.
+
+        ``snapshot`` is a stable ledger snapshot the caller already took with
+        the registry lock RELEASED; see ``_resolved_reservation_snapshot`` for
+        why that hand-off preserves the exact no-hidden-append authority.
+        Callers that hold no lock omit it and pay for their own snapshot.
+
+        ``resolved`` states that the caller ALREADY re-proved that snapshot
+        with its own sweep, inside this same lock acquisition, and shares the
+        dict.  It exists so the admission CAS in ``_launch_reservation`` and
+        this pass are proved by ONE sweep between them rather than two: the
+        re-proof is a property of the critical section, not of either caller.
+        In exchange this pass mirrors every row it terminalizes back into that
+        shared dict, so the caller's copy keeps describing the ledger exactly
+        without a second parse.
+
+        This pass writes only ledger events and durable terminal intents; the
+        task-store half runs in ``_settle_reviewer_terminal_intents`` with no
+        registry lock held.  Diagnostics about reservations that can never be
+        terminalized share one bounded per-pass budget, so a directory full of
+        unbindable rows cannot turn a single pass into an unbounded burst of
+        marker and ledger writes.
         """
 
         now = time.time()
-        reconciled = 0
-        for request_id, event in self._latest_by_request().items():
+        # The exact requests this pass retired, in ledger order.  It is both
+        # the return count and the key set mirrored into ``latest`` below.
+        # Named apart from the per-row ``terminalized`` flag the loop rebinds.
+        retired: list[str] = []
+        diagnostics_left = self._TERMINAL_INTENT_DIAGNOSTICS_PER_PASS
+        if resolved and snapshot is not None:
+            latest, generation = snapshot
+        else:
+            latest, generation = self._resolved_reservation_snapshot(snapshot)
+        if generation is None:
+            # The ledger changed under every bounded read attempt, so this
+            # snapshot may hide a concurrent append.  Terminalizing on it could
+            # contradict a row that already exists; defer to the next pass.
+            return 0
+        for request_id, event in latest.items():
             state = event.get("state")
             if state == "provider_spawn_committed":
                 provider_pid = int(event.get("provider_pid") or 0)
@@ -4806,37 +5821,31 @@ class ProcessManager:
                         # A live provider is never terminalized by elapsed or
                         # quiet time, even when its bounded owner is gone.
                         continue
-                    self._append_event({
-                        "request_id": request_id,
-                        "task_id": event.get("task_id"),
-                        "runner": event.get("runner"),
-                        "topic": event.get("topic"),
-                        "adapter_id": event.get("adapter_id"),
-                        "state": "blocked",
-                        "blocked_reason": "provider_spawn_committed_provider_dead",
-                        "reservation_expires_at_epoch": event.get(
-                            "reservation_expires_at_epoch"
-                        ),
-                    })
-                    reconciled += 1
+                    terminalized, diagnostics_left = (
+                        self._terminalize_committed_reservation(
+                            request_id,
+                            event,
+                            "provider_spawn_committed_provider_dead",
+                            diagnostics_left,
+                        )
+                    )
+                    if terminalized:
+                        retired.append(request_id)
                     continue
                 owner_pid = int(event.get("owner_pid") or 0)
                 if owner_pid and _pid_identity_evidence(
                     owner_pid, event.get("owner_pid_start_ticks")
                 ).verdict is PidIdentityVerdict.MISMATCH:
-                    self._append_event({
-                        "request_id": request_id,
-                        "task_id": event.get("task_id"),
-                        "runner": event.get("runner"),
-                        "topic": event.get("topic"),
-                        "adapter_id": event.get("adapter_id"),
-                        "state": "blocked",
-                        "blocked_reason": "provider_spawn_committed_owner_dead",
-                        "reservation_expires_at_epoch": event.get(
-                            "reservation_expires_at_epoch"
-                        ),
-                    })
-                    reconciled += 1
+                    terminalized, diagnostics_left = (
+                        self._terminalize_committed_reservation(
+                            request_id,
+                            event,
+                            "provider_spawn_committed_owner_dead",
+                            diagnostics_left,
+                        )
+                    )
+                    if terminalized:
+                        retired.append(request_id)
                 continue
             if state != "starting":
                 continue
@@ -4858,7 +5867,7 @@ class ProcessManager:
                             "reservation_expires_at_epoch"
                         ),
                     })
-                    reconciled += 1
+                    retired.append(request_id)
                 continue
             if self._reviewer_source_graph_prewarm_live_event(event):
                 # A live owned prewarm keeps extending its own liveness; the
@@ -4891,7 +5900,7 @@ class ProcessManager:
                         "reservation_expires_at_epoch"
                     ),
                 })
-                reconciled += 1
+                retired.append(request_id)
                 continue
             if float(event.get("reservation_expires_at_epoch") or 0.0) >= now:
                 continue
@@ -4907,8 +5916,18 @@ class ProcessManager:
                     "reservation_expires_at_epoch"
                 ),
             })
-            reconciled += 1
-        return reconciled
+            retired.append(request_id)
+        # Mirror this pass's OWN appends into the snapshot it was proved on.
+        # A caller sharing the dict (``resolved=True``) decides admission from
+        # it with no second parse, so it has to keep describing the ledger
+        # exactly -- otherwise a reservation this pass just retired would still
+        # read as live and the CAS would refuse a slot that is genuinely free.
+        # Only ``state`` is mirrored: it is the sole field admission reads
+        # about a retired row, and the appended event above stays the one and
+        # only authority for everything else.
+        for request_id in retired:
+            latest[request_id] = {**latest[request_id], "state": "blocked"}
+        return len(retired)
 
     def _build_adapter(self, **kwargs: Any) -> Any:
         if self._adapter_builder is not None:
@@ -5090,14 +6109,25 @@ class ProcessManager:
             raise LaunchRejected("collision_guard_failed")
         return card
 
-    def _active_request_ids(self) -> set[str]:
+    def _active_request_ids(
+        self, latest: Mapping[str, Mapping[str, Any]] | None = None
+    ) -> set[str]:
+        """Requests still live, from ``latest`` when the caller proved one.
+
+        Admission hands in a generation-proven snapshot, because an unproven
+        parse can hide the very ``running`` row that would have filled the last
+        slot.  Reporting callers omit it and take the plain read.
+        """
+
         dead = [rid for rid, live in self._live.items() if live.process.poll() is not None]
         for rid in dead:
             self._live.pop(rid, None)
         active = {
             rid for rid, live in self._live.items() if live.process.poll() is None
         }
-        for request_id, event in self._latest_by_request().items():
+        if latest is None:
+            latest = self._latest_by_request()
+        for request_id, event in latest.items():
             state = event.get("state")
             if state == "provider_spawn_committed":
                 provider_pid = int(event.get("provider_pid") or 0)
@@ -5139,8 +6169,10 @@ class ProcessManager:
                 active.add(request_id)
         return active
 
-    def _active_count(self) -> int:
-        return len(self._active_request_ids())
+    def _active_count(
+        self, latest: Mapping[str, Mapping[str, Any]] | None = None
+    ) -> int:
+        return len(self._active_request_ids(latest))
 
     def launch(
         self,
@@ -5801,10 +6833,21 @@ class ProcessManager:
         }
         return {"ok": True, "prepared": prepared}
 
-    def _reviewer_receipt(self, request_id: str) -> dict[str, Any]:
-        """Return a bounded, truthful receipt for an already-reserved reviewer."""
+    def _reviewer_receipt(
+        self,
+        request_id: str,
+        latest: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Return a bounded, truthful receipt for an already-reserved reviewer.
 
-        event = self._latest_by_request().get(request_id) or {}
+        ``latest`` is the snapshot the admission decision was proven against.
+        Reusing it keeps the receipt describing the exact ledger that decision
+        saw; a fresh parse here could report a row the decision never had.
+        """
+
+        if latest is None:
+            latest = self._latest_by_request()
+        event = latest.get(request_id) or {}
         return {
             "ok": True,
             "already_reserved": True,
@@ -5856,7 +6899,11 @@ class ProcessManager:
             event["preparation_detail"] = str(detail)[:300]
         self._append_event(event)
 
-    def _live_reviewer_receipt(self, reviewer_task_id: str) -> dict[str, Any] | None:
+    def _live_reviewer_receipt(
+        self,
+        reviewer_task_id: str,
+        latest: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
         """Return a bounded receipt for an already-live reviewer, else ``None``.
 
         A reviewer that already holds a live starting reservation, a durable
@@ -5866,12 +6913,20 @@ class ProcessManager:
         admission check -- an unexpired pid-null reservation, a committed owner
         that is not proven dead, or a real pid whose identity is not a proven
         mismatch -- never elapsed or quiet time against a live provider.
+
+        ``latest`` is the snapshot the caller already proved stable for its
+        critical section.  This is the duplicate-admission decision, so a
+        hidden append is exactly what would hide the live reviewer it is asked
+        about; callers that admit on the answer hand in their proven snapshot
+        rather than letting an unproven parse mint a second provider.
         """
 
+        if latest is None:
+            latest = self._latest_by_request()
         for live in self._live.values():
             if live.task_id == reviewer_task_id and live.process.poll() is None:
-                return self._reviewer_receipt(live.request_id)
-        for request_id, event in self._latest_by_request().items():
+                return self._reviewer_receipt(live.request_id, latest)
+        for request_id, event in latest.items():
             if event.get("task_id") != reviewer_task_id:
                 continue
             state = event.get("state")
@@ -5880,24 +6935,24 @@ class ProcessManager:
                 if provider_pid and _pid_identity_evidence(
                     provider_pid, event.get("provider_pid_start_ticks")
                 ).verdict is not PidIdentityVerdict.MISMATCH:
-                    return self._reviewer_receipt(request_id)
+                    return self._reviewer_receipt(request_id, latest)
                 owner_pid = int(event.get("owner_pid") or 0)
                 if owner_pid and _pid_identity_evidence(
                     owner_pid, event.get("owner_pid_start_ticks")
                 ).verdict is not PidIdentityVerdict.MISMATCH:
-                    return self._reviewer_receipt(request_id)
+                    return self._reviewer_receipt(request_id, latest)
                 continue
             if state not in ACTIVE_PROCESS_STATES:
                 continue
             pid = int(event.get("pid") or 0)
             if state == "starting" and not pid:
                 if self._reviewer_source_graph_prewarm_live_event(event):
-                    return self._reviewer_receipt(request_id)
+                    return self._reviewer_receipt(request_id, latest)
                 if (
                     float(event.get("reservation_expires_at_epoch") or 0.0)
                     > time.time()
                 ):
-                    return self._reviewer_receipt(request_id)
+                    return self._reviewer_receipt(request_id, latest)
                 continue
             if (
                 pid
@@ -5906,7 +6961,7 @@ class ProcessManager:
                 ).verdict
                 is not PidIdentityVerdict.MISMATCH
             ):
-                return self._reviewer_receipt(request_id)
+                return self._reviewer_receipt(request_id, latest)
         return None
 
     def _reserve_quality_reviewer_attempt(
@@ -5930,40 +6985,66 @@ class ProcessManager:
         exact live-pid rules are unchanged.
         """
 
-        with self._lock, self._registry_lock():
-            self._reconcile_expired_starting_reservations()
-            existing = self._live_reviewer_receipt(reviewer_task_id)
-            if existing is not None:
-                return existing
-            if self._active_count() >= _configured_limit():
-                return {"ok": False, "error": "concurrency_limit_reached"}
-            request_id = uuid.uuid4().hex
-            self._append_event({
-                "request_id": request_id,
-                "task_id": reviewer_task_id,
-                "runner": runner,
-                "topic": "quality_review",
-                "adapter_id": adapter_id,
-                "model": model,
-                "state": "starting",
-                "reservation_expires_at_epoch": (
-                    time.time() + QUALITY_REVIEW_ATTEMPT_RESERVATION_SECONDS
-                ),
-                "owner_pid": os.getpid(),
-                "owner_pid_start_ticks": _pid_start_ticks(os.getpid()),
-                "timeout_seconds": timeout_seconds,
-                "quality_review_attempt": {
-                    "target_request_id": target_request_id,
-                    "target_task_id": target_task_id,
-                    "lens": lens,
-                },
-            })
-            return {
-                "ok": True,
-                "already_reserved": False,
-                "request_id": request_id,
-                "state": "starting",
-            }
+        # The stable snapshot may replay the whole ledger up to
+        # ``_LEDGER_SNAPSHOT_MAX_ATTEMPTS`` times.  Taking it here, before the
+        # cross-process registry lock, keeps that amplified work off every
+        # unrelated reservation acknowledgement waiting on the same lock.
+        snapshot = self._latest_by_request_stable()
+        try:
+            with self._lock, self._registry_lock():
+                # ONE proven snapshot backs this whole critical section, and
+                # every decision below is taken from it rather than from a
+                # fresh parse.  Reconciliation, the already-reserved check and
+                # the concurrency ceiling are each falsified by a single hidden
+                # append -- and ``_append_event`` does not take this lock -- so
+                # acting on an unproven parse could reserve a second provider
+                # for a reviewer that already has one.  When no generation can
+                # be shown at all the reservation defers instead of guessing.
+                proven = self._proven_reservation_snapshot(snapshot)
+                if proven is None:
+                    return {"ok": False, "error": "ledger_snapshot_unproven"}
+                latest = proven[0]
+                self._reconcile_expired_starting_reservations(
+                    proven, resolved=True
+                )
+                existing = self._live_reviewer_receipt(reviewer_task_id, latest)
+                if existing is not None:
+                    return existing
+                if self._active_count(latest) >= _configured_limit():
+                    return {"ok": False, "error": "concurrency_limit_reached"}
+                request_id = uuid.uuid4().hex
+                self._append_event({
+                    "request_id": request_id,
+                    "task_id": reviewer_task_id,
+                    "runner": runner,
+                    "topic": "quality_review",
+                    "adapter_id": adapter_id,
+                    "model": model,
+                    "state": "starting",
+                    "reservation_expires_at_epoch": (
+                        time.time() + QUALITY_REVIEW_ATTEMPT_RESERVATION_SECONDS
+                    ),
+                    "owner_pid": os.getpid(),
+                    "owner_pid_start_ticks": _pid_start_ticks(os.getpid()),
+                    "timeout_seconds": timeout_seconds,
+                    "quality_review_attempt": {
+                        "target_request_id": target_request_id,
+                        "target_task_id": target_task_id,
+                        "lens": lens,
+                    },
+                })
+                return {
+                    "ok": True,
+                    "already_reserved": False,
+                    "request_id": request_id,
+                    "state": "starting",
+                }
+        finally:
+            # Reconciliation above recorded terminal intent only; the SQLite
+            # transition and its single manager callback happen here, with the
+            # outer registry lock already released.  Contained, so a settlement
+            # failure never masks the reviewer receipt this block just built.
+            self._settle_reviewer_terminal_intents_contained()
 
     def _reviewer_reservation_still_held(self, request_id: str) -> bool:
         """True while the exact attempt still owns an unterminalized reservation."""
@@ -5987,6 +7068,8 @@ class ProcessManager:
         self,
         request_id: str,
         binding: dict[str, Any] | None = None,
+        *,
+        reviewer_claim_epoch: Any = None,
     ) -> bool:
         """Atomically advance a still-held reservation to spawn-committed.
 
@@ -6005,10 +7088,28 @@ class ProcessManager:
         once, so a lost-ack/reload re-observing the same committed phase never
         rebinds a different packet and a retry reconciles the original attempt
         instead of minting a duplicate provider.
+
+        ``reviewer_claim_epoch`` is the reviewer card's own claim epoch at the
+        moment of commit.  It is the identity a later owner/provider-dead
+        reconciliation must bind its terminal intent to: without it a recovery
+        pass cannot tell this claim from a subsequent re-claim of the same
+        reviewer task, so it fails closed and terminalizes nothing.
+
+        The CAS reads through a bracketed generation proof rather than a plain
+        parse: ``_append_event`` never takes the registry lock, so a rival
+        commit -- or a supervisor's ``running`` row -- can land mid-parse and
+        the row that would lose this CAS is simply not seen.  When no stable
+        generation can be shown the transition answers ``False`` and no
+        provider is spawned, so an unprovable ledger can never mint a duplicate
+        provider for a reservation somebody else already committed.
         """
 
+        snapshot = self._latest_by_request_stable()
         with self._registry_lock():
-            latest = self._latest_by_request().get(request_id) or {}
+            proven = self._proven_reservation_snapshot(snapshot)
+            if proven is None:
+                return False
+            latest = proven[0].get(request_id) or {}
             if latest.get("state") == "provider_spawn_committed":
                 return True
             if latest.get("state") != "starting":
@@ -6027,6 +7128,13 @@ class ProcessManager:
                 "owner_pid": os.getpid(),
                 "owner_pid_start_ticks": _pid_start_ticks(os.getpid()),
             }
+            epoch = (
+                reviewer_claim_epoch
+                if reviewer_claim_epoch is not None
+                else latest.get("reviewer_claim_epoch")
+            )
+            if _is_bool_safe_int(epoch) and int(epoch) >= 1:
+                committed["reviewer_claim_epoch"] = int(epoch)
             if latest.get("quality_review_attempt") is not None:
                 committed["quality_review_attempt"] = latest["quality_review_attempt"]
             if isinstance(binding, dict):
@@ -6054,10 +7162,22 @@ class ProcessManager:
         owner already attached a provider for this exact request/task/packet
         binding: the caller is the losing spawner and must terminate its own
         just-spawned process.  Liveness never depends on elapsed or quiet time.
+
+        The CAS reads through a bracketed generation proof rather than a plain
+        parse.  ``_append_event`` never takes the registry lock, so the rival
+        owner's own attach can land mid-parse and stay invisible -- and a
+        hidden append here is exactly what would let two spawners both believe
+        they attached first.  An unprovable snapshot therefore answers
+        ``False``, so the caller terminates the process it just spawned: the
+        safe half of the ambiguity, never a second live provider.
         """
 
+        snapshot = self._latest_by_request_stable()
         with self._registry_lock():
-            latest = self._latest_by_request().get(request_id) or {}
+            proven = self._proven_reservation_snapshot(snapshot)
+            if proven is None:
+                return False
+            latest = proven[0].get(request_id) or {}
             state = latest.get("state")
             if state == "running":
                 return (
@@ -6095,6 +7215,11 @@ class ProcessManager:
                 "target_task_id",
                 "lens",
                 "target_claim_epoch",
+                # Attaching the provider identity re-states the committed
+                # phase, so the reviewer's own claim epoch has to travel with
+                # it.  Dropping it here would leave every provider-dead
+                # reservation unbindable and therefore never recoverable.
+                "reviewer_claim_epoch",
             ):
                 if latest.get(key) is not None:
                     attached[key] = latest[key]
@@ -6119,12 +7244,24 @@ class ProcessManager:
         owner in a *different* ProcessManager therefore never steals a
         committed spawn and a live provider is never classified by elapsed or
         quiet time.
+
+        That reread is a BRACKETED one.  ``_append_event`` never takes the
+        registry lock, so a plain parse under it can be interleaved by the very
+        row that forbids this terminalization -- the rival spawn commit, or a
+        supervisor publishing ``running`` -- and simply not see it.  The stable
+        snapshot is taken with the lock released and re-proved by one sweep
+        inside it; when no generation can be shown, this pass terminalizes
+        nothing and a later one retries.
         """
 
+        snapshot = self._latest_by_request_stable()
         with self._registry_lock():
             if request_id in self._live:
                 return
-            latest = self._latest_by_request().get(request_id) or {}
+            proven = self._proven_reservation_snapshot(snapshot)
+            if proven is None:
+                return
+            latest = proven[0].get(request_id) or {}
             if latest.get("state") in ("provider_spawn_committed", "running"):
                 return
             if latest.get("state") != "starting":
@@ -6525,6 +7662,30 @@ class ProcessManager:
                 unlink_if_regular(authority_path)
             if bridge_request is not None:
                 vscode_lm_bridge.cancel_request(bridge_request)
+            claimed_task_transition = "not_claimed"
+            if claimed:
+                # The reservation is somebody else's to terminalize, but the
+                # CARD this launch claimed is not: returning here without a
+                # transition leaves it ``processing`` under a claim no live
+                # owner holds, and nothing else brings a later pass back to
+                # it.  The reservation event stays untouched -- this moves the
+                # exact claimed task, once, to the truthful failure state.
+                claimed_task_transition = "launch_failed"
+                failed = task_engine.mark_launch_failed(
+                    self.repo,
+                    task_id,
+                    runner,
+                    reason="quality_review_reservation_terminalized",
+                    request_id=request_id or reserved_request_id or "",
+                )
+                if not failed.get("ok"):
+                    # Naming the refusal keeps a still-processing card visible
+                    # in the receipt instead of the caller reading a bounded
+                    # blocked reason as proof the claim was released.
+                    claimed_task_transition = (
+                        "launch_failure_transition_failed:"
+                        + str(failed.get("stderr") or failed.get("stdout") or "")[:200]
+                    )
             return {
                 "ok": False,
                 "launch_implemented": LAUNCH_IMPLEMENTED,
@@ -6536,6 +7697,7 @@ class ProcessManager:
                 "adapter_id": adapter_id,
                 "state": "blocked",
                 "blocked_reason": "quality_review_reservation_terminalized",
+                "claimed_task_transition": claimed_task_transition,
                 "shell": False,
             }
 
@@ -7167,7 +8329,12 @@ class ProcessManager:
                 if (
                     reserved_request_id is not None
                     and not self._reviewer_spawn_transition(
-                        reserved_request_id, binding=quality_review_binding
+                        reserved_request_id,
+                        binding=quality_review_binding,
+                        # The reviewer card is already claimed at this point, so
+                        # the committed phase can carry the exact epoch a later
+                        # owner/provider-dead recovery must bind to.
+                        reviewer_claim_epoch=metadata.get("claim_epoch"),
                     )
                 ):
                     raise _ReviewerReservationTerminalized(reserved_request_id)
@@ -7373,11 +8540,24 @@ class ProcessManager:
                 diagnostic=diagnostic,
             )
 
-    def _assert_no_duplicate_task(self, task_id: str) -> None:
+    def _assert_no_duplicate_task(
+        self,
+        task_id: str,
+        latest: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
+        """Refuse a second launch of one task, from a proven ledger read.
+
+        ``latest`` is the generation-proven snapshot admission already holds.
+        Re-reading here would be an unproven parse, and the row a concurrent
+        append hides is exactly the live duplicate this guard exists to find.
+        """
+
         for live in self._live.values():
             if live.task_id == task_id and live.process.poll() is None:
                 raise LaunchRejected(f"duplicate_live_task:{live.request_id}")
-        for event in self._latest_by_request().values():
+        if latest is None:
+            latest = self._latest_by_request()
+        for event in latest.values():
             if event.get("task_id") != task_id or event.get("state") not in ACTIVE_PROCESS_STATES:
                 continue
             pid = int(event.get("pid") or 0)
@@ -9248,15 +10428,14 @@ class ProcessManager:
                     + str(metadata.get("timeout_seconds") or "unknown")
                     + f":exit_code={exit_code}"
                 )
-            elif supervisor_state == "token_budget_exceeded":
-                terminal_state = "token_budget_exceeded"
-                budget = supervisor_status.get("token_budget") or {}
-                error = error or (
-                    "token_budget_exceeded:cap_tokens="
-                    + str(budget.get("cap_tokens") or "unknown")
-                    + ":accepted_total_tokens="
-                    + str(budget.get("accepted_total_tokens") or "unknown")
-                )
+            # NF: The supervisor is uncapped and no longer authorizes a token
+            # budget, so it never emits a fresh ``token_budget_exceeded`` state.
+            # A legacy supervisor packet that still carries that state must NOT
+            # synthesize a new token-cap terminal outcome; with the branch gone
+            # it falls through to the infrastructure-failure classification
+            # below (``worker_failed`` / ``supervisor_incomplete``). Historical
+            # ``token_budget_exceeded`` rows stay readable and diagnosable -- no
+            # new token-cap transition is minted here.
             elif supervisor_state == "output_budget_exceeded":
                 terminal_state = "output_budget_exceeded"
                 budget = supervisor_status.get("output_budget") or {}

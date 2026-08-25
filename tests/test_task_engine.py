@@ -649,17 +649,14 @@ def test_reject_review_predecessor_missing_hashes_fails_closed(tmp_path: Path) -
 
 @pytest.mark.parametrize(
     "hashes",
-    [None, [], "deadbeef", {"out.txt": "not-a-digest"}, {"out.txt": _VALID_HASH}],
+    [[], "deadbeef", {"out.txt": "not-a-digest"}, {"out.txt": _VALID_HASH}],
 )
 def test_reject_review_predecessor_hash_map_mutations_fail_closed(
     tmp_path: Path, hashes: object
 ) -> None:
     card = _validation_failed_card(tmp_path, changed_paths=[], hashes={})
     evidence = card["terminal_review"]["evidence"]
-    if hashes is None:
-        evidence.pop("changed_path_hashes")
-    else:
-        evidence["changed_path_hashes"] = hashes
+    evidence["changed_path_hashes"] = hashes
     resolved, error = _resolve(card, _REQ_OLD, tmp_path)
     assert resolved is None
     assert error == "predecessor_request_id_missing_hashes"

@@ -4791,3 +4791,131 @@ def test_sandbox_argv_plants_outer_authority_only_when_requested(
         assert "--outer-validation-authority" in flagged
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00423: coherent current-canonical dependency generation.
+#
+# Post-NF376, a sparse candidate whose allowed production file imports a
+# non-writable dependency overlaid the allowed file from the live parent tree
+# while leaving the imported dependency at the stale detached-Git-HEAD copy.
+# The exact reproduction: current ``process_launcher.py`` imports
+# ``task_store.is_bool_safe_int`` (present only in the current canonical tree,
+# not at HEAD). The dependency must be seeded from the same coherent
+# current-canonical generation -- without ``task_store.py`` becoming writable,
+# a candidate change, or promotable.
+# ---------------------------------------------------------------------------
+
+_TASK_STORE_HEAD = "STORE = 'v1'\n"
+_TASK_STORE_CURRENT = (
+    "def is_bool_safe_int(value):\n"
+    "    return isinstance(value, int) and not isinstance(value, bool)\n"
+)
+_LAUNCHER_HEAD = "LAUNCH_OK = False\n"
+_LAUNCHER_CURRENT = (
+    "from prodpkg.task_store import is_bool_safe_int\n"
+    "LAUNCH_OK = is_bool_safe_int(5)\n"
+)
+
+
+def _seed_nf423_coherent_dependency(repo: Path) -> None:
+    """Commit the HEAD generation, then dirty the tree to current canonical.
+
+    HEAD is internally consistent (the launcher does not yet import the
+    dependency symbol), so a HEAD-only control resolves cleanly. The current
+    canonical working tree adds ``is_bool_safe_int`` to the dependency and the
+    launcher's import of it; only a stale-HEAD/current mix fails.
+    """
+    package = repo / "src/prodpkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_bytes(b"")
+    (package / "task_store.py").write_text(_TASK_STORE_HEAD, encoding="utf-8")
+    (package / "process_launcher.py").write_text(_LAUNCHER_HEAD, encoding="utf-8")
+    (repo / "probe_launcher.py").write_text(
+        "from prodpkg.process_launcher import LAUNCH_OK\n"
+        "print('LAUNCH_OK', LAUNCH_OK)\n",
+        encoding="utf-8",
+    )
+    (repo / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\npythonpath = ['src']\n", encoding="utf-8"
+    )
+    assert (
+        _git(
+            repo,
+            "add",
+            "src/prodpkg",
+            "probe_launcher.py",
+            "pyproject.toml",
+        ).returncode
+        == 0
+    )
+    assert _git(repo, "commit", "-qm", "nf423 head generation").returncode == 0
+    # Advance the working tree to the current canonical generation, uncommitted
+    # so the detached HEAD checkout differs from the live parent tree.
+    (package / "task_store.py").write_text(_TASK_STORE_CURRENT, encoding="utf-8")
+    (package / "process_launcher.py").write_text(
+        _LAUNCHER_CURRENT, encoding="utf-8"
+    )
+
+
+def test_sparse_dependency_closure_is_one_coherent_current_canonical_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    _seed_nf423_coherent_dependency(repo)
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "nf423-worktrees"),
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "nf423-coherent-dependency",
+        {
+            # task_store.py is intentionally NOT writable: it is a read-only
+            # imported dependency, never a candidate change.
+            "allowed_writes": ["src/prodpkg/process_launcher.py"],
+            "read_first": [
+                "src/prodpkg/process_launcher.py",
+                "probe_launcher.py",
+            ],
+            "validation": ["PYTHONPATH=src python3 probe_launcher.py"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        dependency = workspace.path / "src/prodpkg/task_store.py"
+        # The dependency is materialized from the current canonical tree, not
+        # the stale detached-HEAD copy -- one coherent generation.
+        assert dependency.is_file()
+        assert dependency.read_text(encoding="utf-8") == _TASK_STORE_CURRENT
+        assert dependency.read_text(encoding="utf-8") != _TASK_STORE_HEAD
+        assert (
+            workspace.path / "src/prodpkg/process_launcher.py"
+        ).read_text(encoding="utf-8") == _LAUNCHER_CURRENT
+
+        # The unmodified dependency stays read-only: outside allowed_writes and
+        # absent from the candidate delta, so it can never be promoted.
+        assert "src/prodpkg/task_store.py" not in workspace.allowed_writes
+        assert worker_workspace.changed_paths(workspace) == []
+
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["PYTHONPATH=src python3 probe_launcher.py"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+        assert result["returncode"] == 0, result
+        assert "LAUNCH_OK True" in result["stdout_head"]
+
+        # A candidate edit to the allowed file is the sole promotable change;
+        # the imported dependency never appears in the candidate delta.
+        with (
+            workspace.path / "src/prodpkg/process_launcher.py"
+        ).open("a", encoding="utf-8") as stream:
+            stream.write("NF423_SENTINEL = 'candidate'\n")
+        assert worker_workspace.changed_paths(workspace) == [
+            "src/prodpkg/process_launcher.py"
+        ]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)

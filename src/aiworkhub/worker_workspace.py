@@ -2718,18 +2718,31 @@ def create_workspace(
         raise WorkspaceError(f"git_worktree_add_failed:{result.stderr[-1000:]}")
     try:
         phase_started = time.monotonic()
-        # Declared inputs intentionally reflect the live parent tree.  The
-        # package support closure is different: leave those paths exactly as
-        # checked out from the detached base commit, so an unrelated dirty
-        # parent file can never become validation authority.
+        # Declared inputs and their imported support/dependency closure must
+        # reflect ONE coherent current-canonical generation.  Overlaying the
+        # support closure from the live parent tree (NF-2026-00423) prevents a
+        # candidate whose allowed production file imports a current-canonical
+        # dependency from validating against a stale detached-HEAD copy of that
+        # dependency.  Only the exact resolved closure is copied -- never an
+        # arbitrary dirty parent file -- and support paths stay outside
+        # ``allowed_writes``, so their post-overlay bytes seed
+        # ``workspace_baseline`` below and they remain read-only, never enter
+        # the candidate delta, and can never be promoted.
         for relative in live_seeded:
             destination = path / relative
             _require_beneath(path, destination)
             _require_beneath(repo, repo / relative)
             _copy_one(repo / relative, destination)
         for relative in support_seeded:
+            source = repo / relative
             support_path = path / relative
+            _require_beneath(repo, source)
             _require_beneath(path, support_path)
+            if source.is_symlink() or not source.is_file():
+                raise WorkspaceError(
+                    f"validation_worker_support_missing:{relative}"
+                )
+            _copy_one(source, support_path)
             if support_path.is_symlink() or not support_path.is_file():
                 raise WorkspaceError(
                     f"validation_worker_support_missing:{relative}"

@@ -372,6 +372,8 @@ def _latest_progress_event(path: Path) -> dict[str, Any]:
 
 
 def _token_budget_config(spec: dict[str, Any]) -> tuple[int | None, str]:
+    # Legacy token_budget metadata is parsed for backward-compatible diagnostics
+    # only. The returned cap never enforces: worker runs are always uncapped.
     raw = spec.get("token_budget")
     if raw in (None, {}):
         return None, str(spec.get("adapter_id") or "")
@@ -645,10 +647,8 @@ def supervise(spec: dict[str, Any]) -> int:
                     token_state = decision.state
                     token_decisions.append(decision)
                     last_observed_tokens = observed_tokens
-                    if decision.cap_enforceable:
-                        final_state = "token_budget_exceeded"
-                        returncode = _terminate_child(child)
-                        break
+                    # Provider usage is non-enforcing telemetry only: a crossed
+                    # legacy cap never signals, terminates, or reaps the child.
                 heartbeat_seq += 1
                 _write_json_0600(status_path, {
                     "state": "running",
@@ -782,11 +782,7 @@ def supervise(spec: dict[str, Any]) -> int:
                 "stderr_received_bytes": stderr_capture.received_bytes,
                 "byte_labels_are_token_truth": False,
             },
-            "error": (
-                "token_budget_exceeded:provider_reported_live_usage"
-                if final_state == "token_budget_exceeded"
-                else ""
-            ),
+            "error": "",
         })
     except Exception as exc:
         if child is not None and child.poll() is None:
@@ -862,8 +858,6 @@ def supervise(spec: dict[str, Any]) -> int:
         return 125
     if final_state == "timed_out":
         return 124
-    if final_state == "token_budget_exceeded":
-        return 122
     return int(returncode)
 
 

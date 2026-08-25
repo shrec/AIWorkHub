@@ -534,7 +534,13 @@ def test_failure_outcome_reaches_blocked_without_ambient_writes_or_any_grant(tmp
     assert card["worker_status"] == "worker_failed"
 
 
-def test_live_token_cap_outcome_reaches_truthful_blocked_state(tmp_path, monkeypatch):
+def test_legacy_token_cap_packet_never_mints_new_token_cap_terminalization(tmp_path, monkeypatch):
+    """Uncapped: the supervisor no longer authorizes a token budget, so it
+    never emits a fresh ``token_budget_exceeded`` state. A legacy supervisor
+    packet that still carries that state must NOT synthesize a new token-cap
+    terminal outcome -- it is reclassified as an infrastructure ``worker_failed``.
+    The token-budget telemetry is preserved verbatim in the failure evidence
+    so the historical packet stays readable and diagnosable."""
     card = _card()
     manager = _build_manager(tmp_path, card)
     monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: False)
@@ -550,7 +556,7 @@ def test_live_token_cap_outcome_reaches_truthful_blocked_state(tmp_path, monkeyp
     monkeypatch.setattr(
         process_launcher.task_engine, "mark_terminal_failure", fake_mark_terminal_failure
     )
-    request_id = "req-token-cap"
+    request_id = "req-legacy-token-cap"
     _seed_request(
         manager,
         tmp_path,
@@ -572,11 +578,64 @@ def test_live_token_cap_outcome_reaches_truthful_blocked_state(tmp_path, monkeyp
 
     result = manager._finalize_isolated_request(request_id)
 
-    assert result["state"] == "token_budget_exceeded"
-    assert failure_calls[0][2] == "token_budget_exceeded"
-    assert failure_calls[0][4]["token_budget"]["enforceable_live_tokens"] == 13
+    # No new token-cap terminalization: the outcome is infrastructure failure.
+    assert result["state"] == "worker_failed"
+    assert result["state"] != "token_budget_exceeded"
+    assert failure_calls[0][2] == "worker_failed"
+    assert failure_calls[0][2] != "token_budget_exceeded"
     assert card["status"] == "blocked"
-    assert card["worker_status"] == "token_budget_exceeded"
+    assert card["worker_status"] == "worker_failed"
+    # Historical telemetry stays readable/diagnosable in the evidence and the
+    # preserved supervisor error, without minting a new token-cap transition.
+    assert failure_calls[0][4]["token_budget"]["enforceable_live_tokens"] == 13
+    assert failure_calls[0][4]["supervisor_state"] == "token_budget_exceeded"
+    assert "token_budget_exceeded" in result["error"]
+
+
+def test_legacy_token_cap_packet_without_error_falls_through_to_supervisor_incomplete(
+    tmp_path, monkeypatch,
+):
+    """Even a bare legacy token-cap packet (no supervisor error string) never
+    synthesizes a token-cap error: it is classified as an infrastructure
+    ``worker_failed`` via the generic ``supervisor_incomplete`` fallback, and
+    the diagnostic names the stale state rather than authorizing a token cap."""
+    card = _card()
+    manager = _build_manager(tmp_path, card)
+    monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: False)
+    failure_calls = []
+
+    def fake_mark_terminal_failure(
+        repo, task_id, runner, substatus, *, evidence=None, request_id=""
+    ):
+        failure_calls.append((task_id, runner, substatus, request_id, evidence))
+        card.update({"status": "blocked", "worker_status": substatus})
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        process_launcher.task_engine, "mark_terminal_failure", fake_mark_terminal_failure
+    )
+    request_id = "req-legacy-token-cap-bare"
+    _seed_request(
+        manager,
+        tmp_path,
+        card,
+        request_id=request_id,
+        supervisor_pid=2_147_483_047,
+        supervisor_ticks=999_999_946,
+        supervisor_status={
+            "state": "token_budget_exceeded",
+            "exit_code": 122,
+            "token_budget": {"cap_tokens": 10},
+        },
+    )
+
+    result = manager._finalize_isolated_request(request_id)
+
+    assert result["state"] == "worker_failed"
+    assert failure_calls[0][2] == "worker_failed"
+    assert card["worker_status"] == "worker_failed"
+    assert "supervisor_incomplete:state=token_budget_exceeded" in result["error"]
+    assert "token_budget_exceeded:cap_tokens" not in result["error"]
 
 
 def test_output_byte_cap_outcome_reaches_truthful_blocked_state(tmp_path, monkeypatch):

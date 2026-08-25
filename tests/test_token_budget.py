@@ -10,7 +10,7 @@ from aiworkhub.token_budget import (
 )
 
 
-def test_authority_ordering_and_only_live_crossing_is_enforceable() -> None:
+def test_authority_ordering_and_cap_crossing_is_never_enforceable() -> None:
     assert telemetry_authority_rank(TelemetryAuthority.TELEMETRY_UNAVAILABLE) == 0
     assert telemetry_authority_rank(TelemetryAuthority.POSTHOC_ONLY) == 1
     assert telemetry_authority_rank(TelemetryAuthority.ENFORCED_LIVE) == 2
@@ -45,7 +45,8 @@ def test_authority_ordering_and_only_live_crossing_is_enforceable() -> None:
     assert live.accepted_total_tokens == 250
     assert live.enforceable_live_tokens == 100
     assert live.cap_crossed is True
-    assert live.cap_enforceable is True
+    assert live.cap_enforceable is False
+    assert live.evidence["enforcing"] is False
 
 
 def test_later_live_cumulative_report_can_authoritatively_prove_cap_crossing() -> None:
@@ -74,7 +75,7 @@ def test_later_live_cumulative_report_can_authoritatively_prove_cap_crossing() -
     assert live.accepted_total_tokens == 175
     assert live.enforceable_live_tokens == 175
     assert live.cap_crossed is True
-    assert live.cap_enforceable is True
+    assert live.cap_enforceable is False
 
 
 def test_cumulative_and_delta_samples_do_not_double_count_or_regress() -> None:
@@ -168,7 +169,7 @@ def test_mixed_cumulative_delta_cumulative_only_accepts_unseen_attempt_total() -
     assert cumulative.accepted_total_tokens == 125
     assert cumulative.enforceable_live_tokens == 125
     assert cumulative.cap_crossed is True
-    assert cumulative.cap_enforceable is True
+    assert cumulative.cap_enforceable is False
     assert overlapping.accepted_delta_tokens == 0
     assert overlapping.accepted_total_tokens == 125
     assert overlapping.cap_enforceable is False
@@ -333,4 +334,6 @@ def test_supervisor_evidence_is_immutable_and_contains_no_dollars() -> None:
     assert evidence["subject"] == "worker-request"
     assert evidence["event_sha256"]
     assert evidence["cost_usd"] is None
-    assert evidence["events"][0]["cap_enforceable"] is True
+    assert evidence["enforcing"] is False
+    assert evidence["events"][0]["cap_enforceable"] is False
+    assert evidence["events"][0]["enforcing"] is False

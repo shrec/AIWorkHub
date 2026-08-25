@@ -1752,7 +1752,17 @@ def _enqueue_terminal_callback_row(
     request_id: str,
     now: str,
 ) -> bool:
-    """Insert one callback row without committing the caller's transaction."""
+    """Insert one callback row without committing the caller's transaction.
+
+    This is the *in-transaction* callback authority, and it is deliberately
+    scoped to exactly that: the atomic terminal-**review** transaction, which
+    persists the card, its event and its callback row or none of them.  The
+    post-transition callback owed after a recorded terminal **failure** cannot
+    share this path -- it runs against a transaction that has already committed
+    -- and belongs to ``enqueue_terminal_callback``.  Naming both scopes here
+    keeps "single authority" a true statement about each one rather than a
+    claim one of them quietly contradicts.
+    """
 
     normalized_provider = str(provider or "").strip().lower()
     normalized_origin = str(origin_thread_id or "").strip()
@@ -2176,6 +2186,27 @@ def mark_launch_failed(
 MARK_TERMINAL_FAILURE_SUBSTATUSES: frozenset[str] = task_fsm.MARK_TERMINAL_FAILURE_SUBSTATUSES
 
 
+def is_bool_safe_int(value: object) -> bool:
+    """True only for a plain ``int`` -- ``bool`` is explicitly rejected.
+
+    ``True`` is an ``int`` subclass, so a truthy flag that reaches a claim
+    epoch would otherwise masquerade as episode 1 and bind a terminal
+    transition or its callback to the wrong claim.
+
+    Public because the launcher validates the very epochs it is about to hand
+    to this module and must not keep a second copy of the rule: two predicates
+    that drift apart would let one of them admit a ``bool`` the other rejects,
+    and the disagreement would only ever show up as a terminal transition
+    bound to the wrong episode.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+# The module-internal spelling every call site below already uses.  Aliased
+# rather than redefined so there is exactly one implementation of the rule.
+_is_bool_safe_int = is_bool_safe_int
+
+
 def mark_terminal_failure(
     root: str | Path,
     task_id: str,
@@ -2184,6 +2215,7 @@ def mark_terminal_failure(
     substatus: str,
     evidence: Mapping[str, Any] | None = None,
     request_id: str = "",
+    claim_epoch: int | None = None,
 ) -> tuple[bool, str]:
     """Record a post-launch failure outside the actionable review queue.
 
@@ -2191,11 +2223,21 @@ def mark_terminal_failure(
     definition.  Preserve its exact evidence and declared gate denominator,
     emit a truthful terminal substatus, and end in the canonical ``blocked``
     bucket instead of fabricating ``status=review``.
+
+    ``claim_epoch`` binds the transition to one exact claim.  A caller that
+    resumes a durable terminal intent after a crash observed the card at one
+    specific epoch; by the time it runs again the card may have been released
+    and re-claimed, and terminalizing *that* claim would kill live work on the
+    strength of dead evidence.  Declaring the observed epoch makes the mismatch
+    fail closed (``claim_epoch_mismatch``) against the very row this call is
+    about to update, instead of against a card read somewhere else.
     """
     allowed = MARK_TERMINAL_FAILURE_SUBSTATUSES
     substatus = str(substatus or "").strip()
     if substatus not in allowed:
         return False, f"unsupported_terminal_failure:{substatus}"
+    if claim_epoch is not None and not _is_bool_safe_int(claim_epoch):
+        return False, "expected_claim_epoch_invalid"
     _readiness, db_path = _require_ready(root)
     conn = _connect(db_path)
     try:
@@ -2228,14 +2270,19 @@ def mark_terminal_failure(
 
         evidence_payload = dict(evidence or {})
         try:
-            claim_epoch = max(0, int(card.get("claim_epoch") or 0))
+            card_claim_epoch = max(0, int(card.get("claim_epoch") or 0))
         except (TypeError, ValueError):
-            claim_epoch = 0
+            card_claim_epoch = 0
+        if claim_epoch is not None and claim_epoch != card_claim_epoch:
+            return False, (
+                f"claim_epoch_mismatch:expected={claim_epoch}"
+                f":current={card_claim_epoch}"
+            )
         deterministic_verification = task_fsm.deterministic_verification(
             substatus,
             evidence_payload.get("validation"),
             evidence_payload.get("required_outputs"),
-            claim_epoch=claim_epoch,
+            claim_epoch=card_claim_epoch,
         )
         now = datetime.now(timezone.utc).isoformat()
         terminal = {
@@ -2244,7 +2291,7 @@ def mark_terminal_failure(
             "deterministic_verification": deterministic_verification,
             "recorded_at": now,
             "runner": runner,
-            "claim_epoch": claim_epoch,
+            "claim_epoch": card_claim_epoch,
         }
         card.update(
             status="blocked",
@@ -2286,6 +2333,461 @@ def mark_terminal_failure(
         return True, "blocked"
     finally:
         conn.close()
+
+
+# ``mark_terminal_failure`` states proving no later attempt could ever move
+# that exact claim.  A caller holding a durable terminal intent needs to tell
+# "retry on the next pass" from "retire this intent"; restating the strings at
+# the call site would let the two vocabularies drift apart silently and either
+# strand a processing card or retry a verdict forever.
+TERMINAL_FAILURE_FINAL_STATES: frozenset[str] = frozenset({
+    "task_not_found",
+    "runner_mismatch",
+    "claim_owner_mismatch",
+    "launch_request_mismatch",
+    "launch_request_id_required",
+    "expected_claim_epoch_invalid",
+})
+
+# The refusals that can ALSO mean "this exact transition already landed": the
+# card left ``processing`` because a previous attempt moved it, or it was
+# recovered and re-claimed since, so a later episode owns the row and the retry
+# is refused for naming the older claim.  Named once so the recovery path below
+# and the final-state vocabulary cannot drift.
+TERMINAL_FAILURE_NOT_PROCESSING_PREFIX = "not_processing:"
+TERMINAL_FAILURE_CLAIM_EPOCH_MISMATCH_PREFIX = "claim_epoch_mismatch:"
+
+# Final states that carry the observed value after a colon.
+TERMINAL_FAILURE_FINAL_STATE_PREFIXES: tuple[str, ...] = (
+    TERMINAL_FAILURE_NOT_PROCESSING_PREFIX,
+    TERMINAL_FAILURE_CLAIM_EPOCH_MISMATCH_PREFIX,
+    "unsupported_terminal_failure:",
+)
+
+# Refusals a recover/re-claim can produce against a card whose terminal failure
+# this caller ALREADY committed.  The window is the same one every time: the
+# transition is durable, the callback it owes is not, and by the time the
+# settler runs again the row has moved on -- to a later episode
+# (``claim_epoch_mismatch``), to another owner (``claim_owner_mismatch``,
+# ``runner_mismatch``) or to a new launch (``launch_request_mismatch``,
+# ``launch_request_id_required``).  Reading any of them as "nothing landed"
+# retires an owed manager wake for a transition that really happened, so each
+# one is answered from the card's OWN recorded terminal failure instead.
+# Everything outside this set is a pre-store or not-found guard that proves no
+# attempt of this caller's ever reached the card, and is answered for free.
+TERMINAL_FAILURE_RECLAIM_REFUSAL_STATES: frozenset[str] = frozenset({
+    "runner_mismatch",
+    "claim_owner_mismatch",
+    "launch_request_mismatch",
+    "launch_request_id_required",
+})
+TERMINAL_FAILURE_RECLAIM_REFUSAL_PREFIXES: tuple[str, ...] = (
+    TERMINAL_FAILURE_NOT_PROCESSING_PREFIX,
+    TERMINAL_FAILURE_CLAIM_EPOCH_MISMATCH_PREFIX,
+)
+
+
+def terminal_failure_refusal_may_hide_landing(state: str) -> bool:
+    """True when ``state`` alone cannot prove the transition never landed.
+
+    A refusal names why THIS attempt was rejected now; it says nothing about
+    whether an earlier attempt by the same caller already committed the card.
+    Only the card's own recorded terminal failure settles that, so these
+    refusals earn a card read and every other one is answered without it.
+    """
+
+    state = str(state or "")
+    if state in TERMINAL_FAILURE_RECLAIM_REFUSAL_STATES:
+        return True
+    return state.startswith(TERMINAL_FAILURE_RECLAIM_REFUSAL_PREFIXES)
+
+
+def terminal_failure_state_is_final(state: str) -> bool:
+    """True when ``state`` proves no later pass could move that exact claim.
+
+    Anything else -- notably ``terminal_failure_transition_conflict`` -- is a
+    transient CAS loss that a retry can still win, so the caller must keep its
+    intent rather than dropping the transition.
+    """
+
+    state = str(state or "")
+    if state in TERMINAL_FAILURE_FINAL_STATES:
+        return True
+    return state.startswith(TERMINAL_FAILURE_FINAL_STATE_PREFIXES)
+
+
+def terminal_failure_already_applied(
+    root: str | Path,
+    task_id: str,
+    state: str,
+    *,
+    runner: str,
+    substatus: str,
+    request_id: str,
+    claim_epoch: int,
+) -> bool:
+    """True only when the card already records THIS exact terminal failure.
+
+    A caller that died -- or lost its disk -- between a successful
+    ``mark_terminal_failure`` and the one callback it still owes comes back to
+    a card it no longer owns, so its retry is refused and the refusal is final.
+    Which refusal it gets depends only on how far the card moved on in the
+    meantime: still blocked by that very transition (``not_processing:``), or
+    recovered and re-claimed into a later episode, another owner or a new
+    launch request.  Treating ANY of them as "nothing to do" drops the callback
+    for a transition that really did happen, so all of them are decided by the
+    card's own recorded evidence (see
+    ``terminal_failure_refusal_may_hide_landing``).  Refusals outside that set
+    prove no attempt ever reached the card and are answered ``False`` without
+    reading it at all.
+
+    The match is exact -- runner, substatus, the bound episode and the request
+    the recorded evidence names -- so a card blocked by some other authority,
+    or a LATER episode's own terminal failure, is never mistaken for this
+    caller's work.  That exactness is what makes reading the re-claim refusals
+    safe: the answer comes from the episode the record names, never from the
+    episode the card currently carries.
+
+    Store failures are deliberately NOT contained here.  The caller holds a
+    durable intent, and an unreadable or locked store must leave that intent in
+    place for the next pass rather than resolve to "no callback owed".
+    """
+
+    if not terminal_failure_refusal_may_hide_landing(state):
+        return False
+    if not _is_bool_safe_int(claim_epoch):
+        return False
+    card = get_task(root, task_id) or {}
+    recorded = card.get("terminal_failure")
+    if not isinstance(recorded, Mapping):
+        return False
+    evidence = recorded.get("evidence")
+    if not isinstance(evidence, Mapping):
+        evidence = {}
+    recorded_epoch = recorded.get("claim_epoch")
+    return (
+        str(recorded.get("runner") or "") == str(runner)
+        and str(recorded.get("substatus") or "") == str(substatus)
+        and _is_bool_safe_int(recorded_epoch)
+        and recorded_epoch == claim_epoch
+        and str(evidence.get("request_id") or "") == str(request_id)
+    )
+
+
+def _terminal_callback_episode(
+    card: Mapping[str, Any],
+    *,
+    substatus: str,
+    request_id: str,
+    claim_epoch: int | None,
+) -> int | None:
+    """The episode a terminal callback may settle, or ``None`` to fail closed.
+
+    A settler that crashed between its terminal transition and the callback it
+    owes can come back to a card that has since been recovered and re-claimed.
+    Gating the callback on the card's CURRENT epoch strands that intent for
+    good: the transition is recorded, so the retry is refused as already
+    applied, and the enqueue is refused because the epoch drifted -- no pass
+    could ever settle it again.
+
+    So the card's own recorded terminal failure is the second authority.  It is
+    accepted only when it names EXACTLY this caller's episode, substatus and
+    request, which is what keeps a foreign settler -- or the current claim --
+    from spoofing an episode it never transitioned.  Omitting ``claim_epoch``
+    still binds to the card's current epoch, because that is what a caller
+    holding the claim it just terminalized already observed.
+    """
+
+    try:
+        card_claim_epoch = max(0, int(card.get("claim_epoch") or 0))
+    except (TypeError, ValueError):
+        card_claim_epoch = 0
+    if claim_epoch is None or claim_epoch == card_claim_epoch:
+        return card_claim_epoch
+    recorded = card.get("terminal_failure")
+    if not isinstance(recorded, Mapping):
+        return None
+    recorded_epoch = recorded.get("claim_epoch")
+    if not _is_bool_safe_int(recorded_epoch) or recorded_epoch != claim_epoch:
+        return None
+    if str(recorded.get("substatus") or "") != str(substatus):
+        return None
+    evidence = recorded.get("evidence")
+    if not isinstance(evidence, Mapping):
+        return None
+    if str(evidence.get("request_id") or "") != str(request_id):
+        return None
+    return int(claim_epoch)
+
+
+def enqueue_terminal_callback(
+    root: str | Path,
+    task_id: str,
+    *,
+    substatus: str,
+    request_id: str = "",
+    claim_epoch: int | None = None,
+) -> bool:
+    """Enqueue the one manager callback owed for a recorded terminal failure.
+
+    This is the single authority for the *post-transition* enqueue: a caller
+    that has already committed a card to a terminal failure substatus owes
+    exactly one callback, and every private copy of the callback-database
+    access is one more place to forget the episode binding.  Callers therefore
+    hand over the substatus and the episode and let the store resolve the
+    transition, the origin thread and the provider.  The atomic terminal-review
+    path is the other, deliberately separate writer: it has a live transaction
+    to join, so it writes its row through ``_enqueue_terminal_callback_row``
+    instead of reaching this function.
+
+    ``claim_epoch`` names the episode the caller actually transitioned rather
+    than whatever epoch the card happens to carry by the time the callback is
+    built.  A crash-recovered intent must declare it: the card may have been
+    released and re-claimed since, and the mismatch then fails closed instead
+    of signalling the manager about someone else's episode.  Omitting it binds
+    the callback to the card's current epoch, which is what a caller holding
+    the claim it just terminalized already observed.
+
+    ``enqueue_callback`` is itself idempotent per (task, transition, episode),
+    so a retried settlement of the same intent never emits a second callback.
+    An unreadable, not-yet-initialised or locked store is contained here and
+    reported as "not enqueued", because a callback that could not be written is
+    never worth displacing the terminal transition that was.
+
+    ``False`` therefore covers two different worlds and cannot tell them
+    apart: the row could not be written *yet*, and the row this caller owes is
+    *already there* -- ``callback_store.enqueue_callback`` dedups on (task,
+    provider, route, transition, episode) and reports that no-op the same way
+    as a refusal.  A caller holding a durable intent must not read either as
+    "nothing more is owed", and must separate them with
+    ``terminal_callback_already_durable`` before it retires that intent;
+    otherwise the already-durable world retries forever.
+
+    A THIRD world hides behind the same ``False``: an identity the enqueue
+    refuses structurally -- an unbound origin thread, a provider it will not
+    route -- can never produce a row, so neither retrying nor the durable
+    proof can ever resolve it.  ``terminal_callback_identity_unroutable``
+    names that world so a settler can retire its intent against a truthful
+    disposition instead of retrying forever.
+    """
+
+    from . import callback_store
+
+    if claim_epoch is not None and not _is_bool_safe_int(claim_epoch):
+        return False
+    try:
+        card = get_task(root, task_id) or {}
+        episode = _terminal_callback_episode(
+            card,
+            substatus=substatus,
+            request_id=request_id,
+            claim_epoch=claim_epoch,
+        )
+        if episode is None:
+            return False
+        _readiness, db_path = _require_ready(root)
+        conn = _connect(db_path)
+        try:
+            callback_store.init_db(conn)
+            origin_thread_id = (
+                callback_store.read_origin_thread(conn, task_id)
+                or str(card.get("origin_thread_id") or "").strip()
+            )
+            enqueued = callback_store.enqueue_callback(
+                conn,
+                task_id,
+                origin_thread_id,
+                callback_store.resolve_callback_transition(substatus),
+                provider=str(card.get("coordinator_provider") or "").strip().lower(),
+                episode_id=str(episode),
+                request_id=request_id,
+            )
+            conn.commit()
+            return bool(enqueued)
+        finally:
+            conn.close()
+    except (TaskStoreError, sqlite3.Error):
+        # ``sqlite3.OperationalError("database is locked")`` is the ordinary
+        # shape of a contended store and is no more evidence about the claim
+        # than an unreadable one; both are reported as "not written yet".
+        return False
+
+
+# Outbox states that prove a callback really is durably enqueued work on their
+# own.  ``dead_letter`` is not one of them, because two very different rows
+# wear that state; see ``TERMINAL_CALLBACK_NEVER_DELIVERABLE_ERROR_PREFIX``.
+TERMINAL_CALLBACK_DURABLE_STATES = ("pending", "inflight", "delivered", "superseded")
+
+# The exact ``last_error`` prefix ``callback_store.enqueue_callback`` stamps on
+# the dead letter it writes INSTEAD of enqueuing a malformed row.  That row was
+# never deliverable work, so retiring a terminal intent against it would drop
+# the manager wake in silence.  A dead letter WITHOUT this prefix is the other
+# row entirely: one that really was enqueued, became deliverable work, and only
+# later exhausted delivery.  It still occupies the store's dedup key forever,
+# so no later pass can enqueue it again -- reading it as "not written yet"
+# strands the intent, and the processing claim behind it, for good.
+TERMINAL_CALLBACK_NEVER_DELIVERABLE_ERROR_PREFIX = "malformed_callback_outbox_row:"
+
+
+def terminal_callback_already_durable(
+    root: str | Path,
+    task_id: str,
+    *,
+    substatus: str,
+    request_id: str = "",
+    claim_epoch: int | None = None,
+) -> bool:
+    """True only when THIS exact terminal callback is already in the outbox.
+
+    This is the other half of ``enqueue_terminal_callback``'s ``False``.  A
+    settler that died between a successful enqueue and retiring its durable
+    intent meets the already-durable world on every later pass: the
+    transition is recorded, so the retry is refused as already applied, and
+    the enqueue is refused as a duplicate.  Reading both as "not written yet"
+    strands that intent -- and the processing claim behind it -- forever, so
+    the two worlds are separated by an authenticated existence proof rather
+    than by a guess about which refusal was meant.
+
+    The proof is the store's own dedup authority, not a stricter copy of it.
+    ``callback_store.enqueue_callback`` refuses on exactly
+    ``(task, provider, origin thread, transition, episode)`` and is blind to
+    both ``state`` and ``request_id``, so this query matches that tuple and
+    nothing more.  Proving a NARROWER identity than the enqueue refuses on is
+    what turns a permanent refusal into an endless retry: a row another
+    request wrote in this same episode occupies the key for good, and no pass
+    could ever produce the row a request-scoped proof demanded.  The identity
+    binding is not weakened by that -- task, provider, route, transition and
+    episode all still have to match, and ``_terminal_callback_episode`` is
+    what binds the episode to this caller's exact substatus, request and
+    claim epoch before the query is ever built.
+
+    ``state`` is likewise read the way the dedup key reads it.  A row that was
+    enqueued and later dead-lettered by delivery is durable proof, because it
+    holds the key permanently; only the dead letter the enqueue writes in
+    place of a malformed row is not, and that one names itself in
+    ``last_error``.  Anything unknown or mismatched answers ``False`` and the
+    caller keeps its intent.
+
+    Store failures are deliberately NOT contained here, for the same reason
+    ``terminal_failure_already_applied`` does not contain them: the caller
+    holds a durable intent, and an unreadable or locked store must leave that
+    intent in place for the next pass rather than resolve to "already sent".
+    """
+
+    from . import callback_store
+
+    if claim_epoch is not None and not _is_bool_safe_int(claim_epoch):
+        return False
+    card = get_task(root, task_id) or {}
+    episode = _terminal_callback_episode(
+        card,
+        substatus=substatus,
+        request_id=request_id,
+        claim_epoch=claim_epoch,
+    )
+    if episode is None:
+        return False
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        callback_store.init_db(conn)
+        origin_thread_id = str(
+            callback_store.read_origin_thread(conn, task_id)
+            or card.get("origin_thread_id")
+            or ""
+        ).strip()
+        if not origin_thread_id:
+            # The enqueue refuses an unroutable identity outright, so no row
+            # it wrote can ever be proven from one.  Fail closed.
+            return False
+        placeholders = ", ".join("?" for _ in TERMINAL_CALLBACK_DURABLE_STATES)
+        never_deliverable = TERMINAL_CALLBACK_NEVER_DELIVERABLE_ERROR_PREFIX
+        row = conn.execute(
+            "SELECT 1 FROM callback_outbox"
+            "  WHERE task_id=? AND provider=? AND origin_thread_id=?"
+            "    AND transition=? AND episode_id=?"
+            f"    AND (state IN ({placeholders})"
+            "      OR (state='dead_letter'"
+            "          AND substr(COALESCE(last_error, ''), 1, ?) <> ?))"
+            "  LIMIT 1",
+            (
+                str(task_id),
+                str(card.get("coordinator_provider") or "").strip().lower(),
+                origin_thread_id,
+                callback_store.resolve_callback_transition(substatus),
+                str(episode),
+                *TERMINAL_CALLBACK_DURABLE_STATES,
+                len(never_deliverable),
+                never_deliverable,
+            ),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+# The provider vocabulary ``callback_store.enqueue_callback`` will route.  A
+# card outside it can never produce an outbox row, so a settler holding a
+# durable intent has to be able to see that from here rather than reading a
+# permanent structural refusal as "the store is busy, try again".
+TERMINAL_CALLBACK_ROUTABLE_PROVIDERS: tuple[str, ...] = (
+    "",
+    "codex",
+    "claude",
+    "copilot",
+)
+
+
+def terminal_callback_identity_unroutable(
+    root: str | Path,
+    task_id: str,
+    *,
+    substatus: str,
+) -> str:
+    """Name why this card's callback identity can NEVER be enqueued, or ''.
+
+    ``enqueue_terminal_callback`` answers ``False`` for a store that is merely
+    unavailable, for a row that is already there, and for an identity the
+    enqueue rejects on sight.  The first two are separated by
+    ``terminal_callback_already_durable``; this separates the third.  Without
+    it a terminal failure that committed against an unroutable card leaves a
+    world where neither the enqueue nor the durable proof can ever succeed,
+    and the settler retries the same refusal forever while the intent -- and
+    the claim behind it -- never retires.
+
+    The answer is a short fixed reason from this function's own vocabulary,
+    never card content, so an operator-visible diagnostic built from it stays
+    bounded.  ``''`` means "nothing structural stops the enqueue", which keeps
+    every other refusal on the retry path where it belongs.
+
+    Store failures are deliberately NOT contained here, for the same reason
+    the two functions above do not contain them: an unreadable or locked store
+    proves nothing about the identity and must leave the intent in place.
+    """
+
+    from . import callback_store
+
+    card = get_task(root, task_id) or {}
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        callback_store.init_db(conn)
+        origin_thread_id = str(
+            callback_store.read_origin_thread(conn, task_id)
+            or card.get("origin_thread_id")
+            or ""
+        ).strip()
+    finally:
+        conn.close()
+    if not origin_thread_id:
+        return "origin_thread_unbound"
+    provider = str(card.get("coordinator_provider") or "").strip().lower()
+    if provider not in TERMINAL_CALLBACK_ROUTABLE_PROVIDERS:
+        return "provider_unroutable"
+    transition = callback_store.resolve_callback_transition(substatus)
+    if transition not in callback_store.CALLBACK_ELIGIBLE_TRANSITIONS:
+        return "transition_ineligible"
+    return ""
 
 
 # Terminal substatuses that represent hard dependency/policy/scope blockers

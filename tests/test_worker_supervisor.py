@@ -451,11 +451,15 @@ def test_fake_clock_past_legacy_timeout_does_not_kill_live_child(
         _assert_timeout_not_enforced(payload, timeout_seconds)
 
 
-def test_supervisor_enforces_provider_reported_live_token_cap(tmp_path: Path) -> None:
+def test_supervisor_does_not_terminate_when_live_usage_crosses_legacy_cap(
+    tmp_path: Path,
+) -> None:
+    # A deterministic provider stream crosses a legacy cap while running and
+    # must continue to ordinary completion: usage never signals or reaps it.
     script = (
         "import json,time; "
         "print(json.dumps({'usage': {'input_tokens': 9, 'output_tokens': 4}}), flush=True); "
-        "time.sleep(30)"
+        "time.sleep(.4)"
     )
     spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
     spec.update(
@@ -467,16 +471,21 @@ def test_supervisor_enforces_provider_reported_live_token_cap(tmp_path: Path) ->
 
     result = _run_supervisor(spec_path)
 
-    assert result.returncode == 122, result.stderr.decode()
+    assert result.returncode == 0, result.stderr.decode()
     status = _read_status(Path(spec["status_path"]))
-    assert status["state"] == "token_budget_exceeded"
+    assert status["state"] == "exited"
+    assert status["state"] != "token_budget_exceeded"
     _assert_timeout_not_enforced(status, 10)
+    assert status["error"] == ""
+    # Usage is still recorded, explicitly labeled non-enforcing telemetry.
     assert status["token_budget"]["cap_tokens"] == 10
-    assert status["token_budget"]["enforceable_live_tokens"] == 13
-    assert status["token_budget"]["events"][-1]["cap_enforceable"] is True
+    assert status["token_budget"]["accepted_total_tokens"] == 13
+    assert status["token_budget"]["enforcing"] is False
+    assert status["token_budget"]["cap_enforceable"] is False
+    assert status["token_budget"]["events"][-1]["cap_enforceable"] is False
 
 
-def test_supervisor_sums_claude_completed_turn_usage_for_live_cap(
+def test_supervisor_records_claude_turn_usage_without_enforcing_legacy_cap(
     tmp_path: Path,
 ) -> None:
     event = {
@@ -494,8 +503,8 @@ def test_supervisor_sums_claude_completed_turn_usage_for_live_cap(
     script = (
         "import json,time; "
         f"event={event!r}; "
-        "print(json.dumps(event), flush=True); time.sleep(.2); "
-        "print(json.dumps(event), flush=True); time.sleep(30)"
+        "print(json.dumps(event), flush=True); time.sleep(.15); "
+        "print(json.dumps(event), flush=True); time.sleep(.4)"
     )
     spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
     spec.update(
@@ -507,12 +516,14 @@ def test_supervisor_sums_claude_completed_turn_usage_for_live_cap(
 
     result = _run_supervisor(spec_path)
 
-    assert result.returncode == 122, result.stderr.decode()
+    assert result.returncode == 0, result.stderr.decode()
     status = _read_status(Path(spec["status_path"]))
-    assert status["state"] == "token_budget_exceeded"
+    assert status["state"] == "exited"
+    assert status["state"] != "token_budget_exceeded"
     _assert_timeout_not_enforced(status, 10)
-    assert status["token_budget"]["enforceable_live_tokens"] == 112
-    assert status["token_budget"]["events"][-1]["cap_enforceable"] is True
+    assert status["token_budget"]["accepted_total_tokens"] == 112
+    assert status["token_budget"]["enforcing"] is False
+    assert status["token_budget"]["events"][-1]["cap_enforceable"] is False
 
 
 def test_supervisor_does_not_terminate_on_output_bytes(
@@ -558,6 +569,7 @@ def test_terminal_only_usage_is_posthoc_and_never_claimed_enforced(tmp_path: Pat
     _assert_timeout_not_enforced(status, 10)
     assert status["token_budget"]["accepted_total_tokens"] == 13
     assert status["token_budget"]["enforceable_live_tokens"] == 0
+    assert status["token_budget"]["enforcing"] is False
     assert status["token_budget"]["events"][-1]["cap_enforceable"] is False
 
 
@@ -824,16 +836,15 @@ def test_fake_clock_exact_child_exit_is_exactly_once(
     _assert_timeout_not_enforced(status, timeout_seconds)
 
 
-def test_fake_clock_token_budget_termination_is_exactly_once(
+def test_fake_clock_live_usage_crossing_legacy_cap_never_terminates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = _FakeClock()
     _install_fake_clock(monkeypatch, clock)
     timeout_seconds = 2
     script = (
-        "import json,time; "
-        "print(json.dumps({'usage': {'input_tokens': 9, 'output_tokens': 4}}), flush=True); "
-        "time.sleep(30)"
+        "import json; "
+        "print(json.dumps({'usage': {'input_tokens': 9, 'output_tokens': 4}}), flush=True)"
     )
     _, spec = _spec(tmp_path, [sys.executable, "-c", script], timeout=timeout_seconds)
     spec.update(
@@ -852,9 +863,13 @@ def test_fake_clock_token_budget_termination_is_exactly_once(
 
     code = worker_supervisor.supervise(spec)
 
-    assert code == 122
-    assert terminate_calls["n"] == 1
+    assert code == 0
+    assert terminate_calls["n"] == 0
     status = json.loads(Path(spec["status_path"]).read_text(encoding="utf-8"))
-    assert status["state"] == "token_budget_exceeded"
+    assert status["state"] == "exited"
+    assert status["state"] != "token_budget_exceeded"
     _assert_timeout_not_enforced(status, timeout_seconds)
-    assert status["token_budget"]["events"][-1]["cap_enforceable"] is True
+    assert status["token_budget"]["cap_tokens"] == 10
+    assert status["token_budget"]["accepted_total_tokens"] == 13
+    assert status["token_budget"]["enforcing"] is False
+    assert status["token_budget"]["events"][-1]["cap_enforceable"] is False

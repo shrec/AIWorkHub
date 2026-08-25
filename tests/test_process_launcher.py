@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -5052,3 +5054,1808 @@ def test_terminal_rework_delta_evidence_reports_seal_failure_without_descriptor(
     assert evidence["sealed"] is False
     assert evidence["reason"] == "rework_delta_seal_failed:synthetic_failure"
     assert "artifact_path" not in evidence
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00401: reconciliation records terminal intent under the registry
+# lock and settles it against the task store with the lock released.
+# ---------------------------------------------------------------------------
+
+
+def _committed_reviewer_event(
+    request_id: str,
+    *,
+    reviewer_claim_epoch: int | None = 5,
+    task_id: str = "TASK_B1",
+) -> dict:
+    """A committed reviewer attempt whose owner identity is a proven mismatch."""
+
+    event = {
+        "request_id": request_id,
+        "task_id": task_id,
+        "runner": "claude_worker_b1",
+        "topic": "quality_review",
+        "adapter_id": "claude_cli",
+        "state": "provider_spawn_committed",
+        "reservation_expires_at_epoch": time.time() + 600,
+        "owner_pid": os.getpid(),
+        "owner_pid_start_ticks": 1,
+    }
+    if reviewer_claim_epoch is not None:
+        event["reviewer_claim_epoch"] = reviewer_claim_epoch
+    return event
+
+
+def test_reconciliation_reaches_no_task_store_under_the_registry_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event(_committed_reviewer_event("req-no-store"))
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("reconciliation must not touch the task store under the lock")
+
+    for name in ("mark_terminal_failure", "get_task", "_require_ready", "_connect"):
+        monkeypatch.setattr(process_launcher.task_store, name, forbidden)
+
+    assert manager._reconcile_expired_starting_reservations() == 1
+    latest = manager._latest_by_request()["req-no-store"]
+    assert latest["state"] == "blocked"
+    assert latest["blocked_reason"] == "provider_spawn_committed_owner_dead"
+    assert latest["terminal_intent"] == "recorded"
+    assert manager._reviewer_terminal_intent_path("req-no-store").is_file()
+
+
+def _intent_diagnostics(manager) -> list[dict]:
+    """Every operator-visible line recorded for an unsettleable intent."""
+
+    path = process_launcher.reviewer_terminal_intent_diagnostic_path(
+        manager.process_log_path
+    )
+    if not path.is_file():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_terminal_intent_without_bindable_identity_is_never_acted_on(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event(_committed_reviewer_event("req-bound", reviewer_claim_epoch=6))
+    assert manager._reconcile_expired_starting_reservations() == 1
+
+    intent_path = manager._reviewer_terminal_intent_path("req-bound")
+    payload = json.loads(intent_path.read_text(encoding="utf-8"))
+    payload["reviewer_claim_epoch"] = None
+    intent_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("an unbindable intent must never reach the task store")
+
+    monkeypatch.setattr(
+        process_launcher.task_store, "mark_terminal_failure", forbidden
+    )
+    monkeypatch.setattr(
+        process_launcher.task_store, "enqueue_terminal_callback", forbidden
+    )
+
+    ledger_before = len(manager._events())
+    assert manager._settle_reviewer_terminal_intents() == 0
+    # It is retained, not deleted: a corrupt intent is evidence, not garbage.
+    assert intent_path.is_file()
+
+    # ...but silent evidence strands the card with nothing saying why, so the
+    # diagnostic ledger names it exactly once.
+    diagnostics = _intent_diagnostics(manager)
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["reason"] == "identity_unbindable"
+    assert diagnostics[0]["intent_file"] == intent_path.name
+    assert diagnostics[0]["schema_id"] == (
+        process_launcher.REVIEWER_TERMINAL_INTENT_DIAGNOSTIC_SCHEMA_ID
+    )
+    assert diagnostics[0]["bytes"] == intent_path.stat().st_size
+
+    # Reporting it must not re-enter settlement: no process-ledger event, and
+    # therefore no second reconcile pass and no callback.
+    assert len(manager._events()) == ledger_before
+    for _ in range(3):
+        assert manager._settle_reviewer_terminal_intents() == 0
+    assert len(_intent_diagnostics(manager)) == 1
+
+
+def test_foreign_intent_files_are_ignored(tmp_path: Path, monkeypatch) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager.process_dir.mkdir(parents=True, exist_ok=True)
+    foreign = manager.process_dir / (
+        "deadbeef" + process_launcher.ProcessManager._REVIEWER_TERMINAL_INTENT_SUFFIX
+    )
+    foreign.write_text(json.dumps({"schema_id": "someone.else.v1"}), encoding="utf-8")
+    unreadable = manager.process_dir / (
+        "beefdead" + process_launcher.ProcessManager._REVIEWER_TERMINAL_INTENT_SUFFIX
+    )
+    unreadable.write_text("{not json at all", encoding="utf-8")
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("a foreign schema must never drive a terminal transition")
+
+    monkeypatch.setattr(
+        process_launcher.task_store, "mark_terminal_failure", forbidden
+    )
+    monkeypatch.setattr(
+        process_launcher.task_store, "enqueue_terminal_callback", forbidden
+    )
+
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert foreign.is_file()
+    assert unreadable.is_file()
+
+    reasons = {
+        record["intent_file"]: record["reason"]
+        for record in _intent_diagnostics(manager)
+    }
+    assert reasons == {
+        foreign.name: "foreign_schema",
+        unreadable.name: "unparseable_json",
+    }
+    # Each file is reported once no matter how many passes run over it.
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert len(_intent_diagnostics(manager)) == 2
+
+
+def test_unreadable_intent_bytes_are_named_once_and_never_confused_with_a_race(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # ``FileNotFoundError`` on this read means the settler that won the intent
+    # retired it underneath us -- the benign race the design is built around,
+    # and rightly silent.  Any OTHER read failure leaves the intent sitting
+    # there unsettleable, and reading it as that same race stranded the card
+    # with nothing anywhere saying why.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event(
+        _committed_reviewer_event("req-unreadable", reviewer_claim_epoch=4)
+    )
+    assert manager._reconcile_expired_starting_reservations() == 1
+    intent_path = manager._reviewer_terminal_intent_path("req-unreadable")
+    assert intent_path.is_file()
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("an unreadable intent must never reach the task store")
+
+    monkeypatch.setattr(
+        process_launcher.task_store, "mark_terminal_failure", forbidden
+    )
+    monkeypatch.setattr(
+        process_launcher.task_store, "enqueue_terminal_callback", forbidden
+    )
+
+    # Injected rather than produced with chmod: chmod's effect on a read
+    # depends on the filesystem and on whether the suite runs as root, so it
+    # cannot state deterministically which branch is under test.
+    injected: list[OSError] = [FileNotFoundError(errno.ENOENT, "already retired")]
+    exact_read_text = Path.read_text
+
+    def refusing_read_text(self, *args, **kwargs):
+        if self.name == intent_path.name:
+            raise injected[0]
+        return exact_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", refusing_read_text)
+
+    # The winner already retired it: nothing to report.
+    for _ in range(2):
+        assert manager._settle_reviewer_terminal_intents() == 0
+    assert _intent_diagnostics(manager) == []
+
+    # The intent is still THERE and unreadable, which no pass can settle.
+    injected[0] = OSError(errno.EIO, "injected unreadable intent")
+    for _ in range(3):
+        assert manager._settle_reviewer_terminal_intents() == 0
+
+    monkeypatch.undo()
+    # Retained, never deleted: the intent is the only thing that brings a
+    # later pass back to this claim once the bytes are readable again.
+    assert intent_path.is_file()
+    diagnostics = _intent_diagnostics(manager)
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["reason"] == "unreadable_bytes"
+    assert diagnostics[0]["intent_file"] == intent_path.name
+    assert diagnostics[0]["schema_id"] == (
+        process_launcher.REVIEWER_TERMINAL_INTENT_DIAGNOSTIC_SCHEMA_ID
+    )
+
+
+def test_unsettleable_intent_diagnostics_are_bounded_per_pass(
+    tmp_path: Path,
+) -> None:
+    # An operator who leaves a pile of corrupt intents in place must not have
+    # the diagnostic ledger grow without bound in a single pass -- but nothing
+    # may be silently dropped either, so later passes report the remainder.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager.process_dir.mkdir(parents=True, exist_ok=True)
+    cap = process_launcher.ProcessManager._TERMINAL_INTENT_DIAGNOSTICS_PER_PASS
+    total = cap + 3
+    for index in range(total):
+        path = manager.process_dir / (
+            f"{index:08x}"
+            + process_launcher.ProcessManager._REVIEWER_TERMINAL_INTENT_SUFFIX
+        )
+        path.write_text("{ truncated", encoding="utf-8")
+
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert len(_intent_diagnostics(manager)) == cap
+
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert len(_intent_diagnostics(manager)) == total
+
+    # Every intent is now accounted for exactly once and nothing repeats.
+    files = [record["intent_file"] for record in _intent_diagnostics(manager)]
+    assert len(set(files)) == total
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert len(_intent_diagnostics(manager)) == total
+
+
+def test_terminal_intent_resolution_classifies_store_outcomes() -> None:
+    resolved = process_launcher.ProcessManager._terminal_intent_is_resolved
+    # Outcomes proving no future pass could move this exact claim.
+    assert resolved("task_not_found") is True
+    assert resolved("runner_mismatch") is True
+    assert resolved("claim_owner_mismatch") is True
+    assert resolved("launch_request_mismatch") is True
+    assert resolved("expected_claim_epoch_invalid") is True
+    assert resolved("claim_epoch_mismatch:expected=3:current=4") is True
+    assert resolved("not_processing:current=blocked") is True
+    assert resolved("unsupported_terminal_failure:nonsense") is True
+    # A CAS conflict is transient and must keep the intent for the next pass.
+    assert resolved("terminal_failure_transition_conflict") is False
+    assert resolved("blocked") is False
+
+
+def test_terminal_intent_resolution_reads_the_stores_own_vocabulary() -> None:
+    # The launcher must not keep a private copy of these states: a copy stops
+    # matching the day the store grows a new fail-closed outcome, and the
+    # intent would then be retried forever against a card it can never move.
+    store = process_launcher.task_store
+    resolved = process_launcher.ProcessManager._terminal_intent_is_resolved
+    for state in store.TERMINAL_FAILURE_FINAL_STATES:
+        assert resolved(state) is True
+    for prefix in store.TERMINAL_FAILURE_FINAL_STATE_PREFIXES:
+        assert resolved(prefix + "observed") is True
+    assert store.terminal_failure_state_is_final("") is False
+    assert store.terminal_failure_state_is_final(None) is False
+
+
+def _pending_intent(tmp_path: Path, request_id: str, claim_epoch: int = 4):
+    """A manager holding exactly one durable, bindable terminal intent."""
+
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event(
+        _committed_reviewer_event(request_id, reviewer_claim_epoch=claim_epoch)
+    )
+    assert manager._reconcile_expired_starting_reservations() == 1
+    intent_path = manager._reviewer_terminal_intent_path(request_id)
+    assert intent_path.is_file()
+    return manager, intent_path
+
+
+_FINAL_REFUSALS = sorted(
+    process_launcher.task_store.TERMINAL_FAILURE_FINAL_STATES
+) + [
+    prefix + "observed"
+    for prefix in process_launcher.task_store.TERMINAL_FAILURE_FINAL_STATE_PREFIXES
+]
+
+
+@pytest.mark.parametrize("final_state", _FINAL_REFUSALS)
+def test_final_refusal_never_retires_an_intent_silently(
+    tmp_path: Path, monkeypatch, final_state: str
+) -> None:
+    # Across the WHOLE final-state vocabulary: a refusal that is not this
+    # intent's own completed transition retires the ticket having moved no
+    # card at all.  Retiring it silently is indistinguishable from a
+    # settlement that worked, so every one of these must leave evidence.
+    manager, intent_path = _pending_intent(tmp_path, "req-final")
+
+    monkeypatch.setattr(
+        process_launcher.task_store,
+        "mark_terminal_failure",
+        lambda *_a, **_k: (False, final_state),
+    )
+    monkeypatch.setattr(
+        process_launcher.task_store,
+        "terminal_failure_already_applied",
+        lambda *_a, **_k: False,
+    )
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("a refusal that moved no card owes no callback")
+
+    monkeypatch.setattr(
+        process_launcher.task_store, "enqueue_terminal_callback", forbidden
+    )
+
+    assert manager._settle_reviewer_terminal_intents() == 0
+    # Spent: no later pass could ever move this claim, so the ticket goes...
+    assert not intent_path.exists()
+    # ...but never before the refusal is on the record, exactly once.
+    diagnostics = _intent_diagnostics(manager)
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["reason"] == f"final_refusal:{final_state}"
+    assert diagnostics[0]["intent_file"] == intent_path.name
+    assert diagnostics[0]["schema_id"] == (
+        process_launcher.REVIEWER_TERMINAL_INTENT_DIAGNOSTIC_SCHEMA_ID
+    )
+    # Retiring the ticket retires its markers too: nothing is left behind to
+    # suppress the diagnostic if the same request ever recurs.
+    assert not manager._terminal_intent_diagnosed_marker(intent_path).exists()
+    assert not manager._terminal_intent_retired_marker(intent_path).exists()
+    # Nothing re-enters settlement and nothing repeats.
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert len(_intent_diagnostics(manager)) == 1
+
+
+def test_final_refusal_retains_the_intent_when_evidence_cannot_be_written(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Never silent-drop: when the refusal cannot be recorded the ticket is
+    # retained so a later pass reports AND retires it, rather than the intent
+    # disappearing with nothing anywhere saying it ever existed.
+    manager, intent_path = _pending_intent(tmp_path, "req-unwritable")
+
+    monkeypatch.setattr(
+        process_launcher.task_store,
+        "mark_terminal_failure",
+        lambda *_a, **_k: (False, "task_not_found"),
+    )
+    monkeypatch.setattr(
+        process_launcher.task_store,
+        "terminal_failure_already_applied",
+        lambda *_a, **_k: False,
+    )
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_append_intent_diagnostic",
+        lambda self, record: False,
+    )
+
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert intent_path.is_file()
+    assert _intent_diagnostics(manager) == []
+    # The failed claim was given back, so it cannot suppress a later report.
+    assert not manager._terminal_intent_retired_marker(intent_path).exists()
+
+    # A later pass, with the ledger writable again, reports and then retires.
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        process_launcher.task_store,
+        "mark_terminal_failure",
+        lambda *_a, **_k: (False, "task_not_found"),
+    )
+    monkeypatch.setattr(
+        process_launcher.task_store,
+        "terminal_failure_already_applied",
+        lambda *_a, **_k: False,
+    )
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert not intent_path.exists()
+    reasons = [record["reason"] for record in _intent_diagnostics(manager)]
+    assert reasons == ["final_refusal:task_not_found"]
+
+
+_ABSENT = object()
+
+# Every shape that leaves a proven-dead reservation impossible to bind to an
+# exact task/request/claim epoch.  Each one must fail closed AND say so once.
+_IDENTITY_INCOMPLETE_EVENTS = {
+    "epoch_missing": {"reviewer_claim_epoch": _ABSENT},
+    "epoch_zero": {"reviewer_claim_epoch": 0},
+    "epoch_negative": {"reviewer_claim_epoch": -3},
+    # ``bool`` is an ``int`` subclass, so a bare isinstance check would accept
+    # these and bind a transition to epoch 1 or 0.
+    "epoch_bool_true": {"reviewer_claim_epoch": True},
+    "epoch_bool_false": {"reviewer_claim_epoch": False},
+    "epoch_string": {"reviewer_claim_epoch": "7"},
+    "epoch_float": {"reviewer_claim_epoch": 7.0},
+    "task_id_missing": {"task_id": _ABSENT},
+    "task_id_blank": {"task_id": "   "},
+    "runner_missing": {"runner": _ABSENT},
+    "runner_blank": {"runner": ""},
+}
+
+
+def _incomplete_identity_event(request_id: str, label: str) -> dict:
+    event = _committed_reviewer_event(request_id)
+    for key, value in _IDENTITY_INCOMPLETE_EVENTS[label].items():
+        if value is _ABSENT:
+            event.pop(key, None)
+        else:
+            event[key] = value
+    return event
+
+
+@pytest.mark.parametrize("label", sorted(_IDENTITY_INCOMPLETE_EVENTS))
+def test_identity_incomplete_committed_reservation_is_reported_exactly_once(
+    tmp_path: Path, monkeypatch, label: str
+) -> None:
+    # A proven-dead committed reservation that cannot be bound is never
+    # terminalized -- correctly -- but that refusal is re-derived from the same
+    # unchanged row on every pass.  Without a diagnostic it is silent forever.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event(_incomplete_identity_event("req-incomplete", label))
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("an unbindable reservation must never reach the task store")
+
+    monkeypatch.setattr(
+        process_launcher.task_store, "mark_terminal_failure", forbidden
+    )
+    monkeypatch.setattr(
+        process_launcher.task_store, "enqueue_terminal_callback", forbidden
+    )
+
+    intent_path = manager._reviewer_terminal_intent_path("req-incomplete")
+    ledger_before = len(manager._events())
+
+    # Fails closed: nothing terminalized, no intent recorded, no ledger event.
+    assert manager._reconcile_expired_starting_reservations() == 0
+    assert not intent_path.exists()
+    assert len(manager._events()) == ledger_before
+
+    # ...but the stranded reservation is now named, exactly once.
+    diagnostics = _intent_diagnostics(manager)
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["reason"] == (
+        "identity_incomplete:provider_spawn_committed_owner_dead"
+    )
+    assert diagnostics[0]["intent_file"] == intent_path.name
+    assert diagnostics[0]["schema_id"] == (
+        process_launcher.REVIEWER_TERMINAL_INTENT_DIAGNOSTIC_SCHEMA_ID
+    )
+
+    # Re-evaluated on every pass, reported once: the bound is what makes the
+    # diagnostic safe to emit from a loop that never converges.
+    for _ in range(5):
+        assert manager._reconcile_expired_starting_reservations() == 0
+    assert len(_intent_diagnostics(manager)) == 1
+    assert len(manager._events()) == ledger_before
+    assert not intent_path.exists()
+
+
+def test_identity_incomplete_diagnostic_separates_distinct_episodes(
+    tmp_path: Path,
+) -> None:
+    # Keying the marker on the request alone would hide a genuinely different
+    # episode -- a re-claimed card arriving with a new, still-malformed
+    # identity -- behind the first line ever written for that request.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event(_incomplete_identity_event("req-episodes", "epoch_zero"))
+    assert manager._reconcile_expired_starting_reservations() == 0
+    assert len(_intent_diagnostics(manager)) == 1
+
+    # The same episode again stays silent...
+    assert manager._reconcile_expired_starting_reservations() == 0
+    assert len(_intent_diagnostics(manager)) == 1
+
+    # ...while a new identity for the same request earns its own line.
+    manager._append_event(_incomplete_identity_event("req-episodes", "epoch_string"))
+    assert manager._reconcile_expired_starting_reservations() == 0
+    assert len(_intent_diagnostics(manager)) == 2
+    assert manager._reconcile_expired_starting_reservations() == 0
+    assert len(_intent_diagnostics(manager)) == 2
+
+
+def test_identity_incomplete_diagnostics_are_bounded_per_reconcile_pass(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The O_EXCL marker bounds one EPISODE for all time, but a single
+    # reconciliation pass can meet arbitrarily many distinct unbindable rows,
+    # and each first sighting costs a marker plus a ledger line.  Without a
+    # per-pass ceiling one pass emits the whole pile -- so the pass is bounded,
+    # and the remainder is retried rather than dropped.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    cap = process_launcher.ProcessManager._TERMINAL_INTENT_DIAGNOSTICS_PER_PASS
+    total = cap + 3
+    for index in range(total):
+        manager._append_event(
+            _committed_reviewer_event(
+                f"req-flood-{index:02d}",
+                reviewer_claim_epoch=None,
+                task_id=f"TASK_FLOOD_{index:02d}",
+            )
+        )
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("an unbindable reservation must never reach the task store")
+
+    monkeypatch.setattr(
+        process_launcher.task_store, "mark_terminal_failure", forbidden
+    )
+    monkeypatch.setattr(
+        process_launcher.task_store, "enqueue_terminal_callback", forbidden
+    )
+
+    ledger_before = len(manager._events())
+
+    # Fails closed for every row, and reports at most ``cap`` of them.
+    assert manager._reconcile_expired_starting_reservations() == 0
+    assert len(_intent_diagnostics(manager)) == cap
+    assert len(manager._events()) == ledger_before
+
+    # An unreported episode kept no marker, so the next pass names the rest
+    # instead of them being silently dropped.
+    assert manager._reconcile_expired_starting_reservations() == 0
+    assert len(_intent_diagnostics(manager)) == total
+
+    # Exactly once per episode: every request appears on the record once, and
+    # further passes -- which re-derive the same refusal forever -- add nothing.
+    files = [record["intent_file"] for record in _intent_diagnostics(manager)]
+    assert len(set(files)) == total
+    for _ in range(3):
+        assert manager._reconcile_expired_starting_reservations() == 0
+    assert len(_intent_diagnostics(manager)) == total
+    assert len(manager._events()) == ledger_before
+    for index in range(total):
+        assert not manager._reviewer_terminal_intent_path(
+            f"req-flood-{index:02d}"
+        ).exists()
+
+
+def test_bindable_committed_reservation_records_no_identity_diagnostic(
+    tmp_path: Path,
+) -> None:
+    # The diagnostic names a permanent stranding, so a reservation that
+    # terminalizes normally must not produce one: an operator paged for a
+    # healthy transition learns to ignore the ledger.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event(
+        _committed_reviewer_event("req-bindable", reviewer_claim_epoch=4)
+    )
+    assert manager._reconcile_expired_starting_reservations() == 1
+    assert manager._reviewer_terminal_intent_path("req-bindable").is_file()
+    assert _intent_diagnostics(manager) == []
+
+
+def test_intent_substatus_outside_store_vocabulary_never_reaches_the_store(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A substatus the store would refuse is a malformed intent, not a claim to
+    # act on.  Validating it here keeps it off SQLite entirely and routes it to
+    # the retention path instead of letting a final
+    # ``unsupported_terminal_failure`` retire a card that never moved.
+    manager, intent_path = _pending_intent(tmp_path, "req-substatus")
+    payload = json.loads(intent_path.read_text(encoding="utf-8"))
+    payload["substatus"] = "not_a_real_substatus"
+    intent_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("a malformed substatus must never reach the task store")
+
+    monkeypatch.setattr(
+        process_launcher.task_store, "mark_terminal_failure", forbidden
+    )
+    monkeypatch.setattr(
+        process_launcher.task_store, "enqueue_terminal_callback", forbidden
+    )
+
+    assert manager._settle_reviewer_terminal_intents() == 0
+    # Retained as evidence, exactly like an unbindable identity.
+    assert intent_path.is_file()
+    diagnostics = _intent_diagnostics(manager)
+    assert len(diagnostics) == 1
+    # ...but under its OWN reason.  The identity here bound perfectly and only
+    # the substatus is unusable, so reusing ``identity_unbindable`` would send
+    # an operator to repair task/request/claim-epoch fields that are correct.
+    assert diagnostics[0]["reason"] == "substatus_unsupported"
+    assert diagnostics[0]["intent_file"] == intent_path.name
+    for _ in range(3):
+        assert manager._settle_reviewer_terminal_intents() == 0
+    assert len(_intent_diagnostics(manager)) == 1
+
+
+@pytest.mark.parametrize(
+    "substatus", sorted(process_launcher.task_store.MARK_TERMINAL_FAILURE_SUBSTATUSES)
+)
+def test_every_declared_substatus_still_reaches_the_store(
+    tmp_path: Path, monkeypatch, substatus: str
+) -> None:
+    # The new guard must gate malformed values only: every substatus the store
+    # itself declares has to pass straight through to the transition.
+    manager, intent_path = _pending_intent(tmp_path, "req-vocab")
+    payload = json.loads(intent_path.read_text(encoding="utf-8"))
+    payload["substatus"] = substatus
+    intent_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    seen: list[str] = []
+
+    def mark(*_args, **kwargs):
+        seen.append(kwargs["substatus"])
+        return True, "blocked"
+
+    monkeypatch.setattr(process_launcher.task_store, "mark_terminal_failure", mark)
+    monkeypatch.setattr(
+        process_launcher.task_store,
+        "enqueue_terminal_callback",
+        lambda *_a, **_k: True,
+    )
+
+    assert manager._settle_reviewer_terminal_intents() == 1
+    assert seen == [substatus]
+    assert not intent_path.exists()
+    assert _intent_diagnostics(manager) == []
+
+
+def test_contained_settlement_failure_is_named_once_per_exception_type(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The contained catch must keep returning 0 -- the caller's launch outcome
+    # may not be replaced by an unrelated reservation error -- but 0 is also
+    # what "nothing was pending" returns, so a settler that can never run
+    # would otherwise look idle forever.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager.process_dir.mkdir(parents=True, exist_ok=True)
+
+    def boom(self):
+        raise RuntimeError("settler is broken")
+
+    monkeypatch.setattr(
+        process_launcher.ProcessManager, "_settle_reviewer_terminal_intents", boom
+    )
+    # Repeated passes must not grow the ledger while the fault persists.
+    for _ in range(3):
+        assert manager._settle_reviewer_terminal_intents_contained() == 0
+    diagnostics = _intent_diagnostics(manager)
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["reason"] == "settlement_pass_failed:RuntimeError"
+    assert diagnostics[0]["intent_file"] == ""
+    assert diagnostics[0]["schema_id"] == (
+        process_launcher.REVIEWER_TERMINAL_INTENT_DIAGNOSTIC_SCHEMA_ID
+    )
+
+    # A genuinely different fault is still worth one line of its own.
+    def other(self):
+        raise ValueError("a different fault")
+
+    monkeypatch.setattr(
+        process_launcher.ProcessManager, "_settle_reviewer_terminal_intents", other
+    )
+    assert manager._settle_reviewer_terminal_intents_contained() == 0
+    assert {record["reason"] for record in _intent_diagnostics(manager)} == {
+        "settlement_pass_failed:RuntimeError",
+        "settlement_pass_failed:ValueError",
+    }
+
+
+def test_bool_safe_int_rule_has_exactly_one_authority() -> None:
+    # Two copies of this rule drift, and the day they disagree a truthy flag
+    # binds a terminal transition or its callback to episode 1.
+    assert (
+        process_launcher._is_bool_safe_int
+        is process_launcher.task_store.is_bool_safe_int
+    )
+    predicate = process_launcher._is_bool_safe_int
+    assert predicate(1) is True
+    assert predicate(0) is True
+    assert predicate(True) is False
+    assert predicate(False) is False
+    assert predicate("1") is False
+    assert predicate(None) is False
+
+
+def test_settled_terminal_callback_routes_through_the_public_store_api(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Settlement owns no second copy of the callback-store access and no
+    # private wrapper around it: it hands the store the exact episode it just
+    # transitioned and lets the store bind the transition and the thread.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event(
+        _committed_reviewer_event("req-callback", reviewer_claim_epoch=9)
+    )
+    assert manager._reconcile_expired_starting_reservations() == 1
+
+    calls: list[dict] = []
+
+    def record(root, task_id, **kwargs):
+        calls.append({"root": root, "task_id": task_id, **kwargs})
+        return True
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("the launcher must not reach the callback database itself")
+
+    monkeypatch.setattr(
+        process_launcher.task_store, "mark_terminal_failure",
+        lambda *_a, **_k: (True, "blocked"),
+    )
+    monkeypatch.setattr(process_launcher.task_store, "enqueue_terminal_callback", record)
+    for name in ("get_task", "_require_ready", "_connect"):
+        monkeypatch.setattr(process_launcher.task_store, name, forbidden)
+
+    assert manager._settle_reviewer_terminal_intents() == 1
+    assert calls == [{
+        "root": manager.repo,
+        "task_id": "TASK_B1",
+        "substatus": "liveness_lost",
+        "request_id": "req-callback",
+        "claim_epoch": 9,
+    }]
+    assert not hasattr(manager, "_enqueue_terminal_callback")
+
+
+def test_terminal_callback_authority_contains_an_unavailable_store(
+    tmp_path: Path,
+) -> None:
+    # Containment lives in the one authority rather than in each caller: a
+    # store that cannot even be opened is reported as "not enqueued" instead of
+    # raising over the terminal transition that already succeeded.
+    assert process_launcher.task_store.enqueue_terminal_callback(
+        tmp_path,
+        "TASK_B1",
+        substatus="liveness_lost",
+        request_id="req-callback",
+        claim_epoch=9,
+    ) is False
+
+
+def test_terminal_callback_authority_contains_a_locked_store(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # ``database is locked`` is the ordinary shape of a contended store, and it
+    # is a ``sqlite3.Error`` rather than a ``TaskStoreError``.  Letting it
+    # escape would make one contended card abort the settlement of every other
+    # intent, so it is contained here as "not written yet".
+    store = process_launcher.task_store
+
+    def locked(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "get_task", locked)
+    assert store.enqueue_terminal_callback(
+        tmp_path,
+        "TASK_B1",
+        substatus="liveness_lost",
+        request_id="req-callback",
+        claim_epoch=9,
+    ) is False
+
+
+def _ready_store_with_card(
+    root: Path,
+    *,
+    provider: str = "claude",
+    origin_thread_id: str = "thread-42",
+    claim_epoch: int = 9,
+) -> Path:
+    """One initialized canonical store holding exactly one terminalized card.
+
+    The containment regressions above deliberately never reach a real store,
+    so the *success* arm of the callback authority -- the single writer of the
+    manager wake a settled terminal intent owes -- was never executed by a
+    test.  Seeding the card directly is the smallest fixture that gets there:
+    the creation API derives identity from a live manager route this suite has
+    no business standing up.
+    """
+    store = process_launcher.task_store
+    assert store.initialize_repository(root)["ok"] is True
+    db = Path(store.storage_readiness(root).canonical_db)
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status,"
+            " card_json, created_at, updated_at, origin_thread_id)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                "TASK_B1",
+                "claude_worker_b1",
+                "task_mcp",
+                "blocked",
+                "liveness_lost",
+                json.dumps(
+                    {"coordinator_provider": provider, "claim_epoch": claim_epoch}
+                ),
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                origin_thread_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db
+
+
+def _outbox_rows(db: Path) -> list[dict]:
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute("SELECT * FROM callback_outbox")]
+    finally:
+        conn.close()
+
+
+def test_terminal_callback_authority_writes_exactly_one_bound_row(tmp_path: Path) -> None:
+    # Every field this row binds is what routes the wake: the transition tells
+    # the manager what happened, and provider/thread/episode/request tell it
+    # whose episode it happened to.  A silently unbound field is a callback
+    # delivered about somebody else's work, so they are asserted exactly.
+    db = _ready_store_with_card(tmp_path)
+    store = process_launcher.task_store
+
+    assert store.enqueue_terminal_callback(
+        tmp_path,
+        "TASK_B1",
+        substatus="liveness_lost",
+        request_id="req-callback",
+        claim_epoch=9,
+    ) is True
+
+    rows = _outbox_rows(db)
+    assert len(rows) == 1
+    assert {
+        key: rows[0][key]
+        for key in (
+            "task_id", "provider", "origin_thread_id",
+            "transition", "episode_id", "request_id", "state",
+        )
+    } == {
+        "task_id": "TASK_B1",
+        "provider": "claude",
+        "origin_thread_id": "thread-42",
+        "transition": "blocked",
+        "episode_id": "9",
+        "request_id": "req-callback",
+        "state": "pending",
+    }
+
+    # A retried settlement of the same durable intent is owed nothing more.
+    # ``False`` here is "already written", and the outbox must be untouched --
+    # a second pending row is a second wake for one terminal outcome.
+    assert store.enqueue_terminal_callback(
+        tmp_path,
+        "TASK_B1",
+        substatus="liveness_lost",
+        request_id="req-callback",
+        claim_epoch=9,
+    ) is False
+    assert _outbox_rows(db) == rows
+
+
+@pytest.mark.parametrize(
+    ("provider", "origin_thread_id", "card_claim_epoch"),
+    [
+        ("claude", "", 9),
+        ("gemini", "thread-42", 9),
+        ("claude", "thread-42", 10),
+    ],
+    ids=["route_missing", "provider_unknown", "episode_mismatch"],
+)
+def test_terminal_callback_authority_writes_nothing_it_cannot_bind(
+    tmp_path: Path, provider: str, origin_thread_id: str, card_claim_epoch: int
+) -> None:
+    # An unroutable or foreign identity fails closed as "not enqueued" and
+    # leaves no row behind: a callback nobody can be sure belongs to this
+    # episode is worse than the callback that was never written.
+    db = _ready_store_with_card(
+        tmp_path,
+        provider=provider,
+        origin_thread_id=origin_thread_id,
+        claim_epoch=card_claim_epoch,
+    )
+    assert process_launcher.task_store.enqueue_terminal_callback(
+        tmp_path,
+        "TASK_B1",
+        substatus="liveness_lost",
+        request_id="req-callback",
+        claim_epoch=9,
+    ) is False
+    assert _outbox_rows(db) == []
+
+
+def test_terminal_callback_authority_never_wakes_a_manager_with_review_ready(
+    tmp_path: Path,
+) -> None:
+    # A substatus this layer does not recognize must resolve to the ``blocked``
+    # failure class a manager has to look at, never to ``review_ready`` -- that
+    # would announce unreviewed, failed work as ready to inspect.
+    db = _ready_store_with_card(tmp_path)
+    assert process_launcher.task_store.enqueue_terminal_callback(
+        tmp_path,
+        "TASK_B1",
+        substatus="not_a_declared_substatus",
+        request_id="req-callback",
+        claim_epoch=9,
+    ) is True
+    rows = _outbox_rows(db)
+    assert len(rows) == 1
+    assert rows[0]["transition"] == "blocked"
+
+
+def _ready_store_with_settled_card(
+    root: Path,
+    *,
+    request_id: str,
+    claim_epoch: int = 9,
+    card_claim_epoch: int | None = None,
+    provider: str = "claude",
+    origin_thread_id: str = "thread-42",
+    status: str = "blocked",
+    worker_status: str = "liveness_lost",
+    claimed_by: str = "",
+    launch_request_id: str = "",
+) -> Path:
+    """An initialized store whose card already records THIS terminal failure.
+
+    That is exactly what a settler crash leaves behind: the transition is
+    durable on the card, so every later ``mark_terminal_failure`` can only
+    refuse the retry as already applied, and the one callback the intent still
+    owes is all that is left to settle.
+
+    ``card_claim_epoch`` (with ``status``/``worker_status``) models the card
+    DRIFTING past the episode its recorded failure names -- a recovery that
+    re-claimed and released it while the crashed settler still owed its
+    callback.  ``claimed_by``/``launch_request_id`` carry that drift all the
+    way into a live LATER claim, which is what makes the store refuse the
+    retried transition for the epoch rather than for the status.
+    ``provider``/``origin_thread_id`` model a callback identity the callback
+    store will never route.
+    """
+
+    current_epoch = claim_epoch if card_claim_epoch is None else card_claim_epoch
+    db = _ready_store_with_card(
+        root,
+        provider=provider,
+        origin_thread_id=origin_thread_id,
+        claim_epoch=current_epoch,
+    )
+    card: dict = {
+        "coordinator_provider": provider,
+        "claim_epoch": current_epoch,
+        "terminal_failure": {
+            "runner": "claude_worker_b1",
+            "substatus": "liveness_lost",
+            "claim_epoch": claim_epoch,
+            "evidence": {"request_id": request_id},
+        },
+    }
+    if launch_request_id:
+        card["launch_request_id"] = launch_request_id
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "UPDATE tasks SET status=?, worker_status=?, claimed_by=?, card_json=?"
+            " WHERE task_id=?",
+            (
+                status,
+                worker_status,
+                claimed_by or None,
+                json.dumps(card),
+                "TASK_B1",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db
+
+
+def _crashed_settler(tmp_path: Path, request_id: str) -> tuple:
+    """Compose the real settler with a real store in the exact crash window.
+
+    The callback is durably enqueued and the intent that owes it was never
+    retired -- the state the process is in when it dies between those two
+    steps.
+    """
+
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    db = _ready_store_with_settled_card(manager.repo, request_id=request_id)
+    manager._append_event(
+        _committed_reviewer_event(request_id, reviewer_claim_epoch=9)
+    )
+    assert manager._reconcile_expired_starting_reservations() == 1
+    intent_path = manager._reviewer_terminal_intent_path(request_id)
+    assert intent_path.is_file()
+    assert process_launcher.task_store.enqueue_terminal_callback(
+        manager.repo,
+        "TASK_B1",
+        substatus="liveness_lost",
+        request_id=request_id,
+        claim_epoch=9,
+    ) is True
+    return manager, db, intent_path
+
+
+def test_an_already_durable_callback_retires_its_intent_and_adds_no_row(
+    tmp_path: Path,
+) -> None:
+    # The exactly-once gap this closes.  ``enqueue_terminal_callback`` answers
+    # False for a duplicate exactly as it does for an unwritable store, so a
+    # settler that crashed after enqueueing meets that same refusal on every
+    # later scan.  Reading it as "not written yet" strands this intent -- and
+    # the processing claim behind it -- forever, which is why the scan below
+    # has to retire it while leaving the outbox untouched.
+    manager, db, intent_path = _crashed_settler(tmp_path, "req-durable")
+    durable = _outbox_rows(db)
+    assert len(durable) == 1
+    assert durable[0]["request_id"] == "req-durable"
+    assert durable[0]["state"] == "pending"
+
+    assert manager._settle_reviewer_terminal_intents() == 1
+    assert not intent_path.exists()
+    # One terminal outcome owes one manager wake: a second pending row here
+    # would be a second wake for the same episode.
+    assert _outbox_rows(db) == durable
+
+    # Repeated scans have nothing left to settle and still add nothing.
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert _outbox_rows(db) == durable
+
+
+def test_concurrent_scans_retire_one_durable_intent_exactly_once(
+    tmp_path: Path,
+) -> None:
+    # The same crash window, reached by four scans at once: the ticket is
+    # claimed under one request lock, so exactly one of them may report a
+    # settlement and none of them may write a second row.
+    manager, db, intent_path = _crashed_settler(tmp_path, "req-durable-race")
+    durable = _outbox_rows(db)
+    assert len(durable) == 1
+
+    start = threading.Barrier(4)
+    settled: list[int] = []
+    guard = threading.Lock()
+
+    def scan() -> None:
+        start.wait(timeout=30)
+        result = manager._settle_reviewer_terminal_intents()
+        with guard:
+            settled.append(result)
+
+    threads = [threading.Thread(target=scan) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not any(thread.is_alive() for thread in threads)
+
+    assert sum(settled) == 1, settled
+    assert not intent_path.exists()
+    assert _outbox_rows(db) == durable
+
+
+def test_the_durable_callback_proof_binds_this_exact_identity(
+    tmp_path: Path,
+) -> None:
+    # The proof is what retires a ticket, so it must never answer for anybody
+    # else's callback.  The exact identity the intent bound is proven; a
+    # foreign episode or transition fails closed and keeps its own intent for
+    # a pass that really is owed one.
+    db = _ready_store_with_settled_card(tmp_path, request_id="req-durable")
+    durable = process_launcher.task_store.terminal_callback_already_durable
+    assert process_launcher.task_store.enqueue_terminal_callback(
+        tmp_path,
+        "TASK_B1",
+        substatus="liveness_lost",
+        request_id="req-durable",
+        claim_epoch=9,
+    ) is True
+    assert len(_outbox_rows(db)) == 1
+
+    assert durable(
+        tmp_path,
+        "TASK_B1",
+        substatus="liveness_lost",
+        request_id="req-durable",
+        claim_epoch=9,
+    ) is True
+    for foreign in (
+        {"request_id": "req-durable", "claim_epoch": 8, "substatus": "liveness_lost"},
+        {"request_id": "req-durable", "claim_epoch": 9, "substatus": "exited"},
+        {"request_id": "req-durable", "claim_epoch": True, "substatus": "liveness_lost"},
+    ):
+        assert durable(tmp_path, "TASK_B1", **foreign) is False
+        assert durable(tmp_path, "TASK_OTHER", **foreign) is False
+    # The one field the proof deliberately does NOT narrow on is request_id,
+    # because the store's dedup key does not carry it either: the row above
+    # occupies (task, provider, route, transition, episode) for good, so a
+    # sibling request in this same episode can never enqueue again.  Proving
+    # a narrower identity than the enqueue refuses on is what turns that
+    # permanent refusal into an endless retry, so the two agree exactly.
+    assert durable(
+        tmp_path,
+        "TASK_B1",
+        substatus="liveness_lost",
+        request_id="req-other",
+        claim_epoch=9,
+    ) is True
+    # Aligning on request_id weakens nothing else: a foreign TASK still fails
+    # closed on the same call, and every other component of the key is exact.
+    assert durable(
+        tmp_path,
+        "TASK_OTHER",
+        substatus="liveness_lost",
+        request_id="req-other",
+        claim_epoch=9,
+    ) is False
+    # Proving nothing must never be mistaken for proving something, so an
+    # unreadable store raises here instead of resolving to "already sent".
+    with pytest.raises(process_launcher.task_store.TaskStoreError):
+        durable(
+            tmp_path / "not-a-repository",
+            "TASK_B1",
+            substatus="liveness_lost",
+            request_id="req-durable",
+            claim_epoch=9,
+        )
+
+
+def _dead_letter_the_only_row(db: Path, *, last_error: str) -> None:
+    """Move the single outbox row to ``dead_letter`` with an exact reason."""
+
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "UPDATE callback_outbox SET state='dead_letter', last_error=?",
+            (last_error,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_dead_lettered_callback_settles_once_instead_of_retrying_forever(
+    tmp_path: Path,
+) -> None:
+    # A row that really was enqueued, became deliverable work, and only later
+    # exhausted delivery still occupies the store's state-agnostic dedup key
+    # forever.  So the enqueue refuses permanently -- and if the durable proof
+    # refused with it, this intent (and the processing claim behind it) would
+    # retry on every pass for the rest of time.  One bounded truthful
+    # settlement, no duplicate row, no silent retry.
+    manager, db, intent_path = _crashed_settler(tmp_path, "req-deadletter")
+    enqueued = _outbox_rows(db)
+    assert len(enqueued) == 1
+    assert enqueued[0]["state"] == "pending"
+
+    _dead_letter_the_only_row(db, last_error="delivery_exhausted:http_502")
+
+    # The enqueue is refused for good: the key is taken and state is not part
+    # of it, so no later pass could ever produce a replacement row.
+    assert process_launcher.task_store.enqueue_terminal_callback(
+        manager.repo,
+        "TASK_B1",
+        substatus="liveness_lost",
+        request_id="req-deadletter",
+        claim_epoch=9,
+    ) is False
+    assert len(_outbox_rows(db)) == 1
+
+    assert manager._settle_reviewer_terminal_intents() == 1
+    assert not intent_path.exists()
+    after = _outbox_rows(db)
+    assert len(after) == 1, "settling must never add a second row for one episode"
+    assert after[0]["state"] == "dead_letter"
+
+    # And the retired ticket brings no later pass back to this claim.
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert _outbox_rows(db) == after
+
+
+def test_a_never_deliverable_dead_letter_never_retires_an_intent(
+    tmp_path: Path,
+) -> None:
+    # The OTHER row wearing ``dead_letter``: the one ``enqueue_callback``
+    # writes INSTEAD of enqueuing, when it rejects the row as malformed.  That
+    # callback never became deliverable work, so retiring an intent against it
+    # would drop the manager wake in total silence.  It names itself in
+    # ``last_error`` and the proof refuses it.
+    manager, db, intent_path = _crashed_settler(tmp_path, "req-malformed")
+    assert len(_outbox_rows(db)) == 1
+
+    _dead_letter_the_only_row(
+        db,
+        last_error=(
+            process_launcher.task_store
+            .TERMINAL_CALLBACK_NEVER_DELIVERABLE_ERROR_PREFIX
+            + "request_id_too_long"
+        ),
+    )
+
+    assert process_launcher.task_store.terminal_callback_already_durable(
+        manager.repo,
+        "TASK_B1",
+        substatus="liveness_lost",
+        request_id="req-malformed",
+        claim_epoch=9,
+    ) is False
+    # Nothing is settled and the ticket is kept, so the wake stays owed and
+    # visible instead of being retired against a row that never carried it.
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert intent_path.is_file()
+    assert len(_outbox_rows(db)) == 1
+
+
+def _ready_store_with_processing_card(
+    root: Path,
+    *,
+    request_id: str,
+    claim_epoch: int = 9,
+    provider: str = "claude",
+    origin_thread_id: str = "thread-42",
+) -> Path:
+    """A real claimed card every transition guard has to be crossed against.
+
+    ``mark_terminal_failure`` checks the runner, the canonical ``processing``
+    status, the claim owner, the card's ``launch_request_id`` and its
+    ``claim_epoch`` against this exact row.  The other real-store fixtures
+    here start from a card that is ALREADY terminalized, so those guards are
+    only ever met by their refusal arm; this one is what a settlement has to
+    pass through on the way to a first, successful transition.
+    """
+
+    store = process_launcher.task_store
+    assert store.initialize_repository(root)["ok"] is True
+    db = Path(store.storage_readiness(root).canonical_db)
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status,"
+            " card_json, created_at, updated_at, origin_thread_id, claimed_by)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "TASK_B1",
+                "claude_worker_b1",
+                "task_mcp",
+                "processing",
+                "running",
+                json.dumps({
+                    "coordinator_provider": provider,
+                    "claim_epoch": claim_epoch,
+                    "launch_request_id": request_id,
+                }),
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                origin_thread_id,
+                "claude_worker_b1",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db
+
+
+def test_a_real_store_settlement_crosses_every_transition_guard(
+    tmp_path: Path,
+) -> None:
+    # End to end with NOTHING stubbed: a live processing claim, the real
+    # transition, and the real enqueue.  The happy path has to cross runner,
+    # claim owner, claim epoch and launch_request identity against one actual
+    # row, and land exactly one manager wake naming the exact episode.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    db = _ready_store_with_processing_card(manager.repo, request_id="req-happy")
+    manager._append_event(
+        _committed_reviewer_event("req-happy", reviewer_claim_epoch=9)
+    )
+    assert manager._reconcile_expired_starting_reservations() == 1
+    intent_path = manager._reviewer_terminal_intent_path("req-happy")
+    assert intent_path.is_file()
+
+    assert manager._settle_reviewer_terminal_intents() == 1
+    assert not intent_path.exists()
+
+    card = process_launcher.task_store.get_task(manager.repo, "TASK_B1") or {}
+    assert card["status"] == "blocked"
+    recorded = card["terminal_failure"]
+    assert recorded["substatus"] == "liveness_lost"
+    assert recorded["runner"] == "claude_worker_b1"
+    assert recorded["claim_epoch"] == 9
+    assert recorded["evidence"]["request_id"] == "req-happy"
+    assert recorded["evidence"]["reviewer_claim_epoch"] == 9
+
+    rows = _outbox_rows(db)
+    assert len(rows) == 1
+    assert rows[0]["state"] == "pending"
+    assert rows[0]["task_id"] == "TASK_B1"
+    assert rows[0]["provider"] == "claude"
+    assert rows[0]["origin_thread_id"] == "thread-42"
+    assert rows[0]["request_id"] == "req-happy"
+    assert str(rows[0]["episode_id"]) == "9"
+
+    # Exactly once: the ticket is retired, so a repeated pass settles nothing
+    # and the manager is never woken twice for one terminal outcome.
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert _outbox_rows(db) == rows
+
+
+_APPLIED_INTENT = {
+    "runner": "claude_worker_b1",
+    "substatus": "liveness_lost",
+    "request_id": "req-callback",
+    "claim_epoch": 9,
+}
+
+
+def test_terminal_failure_already_applied_matches_only_this_exact_intent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Post-transition recovery must never fabricate a callback for somebody
+    # else's terminal outcome: the recorded failure has to name this runner,
+    # this substatus, this episode and this request.
+    store = process_launcher.task_store
+    recorded = {
+        "runner": "claude_worker_b1",
+        "substatus": "liveness_lost",
+        "claim_epoch": 9,
+        "evidence": {"request_id": "req-callback"},
+    }
+    card: dict = {"claim_epoch": 9, "terminal_failure": recorded}
+    monkeypatch.setattr(store, "get_task", lambda *_a, **_k: card)
+
+    applied = store.terminal_failure_already_applied
+    state = "not_processing:current=blocked"
+    assert applied(tmp_path, "TASK_B1", state, **_APPLIED_INTENT) is True
+
+    for key, foreign in (
+        ("runner", "someone_else"),
+        ("substatus", "worker_failed"),
+        ("claim_epoch", 10),
+    ):
+        card["terminal_failure"] = {**recorded, key: foreign}
+        assert applied(tmp_path, "TASK_B1", state, **_APPLIED_INTENT) is False
+
+    # A recorded ``True`` must not be read as episode 1 by the comparison.
+    card["terminal_failure"] = {**recorded, "claim_epoch": True}
+    assert applied(
+        tmp_path, "TASK_B1", state, **{**_APPLIED_INTENT, "claim_epoch": 1}
+    ) is False
+    card["terminal_failure"] = {
+        **recorded, "evidence": {"request_id": "another-request"},
+    }
+    assert applied(tmp_path, "TASK_B1", state, **_APPLIED_INTENT) is False
+
+    # A card that records no terminal failure at all never counts as ours.
+    card["terminal_failure"] = None
+    assert applied(tmp_path, "TASK_B1", state, **_APPLIED_INTENT) is False
+
+
+def test_terminal_failure_already_applied_reads_no_card_for_other_refusals(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A refusal only says why THIS attempt was rejected now.  The ones a
+    # recover/re-claim can produce are decided from the card; the rest are
+    # pre-store or not-found guards that prove no attempt of this caller's ever
+    # reached the card, so they are answered without opening the store at all.
+    store = process_launcher.task_store
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("a refusal that proves nothing landed must not read a card")
+
+    monkeypatch.setattr(store, "get_task", forbidden)
+    applied = store.terminal_failure_already_applied
+    for state in (
+        "task_not_found",
+        "expected_claim_epoch_invalid",
+        "unsupported_terminal_failure:not_a_real_substatus",
+        "terminal_failure_transition_conflict",
+        "blocked",
+        "",
+    ):
+        assert applied(tmp_path, "TASK_B1", state, **_APPLIED_INTENT) is False
+
+    # ``True`` is an ``int`` subclass; it must never bind episode 1.  The epoch
+    # is validated before any card read, so this holds for every refusal that
+    # would otherwise open the store.
+    for state in (
+        "not_processing:current=blocked",
+        "claim_epoch_mismatch:expected=9:current=10",
+        "claim_owner_mismatch",
+    ):
+        for bad in (True, False, "9", 9.0):
+            assert applied(
+                tmp_path, "TASK_B1", state, **{**_APPLIED_INTENT, "claim_epoch": bad}
+            ) is False
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "not_processing:current=blocked",
+        "claim_epoch_mismatch:expected=9:current=11",
+        "claim_owner_mismatch",
+        "runner_mismatch",
+        "launch_request_mismatch",
+        "launch_request_id_required",
+    ],
+)
+def test_every_reclaim_refusal_is_decided_by_the_card_not_the_string(
+    tmp_path: Path, monkeypatch, state: str
+) -> None:
+    # The crash window is always the same one: the transition is durable and
+    # the callback it owes is not.  Which refusal the retry meets depends only
+    # on how far the card moved on -- to a later episode, another owner, a new
+    # launch request.  Reading any of them as "nothing landed" retires an owed
+    # manager wake, so all of them consult the card, and the card's own record
+    # is what decides.
+    store = process_launcher.task_store
+    recorded = {
+        "runner": "claude_worker_b1",
+        "substatus": "liveness_lost",
+        "claim_epoch": 9,
+        "evidence": {"request_id": "req-callback"},
+    }
+    # The card has since been re-claimed into a later episode; the record it
+    # still carries names THIS caller's episode 9.
+    card: dict = {"claim_epoch": 11, "terminal_failure": recorded}
+    monkeypatch.setattr(store, "get_task", lambda *_a, **_k: card)
+
+    applied = store.terminal_failure_already_applied
+    assert applied(tmp_path, "TASK_B1", state, **_APPLIED_INTENT) is True
+
+    # A record naming the LATER episode is somebody else's outcome, never this
+    # caller's, so the same refusal now answers False and the intent is spent.
+    card["terminal_failure"] = {**recorded, "claim_epoch": 11}
+    assert applied(tmp_path, "TASK_B1", state, **_APPLIED_INTENT) is False
+    card["terminal_failure"] = None
+    assert applied(tmp_path, "TASK_B1", state, **_APPLIED_INTENT) is False
+
+
+def test_mark_terminal_failure_rejects_a_non_integer_claim_epoch(
+    tmp_path: Path,
+) -> None:
+    # ``True`` is an ``int`` subclass; accepting it would let a truthy value
+    # masquerade as claim epoch 1 and terminalize the wrong claim.  The guard
+    # fails closed before any store access, so no repository is required.
+    for bad in (True, False, "3", 3.0):
+        ok, state = process_launcher.task_store.mark_terminal_failure(
+            tmp_path,
+            "TASK_B1",
+            runner="claude_worker_b1",
+            substatus="liveness_lost",
+            claim_epoch=bad,
+        )
+        assert ok is False
+        assert state == "expected_claim_epoch_invalid"
+
+
+def test_mark_terminal_failure_rejects_an_unsupported_substatus(
+    tmp_path: Path,
+) -> None:
+    ok, state = process_launcher.task_store.mark_terminal_failure(
+        tmp_path,
+        "TASK_B1",
+        runner="claude_worker_b1",
+        substatus="not_a_real_substatus",
+        claim_epoch=3,
+    )
+    assert ok is False
+    assert state == "unsupported_terminal_failure:not_a_real_substatus"
+
+
+def _reclaimed_settled_store(root: Path, *, request_id: str) -> Path:
+    """The crash window, met again after the card was recovered and re-claimed.
+
+    The settler's own transition is still recorded against episode 9, and the
+    card has since moved on to episode 11 and been released back to pending.
+    That drift is the whole point: the callback is still owed for episode 9
+    and nothing on the current card names it.
+    """
+
+    return _ready_store_with_settled_card(
+        root,
+        request_id=request_id,
+        claim_epoch=9,
+        card_claim_epoch=11,
+        status="pending",
+        worker_status="unclaimed",
+    )
+
+
+def test_a_recovered_and_reclaimed_card_still_settles_its_recorded_episode(
+    tmp_path: Path,
+) -> None:
+    # Epoch drift after recover/re-claim.  The card proves this settler's own
+    # transition landed, so the callback stays owed -- but binding the enqueue
+    # and the durable proof to the card's CURRENT epoch refuses both forever,
+    # and the intent (with the claim behind it) can never retire.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    db = _reclaimed_settled_store(manager.repo, request_id="req-reclaimed")
+    manager._append_event(
+        _committed_reviewer_event("req-reclaimed", reviewer_claim_epoch=9)
+    )
+    assert manager._reconcile_expired_starting_reservations() == 1
+    intent_path = manager._reviewer_terminal_intent_path("req-reclaimed")
+    assert intent_path.is_file()
+
+    store = process_launcher.task_store
+    # The retry is refused because the card is no longer this settler's to
+    # move, and the card itself is what proves the transition already landed.
+    ok, state = store.mark_terminal_failure(
+        manager.repo,
+        "TASK_B1",
+        runner="claude_worker_b1",
+        substatus="liveness_lost",
+        request_id="req-reclaimed",
+        claim_epoch=9,
+    )
+    assert ok is False
+    assert state.startswith("not_processing:")
+    assert store.terminal_failure_already_applied(
+        manager.repo,
+        "TASK_B1",
+        state,
+        runner="claude_worker_b1",
+        substatus="liveness_lost",
+        request_id="req-reclaimed",
+        claim_epoch=9,
+    ) is True
+
+    assert manager._settle_reviewer_terminal_intents() == 1
+    assert not intent_path.exists()
+    rows = _outbox_rows(db)
+    assert len(rows) == 1
+    # The wake names the episode the transition moved, never the later claim.
+    assert rows[0]["episode_id"] == "9"
+    assert rows[0]["request_id"] == "req-reclaimed"
+    assert rows[0]["state"] == "pending"
+
+    # Nothing is left to settle, and no second wake for one terminal outcome.
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert _outbox_rows(db) == rows
+
+
+def _reclaimed_processing_store(root: Path, *, request_id: str) -> Path:
+    """The crash window met again after the card was re-claimed and is LIVE.
+
+    The settler's own transition is still recorded against episode 9, and the
+    card has since been recovered into episode 11 and re-claimed by the same
+    runner under a new launch request.  Nothing about the STATUS refuses the
+    retry any more, so the store refuses it for the epoch instead -- which is
+    the refusal a settler must not read as "this transition never happened".
+    """
+
+    return _ready_store_with_settled_card(
+        root,
+        request_id=request_id,
+        claim_epoch=9,
+        card_claim_epoch=11,
+        status="processing",
+        worker_status="claimed",
+        claimed_by="claude_worker_b1",
+        launch_request_id=request_id,
+    )
+
+
+def test_a_reclaim_before_the_callback_never_retires_the_wake_it_owes(
+    tmp_path: Path,
+) -> None:
+    # The exact hidden re-claim.  This settler's transition landed and it died
+    # owing one callback; by the time it runs again the card is live under a
+    # LATER episode, so the retry is refused with ``claim_epoch_mismatch``
+    # rather than ``not_processing``.  Deciding from the refusal string retires
+    # the ticket, and the manager is never woken about work that really did
+    # terminate.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    db = _reclaimed_processing_store(manager.repo, request_id="req-reclaim-live")
+    manager._append_event(
+        _committed_reviewer_event("req-reclaim-live", reviewer_claim_epoch=9)
+    )
+    assert manager._reconcile_expired_starting_reservations() == 1
+    intent_path = manager._reviewer_terminal_intent_path("req-reclaim-live")
+    assert intent_path.is_file()
+
+    store = process_launcher.task_store
+    ok, state = store.mark_terminal_failure(
+        manager.repo,
+        "TASK_B1",
+        runner="claude_worker_b1",
+        substatus="liveness_lost",
+        request_id="req-reclaim-live",
+        claim_epoch=9,
+    )
+    assert ok is False
+    assert state.startswith("claim_epoch_mismatch:")
+    # The CARD, not the refusal string, is what proves the transition landed.
+    assert store.terminal_failure_already_applied(
+        manager.repo,
+        "TASK_B1",
+        state,
+        runner="claude_worker_b1",
+        substatus="liveness_lost",
+        request_id="req-reclaim-live",
+        claim_epoch=9,
+    ) is True
+
+    assert manager._settle_reviewer_terminal_intents() == 1
+    assert not intent_path.exists()
+    rows = _outbox_rows(db)
+    assert len(rows) == 1
+    # The wake names episode 9 -- the one the transition actually moved --
+    # never the live episode 11 that re-claimed the card afterwards.
+    assert rows[0]["episode_id"] == "9"
+    assert rows[0]["request_id"] == "req-reclaim-live"
+    assert rows[0]["state"] == "pending"
+
+    # Idempotent: a second scan owes nothing and adds no second wake, and the
+    # live later claim is left exactly where its own owner put it.
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert _outbox_rows(db) == rows
+    reclaimed = store.get_task(manager.repo, "TASK_B1") or {}
+    assert reclaimed.get("claim_epoch") == 11
+
+
+def test_a_recorded_episode_settles_only_the_intent_that_recorded_it(
+    tmp_path: Path,
+) -> None:
+    # The recorded episode is a second authority, so it must be exactly as
+    # narrow as the card's own evidence: a foreign request, a foreign episode
+    # or a foreign substatus may never settle -- or prove -- a callback for
+    # somebody else's terminal outcome just because the card drifted.
+    db = _reclaimed_settled_store(tmp_path, request_id="req-reclaimed")
+    store = process_launcher.task_store
+
+    for foreign in (
+        {"request_id": "req-other", "claim_epoch": 9, "substatus": "liveness_lost"},
+        {"request_id": "req-reclaimed", "claim_epoch": 8, "substatus": "liveness_lost"},
+        {"request_id": "req-reclaimed", "claim_epoch": 9, "substatus": "exited"},
+    ):
+        assert store.enqueue_terminal_callback(tmp_path, "TASK_B1", **foreign) is False
+        assert store.terminal_callback_already_durable(
+            tmp_path, "TASK_B1", **foreign
+        ) is False
+    assert _outbox_rows(db) == []
+
+    exact = {
+        "substatus": "liveness_lost",
+        "request_id": "req-reclaimed",
+        "claim_epoch": 9,
+    }
+    assert store.enqueue_terminal_callback(tmp_path, "TASK_B1", **exact) is True
+    rows = _outbox_rows(db)
+    assert len(rows) == 1
+    assert rows[0]["episode_id"] == "9"
+    assert store.terminal_callback_already_durable(
+        tmp_path, "TASK_B1", **exact
+    ) is True
+    # And the retry of that exact settlement is still a no-op, not a second row.
+    assert store.enqueue_terminal_callback(tmp_path, "TASK_B1", **exact) is False
+    assert _outbox_rows(db) == rows
+
+
+@pytest.mark.parametrize(
+    ("provider", "origin_thread_id", "reason"),
+    [
+        ("claude", "", "origin_thread_unbound"),
+        ("gemini", "thread-42", "provider_unroutable"),
+    ],
+    ids=["empty_origin", "unknown_provider"],
+)
+def test_an_unroutable_callback_identity_retires_with_a_named_disposition(
+    tmp_path: Path, provider: str, origin_thread_id: str, reason: str
+) -> None:
+    # The third world behind ``enqueue_terminal_callback``'s ``False``.  The
+    # terminal failure is committed and the callback identity is one the store
+    # refuses structurally, so neither the enqueue nor the durable proof can
+    # EVER succeed.  Reading that as "not written yet" retries the same refusal
+    # on every scan for the life of the process and never retires the intent.
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    db = _ready_store_with_settled_card(
+        manager.repo,
+        request_id="req-unroutable",
+        provider=provider,
+        origin_thread_id=origin_thread_id,
+    )
+    manager._append_event(
+        _committed_reviewer_event("req-unroutable", reviewer_claim_epoch=9)
+    )
+    assert manager._reconcile_expired_starting_reservations() == 1
+    intent_path = manager._reviewer_terminal_intent_path("req-unroutable")
+    assert intent_path.is_file()
+
+    assert (
+        process_launcher.task_store.terminal_callback_identity_unroutable(
+            manager.repo, "TASK_B1", substatus="liveness_lost"
+        )
+        == reason
+    )
+
+    assert manager._settle_reviewer_terminal_intents() == 1
+    assert not intent_path.exists()
+    # The manager wake really is lost, so the disposition is named rather than
+    # the ticket being retired in silence.
+    assert [record["reason"] for record in _intent_diagnostics(manager)] == [
+        f"callback_unroutable:{reason}"
+    ]
+    assert _outbox_rows(db) == []
+
+    # And no later scan comes back to it: the silent infinite retry is gone.
+    assert manager._settle_reviewer_terminal_intents() == 0
+    assert len(_intent_diagnostics(manager)) == 1
+    assert _outbox_rows(db) == []
+
+
+def test_a_routable_identity_never_takes_the_unroutable_disposition(
+    tmp_path: Path,
+) -> None:
+    # The escape hatch has to stay shut for every ordinary card, or a merely
+    # contended store would retire an intent whose callback is still owed.
+    store = process_launcher.task_store
+    _ready_store_with_settled_card(tmp_path, request_id="req-routable")
+    assert store.terminal_callback_identity_unroutable(
+        tmp_path, "TASK_B1", substatus="liveness_lost"
+    ) == ""
+    # Proving nothing must never be mistaken for proving "can never route", so
+    # an unreadable store raises here instead of resolving to a retirement.
+    with pytest.raises(store.TaskStoreError):
+        store.terminal_callback_identity_unroutable(
+            tmp_path / "not-a-repository", "TASK_B1", substatus="liveness_lost"
+        )

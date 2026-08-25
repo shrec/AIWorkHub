@@ -158,6 +158,7 @@ def _record_decision(
         "cap_tokens": final_state.cap_tokens,
         "cap_crossed": cap_crossed,
         "cap_enforceable": cap_enforceable,
+        "enforcing": False,
         "cost_usd": None,
     }
     return TokenBudgetDecision(
@@ -295,9 +296,9 @@ def consume_sample(state: TokenBudgetState, sample: TokenSample) -> TokenBudgetD
         and previous_live < state.cap_tokens
         and next_live >= state.cap_tokens
     )
-    cap_enforceable = (
-        cap_crossed and sample.authority is TelemetryAuthority.ENFORCED_LIVE
-    )
+    # Observed usage is telemetry only. Crossing a legacy cap is recorded as a
+    # diagnostic but never authorizes enforcement, so no sample is enforceable.
+    cap_enforceable = False
     record = ReportRecord(
         fingerprint, SampleOutcome.ACCEPTED, accepted_delta, "accepted"
     )
@@ -351,6 +352,7 @@ def supervisor_evidence(
         "cap_enforceable": any(
             bool(event.get("cap_enforceable")) for event in events
         ),
+        "enforcing": False,
         "event_sha256": hashlib.sha256(encoded).hexdigest(),
         "events": events,
     }

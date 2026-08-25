@@ -14,6 +14,7 @@ import hashlib
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -951,6 +952,474 @@ def test_reject_explicit_current_zero_diff_predecessor_matches_automatic_resolut
     assert card["review_feedback"]["predecessor_request_id"] == request_id
     assert card["review_feedback"]["predecessor_changed_paths"] == []
     assert "terminal_review" not in card
+
+
+_ZERO_DIFF_GITIGNORE = "__pycache__/\n.pytest_cache/\n.ruff_cache/\n.coverage\n"
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+
+def _sealed_zero_diff_workspace(
+    coord: Path,
+    task_id: str,
+    request_id: str,
+    writable: dict[str, bytes],
+    allowed_writes: list[str] | None = None,
+) -> dict:
+    """Materialize a *realistic* retained worktree and seal its baseline.
+
+    Mirrors ``worker_workspace.WorkerWorkspace.as_metadata()`` for an attempt
+    that wrote nothing: every declared writable path exists on disk and its
+    ``workspace_baseline`` digest is computed from those exact bytes, so an
+    empty diff is re-derivable from the filesystem instead of merely declared.
+    ``tree_baseline`` is sealed the same way over the *complete* worktree, so a
+    path no per-path baseline entry covers -- such as a file only a glob
+    ``allowed_writes`` entry could match -- is still mechanically comparable.
+
+    The worktree is a real git repository with a real ``.gitignore`` because
+    the declared ``changed_paths`` on terminal evidence come from git; a
+    fixture that is only a bare directory cannot show whether the zero-diff
+    authority agrees with git about what is ignored.  ``core.excludesFile`` is
+    pointed at a path that does not exist so the developer's global ignore
+    rules cannot change what this test proves.
+    """
+    workspace = _strict_retained_workspace(
+        coord,
+        task_id,
+        request_id,
+        sorted(writable) if allowed_writes is None else allowed_writes,
+    )
+    root = Path(workspace["path"])
+    _git(root, "init", "--quiet")
+    _git(root, "config", "core.excludesFile", str(root / ".git" / "no-global-excludes"))
+    (root / ".gitignore").write_text(_ZERO_DIFF_GITIGNORE, encoding="utf-8")
+    tracked = [".gitignore"]
+    baseline: dict[str, str | None] = {}
+    for relative, content in writable.items():
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        tracked.append(relative)
+    # Staged, not committed: ``git check-ignore`` consults the index, which is
+    # what keeps a tracked path that also matches an ignore pattern reported as
+    # *not* ignored.
+    _git(root, "add", "--", *tracked)
+    for relative in writable:
+        baseline[relative] = worker_workspace._hash_path(root / relative)
+    workspace["workspace_baseline"] = baseline
+    workspace["tree_baseline"] = worker_workspace._worktree_manifest(root)
+    return workspace
+
+
+def _terminal_failure_evidence(
+    task_id: str,
+    request_id: str,
+    workspace: dict,
+    changed_paths: list[str],
+) -> dict:
+    """The exact evidence a validation_failed terminal review carries.
+
+    ``ProcessManager._terminal_failure_exact`` seals request identity, the
+    changed/promoted path lists and workspace metadata -- and, unlike the
+    review_ready path, no ``changed_path_hashes`` map at all.  A read-only
+    (zero diff) failure therefore reaches ``core.reject_review`` with an
+    absent hash map and an empty declared diff, which is the shape observed on
+    Windows terminal cards.
+    """
+    return {
+        "request_id": request_id,
+        "error": "declared validation command failed",
+        "changed_paths": list(changed_paths),
+        "promoted_paths": [],
+        "workspace": workspace,
+        "request_identity": {
+            "request_id": request_id,
+            "task_id": task_id,
+            "runner": "claude_coding",
+            "topic": "coding",
+        },
+    }
+
+
+def _insert_validation_failed_card(
+    coord: Path,
+    task_id: str,
+    request_id: str,
+    workspace: dict,
+    changed_paths: list[str],
+    *,
+    review_claim_epoch: int = 1,
+) -> None:
+    _insert(
+        coord,
+        task_id,
+        card={
+            "claim_epoch": 1,
+            "terminal_review": {
+                "claim_epoch": review_claim_epoch,
+                "substatus": "validation_failed",
+                "evidence": _terminal_failure_evidence(
+                    task_id, request_id, workspace, changed_paths
+                ),
+            },
+        },
+    )
+
+
+def _reject_zero_diff(coord: Path, task_id: str, request_id: str) -> dict:
+    return core.reject_review(
+        task_id,
+        "rerun the read-only audit",
+        to="pending",
+        predecessor_request_id=request_id,
+    )
+
+
+def test_reject_explicit_validation_failed_zero_diff_predecessor_is_selectable(
+    coord,
+):
+    """The Windows regression: an explicit predecessor_request_id naming a
+    retained validation_failed review that changed nothing must bind, even
+    though that terminal evidence shape carries no changed_path_hashes map."""
+    request_id = "validation-failed-zero-diff"
+    task_id = "T_V2_VF_ZERO_DIFF"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    # On the canonical preimage this is predecessor_request_id_missing_hashes.
+    assert result["ok"] is True, result.get("stderr")
+    row = _row(coord, task_id)
+    assert row["status"] == "pending" and row["worker_status"] == "unclaimed"
+    card = json.loads(row["card_json"])
+    assert card["review_feedback"]["predecessor_request_id"] == request_id
+    assert card["review_feedback"]["predecessor_changed_paths"] == []
+    assert "terminal_review" not in card
+
+
+def test_reject_explicit_validation_failed_zero_diff_ignores_post_seal_artifacts(
+    coord,
+):
+    """Running the declared validation leaves git-ignored artifacts behind.
+
+    ``__pycache__/``, ``.pytest_cache/``, ``.ruff_cache/`` and ``.coverage``
+    appear in a raw tree manifest but never in the git-derived declared
+    ``changed_paths``.  The zero-diff authority must agree with git about that,
+    or every real read-only rejection recreates the original failure.
+    """
+    request_id = "validation-failed-zero-diff-artifacts"
+    task_id = "T_V2_VF_ZERO_DIFF_ARTIFACTS"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    root = Path(workspace["path"])
+    for relative, content in {
+        "src/__pycache__/audited.cpython-312.pyc": b"\x00compiled\n",
+        ".pytest_cache/CACHEDIR.TAG": b"Signature: 8a477f597d28d172\n",
+        ".ruff_cache/0.6.9/entry": b"cached\n",
+        ".coverage": b"coverage-db\n",
+    }.items():
+        artifact = root / relative
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(content)
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is True, result.get("stderr")
+    card = json.loads(_row(coord, task_id)["card_json"])
+    assert card["review_feedback"]["predecessor_request_id"] == request_id
+    assert card["review_feedback"]["predecessor_changed_paths"] == []
+
+
+def test_reject_explicit_validation_failed_zero_diff_rejects_drifted_workspace(
+    coord,
+):
+    """A declared empty diff is never authority on its own: if a declared
+    writable path no longer matches the digest sealed with it, the selection
+    fails closed and says so."""
+    request_id = "validation-failed-zero-diff-drift"
+    task_id = "T_V2_VF_ZERO_DIFF_DRIFT"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    (Path(workspace["path"]) / "src" / "audited.py").write_bytes(b"drifted\n")
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_zero_diff_baseline_drift"
+    assert _row(coord, task_id)["status"] == "review"
+
+
+def test_reject_explicit_validation_failed_zero_diff_requires_sealed_baseline(
+    coord,
+):
+    """A declared writable path left out of workspace_baseline leaves nothing
+    to re-derive, so the empty hash map must not be synthesized."""
+    request_id = "validation-failed-zero-diff-unsealed"
+    task_id = "T_V2_VF_ZERO_DIFF_UNSEALED"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    workspace["workspace_baseline"] = {}
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_zero_diff_unsealed_baseline"
+    assert _row(coord, task_id)["status"] == "review"
+
+
+def test_reject_explicit_validation_failed_zero_diff_requires_sealed_tree(coord):
+    """Evidence that never carried a tree manifest cannot prove a zero diff,
+    and must not be confused with a tree that merely drifted."""
+    request_id = "validation-failed-zero-diff-no-tree"
+    task_id = "T_V2_VF_ZERO_DIFF_NO_TREE"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    workspace.pop("tree_baseline")
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_zero_diff_unsealed_tree"
+    assert _row(coord, task_id)["status"] == "review"
+
+
+def test_reject_explicit_validation_failed_zero_diff_rejects_new_glob_scope_file(
+    coord,
+):
+    """A glob ``allowed_writes`` entry cannot be enumerated by the per-path
+    ``workspace_baseline``, so a file created under it after provisioning is
+    invisible there.  It is untracked and *not* git-ignored, so the complete
+    tree comparison must still report drift."""
+    request_id = "validation-failed-zero-diff-glob-new-file"
+    task_id = "T_V2_VF_ZERO_DIFF_GLOB_NEW"
+    workspace = _sealed_zero_diff_workspace(
+        coord,
+        task_id,
+        request_id,
+        {"src/audited.py": b"unchanged\n"},
+        allowed_writes=["src/audited.py", "out/*.txt"],
+    )
+    # Created after the baseline was sealed: matches the glob scope, is absent
+    # from workspace_baseline, and leaves every declared exact path untouched.
+    created = Path(workspace["path"]) / "out" / "leaked.txt"
+    created.parent.mkdir(parents=True, exist_ok=True)
+    created.write_bytes(b"created after provisioning\n")
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_zero_diff_tree_drift"
+    assert _row(coord, task_id)["status"] == "review"
+
+
+def test_reject_explicit_validation_failed_zero_diff_rejects_out_of_root_workspace(
+    coord,
+):
+    """A card-declared path outside the repository-scoped runtime worktree
+    root is never scanned, however plausible its sealed manifests look."""
+    request_id = "validation-failed-zero-diff-stray"
+    task_id = "T_V2_VF_ZERO_DIFF_STRAY"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    stray = coord / ".aiworkhub" / "runtime" / "stray" / "worktree"
+    stray.mkdir(parents=True, exist_ok=True)
+    workspace["path"] = str(stray)
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_zero_diff_workspace_out_of_root"
+    assert _row(coord, task_id)["status"] == "review"
+
+
+def test_reject_explicit_validation_failed_zero_diff_rejects_foreign_request_worktree(
+    coord,
+):
+    """Inside the runtime worktree root is not enough: the worktree scanned
+    must be the one this exact request owns."""
+    request_id = "validation-failed-zero-diff-foreign"
+    task_id = "T_V2_VF_ZERO_DIFF_FOREIGN"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    foreign = _sealed_zero_diff_workspace(
+        coord,
+        task_id,
+        "validation-failed-zero-diff-foreign-other",
+        {"src/audited.py": b"unchanged\n"},
+    )
+    workspace["path"] = foreign["path"]
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_zero_diff_identity_mismatch"
+    assert _row(coord, task_id)["status"] == "review"
+
+
+def test_reject_explicit_validation_failed_zero_diff_rejects_stale_claim_epoch(
+    coord,
+):
+    """A retained worktree from a superseded claim episode is not this
+    episode's evidence, and is refused before anything is hashed."""
+    request_id = "validation-failed-zero-diff-epoch"
+    task_id = "T_V2_VF_ZERO_DIFF_EPOCH"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    _insert_validation_failed_card(
+        coord, task_id, request_id, workspace, [], review_claim_epoch=2
+    )
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_zero_diff_identity_mismatch"
+    assert _row(coord, task_id)["status"] == "review"
+
+
+def test_reject_explicit_validation_failed_zero_diff_bounds_the_tree_walk(
+    coord, monkeypatch
+):
+    """The complete tree walk is capped; an oversized worktree fails closed
+    with its own reason rather than being silently truncated into a pass."""
+    request_id = "validation-failed-zero-diff-budget"
+    task_id = "T_V2_VF_ZERO_DIFF_BUDGET"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    monkeypatch.setattr(core, "_MAX_ZERO_DIFF_TREE_ENTRIES", 1)
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_zero_diff_budget_exceeded"
+    assert _row(coord, task_id)["status"] == "review"
+
+
+def test_reject_explicit_validation_failed_zero_diff_reports_scan_failure(
+    coord, monkeypatch
+):
+    """An unreadable retained worktree proves nothing either way, and must not
+    be reported as drift."""
+    request_id = "validation-failed-zero-diff-scan"
+    task_id = "T_V2_VF_ZERO_DIFF_SCAN"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+
+    def _unreadable(_root):
+        raise OSError("scandir denied")
+
+    monkeypatch.setattr(core, "_bounded_worktree_manifest", _unreadable)
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_zero_diff_scan_failed"
+    assert _row(coord, task_id)["status"] == "review"
+
+
+def test_reject_explicit_validation_failed_zero_diff_reports_ignore_check_failure(
+    coord, monkeypatch
+):
+    """If git cannot classify the candidate delta, the artifact allowance must
+    fail closed with its own reason -- never default to "nothing is ignored"
+    (spurious drift) or to "everything is" (a forged pass)."""
+    request_id = "validation-failed-zero-diff-ignore"
+    task_id = "T_V2_VF_ZERO_DIFF_IGNORE"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    (Path(workspace["path"]) / ".coverage").write_bytes(b"coverage-db\n")
+
+    def _no_git(_root, _candidates):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(core, "_git_ignored_subset", _no_git)
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_zero_diff_ignore_check_failed"
+    assert _row(coord, task_id)["status"] == "review"
+
+
+def test_reject_explicit_validation_failed_zero_diff_requires_coordinator_capability(
+    coord, monkeypatch
+):
+    """The card names the directory this walks.  Without the coordinator
+    capability nothing on that path may be scanned or hashed, and no
+    filesystem-derived verdict may be returned."""
+    request_id = "validation-failed-zero-diff-capability"
+    task_id = "T_V2_VF_ZERO_DIFF_CAPABILITY"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    scanned: list[Path] = []
+
+    def _record(root):
+        scanned.append(root)
+        raise AssertionError("scanned a card-declared path without capability")
+
+    monkeypatch.setattr(
+        core, "_verify_coordinator_capability", lambda _runner: (False, "denied")
+    )
+    monkeypatch.setattr(core, "_bounded_worktree_manifest", _record)
+    _insert_validation_failed_card(coord, task_id, request_id, workspace, [])
+
+    result = _reject_zero_diff(coord, task_id, request_id)
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_zero_diff_capability_denied"
+    assert scanned == []
+    assert _row(coord, task_id)["status"] == "review"
+
+
+def test_reject_explicit_validation_failed_nonempty_diff_without_hashes_fails_closed(
+    coord,
+):
+    """A non-empty declared diff with no hash map stays unbindable -- the
+    zero-diff allowance must not weaken changed-path hash binding."""
+    request_id = "validation-failed-nonempty-diff"
+    task_id = "T_V2_VF_NONEMPTY_DIFF"
+    workspace = _sealed_zero_diff_workspace(
+        coord, task_id, request_id, {"src/audited.py": b"unchanged\n"}
+    )
+    _insert_validation_failed_card(
+        coord, task_id, request_id, workspace, ["src/audited.py"]
+    )
+
+    result = core.reject_review(
+        task_id,
+        "rerun the audit",
+        to="pending",
+        predecessor_request_id=request_id,
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"] == "predecessor_request_id_missing_hashes"
+    assert _row(coord, task_id)["status"] == "review"
 
 
 def test_reject_default_predecessor_is_current_review(coord):
