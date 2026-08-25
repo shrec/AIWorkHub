@@ -6915,3 +6915,226 @@ def test_worker_launch_env_is_collision_free_and_applies_provider_env(tmp_path):
     assert env_p["COPILOT_PROVIDER_API_KEY"] == "byok-secret"
     # The provider env never shadows the request-owned temp keys.
     assert Path(env_p["TMPDIR"]).parent.name == "req-provider"
+
+
+def _quality_reviewer_launch_harness(tmp_path, monkeypatch):
+    cards: dict[str, dict] = {}
+    order: list[str] = []
+    started: list[object] = []
+
+    def show(task_id: str):
+        card = {
+            "task_id": task_id,
+            "runner": "claude_worker_b1",
+            "topic": "task_mcp",
+            "status": "review",
+            "worker_status": "review",
+            "terminal_review": {"substatus": "review_ready"},
+            "allowed_writes": [],
+            "priority": "high",
+        }
+        return {"returncode": 0, "stdout": json.dumps(card), "stderr": ""}
+
+    manager = _manager(
+        tmp_path,
+        show_task=show,
+        argv=[sys.executable, "-c", "pass"],
+    )
+    monkeypatch.setattr(
+        process_launcher.quality_review,
+        "assess_reviewer_launch_target",
+        lambda **_k: {
+            "can_launch": True,
+            "fails_at_launch": False,
+            "reason": "reviewer_target_review_ready",
+            "target_substatus": "review_ready",
+        },
+    )
+
+    def fake_create(**kwargs):
+        order.append("create")
+        cards[str(kwargs["task_id"])] = dict(kwargs)
+        return {"ok": True, "created": True, "task_id": kwargs["task_id"]}
+
+    def fake_claim(repo, task_id, runner, topic, request_id=""):
+        order.append("claim")
+        card = {
+            "task_id": task_id,
+            "runner": runner,
+            "topic": topic,
+            "launch_request_id": request_id,
+            "claim_epoch": 1,
+            "status": "processing",
+            "worker_status": "claimed",
+            "claimed_by": runner,
+        }
+        cards[str(task_id)] = card
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout": json.dumps(card),
+            "stderr": "",
+        }
+
+    class FakeThread:
+        def __init__(self, target=None, kwargs=None, name=None, daemon=None):
+            self.target = target
+            self.kwargs = kwargs or {}
+            self.name = name
+            started.append(self)
+
+        def start(self):
+            order.append("thread")
+
+    monkeypatch.setattr(process_launcher.core, "create_task", fake_create)
+    monkeypatch.setattr(process_launcher.task_engine, "claim_start_exact", fake_claim)
+    monkeypatch.setattr(process_launcher.threading, "Thread", FakeThread)
+    return manager, cards, order, started
+
+
+def test_quality_reviewer_launch_ack_requires_visible_claimed_card(
+    tmp_path, monkeypatch,
+):
+    manager, cards, order, started = _quality_reviewer_launch_harness(
+        tmp_path, monkeypatch
+    )
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req-1",
+        target_task_id="TARGET_TASK_1",
+        reviewer_task_id="REVIEWER_TASK_1",
+        runner="claude_worker_reviewer",
+        adapter_id="claude_cli",
+        lens="correctness",
+    )
+    assert receipt["ok"] is True
+    assert receipt["request_id"]
+    assert receipt["task_id"] == "REVIEWER_TASK_1"
+    assert receipt["launch_request_id"] == receipt["request_id"]
+    assert cards["REVIEWER_TASK_1"]["launch_request_id"] == receipt["request_id"]
+    assert cards["REVIEWER_TASK_1"]["status"] == "processing"
+    assert cards["REVIEWER_TASK_1"]["worker_status"] == "claimed"
+    assert order[:2] == ["create", "claim"]
+    assert order.index("create") < order.index("thread")
+    assert len(started) == 1
+    latest = manager._latest_by_request()[receipt["request_id"]]
+    assert latest["task_id"] == "REVIEWER_TASK_1"
+    assert latest["state"] == "starting"
+
+
+def test_quality_reviewer_launch_create_failure_terminalizes_without_ack(
+    tmp_path, monkeypatch,
+):
+    manager, _cards, order, started = _quality_reviewer_launch_harness(
+        tmp_path, monkeypatch
+    )
+
+    def fail_create(**_kwargs):
+        order.append("create")
+        return {"ok": False, "stderr": "manager_identity_required:task_create"}
+
+    monkeypatch.setattr(process_launcher.core, "create_task", fail_create)
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req-1",
+        target_task_id="TARGET_TASK_1",
+        reviewer_task_id="REVIEWER_TASK_1",
+        runner="claude_worker_reviewer",
+        adapter_id="claude_cli",
+        lens="correctness",
+    )
+    assert receipt["ok"] is False
+    assert str(receipt.get("error") or "").startswith(
+        "quality_review_task_create_failed:"
+    )
+    assert "thread" not in order
+    assert started == []
+    blocked = [
+        event
+        for event in manager._latest_by_request().values()
+        if event.get("state") == "blocked"
+    ]
+    assert len(blocked) == 1
+    assert "quality_review_task_create_failed" in str(
+        blocked[0].get("blocked_reason") or ""
+    )
+
+
+def test_quality_reviewer_launch_claim_failure_releases_reservation(
+    tmp_path, monkeypatch,
+):
+    manager, _cards, order, started = _quality_reviewer_launch_harness(
+        tmp_path, monkeypatch
+    )
+
+    def fail_claim(*_a, **_k):
+        order.append("claim")
+        return {
+            "ok": False,
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "claim_conflict:task_id=REVIEWER_TASK_1",
+        }
+
+    monkeypatch.setattr(process_launcher.task_engine, "claim_start_exact", fail_claim)
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req-1",
+        target_task_id="TARGET_TASK_1",
+        reviewer_task_id="REVIEWER_TASK_1",
+        runner="claude_worker_reviewer",
+        adapter_id="claude_cli",
+        lens="correctness",
+    )
+    assert receipt["ok"] is False
+    assert str(receipt.get("error") or "").startswith("quality_review_claim_failed:")
+    assert "thread" not in order
+    assert started == []
+    blocked = [
+        event
+        for event in manager._latest_by_request().values()
+        if event.get("state") == "blocked"
+    ]
+    assert len(blocked) == 1
+    assert "quality_review_claim_failed" in str(blocked[0].get("blocked_reason") or "")
+
+
+def test_quality_reviewer_launch_concurrent_same_id_reconciles_one_request(
+    tmp_path, monkeypatch,
+):
+    real_thread = threading.Thread
+    manager, cards, _order, started = _quality_reviewer_launch_harness(
+        tmp_path, monkeypatch
+    )
+    barrier = threading.Barrier(2)
+    receipts: list[dict | None] = [None, None]
+
+    def run(index: int) -> None:
+        barrier.wait()
+        receipts[index] = manager.launch_quality_reviewer(
+            target_request_id="target-req-1",
+            target_task_id="TARGET_TASK_1",
+            reviewer_task_id="REVIEWER_TASK_1",
+            runner="claude_worker_reviewer",
+            adapter_id="claude_cli",
+            lens="correctness",
+        )
+
+    workers = [
+        real_thread(target=run, args=(0,)),
+        real_thread(target=run, args=(1,)),
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    first, second = receipts
+    assert first is not None and second is not None
+    assert first["ok"] is True and second["ok"] is True
+    assert first["request_id"] == second["request_id"]
+    assert first["task_id"] == second["task_id"] == "REVIEWER_TASK_1"
+    assert cards["REVIEWER_TASK_1"]["launch_request_id"] == first["request_id"]
+    assert len(started) == 1
+    starting = [
+        event
+        for event in manager._latest_by_request().values()
+        if event.get("task_id") == "REVIEWER_TASK_1" and event.get("state") == "starting"
+    ]
+    assert len(starting) == 1

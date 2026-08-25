@@ -1473,3 +1473,70 @@ def test_monitor_does_not_enforce_legacy_provider_timeout(
     )
     manager._monitor(live)
     assert waits == [None]
+
+
+def test_quality_reviewer_preflight_rejects_foreign_launch_request_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reserved = "a" * 32
+    foreign = "b" * 32
+    card = {
+        "task_id": "REVIEWER_TASK_1",
+        "runner": "claude_worker_reviewer",
+        "topic": "quality_review",
+        "status": "processing",
+        "worker_status": "claimed",
+        "claimed_by": "claude_worker_reviewer",
+        "launch_request_id": reserved,
+        "allowed_writes": [],
+        "priority": "high",
+        "read_only": True,
+    }
+    manager = process_launcher.ProcessManager(
+        repo=tmp_path / "repo",
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        isolation_enabled=False,
+        show_task=lambda _tid: {
+            "returncode": 0,
+            "stdout": json.dumps(card),
+            "stderr": "",
+        },
+        collision_guard=lambda **_k: {
+            "returncode": 0,
+            "stdout": '{"collision_free":true}',
+            "stderr": "",
+        },
+        adapter_builder=lambda **_k: SimpleNamespace(
+            argv=[], cwd=str(tmp_path), launchable=True
+        ),
+    )
+    monkeypatch.setattr(process_launcher, "_validate_scope", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        process_launcher, "_validate_required_outputs_contract", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        process_launcher.core, "task_card_path_conflicts", lambda *_a, **_k: []
+    )
+    monkeypatch.setattr(
+        process_launcher.repo_policy, "validate_launch", lambda *_a, **_k: {"ok": True}
+    )
+    with pytest.raises(
+        process_launcher.LaunchRejected, match="task_launch_already_attached"
+    ):
+        manager._preflight_card(
+            "REVIEWER_TASK_1",
+            "claude_worker_reviewer",
+            "quality_review",
+            "claude_cli",
+            reserved_request_id=foreign,
+        )
+    matched = manager._preflight_card(
+        "REVIEWER_TASK_1",
+        "claude_worker_reviewer",
+        "quality_review",
+        "claude_cli",
+        reserved_request_id=reserved,
+    )
+    assert matched["launch_request_id"] == reserved
+    assert matched["task_id"] == "REVIEWER_TASK_1"

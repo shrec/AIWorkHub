@@ -6085,7 +6085,12 @@ class ProcessManager:
             return None, model
 
     def _preflight_card(
-        self, task_id: str, runner: str, topic: str, adapter_id: str
+        self,
+        task_id: str,
+        runner: str,
+        topic: str,
+        adapter_id: str,
+        reserved_request_id: str | None = None,
     ) -> dict[str, Any]:
         # B314_F006 (reviewed, accepted-by-design): there is a TOCTOU window
         # between this preflight read and the atomic core.claim_start_exact()
@@ -6125,7 +6130,9 @@ class ProcessManager:
                 raise LaunchRejected(
                     f"task_claim_owner_mismatch:{claimed_by or 'unclaimed'}"
                 )
-            if launch_request_id:
+            if launch_request_id and launch_request_id != str(
+                reserved_request_id or ""
+            ):
                 raise LaunchRejected(
                     f"task_launch_already_attached:{launch_request_id[:120]}"
                 )
@@ -7385,10 +7392,11 @@ class ProcessManager:
     ) -> None:
         """Run one reserved reviewer attempt under a single background owner.
 
-        The MCP handler already returned a bounded starting/deferred receipt,
-        so preparation and provider start never hold the handler.  Every
-        failure path terminalizes the pre-reserved attempt exactly once and
-        returns, leaving unrelated MCP calls responsive.
+        The handler already created, claimed and bound the exact reviewer card
+        before acknowledgement.  Preparation and provider start never hold the
+        handler.  Every failure path terminalizes the pre-reserved attempt
+        exactly once and returns, leaving unrelated MCP calls responsive.
+        A live uncapped provider is never cancelled by caller timeout.
         """
 
         def _fail(reason: str) -> None:
@@ -7447,40 +7455,6 @@ class ProcessManager:
                 "lens": lens,
                 "independence": independence,
             }
-            created = core.create_task(
-                task_id=reviewer_task_id,
-                title=f"Independent {lens} review for {target_task_id}"[:300],
-                runner=runner,
-                topic="quality_review",
-                objective=(
-                    "Review the exact anti-anchored candidate packet and submit "
-                    f"{lens} findings through the bound reviewer MCP tool."
-                ),
-                acceptance=[
-                    "Exactly one authenticated quality_review_submit receipt",
-                    "No repository mutation",
-                    quality_review.independence_acceptance_line(independence),
-                ],
-                allowed_writes=[],
-                forbidden=[
-                    "repository_write",
-                    "worker_rationale_as_evidence",
-                    "model_supplied_provider_identity",
-                ],
-                required_outputs=[],
-                validation=[],
-                priority="high",
-                callback_required=True,
-                task_type="research",
-                read_only=True,
-            )
-            if not created.get("ok"):
-                _fail(
-                    "quality_review_task_create_failed:"
-                    + str(created.get("stderr") or created.get("stdout") or "")[:500]
-                )
-                return
-            _progress("reviewer_task_created")
             if not self._reviewer_reservation_still_held(request_id):
                 return
             _progress("isolated_launch_started")
@@ -7544,6 +7518,117 @@ class ProcessManager:
                 )
             _fail(f"quality_review_launch_failed:{detail}"[:500])
 
+    def _ensure_quality_reviewer_card_bound(
+        self,
+        *,
+        request_id: str,
+        target_request_id: str,
+        target_task_id: str,
+        reviewer_task_id: str,
+        runner: str,
+        adapter_id: str,
+        lens: str,
+        target_card: dict[str, Any] | None,
+        terminalize_on_failure: bool,
+    ) -> dict[str, Any]:
+        """Create, claim and bind the exact reviewer card before acknowledgement."""
+
+        worker_adapter_id = str((target_card or {}).get("adapter_id") or "")
+        independence = quality_review.resolve_independence_rung(
+            worker_provider=runtime_adapters.provider_for_adapter(
+                worker_adapter_id
+            ),
+            reviewer_provider=runtime_adapters.provider_for_adapter(adapter_id),
+            worker_model=worker_adapter_id,
+            reviewer_model=str(adapter_id or ""),
+        )
+        created = core.create_task(
+            task_id=reviewer_task_id,
+            title=f"Independent {lens} review for {target_task_id}"[:300],
+            runner=runner,
+            topic="quality_review",
+            objective=(
+                "Review the exact anti-anchored candidate packet and submit "
+                f"{lens} findings through the bound reviewer MCP tool."
+            ),
+            acceptance=[
+                "Exactly one authenticated quality_review_submit receipt",
+                "No repository mutation",
+                quality_review.independence_acceptance_line(independence),
+            ],
+            allowed_writes=[],
+            forbidden=[
+                "repository_write",
+                "worker_rationale_as_evidence",
+                "model_supplied_provider_identity",
+            ],
+            required_outputs=[],
+            validation=[],
+            priority="high",
+            callback_required=True,
+            task_type="research",
+            read_only=True,
+        )
+        create_ok = created.get("ok") is True
+        create_detail = str(
+            created.get("stderr")
+            or created.get("stdout")
+            or created.get("error")
+            or ""
+        )
+        if not create_ok and not (
+            created.get("reconciled") is True
+            or str(created.get("receipt_state") or "") == "existing_identical"
+            or create_detail.startswith("task_already_exists:")
+        ):
+            reason = (
+                "quality_review_task_create_failed:" + create_detail[:500]
+            )
+            if terminalize_on_failure:
+                self._terminalize_reviewer_attempt(
+                    request_id, reviewer_task_id, runner, adapter_id, reason=reason
+                )
+            return {"ok": False, "error": reason}
+        claim = task_engine.claim_start_exact(
+            self.repo,
+            reviewer_task_id,
+            runner,
+            "quality_review",
+            request_id=request_id,
+        )
+        if not claim.get("ok"):
+            reason = (
+                "quality_review_claim_failed:"
+                + str(claim.get("stderr") or claim.get("stdout") or "")[:500]
+            )
+            if terminalize_on_failure:
+                self._terminalize_reviewer_attempt(
+                    request_id, reviewer_task_id, runner, adapter_id, reason=reason
+                )
+            return {"ok": False, "error": reason}
+        try:
+            _committed_claim_card(
+                claim,
+                request_id=request_id,
+                task_id=reviewer_task_id,
+                runner=runner,
+                topic="quality_review",
+            )
+        except LaunchRejected as exc:
+            reason = f"quality_review_claim_failed:{exc}"[:500]
+            if terminalize_on_failure:
+                self._terminalize_reviewer_attempt(
+                    request_id, reviewer_task_id, runner, adapter_id, reason=reason
+                )
+            return {"ok": False, "error": reason}
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "task_id": reviewer_task_id,
+            "target_request_id": target_request_id,
+            "launch_request_id": request_id,
+        }
+
     def launch_quality_reviewer(
         self,
         *,
@@ -7558,29 +7643,15 @@ class ProcessManager:
     ) -> dict[str, Any]:
         """Create and launch one independent packet-bound reviewer task.
 
-        The handler reserves the exact reviewer attempt and returns a bounded
-        starting/deferred receipt immediately; expensive preparation and
-        provider start run under one background owner so unrelated MCP calls
-        stay serviceable.  Retried calls reconcile the same attempt instead of
-        launching a duplicate.
+        Acknowledgement is returned only after the exact reviewer card,
+        launch_request_id binding and reservation are durably reconcilable.
+        Expensive preparation and provider start still run under one background
+        owner so a live uncapped provider is never cancelled by caller timeout.
+        Retried calls reconcile the same attempt instead of launching a duplicate.
         """
 
         if lens not in quality_evidence.JUDGMENT_LENSES:
             return {"ok": False, "error": "quality_review_lens_invalid"}
-        existing = self._live_reviewer_receipt(reviewer_task_id)
-        if existing is not None:
-            return existing
-        # Refuse before the deferred return when the target cannot be reviewed.
-        # ``assess_reviewer_launch_target`` is the decidable part of the launch:
-        # a target that is not ``review_ready`` makes the review impossible, so
-        # the caller learns ``ok:false`` now -- carrying the named reason --
-        # instead of holding a success receipt for a reviewer that would resolve
-        # its target on the background thread, refuse and die (the receipt would
-        # otherwise say only that a thread was started, not that a review is
-        # running).  Deferring the heavy prewarm/preparation is still correct;
-        # only this already-decidable target verdict is pulled ahead of the
-        # reservation and the deferred return, so the return carries only what
-        # has actually been established.
         try:
             _target_card: dict[str, Any] | None = _parse_card(
                 self._show_task(target_task_id), target_task_id
@@ -7590,6 +7661,31 @@ class ProcessManager:
         _target_verdict = quality_review.assess_reviewer_launch_target(
             target_card=_target_card
         )
+
+        def _bind_visible_card(
+            request_id: str, *, terminalize_on_failure: bool
+        ) -> dict[str, Any]:
+            return self._ensure_quality_reviewer_card_bound(
+                request_id=request_id,
+                target_request_id=target_request_id,
+                target_task_id=target_task_id,
+                reviewer_task_id=reviewer_task_id,
+                runner=runner,
+                adapter_id=adapter_id,
+                lens=lens,
+                target_card=_target_card,
+                terminalize_on_failure=terminalize_on_failure,
+            )
+
+        existing = self._live_reviewer_receipt(reviewer_task_id)
+        if existing is not None:
+            bound = _bind_visible_card(
+                str(existing.get("request_id") or ""),
+                terminalize_on_failure=False,
+            )
+            if bound.get("ok") is not True:
+                return bound
+            return existing
         if not _target_verdict.get("can_launch"):
             return {
                 "ok": False,
@@ -7610,9 +7706,15 @@ class ProcessManager:
         )
         if reservation.get("ok") is not True:
             return reservation
+        request_id = str(reservation["request_id"])
+        bound = _bind_visible_card(
+            request_id,
+            terminalize_on_failure=not bool(reservation.get("already_reserved")),
+        )
+        if bound.get("ok") is not True:
+            return bound
         if reservation.get("already_reserved"):
             return reservation
-        request_id = str(reservation["request_id"])
         threading.Thread(
             target=self._complete_quality_reviewer_launch,
             kwargs={
@@ -7643,6 +7745,7 @@ class ProcessManager:
             "pid": 0,
             "deferred": True,
             "already_reserved": False,
+            "launch_request_id": request_id,
             "shell": False,
             **_legacy_timeout_fields(timeout_seconds),
         }
@@ -7748,7 +7851,13 @@ class ProcessManager:
             # committed) outputs into this dependent's isolated worktree by
             # declaring them as immutable inputs before create_workspace and the
             # B919 input-drift snapshot see the card.
-            card = self._preflight_card(task_id, runner, topic, adapter_id)
+            card = self._preflight_card(
+                task_id,
+                runner,
+                topic,
+                adapter_id,
+                reserved_request_id=reserved_request_id,
+            )
             claimed = core._lifecycle_state(card) == "processing"
             _enforce_quality_review_launch_binding(topic, quality_review_binding)
             card = self._with_dependency_inputs(card)
