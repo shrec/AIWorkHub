@@ -49,11 +49,28 @@ _MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,127}$")
 ROUTE_CIRCUIT_COOLDOWN_SECONDS = 600.0
 ROUTE_CIRCUIT_LOOKBACK_SECONDS = 86_400.0
 ROUTE_CIRCUIT_TRANSIENT_THRESHOLD = 2
-_ROUTE_SUCCESS_STATES = frozenset({"accepted", "review_ready", "validation_failed"})
-_ROUTE_AUTH_MARKERS = (
-    "authentication_failed", "authorization_failed", "invalid_api_key",
-    "unauthorized", "http_status=401", "http_status=403",
+# validation_failed, finalize_failed and review_ready are downstream gate
+# outcomes: the provider returned a usable result, so they close (never open)
+# a route circuit and are never counted as provider-route failures.
+_ROUTE_SUCCESS_STATES = frozenset(
+    {"accepted", "review_ready", "validation_failed", "finalize_failed"}
 )
+# Route-terminal kinds that fail closed after a single authenticated,
+# provider-owned terminal error rather than the transient retry threshold.
+_ROUTE_SINGLE_FAILURE_KINDS = frozenset({"auth", "quota"})
+# Sealed, provider-owned structured terminal error codes.  These are honoured
+# only from an error object the transport sealed itself; the free-form ``error``
+# string and any assistant/model prose are never scanned for them, so a model
+# cannot spoof a balance/quota or refresh-token failure into a route circuit.
+_ROUTE_QUOTA_ERROR_CODES = frozenset({
+    "insufficient_balance", "insufficient_quota",
+    "balance_exhausted", "quota_exhausted",
+})
+_ROUTE_AUTH_ERROR_CODES = frozenset({
+    "invalid_grant", "unknown_refresh_token",
+    "invalid_api_key", "unauthorized",
+    "authentication_failed", "authorization_failed",
+})
 _ROUTE_TRANSIENT_MARKERS = (
     "provider_timeout", "mcp_request_timeout", "no_terminal_event",
     "empty_provider_response", "direct app-server input", "turn/start failed",
@@ -389,11 +406,54 @@ def _process_event_epoch(process: Mapping[str, Any]) -> float | None:
     return None
 
 
+def _sealed_provider_error(process: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Return the sealed, provider-owned structured terminal error, if present.
+
+    Only an error object the provider transport sealed itself (``owner`` is the
+    provider and ``sealed`` is exactly ``True``) is trusted.  Arbitrary
+    assistant/model prose -- including free-form ``error`` text that merely
+    contains ``402`` or ``insufficient_balance`` -- is never a classification
+    signal, so substring spoofing cannot forge a balance/quota or refresh-token
+    failure into a route circuit.
+    """
+
+    sealed = process.get("provider_error")
+    if not isinstance(sealed, Mapping):
+        return None
+    if str(sealed.get("owner") or "").strip().casefold() != "provider":
+        return None
+    if sealed.get("sealed") is not True:
+        return None
+    return sealed
+
+
+def _sealed_error_kind(sealed: Mapping[str, Any]) -> str:
+    code = str(sealed.get("code") or "").strip().casefold()
+    status = sealed.get("http_status")
+    status_code = (
+        status if isinstance(status, int) and not isinstance(status, bool) else 0
+    )
+    if status_code == 402 or code in _ROUTE_QUOTA_ERROR_CODES:
+        return "quota"
+    if status_code in {401, 403} or code in _ROUTE_AUTH_ERROR_CODES:
+        return "auth"
+    return ""
+
+
 def _route_failure_kind(process: Mapping[str, Any]) -> str:
+    sealed = _sealed_provider_error(process)
+    if sealed is not None:
+        sealed_kind = _sealed_error_kind(sealed)
+        if sealed_kind:
+            return sealed_kind
+    # Auth/quota hard-failure kinds are classified only from the sealed,
+    # provider-owned structured error handled above.  The free-form ``error``
+    # string is never scanned for auth/quota markers, so assistant/model prose
+    # or substring spoofing cannot forge a single-failure circuit trip; only
+    # unauthenticated transport signals fall through to the multi-failure
+    # transient threshold below.
     state = str(process.get("state") or "").strip().casefold()
     error = str(process.get("error") or "").strip().casefold()
-    if any(marker in error for marker in _ROUTE_AUTH_MARKERS):
-        return "auth"
     if state in {"launch_failed", "timed_out"}:
         return "transient"
     if state == "worker_failed" and any(
@@ -434,13 +494,16 @@ def _route_circuit(
             latest_failure_epoch = (
                 epoch if latest_failure_epoch is None else latest_failure_epoch
             )
-            if kind == "auth":
+            if kind in _ROUTE_SINGLE_FAILURE_KINDS:
                 break
             continue
         if state in _ROUTE_SUCCESS_STATES:
             break
 
-    threshold = 1 if latest_kind == "auth" else ROUTE_CIRCUIT_TRANSIENT_THRESHOLD
+    threshold = (
+        1 if latest_kind in _ROUTE_SINGLE_FAILURE_KINDS
+        else ROUTE_CIRCUIT_TRANSIENT_THRESHOLD
+    )
     failure_age = (
         max(0.0, now_epoch - latest_failure_epoch)
         if latest_failure_epoch is not None else None

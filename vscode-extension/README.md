@@ -12,12 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.54
+## What's new in 0.10.55
 
-- Model workers are uncapped by default end to end. Reviewer terminal intent
-  settlement survives stale reservations and callback recovery, while
-  zero-diff rework and sparse validation use mechanically verified current
-  canonical evidence instead of entering stale-workspace retry loops.
+- Task templates now choose language-compatible validators, Source Graph
+  telemetry separates live worker calls from injected prefetch evidence, and
+  sealed provider quota/authentication failures stop only the affected route
+  from being selected repeatedly.
 
 ## Architecture at a glance
 

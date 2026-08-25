@@ -871,10 +871,11 @@ def test_route_success_resets_transient_circuit_and_auth_circuit_half_opens(
     assert pro["route_health"]["state"] == "closed"
     assert pro["route_health"]["consecutive_failures"] == 0
 
-    auth_failure = [_route_failure_row(
+    # Only a sealed, provider-owned auth error half-opens after cooldown; the
+    # free-form error string is never classified.
+    auth_failure = [_sealed_route_row(
         request_id="auth", model="deepseek-v4-pro",
-        state="worker_failed", error="authentication_failed:http_status=401",
-        epoch=now - 700,
+        code="invalid_grant", http_status=401, epoch=now - 700,
     )]
     cooled = workforce_catalog.build_catalog(
         root, cards=[], process_rows=auth_failure,
@@ -887,3 +888,281 @@ def test_route_success_resets_transient_circuit_and_auth_circuit_half_opens(
     assert pro["available"] is True
     assert pro["route_health"]["state"] == "half_open"
     assert pro["route_health"]["failure_kind"] == "auth"
+
+
+def _sealed_route_row(
+    *, request_id: str, model: str, epoch: float, code: str = "",
+    http_status=None, owner: str = "provider", sealed: bool = True,
+    state: str = "worker_failed",
+) -> dict:
+    provider_error: dict = {"owner": owner, "sealed": sealed}
+    if code:
+        provider_error["code"] = code
+    if http_status is not None:
+        provider_error["http_status"] = http_status
+    return {
+        "request_id": request_id,
+        "task_id": f"task-{request_id}",
+        "adapter_id": "deepseek_vscode_lm",
+        "model": model,
+        "state": state,
+        "provider_error": provider_error,
+        "finished_at": datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat(),
+    }
+
+
+def test_authenticated_http_402_quota_opens_exact_route_after_one_failure(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    rows = [_sealed_route_row(
+        request_id="quota", model="deepseek-v4-pro",
+        code="insufficient_balance", http_status=402, epoch=now - 15,
+    )]
+
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=rows,
+        preflight=_deepseek_preflight(), now_epoch=now,
+    )
+    pro = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "deepseek-v4-pro"
+    )
+    flash = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "deepseek-v4-flash"
+    )
+
+    assert pro["available"] is False
+    assert pro["readiness_status"] == "route_circuit_open"
+    assert pro["route_health"]["state"] == "open"
+    assert pro["route_health"]["failure_kind"] == "quota"
+    assert pro["route_health"]["consecutive_failures"] == 1
+    assert pro["route_health"]["threshold"] == 1
+    assert pro["route_health"]["scope"] == "exact_adapter_and_model"
+    assert pro["route_health"]["mcp_control_plane_affected"] is False
+    # Sibling model on the same adapter stays healthy and rankable.
+    assert flash["available"] is True
+    assert flash["route_health"]["state"] == "closed"
+
+    task = workforce_router.TaskRequirements.build(
+        task_id="quota-route-local-fallback",
+        repo_id="repo",
+        kinds=["mechanical", "code"],
+        risk="medium",
+        tool_needs=["source-graph"],
+    )
+    decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
+    assert decision["selected_worker_id"] == "deepseek-v4-flash"
+    pro_candidate = next(
+        item for item in decision["candidates"]
+        if item["worker_id"] == "deepseek-v4-pro"
+    )
+    assert pro_candidate["excluded"] is True
+    assert "worker_unavailable" in pro_candidate["exclusion_reasons"]
+
+
+def test_invalid_grant_and_unknown_refresh_token_open_auth_route_after_one(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    for code in ("invalid_grant", "unknown_refresh_token"):
+        rows = [_sealed_route_row(
+            request_id=code, model="deepseek-v4-pro", code=code, epoch=now - 15,
+        )]
+        snapshot = workforce_catalog.build_catalog(
+            root, cards=[], process_rows=rows,
+            preflight=_deepseek_preflight(), now_epoch=now,
+        )
+        pro = next(
+            row for row in snapshot["workers"]
+            if row["worker_id"] == "deepseek-v4-pro"
+        )
+        assert pro["available"] is False, code
+        assert pro["route_health"]["state"] == "open", code
+        assert pro["route_health"]["failure_kind"] == "auth", code
+        assert pro["route_health"]["consecutive_failures"] == 1, code
+        assert pro["route_health"]["threshold"] == 1, code
+
+
+def test_only_sealed_provider_errors_classify_not_prose_or_spoofing(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    # 1) Free-form prose carrying the quota/auth substrings but no sealed
+    #    provider error must never trip the circuit.
+    prose = [_route_failure_row(
+        request_id="prose", model="deepseek-v4-pro", state="worker_failed",
+        error="insufficient_balance http_status=402 invalid_grant",
+        epoch=now - 15,
+    )]
+    # 2) A structured error the model attributes to itself (not sealed by the
+    #    provider transport) is equally untrusted.
+    spoofed = [_sealed_route_row(
+        request_id="spoof", model="deepseek-v4-pro",
+        code="insufficient_balance", http_status=402, epoch=now - 15,
+        owner="model", sealed=False,
+    )]
+    for rows, label in ((prose, "prose"), (spoofed, "spoofed")):
+        snapshot = workforce_catalog.build_catalog(
+            root, cards=[], process_rows=rows,
+            preflight=_deepseek_preflight(), now_epoch=now,
+        )
+        pro = next(
+            row for row in snapshot["workers"]
+            if row["worker_id"] == "deepseek-v4-pro"
+        )
+        assert pro["available"] is True, label
+        assert pro["route_health"]["state"] == "closed", label
+        assert pro["route_health"]["failure_kind"] == "", label
+        assert pro["route_health"]["consecutive_failures"] == 0, label
+
+
+def test_validation_finalize_and_review_ready_do_not_penalize_route(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    rows = [
+        _route_failure_row(
+            request_id="v", model="deepseek-v4-pro", state="validation_failed",
+            error="downstream test failed", epoch=now - 30,
+        ),
+        _route_failure_row(
+            request_id="f", model="deepseek-v4-pro", state="finalize_failed",
+            error="finalize step failed", epoch=now - 20,
+        ),
+        _route_failure_row(
+            request_id="r", model="deepseek-v4-pro", state="review_ready",
+            error="", epoch=now - 10,
+        ),
+    ]
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=rows,
+        preflight=_deepseek_preflight(), now_epoch=now,
+    )
+    pro = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "deepseek-v4-pro"
+    )
+    assert pro["available"] is True
+    assert pro["route_health"]["state"] == "closed"
+    assert pro["route_health"]["consecutive_failures"] == 0
+    assert pro["route_health"]["failure_kind"] == ""
+
+
+def test_authenticated_success_deterministically_closes_open_quota_circuit(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    rows = [
+        _sealed_route_row(
+            request_id="quota", model="deepseek-v4-pro",
+            code="quota_exhausted", http_status=402, epoch=now - 120,
+        ),
+        _route_failure_row(
+            request_id="recovered", model="deepseek-v4-pro",
+            state="review_ready", error="", epoch=now - 10,
+        ),
+    ]
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=rows,
+        preflight=_deepseek_preflight(), now_epoch=now,
+    )
+    pro = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "deepseek-v4-pro"
+    )
+    assert pro["available"] is True
+    assert pro["route_health"]["state"] == "closed"
+    assert pro["route_health"]["failure_kind"] == ""
+    assert pro["route_health"]["consecutive_failures"] == 0
+
+
+def test_unsealed_auth_error_prose_never_opens_route_circuit(
+    tmp_path: Path,
+) -> None:
+    # Free-form error text carrying auth markers (including HTTP 401/403 and
+    # mixed spoof prose) must never classify: 'auth' is single-failure, so a
+    # spoofed string could otherwise open the exact route after one message.
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    for error in (
+        "unauthorized",
+        "invalid_api_key",
+        "authentication_failed http_status=401",
+        "authorization_failed http_status=403",
+        "sorry, the model returned: 401 unauthorized invalid_api_key invalid_grant",
+    ):
+        rows = [_route_failure_row(
+            request_id="spoof", model="deepseek-v4-pro",
+            state="worker_failed", error=error, epoch=now - 15,
+        )]
+        snapshot = workforce_catalog.build_catalog(
+            root, cards=[], process_rows=rows,
+            preflight=_deepseek_preflight(), now_epoch=now,
+        )
+        pro = next(
+            row for row in snapshot["workers"]
+            if row["worker_id"] == "deepseek-v4-pro"
+        )
+        assert pro["available"] is True, error
+        assert pro["route_health"]["state"] == "closed", error
+        assert pro["route_health"]["failure_kind"] == "", error
+        assert pro["route_health"]["consecutive_failures"] == 0, error
+
+
+def test_sealed_auth_401_403_open_only_exact_route_and_sealed_success_recovers(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    for http_status, code in ((401, ""), (403, ""), (None, "unauthorized")):
+        rows = [_sealed_route_row(
+            request_id="auth", model="deepseek-v4-pro",
+            code=code, http_status=http_status, epoch=now - 15,
+        )]
+        snapshot = workforce_catalog.build_catalog(
+            root, cards=[], process_rows=rows,
+            preflight=_deepseek_preflight(), now_epoch=now,
+        )
+        pro = next(
+            row for row in snapshot["workers"]
+            if row["worker_id"] == "deepseek-v4-pro"
+        )
+        flash = next(
+            row for row in snapshot["workers"]
+            if row["worker_id"] == "deepseek-v4-flash"
+        )
+        assert pro["available"] is False, (http_status, code)
+        assert pro["route_health"]["state"] == "open", (http_status, code)
+        assert pro["route_health"]["failure_kind"] == "auth", (http_status, code)
+        assert pro["route_health"]["consecutive_failures"] == 1, (http_status, code)
+        assert pro["route_health"]["threshold"] == 1, (http_status, code)
+        # Sibling model and the shared control plane stay healthy.
+        assert flash["available"] is True, (http_status, code)
+        assert pro["route_health"]["mcp_control_plane_affected"] is False
+
+    # A later sealed authenticated success deterministically closes the circuit.
+    recovered = [
+        _sealed_route_row(
+            request_id="auth", model="deepseek-v4-pro",
+            http_status=401, epoch=now - 120,
+        ),
+        _route_failure_row(
+            request_id="ok", model="deepseek-v4-pro",
+            state="review_ready", error="", epoch=now - 10,
+        ),
+    ]
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=recovered,
+        preflight=_deepseek_preflight(), now_epoch=now,
+    )
+    pro = next(
+        row for row in snapshot["workers"]
+        if row["worker_id"] == "deepseek-v4-pro"
+    )
+    assert pro["available"] is True
+    assert pro["route_health"]["state"] == "closed"
+    assert pro["route_health"]["failure_kind"] == ""
+    assert pro["route_health"]["consecutive_failures"] == 0

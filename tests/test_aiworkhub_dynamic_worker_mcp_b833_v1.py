@@ -476,6 +476,21 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     assert verification["source_graph_hit_count"] == first["hit_count"] * 2
     assert verification["source_graph_zero_hit_calls"] == 0
     assert verification["source_graph_failed_calls"] == 0
+    # NF389/r6: the total counters aggregate BOTH the fresh live row and the
+    # cache-replay row (backward-compatible), but the live-scoped counters see
+    # only the single provenance=="live" row -- the cache replay is provenance
+    # "cache" and never enters them.
+    assert verification["provenance_counts"] == {"live": 1, "cache": 1}
+    assert verification["live_source_graph_call_count"] == 1
+    assert verification["live_source_graph_success_count"] == 1
+    assert verification["live_source_graph_hit_count"] == first["hit_count"]
+    assert verification["live_source_graph_zero_hit_calls"] == 0
+    assert verification["live_source_graph_failed_calls"] == 0
+    assert verification["live_source_graph_repeated_query_calls"] == 0
+    assert verification["live_source_graph_mode_counts"] == {"focus": 1}
+    assert verification["live_source_graph_mode_sequence"] == ["focus"]
+    assert len(verification["live_source_graph_query_sequence"]) == 1
+    assert verification["live_source_graph_stage_counts"] == {"orientation": 1}
     assert verification["bounded_bytes_returned"] > 0
     assert verification["source_graph_stage_counts"] == {
         "orientation": 1, "validation": 1,
@@ -494,17 +509,21 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     assert len(verification["source_graph_query_sequence"]) == 2
     assert verification["source_graph_query_sequence"][0] == verification["source_graph_query_sequence"][1]
     assert verification["receipt_conformance"]["status"] == "pass"
+    # NF389/r6: tool-discipline is scored over LIVE rows only. The fresh call
+    # is the sole live row; the cache replay ("cache" provenance) never enters,
+    # so source_graph_calls==1 and repeated_query_calls==0 (no live repeat) and
+    # the score carries no repeated-query penalty.
     assert verification["tool_discipline"] == {
         "schema_id": "aiworkhub.tool_discipline.v1",
         "status": "observed",
         "observation_only": True,
-        "score": 87.5,
-        "source_graph_calls": 2,
+        "score": 100.0,
+        "source_graph_calls": 1,
         "failed_calls": 0,
         "zero_hit_calls": 0,
-        "repeated_query_calls": 1,
+        "repeated_query_calls": 0,
         "deps_after_trace": False,
-        "query_identity_coverage": {"observed": 2, "expected": 2},
+        "query_identity_coverage": {"observed": 1, "expected": 1},
     }
 
 
@@ -597,6 +616,17 @@ def test_prefetch_provenance_is_auditable_but_never_satisfies_live_gate(
     assert verification2["live_source_graph_calls"] == 1
     assert verification2["fresh_source_graph_calls"] == 1
     assert verification2["successful_call_count_by_tool"]["source_graph"] == 2
+    # Core NF-2026-00023 fix: one prefetch + one live call keeps the TOTAL
+    # authenticated count at 2 (backward-compatible) and both provenance rows
+    # in provenance_counts, but every live-scoped counter and the discipline
+    # score report exactly 1 -- the prefetch never inflates them.
+    assert verification2["call_count_by_tool"]["source_graph"] == 2
+    assert verification2["live_source_graph_call_count"] == 1
+    assert verification2["live_source_graph_success_count"] == 1
+    assert verification2["tool_discipline"]["source_graph_calls"] == 1
+    assert verification2["tool_discipline"]["query_identity_coverage"] == {
+        "observed": 1, "expected": 1,
+    }
 
     gate2 = process_launcher._worker_mcp_live_call_gate(metadata, live_ctx.request_id)
     assert gate2["satisfied"] is True
@@ -1111,6 +1141,221 @@ def test_prefetch_and_cache_provenance_never_satisfy_live_gate(
     # auditable but are never counted as a fresh/live provider call.
     assert verification["fresh_source_graph_calls"] == 1
     assert verification["live_source_graph_calls"] == 1
+
+
+def _authenticated_source_graph_entry(
+    ctx: w.WorkerToolContext,
+    key_bytes: bytes,
+    *,
+    provenance: str | None,
+    cache_hit: bool = False,
+    ok: bool = True,
+    hit_count: int = 1,
+    query_sha256: str | None = None,
+    mode: str = "focus",
+    workflow_stage: str = "orientation",
+    pci: str = "pci_valid_1",
+) -> dict:
+    """Build one HMAC-authenticated source_graph ledger row with a bound
+    payload, so a test can exercise the live-scoped counters directly without
+    depending on real engine timing."""
+    entry = {
+        "schema_id": w.AUDIT_ENTRY_SCHEMA_ID, "timestamp": "2026-01-01T00:00:00+00:00",
+        "task_id": ctx.task_id, "runner": ctx.runner, "topic": ctx.topic,
+        "request_id": ctx.request_id,
+        "tool": "source_graph", "ok": ok, "cache_hit": cache_hit,
+        "hit_count": hit_count, "bytes_returned": 1, "violation": "",
+        "authority_source": "canonical", "authority_state": "sole_authority",
+        "authority_repo": str(ctx.authority_repo),
+        "provider_call_id": pci,
+        "payload": {
+            "mode": mode,
+            "query_sha256": query_sha256 or ("a" * 64),
+            "workflow_stage": workflow_stage,
+            # Faithful to the live tool surface: every real ``source_graph_query``
+            # ledger row carries the authoritative index revision in its payload
+            # (worker_ai_tools_mcp writes ``index_revision`` here). ``receipt_
+            # conformance_report`` refuses a fresh source_graph call that lacks a
+            # revision, so a synthetic authenticated row must model it too --
+            # otherwise a genuine zero-hit live call is wrongly gated as if the
+            # index was never touched.
+            "index_revision": source_graph_mod.BUILD_REVISION,
+        },
+    }
+    if provenance is not None:
+        entry["provenance"] = provenance
+    entry["hmac_sha256"] = w._hmac_entry(entry, key_bytes)
+    return entry
+
+
+def test_live_scoped_zero_hit_call_counts_as_one_and_satisfies_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An authenticated provenance=="live" call that returns zero rows is still
+    exactly one live call: it counts once in every live-scoped counter and
+    satisfies the required-tool gate. Query usefulness stays visible through the
+    separate zero-hit counter."""
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
+    key_bytes = ctx.audit_hmac_key_path.read_bytes()
+
+    with ctx.audit_ledger_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_authenticated_source_graph_entry(
+            ctx, key_bytes, provenance="live", hit_count=0,
+        )) + "\n")
+
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    assert verification["provenance_counts"] == {"live": 1}
+    assert verification["live_source_graph_call_count"] == 1
+    assert verification["live_source_graph_success_count"] == 1
+    assert verification["live_source_graph_hit_count"] == 0
+    assert verification["live_source_graph_zero_hit_calls"] == 1
+    assert verification["live_source_graph_failed_calls"] == 0
+    assert verification["live_source_graph_calls"] == 1
+    # A zero-hit live call is real tool use, not a failure: the discipline
+    # score docks for the empty result but the call is still observed.
+    discipline = verification["tool_discipline"]
+    assert discipline["source_graph_calls"] == 1
+    assert discipline["zero_hit_calls"] == 1
+    assert discipline["failed_calls"] == 0
+
+    metadata = _live_gate_metadata(ctx)
+    gate = process_launcher._worker_mcp_live_call_gate(metadata, ctx.request_id)
+    assert gate["gated"] is True
+    assert gate["satisfied"] is True
+    assert gate["satisfaction_by_tool"]["source_graph"] == "live_worker_call"
+
+
+def test_prefetch_and_cache_rows_never_enter_live_scoped_discipline_counters(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A prefetch row and a cache-replay row of the SAME query are auditable in
+    the total counters but must contribute nothing to any live-scoped counter or
+    the discipline score -- only the single live row does."""
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
+    key_bytes = ctx.audit_hmac_key_path.read_bytes()
+    shared_sha = "b" * 64
+
+    with ctx.audit_ledger_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_authenticated_source_graph_entry(
+            ctx, key_bytes, provenance="prefetch", query_sha256=shared_sha,
+            pci="pci_prefetch_1",
+        )) + "\n")
+        handle.write(json.dumps(_authenticated_source_graph_entry(
+            ctx, key_bytes, provenance="cache", cache_hit=True,
+            query_sha256=shared_sha, pci="pci_cache_1",
+        )) + "\n")
+        handle.write(json.dumps(_authenticated_source_graph_entry(
+            ctx, key_bytes, provenance="live", query_sha256=shared_sha,
+            pci="pci_live_1",
+        )) + "\n")
+
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    # Totals see all three authenticated rows (backward-compatible).
+    assert verification["entries_verified"] == 3
+    assert verification["call_count_by_tool"]["source_graph"] == 3
+    assert verification["provenance_counts"] == {"prefetch": 1, "cache": 1, "live": 1}
+    assert len(verification["source_graph_query_sequence"]) == 3
+    # Live-scoped counters see only the one live row -- and because it is the
+    # sole live query there is no repeated-query penalty even though the
+    # prefetch/cache rows carried the identical query hash.
+    assert verification["live_source_graph_call_count"] == 1
+    assert verification["live_source_graph_query_sequence"] == [shared_sha]
+    assert verification["live_source_graph_repeated_query_calls"] == 0
+    assert verification["live_source_graph_calls"] == 1
+    assert verification["tool_discipline"]["source_graph_calls"] == 1
+    assert verification["tool_discipline"]["repeated_query_calls"] == 0
+
+
+def test_repeated_live_query_penalizes_only_live_scoped_discipline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Two genuine live rows carrying the same query hash ARE a repeated live
+    query and dock the live-scoped discipline score, distinguishing a real live
+    repeat from a cache replay of a live query."""
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
+    key_bytes = ctx.audit_hmac_key_path.read_bytes()
+    shared_sha = "c" * 64
+
+    with ctx.audit_ledger_path.open("a", encoding="utf-8") as handle:
+        for pci in ("pci_live_a", "pci_live_b"):
+            handle.write(json.dumps(_authenticated_source_graph_entry(
+                ctx, key_bytes, provenance="live", query_sha256=shared_sha, pci=pci,
+            )) + "\n")
+
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    assert verification["live_source_graph_call_count"] == 2
+    assert verification["live_source_graph_repeated_query_calls"] == 1
+    discipline = verification["tool_discipline"]
+    assert discipline["source_graph_calls"] == 2
+    assert discipline["repeated_query_calls"] == 1
+    # penalty = min(1, repeated/calls) * 25 = min(1, 1/2) * 25 = 12.5
+    assert discipline["score"] == 87.5
+
+
+def test_invalid_and_tampered_provenance_never_enter_live_scoped_counters(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Malformed/spoofed (authenticated-invalid) and tampered (bad HMAC)
+    provenance rows are dropped before any aggregation, so neither can seed a
+    live-scoped counter. Only the genuine live row survives."""
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
+    key_bytes = ctx.audit_hmac_key_path.read_bytes()
+
+    spoofed = _authenticated_source_graph_entry(
+        ctx, key_bytes, provenance="spoofed", pci="pci_spoofed",
+    )
+    tampered = _authenticated_source_graph_entry(
+        ctx, key_bytes, provenance="live", pci="pci_tampered",
+    )
+    tampered["hmac_sha256"] = "0" * 64
+    unbound = _authenticated_source_graph_entry(
+        ctx, key_bytes, provenance=None, pci="pci_unbound",
+    )
+    genuine = _authenticated_source_graph_entry(
+        ctx, key_bytes, provenance="live", pci="pci_genuine",
+    )
+
+    with ctx.audit_ledger_path.open("a", encoding="utf-8") as handle:
+        for entry in (spoofed, tampered, unbound, genuine):
+            handle.write(json.dumps(entry) + "\n")
+
+    verification = w.verify_audit_ledger(
+        ctx.audit_ledger_path, ctx.audit_hmac_key_path,
+        task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,
+    )
+    assert verification["ok"] is False  # spoofed row is an identity violation
+    assert verification["entries_tampered"] == 1
+    assert verification["entries_invalid_identity"] == 1
+    # Only the unbound (verified, no provenance) and genuine live rows verify.
+    assert verification["entries_verified"] == 2
+    assert "spoofed" not in verification["provenance_counts"]
+    assert verification["provenance_counts"] == {"live": 1}
+    # The unbound row has no "live" provenance, so live-scoped counters see
+    # exactly the one genuine live row -- never the spoofed/tampered/unbound.
+    assert verification["live_source_graph_call_count"] == 1
+    assert verification["live_source_graph_calls"] == 1
+    assert verification["tool_discipline"]["source_graph_calls"] == 1
 
 
 def test_hmac_valid_empty_and_missing_provenance_never_satisfy_live_gate(

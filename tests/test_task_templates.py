@@ -509,9 +509,26 @@ def test_non_canonical_template_work_kinds_map_to_generic():
     assert docs["task_type"] == "code"
 
 
-def test_validation_roles_unsatisfiable_when_commands_cannot_cover_required():
-    with pytest.raises(TaskTemplateError, match="validation_roles_unsatisfiable"):
-        _validation_roles_for("bugfix", ["python -m pytest -q tests/test_a.py"])
+def test_validation_roles_seed_through_live_path_and_normalized_authority():
+    # Roles are seeded on the live expansion path and validated by the one
+    # normalized authority (normalize_behavioral_contract), not by a duplicate
+    # in-module fail-closed guard.
+    card = expand_template(
+        "bugfix_with_regression",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    assert len(card["validation_roles"]) == len(card["validation"])
+    kind, roles = normalize_behavioral_contract(
+        card["work_kind"], card["validation"], card["validation_roles"]
+    )
+    assert kind == "bugfix"
+    assert roles == card["validation_roles"]
+    # The seed helper no longer raises; it fills available slots and defers the
+    # authoritative contract check to normalize_behavioral_contract.
+    assert _validation_roles_for(
+        "bugfix", ["python -m pytest -q tests/test_a.py"]
+    ) == ["reproduction"]
 
 
 _CANONICAL_TASK_TYPES = ("code", "data_classification", "research")
@@ -884,4 +901,201 @@ def test_custom_validation_and_roles_reject_unbounded_lists():
     validate_custom_validation_roles(
         ["git diff --check"] * MAX_PATHS_PER_FIELD,
         ["generic"] * MAX_PATHS_PER_FIELD,
+    )
+
+
+def test_real_suffixless_directory_targets_route_to_python_toolchain():
+    card = expand_template("test_only", test_paths=["tests", "tests/unit"])
+    assert card["validation"] == [
+        "python -m pytest -q tests tests/unit",
+        "python -m ruff check tests tests/unit",
+        "git diff --check",
+    ]
+
+
+def test_suffixless_ordinary_files_never_route_to_pytest_or_ruff():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["Makefile", "LICENSE", "Dockerfile", "src/app.py"],
+        test_paths=["tests/test_app.py"],
+    )
+    assert card["validation"] == [
+        "python -m pytest -q tests/test_app.py",
+        "python -m ruff check src/app.py tests/test_app.py",
+        "git diff --check",
+    ]
+    assert card["allowed_writes"] == [
+        "Makefile",
+        "LICENSE",
+        "Dockerfile",
+        "src/app.py",
+        "tests/test_app.py",
+    ]
+    for command in card["validation"]:
+        if command.startswith("python "):
+            assert "Makefile" not in command
+            assert "LICENSE" not in command
+            assert "Dockerfile" not in command
+
+
+def test_non_python_assets_never_route_to_pytest_or_ruff():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=[
+            "config.json",
+            "pyproject.toml",
+            "README.md",
+            "assets/logo.png",
+            "src/app.py",
+        ],
+        test_paths=["tests/test_app.py", "tests/data.json"],
+    )
+    assert card["validation"] == [
+        "python -m pytest -q tests/test_app.py",
+        "python -m ruff check src/app.py tests/test_app.py",
+        "git diff --check",
+    ]
+    non_python_assets = (
+        "config.json",
+        "pyproject.toml",
+        "README.md",
+        ".png",
+        "data.json",
+    )
+    for command in card["validation"]:
+        if command.startswith("python "):
+            for asset in non_python_assets:
+                assert asset not in command
+
+
+def test_mixed_python_and_javascript_targets_stay_language_separated():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/app.py"],
+        test_paths=["tests/test_app.py", "tests/app.test.js"],
+    )
+    assert card["validation"] == [
+        "python -m pytest -q tests/test_app.py",
+        "python -m ruff check src/app.py tests/test_app.py",
+        "node --test tests/app.test.js",
+        "git diff --check",
+    ]
+    python_commands = [c for c in card["validation"] if c.startswith("python ")]
+    node_commands = [c for c in card["validation"] if c.startswith("node ")]
+    assert all(".js" not in command for command in python_commands)
+    assert all(".py" not in command for command in node_commands)
+
+
+def test_suffixless_files_under_tests_never_route_to_pytest_or_ruff():
+    card = expand_template(
+        "test_only",
+        test_paths=["tests/unit", "tests/Makefile", "tests/fixtures/sample"],
+    )
+    assert card["validation"] == [
+        "python -m pytest -q tests/unit",
+        "python -m ruff check tests/unit",
+        "git diff --check",
+    ]
+    assert card["allowed_writes"] == [
+        "tests/unit",
+        "tests/Makefile",
+        "tests/fixtures/sample",
+    ]
+    for command in card["validation"]:
+        if command.startswith("python "):
+            assert "Makefile" not in command
+            assert "fixtures" not in command
+            assert "sample" not in command
+
+
+def test_lowercase_suffixless_file_under_tests_never_routes():
+    # Regression: a lowercase suffixless ordinary file directly under tests/
+    # (tests/data, tests/fixture, tests/notes) is not a directory target and must
+    # never reach pytest or Ruff.  The removed first-character casing heuristic
+    # wrongly classified these lowercase leaves as directories; the explicit
+    # allowlist authority routes only the sanctioned tests/unit directory.
+    card = expand_template(
+        "test_only",
+        test_paths=["tests/unit", "tests/data", "tests/fixture", "tests/notes"],
+    )
+    assert card["validation"] == [
+        "python -m pytest -q tests/unit",
+        "python -m ruff check tests/unit",
+        "git diff --check",
+    ]
+    assert card["allowed_writes"] == [
+        "tests/unit",
+        "tests/data",
+        "tests/fixture",
+        "tests/notes",
+    ]
+    for command in card["validation"]:
+        if command.startswith("python "):
+            for leaf in ("data", "fixture", "notes"):
+                assert leaf not in command
+
+
+def test_underscore_prefixed_leaf_under_tests_never_routes():
+    # Regression: an underscore-prefixed suffixless leaf under tests/
+    # (tests/_helpers) is not an explicitly sanctioned directory target, so it is
+    # deterministically excluded from pytest/Ruff rather than guessed from name
+    # casing.  The sanctioned tests and tests/unit directory targets still route.
+    card = expand_template(
+        "test_only",
+        test_paths=["tests", "tests/unit", "tests/_helpers"],
+    )
+    assert card["validation"] == [
+        "python -m pytest -q tests tests/unit",
+        "python -m ruff check tests tests/unit",
+        "git diff --check",
+    ]
+    assert card["allowed_writes"] == ["tests", "tests/unit", "tests/_helpers"]
+    for command in card["validation"]:
+        if command.startswith("python "):
+            assert "_helpers" not in command
+
+
+@pytest.mark.parametrize(
+    "allow_path",
+    [
+        "tests/../tests/test_a.py",
+        "tests/sub/../test_a.py",
+        "./tests/../tests/test_a.py",
+        "tests/nested/deeper/../../test_a.py",
+    ],
+)
+def test_unchanged_required_public_test_traversal_aliases_fail_closed(allow_path):
+    with pytest.raises(
+        TaskTemplateError, match="unchanged_required_public_test_output"
+    ):
+        reject_unchanged_public_test_outputs(
+            [allow_path], ["src/a.py", "tests/test_a.py"]
+        )
+
+
+@pytest.mark.parametrize(
+    ("allow_path", "required_path"),
+    [
+        ("Tests/test_a.py", "tests/test_a.py"),
+        ("tests/Test_A.py", "tests/test_a.py"),
+        ("TESTS/TEST_A.PY", "tests/test_a.py"),
+        ("tests/test_a.py", "Tests/Test_A.py"),
+        ("Tests/../Tests/Test_A.py", "tests/test_a.py"),
+    ],
+)
+def test_unchanged_required_public_test_windows_case_aliases_fail_closed(
+    allow_path, required_path
+):
+    with pytest.raises(
+        TaskTemplateError, match="unchanged_required_public_test_output"
+    ):
+        reject_unchanged_public_test_outputs(
+            [allow_path], ["src/a.py", required_path]
+        )
+
+
+def test_unchanged_required_traversal_to_non_test_output_is_allowed():
+    # Resolves to src/a.py, which is not a public test output, so it is allowed.
+    reject_unchanged_public_test_outputs(
+        ["tests/../src/a.py"], ["src/a.py", "tests/test_a.py"]
     )

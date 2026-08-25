@@ -415,15 +415,18 @@ def _canonical_work_kind(work_kind: str) -> str:
 
 
 def _validation_roles_for(work_kind: str, validation: Sequence[str]) -> list[str]:
+    """Seed a one-to-one role list for the live expansion path.
+
+    This helper only assigns roles; the authoritative behavioral-contract
+    check is ``normalize_behavioral_contract`` in ``quality_evidence`` (the one
+    normalized authority, exercised by the classify/create-task path and its
+    tests).  It deliberately keeps no duplicate fail-closed guard of its own,
+    so no dead security control lingers here.
+    """
     required = _REQUIRED_VALIDATION_ROLES.get(work_kind, ())
-    if len(required) > len(validation):
-        raise TaskTemplateError("validation_roles_unsatisfiable")
     roles: list[str] = []
     for index, _command in enumerate(validation):
-        if index < len(required):
-            roles.append(required[index])
-        else:
-            roles.append("generic")
+        roles.append(required[index] if index < len(required) else "generic")
     return roles
 
 
@@ -435,10 +438,59 @@ def _is_node_path(path: str) -> bool:
     return path.endswith(_NODE_SUFFIXES)
 
 
+_TEST_ROOT = "tests"
+# Deterministic path-kind authority.  Only these exact suffixless paths are real
+# directory targets eligible for pytest/Ruff; every other suffixless path is
+# treated as an ordinary file and never routed.  This is an explicit allowlist
+# rather than a first-character casing heuristic, so a suffixless file (a
+# lowercase leaf such as ``tests/data`` or an underscore-prefixed leaf such as
+# ``tests/_helpers``) can never be mistaken for a directory, while the sanctioned
+# ``tests`` and ``tests/unit`` directory targets stay supported.
+_SUFFIXLESS_DIRECTORY_TARGETS = frozenset({_TEST_ROOT, f"{_TEST_ROOT}/unit"})
+
+
+def _is_suffixless_directory_target(path: str) -> bool:
+    """Return True only for an explicitly sanctioned suffixless directory target.
+
+    Membership in :data:`_SUFFIXLESS_DIRECTORY_TARGETS` is the sole authority, so
+    ordinary suffixless files (``tests/Makefile``, ``tests/LICENSE``), lowercase
+    or underscore-prefixed suffixless leaves under ``tests`` (``tests/data``,
+    ``tests/_helpers``) and any nested leaf (``tests/fixtures/sample``) are never
+    directory targets and never reach pytest or Ruff, without touching the
+    filesystem or guessing a path kind from its name casing.
+    """
+    return path in _SUFFIXLESS_DIRECTORY_TARGETS
+
+
+def _is_python_toolchain_path(path: str) -> bool:
+    """Return True when a target is eligible for pytest/Ruff.
+
+    A Python file, or a real suffixless directory target rooted at ``tests``
+    (``tests``, ``tests/unit``).  Suffixless ordinary files (Makefile, LICENSE,
+    Dockerfile), suffixless files nested under ``tests`` (``tests/Makefile``,
+    ``tests/fixtures/sample``) and non-Python assets (JSON, TOML, Markdown,
+    images) are never Python-toolchain targets and never reach pytest or Ruff.
+    """
+    if _is_python_path(path):
+        return True
+    return _is_suffixless_directory_target(path)
+
+
 def _canonical_repo_relative_path(path: str) -> str:
+    """Collapse separators and resolve ``.``/``..`` traversal.
+
+    Windows separators and duplicate or leading ``./`` slashes are folded, and a
+    ``..`` segment is resolved against the preceding real segment so traversal
+    aliases (``tests/../tests/x``) canonicalize onto their true target.  A ``..``
+    that would escape the repo root is preserved verbatim so it can never
+    silently alias an in-repo output.
+    """
     parts: list[str] = []
     for part in path.replace("\\", "/").strip().split("/"):
         if part in {"", "."}:
+            continue
+        if part == ".." and parts and parts[-1] != "..":
+            parts.pop()
             continue
         parts.append(part)
     return "/".join(parts)
@@ -462,39 +514,35 @@ def _looks_like_test_path(path: str) -> bool:
 def _validation_commands_for(
     spec: TaskTemplateSpec, production: list[str], tests: list[str]
 ) -> list[str]:
+    """Language/toolchain-aware validation commands in one deterministic order.
+
+    Python-compatible targets drive pytest/Ruff and applicable JavaScript
+    targets drive ``node --test`` in a single consolidated builder shared by
+    every template.  Suffixless ordinary files (Makefile, LICENSE, Dockerfile)
+    and non-Python assets (JSON, TOML, Markdown, images) are never routed to
+    pytest or Ruff, while real suffixless directory targets such as ``tests``
+    and ``tests/unit`` stay supported.
+    """
+    py_production = [path for path in production if _is_python_toolchain_path(path)]
+    py_tests = [path for path in tests if _is_python_toolchain_path(path)]
+    node_tests = [path for path in tests if _is_node_path(path)]
     if spec.name == "cross_boundary_bugfix":
-        py_production = [path for path in production if _is_python_path(path)]
-        py_tests = [path for path in tests if _is_python_path(path)]
         node_production = [path for path in production if _is_node_path(path)]
-        node_tests = [path for path in tests if _is_node_path(path)]
         if not (py_production or py_tests) or not (node_production or node_tests):
             raise TaskTemplateError("missing_cross_boundary_languages")
-        validation: list[str] = []
-        if spec.generates_pytest and py_tests:
-            validation.append(
-                " ".join([COMMAND_PYTHON, "-m", "pytest", "-q", *py_tests])
-            )
-        if spec.generates_lint and (py_production or py_tests):
-            validation.append(
-                " ".join(
-                    [COMMAND_PYTHON, "-m", "ruff", "check", *py_production, *py_tests]
-                )
-            )
-        if node_tests:
-            validation.append(" ".join([COMMAND_NODE, "--test", *node_tests]))
-        if spec.generates_diff_check:
-            validation.append(DIFF_CHECK_COMMAND)
-        return validation
-    lint_targets = [*production, *tests]
-    validation = []
-    if spec.generates_pytest and tests:
+    validation: list[str] = []
+    if spec.generates_pytest and py_tests:
         validation.append(
-            " ".join([COMMAND_PYTHON, "-m", "pytest", "-q", *tests])
+            " ".join([COMMAND_PYTHON, "-m", "pytest", "-q", *py_tests])
         )
-    if spec.generates_lint and lint_targets:
+    if spec.generates_lint and (py_production or py_tests):
         validation.append(
-            " ".join([COMMAND_PYTHON, "-m", "ruff", "check", *lint_targets])
+            " ".join(
+                [COMMAND_PYTHON, "-m", "ruff", "check", *py_production, *py_tests]
+            )
         )
+    if spec.generates_pytest and node_tests:
+        validation.append(" ".join([COMMAND_NODE, "--test", *node_tests]))
     if spec.generates_diff_check:
         validation.append(DIFF_CHECK_COMMAND)
     return validation
@@ -643,7 +691,7 @@ def reject_unchanged_public_test_outputs(
     allow_unchanged: Sequence[Any], required_outputs: Sequence[Any]
 ) -> None:
     required = {
-        _canonical_repo_relative_path(item)
+        _canonical_repo_relative_path(item).lower()
         for item in required_outputs
         if isinstance(item, str)
     }
@@ -651,8 +699,8 @@ def reject_unchanged_public_test_outputs(
     for item in allow_unchanged:
         if not isinstance(item, str):
             raise TaskTemplateError("unchanged_required_public_test_output")
-        normalized = _canonical_repo_relative_path(item)
-        if _is_public_test_path(normalized) and normalized in required:
+        normalized = _canonical_repo_relative_path(item).lower()
+        if normalized.startswith(f"{_TEST_ROOT}/") and normalized in required:
             raise TaskTemplateError("unchanged_required_public_test_output")
 
 

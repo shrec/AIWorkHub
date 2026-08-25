@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.55] - 2026-08-25
+
+### Fixed
+
+- Task templates now classify validation inputs by language and file type, so
+  non-Python fixtures are not accidentally passed to Python-only linters.
+- Source Graph audit telemetry separates authenticated live worker calls from
+  injected prefetch evidence across call, repeat, zero-hit and discipline
+  metrics without weakening the required-tool gate.
+- Provider quota and authentication failures are derived only from sealed
+  provider-owned evidence and open an exact route-local circuit, preventing
+  known-unavailable routes from being selected repeatedly while leaving
+  sibling routes and the MCP control plane available.
+
 ## [0.10.54] - 2026-08-25
 
 ### Fixed

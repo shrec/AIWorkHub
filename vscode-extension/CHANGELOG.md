@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.55 — 2026-08-25
+
+### Fixed
+
+- Task-template validation is language aware, preventing data fixtures from
+  being sent to Python-only tools.
+- Worker Source Graph metrics distinguish live calls from injected prefetch
+  evidence while preserving fail-closed receipt authentication.
+- Sealed provider quota and authentication failures trip only the affected
+  route circuit, avoiding repeated selection of a known-unavailable model.
+
 ## 0.10.54 — 2026-08-25
 
 ### Fixed

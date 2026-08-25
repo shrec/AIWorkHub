@@ -1735,6 +1735,26 @@ def verify_audit_ledger(
         "source_graph_hit_count": 0,
         "source_graph_zero_hit_calls": 0,
         "source_graph_failed_calls": 0,
+        # NF389/r6 live-scoped discipline counters. The counters above stay
+        # backward-compatible: they aggregate EVERY authenticated source_graph
+        # entry regardless of provenance (prefetch/live/cache). These new,
+        # explicitly-named ``live_*`` counters aggregate ONLY authenticated
+        # provenance=="live" entries, so a launch-time prefetch or a cache
+        # replay is still auditable in the totals but can never inflate the
+        # live discipline score or the dashboard-facing live metrics that
+        # consume them. Provenance itself never satisfies the required-tool
+        # gate; only ``live_source_graph_calls`` (a fresh, authoritative,
+        # non-cache live call) does.
+        "live_source_graph_call_count": 0,
+        "live_source_graph_success_count": 0,
+        "live_source_graph_hit_count": 0,
+        "live_source_graph_zero_hit_calls": 0,
+        "live_source_graph_failed_calls": 0,
+        "live_source_graph_repeated_query_calls": 0,
+        "live_source_graph_mode_counts": {},
+        "live_source_graph_mode_sequence": [],
+        "live_source_graph_query_sequence": [],
+        "live_source_graph_stage_counts": {},
         "source_graph_mode_counts": {},
         "source_graph_mode_sequence": [],
         "source_graph_query_sequence": [],
@@ -1848,6 +1868,10 @@ def verify_audit_ledger(
             ) + 1
         payload = entry.get("payload")
         if tool == "source_graph":
+            # ``is_live`` gates the live-scoped discipline counters below. A
+            # prefetch/cache/absent provenance row still updates every total
+            # counter, but never the live ones.
+            is_live = provenance == "live"
             source_hits = max(0, int(entry.get("hit_count") or 0))
             result["source_graph_hit_count"] += source_hits
             if source_hits == 0:
@@ -1897,6 +1921,34 @@ def verify_audit_ledger(
             if mode_recognised:
                 mode_stage = result["source_graph_mode_stage_counts"].setdefault(stage, {})
                 mode_stage[mode] = int(mode_stage.get(mode) or 0) + 1
+            # NF389/r6: live-scoped discipline accounting. ONLY genuine,
+            # authenticated provenance=="live" rows feed the discipline score
+            # and the dashboard live metrics. A prefetch ("prefetch") or a
+            # cache replay ("cache") row is auditable in the total counters
+            # above but must never enter these live-scoped ones -- that is the
+            # exact defect this repair closes (one prefetch + one live call was
+            # reported as source_graph=2 in the live discipline metrics).
+            if is_live:
+                result["live_source_graph_call_count"] += 1
+                result["live_source_graph_hit_count"] += source_hits
+                if source_hits == 0:
+                    result["live_source_graph_zero_hit_calls"] += 1
+                if entry.get("ok") and not entry.get("violation"):
+                    result["live_source_graph_success_count"] += 1
+                else:
+                    result["live_source_graph_failed_calls"] += 1
+                live_mode_counts = result["live_source_graph_mode_counts"]
+                live_mode_counts[mode] = int(live_mode_counts.get(mode) or 0) + 1
+                if len(result["live_source_graph_mode_sequence"]) < 64:
+                    result["live_source_graph_mode_sequence"].append(mode)
+                live_stage_counts = result["live_source_graph_stage_counts"]
+                live_stage_counts[stage] = int(live_stage_counts.get(stage) or 0) + 1
+                if (
+                    len(query_sha256) == 64
+                    and all(char in "0123456789abcdef" for char in query_sha256)
+                    and len(result["live_source_graph_query_sequence"]) < 64
+                ):
+                    result["live_source_graph_query_sequence"].append(query_sha256)
             latency = payload.get("latency_ms") if isinstance(payload, dict) else None
             if isinstance(latency, (int, float)) and 0 <= float(latency) <= 3_600_000:
                 source_graph_latencies.append(round(float(latency), 3))
@@ -2048,6 +2100,13 @@ def verify_audit_ledger(
     result["successful_call_count_by_tool"] = successful_call_count
     result["bounded_bytes_by_tool"] = bounded_bytes_by_tool
     result["cache_hits_by_tool"] = cache_hits_by_tool
+    # Repeated-query discipline is measured over the LIVE query sequence only:
+    # a cache replay of an earlier live query is itself a "cache" row and never
+    # appears here, so it cannot be double-charged as a repeated live query.
+    live_query_sequence = result["live_source_graph_query_sequence"]
+    result["live_source_graph_repeated_query_calls"] = max(
+        0, len(live_query_sequence) - len(set(live_query_sequence))
+    )
     result["authority_index_identity"] = sorted(
         f"{t}:{src}:{state}:{repo}" for t, src, state, repo in authority_seen
     )
@@ -2178,19 +2237,25 @@ def receipt_conformance_report(verification: Mapping[str, Any]) -> dict[str, Any
 
 
 def tool_discipline_report(verification: Mapping[str, Any]) -> dict[str, Any]:
-    """Describe observed Source Graph use without inventing task intent.
+    """Describe observed live Source Graph use without inventing task intent.
 
     Scores are observational and normalized only over evidence that exists.
     They are suitable for telemetry and ranking calibration, never an
     independent completion gate.
+
+    NF389/r6: every input here is the LIVE-scoped counter (provenance=="live"
+    only). A launch-time prefetch or a cache replay is auditable in the total
+    counters but must never move a worker's discipline score, so this report
+    reads exclusively from ``live_source_graph_*`` -- never the backward-
+    compatible totals.
     """
 
-    calls = max(0, int((verification.get("call_count_by_tool") or {}).get("source_graph") or 0))
-    failed = max(0, int(verification.get("source_graph_failed_calls") or 0))
-    zero_hits = max(0, int(verification.get("source_graph_zero_hit_calls") or 0))
-    queries = [str(item) for item in verification.get("source_graph_query_sequence") or []]
+    calls = max(0, int(verification.get("live_source_graph_call_count") or 0))
+    failed = max(0, int(verification.get("live_source_graph_failed_calls") or 0))
+    zero_hits = max(0, int(verification.get("live_source_graph_zero_hit_calls") or 0))
+    queries = [str(item) for item in verification.get("live_source_graph_query_sequence") or []]
     repeated = max(0, len(queries) - len(set(queries)))
-    modes = [str(item) for item in verification.get("source_graph_mode_sequence") or []]
+    modes = [str(item) for item in verification.get("live_source_graph_mode_sequence") or []]
     trace_index = next((index for index, mode in enumerate(modes) if mode == "trace"), None)
     deps_after_trace = bool(
         trace_index is not None and any(mode == "deps" for mode in modes[trace_index + 1:])
