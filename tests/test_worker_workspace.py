@@ -4919,3 +4919,216 @@ def test_sparse_dependency_closure_is_one_coherent_current_canonical_generation(
         ]
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+# ── NF430 request-owned worker temp authority ──────────────────────────────
+
+
+def test_worker_temp_environment_provisions_request_owned_root(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    request_id = "req-nf430-workspace"
+    env = worker_workspace.worker_temp_environment(repo, request_id)
+    assert env["TMPDIR"] == env["TMP"] == env["TEMP"]
+    tmp = Path(env["TMPDIR"])
+    assert tmp.name == "tmp"
+    assert tmp.parent.name == request_id
+    parts = tmp.parts
+    assert ".aiworkhub" in parts and "temp" in parts and "worker" in parts
+    # Outside the candidate worktree by construction.
+    assert "worktree" not in parts
+    assert tmp.is_dir()
+    assert stat.S_IMODE(tmp.stat().st_mode) == 0o700
+    # provision=False resolves the same authority path without creating it.
+    other = tmp_path / "repo2"
+    other.mkdir()
+    lazy = worker_workspace.worker_temp_environment(other, "req-x", provision=False)
+    assert Path(lazy["TMPDIR"]).name == "tmp"
+    assert not Path(lazy["TMPDIR"]).exists()
+
+
+def test_worker_temp_dispose_removes_only_the_named_request_root(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    worker_workspace.worker_temp_environment(repo, "req-keep")
+    worker_workspace.worker_temp_environment(repo, "req-drop")
+    keep = worker_workspace.worker_temp_root(repo, "req-keep")
+    drop = worker_workspace.worker_temp_root(repo, "req-drop")
+    assert keep.is_dir() and drop.is_dir()
+    assert worker_workspace.dispose_worker_temp(repo, "req-drop") is True
+    assert not drop.exists()
+    # Collision-free: disposing one request never touches a sibling request.
+    assert keep.is_dir()
+    # An absent/foreign root is a fail-closed no-op, never an error.
+    assert worker_workspace.dispose_worker_temp(repo, "req-never") is False
+
+
+def test_sandbox_argv_landlock_authorizes_only_a_provisioned_worker_temp(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    request_id = "req-nf430-sandbox"
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=request_id,
+        repo=repo,
+        path=worktree,
+        home=_preprovisioned_private_home(tmp_path),
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    before = worker_workspace.sandbox_argv(
+        workspace, "validation", ["/bin/true"], backend="landlock"
+    )
+    assert "--worker-temp" not in before
+    root = worker_workspace.provision_worker_temp(repo, request_id).root
+    after = worker_workspace.sandbox_argv(
+        workspace, "validation", ["/bin/true"], backend="landlock"
+    )
+    assert "--worker-temp" in after
+    granted = Path(after[after.index("--worker-temp") + 1])
+    assert granted.resolve() == root.resolve()
+    # Only the exact temp root is authorized -- never the repository itself, so
+    # canonical/worktree writes are not widened.
+    assert str(repo) not in after
+
+
+def test_cleanup_workspace_disposes_the_request_worker_temp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "req-nf430-cleanup")
+    worker_workspace.worker_temp_environment(repo, workspace.request_id)
+    root = worker_workspace.worker_temp_root(repo, workspace.request_id)
+    assert root.is_dir()
+    worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+    # The temp authority shares the workspace lifecycle: gone with the worktree.
+    assert not root.exists()
+
+
+def test_in_tree_worker_tmp_is_git_visible_and_scope_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    """NF430: a candidate that smuggles pytest temp into the worktree at
+    ``tests/.aiworkhub_worker_tmp/**`` is never hidden -- it stays visible to
+    Git and enforce_scope rejects it, with no ignore-prefix or .gitignore
+    bypass."""
+    workspace = _workspace(monkeypatch, tmp_path, repo, "req-nf430-intree")
+    try:
+        smuggled = (
+            workspace.path
+            / "tests"
+            / ".aiworkhub_worker_tmp"
+            / "pytest-of-worker"
+            / "junk.txt"
+        )
+        smuggled.parent.mkdir(parents=True)
+        smuggled.write_text("in-tree temp must not hide from git\n", encoding="utf-8")
+        assert "tests/.aiworkhub_worker_tmp/pytest-of-worker/junk.txt" in (
+            worker_workspace.changed_paths(workspace)
+        )
+        with pytest.raises(worker_workspace.WorkspaceError, match="scope_violation"):
+            worker_workspace.enforce_scope(workspace)
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+# ── NF430 metadata broker: worker-temp authorization + denial telemetry ─────
+
+
+def test_metadata_broker_denial_reason_is_bounded_and_path_free() -> None:
+    """NF430: a broker denial retains its stable reason code with no path/secret.
+
+    The blanket ``except`` no longer collapses every cause into an opaque
+    generic EPERM; the reason feeds bounded ``stderr`` telemetry, so it must be
+    the ``WorkspaceError`` prefix (never the ``:detail`` half that embeds the
+    target path) and an errno name for ``OSError``.
+    """
+    reason = worker_workspace._metadata_broker_denial_reason(
+        worker_workspace.WorkspaceError(
+            "metadata_broker_outside_scratch:/canonical/secret/config.lock"
+        )
+    )
+    assert reason == "metadata_broker_outside_scratch"
+    assert "secret" not in reason and "/" not in reason
+    assert (
+        worker_workspace._metadata_broker_denial_reason(
+            OSError(1, "Operation not permitted")
+        )
+        == "oserror_EPERM"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="openat2 target acquisition is POSIX")
+@pytest.mark.skipif(
+    not worker_workspace._openat2_available(),
+    reason="openat2(2) unavailable on this kernel",
+)
+def test_metadata_broker_verify_target_any_authorizes_both_request_roots(
+    tmp_path: Path,
+) -> None:
+    """NF430: a scratch-owned ``config.lock`` beneath EITHER the exec scratch or
+    the request-owned worker temp authority is acquired, while every malicious
+    case (outside all roots, symlinked component) is denied -- authority is
+    never widened to the repository or an arbitrary path."""
+    exec_scratch = (tmp_path / "exec").resolve()
+    exec_scratch.mkdir()
+    worker_temp = (tmp_path / "worker" / "req" / "tmp").resolve()
+    worker_temp.mkdir(parents=True)
+    lock = worker_temp / "pytest-of-worker" / "nested" / ".git" / "config.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text("[core]\n", encoding="utf-8")
+
+    specs = [
+        worker_workspace._open_broker_scratch_root(exec_scratch),
+        worker_workspace._open_broker_scratch_root(worker_temp),
+    ]
+    try:
+        # Beneath the worker temp authority (the second root) -> acquired.
+        fd = worker_workspace._metadata_broker_verify_target_any(
+            str(lock.resolve()), specs
+        )
+        assert fd >= 0
+        os.close(fd)
+        # A target beneath neither authorized root is denied, not widened.
+        outside = tmp_path / "outside.lock"
+        outside.write_text("x", encoding="utf-8")
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="metadata_broker_outside_scratch"
+        ):
+            worker_workspace._metadata_broker_verify_target_any(
+                str(outside.resolve()), specs
+            )
+        # A symlinked component beneath a root is a beneath-but-invalid case:
+        # the kernel (RESOLVE_NO_SYMLINKS) denies it, never falls through.
+        evil = worker_temp / "evil"
+        os.symlink("/etc", evil)
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="metadata_broker_openat2_failed"
+        ):
+            worker_workspace._metadata_broker_verify_target_any(
+                str(evil / "passwd"), specs
+            )
+    finally:
+        for spec_fd, _root in specs:
+            os.close(spec_fd)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="openat2 target acquisition is POSIX")
+@pytest.mark.skipif(
+    not worker_workspace._openat2_available(),
+    reason="openat2(2) unavailable on this kernel",
+)
+def test_open_broker_scratch_root_rejects_symlinked_root(tmp_path: Path) -> None:
+    """NF430: a symlinked authorized root fails closed rather than becoming
+    authority for its target."""
+    real = (tmp_path / "real").resolve()
+    real.mkdir()
+    link = tmp_path / "link"
+    os.symlink(real, link)
+    with pytest.raises(worker_workspace.WorkspaceError):
+        worker_workspace._open_broker_scratch_root(link)

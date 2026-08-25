@@ -2435,6 +2435,88 @@ def configured_temp_root(repo: Path | None = None) -> Path:
     return runtime_temp.temp_root(repo)
 
 
+# ── Request-owned worker temp authority (NF430) ────────────────────────────
+# Worker-run pytest/tempfile artifacts must live in the exact request-owned
+# repository-local ``.aiworkhub/temp/worker/<request_id>`` authority -- outside
+# the candidate worktree -- so they never surface as out-of-scope changed_paths
+# and never collide across concurrent requests.  The runtime_temp module is the
+# single owner of the on-disk layout, the PID/start-time owner manifests, and
+# the dead-owner GC; these thin helpers give the launcher and the Landlock
+# planner one vocabulary for that ``worker`` namespace without duplicating any
+# of that policy here.
+WORKER_TEMP_NAMESPACE = runtime_temp.WORKER_NAMESPACE
+
+
+def worker_temp_root(repo: Path, request_id: str) -> Path:
+    """Return ``<repo>/.aiworkhub/temp/worker/<request_id>`` (never provisioned).
+
+    Pure path resolution through the runtime_temp authority: it validates the
+    request identity and fails closed on symlink/escape without touching the
+    filesystem, so a Landlock/sandbox planner can ask "does this request own a
+    temp root yet?" without creating one as a side effect.
+    """
+    return runtime_temp.request_dir(
+        Path(repo).resolve(), request_id, runtime_temp.WORKER_NAMESPACE
+    )
+
+
+def provision_worker_temp(repo: Path, request_id: str) -> "runtime_temp.RequestTemp":
+    """Create (or reuse) the 0700, owner-stamped worker temp layout for a request.
+
+    Delegates to the runtime_temp authority so the ``tmp`` subdirectory, the
+    PID/start-time owner manifest (consumed by the sole dead-owner GC), and the
+    per-repo quota accounting all stay single-sourced.  Collision-free by
+    construction: the layout is namespaced by request identity.
+    """
+    return runtime_temp.provision_request_temp(
+        Path(repo).resolve(), request_id, namespace=runtime_temp.WORKER_NAMESPACE
+    )
+
+
+def worker_temp_environment(
+    repo: Path,
+    request_id: str,
+    *,
+    provision: bool = True,
+) -> dict[str, str]:
+    """Return the ``TMPDIR``/``TMP``/``TEMP`` mapping for a request's worker temp.
+
+    Every value points at ``<repo>/.aiworkhub/temp/worker/<request_id>/tmp``.
+    With ``provision`` true (the real-launch default) the owner-stamped 0700
+    layout is created first so the child can write immediately; the candidate
+    worktree is never widened because this root lives outside it.  The three
+    keys cover POSIX, macOS and Windows temp semantics with one shell-free
+    mapping and mirror ``runtime_adapters.WORKER_TEMP_ENV_VARS``.
+    """
+    if provision:
+        tmp = provision_worker_temp(repo, request_id).tmp
+    else:
+        tmp = worker_temp_root(repo, request_id) / runtime_temp.TMP_SUBDIR
+    value = str(tmp)
+    return {"TMPDIR": value, "TMP": value, "TEMP": value}
+
+
+def dispose_worker_temp(repo: Path, request_id: str) -> bool:
+    """Best-effort immediate removal of a request's worker temp authority.
+
+    Fail-closed and never raises for an absent/foreign/pinned root: returns
+    True only when the exact request-owned directory was removed.  Stale/
+    dead-owner and review/rework-pinned lifecycles remain the responsibility of
+    the sole runtime_temp GC authority; this is the accepted/discarded/cleanup
+    disposition path.
+    """
+    try:
+        root = worker_temp_root(repo, request_id)
+    except runtime_temp.RuntimeTempError:
+        return False
+    try:
+        return runtime_temp.dispose_request_temp(
+            root, repo=Path(repo).resolve(), expected_request_id=request_id
+        )
+    except (runtime_temp.RuntimeTempError, OSError):
+        return False
+
+
 def _outer_validation_authority_mac(payload: Mapping[str, str]) -> str:
     material = "\n".join(
         f"{key}={payload[key]}" for key in sorted(payload)
@@ -2946,6 +3028,19 @@ def cleanup_workspace(
         _rmtree_workspace_owned(admin_dir)
         if admin_dir.exists():
             raise WorkspaceError("workspace_cleanup_registration_retained")
+    # NF430: the request-owned worker temp authority shares this workspace's
+    # lifecycle.  Whenever the isolated worktree is torn down (accepted,
+    # cancelled, provider-crashed, or reclaimed) its
+    # ``.aiworkhub/temp/worker/<request_id>`` root is disposed too.  The
+    # request id is exactly ``path.parent.name`` by the workspace-shape
+    # contract asserted above.  Best-effort and fail-closed: review/rework/
+    # validation-failed candidates retain the workspace so this never runs for
+    # them (their temp stays pinned), and a dead-owner root is still swept by
+    # the sole runtime_temp GC authority.
+    try:
+        dispose_worker_temp(repo, path.parent.name)
+    except Exception:  # noqa: BLE001 - cleanup must never fail on temp disposal
+        pass
 
 
 def _finalization_probe_key(repo: Path, adapter_id: str) -> tuple[str, str, str]:
@@ -4469,6 +4564,29 @@ def _node_install_root(executable: str) -> Path | None:
     return None
 
 
+def _resolve_existing_worker_temp(workspace: WorkerWorkspace) -> Path | None:
+    """Return the request-owned worker temp root iff it exists as a real dir.
+
+    Self-derived from the workspace identity (never a caller-supplied path) and
+    fail-closed: an invalid request identity, a symlink, or a not-yet-
+    provisioned root all yield ``None`` so a sandbox is never widened by a temp
+    root the launcher did not actually create (NF430).
+    """
+    try:
+        candidate = worker_temp_root(workspace.repo, workspace.request_id)
+    except runtime_temp.RuntimeTempError:
+        return None
+    if candidate.is_symlink() or not candidate.is_dir():
+        return None
+    return candidate
+
+
+def _landlock_worker_temp_flags(workspace: WorkerWorkspace) -> list[str]:
+    """Return the ``--worker-temp`` landlock-exec flag pair, or ``[]``."""
+    worker_temp = _resolve_existing_worker_temp(workspace)
+    return ["--worker-temp", str(worker_temp)] if worker_temp is not None else []
+
+
 def sandbox_argv(
     workspace: WorkerWorkspace,
     adapter_id: str,
@@ -4523,6 +4641,13 @@ def sandbox_argv(
         authority_flags = (
             ["--outer-validation-authority"] if outer_validation_authority else []
         )
+        # NF430: authorize exactly the request-owned temp root the launcher
+        # already provisioned -- never the whole repository -- so a worker's
+        # TMPDIR under ``.aiworkhub/temp/worker/<request_id>`` is writable while
+        # the candidate worktree stays confined to allowed_writes.  Gated on the
+        # directory actually existing so a request without a provisioned temp
+        # root (or an invalid identity) never widens the ruleset.
+        worker_temp_flags = _landlock_worker_temp_flags(workspace)
         return [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -4531,6 +4656,7 @@ def sandbox_argv(
             "--home", str(workspace.home),
             *(value for pattern in workspace.allowed_writes for value in ("--allow", pattern)),
             *exec_scratch_flags,
+            *worker_temp_flags,
             *cwd_flags,
             *authority_flags,
             "--",
@@ -4576,6 +4702,14 @@ def sandbox_argv(
         # to allow exec() on (see provision_validation_exec_scratch).
         validation_binds.extend(
             ("--bind", str(validation_exec_scratch), SANDBOX_VALIDATION_EXEC_SCRATCH)
+        )
+    worker_temp_bind = _resolve_existing_worker_temp(workspace)
+    if worker_temp_bind is not None:
+        # NF430: a writable bind at the exact request-owned temp root, at its
+        # real absolute path, so a TMPDIR pointing there resolves inside the
+        # bubblewrap mount namespace without widening any other bind.
+        validation_binds.extend(
+            ("--bind", str(worker_temp_bind), str(worker_temp_bind))
         )
     argv = [
         str(bwrap),
@@ -4654,6 +4788,7 @@ def _apply_landlock(
     home: Path,
     allowed_writes: Iterable[str],
     exec_scratch: Path | None = None,
+    worker_temp: Path | None = None,
 ) -> None:
     workspace = workspace.resolve()
     home = home.resolve()
@@ -4679,6 +4814,14 @@ def _apply_landlock(
             if exec_scratch.is_symlink() or not exec_scratch.is_dir():
                 raise WorkspaceError(f"landlock_exec_scratch_not_directory:{exec_scratch}")
             _landlock_add_path_rule(libc, ruleset_fd, exec_scratch, handled)
+        if worker_temp is not None:
+            # NF430: grant full mutation beneath the exact request-owned worker
+            # temp root so a worker/pytest TMPDIR there is writable, while the
+            # worktree stays restricted to the allowed_writes rules below.
+            worker_temp = worker_temp.resolve()
+            if worker_temp.is_symlink() or not worker_temp.is_dir():
+                raise WorkspaceError(f"landlock_worker_temp_not_directory:{worker_temp}")
+            _landlock_add_path_rule(libc, ruleset_fd, worker_temp, handled)
         for device in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"):
             path = Path(device)
             if path.exists():
@@ -5029,6 +5172,37 @@ def _metadata_broker_verify_target(
     return fd
 
 
+def _metadata_broker_verify_target_any(
+    candidate: str, scratch_specs: "list[tuple[int, PurePosixPath]]"
+) -> int:
+    """Open and return a verified fd beneath the first authorized scratch root
+    that actually contains ``candidate``.
+
+    NF430: a validation run owns more than one request-scoped writable root --
+    the exec scratch and the ``.aiworkhub/temp/worker/<request_id>`` temp
+    authority the launcher provisioned -- and a worker's TMPDIR points at the
+    latter, so a nested Git/pytest ``config.lock`` chmod lands there.  Each
+    ``(scratch_fd, scratch_root)`` is tried with the identical kernel-authoritative
+    ``_metadata_broker_verify_target`` (``openat2`` RESOLVE_BENEATH|
+    RESOLVE_NO_SYMLINKS, owner, ``st_nlink``, inode-stability): a target merely
+    *outside* one root falls through to the next, while any *beneath-but-invalid*
+    result (traversal, symlink, hardlink, foreign owner, root-itself) still
+    denies fail-closed.  A target beneath none of the authorized roots is
+    rejected -- authority is never widened to the repository or an arbitrary
+    path.
+    """
+    outside: WorkspaceError | None = None
+    for scratch_fd, scratch_root in scratch_specs:
+        try:
+            return _metadata_broker_verify_target(candidate, scratch_fd, scratch_root)
+        except WorkspaceError as exc:
+            if str(exc).startswith("metadata_broker_outside_scratch"):
+                outside = exc
+                continue
+            raise
+    raise outside or WorkspaceError(f"metadata_broker_outside_scratch:{candidate}")
+
+
 def _metadata_broker_process_pgid(pid: int) -> int:
     """Return ``pid``'s process-group id parsed from ``/proc/<pid>/stat``.
 
@@ -5223,8 +5397,8 @@ def _metadata_broker_apply(
     listener_fd: int,
     request: _SeccompNotif,
     child_pid: int,
-    scratch_fd: int,
-    scratch_root: PurePosixPath,
+    scratch_specs: "list[tuple[int, PurePosixPath]] | int",
+    legacy_scratch_root: PurePosixPath | None = None,
 ) -> None:
     """Emulate exactly one verified brokered metadata syscall in the parent.
 
@@ -5232,9 +5406,17 @@ def _metadata_broker_apply(
     process group (validators legitimately fork -- e.g. ``git`` -- so the caller
     is often not ``child_pid`` itself), re-checks the notification id both
     before and after acquiring the target, resolves the target with the kernel
-    as authority (``openat2`` beneath the exact scratch fd) and mutates only a
-    stable, inode-verified file or directory.
+    as authority (``openat2`` beneath one of the exact authorized scratch fds --
+    the exec scratch and the request-owned worker temp authority) and mutates
+    only a stable, inode-verified file or directory.
     """
+    if legacy_scratch_root is not None:
+        # Preserve the established private test/caller ABI while normalizing it
+        # into the same multi-root authority used by the live broker path.
+        scratch_specs = [(int(scratch_specs), legacy_scratch_root)]
+    if not isinstance(scratch_specs, list):
+        raise WorkspaceError("metadata_broker_scratch_authority_invalid")
+
     pid = int(request.pid)
     _metadata_broker_authenticate_pid(pid, child_pid)
     names = _metadata_broker_syscall_names(library)
@@ -5252,7 +5434,7 @@ def _metadata_broker_apply(
         link = _metadata_broker_child_link(pid, f"fd/{raw_fd}")
         if link.endswith(" (deleted)"):
             raise WorkspaceError("metadata_broker_deleted_fd")
-        verified_fd = _metadata_broker_verify_target(link, scratch_fd, scratch_root)
+        verified_fd = _metadata_broker_verify_target_any(link, scratch_specs)
         try:
             verified_info = os.fstat(verified_fd)
             # verified_fd is kernel-resolved via openat2; for directories it
@@ -5319,7 +5501,7 @@ def _metadata_broker_apply(
         raise WorkspaceError(f"metadata_broker_unsupported_syscall:{name}")
 
     _metadata_broker_check_notification(library, listener_fd, request.id)
-    verified_fd = _metadata_broker_verify_target(raw_target, scratch_fd, scratch_root)
+    verified_fd = _metadata_broker_verify_target_any(raw_target, scratch_specs)
     try:
         _metadata_broker_check_notification(library, listener_fd, request.id)
         os.fchmod(verified_fd, mode)
@@ -5335,36 +5517,62 @@ def _metadata_broker_exit_code(status: int) -> int:
     return 1
 
 
-def _run_metadata_broker(listener_fd: int, child_pid: int, scratch: Path) -> int:
-    """Trusted parent loop: emulate only verified brokered operations.
+def _metadata_broker_denial_reason(exc: BaseException) -> str:
+    """Return a bounded, path-free reason code for a broker denial (NF430).
 
-    Opens one stable directory fd for the exact request scratch (the single
-    resolution root handed to every ``openat2`` acquisition), polls with a
-    bounded timeout, reaps the child non-blockingly, and enforces an overall
-    deadline. On any deadline or error the entire validator process group is
-    killed and the child reaped, so a wedged validator can never deadlock the
-    broker, orphan descendants, or leak descriptors; every allocated
-    notification pair is freed on every path.
+    Every ``WorkspaceError`` the broker raises is ``reason:detail`` where the
+    ``detail`` half can embed the target path; only the stable ``reason``
+    prefix is kept.  An ``OSError`` collapses to its errno name.  The result is
+    an ASCII token -- never a path, fd content, mode, pid, or any credential --
+    so denial telemetry can be retained without leaking secrets.
     """
-    import select
+    if isinstance(exc, WorkspaceError):
+        return str(exc).split(":", 1)[0] or "metadata_broker_workspace_error"
+    if isinstance(exc, OSError) and exc.errno is not None:
+        return f"oserror_{errno.errorcode.get(exc.errno, exc.errno)}"
+    return type(exc).__name__
 
-    library = _seccomp_notify_library()
-    if library is None:
-        raise WorkspaceError("seccomp_user_notification_unavailable")
-    scratch_dir_fd = -1
+
+def _record_metadata_broker_denial(exc: BaseException, request: _SeccompNotif) -> None:
+    """Retain one bounded, structured, path-free denial record (NF430).
+
+    Replaces the previous silent collapse of every ``WorkspaceError``/
+    ``OSError``/``ValueError`` into a generic ``EPERM``: the exact rejection
+    reason and the decoded syscall number are written as a single capped line
+    to the trusted parent's stderr, which flows into the validator's captured
+    ``stderr_tail`` so a real broker rejection is diagnosable instead of
+    invisible.  Best-effort and never raises -- telemetry must not perturb the
+    fail-closed ``EPERM`` response already set by the caller.
+    """
     try:
-        # Open the exact supplied root without following its final component.
-        # Resolving first would silently turn a symlink root into authority for
-        # its target. All later target resolution is anchored to this stable fd.
-        try:
-            scratch_dir_fd = os.open(
-                scratch,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            )
-        except OSError as exc:
-            raise WorkspaceError(
-                f"metadata_broker_scratch_unavailable:{exc}"
-            ) from exc
+        reason = _metadata_broker_denial_reason(exc)
+        line = (
+            f"metadata_broker_denied reason={reason} "
+            f"syscall_nr={int(request.data.nr)}\n"
+        )
+        os.write(2, line.encode("ascii", "replace")[:256])
+    except BaseException:  # noqa: BLE001 - telemetry is strictly best-effort
+        pass
+
+
+def _open_broker_scratch_root(scratch: Path) -> "tuple[int, PurePosixPath]":
+    """Open one stable, owner-verified directory fd for an authorized root.
+
+    Opens ``scratch`` without following its final component (a symlinked root
+    would otherwise become authority for its target), confirms it is a
+    directory owned by the current uid, and cross-checks its resolved identity
+    by ``(st_dev, st_ino)`` so a swapped root fails closed.  The returned fd is
+    the single kernel-authoritative resolution anchor handed to every
+    ``openat2`` acquisition beneath this root; the caller owns and closes it.
+    """
+    try:
+        scratch_dir_fd = os.open(
+            scratch,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as exc:
+        raise WorkspaceError(f"metadata_broker_scratch_unavailable:{exc}") from exc
+    try:
         dir_info = os.fstat(scratch_dir_fd)
         if not stat.S_ISDIR(dir_info.st_mode) or dir_info.st_uid != os.getuid():
             raise WorkspaceError("metadata_broker_scratch_untrusted")
@@ -5380,7 +5588,47 @@ def _run_metadata_broker(listener_fd: int, child_pid: int, scratch: Path) -> int
             dir_info.st_ino,
         ):
             raise WorkspaceError("metadata_broker_scratch_identity_changed")
-        scratch_root_posix = PurePosixPath(str(scratch_root))
+    except BaseException:
+        os.close(scratch_dir_fd)
+        raise
+    return scratch_dir_fd, PurePosixPath(str(scratch_root))
+
+
+def _run_metadata_broker(
+    listener_fd: int,
+    child_pid: int,
+    scratch: Path,
+    extra_roots: "Iterable[Path]" = (),
+) -> int:
+    """Trusted parent loop: emulate only verified brokered operations.
+
+    Opens one stable directory fd for the exact exec scratch and for each
+    additional authorized request-owned root (NF430: the
+    ``.aiworkhub/temp/worker/<request_id>`` temp authority a worker's TMPDIR
+    points at), the single resolution roots handed to every ``openat2``
+    acquisition; polls with a bounded timeout, reaps the child non-blockingly,
+    and enforces an overall deadline. On any deadline or error the entire
+    validator process group is killed and the child reaped, so a wedged
+    validator can never deadlock the broker, orphan descendants, or leak
+    descriptors; every allocated notification pair is freed on every path.
+    """
+    import select
+
+    library = _seccomp_notify_library()
+    if library is None:
+        raise WorkspaceError("seccomp_user_notification_unavailable")
+    scratch_specs: list[tuple[int, PurePosixPath]] = []
+    try:
+        # The exec scratch is the mandatory anchor -- a failure to open it is a
+        # real fault. Every additional root goes through the identical stable-fd
+        # + owner + identity verification; a missing or foreign extra root is
+        # skipped fail-closed rather than widening the broker's authority.
+        scratch_specs.append(_open_broker_scratch_root(scratch))
+        for extra in extra_roots:
+            try:
+                scratch_specs.append(_open_broker_scratch_root(Path(extra)))
+            except WorkspaceError:
+                continue
         deadline = time.monotonic() + _METADATA_BROKER_DEADLINE_SECONDS
         poller = select.poll()
         poller.register(listener_fd, select.POLLIN)
@@ -5433,14 +5681,17 @@ def _run_metadata_broker(listener_fd: int, child_pid: int, scratch: Path) -> int
                         listener_fd,
                         request,
                         child_pid,
-                        scratch_dir_fd,
-                        scratch_root_posix,
+                        scratch_specs,
                     )
                     response.val = 0
                     response.error = 0
-                except (WorkspaceError, OSError, ValueError):
+                except (WorkspaceError, OSError, ValueError) as exc:
+                    # Fail closed with EPERM, but never swallow the cause: retain
+                    # a bounded, path-free denial record so a real rejection is
+                    # diagnosable instead of an opaque generic EPERM (NF430).
                     response.val = 0
                     response.error = -errno.EPERM
+                    _record_metadata_broker_denial(exc, request)
                 if library.seccomp_notify_respond(listener_fd, response_ptr) != 0:
                     # A respond failure for a no-longer-valid notification (the
                     # caller died or was killed mid-request) is benign; a
@@ -5457,8 +5708,8 @@ def _run_metadata_broker(listener_fd: int, child_pid: int, scratch: Path) -> int
         _reap_validator(child_pid)
         raise
     finally:
-        if scratch_dir_fd >= 0:
-            os.close(scratch_dir_fd)
+        for spec_fd, _spec_root in scratch_specs:
+            os.close(spec_fd)
 
 
 def _apply_metadata_seccomp() -> None:
@@ -5703,6 +5954,7 @@ def _landlock_exec(argv: list[str]) -> int:
     parser.add_argument("--home", required=True)
     parser.add_argument("--allow", action="append", default=[])
     parser.add_argument("--exec-scratch", default=None)
+    parser.add_argument("--worker-temp", default=None)
     parser.add_argument("--cwd", default=None)
     parser.add_argument("--outer-validation-authority", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -5715,9 +5967,10 @@ def _landlock_exec(argv: list[str]) -> int:
     workspace = Path(args.workspace).resolve()
     home = Path(args.home).resolve()
     exec_scratch = Path(args.exec_scratch).resolve() if args.exec_scratch else None
+    worker_temp = Path(args.worker_temp).resolve() if args.worker_temp else None
     if args.outer_validation_authority:
         plant_outer_validation_authority(workspace, exec_scratch=exec_scratch)
-    _apply_landlock(workspace, home, args.allow, exec_scratch)
+    _apply_landlock(workspace, home, args.allow, exec_scratch, worker_temp=worker_temp)
     if args.cwd is not None:
         # Re-validate against this exec'd child's own view of the workspace
         # (fail closed rather than trusting the parent-provided flag) --
@@ -5779,7 +6032,17 @@ def _landlock_exec(argv: list[str]) -> int:
             suffix = f":{listener_error}" if listener_error else ""
             raise WorkspaceError(f"metadata_broker_listener_transfer_failed{suffix}")
         try:
-            return _run_metadata_broker(listener_fd, child_pid, exec_scratch)
+            # NF430: authorize the request-owned worker temp authority as an
+            # additional broker resolution root (identically owner/inode/symlink
+            # verified) so a worker's TMPDIR-rooted Git/pytest ``config.lock``
+            # chmod beneath ``.aiworkhub/temp/worker/<request_id>`` is emulated,
+            # exactly like the exec scratch, without widening any other path.
+            return _run_metadata_broker(
+                listener_fd,
+                child_pid,
+                exec_scratch,
+                extra_roots=(worker_temp,) if worker_temp is not None else (),
+            )
         finally:
             os.close(listener_fd)
     _apply_metadata_seccomp()
@@ -6679,6 +6942,25 @@ def run_validations(
         if selected_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}
         else SANDBOX_VALIDATION_EXEC_SCRATCH
     )
+    # NF430 (rework): every validation invocation routes TMPDIR/TMP/TEMP at its
+    # own private, per-invocation exec scratch -- the same request-scoped root
+    # MYPY_CACHE_DIR and RUFF_CACHE_DIR use -- rather than a single per-request
+    # worker temp authority shared across invocations.  A shared request TMPDIR
+    # made two concurrent validations of the same request collide on one temp
+    # root and defeated parallel-request isolation; the exec scratch is provisioned
+    # fresh (and exec/metadata probed) per ``run_validations`` call, so two
+    # concurrent requests -- each with a distinct exec scratch -- never share a
+    # temp root, and a worker-side pytest/tempfile creates ``pytest-of-*`` beneath
+    # this request-owned temp authority rather than the shared system temp.  The
+    # seccomp metadata broker therefore authorizes exactly this one mechanically
+    # verified per-invocation root (openat2/uid/nlink/inode checks unchanged), and
+    # a nested Git ``config.lock`` chmod beneath it is authorized without widening
+    # canonical/worktree writes.  There is deliberately no shared per-request
+    # TMPDIR fallback.  The request-owned worker temp authority + multi-root broker
+    # design remain wired for the real ProcessManager launch paths
+    # (``process_launcher.worker_launch_env``) and its direct sandbox/broker tests;
+    # ``cleanup_workspace`` still disposes any such root with the workspace.
+    tmp_env_value = scratch_env_value
     try:
         for command in rows:
             (
@@ -6763,14 +7045,18 @@ def run_validations(
                 isolated_task_queue_db=True,
                 verify_preprovisioned_home=selected_backend == "landlock",
             )
-            env["TMPDIR"] = scratch_env_value
-            env["TMP"] = scratch_env_value
-            env["TEMP"] = scratch_env_value
+            env["TMPDIR"] = tmp_env_value
+            env["TMP"] = tmp_env_value
+            env["TEMP"] = tmp_env_value
             # Nested validation helpers must provision beneath this same exact
             # request-owned scratch root.  Without the explicit authority,
             # candidate tests that create temporary Git repositories fall back
             # to a sibling repo temp path that the outer Landlock/seccomp broker
-            # cannot authorize, producing false config.lock/chmod failures.
+            # cannot authorize, producing false config.lock/chmod failures.  The
+            # exec scratch is the exec-capable authority nested runs anchor on;
+            # it is now also the invocation's TMPDIR/TMP/TEMP above, so a nested
+            # helper's own temporaries and this explicit scratch authority point
+            # at one and the same mechanically verified per-invocation root.
             env[VALIDATION_EXEC_SCRATCH_ROOT_ENV] = scratch_env_value
             # Ruff writes its cache below the current working tree by default.
             # Validation worktrees are intentionally read-only, so that

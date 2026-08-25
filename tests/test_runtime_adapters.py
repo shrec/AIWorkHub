@@ -552,3 +552,17 @@ def test_grok_kilo_extension_symlink_is_rejected(monkeypatch, tmp_path):
     plan = runtime_adapters.build_runtime_command("grok_kilo_cli", "Prompt", repo)
     assert plan.launchable is False
     assert plan.validation_reason == "executable not found: kilo"
+
+
+def test_worker_temp_env_vars_is_the_frozen_temp_key_declaration() -> None:
+    """NF430: the single declaration of which env keys carry a worker's TMPDIR.
+
+    ``process_launcher.worker_launch_env`` overlays exactly these keys with the
+    request-owned ``.aiworkhub/temp/worker/<request_id>`` authority, so their
+    identity is contract.  This module still declares only inert naming data --
+    never an environment mapping -- and the three names cover POSIX ``TMPDIR``
+    plus the ``TMP``/``TEMP`` names Windows and macOS honour.
+    """
+    assert runtime_adapters.WORKER_TEMP_ENV_VARS == ("TMPDIR", "TMP", "TEMP")
+    assert isinstance(runtime_adapters.WORKER_TEMP_ENV_VARS, tuple)
+    assert set(runtime_adapters.WORKER_TEMP_ENV_VARS) == {"TMPDIR", "TMP", "TEMP"}

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -540,6 +541,99 @@ def test_daemon_health_probe_lock_preserves_known_readable_generation(
     assert health["build_revision"] == source_graph.BUILD_REVISION
     assert health["files_seen"] == 7
     assert "database is locked" in health["generation_read_error"]
+
+
+def test_stale_query_connection_retries_once_when_unheld(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "stale_unheld")
+    report = source_graph.build_index(root, incremental=False)
+    real_connect = source_graph.connect
+    calls: list[bool] = []
+
+    def connect_once_stale(db_path, *, read_only=False):
+        calls.append(read_only)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database schema has changed")
+        return real_connect(db_path, read_only=read_only)
+
+    monkeypatch.setattr(source_graph, "connect", connect_once_stale)
+    health = source_graph_daemon.daemon_health(root)
+
+    assert calls == [True, True]
+    assert health["generation_read_error"] == ""
+    assert health["readable_generation"] is True
+    assert health["build_revision"] == report.build_revision
+    assert health["files_seen"] == report.files_seen
+    assert health["last_success_at"] == report.finished_at
+
+
+def test_stale_query_connection_fails_closed_with_live_holder(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "stale_held")
+    source_graph.build_index(root, incremental=False)
+    calls: list[bool] = []
+
+    def connect_stale(db_path, *, read_only=False):
+        calls.append(read_only)
+        raise sqlite3.OperationalError("database schema has changed")
+
+    monkeypatch.setattr(source_graph, "connect", connect_stale)
+    with source_graph.index_write_lease(root) as acquired:
+        assert acquired is True
+        health = source_graph_daemon.daemon_health(root)
+
+    assert calls == [True]
+    assert "live_holder" in health["generation_read_error"]
+    assert health["readable_generation"] is False
+
+
+def test_non_stale_sqlite_error_fails_closed_without_retry(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "non_stale_sql")
+    source_graph.build_index(root, incremental=False)
+    calls: list[bool] = []
+
+    def connect_fail(db_path, *, read_only=False):
+        calls.append(read_only)
+        raise sqlite3.OperationalError("no such table: meta")
+
+    monkeypatch.setattr(source_graph, "connect", connect_fail)
+    health = source_graph_daemon.daemon_health(root)
+
+    assert calls == [True]
+    assert "no such table: meta" in health["generation_read_error"]
+    assert "live_holder" not in health["generation_read_error"]
+
+
+def test_dead_daemon_health_ensure_started_and_stop_agree(tmp_path, cleanup_daemons):
+    root = _init_repo(tmp_path, "dead_daemon_truth")
+    (root / "mod.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    cleanup_daemons.append(root)
+    daemon = source_graph_daemon.ensure_started(root)
+    assert daemon.wait_for_first_build(timeout=10)
+    thread = daemon._thread
+    assert thread is not None
+    daemon._stop_event.set()
+    daemon._refresh_event.set()
+    thread.join(timeout=5)
+    assert thread.is_alive() is False
+    assert source_graph_daemon.get_daemon(root) is daemon
+
+    dead_health = source_graph_daemon.daemon_health(root)
+    assert dead_health["running"] is False
+    assert dead_health["status"] == source_graph_daemon.STATUS_STOPPED
+    assert dead_health["registered"] is True
+    assert dead_health["readable_generation"] is True
+
+    restarted = source_graph_daemon.ensure_started(root)
+    assert restarted is daemon
+    assert restarted.is_running() is True
+    started_health = source_graph_daemon.daemon_health(root)
+    assert started_health["running"] is True
+    assert started_health["status"] != source_graph_daemon.STATUS_STOPPED
+
+    assert source_graph_daemon.stop_daemon(root) is True
+    stopped_health = source_graph_daemon.daemon_health(root)
+    assert stopped_health["running"] is False
+    assert stopped_health["status"] == source_graph_daemon.STATUS_STOPPED
+    assert source_graph_daemon.get_daemon(root) is None
 
 
 def test_health_exposes_successful_build_identity_at_top_level(tmp_path, cleanup_daemons):

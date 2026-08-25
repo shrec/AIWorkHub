@@ -6859,3 +6859,59 @@ def test_a_routable_identity_never_takes_the_unroutable_disposition(
         store.terminal_callback_identity_unroutable(
             tmp_path / "not-a-repository", "TASK_B1", substatus="liveness_lost"
         )
+
+
+# ── NF430 worker temp launch env ───────────────────────────────────────────
+
+
+def test_worker_launch_env_routes_tmpdir_at_request_owned_authority(tmp_path):
+    """NF430: worker_launch_env overlays TMPDIR/TMP/TEMP at the request-owned
+    ``.aiworkhub/temp/worker/<request_id>/tmp`` authority -- provisioned 0700
+    and outside the candidate worktree -- while preserving the sanitized env.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    request_id = "req-nf430-a1b2c3"
+    env = process_launcher.worker_launch_env(
+        "claude_cli", repo=repo, request_id=request_id
+    )
+    tmp = Path(env["TMPDIR"])
+    assert env["TMPDIR"] == env["TMP"] == env["TEMP"]
+    # The exact request-owned repository-local authority, never shared /tmp.
+    assert tmp.name == "tmp"
+    assert tmp.parent.name == request_id
+    parts = tmp.parts
+    assert ".aiworkhub" in parts and "temp" in parts and "worker" in parts
+    assert "worktree" not in parts
+    # Provisioned before spawn: a real 0700 directory the child can write to.
+    assert tmp.is_dir()
+    assert tmp.stat().st_mode & 0o777 == 0o700
+    # The sanitized allowlist is untouched: a request-scoped HOME survives and
+    # launch/credential authority never leaks into the child.
+    assert env["HOME"]
+    assert "AIWORKHUB_ALLOW_LAUNCH" not in env
+    assert "AIWORKHUB_ALLOW_WRITES" not in env
+
+
+def test_worker_launch_env_is_collision_free_and_applies_provider_env(tmp_path):
+    """NF430: distinct requests get distinct temp roots, and the explicit BYOK
+    provider env is still merged exactly as sanitized_env does."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env_a = process_launcher.worker_launch_env(
+        "claude_cli", repo=repo, request_id="req-a"
+    )
+    env_b = process_launcher.worker_launch_env(
+        "claude_cli", repo=repo, request_id="req-b"
+    )
+    assert env_a["TMPDIR"] != env_b["TMPDIR"]
+    assert "req-a" in env_a["TMPDIR"] and "req-b" in env_b["TMPDIR"]
+    env_p = process_launcher.worker_launch_env(
+        "deepseek_copilot_cli",
+        repo=repo,
+        request_id="req-provider",
+        provider_env={"COPILOT_PROVIDER_API_KEY": "byok-secret"},
+    )
+    assert env_p["COPILOT_PROVIDER_API_KEY"] == "byok-secret"
+    # The provider env never shadows the request-owned temp keys.
+    assert Path(env_p["TMPDIR"]).parent.name == "req-provider"

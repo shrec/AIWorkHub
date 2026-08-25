@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.56] - 2026-08-25
+
+### Fixed
+
+- Worker and validation subprocesses now use request-owned temporary roots and
+  a verified nested sandbox/broker boundary, eliminating host-temp leakage and
+  repeated Landlock validation loops while preserving cleanup evidence.
+- Source Graph daemon lifecycle reporting now retries stale query connections
+  only when ownership is provably dead, keeps live-holder failures fail-closed,
+  and makes health, startup and shutdown agree on terminal process truth.
+
 ## [0.10.55] - 2026-08-25
 
 ### Fixed

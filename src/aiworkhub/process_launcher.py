@@ -119,8 +119,10 @@ from .worker_workspace import (
     sandbox_argv,
     select_sandbox_backend,
     sanitized_env as _base_sanitized_env,
+    dispose_worker_temp,
     unlink_if_regular,
     validate_residual_contract,
+    worker_temp_environment,
     VSCODE_LM_IN_PROCESS_BACKEND,
     write_json_0600,
 )
@@ -319,6 +321,40 @@ def sanitized_env(
     if provider_env:
         safe.update({str(key): str(value) for key, value in provider_env.items()})
     return safe
+
+
+def worker_launch_env(
+    adapter_id: str,
+    *,
+    repo: Path,
+    request_id: str,
+    home: Path | None = None,
+    isolated_task_queue_db: bool = False,
+    provider_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build the sanitized worker env, then route TMPDIR/TMP/TEMP at the exact
+    request-owned repository-local temp authority (NF430).
+
+    Both real ProcessManager launch paths -- the isolated supervisor spawn and
+    the direct native launch -- call this before spawning a child, so a
+    worker-run pytest/tempfile lands in
+    ``<repo>/.aiworkhub/temp/worker/<request_id>/tmp`` (provisioned 0700 and
+    owner-stamped here) rather than the shared system temp or inside the
+    candidate worktree.  Nothing else changes: the sanitized allowlist, the
+    request-scoped HOME, and the explicit BYOK provider env are exactly as
+    ``sanitized_env`` built them; only the three temp keys are overlaid, from
+    the single declaration in ``runtime_adapters.WORKER_TEMP_ENV_VARS``.
+    """
+    env = sanitized_env(
+        adapter_id,
+        home=home,
+        isolated_task_queue_db=isolated_task_queue_db,
+        provider_env=provider_env,
+    )
+    temp_env = worker_temp_environment(repo, request_id)
+    for key in runtime_adapters.WORKER_TEMP_ENV_VARS:
+        env[key] = temp_env[key]
+    return env
 
 
 def _vscode_lm_worker_env(
@@ -8342,8 +8378,10 @@ class ProcessManager:
                 process = self._popen(
                     [sys.executable, str(supervisor), "--spec", str(spec_path)],
                     cwd=launch_cwd,
-                    env=sanitized_env(
+                    env=worker_launch_env(
                         adapter_id,
+                        repo=self.repo,
+                        request_id=request_id,
                         home=(
                             workspace.home
                             if sandbox_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}
@@ -8690,8 +8728,17 @@ class ProcessManager:
                 # coordinator token env vars, and every other unrelated
                 # inherited secret are excluded by construction, on this
                 # direct (non-isolated) launch path exactly like the isolated
-                # path (see _launch_isolated's Popen call below).
-                child_env = sanitized_env(adapter_id, provider_env=provider_env)
+                # path (see _launch_isolated's Popen call below).  NF430:
+                # worker_launch_env wraps that same sanitized allowlist and
+                # additionally routes TMPDIR/TMP/TEMP at the request-owned
+                # ``.aiworkhub/temp/worker/<request_id>`` authority, so this
+                # path no longer silently inherits the shared system temp.
+                child_env = worker_launch_env(
+                    adapter_id,
+                    repo=self.repo,
+                    request_id=request_id,
+                    provider_env=provider_env,
+                )
                 child_env["AIWORKHUB_REPO"] = str(self.repo)
                 with stdout_path.open("ab", buffering=0) as stdout_fh, stderr_path.open(
                     "ab", buffering=0
@@ -8770,6 +8817,12 @@ class ProcessManager:
                 "shell": False,
             }
         except (LaunchRejected, project_context.ProjectContextError, OSError, ValueError) as exc:
+            # NF430: the direct path owns no isolated worktree, so cleanup_workspace
+            # never runs for it -- dispose any worker temp authority provisioned
+            # for this request before returning the blocked result so a failed
+            # direct launch leaves no orphaned ``.aiworkhub/temp/worker`` root.
+            if request_id is not None:
+                dispose_worker_temp(self.repo, request_id)
             return self._blocked(
                 task_id, runner, topic, adapter_id, str(exc), request_id=request_id
             )

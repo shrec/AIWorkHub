@@ -134,6 +134,93 @@ def _repo_has_readable_generation(repo_root: Path | str) -> bool:
         return False
 
 
+_STALE_QUERY_CONNECTION_MARKERS = (
+    "database schema has changed",
+    "attempt to write a readonly database",
+)
+_STALE_QUERY_CONNECTION_CODES = frozenset(
+    code
+    for code in (
+        getattr(sqlite3, "SQLITE_READONLY", None),
+        getattr(sqlite3, "SQLITE_SCHEMA", None),
+    )
+    if code is not None
+)
+
+
+def _close_query_connection(conn: sqlite3.Connection | None) -> None:
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+
+def _is_stale_query_connection_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None and code in _STALE_QUERY_CONNECTION_CODES:
+        return True
+    text = str(exc).casefold()
+    return any(marker in text for marker in _STALE_QUERY_CONNECTION_MARKERS)
+
+
+def _live_index_holder_evidence(repo_root: Path | str) -> str:
+    daemon = get_daemon(repo_root)
+    if daemon is not None and daemon.is_running():
+        with daemon._state_lock:
+            status = daemon._status
+            build_process = daemon._build_process
+        if status in {STATUS_INDEXING, STATUS_RECOVERY} or build_process is not None:
+            return f"live_holder:daemon:{status}"
+    try:
+        with source_graph.index_write_lease(Path(repo_root).resolve()) as acquired:
+            if not acquired:
+                return "live_holder:index_write_lease"
+    except source_graph.SourceGraphError as exc:
+        return f"live_holder:{type(exc).__name__}:{exc}"[:300]
+    return ""
+
+
+def _execute_canonical_meta_query(conn: sqlite3.Connection) -> dict[str, str]:
+    return {
+        str(row["key"]): str(row["value"])
+        for row in conn.execute(
+            "SELECT key, value FROM meta WHERE key IN "
+            "('last_build','index_quality','recommendation_roundtrip')"
+        )
+    }
+
+
+def _read_canonical_meta_readonly(
+    repo_root: Path | str, db_path: Path
+) -> dict[str, str]:
+    """Read generation meta on a read-only connection.
+
+    A stale unheld query connection is closed, reopened read-only, and retried
+    exactly once. A live holder or any non-stale SQLite error fails closed
+    without opening writable.
+    """
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = source_graph.connect(db_path, read_only=True)
+        return _execute_canonical_meta_query(conn)
+    except sqlite3.Error as exc:
+        _close_query_connection(conn)
+        conn = None
+        if not _is_stale_query_connection_error(exc):
+            raise
+        holder = _live_index_holder_evidence(repo_root)
+        if holder:
+            raise sqlite3.OperationalError(holder) from exc
+        conn = source_graph.connect(db_path, read_only=True)
+        return _execute_canonical_meta_query(conn)
+    finally:
+        _close_query_connection(conn)
+
+
 class SourceGraphDaemon:
     """Owns exactly one background Source Graph indexing thread for one
     repository. Never constructed directly by callers outside this
@@ -1287,6 +1374,8 @@ class SourceGraphDaemon:
         with self._state_lock:
             running = self.is_running()
             status = self._status
+            if not running and self._thread is not None:
+                status = STATUS_STOPPED
             index_age_seconds: float | None = None
             freshness_anchor = self._last_success_at or self._started_at
             if freshness_anchor:
@@ -1491,17 +1580,7 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
     try:
         db_path = source_graph.resolve_db_path(Path(repo_root).resolve())
         if db_path.exists():
-            conn = source_graph.connect(db_path, read_only=True)
-            try:
-                rows = {
-                    str(row["key"]): str(row["value"])
-                    for row in conn.execute(
-                        "SELECT key, value FROM meta WHERE key IN "
-                        "('last_build','index_quality','recommendation_roundtrip')"
-                    )
-                }
-            finally:
-                conn.close()
+            rows = _read_canonical_meta_readonly(repo_root, db_path)
             payload = json.loads(rows.get("last_build", "{}"))
             finished_at = str(payload.get("finished_at") or "")
             build_revision = str(payload.get("build_revision") or "")

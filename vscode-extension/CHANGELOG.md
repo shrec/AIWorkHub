@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.56 — 2026-08-25
+
+### Fixed
+
+- Worker and validator temporary files are request-owned and cleaned through a
+  verified nested sandbox boundary instead of leaking into host temp storage.
+- Source Graph daemon health and recovery distinguish stale query connections
+  from live lock holders and report consistent process-lifecycle truth.
+
 ## 0.10.55 — 2026-08-25
 
 ### Fixed

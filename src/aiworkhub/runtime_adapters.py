@@ -88,6 +88,18 @@ _KILO_EXTENSION_DIR_GLOB = "kilocode.kilo-code-*"
 VSCODE_LM_ADAPTER = "vscode_lm"
 WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER = "windows_native_cli_requires_appcontainer_sandbox"
 
+# ── Worker temp authority environment variables ────────────────────────────
+# THE single declaration of which environment variables carry a launched
+# worker's temporary-file root.  Both real ProcessManager launch paths overlay
+# exactly these keys with the request-owned repository-local temp authority
+# (``.aiworkhub/temp/worker/<request_id>/tmp``) so a worker-run pytest/tempfile
+# never lands in the shared system temp or inside the candidate worktree.  This
+# is inert naming data only: consistent with this module's contract it never
+# builds, mutates, or returns an environment mapping -- it just names the keys
+# ``process_launcher.worker_launch_env`` and ``worker_workspace`` agree on
+# (POSIX ``TMPDIR`` plus the ``TMP``/``TEMP`` names Windows and macOS honour).
+WORKER_TEMP_ENV_VARS: tuple[str, ...] = ("TMPDIR", "TMP", "TEMP")
+
 # ── Editor model vocabulary ────────────────────────────────────────────────
 # THE single declaration of how a VS Code-reported model is judged callable.
 # vscode_lm_bridge, workforce_catalog and the VS Code extension all consume

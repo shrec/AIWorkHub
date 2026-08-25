@@ -12,12 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.55
+## What's new in 0.10.56
 
-- Task templates now choose language-compatible validators, Source Graph
-  telemetry separates live worker calls from injected prefetch evidence, and
-  sealed provider quota/authentication failures stop only the affected route
-  from being selected repeatedly.
+- Request-owned temporary roots and nested sandbox validation prevent host-temp
+  leakage and self-hosting validation loops. Source Graph daemon health and
+  recovery now distinguish stale connections from live ownership and expose
+  consistent lifecycle truth.
 
 ## Architecture at a glance
 
