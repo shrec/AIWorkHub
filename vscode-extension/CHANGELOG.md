@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.58 — 2026-08-25
+
+### Fixed
+
+- Reviewer launches now create, claim and bind the exact task before returning
+  an acknowledgement, eliminating pending/unclaimed ghost reviewers and making
+  same-ID retry reconciliation deterministic.
+
 ## 0.10.57 — 2026-08-25
 
 ### Fixed

@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.58] - 2026-08-25
+
+### Fixed
+
+- Quality-review launch acknowledgement now follows durable task creation,
+  exact claim and request binding, so deferred reviewer launches cannot leave
+  invisible `starting` requests or pending/unclaimed ghost cards.
+- Same-ID reviewer retries reconcile the exact bound request, while foreign
+  request IDs fail closed and live uncapped providers remain untouched.
+
 ## [0.10.57] - 2026-08-25
 
 ### Fixed

@@ -7851,13 +7851,16 @@ class ProcessManager:
             # committed) outputs into this dependent's isolated worktree by
             # declaring them as immutable inputs before create_workspace and the
             # B919 input-drift snapshot see the card.
-            card = self._preflight_card(
-                task_id,
-                runner,
-                topic,
-                adapter_id,
-                reserved_request_id=reserved_request_id,
-            )
+            if reserved_request_id is None:
+                card = self._preflight_card(task_id, runner, topic, adapter_id)
+            else:
+                card = self._preflight_card(
+                    task_id,
+                    runner,
+                    topic,
+                    adapter_id,
+                    reserved_request_id=reserved_request_id,
+                )
             claimed = core._lifecycle_state(card) == "processing"
             _enforce_quality_review_launch_binding(topic, quality_review_binding)
             card = self._with_dependency_inputs(card)

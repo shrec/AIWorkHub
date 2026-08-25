@@ -141,6 +141,50 @@ def _review_ready_target(monkeypatch: pytest.MonkeyPatch) -> None:
         _show_review_ready_target,
     )
 
+    # Reservation tests isolate the process-ledger boundary. The production
+    # launch now durably creates and claims the reviewer card before returning
+    # its acknowledgement, so provide the mechanically valid task-engine
+    # receipts that this focused fixture previously never needed.
+    monkeypatch.setattr(
+        process_launcher.core,
+        "create_task",
+        lambda **kwargs: {
+            "ok": True,
+            "created": True,
+            "task_id": kwargs["task_id"],
+        },
+    )
+
+    def _claim(
+        _repo: Path,
+        task_id: str,
+        runner: str,
+        topic: str,
+        *,
+        request_id: str,
+    ) -> dict[str, object]:
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout": json.dumps({
+                "task_id": task_id,
+                "runner": runner,
+                "topic": topic,
+                "launch_request_id": request_id,
+                "claim_epoch": 1,
+                "status": "processing",
+                "worker_status": "claimed",
+                "claimed_by": runner,
+            }),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "claim_start_exact",
+        _claim,
+    )
+
 
 def _running_spy(
     manager: process_launcher.ProcessManager, launch_calls: list,
@@ -894,7 +938,6 @@ def test_launch_publishes_phased_progress_under_same_reservation(
         "packet_built",
         "independence_rung_recorded",
         "packet_prepared",
-        "reviewer_task_created",
         "isolated_launch_started",
     ]
 
