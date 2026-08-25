@@ -12,12 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.56
+## What's new in 0.10.57
 
-- Request-owned temporary roots and nested sandbox validation prevent host-temp
-  leakage and self-hosting validation loops. Source Graph daemon health and
-  recovery now distinguish stale connections from live ownership and expose
-  consistent lifecycle truth.
+- Provider runtimes now receive their exact request-owned temporary authority
+  before Landlock rules are composed, preventing Claude/Grok nested-temp launch
+  failures without widening filesystem access.
 
 ## Architecture at a glance
 

@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.57 — 2026-08-25
+
+### Fixed
+
+- Request-owned provider temp directories are provisioned before Landlock is
+  composed, preventing Claude/Grok launch failures while keeping the sandbox
+  restricted to the exact worker request.
+
 ## 0.10.56 — 2026-08-25
 
 ### Fixed

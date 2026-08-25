@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.57] - 2026-08-25
+
+### Fixed
+
+- Worker launch now provisions each request-owned temporary authority before
+  composing Landlock rules, so Claude, Grok and other provider runtimes can
+  create arbitrary private temp subdirectories without host-temp access or
+  provider-specific sandbox exceptions.
+
 ## [0.10.56] - 2026-08-25
 
 ### Fixed

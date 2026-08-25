@@ -294,6 +294,59 @@ def test_production_launch_owns_exact_claim_promotion_and_review(
     or worker_workspace.nested_sandbox_requires_host_boundary(),
     reason="The current host boundary cannot execute nested Landlock workers",
 )
+def test_production_launch_grants_request_temp_before_landlock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    _open_gates(monkeypatch, tmp_path)
+    card = _card()
+    calls = _lifecycle_fakes(monkeypatch, card)
+    script = (
+        "import os, pathlib, shutil; "
+        "root = pathlib.Path(os.environ['TMPDIR']); "
+        "nested = root / 'provider-runtime-random' / 'session'; "
+        "nested.mkdir(parents=True); "
+        "marker = nested / 'owned.txt'; marker.write_text('ok'); "
+        "assert marker.read_text() == 'ok'; "
+        "shutil.rmtree(root / 'provider-runtime-random'); "
+        "pathlib.Path('out/result.txt').write_text('worker-result\\n')"
+    )
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(card),
+        collision_guard=_collision,
+        adapter_builder=_plan([sys.executable, "-c", script]),
+    )
+
+    launched = manager.launch(
+        task_id=card["task_id"],
+        runner=card["runner"],
+        topic=card["topic"],
+        adapter_id="claude_cli",
+        timeout_seconds=30,
+    )
+    assert launched["ok"] is True
+    assert launched["sandbox_backend"] == "landlock"
+
+    result = _wait_terminal(manager, launched["request_id"])
+    assert result["state"] == "review_ready"
+    assert [call[0] for call in calls] == ["claim", "review"]
+    assert result["latest_event"]["promoted_paths"] == []
+    assert result["latest_event"]["workspace_retained"] is True
+
+
+@pytest.mark.skipif(
+    worker_workspace.landlock_abi_version() < 1,
+    reason="Landlock is not supported by this kernel",
+)
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true"
+    or worker_workspace.nested_sandbox_requires_host_boundary(),
+    reason="The current host boundary cannot execute nested Landlock workers",
+)
 def test_cancel_from_restarted_manager_is_durable_and_releases_exact_owner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

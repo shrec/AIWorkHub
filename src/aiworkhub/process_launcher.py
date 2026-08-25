@@ -8115,6 +8115,23 @@ class ProcessManager:
                     }.get(adapter_id)
                     if worker_mcp_config_path is not None:
                         plan = runtime_adapters.inject_worker_mcp_config(plan, worker_mcp_config_path)
+                # Provision the request-owned temp authority before composing
+                # the Landlock command.  sandbox_argv deliberately grants
+                # --worker-temp only for an already-provisioned directory;
+                # creating TMPDIR later at supervisor spawn leaves provider
+                # runtimes unable to create their own nested temp directories.
+                launch_env = worker_launch_env(
+                    adapter_id,
+                    repo=self.repo,
+                    request_id=request_id,
+                    home=(
+                        workspace.home
+                        if sandbox_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}
+                        else None
+                    ),
+                    isolated_task_queue_db=True,
+                    provider_env=provider_env,
+                )
                 worker_argv = sandbox_argv(
                     workspace,
                     adapter_id,
@@ -8378,18 +8395,7 @@ class ProcessManager:
                 process = self._popen(
                     [sys.executable, str(supervisor), "--spec", str(spec_path)],
                     cwd=launch_cwd,
-                    env=worker_launch_env(
-                        adapter_id,
-                        repo=self.repo,
-                        request_id=request_id,
-                        home=(
-                            workspace.home
-                            if sandbox_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}
-                            else None
-                        ),
-                        isolated_task_queue_db=True,
-                        provider_env=provider_env,
-                    ),
+                    env=launch_env,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
