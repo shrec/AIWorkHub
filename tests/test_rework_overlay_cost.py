@@ -223,7 +223,7 @@ def test_rework_overlay_composes_base_and_retained(tmp_path):
 
 def test_rework_overlay_readiness_reuses_then_rebuilds_on_edit(tmp_path, monkeypatch):
     fx = _setup(tmp_path, retained=4, base_filler=20)
-    ctx = _ctx(fx)
+    ctx = replace(_ctx(fx), allowed_writes=("target_0000.py",))
     monkeypatch.setattr(source_graph, "build_index", _forbid_build_index)
 
     real_index_file = source_graph.index_file
