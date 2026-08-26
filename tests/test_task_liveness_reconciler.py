@@ -945,7 +945,9 @@ def test_structured_provider_auth_failure_blocks_without_review_candidate(
             request_id,
         )
     ]
-    assert runtime_auth_failures == [{"http_status": 401}]
+    assert runtime_auth_failures == [
+        {"http_status": 401, "error_code": "", "session_id": ""}
+    ]
     assert card["status"] == "blocked"
     assert manager.status(request_id)["liveness"] == {}
 
