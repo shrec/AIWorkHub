@@ -6,6 +6,28 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.60] - 2026-08-26
+
+### Added
+
+- Repository development-rule manifests now give workers measurable hot-path,
+  multicore, allocation, caching and validation constraints.
+
+### Fixed
+
+- Claude subscription workers recover one exact structured stale-credential
+  401 by atomically refreshing only the request-local credential projection
+  and retrying the same request once; repeated or non-auth failures remain
+  fail-closed and secrets are never persisted in evidence.
+- Same-request Claude recovery keeps the replacement supervisor visible and
+  cancellable instead of allowing the previous monitor to delete its live
+  process registration.
+- C, C++ and CUDA sparse workspaces resolve tracked local headers through
+  declared include roots while rejecting absolute paths, traversal and
+  symlink escapes.
+- Hosted rework and nested validation use current canonical dependency
+  authority, and supervisor progress clocks remain monotonic.
+
 ## [0.10.59] - 2026-08-26
 
 ### Fixed

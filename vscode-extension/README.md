@@ -12,11 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.59
+## What's new in 0.10.60
 
-- Quality-review launches now carry one exact reserved request through the
-  isolated provider handoff, verify the persisted read-only reviewer card and
-  resolve the trusted host supervisor from sparse self-development worktrees.
+- Claude subscription workers recover one exact stale request-local credential
+  without creating a second task or losing cancellation authority.
+- Declared include roots now seed valid C/C++/CUDA local headers into sparse
+  workspaces while traversal and symlink escapes remain blocked.
+- Repository development rules make performance, multicore, allocation,
+  caching and validation constraints explicit to workers.
 
 ## Architecture at a glance
 

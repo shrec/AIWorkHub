@@ -1,5 +1,22 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.60 — 2026-08-26
+
+### Added
+
+- Repository development rules expose explicit performance, multicore,
+  allocation, caching and validation constraints to coding workers.
+
+### Fixed
+
+- Claude subscription workers refresh a stale request-local credential once
+  on an exact authenticated 401 and retry the identical request without
+  losing cancellation or process-liveness authority.
+- Sparse C/C++/CUDA workspaces resolve quoted headers through declared include
+  roots with traversal and symlink-escape protection.
+- Hosted rework, nested validation dependencies and supervisor progress
+  accounting use current deterministic authority.
+
 ## 0.10.59 — 2026-08-26
 
 ### Fixed
