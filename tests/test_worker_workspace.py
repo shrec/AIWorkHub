@@ -189,6 +189,60 @@ def test_create_workspace_timeout_uses_process_free_cleanup(
     assert len(cleanup_calls) == 1
 
 
+def test_claude_credential_projection_refresh_is_narrow_atomic_and_private(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_home = tmp_path / "source-home"
+    source_claude = source_home / ".claude"
+    source_claude.mkdir(parents=True, mode=0o700)
+    (source_claude / ".credentials.json").write_text(
+        '{"token":"secret-v1"}\n', encoding="utf-8"
+    )
+    home = tmp_path / "isolated-home"
+    home.mkdir(mode=0o700)
+    (home / "tmp").mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(source_home))
+
+    first = worker_workspace.refresh_claude_credential_projection(home)
+    (source_claude / ".credentials.json").write_text(
+        '{"token":"secret-v2"}\n', encoding="utf-8"
+    )
+    second = worker_workspace.refresh_claude_credential_projection(home)
+
+    destination = home / ".claude" / ".credentials.json"
+    assert first["refreshed"] is True
+    assert second["refreshed"] is True
+    assert destination.read_text(encoding="utf-8") == '{"token":"secret-v2"}\n'
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+    assert "secret" not in json.dumps(second)
+
+
+def test_claude_credential_projection_rejects_destination_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_home = tmp_path / "source-home"
+    source_claude = source_home / ".claude"
+    source_claude.mkdir(parents=True, mode=0o700)
+    (source_claude / ".credentials.json").write_text("{}", encoding="utf-8")
+    home = tmp_path / "isolated-home"
+    home.mkdir(mode=0o700)
+    destination_dir = home / ".claude"
+    destination_dir.mkdir(mode=0o700)
+    (destination_dir / ".credentials.json").symlink_to(
+        tmp_path / "outside-credential"
+    )
+    monkeypatch.setenv("HOME", str(source_home))
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="claude_credential_destination_symlink_forbidden",
+    ):
+        worker_workspace.refresh_claude_credential_projection(home)
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "parent"

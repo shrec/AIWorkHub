@@ -2547,6 +2547,13 @@ def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
             "refusal_kind": str(outcome.get("refusal_kind") or ""),
             "recoverable": bool(outcome.get("recoverable")),
             "http_status": status,
+            "error_code": error_code,
+            "session_id": str(
+                event.get("session_id")
+                or event.get("sessionId")
+                or event.get("provider_session_id")
+                or ""
+            ),
         }
     return None
 
@@ -8393,6 +8400,7 @@ class ProcessManager:
                     backend=sandbox_backend,
                     package_import_root=worker_ai_tools_mcp.resolve_host_package_import_root(),
                 )
+                launch_cwd = _worker_launch_cwd(workspace.path)
 
                 # B919: snapshot every declared immutable/dependency input from
                 # the canonical repo *before* claim_start_exact, while it is
@@ -8480,6 +8488,9 @@ class ProcessManager:
                     ),
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
+                    "worker_argv": list(worker_argv),
+                    "worker_cwd": launch_cwd,
+                    "claude_auth_retry_count": 0,
                     "supervisor_status_path": str(status_path),
                     "cancel_path": str(cancel_path),
                     "metadata_path": str(metadata_path),
@@ -8622,7 +8633,6 @@ class ProcessManager:
                     request_id=request_id,
                 )
                 launch_phase = "supervisor_spec"
-                launch_cwd = _worker_launch_cwd(workspace.path)
                 write_json_0600(spec_path, {
                     "argv": worker_argv,
                     "cwd": launch_cwd,
@@ -9134,6 +9144,13 @@ class ProcessManager:
             "shell": False,
         }
 
+    def _remove_live_if_current(self, live: _LiveProcess) -> bool:
+        if self._live.get(live.request_id) is not live:
+            return False
+        self._live.pop(live.request_id, None)
+        self._cancelled.discard(live.request_id)
+        return True
+
     def _monitor(self, live: _LiveProcess) -> None:
         if live.isolated:
             try:
@@ -9159,13 +9176,11 @@ class ProcessManager:
                 )
             except _BridgeCancellationDeferred:
                 with self._lock:
-                    self._live.pop(live.request_id, None)
-                    self._cancelled.discard(live.request_id)
+                    self._remove_live_if_current(live)
                 return
             self._finalize_after_process_exit(live.request_id, live.process.poll())
             with self._lock:
-                self._live.pop(live.request_id, None)
-                self._cancelled.discard(live.request_id)
+                self._remove_live_if_current(live)
             return
 
         self._monitor_direct_for_tests(live)
@@ -9306,8 +9321,7 @@ class ProcessManager:
             )
         except _BridgeCancellationDeferred:
             with self._lock:
-                self._live.pop(live.request_id, None)
-                self._cancelled.discard(live.request_id)
+                self._remove_live_if_current(live)
             return
         try:
             card = _parse_card(self._show_task(live.task_id), live.task_id)
@@ -9354,8 +9368,7 @@ class ProcessManager:
             "project_context_acknowledgement": context_ack,
         })
         with self._lock:
-            self._live.pop(live.request_id, None)
-            self._cancelled.discard(live.request_id)
+            self._remove_live_if_current(live)
 
     def _record_usage(
         self,
@@ -9889,6 +9902,153 @@ class ProcessManager:
     @staticmethod
     def _read_supervisor_status(path: Path) -> dict[str, Any]:
         return read_supervisor_status(path)
+
+    def _retry_claude_auth_refresh(
+        self,
+        *,
+        request_id: str,
+        metadata_path: Path,
+        metadata: dict[str, Any],
+        workspace: WorkerWorkspace,
+        provider_launch_failure: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if str(metadata.get("adapter_id") or "") != "claude_cli":
+            return None
+        if int(metadata.get("claude_auth_retry_count") or 0) >= 1:
+            return None
+        classified = claude_auth.classify_runtime_auth_failure(
+            http_status=provider_launch_failure.get("http_status"),
+            error_code=provider_launch_failure.get("error_code"),
+            session_id=provider_launch_failure.get("session_id"),
+        )
+        if classified is None:
+            return None
+        worker_argv = metadata.get("worker_argv")
+        if not isinstance(worker_argv, list) or not all(
+            isinstance(value, str) and value for value in worker_argv
+        ):
+            return None
+        worker_cwd = str(metadata.get("worker_cwd") or "").strip()
+        if not worker_cwd:
+            return None
+
+        projection = _worker_workspace.refresh_claude_credential_projection(
+            workspace.home
+        )
+        status_path = Path(str(metadata["supervisor_status_path"]))
+        stdout_path = Path(str(metadata["stdout_path"]))
+        stderr_path = Path(str(metadata["stderr_path"]))
+        cancel_path = Path(str(metadata["cancel_path"]))
+        spec_path = self.process_dir / f"{request_id}.supervisor-spec.json"
+        for stale_path in (status_path, stdout_path, stderr_path, cancel_path):
+            unlink_if_regular(stale_path)
+        _touch_0600(stdout_path)
+        _touch_0600(stderr_path)
+        timeout_seconds = int(metadata.get("timeout_seconds") or 30)
+        write_json_0600(
+            spec_path,
+            {
+                "argv": list(worker_argv),
+                "cwd": worker_cwd,
+                **_legacy_timeout_fields(timeout_seconds),
+                "status_path": str(status_path),
+                "cancel_path": str(cancel_path),
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+                "max_output_bytes": 16 * 1024 * 1024,
+                "adapter_id": "claude_cli",
+                "token_budget": metadata.get("token_budget"),
+            },
+        )
+        launch_env = worker_launch_env(
+            "claude_cli",
+            repo=self.repo,
+            request_id=request_id,
+            home=workspace.home,
+            isolated_task_queue_db=True,
+        )
+        supervisor = _worker_supervisor_script()
+        process = self._popen(
+            [sys.executable, str(supervisor), "--spec", str(spec_path)],
+            cwd=worker_cwd,
+            env=launch_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            start_new_session=True,
+        )
+        start_ticks = _pid_start_ticks(process.pid)
+        if start_ticks is None:
+            _terminate_process_group(process.pid, grace_seconds=5.0)
+            raise WorkspaceError("supervisor_pid_identity_unavailable")
+        updated = {
+            **metadata,
+            "claude_auth_retry_count": 1,
+            "claude_auth_retry": {
+                "schema_id": "aiworkhub.claude_auth_retry.v1",
+                "http_status": classified["http_status"],
+                "session_id_sha256": classified["session_id_sha256"],
+                "credential_projection_refreshed": bool(
+                    projection.get("refreshed")
+                ),
+                "credential_projection_sha256": str(
+                    projection.get("destination_sha256") or ""
+                ),
+            },
+        }
+        write_json_0600(metadata_path, updated)
+        started_at = _utcnow()
+        live = _LiveProcess(
+            request_id=request_id,
+            task_id=str(metadata["task_id"]),
+            runner=str(metadata["runner"]),
+            topic=str(metadata["topic"]),
+            adapter_id="claude_cli",
+            model=metadata.get("model"),
+            process=process,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            started_at=started_at,
+            timeout_seconds=timeout_seconds,
+            isolated=True,
+            metadata_path=metadata_path,
+            supervisor_status_path=status_path,
+            pid_start_ticks=start_ticks,
+        )
+        with self._lock:
+            self._live[request_id] = live
+        event = self._append_event({
+            "request_id": request_id,
+            "task_id": metadata.get("task_id"),
+            "runner": metadata.get("runner"),
+            "topic": metadata.get("topic"),
+            "adapter_id": "claude_cli",
+            "model": metadata.get("model"),
+            "state": "running",
+            "pid": process.pid,
+            "pid_start_ticks": start_ticks,
+            "started_at": started_at,
+            "timeout_seconds": timeout_seconds,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "metadata_path": str(metadata_path),
+            "supervisor_status_path": str(status_path),
+            "prompt_sha256": metadata.get("prompt_sha256"),
+            "claude_auth_retry_count": 1,
+            "claude_auth_session_id_sha256": classified["session_id_sha256"],
+            "workspace_isolated": True,
+            "sandbox_backend": metadata.get("sandbox_backend"),
+            "shell": False,
+        })
+        thread = threading.Thread(
+            target=self._monitor,
+            args=(live,),
+            name=f"aiworkhub-task-{request_id[:8]}-auth-retry",
+            daemon=True,
+        )
+        thread.start()
+        return event
 
     def _watch_persisted_request(
         self,
@@ -10810,23 +10970,41 @@ class ProcessManager:
                 )
                 if provider_launch_failure is not None:
                     http_status = int(provider_launch_failure["http_status"])
+                    retry_event = self._retry_claude_auth_refresh(
+                        request_id=request_id,
+                        metadata_path=metadata_path,
+                        metadata=metadata,
+                        workspace=workspace,
+                        provider_launch_failure=provider_launch_failure,
+                    )
+                    if retry_event is not None:
+                        return retry_event
                     # The auth-readiness circuit is a claim about the credential,
-                    # so it only trips on an authentication-shaped status (401/
-                    # 403). A rate/quota refusal is not evidence of a bad key and
-                    # must not re-authenticate the route (NF-2026-00326).
+                    # so it only trips on an exact authentication-shaped Claude
+                    # runtime receipt. A rate/quota refusal is not evidence of a
+                    # bad key and must not re-authenticate the route.
                     if (
                         str(metadata.get("adapter_id") or "") == "claude_cli"
-                        and http_status in (401, 403)
-                    ):
-                        claude_auth.record_runtime_auth_failure(
-                            http_status=http_status
+                        and claude_auth.record_runtime_auth_failure(
+                            http_status=http_status,
+                            error_code=provider_launch_failure.get("error_code"),
+                            session_id=provider_launch_failure.get("session_id"),
                         )
+                    ):
+                        error = claude_auth.RUNTIME_AUTH_FAILURE_REASON
                     terminal_state = "launch_failed"
                     # The recorded blocker reason is the classifier's verdict,
                     # derived from the provider's OWN response body here where it
                     # is still in hand -- not a status-only guess and not the
                     # downstream exit_code=1 (NF-2026-00275, NF-2026-00326).
-                    error = str(provider_launch_failure["reason"])
+                    if error != claude_auth.RUNTIME_AUTH_FAILURE_REASON:
+                        error = str(provider_launch_failure["reason"])
+            elif (
+                terminal_state == "exited"
+                and str(metadata.get("adapter_id") or "") == "claude_cli"
+                and int(metadata.get("claude_auth_retry_count") or 0) == 1
+            ):
+                claude_auth.clear_runtime_auth_failure()
 
             changed: list[str] = []
             promoted: list[str] = []

@@ -13,6 +13,7 @@ Proves:
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -517,4 +518,127 @@ def test_invalid_include_root_fails(
     ):
         worker_workspace._resolve_local_quoted_includes(
             repo, ["read/ok.h"], include_roots=(".", "nonexistent_dir")
+        )
+
+
+def _declared_include_root_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "parent"
+    repo.mkdir()
+    assert _git(repo, "init", "-q").returncode == 0
+    assert _git(repo, "config", "user.email", "b664@example.invalid").returncode == 0
+    assert _git(repo, "config", "user.name", "B664").returncode == 0
+
+    include = repo / "deps" / "include" / "ufsecp"
+    src = repo / "kernels"
+    include.mkdir(parents=True)
+    src.mkdir()
+    (include / "ufsecp.h").write_text("#define UFSECP_CPU 1\n", encoding="utf-8")
+    (include / "ufsecp_gpu.h").write_text(
+        "#define UFSECP_GPU 1\n", encoding="utf-8"
+    )
+    (src / "cpu.c").write_text(
+        '#include "ufsecp/ufsecp.h"\nint cpu(void) { return UFSECP_CPU; }\n',
+        encoding="utf-8",
+    )
+    (src / "cpupp.cpp").write_text(
+        '#include "ufsecp/ufsecp.h"\nint cpupp(void) { return UFSECP_CPU; }\n',
+        encoding="utf-8",
+    )
+    (src / "gpu.cu").write_text(
+        '#include "ufsecp/ufsecp_gpu.h"\n'
+        "int gpu(void) { return UFSECP_GPU; }\n",
+        encoding="utf-8",
+    )
+    (repo / "out").mkdir()
+    (repo / "out" / "result.txt").write_text("baseline\n", encoding="utf-8")
+    assert _git(repo, "add", ".").returncode == 0
+    assert _git(repo, "commit", "-qm", "declared-include-root-fixture").returncode == 0
+    return repo
+
+
+def test_c_cpp_cuda_sources_resolve_tracked_headers_under_normalized_include_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = _declared_include_root_repo(tmp_path)
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees")
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "declared-root",
+        {
+            "allowed_writes": ["out/result.txt"],
+            "read_first": ["kernels/cpu.c", "kernels/cpupp.cpp", "kernels/gpu.cu"],
+            "include_roots": ["deps/include/../include"],
+        },
+        "validation",
+    )
+    try:
+        assert (workspace.path / "deps/include/ufsecp/ufsecp.h").is_file()
+        assert (workspace.path / "deps/include/ufsecp/ufsecp_gpu.h").is_file()
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.parametrize(
+    ("include_line", "needle"),
+    [
+        ('#include "/tmp/absolute_escape_b664.h"\n', "/tmp/absolute_escape_b664.h"),
+        (
+            '#include "../../../../traversal_escape_b664.h"\n',
+            "../../../../traversal_escape_b664.h",
+        ),
+    ],
+)
+def test_absolute_and_traversal_escape_includes_fail_closed_with_evidence(
+    include_line: str,
+    needle: str,
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "parent"
+    repo.mkdir()
+    assert _git(repo, "init", "-q").returncode == 0
+    assert _git(repo, "config", "user.email", "b664@example.invalid").returncode == 0
+    assert _git(repo, "config", "user.name", "B664").returncode == 0
+    (repo / "src" / "nested").mkdir(parents=True)
+    (repo / "src" / "nested" / "escape.c").write_text(
+        include_line, encoding="utf-8"
+    )
+    assert _git(repo, "add", ".").returncode == 0
+    assert _git(repo, "commit", "-qm", "escape-fixture").returncode == 0
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match=rf"local_quoted_include_unresolved:.*{re.escape(needle)}",
+    ):
+        worker_workspace._resolve_local_quoted_includes(
+            repo, ["src/nested/escape.c"], include_roots=(".",)
+        )
+
+
+def test_symlink_escape_include_under_declared_root_fails_closed_with_evidence(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "parent"
+    repo.mkdir()
+    assert _git(repo, "init", "-q").returncode == 0
+    assert _git(repo, "config", "user.email", "b664@example.invalid").returncode == 0
+    assert _git(repo, "config", "user.name", "B664").returncode == 0
+    outside = tmp_path / "outside.h"
+    outside.write_text("#define OUTSIDE 1\n", encoding="utf-8")
+    (repo / "include" / "ufsecp").mkdir(parents=True)
+    (repo / "src").mkdir()
+    (repo / "include" / "ufsecp" / "escape.h").symlink_to(outside)
+    (repo / "src" / "main.c").write_text(
+        '#include "ufsecp/escape.h"\n', encoding="utf-8"
+    )
+    assert _git(repo, "add", ".").returncode == 0
+    assert _git(repo, "commit", "-qm", "symlink-escape-fixture").returncode == 0
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match=r"local_quoted_include_unresolved:.*ufsecp/escape.h",
+    ):
+        worker_workspace._resolve_local_quoted_includes(
+            repo, ["src/main.c"], include_roots=("include",)
         )

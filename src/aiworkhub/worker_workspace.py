@@ -1333,6 +1333,11 @@ _HEADER_FILE_SUFFIXES = frozenset(
 )
 _QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
 _DEFAULT_INCLUDE_ROOTS: tuple[str, ...] = (".",)
+_INCLUDE_ROOT_CARD_KEYS = (
+    "include_roots",
+    "local_include_roots",
+    "project_include_roots",
+)
 
 
 def _resolve_local_quoted_includes(
@@ -1359,7 +1364,7 @@ def _resolve_local_quoted_includes(
     if not seeded:
         return []
 
-    _validate_include_roots(repo, include_roots)
+    normalized_roots = _normalize_include_roots(repo, include_roots)
 
     resolved: dict[str, str] = {}  # repo-relative path -> including relative (provenance)
     missing: dict[str, str] = {}    # unresolved include string -> first including relative
@@ -1392,7 +1397,7 @@ def _resolve_local_quoted_includes(
             include_target = match.group(1)
             # Resolve: current-file directory first, then each include root.
             candidate = _resolve_one_quoted_include(
-                repo, including_dir, include_target, include_roots
+                repo, including_dir, include_target, normalized_roots
             )
             if candidate is None:
                 if include_target not in missing:
@@ -1421,14 +1426,39 @@ def _resolve_local_quoted_includes(
     return augmented
 
 
-def _validate_include_roots(repo: Path, roots: tuple[str, ...]) -> None:
+def _normalize_include_roots(repo: Path, roots: Iterable[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
     for raw in roots:
-        norm = _relative_repo_path(raw) if raw != "." else "."
-        if norm == ".":
-            continue
-        candidate = repo / norm
+        if raw == ".":
+            norm = "."
+            candidate = repo
+        else:
+            candidate = _safe_include_candidate(repo, repo, raw)
+            if candidate is None:
+                raise WorkspaceError(f"include_root_not_directory:{raw}")
+            norm = candidate.relative_to(repo).as_posix()
         if candidate.is_symlink() or not candidate.is_dir():
             raise WorkspaceError(f"include_root_not_directory:{raw}")
+        key = "." if norm == "." else norm
+        if key not in seen:
+            seen.add(key)
+            normalized.append(key)
+    return tuple(normalized)
+
+
+def _include_roots_from_card(card: Mapping[str, Any]) -> tuple[str, ...]:
+    roots: list[str] = ["."]
+    for key in _INCLUDE_ROOT_CARD_KEYS:
+        value = card.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            roots.append(value)
+            continue
+        if isinstance(value, Iterable):
+            roots.extend(root for root in value if isinstance(root, str))
+    return tuple(roots)
 
 
 def _resolve_one_quoted_include(
@@ -1443,27 +1473,38 @@ def _resolve_one_quoted_include(
     2. Relative to each configured repository include root.
     """
     # Rule 1: current-file directory.
-    direct = (including_dir / target).resolve()
-    try:
-        direct.relative_to(repo)
-    except ValueError:
-        pass  # escapes repo root
-    else:
-        if direct.exists():
-            return direct
+    direct = _safe_include_candidate(repo, including_dir, target)
+    if direct is not None and direct.exists():
+        return direct
 
     # Rule 2: configured include roots.
     for root_raw in include_roots:
-        base = repo if root_raw == "." else (repo / root_raw).resolve()
-        candidate = (base / target).resolve()
-        try:
-            candidate.relative_to(repo)
-        except ValueError:
+        base = repo if root_raw == "." else repo / root_raw
+        candidate = _safe_include_candidate(repo, base, target)
+        if candidate is None:
             continue
         if candidate.exists():
             return candidate
 
     return None
+
+
+def _safe_include_candidate(repo: Path, base: Path, target: str) -> Path | None:
+    target_value = target.strip().replace("\\", "/")
+    if (
+        not target_value
+        or target_value.startswith("/")
+        or "\x00" in target_value
+    ):
+        return None
+    candidate = Path(os.path.abspath(base / PurePosixPath(target_value)))
+    try:
+        _require_beneath(repo, candidate.parent)
+        resolved = candidate.resolve(strict=False)
+        _require_beneath(repo, resolved)
+    except WorkspaceError:
+        return None
+    return candidate
 # ---- end local quoted-include dependency preflight (B664) -------------------
 
 
@@ -2105,12 +2146,7 @@ def _credential_home(home: Path, adapter_id: str, project_root: Path | None = No
     chmod_path(temp_home, 0o700)
     source_home = Path.home()
     if adapter_id == "claude_cli":
-        source = source_home / ".claude" / ".credentials.json"
-        if source.is_file():
-            destination = home / ".claude" / ".credentials.json"
-            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            shutil.copyfile(source, destination)
-            chmod_path(destination, 0o600)
+        refresh_claude_credential_projection(home)
         # Claude Code ignores the repository's permissions allowlist until the
         # project trust dialog has been accepted. Isolated workers have no TTY,
         # so a fresh minimal HOME would otherwise wait forever before the first
@@ -2142,6 +2178,87 @@ def _credential_home(home: Path, adapter_id: str, project_root: Path | None = No
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             shutil.copyfile(source, destination)
             chmod_path(destination, 0o600)
+
+
+def _copy_regular_file_atomic(source: Path, destination: Path) -> None:
+    source_info = source.lstat()
+    if not stat.S_ISREG(source_info.st_mode):
+        raise WorkspaceError("claude_credential_source_not_regular")
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        chmod_path(destination.parent, 0o700)
+    except OSError:
+        pass
+    if destination.parent.is_symlink() or destination.is_symlink():
+        raise WorkspaceError("claude_credential_destination_symlink_forbidden")
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        read_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            write_fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            try:
+                with os.fdopen(read_fd, "rb") as source_stream:
+                    read_fd = -1
+                    with os.fdopen(write_fd, "wb") as destination_stream:
+                        write_fd = -1
+                        shutil.copyfileobj(source_stream, destination_stream)
+                        destination_stream.flush()
+                        os.fsync(destination_stream.fileno())
+                atomic_replace(temporary, destination)
+                try:
+                    chmod_path(destination, 0o600)
+                except OSError:
+                    pass
+            finally:
+                if write_fd >= 0:
+                    os.close(write_fd)
+        finally:
+            if read_fd >= 0:
+                os.close(read_fd)
+    except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise WorkspaceError(f"claude_credential_projection_failed:{type(exc).__name__}") from exc
+
+
+def refresh_claude_credential_projection(home: Path) -> dict[str, Any]:
+    """Refresh only Claude's narrow request-local credential projection."""
+
+    selected_home = _verify_owner_private_directory(home, "claude_projection_home")
+    source_root_path = Path.home() / ".claude"
+    if source_root_path.exists() or source_root_path.is_symlink():
+        source_root = _verify_owner_private_directory(
+            source_root_path, "claude_credential_source_home"
+        )
+    else:
+        source_root = source_root_path
+    source = source_root / ".credentials.json"
+    destination = selected_home / ".claude" / ".credentials.json"
+    if source.is_symlink():
+        raise WorkspaceError("claude_credential_source_symlink_forbidden")
+    if not source.is_file():
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError as exc:
+            raise WorkspaceError(
+                f"claude_credential_projection_remove_failed:{type(exc).__name__}"
+            ) from exc
+        return {"refreshed": False, "source_present": False}
+    _copy_regular_file_atomic(source, destination)
+    return {
+        "refreshed": True,
+        "source_present": True,
+        "destination_bytes": destination.stat().st_size,
+        "destination_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+    }
 
 
 def _load_repo_taskdb_module(repo: Path) -> Any:
@@ -2930,7 +3047,11 @@ def create_workspace(
 
     declared = list(card.get("read_first") or []) + list(card.get("immutable_inputs") or []) + list(allowed)
     live_seeded = _expand_declared(repo, declared)
-    live_seeded = _resolve_local_quoted_includes(repo, live_seeded)
+    live_seeded = _resolve_local_quoted_includes(
+        repo,
+        live_seeded,
+        include_roots=_include_roots_from_card(card),
+    )
     validation_rows = tuple(
         row
         for row in (card.get("validation") or [])

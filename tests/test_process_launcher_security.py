@@ -237,6 +237,112 @@ def _wait_terminal(manager: process_launcher.ProcessManager, request_id: str) ->
     raise AssertionError("isolated worker did not become terminal")
 
 
+class _FinishedProcess:
+    def __init__(self, pid: int, returncode: int | None = 0) -> None:
+        self.pid = pid
+        self.returncode = returncode
+
+    def wait(self) -> int | None:
+        return self.returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+def test_monitor_keeps_same_request_retry_visible_and_cancellable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    request_id = "r" * 32
+    old_process = _FinishedProcess(111, returncode=1)
+    retry_process = _FinishedProcess(222, returncode=None)
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(_card()),
+    )
+    old_live = process_launcher._LiveProcess(  # noqa: SLF001 - exact race fixture
+        request_id=request_id,
+        task_id="TASK_B1",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        model=None,
+        process=old_process,
+        stdout_path=tmp_path / "old.stdout.log",
+        stderr_path=tmp_path / "old.stderr.log",
+        started_at="2026-08-26T00:00:00+00:00",
+        timeout_seconds=60,
+        isolated=True,
+        pid_start_ticks=1,
+    )
+    retry_live = process_launcher._LiveProcess(  # noqa: SLF001 - exact retry replacement
+        request_id=request_id,
+        task_id="TASK_B1",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        model=None,
+        process=retry_process,
+        stdout_path=tmp_path / "retry.stdout.log",
+        stderr_path=tmp_path / "retry.stderr.log",
+        started_at="2026-08-26T00:00:01+00:00",
+        timeout_seconds=60,
+        isolated=False,
+        pid_start_ticks=2,
+    )
+    manager._append_event({  # noqa: SLF001 - seed cancellable lineage
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "state": "running",
+        "pid": old_process.pid,
+        "pid_start_ticks": 1,
+    })
+    with manager._lock:  # noqa: SLF001 - model active old monitor owner
+        manager._live[request_id] = old_live  # noqa: SLF001
+
+    def install_same_request_retry(bound_request_id: str, returncode: int | None) -> dict:
+        assert bound_request_id == request_id
+        assert returncode == old_process.returncode
+        with manager._lock:  # noqa: SLF001 - retry inserted during finalization
+            manager._live[request_id] = retry_live  # noqa: SLF001
+        return manager._append_event({  # noqa: SLF001 - retry remains same request
+            "request_id": request_id,
+            "task_id": "TASK_B1",
+            "runner": "claude_worker_b1",
+            "topic": "task_mcp",
+            "adapter_id": "claude_cli",
+            "state": "running",
+            "pid": retry_process.pid,
+            "pid_start_ticks": 2,
+        })
+
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        manager,
+        "_finalize_after_process_exit",
+        install_same_request_retry,
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_terminate_process_group",
+        lambda pid, grace_seconds=5.0: terminated.append(pid),
+    )
+
+    manager._monitor(old_live)  # noqa: SLF001
+
+    with manager._lock:  # noqa: SLF001
+        assert manager._live.get(request_id) is retry_live  # noqa: SLF001
+    cancel = manager.cancel(request_id, reason="owner cancelled replacement")
+    assert cancel == {"ok": True, "request_id": request_id, "state": "cancelled"}
+    assert terminated == [retry_process.pid]
+
+
 @pytest.mark.skipif(
     worker_workspace.landlock_abi_version() < 1,
     reason="Landlock is not supported by this kernel",
@@ -905,6 +1011,160 @@ def test_provider_timeout_evidence_rejects_unstructured_timeout_prose(tmp_path: 
         encoding="utf-8",
     )
     assert process_launcher._provider_timeout_failure_from_output(output) is None
+
+
+def test_provider_auth_failure_preserves_claude_session_identity(tmp_path: Path) -> None:
+    output = tmp_path / "provider.jsonl"
+    output.write_text(
+        json.dumps({
+            "type": "result",
+            "is_error": True,
+            "terminal_reason": "api_error",
+            "api_error_status": 401,
+            "error": "authentication_failed",
+            "session_id": "provider-session-secret",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    failure = process_launcher._provider_auth_failure_from_output(output)
+
+    assert failure is not None
+    assert failure["http_status"] == 401
+    assert failure["error_code"] == "authentication_failed"
+    assert failure["session_id"] == "provider-session-secret"
+
+
+def test_claude_auth_refresh_retry_reuses_request_and_identical_worker_argv(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    request_id = "r" * 32
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source_home = tmp_path / "source-home"
+    source_claude = source_home / ".claude"
+    source_claude.mkdir(parents=True, mode=0o700)
+    (source_claude / ".credentials.json").write_text(
+        '{"token":"fresh-host-token"}\n', encoding="utf-8"
+    )
+    workspace_root = tmp_path / "workspace"
+    worktree = workspace_root / "worktree"
+    home = workspace_root / "home"
+    worktree.mkdir(parents=True)
+    home.mkdir(mode=0o700)
+    (home / "tmp").mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(source_home))
+    monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
+    monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    monkeypatch.setenv(worker_workspace.SANDBOX_BACKEND_ENV, "landlock")
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=request_id,
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=("out/result.txt",),
+        parent_baseline={},
+        workspace_baseline={},
+        tree_baseline={},
+        base_oid="a" * 40,
+    )
+    process_dir = tmp_path / "processes"
+    process_dir.mkdir()
+    metadata_path = process_dir / f"{request_id}.request.json"
+    status_path = process_dir / f"{request_id}.supervisor.json"
+    stdout_path = process_dir / f"{request_id}.stdout.log"
+    stderr_path = process_dir / f"{request_id}.stderr.log"
+    cancel_path = process_dir / f"{request_id}.cancel.json"
+    worker_argv = [sys.executable, "-c", "print('same prompt')"]
+    metadata = {
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "model": None,
+        "timeout_seconds": 30,
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "supervisor_status_path": str(status_path),
+        "cancel_path": str(cancel_path),
+        "worker_argv": worker_argv,
+        "worker_cwd": str(worktree),
+        "prompt_sha256": "b" * 64,
+        "sandbox_backend": "landlock",
+        "workspace": workspace.as_metadata(),
+    }
+    worker_workspace.write_json_0600(metadata_path, metadata)
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=process_dir,
+    )
+    popen_calls: list[dict[str, object]] = []
+
+    def fake_popen(argv, **kwargs):
+        popen_calls.append({"argv": list(argv), **kwargs})
+        return SimpleNamespace(pid=4242)
+
+    monkeypatch.setattr(manager, "_popen", fake_popen)
+    monkeypatch.setattr(process_launcher, "_pid_start_ticks", lambda _pid: 17)
+    monkeypatch.setattr(
+        process_launcher,
+        "_worker_supervisor_script",
+        lambda: Path(process_launcher.__file__),
+    )
+
+    class FakeThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(process_launcher.threading, "Thread", FakeThread)
+
+    event = manager._retry_claude_auth_refresh(
+        request_id=request_id,
+        metadata_path=metadata_path,
+        metadata=metadata,
+        workspace=workspace,
+        provider_launch_failure={
+            "http_status": 401,
+            "error_code": "authentication_failed",
+            "session_id": "session-1",
+        },
+    )
+
+    assert event is not None
+    assert event["request_id"] == request_id
+    assert event["state"] == "running"
+    assert len(popen_calls) == 1
+    spec_path = process_dir / f"{request_id}.supervisor-spec.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    assert spec["argv"] == worker_argv
+    updated = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert updated["claude_auth_retry_count"] == 1
+    assert updated["claude_auth_retry"]["session_id_sha256"] != "session-1"
+    assert "fresh-host-token" not in json.dumps(updated)
+    assert (
+        home / ".claude" / ".credentials.json"
+    ).read_text(encoding="utf-8") == '{"token":"fresh-host-token"}\n'
+    assert (
+        manager._retry_claude_auth_refresh(
+            request_id=request_id,
+            metadata_path=metadata_path,
+            metadata=updated,
+            workspace=workspace,
+            provider_launch_failure={
+                "http_status": 401,
+                "error_code": "authentication_failed",
+                "session_id": "session-1",
+            },
+        )
+        is None
+    )
 
 
 def test_success_status_does_not_promote_after_exact_claim_ownership_is_lost(

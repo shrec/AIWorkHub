@@ -24,10 +24,12 @@ RUNTIME_AUTH_FAILURE_TTL_SECONDS = 300.0
 STATUS_TIMEOUT_SECONDS = 5.0
 MAX_STATUS_BYTES = 16 * 1024
 MAX_FAILURE_STATE_BYTES = 4 * 1024
+MAX_SESSION_ID_HASH_BYTES = 64
+RUNTIME_AUTH_FAILURE_REASON = "claude_subscription_session_refresh_required"
 
 _lock = threading.Lock()
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
-_runtime_failures: dict[str, tuple[float, int]] = {}
+_runtime_failures: dict[str, tuple[float, int, str]] = {}
 _EDITOR_LAUNCHER_NAMES = frozenset(
     {
         "code",
@@ -49,7 +51,62 @@ def _executable_identity(path: str) -> str:
     return hashlib.sha256(path.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
-def _persist_runtime_failure(path: str, http_status: int) -> None:
+def _session_identity(session_id: str) -> str:
+    return hashlib.sha256(session_id.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _classify_runtime_auth_failure(
+    *, http_status: object, error_code: object, session_id: object
+) -> tuple[int, str] | None:
+    if type(http_status) is not int:
+        return None
+    if http_status != 401:
+        return None
+    if error_code != "authentication_failed":
+        return None
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return http_status, _session_identity(session_id)[:MAX_SESSION_ID_HASH_BYTES]
+
+
+def classify_runtime_auth_failure(
+    *, http_status: object, error_code: object, session_id: object
+) -> dict[str, Any] | None:
+    classified = _classify_runtime_auth_failure(
+        http_status=http_status,
+        error_code=error_code,
+        session_id=session_id,
+    )
+    if classified is None:
+        return None
+    status, session_hash = classified
+    return {
+        "http_status": status,
+        "session_id_sha256": session_hash,
+    }
+
+
+def _clear_persisted_runtime_failure(path: str) -> None:
+    state_path = _failure_state_path()
+    try:
+        raw = state_path.read_bytes()
+    except OSError:
+        return
+    if len(raw) > MAX_FAILURE_STATE_BYTES:
+        return
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return
+    if payload.get("executable_sha256") != _executable_identity(path):
+        return
+    try:
+        state_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _persist_runtime_failure(path: str, http_status: int, session_hash: str) -> None:
     """Persist only non-secret circuit metadata across MCP/runtime reloads."""
 
     state_path = _failure_state_path()
@@ -61,6 +118,7 @@ def _persist_runtime_failure(path: str, http_status: int) -> None:
         "executable_sha256": _executable_identity(path),
         "observed_at": time.time(),
         "http_status": http_status,
+        "session_id_sha256": session_hash,
     }
     try:
         state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -85,7 +143,7 @@ def _persist_runtime_failure(path: str, http_status: int) -> None:
             pass
 
 
-def _persisted_runtime_failure(path: str) -> tuple[int, float] | None:
+def _persisted_runtime_failure(path: str) -> tuple[int, float, str] | None:
     state_path = _failure_state_path()
     try:
         raw = state_path.read_bytes()
@@ -96,7 +154,8 @@ def _persisted_runtime_failure(path: str) -> tuple[int, float] | None:
     try:
         payload = json.loads(raw.decode("utf-8"))
         observed_at = float(payload["observed_at"])
-        http_status = int(payload["http_status"])
+        http_status = payload["http_status"]
+        session_hash = payload["session_id_sha256"]
     except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if payload.get("schema_id") != "aiworkhub.claude_auth_failure.v1":
@@ -110,9 +169,16 @@ def _persisted_runtime_failure(path: str) -> tuple[int, float] | None:
         except OSError:
             pass
         return None
-    if http_status not in {401, 403}:
+    if type(http_status) is not int or http_status != 401:
         return None
-    return http_status, age
+    if not isinstance(session_hash, str) or not session_hash:
+        return None
+    if (
+        len(session_hash.encode("utf-8", errors="surrogatepass"))
+        > MAX_SESSION_ID_HASH_BYTES
+    ):
+        return None
+    return http_status, age, session_hash
 
 
 def _is_editor_launcher(path: str) -> bool:
@@ -163,28 +229,28 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
     with _lock:
         runtime_failure = _runtime_failures.get(path)
         if runtime_failure is not None:
-            observed_at, http_status = runtime_failure
+            observed_at, http_status, _session_hash = runtime_failure
             if now - observed_at < RUNTIME_AUTH_FAILURE_TTL_SECONDS:
                 return {
                     "ok": False,
                     "authenticated": False,
                     "launchable": False,
                     "status": "authentication_expired",
-                    "blocker_reason": "claude_runtime_authentication_failed",
+                    "blocker_reason": RUNTIME_AUTH_FAILURE_REASON,
                     "http_status": http_status,
                     "runtime_observed": True,
                     "cache_hit": True,
                 }
             _runtime_failures.pop(path, None)
-        persisted_failure = _persisted_runtime_failure(path)
+        persisted_failure = None if force else _persisted_runtime_failure(path)
         if persisted_failure is not None:
-            http_status, _age = persisted_failure
+            http_status, _age, _session_hash = persisted_failure
             return {
                 "ok": False,
                 "authenticated": False,
                 "launchable": False,
                 "status": "authentication_expired",
-                "blocker_reason": "claude_runtime_authentication_failed",
+                "blocker_reason": RUNTIME_AUTH_FAILURE_REASON,
                 "http_status": http_status,
                 "runtime_observed": True,
                 "cache_hit": True,
@@ -236,35 +302,67 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
             "cache_hit": False,
         }
     with _lock:
+        if result.get("launchable") is True:
+            _runtime_failures.pop(path, None)
+            _clear_persisted_runtime_failure(path)
         _cache[path] = (now, dict(result))
     return result
 
 
 def record_runtime_auth_failure(
-    executable: str | None = None, *, http_status: int = 401
-) -> None:
-    """Temporarily trip Claude readiness after an authoritative live 401/403.
+    executable: str | None = None,
+    *,
+    http_status: object = 401,
+    error_code: object = "authentication_failed",
+    session_id: object = "",
+) -> bool:
+    """Temporarily trip Claude readiness after an authoritative live 401.
 
     ``claude auth status`` reports the presence of a local login, not whether
     its OAuth access token can still complete a provider request.  The worker
-    result stream is the stronger authority. Keep the circuit time-bounded and
-    persist only a path hash, timestamp, and HTTP status so runtime reloads do
-    not erase live evidence. AIWorkHub never copies, refreshes, or persists
-    provider credentials.
+    result stream is the stronger authority when it supplies the exact bounded
+    non-secret failure receipt. Keep the circuit time-bounded and persist only
+    hashes, timestamp, and HTTP status so runtime reloads do not erase live
+    evidence. AIWorkHub never copies, refreshes, or persists provider
+    credentials.
     """
+
+    classified = _classify_runtime_auth_failure(
+        http_status=http_status,
+        error_code=error_code,
+        session_id=session_id,
+    )
+    if classified is None:
+        return False
 
     resolved = executable or shutil.which("claude") or ""
     if not resolved:
-        return
+        return False
     try:
         path = str(Path(resolved).resolve(strict=True))
     except (OSError, RuntimeError, ValueError):
-        return
-    status = int(http_status) if int(http_status) in {401, 403} else 401
+        return False
+    status, session_hash = classified
     with _lock:
         _cache.pop(path, None)
-        _runtime_failures[path] = (time.monotonic(), status)
-    _persist_runtime_failure(path, status)
+        _runtime_failures[path] = (time.monotonic(), status, session_hash)
+    _persist_runtime_failure(path, status, session_hash)
+    return True
+
+
+def clear_runtime_auth_failure(executable: str | None = None) -> bool:
+    resolved = executable or shutil.which("claude") or ""
+    if not resolved:
+        return False
+    try:
+        path = str(Path(resolved).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return False
+    with _lock:
+        _runtime_failures.pop(path, None)
+        _cache.pop(path, None)
+    _clear_persisted_runtime_failure(path)
+    return True
 
 
 def invalidate() -> None:
@@ -273,4 +371,10 @@ def invalidate() -> None:
         _runtime_failures.clear()
 
 
-__all__ = ["auth_status", "invalidate", "record_runtime_auth_failure"]
+__all__ = [
+    "auth_status",
+    "classify_runtime_auth_failure",
+    "clear_runtime_auth_failure",
+    "invalidate",
+    "record_runtime_auth_failure",
+]
