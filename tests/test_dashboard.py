@@ -1709,6 +1709,22 @@ def test_coding_foundation_default_snapshot_is_not_wired() -> None:
         assert projection["ownership"] == "full"
 
 
+def test_dashboard_provider_projects_repository_development_rules(tmp_path) -> None:
+    manifest_path = tmp_path / ".aiworkhub" / "config" / "development_rules.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps(_rules_manifest_mapping()), encoding="utf-8")
+
+    provider = dashboard.DashboardProvider(repo_root=tmp_path)
+    rules = dashboard._coding_foundation_projections(
+        provider, ownership="full"
+    )["development_rules"]
+    assert rules["state"] == "measured"
+    assert rules["availability"] == "available"
+    assert rules["declared_rule_count"] == 2
+    assert rules["resolved_rule_count"] == 1
+    assert rules["violation_evidence_state"] == "no_sample"
+
+
 def test_coding_foundation_positive_measured_projections() -> None:
     provider = _FoundationProvider(
         development_rules={

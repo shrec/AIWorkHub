@@ -1980,7 +1980,17 @@ class DashboardProvider:
         api = _load_development_rules_api()
         if api is None:
             raise RuntimeError("development_rules_unavailable")
-        return None
+        path = self.repo_root / ".aiworkhub" / "config" / "development_rules.json"
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        # Repository configuration is expected to stay tiny.  Bound the read
+        # before parsing so a corrupt or replaced file cannot make a dashboard
+        # refresh materialize an arbitrary amount of data.
+        if len(data) > 2 * 1024 * 1024:
+            raise RuntimeError("development_rules_manifest_too_large")
+        return {"manifest": api.parse_manifest_bytes(data)}
 
     def get_skills_projection_input(self) -> Any | None:
         api = _load_skill_registry_api()
