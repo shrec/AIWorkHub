@@ -4732,7 +4732,10 @@ def test_outer_validation_authority_ignores_candidate_env_and_writable_files(
     forged = tmp_path / worker_workspace.OUTER_VALIDATION_AUTHORITY_RELATIVE
     payload = json.loads(forged.read_text(encoding="utf-8"))
     payload["mac"] = "0" * 64
-    forged.chmod(0o600)
+    try:
+        forged.chmod(0o600)
+    except PermissionError:
+        pass
     forged.write_text(json.dumps(payload), encoding="utf-8")
     assert worker_workspace.verify_outer_validation_authority_file(forged) is None
 
@@ -4791,6 +4794,197 @@ def test_sandbox_argv_plants_outer_authority_only_when_requested(
         assert "--outer-validation-authority" in flagged
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def _deny_landlock_sibling_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        worker_workspace,
+        "_directory_write_denied_by_landlock",
+        lambda _directory: True,
+    )
+
+
+def _plant_nested_landlock_layout(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    nested = scratch / "nested-worktrees" / "req" / "worktree"
+    workspace.mkdir()
+    nested.mkdir(parents=True)
+    planted = worker_workspace.plant_outer_validation_authority(
+        workspace, exec_scratch=scratch
+    )
+    locator = scratch / worker_workspace.NESTED_LANDLOCK_AUTHORITY_LOCATOR_RELATIVE
+    return planted, locator, nested, scratch
+
+
+def test_nested_landlock_locator_resolves_from_separate_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    planted, _locator, nested, scratch = _plant_nested_landlock_layout(tmp_path)
+    _deny_landlock_sibling_writes(monkeypatch)
+    monkeypatch.chdir(nested)
+    verified = worker_workspace.authenticated_outer_validation_context()
+    assert verified is not None
+    assert verified["workspace"] == str((tmp_path / "workspace").resolve())
+    assert verified["exec_scratch"] == str(scratch.resolve())
+    assert worker_workspace.verify_outer_validation_authority_file(planted) == verified
+    assert worker_workspace.nested_sandbox_requires_host_boundary() is True
+
+
+def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _planted, locator, nested, scratch = _plant_nested_landlock_layout(tmp_path)
+    _deny_landlock_sibling_writes(monkeypatch)
+    workspace = tmp_path / "workspace"
+    monkeypatch.chdir(nested)
+    real_owned = worker_workspace._coordinator_owned_regular_file
+    locator_key = locator.resolve()
+
+    try:
+        locator.chmod(locator.stat().st_mode | stat.S_IWGRP)
+        mode_forced = False
+    except PermissionError:
+        mode_forced = True
+
+        def reject_locator_mode(path: Path):
+            if path.resolve() == locator_key:
+                return None
+            return real_owned(path)
+
+        monkeypatch.setattr(
+            worker_workspace, "_coordinator_owned_regular_file", reject_locator_mode
+        )
+    assert worker_workspace.authenticated_outer_validation_context() is None
+    if mode_forced:
+        monkeypatch.setattr(
+            worker_workspace, "_coordinator_owned_regular_file", real_owned
+        )
+    try:
+        locator.chmod(0o444)
+    except PermissionError:
+        pass
+
+    original_geteuid = os.geteuid
+    monkeypatch.setattr(os, "geteuid", lambda: original_geteuid() + 1)
+    assert worker_workspace.authenticated_outer_validation_context() is None
+    monkeypatch.setattr(os, "geteuid", original_geteuid)
+
+    real = locator.with_name(locator.name + ".real")
+    locator.rename(real)
+    locator.symlink_to(real)
+    assert worker_workspace.authenticated_outer_validation_context() is None
+    locator.unlink()
+    real.rename(locator)
+
+    payload = json.loads(locator.read_text(encoding="utf-8"))
+    payload["mac"] = "0" * 64
+    try:
+        locator.chmod(0o600)
+    except PermissionError:
+        pass
+    locator.write_text(json.dumps(payload), encoding="utf-8")
+    try:
+        locator.chmod(0o444)
+    except PermissionError:
+        pass
+    assert worker_workspace.authenticated_outer_validation_context() is None
+
+    worker_workspace.plant_outer_validation_authority(
+        workspace, exec_scratch=scratch
+    )
+    status = locator.lstat()
+    escaped = {
+        "schema_id": worker_workspace.NESTED_LANDLOCK_AUTHORITY_LOCATOR_SCHEMA,
+        "kind": worker_workspace._NESTED_LANDLOCK_AUTHORITY_LOCATOR_KIND,
+        "authority": str((tmp_path / "outside" / "authority.json").resolve()),
+        "exec_scratch": str(scratch.resolve()),
+        "workspace": str(workspace.resolve()),
+    }
+    escaped["mac"] = worker_workspace._outer_validation_authority_mac(
+        escaped, identity=status
+    )
+    try:
+        locator.chmod(0o600)
+    except PermissionError:
+        pass
+    locator.write_text(
+        json.dumps(escaped, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+    try:
+        locator.chmod(0o444)
+    except PermissionError:
+        pass
+    assert worker_workspace.authenticated_outer_validation_context() is None
+
+    worker_workspace.plant_outer_validation_authority(
+        workspace, exec_scratch=scratch
+    )
+    copied_bytes = locator.read_bytes()
+    locator.unlink()
+    locator.write_bytes(copied_bytes)
+    try:
+        locator.chmod(0o444)
+    except PermissionError:
+        pass
+    assert worker_workspace.authenticated_outer_validation_context() is None
+
+
+def test_nested_landlock_locator_lookup_is_bounded_to_cwd_ancestors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _planted, _locator, _nested, scratch = _plant_nested_landlock_layout(tmp_path)
+    _deny_landlock_sibling_writes(monkeypatch)
+    limit = worker_workspace._NESTED_LANDLOCK_AUTHORITY_LOCATOR_MAX_ANCESTORS
+    too_deep = scratch
+    for index in range(limit + 2):
+        too_deep = too_deep / f"d{index}"
+    too_deep.mkdir(parents=True)
+    monkeypatch.chdir(too_deep)
+    assert worker_workspace.authenticated_outer_validation_context() is None
+    within = scratch / "nested-worktrees" / "req" / "worktree"
+    monkeypatch.chdir(within)
+    verified = worker_workspace.authenticated_outer_validation_context()
+    assert verified is not None
+    assert verified["exec_scratch"] == str(scratch.resolve())
+
+
+def test_ambient_ancestor_locator_does_not_divert_unrelated_create_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    host_workspace = tmp_path / "host-workspace"
+    host_scratch = tmp_path / "host-scratch"
+    nested = host_scratch / "nested-worktrees" / "host-req" / "worktree"
+    host_workspace.mkdir()
+    nested.mkdir(parents=True)
+    worker_workspace.plant_outer_validation_authority(
+        host_workspace, exec_scratch=host_scratch
+    )
+    _deny_landlock_sibling_writes(monkeypatch)
+    monkeypatch.chdir(nested)
+    ambient = worker_workspace.authenticated_outer_validation_context()
+    assert ambient is not None
+    assert ambient["workspace"] == str(host_workspace.resolve())
+    assert ambient["exec_scratch"] == str(host_scratch.resolve())
+
+    outside = tmp_path / "outside-worktrees"
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(outside))
+    assert worker_workspace.configured_worktree_root(host_workspace) == (
+        host_scratch / "nested-worktrees"
+    ).resolve()
+
+    unrelated_repo = tmp_path / "unrelated-repo"
+    unrelated_repo.mkdir()
+    worktrees = tmp_path / "unrelated-worktrees"
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(worktrees))
+    assert worker_workspace.configured_worktree_root(unrelated_repo) == worktrees.resolve()
+    assert host_scratch.resolve() not in worktrees.parents
+    assert worktrees.resolve() != (host_scratch / "nested-worktrees").resolve()
 
 
 # ---------------------------------------------------------------------------

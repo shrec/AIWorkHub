@@ -13,8 +13,11 @@ which covers the rest of the recovered B833 surface.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -903,3 +906,245 @@ def test_eval_artifact_b834_matches_live_defect_repair() -> None:
         "tools/geoai-task-mcp/eval/aiworkhub_context_optimization_rows_b829_v1.jsonl",
     }
     assert b829_paths.isdisjoint(set(payload["changed_paths"]))
+
+
+def _rework_overlay_packet(
+    authority_repo: Path,
+    files: list[dict[str, object]],
+    *,
+    task_id: str = "TASK_B834",
+    successor_request_id: str = "succ1",
+    predecessor_request_id: str = "pred1",
+) -> dict[str, object]:
+    payload = {
+        "successor_task_id": task_id,
+        "successor_request_id": successor_request_id,
+        "predecessor_task_id": task_id,
+        "predecessor_request_id": predecessor_request_id,
+        "authority_repo": str(authority_repo.resolve()),
+        "files": files,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    return {**payload, "canonical_digest": digest}
+
+
+def test_file_evidence_only_hash_only_injects_digest_bound_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    worktree = _worktree_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    relative = "eval/aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.json"
+    sealed = b'{"schema_id":"file_evidence_only"}\n'
+    digest = hashlib.sha256(sealed).hexdigest()
+    packet = _rework_overlay_packet(
+        authority, [{"path": relative, "sha256": digest}],
+    )
+    ctx = replace(
+        _ctx(repo=worktree, authority_repo=authority, home=home),
+        rework_overlay_packet=packet,
+    )
+    view = w._prepare_rework_overlay_view(
+        ctx, source_graph_mod.resolve_db_path(authority),
+        build_revision="test-rev",
+    )
+    assert view is not None
+    assert view.digest_refs[relative] == digest
+    assert relative not in view.deleted
+    merged, applied = w._merge_rework_overlay_payload(
+        ctx, {"matches": []}, view,
+        mode="file", query=relative, target=relative, budget=8,
+    )
+    assert applied is True
+    assert merged["matches"][0]["status"] == "file_evidence_only"
+    assert merged["matches"][0]["source_hash"] == digest
+    assert merged["matches"][0]["provenance"] == "digest_bound_reference"
+    assert merged["overlay"]["digest_bound_paths"] == [relative]
+
+
+def test_file_evidence_only_sealed_content_materializes_on_hosted_prefetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    worktree = _worktree_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    relative = "eval/aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.json"
+    sealed = b'{"schema_id":"file_evidence_only"}\n'
+    digest = hashlib.sha256(sealed).hexdigest()
+    packet = _rework_overlay_packet(
+        authority,
+        [{
+            "path": relative,
+            "sha256": digest,
+            "content_base64": base64.b64encode(sealed).decode("ascii"),
+        }],
+    )
+    overlay_path = home / "rework_overlay.json"
+    overlay_path.write_text(json.dumps(packet), encoding="utf-8")
+    env = {
+        w.ENV_TASK_ID: "TASK_B834",
+        w.ENV_RUNNER: "glm_copilot_cli",
+        w.ENV_TOPIC: "task_mcp",
+        w.ENV_REQUEST_ID: "succ1",
+        w.ENV_REPO: str(worktree),
+        w.ENV_AUTHORITY_REPO: str(authority),
+        w.ENV_REWORK_OVERLAY_PATH: str(overlay_path),
+        w.ENV_PROVENANCE: "prefetch",
+    }
+    ctx = w.load_context_from_env(env)
+    assert ctx.task_id == "TASK_B834"
+    assert ctx.rework_overlay_packet["predecessor_task_id"] == "TASK_B834"
+    assert ctx.rework_overlay_packet["predecessor_request_id"] == "pred1"
+    assert ctx.provenance == "prefetch"
+    materialized = worktree / relative
+    assert materialized.is_file()
+    assert materialized.read_bytes() == sealed
+    view = w._prepare_rework_overlay_view(
+        ctx, source_graph_mod.resolve_db_path(authority),
+        build_revision="test-rev",
+    )
+    assert view is not None
+    assert relative in view.changed
+    assert view.changed[relative].status == "file_evidence_only"
+    assert view.sealed_sources[relative] == sealed.decode("utf-8")
+
+
+def test_file_evidence_only_tampered_workspace_hash_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    worktree = _worktree_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    relative = "eval/aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.json"
+    sealed = b'{"schema_id":"file_evidence_only"}\n'
+    digest = hashlib.sha256(sealed).hexdigest()
+    target = worktree / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b'{"tampered":true}\n')
+    packet = _rework_overlay_packet(
+        authority, [{"path": relative, "sha256": digest}],
+    )
+    ctx = replace(
+        _ctx(repo=worktree, authority_repo=authority, home=home),
+        rework_overlay_packet=packet,
+    )
+    with pytest.raises(w.WorkerToolError, match="rework_overlay_hash_mismatch"):
+        w._prepare_rework_overlay_view(
+            ctx, source_graph_mod.resolve_db_path(authority),
+            build_revision="test-rev",
+        )
+
+
+def test_file_evidence_only_missing_hash_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    with pytest.raises(w.WorkerToolError, match="rework_packet_file_hash_invalid"):
+        w._verify_rework_overlay_packet(
+            _rework_overlay_packet(
+                authority, [{"path": "eval/missing_hash.json"}],
+            ),
+            "TASK_B834",
+            "succ1",
+            "glm_copilot_cli",
+            authority,
+        )
+
+
+def _sealed_allowed_writes_mismatch_ctx(
+    tmp_path: Path,
+    *,
+    allowed: bool,
+) -> tuple[w.WorkerToolContext, str, bytes, bytes, str]:
+    authority = _authority_repo(tmp_path)
+    worktree = _worktree_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    relative = "eval/aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.json"
+    sealed = b'{"schema_id":"file_evidence_only"}\n'
+    edited = b'{"schema_id":"authorized_worker_edit"}\n'
+    digest = hashlib.sha256(sealed).hexdigest()
+    observed = hashlib.sha256(edited).hexdigest()
+    target = worktree / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(edited)
+    packet = _rework_overlay_packet(
+        authority,
+        [{
+            "path": relative,
+            "sha256": digest,
+            "content_base64": base64.b64encode(sealed).decode("ascii"),
+        }],
+    )
+    overlay_path = home / "rework_overlay.json"
+    overlay_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = replace(
+        _ctx(repo=worktree, authority_repo=authority, home=home),
+        rework_overlay_packet=packet,
+        rework_overlay_packet_path=overlay_path,
+        allowed_writes=(relative,) if allowed else (),
+    )
+    return ctx, relative, sealed, edited, observed
+
+
+def test_sealed_allowed_writes_mismatch_is_authorized_overlay_not_sealed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mute_chmod(monkeypatch)
+    ctx, relative, sealed, edited, observed = _sealed_allowed_writes_mismatch_ctx(
+        tmp_path, allowed=True,
+    )
+    written = w.materialize_rework_overlay_sealed_files(
+        ctx.repo, ctx.rework_overlay_packet, allowed_writes=ctx.allowed_writes,
+    )
+    assert written == []
+    assert (ctx.repo / relative).read_bytes() == edited
+    view = w._prepare_rework_overlay_view(
+        ctx, source_graph_mod.resolve_db_path(ctx.authority_repo),
+        build_revision="test-rev",
+    )
+    assert view is not None
+    assert view.sealed_sources[relative] == sealed.decode("utf-8")
+    assert view.authorized_sources[relative] == edited.decode("utf-8")
+    assert view.authorized_digests[relative] == observed
+    merged, applied = w._merge_rework_overlay_payload(
+        ctx, {"matches": []}, view,
+        mode="file", query=relative, target=relative, budget=8,
+    )
+    assert applied is True
+    assert merged["overlay"]["authorized_overlay_paths"] == [relative]
+    assert merged["overlay"]["authorized_overlay_digests"][relative] == observed
+    assert merged["contexts"][0]["source_preview"] == edited.decode("utf-8")
+    binding = w._rework_source_graph_binding(ctx)
+    assert binding is not None
+    assert binding.authority_source == "rework_overlay"
+
+
+def test_sealed_disallowed_writes_mismatch_fails_closed_on_every_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mute_chmod(monkeypatch)
+    ctx, relative, _sealed, edited, _observed = _sealed_allowed_writes_mismatch_ctx(
+        tmp_path, allowed=False,
+    )
+    with pytest.raises(w.WorkerToolError, match="rework_overlay_hash_mismatch"):
+        w.materialize_rework_overlay_sealed_files(
+            ctx.repo, ctx.rework_overlay_packet, allowed_writes=ctx.allowed_writes,
+        )
+    with pytest.raises(w.WorkerToolError, match="rework_overlay_hash_mismatch"):
+        w._prepare_rework_overlay_view(
+            ctx, source_graph_mod.resolve_db_path(ctx.authority_repo),
+            build_revision="test-rev",
+        )
+    with pytest.raises(w.WorkerToolError, match="rework_overlay_hash_mismatch"):
+        w._rework_source_graph_binding(ctx)
+    assert (ctx.repo / relative).read_bytes() == edited

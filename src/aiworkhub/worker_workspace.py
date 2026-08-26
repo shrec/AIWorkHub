@@ -99,6 +99,17 @@ OUTER_VALIDATION_AUTHORITY_RELATIVE = (
 )
 _OUTER_VALIDATION_AUTHORITY_KIND = "coordinator_outer_validation"
 _OUTER_VALIDATION_HMAC_KEY = b"aiworkhub.outer_validation_authority.v1.landlock"
+NESTED_LANDLOCK_AUTHORITY_LOCATOR_SCHEMA = (
+    "aiworkhub.nested_landlock_authority_locator.v1"
+)
+NESTED_LANDLOCK_AUTHORITY_LOCATOR_RELATIVE = (
+    ".aiworkhub/nested_landlock_authority_locator.v1.json"
+)
+NESTED_LANDLOCK_AUTHORITY_LOCATOR_ANCHOR_RELATIVE = (
+    ".aiworkhub/nested_landlock_authority_locator.v1.anchor"
+)
+_NESTED_LANDLOCK_AUTHORITY_LOCATOR_KIND = "coordinator_nested_landlock_locator"
+_NESTED_LANDLOCK_AUTHORITY_LOCATOR_MAX_ANCESTORS = 16
 
 
 def _load_runtime_temp():
@@ -2393,12 +2404,7 @@ def configured_runtime_root(repo: Path | None = None) -> Path:
 
 def configured_worktree_root(repo: Path | None = None) -> Path:
     """Return the single configured root for isolated worker workspaces."""
-    context = authenticated_outer_validation_context()
-    authorized_scratch = (
-        Path(context["exec_scratch"]).resolve()
-        if context and context.get("exec_scratch")
-        else None
-    )
+    authorized_scratch = _nested_landlock_exec_scratch_for_repo(repo)
     override = os.environ.get(WORKTREE_ROOT_ENV, "").strip()
     if override:
         resolved = Path(override).expanduser().resolve()
@@ -2517,11 +2523,61 @@ def dispose_worker_temp(repo: Path, request_id: str) -> bool:
         return False
 
 
-def _outer_validation_authority_mac(payload: Mapping[str, str]) -> str:
+def _outer_validation_authority_mac(
+    payload: Mapping[str, str],
+    *,
+    identity: os.stat_result,
+) -> str:
     material = "\n".join(
         f"{key}={payload[key]}" for key in sorted(payload)
     ).encode("utf-8")
+    material += f"\ndev={identity.st_dev}\nino={identity.st_ino}".encode("utf-8")
     return hmac.new(_OUTER_VALIDATION_HMAC_KEY, material, hashlib.sha256).hexdigest()
+
+
+def _coordinator_owned_regular_file(path: Path) -> os.stat_result | None:
+    try:
+        status = path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+        return None
+    if posix_path_modes_supported():
+        if status.st_uid != os.geteuid():
+            return None
+        if stat.S_IMODE(status.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
+            return None
+    return status
+
+
+def _write_authenticated_document(
+    path: Path, payload: dict[str, str]
+) -> os.stat_result:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise WorkspaceError("outer_validation_authority_symlink")
+    if path.exists():
+        path.unlink()
+    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        identity = os.fstat(fd)
+        document = {
+            **payload,
+            "mac": _outer_validation_authority_mac(payload, identity=identity),
+        }
+        os.write(
+            fd,
+            json.dumps(document, separators=(",", ":"), sort_keys=True).encode(
+                "utf-8"
+            ),
+        )
+        try:
+            chmod_fd(fd, 0o444)
+        except PermissionError:
+            pass
+    finally:
+        os.close(fd)
+    return identity
 
 
 def _directory_write_denied_by_landlock(directory: Path) -> bool:
@@ -2558,31 +2614,75 @@ def plant_outer_validation_authority(
     """Write the coordinator-only outer validation authority file."""
     workspace = Path(workspace).resolve()
     path = workspace / OUTER_VALIDATION_AUTHORITY_RELATIVE
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_id": OUTER_VALIDATION_AUTHORITY_SCHEMA,
         "kind": _OUTER_VALIDATION_AUTHORITY_KIND,
         "workspace": str(workspace),
     }
-    if exec_scratch is not None:
-        payload["exec_scratch"] = str(Path(exec_scratch).resolve())
-    document = {
-        **payload,
-        "mac": _outer_validation_authority_mac(payload),
-    }
-    path.write_text(
-        json.dumps(document, separators=(",", ":"), sort_keys=True),
-        encoding="utf-8",
+    if exec_scratch is None:
+        _write_authenticated_document(path, payload)
+        return path
+    scratch = Path(exec_scratch).resolve()
+    payload["exec_scratch"] = str(scratch)
+    locator_path = scratch / NESTED_LANDLOCK_AUTHORITY_LOCATOR_RELATIVE
+    anchor_path = workspace / NESTED_LANDLOCK_AUTHORITY_LOCATOR_ANCHOR_RELATIVE
+    locator_path.parent.mkdir(parents=True, exist_ok=True)
+    anchor_path.parent.mkdir(parents=True, exist_ok=True)
+    if locator_path.is_symlink():
+        raise WorkspaceError("nested_landlock_locator_symlink")
+    if anchor_path.is_symlink():
+        raise WorkspaceError("nested_landlock_locator_anchor_symlink")
+    if locator_path.exists():
+        locator_path.unlink()
+    if anchor_path.exists():
+        anchor_path.unlink()
+    locator_fd = os.open(
+        str(locator_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
     )
-    chmod_path(path, 0o444)
+    try:
+        locator_identity = os.fstat(locator_fd)
+        payload["locator_dev"] = str(locator_identity.st_dev)
+        payload["locator_ino"] = str(locator_identity.st_ino)
+        payload["locator_anchor"] = str(anchor_path.resolve())
+        locator_payload = {
+            "schema_id": NESTED_LANDLOCK_AUTHORITY_LOCATOR_SCHEMA,
+            "kind": _NESTED_LANDLOCK_AUTHORITY_LOCATOR_KIND,
+            "authority": str(path.resolve()),
+            "exec_scratch": str(scratch),
+            "workspace": str(workspace),
+        }
+        document = {
+            **locator_payload,
+            "mac": _outer_validation_authority_mac(
+                locator_payload, identity=locator_identity
+            ),
+        }
+        os.write(
+            locator_fd,
+            json.dumps(document, separators=(",", ":"), sort_keys=True).encode(
+                "utf-8"
+            ),
+        )
+        try:
+            chmod_fd(locator_fd, 0o444)
+        except PermissionError:
+            pass
+        try:
+            os.link(str(locator_path), str(anchor_path))
+        except OSError as exc:
+            raise WorkspaceError("nested_landlock_locator_anchor_link") from exc
+        _write_authenticated_document(path, payload)
+    finally:
+        os.close(locator_fd)
     return path
 
 
 def verify_outer_validation_authority_file(path: Path) -> dict[str, str] | None:
     """Return the verified payload or None. Env and prose cannot mint this."""
+    status = _coordinator_owned_regular_file(path)
+    if status is None or status.st_nlink != 1:
+        return None
     try:
-        if path.is_symlink() or not path.is_file():
-            return None
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
@@ -2592,6 +2692,9 @@ def verify_outer_validation_authority_file(path: Path) -> dict[str, str] | None:
     kind = str(raw.get("kind") or "")
     workspace = str(raw.get("workspace") or "")
     exec_scratch = str(raw.get("exec_scratch") or "")
+    locator_dev = str(raw.get("locator_dev") or "")
+    locator_ino = str(raw.get("locator_ino") or "")
+    locator_anchor = str(raw.get("locator_anchor") or "")
     mac = str(raw.get("mac") or "")
     if (
         schema_id != OUTER_VALIDATION_AUTHORITY_SCHEMA
@@ -2607,7 +2710,13 @@ def verify_outer_validation_authority_file(path: Path) -> dict[str, str] | None:
     }
     if exec_scratch:
         payload["exec_scratch"] = exec_scratch
-    expected = _outer_validation_authority_mac(payload)
+    if locator_dev:
+        payload["locator_dev"] = locator_dev
+    if locator_ino:
+        payload["locator_ino"] = locator_ino
+    if locator_anchor:
+        payload["locator_anchor"] = locator_anchor
+    expected = _outer_validation_authority_mac(payload, identity=status)
     if not hmac.compare_digest(mac, expected):
         return None
     try:
@@ -2622,27 +2731,146 @@ def verify_outer_validation_authority_file(path: Path) -> dict[str, str] | None:
     return payload
 
 
+def verify_nested_landlock_authority_locator(
+    path: Path,
+) -> dict[str, str] | None:
+    """Return the re-verified authority payload, or None."""
+    status = _coordinator_owned_regular_file(path)
+    if status is None or status.st_nlink != 2:
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    schema_id = str(raw.get("schema_id") or "")
+    kind = str(raw.get("kind") or "")
+    authority = str(raw.get("authority") or "")
+    exec_scratch = str(raw.get("exec_scratch") or "")
+    workspace = str(raw.get("workspace") or "")
+    mac = str(raw.get("mac") or "")
+    if (
+        schema_id != NESTED_LANDLOCK_AUTHORITY_LOCATOR_SCHEMA
+        or kind != _NESTED_LANDLOCK_AUTHORITY_LOCATOR_KIND
+        or not authority
+        or not exec_scratch
+        or not workspace
+        or not re.fullmatch(r"[0-9a-f]{64}", mac)
+    ):
+        return None
+    payload = {
+        "schema_id": schema_id,
+        "kind": kind,
+        "authority": authority,
+        "exec_scratch": exec_scratch,
+        "workspace": workspace,
+    }
+    expected = _outer_validation_authority_mac(payload, identity=status)
+    if not hmac.compare_digest(mac, expected):
+        return None
+    try:
+        resolved_locator = path.resolve()
+        resolved_scratch = Path(exec_scratch).resolve()
+        resolved_authority = Path(authority).resolve()
+        resolved_workspace = Path(workspace).resolve()
+    except OSError:
+        return None
+    if not _path_is_relative_to(resolved_locator, resolved_scratch):
+        return None
+    if not _path_is_relative_to(resolved_authority, resolved_workspace):
+        return None
+    verified = verify_outer_validation_authority_file(resolved_authority)
+    if verified is None:
+        return None
+    if verified.get("exec_scratch") != str(resolved_scratch):
+        return None
+    if verified.get("workspace") != str(resolved_workspace):
+        return None
+    if verified.get("locator_dev") != str(status.st_dev):
+        return None
+    if verified.get("locator_ino") != str(status.st_ino):
+        return None
+    anchor_text = str(verified.get("locator_anchor") or "")
+    if not anchor_text:
+        return None
+    try:
+        resolved_anchor = Path(anchor_text).resolve()
+        expected_anchor = (
+            resolved_workspace / NESTED_LANDLOCK_AUTHORITY_LOCATOR_ANCHOR_RELATIVE
+        ).resolve()
+    except OSError:
+        return None
+    if resolved_anchor != expected_anchor:
+        return None
+    if not _path_is_relative_to(resolved_anchor, resolved_workspace):
+        return None
+    anchor_status = _coordinator_owned_regular_file(Path(anchor_text))
+    if (
+        anchor_status is None
+        or anchor_status.st_nlink != 2
+        or (anchor_status.st_dev, anchor_status.st_ino)
+        != (status.st_dev, status.st_ino)
+    ):
+        return None
+    return verified
+
+
 def authenticated_outer_validation_context() -> dict[str, str] | None:
     """Return the coordinator outer-validation context when it is authentic.
 
     Candidate environment variables and output text cannot create this
     context. The reserved authority file must verify HMAC and live in a
     directory this process owns and that is mode-writable, yet Landlock
-    still denies creating a sibling.
+    still denies creating a sibling. Nested Landlock lookups use a bounded
+    cwd-ancestor locator and re-verify that authority.
     """
     current = Path.cwd().resolve()
     seen: set[Path] = set()
-    while current not in seen:
+    for _ in range(_NESTED_LANDLOCK_AUTHORITY_LOCATOR_MAX_ANCESTORS + 1):
+        if current in seen:
+            break
         seen.add(current)
+        locator = current / NESTED_LANDLOCK_AUTHORITY_LOCATOR_RELATIVE
+        located = verify_nested_landlock_authority_locator(locator)
+        if located is not None:
+            try:
+                if current == Path(located["exec_scratch"]).resolve():
+                    return located
+            except OSError:
+                pass
         candidate = current / OUTER_VALIDATION_AUTHORITY_RELATIVE
         verified = verify_outer_validation_authority_file(candidate)
         if verified is not None:
-            return verified
+            try:
+                if current == Path(verified["workspace"]).resolve():
+                    return verified
+            except OSError:
+                pass
         parent = current.parent
         if parent == current:
             break
         current = parent
     return None
+
+
+def _nested_landlock_exec_scratch_for_repo(repo: Path | None) -> Path | None:
+    context = authenticated_outer_validation_context()
+    if context is None or repo is None:
+        return None
+    scratch_text = str(context.get("exec_scratch") or "")
+    workspace_text = str(context.get("workspace") or "")
+    if not scratch_text or not workspace_text:
+        return None
+    try:
+        scratch = Path(scratch_text).resolve()
+        workspace = Path(workspace_text).resolve()
+        resolved_repo = Path(repo).resolve()
+    except OSError:
+        return None
+    if resolved_repo != workspace:
+        return None
+    return scratch
 
 
 def nested_sandbox_requires_host_boundary() -> bool:
@@ -3970,9 +4198,6 @@ def sanitized_env(
 
 
 def _exec_scratch_candidate_roots() -> tuple[Path, ...]:
-    context = authenticated_outer_validation_context()
-    if context and context.get("exec_scratch"):
-        return (Path(context["exec_scratch"]),)
     override = os.environ.get(VALIDATION_EXEC_SCRATCH_ROOT_ENV, "").strip()
     if override:
         # An explicit admin override is authoritative: no silent fallback to

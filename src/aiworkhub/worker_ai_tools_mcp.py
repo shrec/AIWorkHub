@@ -87,7 +87,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -385,6 +385,9 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
             str(source.get(ENV_REQUEST_ID) or ""),
             str(source[ENV_RUNNER]),
             authority_repo,
+        )
+        materialize_rework_overlay_sealed_files(
+            repo, rework_packet, allowed_writes=allowed_writes,
         )
     # NF389/r6: only an ABSENT key retains the backward-compatible empty
     # sentinel. A PRESENT key -- even an explicit empty string -- must route
@@ -1382,12 +1385,40 @@ def _rework_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding | N
         # own candidates); a post-resolve ``is_symlink`` can never fire.
         if raw.is_symlink():
             raise WorkerToolError(f"rework_overlay_path_symlink:{relative}")
+        expected_hash = str(entry.get("sha256") or "")
+        sealed = None
+        if entry.get("deleted") is not True:
+            sealed = _sealed_rework_overlay_bytes(entry, relative)
+        if sealed is not None and not candidate.exists():
+            materialize_rework_overlay_sealed_files(
+                ctx.repo, {"files": [entry]}, allowed_writes=ctx.allowed_writes,
+            )
+            candidate = raw.resolve(strict=False)
         if candidate.is_file():
             observed_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
-            changed_paths.append({"path": relative, "sha256": observed_hash})
-            snapshot_rows.append({"path": relative, "sha256": observed_hash})
+            admission = _admit_rework_overlay_observation(
+                relative=relative,
+                expected_hash=expected_hash,
+                observed_hash=observed_hash,
+                has_sealed=sealed is not None,
+                allowed_writes=ctx.allowed_writes,
+            )
+            if admission == "authorized_overlay":
+                changed_paths.append({"path": relative, "sha256": observed_hash})
+                snapshot_rows.append({
+                    "path": relative,
+                    "sha256": expected_hash,
+                    "observed_sha256": observed_hash,
+                })
+            else:
+                sealed_hash = expected_hash or observed_hash
+                changed_paths.append({"path": relative, "sha256": sealed_hash})
+                snapshot_rows.append({"path": relative, "sha256": sealed_hash})
         elif candidate.exists():
             raise WorkerToolError(f"rework_overlay_path_not_file:{relative}")
+        elif expected_hash:
+            changed_paths.append({"path": relative, "sha256": expected_hash})
+            snapshot_rows.append({"path": relative, "sha256": expected_hash})
         else:
             changed_paths.append({"path": relative, "sha256": ""})
             snapshot_rows.append({"path": relative, "deleted": True})
@@ -2776,13 +2807,108 @@ def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> 
     }
 
 
+_REWORK_OVERLAY_EXTRACT_OK = frozenset({"ok", "file_evidence_only"})
+
+
+def _sealed_rework_overlay_bytes(entry: Mapping[str, Any], relative: str) -> bytes | None:
+    if entry.get("deleted") is True:
+        return None
+    expected = str(entry.get("sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise WorkerToolError(f"rework_packet_file_hash_invalid:{relative}")
+    encoded = entry.get("content_base64")
+    if encoded is None:
+        return None
+    import base64
+    try:
+        content = base64.b64decode(str(encoded), validate=True)
+    except (ValueError, TypeError) as exc:
+        raise WorkerToolError(f"rework_packet_file_content_invalid:{relative}") from exc
+    if hashlib.sha256(content).hexdigest() != expected:
+        raise WorkerToolError(f"rework_packet_file_content_hash_mismatch:{relative}")
+    return content
+
+
+def _admit_rework_overlay_observation(
+    *,
+    relative: str,
+    expected_hash: str,
+    observed_hash: str,
+    has_sealed: bool,
+    allowed_writes: Sequence[str],
+) -> Literal["match", "authorized_overlay"]:
+    """Admit a workspace digest against immutable packet-sealed authority."""
+
+    if not expected_hash or observed_hash == expected_hash:
+        return "match"
+    if has_sealed and relative in allowed_writes:
+        return "authorized_overlay"
+    raise WorkerToolError(f"rework_overlay_hash_mismatch:{relative}")
+
+
+def materialize_rework_overlay_sealed_files(
+    repo: Path,
+    packet: Mapping[str, Any],
+    *,
+    allowed_writes: Sequence[str] = (),
+) -> list[str]:
+    """Write sealed predecessor bytes; hash-only entries stay digest-bound."""
+
+    repo_root = repo.resolve()
+    written: list[str] = []
+    files = packet.get("files")
+    if not isinstance(files, list):
+        raise WorkerToolError("rework_packet_files_invalid")
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise WorkerToolError("rework_packet_file_entry_invalid")
+        relative = str(entry.get("path") or "")
+        if entry.get("deleted") is True:
+            continue
+        content = _sealed_rework_overlay_bytes(entry, relative)
+        if content is None:
+            continue
+        raw = repo / relative
+        candidate = raw.resolve(strict=False)
+        if not candidate.is_relative_to(repo_root):
+            raise WorkerToolError(f"rework_overlay_path_escapes_workspace:{relative}")
+        if raw.is_symlink():
+            raise WorkerToolError(f"rework_overlay_path_symlink:{relative}")
+        if candidate.exists() and not candidate.is_file():
+            raise WorkerToolError(f"rework_overlay_path_not_file:{relative}")
+        expected = str(entry["sha256"])
+        if candidate.is_file():
+            observed = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            _admit_rework_overlay_observation(
+                relative=relative,
+                expected_hash=expected,
+                observed_hash=observed,
+                has_sealed=True,
+                allowed_writes=allowed_writes,
+            )
+            continue
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        tmp = candidate.parent / f".{candidate.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            tmp.write_bytes(content)
+            os.replace(tmp, candidate)
+        finally:
+            tmp.unlink(missing_ok=True)
+        written.append(relative)
+    return written
+
+
 @dataclass(frozen=True, slots=True)
 class _ReworkOverlayView:
-    """Read-only, request-local Source Graph delta prepared from the worktree."""
+    """Read-only, request-local Source Graph delta from sealed hashes/deltas."""
 
     changed: Mapping[str, Any]
     deleted: frozenset[str]
     snapshot_sha256: str
+    sealed_sources: Mapping[str, str] = field(default_factory=dict)
+    digest_refs: Mapping[str, str] = field(default_factory=dict)
+    authorized_sources: Mapping[str, str] = field(default_factory=dict)
+    authorized_digests: Mapping[str, str] = field(default_factory=dict)
 
 
 def _prepare_rework_overlay_view(
@@ -2791,7 +2917,7 @@ def _prepare_rework_overlay_view(
     *,
     build_revision: str,
 ) -> _ReworkOverlayView | None:
-    """Extract only packet-bound worktree files without building or writing a DB."""
+    """Extract packet-bound files from sealed bytes or digest-bound hashes."""
 
     packet = ctx.rework_overlay_packet
     if packet is None:
@@ -2822,28 +2948,72 @@ def _prepare_rework_overlay_view(
     repo_root = ctx.repo.resolve()
     changed: dict[str, Any] = {}
     deleted: set[str] = set()
+    sealed_sources: dict[str, str] = {}
+    digest_refs: dict[str, str] = {}
+    authorized_sources: dict[str, str] = {}
+    authorized_digests: dict[str, str] = {}
     snapshot_rows: list[dict[str, str | bool]] = []
     for relative in sorted(entries):
+        entry = entries[relative]
         raw_path = ctx.repo / relative
         resolved = raw_path.resolve(strict=False)
         if not resolved.is_relative_to(repo_root):
             raise WorkerToolError(f"rework_overlay_path_escapes_workspace:{relative}")
         if raw_path.is_symlink():
             raise WorkerToolError(f"rework_overlay_path_symlink:{relative}")
-        if not resolved.exists():
+        if entry.get("deleted") is True:
             deleted.add(relative)
             snapshot_rows.append({"path": relative, "deleted": True})
             continue
+        expected_hash = str(entry.get("sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise WorkerToolError(f"rework_packet_file_hash_invalid:{relative}")
+        sealed = _sealed_rework_overlay_bytes(entry, relative)
+        if sealed is not None:
+            sealed_sources[relative] = sealed.decode("utf-8", errors="replace")
+            if not resolved.exists():
+                materialize_rework_overlay_sealed_files(
+                    ctx.repo, {"files": [entry]}, allowed_writes=ctx.allowed_writes,
+                )
+                resolved = raw_path.resolve(strict=False)
+        if not resolved.exists():
+            if sealed is None:
+                digest_refs[relative] = expected_hash
+                snapshot_rows.append({"path": relative, "sha256": expected_hash})
+                continue
+            raise WorkerToolError(f"rework_overlay_file_missing:{relative}")
         if not resolved.is_file():
             raise WorkerToolError(f"rework_overlay_path_not_file:{relative}")
-        observed_hash = hashlib.sha256(resolved.read_bytes()).hexdigest()
-        snapshot_rows.append({"path": relative, "sha256": observed_hash})
+        observed_bytes = resolved.read_bytes()
+        observed_hash = hashlib.sha256(observed_bytes).hexdigest()
+        admission = _admit_rework_overlay_observation(
+            relative=relative,
+            expected_hash=expected_hash,
+            observed_hash=observed_hash,
+            has_sealed=sealed is not None,
+            allowed_writes=ctx.allowed_writes,
+        )
+        if admission == "authorized_overlay":
+            authorized_sources[relative] = observed_bytes.decode(
+                "utf-8", errors="replace",
+            )
+            authorized_digests[relative] = observed_hash
+            snapshot_rows.append({
+                "path": relative,
+                "sha256": expected_hash,
+                "observed_sha256": observed_hash,
+            })
+        else:
+            snapshot_rows.append({"path": relative, "sha256": observed_hash})
+        if sealed is None:
+            digest_refs[relative] = expected_hash
+            continue
         if canonical_hashes.get(relative) == observed_hash:
             continue
         extraction = _source_graph_ast.extract_file(
             repo_root, resolved, build_revision=build_revision,
         )
-        if extraction.status != "ok":
+        if extraction.status not in _REWORK_OVERLAY_EXTRACT_OK:
             raise WorkerToolError(
                 f"rework_overlay_extract_failed:{relative}:{extraction.status}"
             )
@@ -2855,7 +3025,10 @@ def _prepare_rework_overlay_view(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
-    return _ReworkOverlayView(changed, frozenset(deleted), snapshot_sha256)
+    return _ReworkOverlayView(
+        changed, frozenset(deleted), snapshot_sha256,
+        sealed_sources, digest_refs, authorized_sources, authorized_digests,
+    )
 
 
 def _drop_shadowed_source_graph_rows(value: Any, shadowed: frozenset[str]) -> Any:
@@ -2917,9 +3090,15 @@ def _merge_rework_overlay_payload(
 ) -> tuple[dict[str, Any], bool]:
     """Compose a canonical query result with a small in-memory worktree delta."""
 
-    if view is None or (not view.changed and not view.deleted):
+    if view is None or (
+        not view.changed and not view.deleted and not view.digest_refs
+        and not view.authorized_digests
+    ):
         return payload, False
-    shadowed = frozenset((*view.changed.keys(), *view.deleted))
+    shadowed = frozenset((
+        *view.changed.keys(), *view.deleted, *view.digest_refs,
+        *view.authorized_digests,
+    ))
     merged = _drop_shadowed_source_graph_rows(payload, shadowed)
     if not isinstance(merged, dict):
         merged = {}
@@ -2931,7 +3110,11 @@ def _merge_rework_overlay_payload(
     overlay_matches: list[dict[str, Any]] = []
     overlay_contexts: list[dict[str, Any]] = []
     for relative, extraction in sorted(view.changed.items()):
-        text = (ctx.repo / relative).read_text(encoding="utf-8", errors="replace")
+        text = view.authorized_sources.get(relative)
+        if text is None:
+            text = view.sealed_sources.get(relative)
+        if text is None:
+            raise WorkerToolError(f"rework_overlay_sealed_source_missing:{relative}")
         lines = text.splitlines()
         if mode == "file":
             requested = target or query
@@ -3009,6 +3192,29 @@ def _merge_rework_overlay_payload(
                 )
             )
 
+    for relative, digest in sorted(view.digest_refs.items()):
+        if mode == "file":
+            requested = target or query
+            if requested != relative:
+                continue
+        elif mode not in {"focus", "symbols"}:
+            continue
+        elif query_tokens and not all(
+            token in relative.casefold() for token in query_tokens
+        ):
+            continue
+        overlay_matches.append({
+            "file_path": relative,
+            "kind": "file",
+            "name": Path(relative).name,
+            "qualname": relative,
+            "source_hash": digest,
+            "status": "file_evidence_only",
+            "line_start": 1,
+            "line_end": 1,
+            "provenance": "digest_bound_reference",
+        })
+
     overlay_matches.sort(key=lambda row: (
         str(row.get("file_path") or ""),
         int(row.get("line_start") or 0),
@@ -3038,6 +3244,9 @@ def _merge_rework_overlay_payload(
         "snapshot_sha256": view.snapshot_sha256,
         "changed_paths": sorted(view.changed),
         "deleted_paths": sorted(view.deleted),
+        "digest_bound_paths": sorted(view.digest_refs),
+        "authorized_overlay_paths": sorted(view.authorized_digests),
+        "authorized_overlay_digests": dict(view.authorized_digests),
     }
     if mode in {"body", "function", "class"}:
         merged["freshness"] = "worktree_overlay" if overlay_matches else "no_match"
