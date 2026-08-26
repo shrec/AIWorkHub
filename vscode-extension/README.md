@@ -12,14 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.60
+## What's new in 0.10.61
 
-- Claude subscription workers recover one exact stale request-local credential
-  without creating a second task or losing cancellation authority.
-- Declared include roots now seed valid C/C++/CUDA local headers into sparse
-  workspaces while traversal and symlink escapes remain blocked.
-- Repository development rules make performance, multicore, allocation,
-  caching and validation constraints explicit to workers.
+- The Development Rules card now reports the repository's validated manifest,
+  digest and resolved rule counts instead of a false `No sample` state.
+- AIWorkHub's repository manifest defines deterministic hot-path allocation,
+  multicore, cache, SQLite, subprocess, model-budget and cross-platform rules.
 
 ## Architecture at a glance
 

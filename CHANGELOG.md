@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.61] - 2026-08-26
+
+### Fixed
+
+- The production dashboard now loads, validates and projects the repository's
+  bounded `.aiworkhub/config/development_rules.json` manifest instead of
+  reporting `No sample` while valid rules already exist.
+- Development Rules telemetry now exposes the canonical manifest version,
+  digest, declared rule count and resolved default-context count.
+
 ## [0.10.60] - 2026-08-26
 
 ### Added

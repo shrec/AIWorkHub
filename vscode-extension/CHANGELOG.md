@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.61 — 2026-08-26
+
+### Fixed
+
+- The Development Rules dashboard card now reads the validated repository
+  manifest and reports its measured version, digest and rule counts instead
+  of a false `No sample` state.
+
 ## 0.10.60 — 2026-08-26
 
 ### Added
