@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.59 — 2026-08-26
+
+### Fixed
+
+- Reviewer launch now preserves the exact reserved request through isolated
+  provider spawn, validates the durable read-only card and avoids a second
+  claim.
+- Sparse self-development candidates locate the existing host supervisor
+  script deterministically, so reviewer launches no longer fail before start.
+
 ## 0.10.58 — 2026-08-25
 
 ### Fixed

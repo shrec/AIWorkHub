@@ -357,6 +357,41 @@ def worker_launch_env(
     return env
 
 
+def _worker_supervisor_script() -> Path:
+    sibling = Path(__file__).with_name("worker_supervisor.py")
+    if sibling.is_file() and sibling.name == "worker_supervisor.py":
+        return sibling
+    try:
+        host_script = (
+            worker_ai_tools_mcp.resolve_host_package_import_root()
+            / "aiworkhub"
+            / "worker_supervisor.py"
+        )
+    except OSError:
+        host_script = None
+    if (
+        host_script is not None
+        and host_script.is_file()
+        and host_script.name == "worker_supervisor.py"
+    ):
+        return host_script
+    seen: set[str] = set()
+    for entry in sys.path:
+        if not entry:
+            continue
+        candidate = Path(entry) / "aiworkhub" / "worker_supervisor.py"
+        try:
+            resolved = str(candidate.resolve())
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if candidate.is_file() and candidate.name == "worker_supervisor.py":
+            return candidate
+    raise LaunchRejected("worker_supervisor_script_missing")
+
+
 def _vscode_lm_worker_env(
     provider_env: dict[str, str] | None,
     package_import_root: Path,
@@ -6227,17 +6262,27 @@ class ProcessManager:
         model: str | None = None,
         owner_prompt: str = "",
         timeout_seconds: int = 7200,
+        quality_review_binding: dict[str, Any] | None = None,
+        reserved_request_id: str | None = None,
+        prewarm_progress: Callable[..., None] | None = None,
     ) -> dict[str, Any]:
-        if self.isolation_enabled:
-            return self._launch_isolated(
-                task_id=task_id,
-                runner=runner,
-                topic=topic,
-                adapter_id=adapter_id,
-                model=model,
-                owner_prompt=owner_prompt,
-                timeout_seconds=timeout_seconds,
-            )
+        isolated_kwargs: dict[str, Any] = {
+            "task_id": task_id,
+            "runner": runner,
+            "topic": topic,
+            "adapter_id": adapter_id,
+            "model": model,
+            "owner_prompt": owner_prompt,
+            "timeout_seconds": timeout_seconds,
+        }
+        if quality_review_binding is not None:
+            isolated_kwargs["quality_review_binding"] = quality_review_binding
+        if reserved_request_id is not None:
+            isolated_kwargs["reserved_request_id"] = reserved_request_id
+        if prewarm_progress is not None:
+            isolated_kwargs["prewarm_progress"] = prewarm_progress
+        if self.isolation_enabled or reserved_request_id is not None:
+            return self._launch_isolated(**isolated_kwargs)
         return self._launch_direct_for_tests(
             task_id=task_id,
             runner=runner,
@@ -6247,6 +6292,8 @@ class ProcessManager:
             owner_prompt=owner_prompt,
             timeout_seconds=timeout_seconds,
         )
+
+    launch_task = launch
 
     def _launch_validation_only_replay(
         self,
@@ -6946,6 +6993,10 @@ class ProcessManager:
         self,
         reviewer_task_id: str,
         latest: Mapping[str, Mapping[str, Any]] | None = None,
+        *,
+        target_request_id: str | None = None,
+        target_task_id: str | None = None,
+        lens: str | None = None,
     ) -> dict[str, Any] | None:
         """Return a bounded receipt for an already-live reviewer, else ``None``.
 
@@ -6962,13 +7013,46 @@ class ProcessManager:
         hidden append is exactly what would hide the live reviewer it is asked
         about; callers that admit on the answer hand in their proven snapshot
         rather than letting an unproven parse mint a second provider.
+
+        The sealed ``quality_review_attempt`` target request, task and lens
+        must match the caller.  A live reviewer for the same
+        ``reviewer_task_id`` with a different sealed target is a rejection,
+        never a reusable reservation.
         """
 
         if latest is None:
             latest = self._latest_by_request()
+
+        def _admit(request_id: str) -> dict[str, Any]:
+            identity = (target_request_id, target_task_id, lens)
+            if identity == (None, None, None):
+                return self._reviewer_receipt(request_id, latest)
+            if any(value is None for value in identity):
+                return {
+                    "ok": False,
+                    "error": "quality_review_attempt_identity_mismatch",
+                }
+            event = latest.get(request_id) or {}
+            attempt = event.get("quality_review_attempt")
+            if not isinstance(attempt, Mapping):
+                return {
+                    "ok": False,
+                    "error": "quality_review_attempt_identity_mismatch",
+                }
+            if (
+                str(attempt.get("target_request_id") or "") != target_request_id
+                or str(attempt.get("target_task_id") or "") != target_task_id
+                or str(attempt.get("lens") or "") != lens
+            ):
+                return {
+                    "ok": False,
+                    "error": "quality_review_attempt_identity_mismatch",
+                }
+            return self._reviewer_receipt(request_id, latest)
+
         for live in self._live.values():
             if live.task_id == reviewer_task_id and live.process.poll() is None:
-                return self._reviewer_receipt(live.request_id, latest)
+                return _admit(live.request_id)
         for request_id, event in latest.items():
             if event.get("task_id") != reviewer_task_id:
                 continue
@@ -6978,24 +7062,24 @@ class ProcessManager:
                 if provider_pid and _pid_identity_evidence(
                     provider_pid, event.get("provider_pid_start_ticks")
                 ).verdict is not PidIdentityVerdict.MISMATCH:
-                    return self._reviewer_receipt(request_id, latest)
+                    return _admit(request_id)
                 owner_pid = int(event.get("owner_pid") or 0)
                 if owner_pid and _pid_identity_evidence(
                     owner_pid, event.get("owner_pid_start_ticks")
                 ).verdict is not PidIdentityVerdict.MISMATCH:
-                    return self._reviewer_receipt(request_id, latest)
+                    return _admit(request_id)
                 continue
             if state not in ACTIVE_PROCESS_STATES:
                 continue
             pid = int(event.get("pid") or 0)
             if state == "starting" and not pid:
                 if self._reviewer_source_graph_prewarm_live_event(event):
-                    return self._reviewer_receipt(request_id, latest)
+                    return _admit(request_id)
                 if (
                     float(event.get("reservation_expires_at_epoch") or 0.0)
                     > time.time()
                 ):
-                    return self._reviewer_receipt(request_id, latest)
+                    return _admit(request_id)
                 continue
             if (
                 pid
@@ -7004,7 +7088,7 @@ class ProcessManager:
                 ).verdict
                 is not PidIdentityVerdict.MISMATCH
             ):
-                return self._reviewer_receipt(request_id, latest)
+                return _admit(request_id)
         return None
 
     def _reserve_quality_reviewer_attempt(
@@ -7050,7 +7134,13 @@ class ProcessManager:
                 self._reconcile_expired_starting_reservations(
                     proven, resolved=True
                 )
-                existing = self._live_reviewer_receipt(reviewer_task_id, latest)
+                existing = self._live_reviewer_receipt(
+                    reviewer_task_id,
+                    latest,
+                    target_request_id=target_request_id,
+                    target_task_id=target_task_id,
+                    lens=lens,
+                )
                 if existing is not None:
                     return existing
                 if self._active_count(latest) >= _configured_limit():
@@ -7377,7 +7467,7 @@ class ProcessManager:
             return "timeout"
         return "completed"
 
-    def _complete_quality_reviewer_launch(
+    def _launch_reserved_quality_reviewer(
         self,
         *,
         request_id: str,
@@ -7391,6 +7481,7 @@ class ProcessManager:
         timeout_seconds: int,
     ) -> None:
         """Run one reserved reviewer attempt under a single background owner.
+
 
         The handler already created, claimed and bound the exact reviewer card
         before acknowledgement.  Preparation and provider start never hold the
@@ -7462,23 +7553,28 @@ class ProcessManager:
 
             def _run_isolated_launch() -> None:
                 try:
-                    launch_box["result"] = self._launch_isolated(
-                        task_id=reviewer_task_id,
-                        runner=runner,
-                        topic="quality_review",
-                        adapter_id=adapter_id,
-                        model=model,
-                        owner_prompt="",
-                        timeout_seconds=timeout_seconds,
-                        quality_review_binding=binding,
-                        reserved_request_id=request_id,
-                        prewarm_progress=_progress,
-                    )
+                    launch_kwargs: dict[str, Any] = {
+                        "task_id": reviewer_task_id,
+                        "runner": runner,
+                        "topic": "quality_review",
+                        "adapter_id": adapter_id,
+                        "model": model,
+                        "owner_prompt": "",
+                        "timeout_seconds": timeout_seconds,
+                    }
+                    if binding is not None:
+                        launch_kwargs["quality_review_binding"] = binding
+                    if request_id:
+                        launch_kwargs["reserved_request_id"] = request_id
+                    if _progress is not None:
+                        launch_kwargs["prewarm_progress"] = _progress
+                    launch_box["result"] = self.launch_task(**launch_kwargs)
                 except Exception as exc:  # noqa: BLE001 -- defensive bounded worker
                     launch_box["result"] = {
                         "ok": False,
                         "error": f"quality_review_launch_failed:{exc}"[:500],
                     }
+
 
             launcher = threading.Thread(
                 target=_run_isolated_launch,
@@ -7518,6 +7614,8 @@ class ProcessManager:
                 )
             _fail(f"quality_review_launch_failed:{detail}"[:500])
 
+    _complete_quality_reviewer_launch = _launch_reserved_quality_reviewer
+
     def _ensure_quality_reviewer_card_bound(
         self,
         *,
@@ -7525,6 +7623,7 @@ class ProcessManager:
         target_request_id: str,
         target_task_id: str,
         reviewer_task_id: str,
+
         runner: str,
         adapter_id: str,
         lens: str,
@@ -7570,17 +7669,17 @@ class ProcessManager:
             read_only=True,
         )
         create_ok = created.get("ok") is True
+        create_structured = (
+            created.get("reconciled") is True
+            or str(created.get("receipt_state") or "") == "existing_identical"
+        )
         create_detail = str(
             created.get("stderr")
             or created.get("stdout")
             or created.get("error")
             or ""
         )
-        if not create_ok and not (
-            created.get("reconciled") is True
-            or str(created.get("receipt_state") or "") == "existing_identical"
-            or create_detail.startswith("task_already_exists:")
-        ):
+        if not create_ok and not create_structured:
             reason = (
                 "quality_review_task_create_failed:" + create_detail[:500]
             )
@@ -7589,6 +7688,46 @@ class ProcessManager:
                     request_id, reviewer_task_id, runner, adapter_id, reason=reason
                 )
             return {"ok": False, "error": reason}
+
+        def _fail(reason: str) -> dict[str, Any]:
+            if terminalize_on_failure:
+                self._terminalize_reviewer_attempt(
+                    request_id, reviewer_task_id, runner, adapter_id, reason=reason
+                )
+            return {"ok": False, "error": reason}
+
+        def _verify_durable(*, require_launch_request: bool) -> dict[str, Any] | None:
+            try:
+                card = _parse_card(
+                    self._show_task(reviewer_task_id), reviewer_task_id
+                )
+            except LaunchRejected as exc:
+                return _fail(f"quality_review_card_unreadable:{exc}"[:500])
+            allowed_writes = card.get("allowed_writes")
+            mismatches: list[str] = []
+            if card.get("read_only") is not True:
+                mismatches.append("read_only")
+            if not isinstance(allowed_writes, list) or list(allowed_writes) != []:
+                mismatches.append("allowed_writes")
+            if card.get("topic") != "quality_review":
+                mismatches.append("topic")
+            if card.get("runner") != runner:
+                mismatches.append("runner")
+            if (
+                require_launch_request
+                and card.get("launch_request_id") != request_id
+            ):
+                mismatches.append("launch_request_id")
+            if mismatches:
+                return _fail(
+                    "quality_review_card_identity_mismatch:"
+                    + ",".join(mismatches)
+                )
+            return None
+
+        durable_error = _verify_durable(require_launch_request=False)
+        if durable_error is not None:
+            return durable_error
         claim = task_engine.claim_start_exact(
             self.repo,
             reviewer_task_id,
@@ -7601,11 +7740,7 @@ class ProcessManager:
                 "quality_review_claim_failed:"
                 + str(claim.get("stderr") or claim.get("stdout") or "")[:500]
             )
-            if terminalize_on_failure:
-                self._terminalize_reviewer_attempt(
-                    request_id, reviewer_task_id, runner, adapter_id, reason=reason
-                )
-            return {"ok": False, "error": reason}
+            return _fail(reason)
         try:
             _committed_claim_card(
                 claim,
@@ -7615,12 +7750,10 @@ class ProcessManager:
                 topic="quality_review",
             )
         except LaunchRejected as exc:
-            reason = f"quality_review_claim_failed:{exc}"[:500]
-            if terminalize_on_failure:
-                self._terminalize_reviewer_attempt(
-                    request_id, reviewer_task_id, runner, adapter_id, reason=reason
-                )
-            return {"ok": False, "error": reason}
+            return _fail(f"quality_review_claim_failed:{exc}"[:500])
+        durable_error = _verify_durable(require_launch_request=True)
+        if durable_error is not None:
+            return durable_error
         return {
             "ok": True,
             "request_id": request_id,
@@ -7677,8 +7810,15 @@ class ProcessManager:
                 terminalize_on_failure=terminalize_on_failure,
             )
 
-        existing = self._live_reviewer_receipt(reviewer_task_id)
+        existing = self._live_reviewer_receipt(
+            reviewer_task_id,
+            target_request_id=target_request_id,
+            target_task_id=target_task_id,
+            lens=lens,
+        )
         if existing is not None:
+            if existing.get("ok") is not True:
+                return existing
             bound = _bind_visible_card(
                 str(existing.get("request_id") or ""),
                 terminalize_on_failure=False,
@@ -7716,8 +7856,9 @@ class ProcessManager:
         if reservation.get("already_reserved"):
             return reservation
         threading.Thread(
-            target=self._complete_quality_reviewer_launch,
+            target=self._launch_reserved_quality_reviewer,
             kwargs={
+
                 "request_id": request_id,
                 "target_request_id": target_request_id,
                 "target_task_id": target_task_id,
@@ -7851,9 +7992,7 @@ class ProcessManager:
             # committed) outputs into this dependent's isolated worktree by
             # declaring them as immutable inputs before create_workspace and the
             # B919 input-drift snapshot see the card.
-            if reserved_request_id is None:
-                card = self._preflight_card(task_id, runner, topic, adapter_id)
-            else:
+            if reserved_request_id is not None:
                 card = self._preflight_card(
                     task_id,
                     runner,
@@ -7861,8 +8000,11 @@ class ProcessManager:
                     adapter_id,
                     reserved_request_id=reserved_request_id,
                 )
+            else:
+                card = self._preflight_card(task_id, runner, topic, adapter_id)
             claimed = core._lifecycle_state(card) == "processing"
             _enforce_quality_review_launch_binding(topic, quality_review_binding)
+
             card = self._with_dependency_inputs(card)
             replay_authorization = _validation_only_replay_authorization(
                 card, task_id
@@ -8271,21 +8413,33 @@ class ProcessManager:
                 ):
                     raise _ReviewerReservationTerminalized(reserved_request_id)
                 launch_phase = "canonical_claim"
-                claim = task_engine.claim_start_exact(
-                    self.repo, task_id, runner, topic, request_id=request_id
-                )
-                if not claim.get("ok"):
-                    raise LaunchRejected(
-                        "claim_start_failed:" + str(claim.get("stderr") or claim.get("stdout") or "")[:300]
+                if claimed and reserved_request_id is not None:
+                    if str(card.get("launch_request_id") or "") != str(request_id):
+                        raise LaunchRejected(
+                            "claim_start_failed:"
+                            "card_scoped_claim_start_ineligible:"
+                            + str(core._lifecycle_state(card) or "processing")
+                        )
+                    claim_epoch = card.get("claim_epoch")
+                    if type(claim_epoch) is not int or claim_epoch < 1:
+                        raise LaunchRejected("claim_receipt_invalid:claim_epoch")
+                else:
+                    claim = task_engine.claim_start_exact(
+                        self.repo, task_id, runner, topic, request_id=request_id
                     )
-                card = _committed_claim_card(
-                    claim,
-                    request_id=request_id,
-                    task_id=task_id,
-                    runner=runner,
-                    topic=topic,
-                )
-                claimed = True
+                    if not claim.get("ok"):
+                        raise LaunchRejected(
+                            "claim_start_failed:"
+                            + str(claim.get("stderr") or claim.get("stdout") or "")[:300]
+                        )
+                    card = _committed_claim_card(
+                        claim,
+                        request_id=request_id,
+                        task_id=task_id,
+                        runner=runner,
+                        topic=topic,
+                    )
+                    claimed = True
 
                 prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
                 context_delivery = _project_context_delivery(context_result, prompt_hash)
@@ -8293,6 +8447,7 @@ class ProcessManager:
                     "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
                     "request_id": request_id,
                     "task_id": task_id,
+
                     "runner": runner,
                     "topic": topic,
                     "claim_epoch": card["claim_epoch"],
@@ -8481,7 +8636,7 @@ class ProcessManager:
                     "token_budget": metadata.get("token_budget"),
                 })
 
-                supervisor = Path(__file__).with_name("worker_supervisor.py")
+                supervisor = _worker_supervisor_script()
                 # landlock confines the *real* isolated workspace.home
                 # directory directly, so HOME must literally be that path.
                 # bubblewrap instead remounts workspace.home onto the string

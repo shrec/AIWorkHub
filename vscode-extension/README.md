@@ -12,11 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.58
+## What's new in 0.10.59
 
-- Quality-review acknowledgements are now issued only after the exact reviewer
-  task is durably created, claimed and request-bound, preventing invisible
-  starting requests and pending/unclaimed ghost cards.
+- Quality-review launches now carry one exact reserved request through the
+  isolated provider handoff, verify the persisted read-only reviewer card and
+  resolve the trusted host supervisor from sparse self-development worktrees.
 
 ## Architecture at a glance
 

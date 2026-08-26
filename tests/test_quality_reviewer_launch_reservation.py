@@ -60,8 +60,11 @@ def _starting(
     if pid:
         event["pid"] = pid
         event["pid_start_ticks"] = pid_start_ticks
-    if quality_review_attempt is not None:
-        event["quality_review_attempt"] = quality_review_attempt
+    event["quality_review_attempt"] = quality_review_attempt or {
+        "target_request_id": "target-req",
+        "target_task_id": "TARGET_TASK",
+        "lens": "correctness",
+    }
     return event
 
 
@@ -122,7 +125,16 @@ def _review_ready_target(monkeypatch: pytest.MonkeyPatch) -> None:
     through the refusal path overrides this by stubbing ``_show_task`` itself.
     """
 
+    reviewer_cards: dict[str, dict[str, object]] = {}
+
     def _show_review_ready_target(_self, task_id: str) -> dict[str, object]:
+        reviewer = reviewer_cards.get(task_id)
+        if reviewer is not None:
+            return {
+                "returncode": 0,
+                "stdout": json.dumps(reviewer),
+                "stderr": "",
+            }
         return {
             "returncode": 0,
             "stdout": json.dumps({
@@ -145,15 +157,24 @@ def _review_ready_target(monkeypatch: pytest.MonkeyPatch) -> None:
     # launch now durably creates and claims the reviewer card before returning
     # its acknowledgement, so provide the mechanically valid task-engine
     # receipts that this focused fixture previously never needed.
-    monkeypatch.setattr(
-        process_launcher.core,
-        "create_task",
-        lambda **kwargs: {
+    def _create(**kwargs: object) -> dict[str, object]:
+        task_id = str(kwargs["task_id"])
+        reviewer_cards[task_id] = {
+            "task_id": task_id,
+            "runner": kwargs["runner"],
+            "topic": kwargs["topic"],
+            "read_only": kwargs.get("read_only") is True,
+            "allowed_writes": list(kwargs.get("allowed_writes") or []),
+            "status": "pending",
+            "worker_status": "unclaimed",
+        }
+        return {
             "ok": True,
             "created": True,
-            "task_id": kwargs["task_id"],
-        },
-    )
+            "task_id": task_id,
+        }
+
+    monkeypatch.setattr(process_launcher.core, "create_task", _create)
 
     def _claim(
         _repo: Path,
@@ -163,19 +184,24 @@ def _review_ready_target(monkeypatch: pytest.MonkeyPatch) -> None:
         *,
         request_id: str,
     ) -> dict[str, object]:
+        existing = reviewer_cards.get(task_id) or {}
+        card = {
+            "task_id": task_id,
+            "runner": runner,
+            "topic": topic,
+            "launch_request_id": request_id,
+            "claim_epoch": 1,
+            "status": "processing",
+            "worker_status": "claimed",
+            "claimed_by": runner,
+            "read_only": existing.get("read_only") is True,
+            "allowed_writes": list(existing.get("allowed_writes") or []),
+        }
+        reviewer_cards[task_id] = card
         return {
             "ok": True,
             "returncode": 0,
-            "stdout": json.dumps({
-                "task_id": task_id,
-                "runner": runner,
-                "topic": topic,
-                "launch_request_id": request_id,
-                "claim_epoch": 1,
-                "status": "processing",
-                "worker_status": "claimed",
-                "claimed_by": runner,
-            }),
+            "stdout": json.dumps(card),
             "stderr": "",
         }
 
@@ -397,9 +423,6 @@ def test_launch_quality_reviewer_is_idempotent_for_live_reservation(
 
 def test_launch_returns_bounded_receipt_while_preparation_blocks(tmp_path, monkeypatch):
     manager = _manager(tmp_path)
-    monkeypatch.setattr(
-        process_launcher.core, "create_task", lambda **_kwargs: {"ok": True},
-    )
 
     prep_started = threading.Event()
     release = threading.Event()
@@ -502,9 +525,6 @@ def test_preparation_failure_terminalizes_attempt_once(tmp_path, monkeypatch):
 
 def test_lost_ack_retry_reconciles_same_attempt(tmp_path, monkeypatch):
     manager = _manager(tmp_path)
-    monkeypatch.setattr(
-        process_launcher.core, "create_task", lambda **_kwargs: {"ok": True},
-    )
 
     prep_started = threading.Event()
     release = threading.Event()
@@ -554,9 +574,6 @@ def test_lost_ack_retry_reconciles_same_attempt(tmp_path, monkeypatch):
 
 def test_parallel_same_task_race_yields_single_provider(tmp_path, monkeypatch):
     manager = _manager(tmp_path)
-    monkeypatch.setattr(
-        process_launcher.core, "create_task", lambda **_kwargs: {"ok": True},
-    )
 
     prep_started = threading.Event()
     release = threading.Event()
@@ -632,9 +649,6 @@ def test_three_lenses_share_one_preparation_and_launch_distinctly(
     tmp_path, monkeypatch,
 ):
     manager = _manager(tmp_path)
-    monkeypatch.setattr(
-        process_launcher.core, "create_task", lambda **_kwargs: {"ok": True},
-    )
 
     prep_calls: list = []
     prep_started = threading.Event()
@@ -760,9 +774,6 @@ def test_owner_preparation_timeout_terminalizes_each_reservation_once(
 ):
     manager = _manager(tmp_path)
     manager._QUALITY_REVIEW_PREP_OWNER_SECONDS = 0.05
-    monkeypatch.setattr(
-        process_launcher.core, "create_task", lambda **_kwargs: {"ok": True},
-    )
 
     never = threading.Event()
 
@@ -821,9 +832,6 @@ def test_status_read_bounded_and_reports_phase_while_prep_blocks(
     tmp_path, monkeypatch,
 ):
     manager = _manager(tmp_path)
-    monkeypatch.setattr(
-        process_launcher.core, "create_task", lambda **_kwargs: {"ok": True},
-    )
 
     prep_started = threading.Event()
     release = threading.Event()
@@ -884,9 +892,6 @@ def test_launch_publishes_phased_progress_under_same_reservation(
     tmp_path, monkeypatch,
 ):
     manager = _manager(tmp_path)
-    monkeypatch.setattr(
-        process_launcher.core, "create_task", lambda **_kwargs: {"ok": True},
-    )
 
     def phased_build(*_args, **kwargs):
         progress = kwargs.get("progress")

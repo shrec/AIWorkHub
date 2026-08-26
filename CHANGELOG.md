@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.59] - 2026-08-26
+
+### Fixed
+
+- Quality-review launch now keeps one exact request from durable reservation
+  through provider spawn, skips the duplicate claim, verifies the persisted
+  read-only reviewer card and rejects target/lens identity reuse.
+- Sparse candidate worktrees resolve the trusted worker supervisor from the
+  installed host package instead of failing before the provider can start.
+
 ## [0.10.58] - 2026-08-25
 
 ### Fixed

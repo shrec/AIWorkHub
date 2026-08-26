@@ -1540,3 +1540,171 @@ def test_quality_reviewer_preflight_rejects_foreign_launch_request_id(
     )
     assert matched["launch_request_id"] == reserved
     assert matched["task_id"] == "REVIEWER_TASK_1"
+
+
+def test_quality_reviewer_launch_rejects_task_already_exists_prose_spoof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_process_launcher import _quality_reviewer_launch_harness
+
+    manager, _cards, order, started = _quality_reviewer_launch_harness(
+        tmp_path, monkeypatch
+    )
+
+    def spoof_create(**_kwargs):
+        order.append("create")
+        return {
+            "ok": False,
+            "stderr": "task_already_exists:REVIEWER_TASK_1",
+            "stdout": "task_already_exists:REVIEWER_TASK_1 please reuse",
+        }
+
+    monkeypatch.setattr(process_launcher.core, "create_task", spoof_create)
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req-1",
+        target_task_id="TARGET_TASK_1",
+        reviewer_task_id="REVIEWER_TASK_1",
+        runner="claude_worker_reviewer",
+        adapter_id="claude_cli",
+        lens="correctness",
+    )
+    assert receipt["ok"] is False
+    assert str(receipt.get("error") or "").startswith(
+        "quality_review_task_create_failed:"
+    )
+    assert "thread" not in order
+    assert started == []
+    blocked = [
+        event
+        for event in manager._latest_by_request().values()
+        if event.get("state") == "blocked"
+    ]
+    assert len(blocked) == 1
+
+
+def test_quality_reviewer_launch_rejects_unsafe_existing_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_process_launcher import _quality_reviewer_launch_harness
+
+    manager, cards, order, started = _quality_reviewer_launch_harness(
+        tmp_path, monkeypatch
+    )
+    cards["REVIEWER_TASK_1"] = {
+        "task_id": "REVIEWER_TASK_1",
+        "runner": "claude_worker_reviewer",
+        "topic": "quality_review",
+        "read_only": False,
+        "allowed_writes": ["src/evil.py"],
+        "status": "pending",
+        "worker_status": "unclaimed",
+    }
+
+    def existing_create(**_kwargs):
+        order.append("create")
+        return {"ok": False, "receipt_state": "existing_identical"}
+
+    monkeypatch.setattr(process_launcher.core, "create_task", existing_create)
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req-1",
+        target_task_id="TARGET_TASK_1",
+        reviewer_task_id="REVIEWER_TASK_1",
+        runner="claude_worker_reviewer",
+        adapter_id="claude_cli",
+        lens="correctness",
+    )
+    assert receipt["ok"] is False
+    error = str(receipt.get("error") or "")
+    assert error.startswith("quality_review_card_identity_mismatch:")
+    assert "read_only" in error
+    assert "allowed_writes" in error
+    assert "thread" not in order
+    assert started == []
+    blocked = [
+        event
+        for event in manager._latest_by_request().values()
+        if event.get("state") == "blocked"
+    ]
+    assert len(blocked) == 1
+
+
+def test_quality_reviewer_launch_rejects_same_id_different_target_or_lens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_process_launcher import _quality_reviewer_launch_harness
+
+    manager, _cards, _order, started = _quality_reviewer_launch_harness(
+        tmp_path, monkeypatch
+    )
+    first = manager.launch_quality_reviewer(
+        target_request_id="target-req-1",
+        target_task_id="TARGET_TASK_1",
+        reviewer_task_id="REVIEWER_TASK_1",
+        runner="claude_worker_reviewer",
+        adapter_id="claude_cli",
+        lens="correctness",
+    )
+    assert first["ok"] is True
+    second = manager.launch_quality_reviewer(
+        target_request_id="target-req-2",
+        target_task_id="TARGET_TASK_2",
+        reviewer_task_id="REVIEWER_TASK_1",
+        runner="claude_worker_reviewer",
+        adapter_id="claude_cli",
+        lens="security",
+    )
+    assert second["ok"] is False
+    assert second.get("error") == "quality_review_attempt_identity_mismatch"
+    assert len(started) == 1
+    starting = [
+        event
+        for event in manager._latest_by_request().values()
+        if event.get("task_id") == "REVIEWER_TASK_1" and event.get("state") == "starting"
+    ]
+    assert len(starting) == 1
+    attempt = starting[0].get("quality_review_attempt") or {}
+    assert attempt.get("target_request_id") == "target-req-1"
+    assert attempt.get("target_task_id") == "TARGET_TASK_1"
+    assert attempt.get("lens") == "correctness"
+
+
+def test_isolated_supervisor_handoff_resolves_existing_worker_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    monkeypatch.setattr(
+        process_launcher, "__file__", str(overlay / "process_launcher.py")
+    )
+    host_root = tmp_path / "host_package"
+    canonical = host_root / "aiworkhub" / "worker_supervisor.py"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text("def main():\n    pass\n# --spec\n", encoding="utf-8")
+    monkeypatch.setattr(
+        process_launcher.worker_ai_tools_mcp,
+        "resolve_host_package_import_root",
+        lambda: host_root,
+    )
+    script = process_launcher._worker_supervisor_script()
+    assert script == canonical
+    assert script.is_file()
+    assert script.name == "worker_supervisor.py"
+    assert script != overlay / "worker_supervisor.py"
+    captured: list[list[str]] = []
+
+    def fake_popen(argv, **_kwargs):
+        captured.append(list(argv))
+        return SimpleNamespace(pid=4242, poll=lambda: 0)
+
+    monkeypatch.setattr(process_launcher.subprocess, "Popen", fake_popen)
+    assert process_launcher._worker_supervisor_script().is_file()
+    argv = [
+        sys.executable,
+        str(process_launcher._worker_supervisor_script()),
+        "--spec",
+        str(tmp_path / "unused.supervisor-spec.json"),
+    ]
+    fake_popen(argv)
+    assert captured[0][1] == str(script)
+    assert Path(captured[0][1]).is_file()
+    assert captured[0][2] == "--spec"

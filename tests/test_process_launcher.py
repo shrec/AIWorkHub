@@ -6923,6 +6923,13 @@ def _quality_reviewer_launch_harness(tmp_path, monkeypatch):
     started: list[object] = []
 
     def show(task_id: str):
+        stored = cards.get(str(task_id))
+        if isinstance(stored, dict) and stored.get("topic") == "quality_review":
+            return {
+                "returncode": 0,
+                "stdout": json.dumps(stored),
+                "stderr": "",
+            }
         card = {
             "task_id": task_id,
             "runner": "claude_worker_b1",
@@ -6953,11 +6960,21 @@ def _quality_reviewer_launch_harness(tmp_path, monkeypatch):
 
     def fake_create(**kwargs):
         order.append("create")
-        cards[str(kwargs["task_id"])] = dict(kwargs)
+        card = {
+            "task_id": kwargs["task_id"],
+            "runner": kwargs["runner"],
+            "topic": kwargs["topic"],
+            "read_only": kwargs.get("read_only", False),
+            "allowed_writes": list(kwargs.get("allowed_writes") or []),
+            "status": "pending",
+            "worker_status": "unclaimed",
+        }
+        cards[str(kwargs["task_id"])] = card
         return {"ok": True, "created": True, "task_id": kwargs["task_id"]}
 
     def fake_claim(repo, task_id, runner, topic, request_id=""):
         order.append("claim")
+        existing = cards.get(str(task_id), {})
         card = {
             "task_id": task_id,
             "runner": runner,
@@ -6967,6 +6984,8 @@ def _quality_reviewer_launch_harness(tmp_path, monkeypatch):
             "status": "processing",
             "worker_status": "claimed",
             "claimed_by": runner,
+            "read_only": existing.get("read_only", True),
+            "allowed_writes": list(existing.get("allowed_writes") or []),
         }
         cards[str(task_id)] = card
         return {
@@ -7138,3 +7157,331 @@ def test_quality_reviewer_launch_concurrent_same_id_reconciles_one_request(
         if event.get("task_id") == "REVIEWER_TASK_1" and event.get("state") == "starting"
     ]
     assert len(starting) == 1
+
+
+def test_quality_reviewer_launch_existing_identical_rereads_safe_card(
+    tmp_path, monkeypatch,
+):
+    manager, cards, order, started = _quality_reviewer_launch_harness(
+        tmp_path, monkeypatch
+    )
+    cards["REVIEWER_TASK_1"] = {
+        "task_id": "REVIEWER_TASK_1",
+        "runner": "claude_worker_reviewer",
+        "topic": "quality_review",
+        "read_only": True,
+        "allowed_writes": [],
+        "status": "pending",
+        "worker_status": "unclaimed",
+    }
+
+    def existing_create(**_kwargs):
+        order.append("create")
+        return {
+            "ok": False,
+            "receipt_state": "existing_identical",
+            "reconciled": True,
+        }
+
+    monkeypatch.setattr(process_launcher.core, "create_task", existing_create)
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req-1",
+        target_task_id="TARGET_TASK_1",
+        reviewer_task_id="REVIEWER_TASK_1",
+        runner="claude_worker_reviewer",
+        adapter_id="claude_cli",
+        lens="correctness",
+    )
+    assert receipt["ok"] is True
+    assert receipt["task_id"] == "REVIEWER_TASK_1"
+    assert cards["REVIEWER_TASK_1"]["launch_request_id"] == receipt["request_id"]
+    assert order[:2] == ["create", "claim"]
+    assert order.index("create") < order.index("thread")
+    assert len(started) == 1
+
+
+def test_quality_reviewer_launch_task_omits_none_reserved_request_id(
+    tmp_path, monkeypatch,
+):
+    _open_gates(monkeypatch)
+    seen: list[dict] = []
+
+    def isolated_without_reserved(**kwargs):
+        seen.append(kwargs)
+        assert "reserved_request_id" not in kwargs
+        return {"ok": True, "state": "running", "request_id": "compat-req"}
+
+    manager = _manager(
+        tmp_path,
+        show_task=_show(_card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager.isolation_enabled = True
+    monkeypatch.setattr(manager, "_launch_isolated", isolated_without_reserved)
+    result = manager.launch(
+        task_id="TASK_B1",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+    )
+    assert result["ok"] is True
+    assert seen and "reserved_request_id" not in seen[0]
+
+
+def test_quality_reviewer_preflight_omits_none_reserved_request_id(
+    tmp_path, monkeypatch,
+):
+    _open_gates(monkeypatch)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(_card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+
+    def preflight_without_reserved(task_id, runner, topic, adapter_id):
+        raise process_launcher.LaunchRejected("stop-after-compat-preflight")
+
+    monkeypatch.setattr(manager, "_preflight_card", preflight_without_reserved)
+    monkeypatch.setattr(
+        manager,
+        "_blocked",
+        lambda task_id, runner, topic, adapter_id, reason, **_k: {
+            "ok": False,
+            "blocked_reason": reason,
+            "task_id": task_id,
+        },
+    )
+    result = manager._launch_isolated(
+        task_id="TASK_B1",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        model=None,
+        owner_prompt="",
+        timeout_seconds=30,
+    )
+    assert result.get("ok") is False
+    assert "stop-after-compat-preflight" in str(result.get("blocked_reason") or "")
+
+
+def test_quality_reviewer_reserved_launch_handoff_skips_second_claim(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(process_launcher, "chmod_fd", lambda *_a, **_k: None)
+    monkeypatch.setattr(process_launcher, "chmod_path", lambda *_a, **_k: None)
+    monkeypatch.setattr(os, "chmod", lambda *_a, **_k: None)
+
+    def append_without_chmod(path, event, **_k):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+    monkeypatch.setattr(
+        process_launcher.process_event_ledger, "append_event", append_without_chmod
+    )
+    manager, cards, _order, started = _quality_reviewer_launch_harness(
+        tmp_path, monkeypatch
+    )
+    claim_calls: list[str] = []
+
+    def fake_claim(repo, task_id, runner, topic, request_id=""):
+        claim_calls.append(str(request_id))
+        existing = cards.get(str(task_id), {})
+        if existing.get("status") == "processing":
+
+            return {
+                "ok": False,
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "card_scoped_claim_start_ineligible:processing",
+
+            }
+        card = {
+            "task_id": task_id,
+            "runner": runner,
+            "topic": topic,
+            "launch_request_id": request_id,
+            "claim_epoch": 1,
+            "status": "processing",
+            "worker_status": "claimed",
+            "claimed_by": runner,
+            "read_only": existing.get("read_only", True),
+            "allowed_writes": list(existing.get("allowed_writes") or []),
+        }
+        cards[str(task_id)] = card
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout": json.dumps(card),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(process_launcher.task_engine, "claim_start_exact", fake_claim)
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req-1",
+        target_task_id="TARGET_TASK_1",
+        reviewer_task_id="REVIEWER_TASK_1",
+        runner="claude_worker_reviewer",
+        adapter_id="claude_cli",
+        lens="correctness",
+    )
+    assert receipt["ok"] is True
+    bound_id = str(receipt["request_id"])
+    assert cards["REVIEWER_TASK_1"]["launch_request_id"] == bound_id
+    assert len(claim_calls) == 1
+    owner = started[0]
+    assert owner.target == manager._launch_reserved_quality_reviewer
+
+    _open_gates(monkeypatch)
+    candidate_dir = tmp_path / "candidate"
+    candidate_dir.mkdir()
+    candidate_home = tmp_path / "candidate_home"
+    (candidate_home / "task_mcp_worker_runtime").mkdir(parents=True)
+    fake_workspace = process_launcher.WorkerWorkspace(
+        request_id="c" * 32,
+        repo=candidate_dir,
+        path=candidate_dir,
+        home=candidate_home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    packet = {
+        "packet_sha256": "a" * 64,
+        "target": {"claim_epoch": 1},
+        "lens": "correctness",
+    }
+
+    def fake_prep(*_a, **_k):
+        return {
+            "ok": True,
+            "prepared": {
+                "worker_adapter_id": "claude_cli",
+                "workspace": fake_workspace,
+                "changed_hashes": {"module.py": "h"},
+                "packet": packet,
+            },
+        }
+
+    monkeypatch.setattr(manager, "_prepared_quality_review", fake_prep)
+    popen_calls: list[object] = []
+
+    def fake_popen(*_a, **_k):
+        popen_calls.append(True)
+        return SimpleNamespace(pid=4242, poll=lambda: None)
+
+    monkeypatch.setattr(manager, "_popen", fake_popen)
+    spawn_calls: list[str] = []
+
+    def fake_spawn(request_id, binding=None, **_k):
+        spawn_calls.append(str(request_id))
+        return True
+
+    monkeypatch.setattr(manager, "_reviewer_spawn_transition", fake_spawn)
+    launch_kwargs_seen: list[dict] = []
+    launch_receipts: list[dict] = []
+
+    def wrapped_launch_task(**kwargs):
+        launch_kwargs_seen.append(dict(kwargs))
+        reserved = kwargs.get("reserved_request_id")
+        card = manager._preflight_card(
+            kwargs["task_id"],
+            kwargs["runner"],
+            kwargs["topic"],
+            kwargs["adapter_id"],
+            reserved_request_id=reserved,
+        )
+        assert process_launcher.core._lifecycle_state(card) == "processing"
+        assert card.get("launch_request_id") == reserved
+        manager._reviewer_spawn_transition(
+            reserved, binding=kwargs.get("quality_review_binding")
+        )
+        process = manager._popen([sys.executable, "-c", "pass"])
+        result = {
+            "ok": True,
+            "request_id": reserved,
+            "task_id": kwargs["task_id"],
+            "state": "running",
+            "pid": process.pid,
+        }
+        launch_receipts.append(result)
+        return result
+
+    monkeypatch.setattr(manager, "launch_task", wrapped_launch_task)
+
+    class ExecThread:
+        def __init__(self, target=None, kwargs=None, name=None, daemon=None, args=()):
+            self.target = target
+            self.kwargs = kwargs or {}
+            self.args = args
+            self.name = name or ""
+
+        def start(self):
+            if str(self.name).startswith("aiworkhub-task-"):
+                return
+            if self.target is not None:
+                self.target(*self.args, **self.kwargs)
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(process_launcher.threading, "Thread", ExecThread)
+    owner.target(**owner.kwargs)
+    assert len(claim_calls) == 1
+    assert launch_kwargs_seen
+    assert launch_kwargs_seen[0].get("reserved_request_id") == bound_id
+    assert launch_kwargs_seen[0].get("task_id") == "REVIEWER_TASK_1"
+    assert launch_receipts and launch_receipts[0].get("ok") is True
+    assert launch_receipts[0].get("request_id") == bound_id
+    assert spawn_calls == [bound_id]
+    assert popen_calls == [True]
+
+
+def test_quality_reviewer_supervisor_handoff_uses_existing_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    monkeypatch.setattr(
+        process_launcher, "__file__", str(overlay / "process_launcher.py")
+    )
+    host_root = tmp_path / "host_package"
+    canonical = host_root / "aiworkhub" / "worker_supervisor.py"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text("def main():\n    pass\n# --spec\n", encoding="utf-8")
+    monkeypatch.setattr(
+        process_launcher.worker_ai_tools_mcp,
+        "resolve_host_package_import_root",
+        lambda: host_root,
+    )
+    script = process_launcher._worker_supervisor_script()
+    assert script == canonical
+    assert script.is_file()
+    assert script.name == "worker_supervisor.py"
+    assert not (overlay / "worker_supervisor.py").exists()
+    text = script.read_text(encoding="utf-8")
+    assert "--spec" in text
+    assert "def main" in text
+
+
+def test_quality_reviewer_supervisor_handoff_rejects_missing_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    monkeypatch.setattr(
+        process_launcher, "__file__", str(overlay / "process_launcher.py")
+    )
+    monkeypatch.setattr(
+        process_launcher.worker_ai_tools_mcp,
+        "resolve_host_package_import_root",
+        lambda: tmp_path / "missing_host_package",
+    )
+    monkeypatch.setattr(process_launcher.sys, "path", [])
+    with pytest.raises(
+        process_launcher.LaunchRejected, match="worker_supervisor_script_missing"
+    ):
+        process_launcher._worker_supervisor_script()
