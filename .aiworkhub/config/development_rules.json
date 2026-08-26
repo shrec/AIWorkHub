@@ -1,0 +1,427 @@
+{
+  "schema": "aiworkhub.development_rules_manifest",
+  "schema_version": "1.0.0",
+  "languages": [
+    "c",
+    "cpp",
+    "cuda",
+    "javascript",
+    "json",
+    "markdown",
+    "python",
+    "rust",
+    "shell",
+    "typescript",
+    "yaml"
+  ],
+  "rules": [
+    {
+      "id": "coding_baseline",
+      "topic": "coding_baseline",
+      "kind": "coding_convention",
+      "applicability": {},
+      "allow": [
+        "bounded_work",
+        "deterministic_output",
+        "explicit_authority",
+        "incremental_default",
+        "structured_errors"
+      ],
+      "forbid": [
+        "ambient_authority",
+        "silent_fallback",
+        "unbounded_work"
+      ],
+      "payload": {
+        "guideline_ids": [
+          "bounded_inputs",
+          "canonical_state",
+          "deterministic_results",
+          "explicit_cleanup",
+          "stable_error_taxonomy"
+        ],
+        "severity": "error"
+      }
+    },
+    {
+      "id": "hot_path_allocation",
+      "topic": "hot_path_allocation",
+      "kind": "performance",
+      "applicability": {
+        "languages": ["python"],
+        "paths": [
+          "src/aiworkhub/dashboard.py",
+          "src/aiworkhub/process_event_ledger.py",
+          "src/aiworkhub/process_launcher.py",
+          "src/aiworkhub/source_graph*.py",
+          "src/aiworkhub/task_store.py",
+          "src/aiworkhub/worker_ai_tools_mcp.py",
+          "src/aiworkhub/worker_workspace.py"
+        ]
+      },
+      "allow": [
+        "arena_reuse",
+        "batching",
+        "buffer_reuse",
+        "iterator_streaming",
+        "preallocation"
+      ],
+      "forbid": [
+        "allocation_in_hot_loop",
+        "full_copy_in_hot_loop",
+        "materialize_unbounded_collection",
+        "repeated_decode_in_hot_loop"
+      ],
+      "payload": {
+        "max_allocations_per_iteration": 0,
+        "max_time_complexity": "o_n_log_n",
+        "max_space_complexity": "o_n",
+        "min_concurrency_headroom_fraction": 0.25,
+        "measurement_required": true,
+        "measurement_evidence_id": "hot_path_benchmark"
+      }
+    },
+    {
+      "id": "graph_cpu_parallelism",
+      "topic": "parallelism_model",
+      "kind": "concurrency",
+      "applicability": {
+        "languages": ["python", "rust"],
+        "paths": [
+          "src/aiworkhub/source_graph*.py",
+          "src/aiworkhub/source_graph_rs/**"
+        ]
+      },
+      "allow": [
+        "content_hash_delta",
+        "deterministic_partition",
+        "process_pool",
+        "stable_merge"
+      ],
+      "forbid": [
+        "hardcoded_worker_count",
+        "single_core_full_rebuild",
+        "shared_mutable_partition_state"
+      ],
+      "payload": {
+        "model": "processes_cpu_bound",
+        "min_headroom_fraction": 0.25
+      }
+    },
+    {
+      "id": "runtime_io_parallelism",
+      "topic": "parallelism_model",
+      "kind": "concurrency",
+      "applicability": {
+        "languages": ["python", "javascript", "typescript"],
+        "paths": [
+          "src/aiworkhub/dashboard*.py",
+          "src/aiworkhub/process_launcher.py",
+          "src/aiworkhub/server.py",
+          "src/aiworkhub/task_store.py",
+          "src/aiworkhub/worker_workspace.py",
+          "vscode-extension/**"
+        ]
+      },
+      "allow": [
+        "bounded_batching",
+        "concurrent_readers",
+        "single_writer_queue",
+        "thread_pool"
+      ],
+      "forbid": [
+        "global_lock_during_io",
+        "serial_independent_io",
+        "unbounded_thread_creation"
+      ],
+      "payload": {
+        "model": "threads_io_bound",
+        "min_headroom_fraction": 0.25
+      }
+    },
+    {
+      "id": "parallelism_fallback",
+      "topic": "parallelism_model",
+      "kind": "concurrency",
+      "applicability": {},
+      "allow": [
+        "core_count_derived_workers",
+        "deterministic_parallel_output",
+        "measured_sequential_exception"
+      ],
+      "forbid": [
+        "hardcoded_worker_count",
+        "unmeasured_sequential_hot_path"
+      ],
+      "payload": {
+        "model": "threads_io_bound",
+        "min_headroom_fraction": 0.25
+      }
+    },
+    {
+      "id": "incremental_state",
+      "topic": "incremental_state",
+      "kind": "forbidden_pattern",
+      "applicability": {
+        "paths": [
+          "src/aiworkhub/source_graph*.py",
+          "src/aiworkhub/storage_observability.py",
+          "src/aiworkhub/worker_workspace.py"
+        ]
+      },
+      "allow": [
+        "content_hash_delta",
+        "generation_snapshot",
+        "last_known_good_read",
+        "metadata_cache",
+        "subgraph_overlay"
+      ],
+      "forbid": [
+        "copy_full_canonical_graph",
+        "full_rescan_without_change",
+        "recompute_unchanged_storage",
+        "write_in_place_generation"
+      ],
+      "payload": {
+        "severity": "error",
+        "rationale_id": "incremental_performance"
+      }
+    },
+    {
+      "id": "sqlite_concurrency",
+      "topic": "sqlite_concurrency",
+      "kind": "coding_convention",
+      "applicability": {
+        "languages": ["python"],
+        "paths": ["src/aiworkhub/*.py"]
+      },
+      "allow": [
+        "busy_timeout",
+        "concurrent_readers",
+        "short_transactions",
+        "single_writer_queue",
+        "wal_mode"
+      ],
+      "forbid": [
+        "database_lock_without_owner",
+        "long_write_transaction",
+        "network_db_dependency"
+      ],
+      "payload": {
+        "guideline_ids": [
+          "bounded_transaction",
+          "lock_owner_diagnostics",
+          "sqlite_wal",
+          "writer_batching"
+        ],
+        "severity": "error"
+      }
+    },
+    {
+      "id": "cache_discipline",
+      "topic": "cache_discipline",
+      "kind": "forbidden_pattern",
+      "applicability": {},
+      "allow": [
+        "bounded_cache",
+        "generation_invalidation",
+        "lru_eviction",
+        "measured_hit_rate",
+        "ttl_eviction"
+      ],
+      "forbid": [
+        "cache_without_bound",
+        "stale_generation_retention",
+        "unmeasured_cache"
+      ],
+      "payload": {
+        "severity": "error",
+        "rationale_id": "bounded_memory"
+      }
+    },
+    {
+      "id": "subprocess_lifecycle",
+      "topic": "subprocess_lifecycle",
+      "kind": "ownership_lifetime",
+      "applicability": {
+        "languages": ["python", "javascript", "typescript"]
+      },
+      "allow": [
+        "pid_start_tick_fencing",
+        "process_group_termination",
+        "request_scoped_temp",
+        "structured_terminal_state"
+      ],
+      "forbid": [
+        "elapsed_time_worker_kill",
+        "orphan_process",
+        "system_temp_leak",
+        "unreleased_lock"
+      ],
+      "payload": {
+        "requires_raii": false,
+        "requires_context_manager": true,
+        "requires_explicit_cleanup": true,
+        "forbidden_raw_ownership_patterns": [
+          "bare_popen",
+          "detached_child",
+          "unowned_lock",
+          "unscoped_temp"
+        ]
+      }
+    },
+    {
+      "id": "native_ownership",
+      "topic": "native_ownership",
+      "kind": "ownership_lifetime",
+      "applicability": {
+        "languages": ["c", "cpp", "cuda", "rust"]
+      },
+      "allow": [
+        "borrowed_view",
+        "raii_guard",
+        "smart_pointer",
+        "value_semantics"
+      ],
+      "forbid": [
+        "manual_lifetime_pair",
+        "owning_raw_pointer",
+        "unbounded_stack_buffer"
+      ],
+      "payload": {
+        "requires_raii": true,
+        "requires_context_manager": false,
+        "requires_explicit_cleanup": true,
+        "forbidden_raw_ownership_patterns": [
+          "manual_delete",
+          "manual_free",
+          "owning_raw_pointer"
+        ]
+      }
+    },
+    {
+      "id": "task_atomicity",
+      "topic": "task_atomicity",
+      "kind": "coding_convention",
+      "applicability": {},
+      "allow": [
+        "exact_allowed_writes",
+        "production_and_test_scope",
+        "template_created_task",
+        "terminal_same_turn"
+      ],
+      "forbid": [
+        "overlapping_parallel_writes",
+        "review_queue_accumulation",
+        "whole_file_regeneration"
+      ],
+      "payload": {
+        "guideline_ids": [
+          "atomic_change",
+          "exact_scope",
+          "mechanical_validation",
+          "segment_edit"
+        ],
+        "severity": "error"
+      }
+    },
+    {
+      "id": "model_execution_policy",
+      "topic": "model_execution_policy",
+      "kind": "forbidden_pattern",
+      "applicability": {},
+      "allow": [
+        "provider_terminal_response",
+        "response_based_liveness",
+        "uncapped_model_execution"
+      ],
+      "forbid": [
+        "elapsed_time_model_kill",
+        "implicit_output_budget",
+        "implicit_token_budget",
+        "silent_provider_fallback"
+      ],
+      "payload": {
+        "severity": "error",
+        "rationale_id": "preserve_model_work"
+      }
+    },
+    {
+      "id": "performance_evidence",
+      "topic": "performance_evidence",
+      "kind": "evidence",
+      "applicability": {
+        "tasks": ["optimize", "performance", "release"]
+      },
+      "allow": [
+        "before_after_measurement",
+        "cross_platform_sample",
+        "resource_profile"
+      ],
+      "forbid": [
+        "performance_claim_without_measurement"
+      ],
+      "payload": {
+        "required_evidence_types": [
+          "benchmark_report",
+          "profile_report",
+          "regression_test"
+        ],
+        "min_count": 3
+      }
+    },
+    {
+      "id": "release_evidence",
+      "topic": "release_evidence",
+      "kind": "evidence",
+      "applicability": {
+        "tasks": ["release"]
+      },
+      "allow": [
+        "artifact_checksum",
+        "fresh_install",
+        "full_ci_matrix",
+        "version_parity"
+      ],
+      "forbid": [
+        "release_with_red_ci",
+        "release_without_artifact_verification"
+      ],
+      "payload": {
+        "required_evidence_types": [
+          "artifact_checksum",
+          "ci_report",
+          "fresh_install_report",
+          "version_report"
+        ],
+        "min_count": 4
+      }
+    },
+    {
+      "id": "cross_platform_contract",
+      "topic": "cross_platform_contract",
+      "kind": "coding_convention",
+      "applicability": {},
+      "allow": [
+        "linux_contract",
+        "macos_contract",
+        "remote_ssh_contract",
+        "windows_contract"
+      ],
+      "forbid": [
+        "posix_only_assumption",
+        "shell_string_command",
+        "windows_path_guess"
+      ],
+      "payload": {
+        "guideline_ids": [
+          "argv_subprocess",
+          "pathlib_paths",
+          "platform_contract_tests",
+          "process_tree_cleanup"
+        ],
+        "severity": "error"
+      }
+    }
+  ]
+}

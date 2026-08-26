@@ -22,6 +22,9 @@ node_modules/
 *.sqlite3
 *.db
 .aiworkhub/*
+!.aiworkhub/config/
+.aiworkhub/config/*
+!.aiworkhub/config/development_rules.json
 !.aiworkhub/quality.json
 !.aiworkhub/eval-artifacts.json
 !.aiworkhub/source-graph-retrieval-eval.json
