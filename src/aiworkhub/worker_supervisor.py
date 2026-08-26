@@ -724,6 +724,13 @@ def supervise(spec: dict[str, Any]) -> int:
         )
         if final_meaningful_sequence > last_meaningful_progress_sequence:
             last_meaningful_progress_epoch = time.time()
+            # The meaningful event was parsed from the captured stdout, so its
+            # observation cannot truthfully post-date the output-change clock.
+            # Keep the two clocks monotonic even when the final capture and
+            # parse happen inside the same sub-millisecond scheduling slice.
+            last_output_change_epoch = max(
+                last_output_change_epoch, last_meaningful_progress_epoch
+            )
             last_meaningful_phase = str(final_meaningful_progress["phase"])
             last_meaningful_progress_sequence = final_meaningful_sequence
             last_meaningful_progress_event = final_meaningful_progress
