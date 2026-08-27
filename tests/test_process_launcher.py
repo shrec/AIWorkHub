@@ -7688,3 +7688,130 @@ def test_validate_required_outputs_retains_all_distinct_mismatch_categories(
         {"path": "empty.py", "reason": "required_output_zero_bytes"}
     ]
     assert diagnostics["primary_validation_result"] == []
+
+
+@pytest.mark.parametrize(
+    ("production_paths", "test_paths", "mandatory_changed_outputs", "files", "unchanged_baselines"),
+    [
+        (
+            ["src/app_container.py", "src/app_container_config.py"],
+            ["tests/test_app_container.py"],
+            ["src/app_container.py"],
+            {
+                "src/app_container.py": b"changed-fix",
+                "src/app_container_config.py": b"unchanged-config",
+            },
+            {"src/app_container_config.py": b"unchanged-config"},
+        ),
+        (
+            ["src/model_settings_modal.py", "src/model_settings.css"],
+            ["tests/test_model_settings_modal.py"],
+            ["src/model_settings_modal.py"],
+            {
+                "src/model_settings_modal.py": b"changed-modal",
+                "src/model_settings.css": b"unchanged-css",
+                "tests/test_model_settings_modal.py": b"unchanged-test",
+            },
+            {
+                "src/model_settings.css": b"unchanged-css",
+                "tests/test_model_settings_modal.py": b"unchanged-test",
+            },
+        ),
+    ],
+    ids=["appcontainer_style", "model_settings_style"],
+)
+def test_optional_authorized_helper_unchanged_does_not_fail_finalization(
+    tmp_path: Path,
+    production_paths: list[str],
+    test_paths: list[str],
+    mandatory_changed_outputs: list[str],
+    files: dict[str, bytes],
+    unchanged_baselines: dict[str, bytes],
+) -> None:
+    """End-to-end AppContainer/Model-Settings regression: the worker changes
+    only the declared mandatory file; every other authorized-but-optional
+    production/test path stays byte-identical, and finalization must observe
+    only the explicitly declared mandatory change, not the full authorized
+    write scope."""
+    expanded = task_templates.expand_template(
+        "implementation_with_tests",
+        production_paths=production_paths,
+        test_paths=test_paths,
+        mandatory_changed_outputs=mandatory_changed_outputs,
+    )
+    workspace = _seeded_workspace(
+        tmp_path,
+        files=files,
+        baselines={
+            relative: hashlib.sha256(content).hexdigest()
+            for relative, content in unchanged_baselines.items()
+        },
+        allowed_writes=tuple(expanded["allowed_writes"]),
+    )
+    records = process_launcher.validate_required_outputs(
+        workspace, expanded["required_outputs"]
+    )
+    assert {record["path"] for record in records} == set(mandatory_changed_outputs)
+
+
+def test_validate_required_outputs_existing_mandatory_file_edited_from_old_baseline(
+    tmp_path: Path,
+) -> None:
+    """Reproduce the primary real-world accepted path: the mandatory output
+    already existed before the change (a real pre-edit baseline hash), and
+    the worker edited its bytes. This must validate cleanly, distinct from
+    the no-baseline (newly created file) and unchanged-baseline (no-op)
+    shapes already covered above."""
+    workspace = _seeded_workspace(
+        tmp_path,
+        files={"src/app_container.py": b"changed-fix"},
+        baselines={"src/app_container.py": hashlib.sha256(b"original-fix").hexdigest()},
+    )
+    expanded = task_templates.expand_template(
+        "implementation_with_tests",
+        production_paths=["src/app_container.py"],
+        test_paths=["tests/test_app_container.py"],
+        mandatory_changed_outputs=["src/app_container.py"],
+    )
+    records = process_launcher.validate_required_outputs(
+        workspace, expanded["required_outputs"]
+    )
+    assert {record["path"] for record in records} == {"src/app_container.py"}
+
+
+def test_appcontainer_style_explicit_mandatory_output_unchanged_fails_closed_with_evidence(
+    tmp_path: Path,
+) -> None:
+    """When the explicitly declared mandatory output is left unchanged,
+    finalization must still fail closed, and the diagnostics must retain the
+    primary validation result (records that did pass) alongside the
+    mismatch, never discarding it."""
+    expanded = task_templates.expand_template(
+        "implementation_with_tests",
+        production_paths=["src/app_container.py", "src/app_container_config.py"],
+        test_paths=["tests/test_app_container.py"],
+        mandatory_changed_outputs=["src/app_container.py"],
+    )
+    workspace = _seeded_workspace(
+        tmp_path,
+        files={
+            "src/app_container.py": b"unchanged-fix",
+            "src/app_container_config.py": b"unchanged-config",
+        },
+        baselines={
+            "src/app_container.py": hashlib.sha256(b"unchanged-fix").hexdigest(),
+            "src/app_container_config.py": hashlib.sha256(
+                b"unchanged-config"
+            ).hexdigest(),
+        },
+        allowed_writes=tuple(expanded["allowed_writes"]),
+    )
+    with pytest.raises(
+        process_launcher.WorkspaceError, match="required_output_mismatch"
+    ) as excinfo:
+        process_launcher.validate_required_outputs(
+            workspace, expanded["required_outputs"]
+        )
+    diagnostics = json.loads(str(excinfo.value).split(":", 1)[1])
+    assert diagnostics["unchanged_mandatory_outputs"] == ["src/app_container.py"]
+    assert diagnostics["primary_validation_result"] == []

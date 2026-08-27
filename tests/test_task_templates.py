@@ -1103,3 +1103,96 @@ def test_unchanged_required_traversal_to_non_test_output_is_allowed():
     reject_unchanged_public_test_outputs(
         ["tests/../src/a.py"], ["src/a.py", "tests/test_a.py"]
     )
+
+
+# --- NF-2026-00456: allowed_writes/write_set is authenticated read/write
+# *scope*, never an implicit assertion that every path in it must change.
+# required_outputs is the (by default empty) narrow subset a downstream
+# finalizer must observe as changed, and a path only lands there when it is
+# explicitly passed via mandatory_changed_outputs. ------------------------
+
+
+def test_mandatory_changed_outputs_default_to_empty_required_outputs():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/app_container.py", "src/app_container_config.py"],
+        test_paths=["tests/test_app_container.py"],
+    )
+    assert card["allowed_writes"] == [
+        "src/app_container.py",
+        "src/app_container_config.py",
+        "tests/test_app_container.py",
+    ]
+    assert card["write_set"] == card["allowed_writes"]
+    assert card["required_outputs"] == []
+
+
+def test_mandatory_changed_output_out_of_scope_fails_closed():
+    with pytest.raises(
+        TaskTemplateError, match="mandatory_changed_output_out_of_scope"
+    ):
+        expand_template(
+            "implementation_with_tests",
+            production_paths=["src/app_container.py"],
+            test_paths=["tests/test_app_container.py"],
+            mandatory_changed_outputs=["src/not_in_scope.py"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("production_paths", "test_paths", "mandatory_changed_outputs"),
+    [
+        (
+            ["src/app_container.py", "src/app_container_config.py"],
+            ["tests/test_app_container.py"],
+            ["src/app_container.py"],
+        ),
+        (
+            ["src/model_settings_modal.py", "src/model_settings.css"],
+            ["tests/test_model_settings_modal.py"],
+            ["src/model_settings_modal.py"],
+        ),
+    ],
+    ids=["appcontainer_style", "model_settings_style"],
+)
+def test_optional_authorized_path_stays_unchanged_eligible(
+    production_paths, test_paths, mandatory_changed_outputs
+):
+    """Reproduce the AppContainer/Model-Settings regressions: an unrelated
+    production or test path a worker is merely authorized to touch must not
+    become a mandatory-change target just because it shares write scope with
+    the declared fix file."""
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=production_paths,
+        test_paths=test_paths,
+        mandatory_changed_outputs=mandatory_changed_outputs,
+    )
+    assert card["allowed_writes"] == [*production_paths, *test_paths]
+    assert card["required_outputs"] == mandatory_changed_outputs
+    for path in card["allowed_writes"]:
+        if path not in mandatory_changed_outputs:
+            assert path not in card["required_outputs"]
+
+
+def test_mandatory_changed_outputs_can_select_a_test_path():
+    card = expand_template(
+        "bugfix_with_regression",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+        mandatory_changed_outputs=["tests/test_a.py"],
+    )
+    assert card["required_outputs"] == ["tests/test_a.py"]
+    assert "src/a.py" not in card["required_outputs"]
+
+
+def test_mandatory_changed_outputs_partially_out_of_scope_fails_closed():
+    with pytest.raises(
+        TaskTemplateError, match="mandatory_changed_output_out_of_scope"
+    ):
+        expand_template(
+            "bugfix_with_regression",
+            production_paths=["src/a.py"],
+            test_paths=["tests/test_a.py"],
+            mandatory_changed_outputs=["src/a.py", "src/not_in_scope.py"],
+        )
