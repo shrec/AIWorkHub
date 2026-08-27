@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import capture_adapters, context_graph
+from . import capture_adapters, context_graph, feature_settings
 
 _PROVIDER = "claude"
 _EVENT_TYPE = "chat_message"
@@ -131,9 +131,17 @@ def capture_claude_records(
     mid-batch and discard every good record alongside it.  A visible ``rejected``
     count lets an operator tell a quiet repository from a rejected batch.
     """
-    descriptor = capture_adapters.adapter(_PROVIDER) or {}
     counts = {"seen": 0, "captured": 0, "idempotent": 0, "skipped": 0, "rejected": 0}
     rejected_records: list[dict[str, str]] = []
+    if not feature_settings.enabled(repo, "context_graph"):
+        return {
+            **feature_settings.disabled_result("context_graph"),
+            "provider": _PROVIDER,
+            "rejected_records": rejected_records,
+            **counts,
+        }
+
+    descriptor = capture_adapters.adapter(_PROVIDER) or {}
     if not capture_adapters.is_configured(_PROVIDER):
         # No capture path for this provider; report the state, capture nothing.
         return {

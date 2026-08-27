@@ -192,14 +192,64 @@ def test_claude_capture_skips_malformed_session_id_and_keeps_the_batch(tmp_path:
     assert context_graph.status(repo)["events"] == 2
 
 
-def test_claude_capture_fails_closed_when_context_graph_disabled(tmp_path: Path) -> None:
+def test_claude_capture_reports_disabled_without_consuming_records(tmp_path: Path) -> None:
     repo = _repo(tmp_path)  # context_graph feature left disabled
 
-    summary = context_capture.capture_claude_records(repo, _records())
+    def records():
+        raise AssertionError("disabled capture must not consume records")
+        yield from ()
 
-    assert summary["captured"] == 0
-    assert summary["skipped"] == 5
+    summary = context_capture.capture_claude_records(repo, records())
+
+    assert summary == {
+        **feature_settings.disabled_result("context_graph"),
+        "provider": "claude",
+        "seen": 0,
+        "captured": 0,
+        "idempotent": 0,
+        "skipped": 0,
+        "rejected": 0,
+        "rejected_records": [],
+    }
     assert context_graph.status(repo) == feature_settings.disabled_result("context_graph")
+
+
+def test_claude_capture_enabled_empty_records_is_final_items(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _enable(repo)
+
+    summary = context_capture.capture_claude_records(repo, [])
+
+    assert summary == {
+        "ok": True,
+        "provider": "claude",
+        "state": "final_items",
+        "seen": 0,
+        "captured": 0,
+        "idempotent": 0,
+        "skipped": 0,
+        "rejected": 0,
+        "rejected_records": [],
+    }
+
+
+def test_claude_capture_enabled_non_projectable_records_count_real_skips(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _enable(repo)
+
+    summary = context_capture.capture_claude_records(repo, _records()[2:])
+
+    assert summary == {
+        "ok": True,
+        "provider": "claude",
+        "state": "final_items",
+        "seen": 3,
+        "captured": 0,
+        "idempotent": 0,
+        "skipped": 3,
+        "rejected": 0,
+        "rejected_records": [],
+    }
 
 
 def test_extract_ignores_non_final_records() -> None:
