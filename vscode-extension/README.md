@@ -12,14 +12,16 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.62
+## What's new in 0.10.63
 
-- Required-output failures arrive as one complete structured diagnostic, so
-  rework can repair missing, unchanged and out-of-scope outputs together.
-- Sparse validation retains local CommonJS JavaScript/JSON dependencies and
-  uses the trusted Python runtime across restricted hosts.
-- A measured self-hosting recovery rule permits a minimal validated replacement
-  build when the installed Task MCP/plugin itself blocks development.
+- Model settings stay responsive and visually stable while provider and model
+  switches change.
+- Native Codex capability discovery, quality reviews and audited task reroutes
+  keep recovery on observable canonical routes.
+- Complete worker outcomes and production failure learning distinguish code,
+  validation, provider and runtime failures.
+- Context capture state, owner-manifest reads and deterministic validation
+  replay now enforce their contracts with focused regression coverage.
 
 ## Architecture at a glance
 

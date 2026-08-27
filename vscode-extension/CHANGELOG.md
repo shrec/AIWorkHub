@@ -1,5 +1,29 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.63 — 2026-08-27
+
+### Added
+
+- Native Codex model capability observation and audited task launch-identity
+  rerouting keep recovery on canonical provider routes.
+- Failure-learning telemetry and complete worker outcome categories make task
+  failures and active states diagnosable without collapsing distinct causes.
+
+### Fixed
+
+- The model selector remains responsive and dimensionally stable while model
+  and provider toggles change.
+- Native Codex reviewers can run through the canonical quality-review topic.
+- Context capture reports disabled and skipped states truthfully.
+- Owner-manifest reads reject post-read path replacement races.
+- Deterministic validation replay and Source Graph mode documentation stay
+  aligned with their canonical contracts.
+
+### Known limitations
+
+- NF-2026-00448 and its dependent Windows AppContainer runtime are explicitly
+  excluded and remain open; this release makes no completed AppContainer claim.
+
 ## 0.10.62 — 2026-08-27
 
 ### Fixed

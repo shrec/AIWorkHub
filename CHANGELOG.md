@@ -6,6 +6,40 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.63] - 2026-08-27
+
+### Added
+
+- Native Codex capability probing now observes authenticated model catalogs
+  without inference calls and keeps repository routing aligned with enabled
+  provider policy.
+- Production failure learning classifies provider, runtime, validation and
+  candidate-code failures into durable evidence for later routing decisions.
+- Daily worker outcomes expose the complete terminal category set instead of
+  collapsing activity into three broad buckets.
+
+### Fixed
+
+- The model-settings selector keeps a stable responsive layout and visual
+  state while provider and model toggles change.
+- Native Codex quality reviews are admitted through the canonical runner/topic
+  policy, and explicit audited launch-identity reroutes can recover a terminal
+  retry without replacing its task history.
+- Context capture distinguishes a disabled feature from a real enabled skip,
+  preserving truthful counters and generator consumption.
+- Runtime owner-manifest reads revalidate file-descriptor and path identity
+  after bounded reads, closing replacement races before parsed data is used.
+- Hash-pinned validation replays and required-output checks preserve their
+  exact scope while allowing provider-free deterministic verification.
+- Source Graph documentation now derives its advertised mode count from the
+  canonical 37-mode contract.
+
+### Known limitations
+
+- Nested Windows validation metadata handling and the dependent native Windows
+  AppContainer runtime remain excluded from this release while NF-2026-00448
+  stays open; no completed AppContainer isolation claim is made for 0.10.63.
+
 ## [0.10.62] - 2026-08-27
 
 ### Fixed
