@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -103,6 +104,132 @@ def test_provision_request_temp_layout_and_owner_manifest(tmp_path: Path) -> Non
     other = runtime_temp.provision_request_temp(repo, "req-other", namespace="worker")
     assert other.root != layout.root
     assert list(layout.root.iterdir())  # first request dir still intact and isolated
+
+
+def test_read_owner_manifest_rejects_fifo_promptly(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo") or not hasattr(os, "fork"):
+        pytest.skip("requires POSIX FIFO and fork support")
+
+    owner_dir = tmp_path / "owner"
+    owner_dir.mkdir()
+    os.mkfifo(owner_dir / runtime_temp.OWNER_MANIFEST_NAME)
+
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        try:
+            result = runtime_temp.read_owner_manifest(owner_dir)
+            os.write(write_fd, b"1" if result is None else b"0")
+        finally:
+            os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    deadline = time.monotonic() + 1
+    pid = 0
+    status = 0
+    try:
+        while time.monotonic() < deadline:
+            pid, status = os.waitpid(child, os.WNOHANG)
+            if pid:
+                break
+            time.sleep(0.01)
+        assert pid == child
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert os.read(read_fd, 1) == b"1"
+    finally:
+        os.close(read_fd)
+        if pid == 0:
+            try:
+                os.kill(child, 9)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child, os.WNOHANG)
+            except ChildProcessError:
+                pass
+
+
+def test_read_owner_manifest_rejects_special_symlink_and_oversized(
+    tmp_path: Path,
+) -> None:
+    valid = _write_manifest(tmp_path / "valid", "valid", pid=111, starttime=111)
+    assert runtime_temp.read_owner_manifest(valid)["request_id"] == "valid"
+
+    symlinked = tmp_path / "symlinked"
+    symlinked.mkdir()
+    os.symlink(
+        valid / runtime_temp.OWNER_MANIFEST_NAME,
+        symlinked / runtime_temp.OWNER_MANIFEST_NAME,
+    )
+    assert runtime_temp.read_owner_manifest(symlinked) is None
+
+    directory_manifest = tmp_path / "directory-manifest"
+    (directory_manifest / runtime_temp.OWNER_MANIFEST_NAME).mkdir(parents=True)
+    assert runtime_temp.read_owner_manifest(directory_manifest) is None
+
+    oversized = tmp_path / "oversized"
+    oversized.mkdir()
+    (oversized / runtime_temp.OWNER_MANIFEST_NAME).write_text(
+        "{" + " " * runtime_temp.MAX_MANIFEST_BYTES + "}",
+        encoding="utf-8",
+    )
+    assert runtime_temp.read_owner_manifest(oversized) is None
+
+
+def test_read_owner_manifest_rejects_lstat_open_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner_dir = _write_manifest(tmp_path / "race", "race", pid=111, starttime=111)
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text(
+        json.dumps({
+            "schema_id": runtime_temp.OWNER_SCHEMA_ID,
+            "request_id": "replacement",
+        }),
+        encoding="utf-8",
+    )
+    original = owner_dir / runtime_temp.OWNER_MANIFEST_NAME
+    assert original.stat().st_ino != replacement.stat().st_ino
+    real_open = os.open
+
+    def swap_before_open(path, flags, mode=0o777, *, dir_fd=None):
+        os.replace(replacement, owner_dir / runtime_temp.OWNER_MANIFEST_NAME)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(runtime_temp.os, "open", swap_before_open)
+    assert runtime_temp.read_owner_manifest(owner_dir) is None
+
+
+def test_read_owner_manifest_rejects_post_read_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner_dir = _write_manifest(
+        tmp_path / "post-read-race", "race", pid=111, starttime=111
+    )
+    replacement_dir = _write_manifest(
+        tmp_path / "post-read-replacement", "replacement", pid=222, starttime=222
+    )
+    original = owner_dir / runtime_temp.OWNER_MANIFEST_NAME
+    replacement = replacement_dir / runtime_temp.OWNER_MANIFEST_NAME
+    assert original.stat().st_ino != replacement.stat().st_ino
+    real_read = os.read
+    replaced = False
+
+    def swap_after_read(fd: int, n: int) -> bytes:
+        nonlocal replaced
+        raw = real_read(fd, n)
+        if not replaced:
+            os.replace(replacement, original)
+            replaced = True
+        return raw
+
+    monkeypatch.setattr(runtime_temp.os, "read", swap_after_read)
+    assert runtime_temp.read_owner_manifest(owner_dir) is None
+    assert replaced is True
 
 
 def test_owner_alive_live_dead_reused_and_unknown(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -364,20 +364,71 @@ def write_owner_manifest(root: Path, request_id: str, repo: Path) -> dict[str, A
     return manifest
 
 
+def _manifest_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(info.st_dev),
+        int(info.st_ino),
+        int(info.st_mode),
+        int(info.st_nlink),
+        int(info.st_uid),
+        int(info.st_gid),
+        int(info.st_size),
+        int(info.st_mtime_ns),
+        int(info.st_ctime_ns),
+    )
+
+
 def read_owner_manifest(directory: Path) -> dict[str, Any] | None:
     """Return a valid owner manifest, or None for an unknown/invalid owner."""
     path = Path(directory) / OWNER_MANIFEST_NAME
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd: int | None = None
     try:
         info = path.lstat()
-        value = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_size > MAX_MANIFEST_BYTES
+        ):
+            return None
+
+        pre_identity = _manifest_identity(info)
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        after = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _manifest_identity(opened) != pre_identity
+            or _manifest_identity(after) != pre_identity
+            or opened.st_size > MAX_MANIFEST_BYTES
+        ):
+            return None
+
+        raw = os.read(fd, MAX_MANIFEST_BYTES + 1)
+        if len(raw) > MAX_MANIFEST_BYTES:
+            return None
+
+        reread_opened = os.fstat(fd)
+        reread_path = path.lstat()
+        if (
+            not stat.S_ISREG(reread_opened.st_mode)
+            or not stat.S_ISREG(reread_path.st_mode)
+            or _manifest_identity(reread_opened) != pre_identity
+            or _manifest_identity(reread_path) != pre_identity
+            or reread_opened.st_size > MAX_MANIFEST_BYTES
+        ):
+            return None
+
+        value = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    if (
-        stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISREG(info.st_mode)
-        or info.st_size > MAX_MANIFEST_BYTES
-    ):
-        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     if not isinstance(value, dict) or value.get("schema_id") != OWNER_SCHEMA_ID:
         return None
     return value
