@@ -2562,9 +2562,10 @@ tbody tr.is-selected td:first-child {
 @media (max-width: 620px) {
   .settings-row { align-items: flex-start; gap: 10px; padding: 9px; }
   .settings-model-route { width: calc(100% - 8px); margin-left: 8px; }
-  .settings-copy small { overflow-wrap: anywhere; }
   .switch-control { flex: 0 0 auto; margin-top: 2px; }
   .settings-footnote { height: auto; min-height: 40px; overflow-wrap: anywhere; }
+  .settings-metric-grid,
+  .settings-language-grid { grid-template-columns: 1fr; }
 }
 
 .settings-group-heading {
@@ -2599,6 +2600,7 @@ tbody tr.is-selected td:first-child {
 .settings-copy strong {
   color: var(--ink);
   font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
 }
 
 .settings-copy small,
@@ -2606,6 +2608,7 @@ tbody tr.is-selected td:first-child {
   color: var(--muted);
   font-size: var(--fs-2xs);
   line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .settings-footnote {

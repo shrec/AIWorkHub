@@ -4054,8 +4054,78 @@ const FEATURE_LABELS = Object.freeze({
   context_graph: ["Manager Context Graph", "Manager-only append-only conversation ledger with deterministic graph projection and bounded retrieval. Worker sessions are excluded."],
 });
 
+// Identifies a settings-list control by the data it renders from (not by DOM
+// node identity, which replaceChildren always destroys) so focus can follow
+// the same logical control -- feature flag, provider, model route or
+// language -- across a full settings re-render.
+function settingsControlIdentity(element) {
+  if (!element || !element.dataset) return null;
+  if (element.dataset.settingsTab) return `tab:${element.dataset.settingsTab}`;
+  if (element.dataset.modelProvider && (element.dataset.modelAdapter || element.dataset.modelName)) {
+    return `model-route:${element.dataset.modelProvider}|${element.dataset.modelAdapter || ""}|${element.dataset.modelName || ""}`;
+  }
+  if (element.dataset.modelProvider) return `model-provider:${element.dataset.modelProvider}`;
+  if (element.dataset.sourceGraphLanguage) return `sg-language:${element.dataset.sourceGraphLanguage}`;
+  if (element.dataset.featureSetting) return `feature:${element.dataset.featureSetting}`;
+  return null;
+}
+
+function settingsControlProvider(identity) {
+  if (!identity) return null;
+  if (identity.startsWith("model-provider:")) return identity.slice("model-provider:".length);
+  if (identity.startsWith("model-route:")) return identity.slice("model-route:".length).split("|")[0];
+  return null;
+}
+
+function settingsControlSection(identity) {
+  if (!identity) return null;
+  if (identity.startsWith("tab:")) return identity.slice("tab:".length);
+  if (identity.startsWith("model-provider:") || identity.startsWith("model-route:")) return "models";
+  if (identity.startsWith("sg-language:")) return "source-graph";
+  if (identity.startsWith("feature:")) return "features";
+  return null;
+}
+
+// Re-focuses the control matching `previousIdentity` in the freshly rendered
+// settings list. When that exact row no longer exists (its provider or
+// route was toggled away), falls back first to a surviving control under the
+// same provider, then to that section's tab button, so focus always lands on
+// a real, currently visible control instead of escaping the open dialog.
+function restoreSettingsFocus(previousIdentity) {
+  if (!previousIdentity) return;
+  const controls = Array.from(elements.settingsList.querySelectorAll("input"));
+  const exact = controls.find((control) => settingsControlIdentity(control) === previousIdentity);
+  if (exact) {
+    exact.focus();
+    return;
+  }
+  const provider = settingsControlProvider(previousIdentity);
+  if (provider) {
+    const sibling = controls.find((control) => settingsControlProvider(settingsControlIdentity(control)) === provider);
+    if (sibling) {
+      sibling.focus();
+      return;
+    }
+  }
+  const section = settingsControlSection(previousIdentity);
+  const tabButton = section
+    ? Array.from(elements.settingsList.querySelectorAll("[data-settings-tab]")).find((button) => button.dataset.settingsTab === section)
+    : null;
+  if (tabButton) {
+    tabButton.focus();
+    return;
+  }
+  elements.settingsDialog.focus();
+}
+
 function renderSettings(payload) {
+  const activeControl = elements.settingsList.contains(document.activeElement)
+    ? document.activeElement
+    : null;
+  const previousIdentity = settingsControlIdentity(activeControl);
   const previousScrollTop = elements.settingsList.scrollTop;
+  const previousDialogScrollTop = elements.settingsDialog.scrollTop;
+  const previousPageScrollTop = document.scrollingElement ? document.scrollingElement.scrollTop : 0;
   if (!payload || payload.ok !== true || !payload.features) {
     state.featureSettings = null;
     elements.settingsSummary.textContent = (payload && payload.error) || "Settings unavailable";
@@ -4278,6 +4348,11 @@ function renderSettings(payload) {
   for (const section of Object.values(sections)) fragment.appendChild(section);
   elements.settingsList.replaceChildren(fragment);
   elements.settingsList.scrollTop = Math.min(previousScrollTop, elements.settingsList.scrollHeight);
+  elements.settingsDialog.scrollTop = previousDialogScrollTop;
+  if (document.scrollingElement) {
+    document.scrollingElement.scrollTop = previousPageScrollTop;
+  }
+  restoreSettingsFocus(previousIdentity);
 }
 
 // ── Fixed-enum inbound message handling from the extension host ───────────
