@@ -64,7 +64,12 @@ def test_route_is_ready_unverified_until_quota_is_actually_observed(monkeypatch)
     )
 
     result = repo_policy._provider_status(
-        Path("."), "claude_cli", _POLICY, "landlock", ""
+        Path("."),
+        "claude_cli",
+        _POLICY,
+        "landlock",
+        "",
+        model_policy={"providers": {}, "adapters": {}, "models": {}},
     )
 
     assert result["launchable"] is True
@@ -100,7 +105,12 @@ def test_route_is_ready_only_when_quota_was_observed(monkeypatch) -> None:
     )
 
     result = repo_policy._provider_status(
-        Path("."), "claude_cli", _POLICY, "landlock", ""
+        Path("."),
+        "claude_cli",
+        _POLICY,
+        "landlock",
+        "",
+        model_policy={"providers": {}, "adapters": {}, "models": {}},
     )
 
     assert result["quota_observed"] is True

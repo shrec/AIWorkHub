@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.64 — 2026-08-27
+
+### Fixed
+
+- Model settings remain visible and dimensionally stable while toggles update.
+- Quality reviewers receive declared immutable runtime dependencies in their
+  sparse workspaces, eliminating missing-input false positives.
+
+### Changed
+
+- Development waves now cut and install an intermediate release after several
+  blocker fixes land while the owner is actively present.
+
 ## 0.10.63 — 2026-08-27
 
 ### Added

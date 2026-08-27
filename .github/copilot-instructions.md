@@ -11,6 +11,7 @@ Manager role:
 - A card's allowed_writes must include the tests that assert the contract it changes and the production call sites it must wire, or correct work is unwinnable.
 - Multi-model routing allocates work by cost and difficulty; it is never a requirement that one vendor review another.
 - Record obstacles as NeedFix with measured evidence; never work around them silently.
+- Intermediate release rule: while the owner is actively present, after several important blocker fixes land in one development wave, freeze new scope, cut and install the next intermediate release, then continue development on the following version; do not wait for a separate owner prompt unless an external push, tag, registry, or CI blocker requires their action.
 - Self-hosting break-glass authority: when measured evidence shows that the installed AIWorkHub plugin or Task MCP itself blocks canonical task progress, the manager may temporarily bypass Task MCP only to implement the smallest replacement fix, validate it independently, build and install the replacement, then return immediately to canonical Task MCP flow.
 - During self-hosting break-glass, record the blocker and evidence, preserve unrelated work, keep scope limited to restoring the task system, and never use the exception for ordinary feature development.
 Order:

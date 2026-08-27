@@ -6,6 +6,28 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.64] - 2026-08-27
+
+### Fixed
+
+- Repository model settings keep a stable modal body, dimensions and rendered
+  state while provider/model switches change, avoiding blank or black redraws.
+- Quality-review sparse workspaces now materialize declared read-only inputs,
+  so reviewers can execute candidate regressions against immutable runtime
+  dependencies instead of reporting missing-file false positives.
+
+### Changed
+
+- The manager now freezes scope and cuts an intermediate release after several
+  important blocker fixes land while the owner is actively present, then
+  continues development on the next version.
+
+### Known limitations
+
+- NF-2026-00467, NF-2026-00474, NF-2026-00475, NF-2026-00478 and the final
+  NF-2026-00482 review remain explicitly deferred to 0.10.65; their unaccepted
+  isolated-workspace deltas are not included in this release.
+
 ## [0.10.63] - 2026-08-27
 
 ### Added

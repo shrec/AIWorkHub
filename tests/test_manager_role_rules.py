@@ -41,6 +41,7 @@ ROLE_STATEMENTS = (
     "the production call sites it must wire",
     "it is never a requirement that one vendor review another",
     "Record obstacles as NeedFix with measured evidence",
+    "Intermediate release rule:",
 )
 
 
