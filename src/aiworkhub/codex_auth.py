@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
+from .platform_io import background_process_launch_kwargs
+
 
 POSITIVE_CACHE_TTL_SECONDS = 300.0
 NEGATIVE_CACHE_TTL_SECONDS = 30.0
@@ -102,6 +104,7 @@ def _login_ready(path: str) -> bool:
             check=False,
             shell=False,
             timeout=LOGIN_TIMEOUT_SECONDS,
+            **background_process_launch_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -232,6 +235,7 @@ def _probe_app_server(path: str) -> tuple[bool, list[str]]:
             stderr=subprocess.DEVNULL,
             shell=False,
             close_fds=True,
+            **background_process_launch_kwargs(),
         )
     except OSError as exc:
         raise _ProbeError("codex_app_server_start_failed") from exc

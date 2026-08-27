@@ -11,6 +11,28 @@ import pytest
 from aiworkhub import platform_io
 
 
+def test_background_process_launch_kwargs_dispatches_exactly_by_platform(monkeypatch):
+    startup = SimpleNamespace(dwFlags=0, wShowWindow=None)
+    monkeypatch.setattr(
+        platform_io.subprocess, "STARTUPINFO", lambda: startup, raising=False
+    )
+    monkeypatch.setattr(
+        platform_io.subprocess, "STARTF_USESHOWWINDOW", 4, raising=False
+    )
+    monkeypatch.setattr(platform_io.subprocess, "SW_HIDE", 0, raising=False)
+    monkeypatch.setattr(platform_io.subprocess, "CREATE_NO_WINDOW", 8, raising=False)
+
+    assert platform_io.background_process_launch_kwargs("nt") == {
+        "creationflags": 8,
+        "startupinfo": startup,
+    }
+    assert startup.dwFlags == 4
+    assert startup.wShowWindow == 0
+    assert platform_io.background_process_launch_kwargs("posix") == {
+        "start_new_session": True,
+    }
+
+
 def test_windows_pid_probe_is_non_signalling():
     if os.name != "nt":
         return

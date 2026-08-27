@@ -12,6 +12,29 @@ import pytest
 from aiworkhub import codex_auth
 
 
+def test_probes_forward_shared_background_launch_policy(monkeypatch):
+    marker = {"start_new_session": True}
+    calls = []
+    monkeypatch.setattr(codex_auth, "background_process_launch_kwargs", lambda: marker)
+
+    def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(codex_auth.subprocess, "run", run)
+    assert codex_auth._login_ready("codex") is True
+    assert calls[-1][1]["start_new_session"] is True
+
+    def popen(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise OSError("stop after capture")
+
+    monkeypatch.setattr(codex_auth.subprocess, "Popen", popen)
+    with pytest.raises(codex_auth._ProbeError, match="codex_app_server_start_failed"):
+        codex_auth._probe_app_server("codex")
+    assert calls[-1][1]["start_new_session"] is True
+
+
 def _line(request_id: int, result: dict) -> bytes:
     return json.dumps({"id": request_id, "result": result}).encode() + b"\n"
 

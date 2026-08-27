@@ -60,6 +60,27 @@ import _taskdb_compat as taskdb  # noqa: E402
 FAKE_SERVER = Path(__file__).resolve().parent / "_fake_app_server.py"
 
 
+def test_app_server_client_forwards_shared_background_launch_policy(
+    monkeypatch, tmp_path
+):
+    marker = {"start_new_session": True}
+    captured = {}
+    monkeypatch.setattr(
+        callback_bridge, "background_process_launch_kwargs", lambda: marker
+    )
+
+    def popen(*args, **kwargs):
+        captured.update(kwargs)
+        raise OSError("stop after capture")
+
+    monkeypatch.setattr(callback_bridge.subprocess, "Popen", popen)
+    with pytest.raises(callback_bridge.AppServerError):
+        callback_bridge.AppServerClient(repo=tmp_path).start()
+    assert captured["start_new_session"] is True
+    assert captured["cwd"] == str(tmp_path)
+    assert captured["bufsize"] == 0
+
+
 def _fake_executable(extra_args: list[str] | None = None) -> list[str]:
     # Every caller spawns a real _fake_app_server.py subprocess (AppServerClient
     # / _batch_bridge / _SidebandHarness) and drives stdio/socket handshakes.

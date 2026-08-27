@@ -116,8 +116,10 @@ if os.name == "nt":  # pragma: no cover - imported only on Windows hosts
     import ctypes.wintypes as wintypes
 
 try:
-    from .platform_io import chmod_fd
+    from .platform_io import background_process_launch_kwargs, chmod_fd
 except ImportError:  # direct-script Codex mux entrypoint
+    from platform_io import background_process_launch_kwargs
+
     def chmod_fd(fd: int, mode: int) -> None:
         fchmod = getattr(os, "fchmod", None)
         if fchmod is not None:
@@ -422,7 +424,11 @@ def _bind_child_lifetime_to_this_process(child: subprocess.Popen[Any]) -> int | 
 def _hold_passthrough_child(real_executable: str, argv: list[str]) -> int:
     """Keep the Windows PID tracked by VS Code alive until Codex exits."""
 
-    child = subprocess.Popen([real_executable, *argv], shell=False)
+    child = subprocess.Popen(
+        [real_executable, *argv],
+        shell=False,
+        **background_process_launch_kwargs(),
+    )
     job_handle = _bind_child_lifetime_to_this_process(child)
     try:
         return int(child.wait())
@@ -1459,6 +1465,7 @@ class AppServerMux:
             stderr=None,  # inherited -- transparent stderr proxy, no active pumping needed
             bufsize=0,
             cwd=str(self._repo_root) if self._repo_root is not None else None,
+            **background_process_launch_kwargs(),
         )
         self._child_job_handle = _bind_child_lifetime_to_this_process(self._child)
         child_start = _proc_start_time(self._child.pid)

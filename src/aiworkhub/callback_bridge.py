@@ -72,6 +72,7 @@ from .app_server_mux import (
     describe_sideband_owner_freshness,
     find_owning_sideband_instances,
 )
+from .platform_io import background_process_launch_kwargs
 from .route_identity import CoordinatorRouteKey, fail_on_incomplete_coordinator_route
 
 CALLBACK_ELIGIBLE_STATES: frozenset[str] = frozenset({
@@ -1248,8 +1249,8 @@ class AppServerClient:
                 stderr=subprocess.DEVNULL,
                 cwd=str(self._repo),
                 shell=False,
-                start_new_session=True,
                 bufsize=0,
+                **background_process_launch_kwargs(),
             )
             if os.name == "nt":
                 self._stdout_queue = queue.Queue()

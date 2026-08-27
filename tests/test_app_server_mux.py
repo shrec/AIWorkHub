@@ -48,6 +48,33 @@ FAKE_SERVER = Path(__file__).resolve().parent / "_fake_app_server.py"
 MUX_MODULE = Path(__file__).resolve().parents[1] / "src" / "aiworkhub" / "app_server_mux.py"
 
 
+def test_mux_child_forwards_shared_background_launch_policy(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(
+        app_server_mux,
+        "background_process_launch_kwargs",
+        lambda: {"start_new_session": True},
+    )
+
+    def popen(*args, **kwargs):
+        captured.update(kwargs)
+        raise OSError("stop after capture")
+
+    monkeypatch.setattr(app_server_mux.subprocess, "Popen", popen)
+    mux = AppServerMux(
+        ["app-server", "--stdio"],
+        repo_id="repo",
+        repo_root=tmp_path,
+        real_executable="codex",
+        sideband_dir=tmp_path / "sideband",
+    )
+    with pytest.raises(OSError, match="stop after capture"):
+        mux.start()
+    assert captured["start_new_session"] is True
+    assert captured["cwd"] == str(tmp_path)
+    assert captured["bufsize"] == 0
+
+
 def _fake_child_executable(extra_args: list[str] | None = None) -> list[str]:
     return [sys.executable, str(FAKE_SERVER), *(extra_args or [])]
 
@@ -244,6 +271,7 @@ def test_non_app_server_invocation_never_touches_sideband_dir():
 
 def test_windows_passthrough_keeps_tracked_parent_until_child_exit(monkeypatch):
     events = []
+    startupinfo = object()
 
     class _Child:
         _handle = 91
@@ -252,7 +280,17 @@ def test_windows_passthrough_keeps_tracked_parent_until_child_exit(monkeypatch):
             events.append(("wait", timeout))
             return 23
 
-    monkeypatch.setattr(app_server_mux.subprocess, "Popen", lambda *args, **kwargs: _Child())
+    monkeypatch.setattr(
+        app_server_mux,
+        "background_process_launch_kwargs",
+        lambda: {"creationflags": 8, "startupinfo": startupinfo},
+    )
+
+    def popen(*args, **kwargs):
+        events.append(("popen", args, kwargs))
+        return _Child()
+
+    monkeypatch.setattr(app_server_mux.subprocess, "Popen", popen)
     monkeypatch.setattr(
         app_server_mux,
         "_bind_child_lifetime_to_this_process",
@@ -265,7 +303,16 @@ def test_windows_passthrough_keeps_tracked_parent_until_child_exit(monkeypatch):
     )
 
     assert app_server_mux._hold_passthrough_child("codex.exe", ["app-server"]) == 23
-    assert events == [("bind", 91), ("wait", None), ("close", 77)]
+    assert events == [
+        (
+            "popen",
+            (["codex.exe", "app-server"],),
+            {"shell": False, "creationflags": 8, "startupinfo": startupinfo},
+        ),
+        ("bind", 91),
+        ("wait", None),
+        ("close", 77),
+    ]
 
 
 def test_mux_shutdown_releases_its_exact_windows_job_handle(monkeypatch, tmp_path):

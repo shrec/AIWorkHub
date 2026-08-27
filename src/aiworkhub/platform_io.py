@@ -9,7 +9,34 @@ from __future__ import annotations
 
 import errno
 import os
+import subprocess
 import time
+from typing import Any, TypedDict
+
+
+class BackgroundProcessLaunchKwargs(TypedDict, total=False):
+    """Platform-specific kwargs for a supervised headless subprocess."""
+
+    creationflags: int
+    startupinfo: Any
+    start_new_session: bool
+
+
+def background_process_launch_kwargs(
+    platform_name: str | None = None,
+) -> BackgroundProcessLaunchKwargs:
+    """Return only the headless process flags supported by this platform."""
+
+    platform_name = os.name if platform_name is None else platform_name
+    if platform_name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        return {
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+            "startupinfo": startupinfo,
+        }
+    return {"start_new_session": True}
 
 
 WINDOWS_REPLACE_RETRY_SECONDS = 1.0
