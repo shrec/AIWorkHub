@@ -438,11 +438,33 @@ def _provider_status(
                 result[key] = value
         observed_models = readiness.get("observed_models")
         if isinstance(observed_models, list):
-            result["observed_models"] = [
+            provider_observed_models = [
                 str(value)[:128]
                 for value in observed_models[:128]
                 if isinstance(value, str) and value
             ]
+            eligible_observed_models = [
+                value
+                for value in provider_observed_models
+                if model_settings.evaluate_state(
+                    model_policy,
+                    provider=policy_provider,
+                    adapter=policy_adapter,
+                    model=value,
+                )
+            ]
+            result["provider_observed_models"] = provider_observed_models
+            result["observed_models"] = eligible_observed_models
+            excluded_count = len(provider_observed_models) - len(eligible_observed_models)
+            if excluded_count:
+                result[
+                    "observed_models_excluded_by_repository_model_policy"
+                ] = excluded_count
+            if provider_observed_models and not eligible_observed_models:
+                result["provider_launchable"] = result["launchable"]
+                result["launchable"] = False
+                result["status"] = "repository_model_policy_disabled"
+                result["reason"] = "all_observed_models_disabled_by_repository_model_settings"
     if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
         result["sandbox_backend"] = "vscode_lm_in_process"
     else:

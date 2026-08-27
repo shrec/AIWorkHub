@@ -905,6 +905,114 @@ def test_explicitly_enabled_copilot_codex_fallback_remains_labeled(
     assert worker["available"] is True
 
 
+def test_disabled_copilot_concrete_model_from_catalog_is_not_selectable(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    model_settings.update(
+        root,
+        provider="copilot",
+        adapter="vscode_lm",
+        model="gpt-5.5",
+        enabled=False,
+        expected_revision=0,
+    )
+    preflight = {"providers": [
+        {
+            "adapter_id": "codex_cli",
+            "launchable": False,
+            "status": "access_unavailable",
+        },
+        {
+            "adapter_id": "vscode_lm",
+            "launchable": True,
+            "access_observed": True,
+            "observed_models": ["gpt-5.5"],
+            "provider_observed_models": ["gpt-5.5"],
+            "status": "ready_unverified",
+        },
+    ]}
+
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=preflight
+    )
+    worker = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "gpt-5.5"
+    )
+    assert worker["policy_provider"] == "openai"
+    assert worker["policy_adapter"] == "codex_cli"
+    assert worker["effective_adapter_id"] == "codex_cli"
+    assert worker["available"] is False
+
+    task = workforce_router.TaskRequirements.build(
+        task_id="T-disabled-copilot-model",
+        repo_id="repo",
+        kinds=["code"],
+        risk="critical",
+        owner_model_pin="gpt-5.5",
+        tool_needs=["source-graph"],
+    )
+    decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
+    assert decision["selected_worker_id"] is None
+    assert decision["launch_contract"] is None
+
+
+def test_enabled_deepseek_copilot_route_survives_disabled_copilot_catalog_model(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    model_settings.update(
+        root,
+        provider="copilot",
+        adapter="vscode_lm",
+        model="deepseek-v4-pro",
+        enabled=False,
+        expected_revision=0,
+    )
+    model_settings.update(
+        root,
+        provider="deepseek",
+        adapter="deepseek_copilot_cli",
+        model="deepseek-v4-pro",
+        enabled=True,
+        expected_revision=1,
+    )
+
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight={"providers": [
+            {
+                "adapter_id": "deepseek_vscode_lm",
+                "launchable": False,
+                "status": "repository_model_policy_disabled",
+            },
+            {
+                "adapter_id": "vscode_lm",
+                "launchable": True,
+                "access_observed": True,
+                "observed_models": [],
+                "provider_observed_models": ["deepseek-v4-pro"],
+                "status": "repository_model_policy_disabled",
+            },
+            {
+                "adapter_id": "deepseek_copilot_cli",
+                "launchable": True,
+                "access_observed": True,
+                "status": "ready_unverified",
+            },
+        ]},
+    )
+    worker = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "deepseek-v4-pro"
+    )
+    assert worker["effective_adapter_id"] == "deepseek_copilot_cli"
+    assert worker["policy_provider"] == "deepseek"
+    assert worker["policy_enabled"] is True
+    assert worker["available"] is True
+
+
 def test_canonical_usage_rows_supply_tokens_and_labeled_unknown_cost(tmp_path: Path) -> None:
     root = _root(tmp_path)
     snapshot = workforce_catalog.build_catalog(

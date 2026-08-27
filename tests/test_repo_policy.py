@@ -317,3 +317,50 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
     serialized = json.dumps(report, sort_keys=True)
     assert "/private/host" not in serialized
     assert "executable" not in serialized
+
+
+def test_preflight_filters_disabled_observed_models_without_hiding_reachability(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _initialized_root(tmp_path)
+    model_settings_state = {
+        "providers": {},
+        "adapters": {},
+        "models": {"copilot": {"vscode_lm": {"gpt-5.5": False}}},
+    }
+    monkeypatch.setattr(
+        repo_policy.model_settings,
+        "load",
+        lambda _root: model_settings_state,
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id, "codex", True, ""
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *args, **kwargs: {
+            "launchable": True,
+            "access_observed": True,
+            "observed_models": ["gpt-5.5", "gpt-5.3-codex"],
+            "model_catalog_complete": True,
+        },
+    )
+
+    status = repo_policy._provider_status(
+        root,
+        "vscode_lm",
+        repo_policy.load_policy(root),
+        "bubblewrap",
+        "",
+    )
+
+    assert status["provider_observed_models"] == ["gpt-5.5", "gpt-5.3-codex"]
+    assert status["observed_models"] == ["gpt-5.3-codex"]
+    assert status["observed_models_excluded_by_repository_model_policy"] == 1
+    assert status["access_observed"] is True
+    assert status["launchable"] is True
