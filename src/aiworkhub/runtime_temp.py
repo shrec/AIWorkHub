@@ -386,6 +386,9 @@ def _windows_invalid_handle_value() -> int:
     return int(ctypes.c_void_p(-1).value)
 
 
+_WINDOWS_FILE_SHARE_READ = 0x00000001
+
+
 def _windows_handle_attributes(handle: int) -> int | None:
     class _ByHandleFileInformation(ctypes.Structure):
         _fields_ = [
@@ -445,7 +448,6 @@ def _valid_windows_metadata(
         or metadata.file_attributes <= 0
         or metadata.file_attributes & file_attribute_reparse_point
         or metadata.last_write_time <= 0
-        or metadata.change_time <= 0
         or metadata.end_of_file <= 0
     ):
         return None
@@ -552,7 +554,6 @@ def _windows_handle_identity(handle: int) -> tuple[int, int] | None:
 def _windows_open_manifest_handle(path: Path) -> int | None:
     file_flag_open_reparse_point = 0x00200000
     generic_read = 0x80000000
-    share_all = 0x00000001 | 0x00000002 | 0x00000004
     open_existing = 3
     file_attribute_normal = 0x80
 
@@ -570,7 +571,7 @@ def _windows_open_manifest_handle(path: Path) -> int | None:
     handle = kernel32.CreateFileW(
         str(path),
         generic_read,
-        share_all,
+        _WINDOWS_FILE_SHARE_READ,
         None,
         open_existing,
         file_attribute_normal | file_flag_open_reparse_point,

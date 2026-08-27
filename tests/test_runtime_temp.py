@@ -200,6 +200,7 @@ def test_read_owner_manifest_rejects_lstat_open_substitution(
             return real_open(path, flags, mode)
         return real_open(path, flags, mode, dir_fd=dir_fd)
 
+    monkeypatch.setattr(runtime_temp, "_is_windows", lambda: False)
     monkeypatch.setattr(runtime_temp.os, "open", swap_before_open)
     assert runtime_temp.read_owner_manifest(owner_dir) is None
 
@@ -223,10 +224,11 @@ def test_read_owner_manifest_rejects_post_read_replacement(
         nonlocal replaced
         raw = real_read(fd, n)
         if not replaced:
-            os.replace(replacement, original)
             replaced = True
+            os.replace(replacement, original)
         return raw
 
+    monkeypatch.setattr(runtime_temp, "_is_windows", lambda: False)
     monkeypatch.setattr(runtime_temp.os, "read", swap_after_read)
     assert runtime_temp.read_owner_manifest(owner_dir) is None
     assert replaced is True
@@ -286,7 +288,9 @@ def test_read_owner_manifest_windows_identity_accepts_valid_manifest(
         runtime_temp, "_windows_handle_identity", lambda value: identity
     )
     monkeypatch.setattr(
-        runtime_temp, "_windows_handle_metadata", lambda value: _windows_metadata(len(raw))
+        runtime_temp,
+        "_windows_handle_metadata",
+        lambda value: _windows_metadata(len(raw), change_time=0),
     )
     monkeypatch.setattr(runtime_temp, "_windows_close_handle", lambda value: None)
 
@@ -301,6 +305,56 @@ def test_read_owner_manifest_windows_identity_accepts_valid_manifest(
     assert manifest is not None
     assert manifest["request_id"] == "windows-valid"
     assert read_sizes == [runtime_temp.MAX_MANIFEST_BYTES + 1]
+
+
+def test_windows_open_manifest_handle_denies_write_delete_sharing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = tmp_path / runtime_temp.OWNER_MANIFEST_NAME
+    manifest.write_text("{}", encoding="utf-8")
+    calls: list[tuple[str, int, int, int, int]] = []
+
+    class CreateFileW:
+        argtypes = None
+        restype = None
+
+        def __call__(
+            self,
+            path: str,
+            access: int,
+            share_mode: int,
+            security: object,
+            creation: int,
+            flags: int,
+            template: object,
+        ) -> int:
+            del security, template
+            calls.append((path, access, share_mode, creation, flags))
+            return 4321
+
+    class Kernel32:
+        pass
+
+    kernel32 = Kernel32()
+    kernel32.CreateFileW = CreateFileW()
+
+    monkeypatch.setattr(
+        runtime_temp.ctypes,
+        "WinDLL",
+        lambda name, use_last_error=True: kernel32,
+        raising=False,
+    )
+
+    assert runtime_temp._windows_open_manifest_handle(manifest) == 4321
+    assert calls == [
+        (
+            str(manifest),
+            0x80000000,
+            runtime_temp._WINDOWS_FILE_SHARE_READ,
+            3,
+            0x80 | 0x00200000,
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -668,7 +722,7 @@ def test_read_owner_manifest_windows_rejects_same_length_in_place_rewrite(
     assert metadata_calls == 2
 
 
-@pytest.mark.parametrize("metadata_stage", ["pre-missing", "post-missing", "pre-zero"])
+@pytest.mark.parametrize("metadata_stage", ["pre-missing", "post-missing"])
 def test_read_owner_manifest_windows_fails_closed_for_missing_handle_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata_stage: str
 ) -> None:
@@ -688,8 +742,6 @@ def test_read_owner_manifest_windows_fails_closed_for_missing_handle_metadata(
             return None
         if metadata_stage == "post-missing" and calls == 2:
             return None
-        if metadata_stage == "pre-zero" and calls == 1:
-            return _windows_metadata(len(raw), change_time=0)
         return _windows_metadata(len(raw))
 
     monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
