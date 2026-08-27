@@ -3099,6 +3099,111 @@ def _validate_adapter_identity(runner: str, adapter_id: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# NF-2026-00460: canonical workforce identity table.
+#
+# The only (runner, adapter_id) pairs this process may resolve to a provider
+# reservation/spawn, and the exact canonical model each pair owns. A model is
+# never inferred from a display name or editor inventory -- it must equal
+# this table's ``model`` (after normalizing only a documented alias below)
+# exactly, or the launch is rejected before any provider credential is
+# touched and before core.claim_start_exact runs.
+_WORKFORCE_MODEL_ALIASES: dict[str, str] = {
+    "sonnet": "claude-sonnet-5",
+    "haiku": "claude-haiku-4.5",
+}
+
+_CANONICAL_WORKFORCE: dict[tuple[str, str], dict[str, Any]] = {
+    ("claude_sonnet-5", "claude_cli"): {
+        "model": "claude-sonnet-5",
+        "enabled": True,
+        "available": True,
+        "risk_tiers": frozenset({"low", "medium", "high", "critical"}),
+    },
+    ("claude_sonnet-5", "vscode_lm"): {
+        "model": "claude-sonnet-5",
+        "enabled": True,
+        "available": True,
+        "risk_tiers": frozenset({"low", "medium", "high", "critical"}),
+    },
+    ("claude_haiku-4.5", "claude_cli"): {
+        "model": "claude-haiku-4.5",
+        "enabled": True,
+        "available": True,
+        "risk_tiers": frozenset({"low", "medium"}),
+    },
+    ("claude_haiku-4.5", "vscode_lm"): {
+        "model": "claude-haiku-4.5",
+        "enabled": True,
+        "available": True,
+        "risk_tiers": frozenset({"low", "medium"}),
+    },
+}
+
+
+def _normalize_workforce_model(model: str | None) -> str:
+    stripped = str(model or "").strip()
+    return _WORKFORCE_MODEL_ALIASES.get(stripped, stripped)
+
+
+def validate_workforce_identity(
+    runner: str,
+    adapter_id: str,
+    model: str | None,
+    *,
+    risk_tier: str | None = None,
+) -> str | None:
+    """Validate an exact, explicitly-pinned (runner, adapter_id, model) tuple
+    against the canonical workforce before any provider reservation/spawn.
+
+    Scoped to the ``claude_*`` runner family this repository owns a canonical
+    workforce table for -- every other runner family (grok, glm, deepseek,
+    codex, copilot) keeps its existing, unchanged identity handling. A launch
+    that does not pin a specific model is likewise unaffected: this only
+    guards an explicit, exact model pin, never one inferred from a display
+    name or editor inventory. Normalizes only a documented workforce alias
+    (``_WORKFORCE_MODEL_ALIASES``). Returns the canonical model name (or the
+    original ``model`` when this validation does not apply). Raises
+    ``LaunchRejected`` with a typed reason for any pinned runner/adapter/model
+    combination that does not resolve to exactly one canonical workforce row,
+    or for a disabled, unavailable, or risk-incapable route.
+    """
+    _validate_adapter_identity(runner, adapter_id)
+    if not runner.startswith("claude_"):
+        return model
+    if model is None or not str(model).strip():
+        return model
+    route = _CANONICAL_WORKFORCE.get((runner, adapter_id))
+    if route is None:
+        raise LaunchRejected(
+            f"workforce_route_absent:runner={runner}:adapter={adapter_id}"
+        )
+    canonical_model = _normalize_workforce_model(model)
+    if not canonical_model or canonical_model != route["model"]:
+        raise LaunchRejected(
+            "workforce_model_mismatch:"
+            f"runner={runner}:adapter={adapter_id}:expected={route['model']}:got={model}"
+        )
+    if not route["enabled"]:
+        raise LaunchRejected(
+            f"workforce_route_disabled:runner={runner}:model={canonical_model}"
+        )
+    if not route["available"]:
+        raise LaunchRejected(
+            f"workforce_route_unavailable:runner={runner}:model={canonical_model}"
+        )
+    normalized_risk_tier = str(risk_tier or "").strip().lower() or None
+    if (
+        normalized_risk_tier is not None
+        and normalized_risk_tier not in route["risk_tiers"]
+    ):
+        raise LaunchRejected(
+            "workforce_route_risk_incapable:"
+            f"runner={runner}:model={canonical_model}:risk_tier={normalized_risk_tier}"
+        )
+    return canonical_model
+
+
 def _worker_mcp_bundle_payload(
     context_result: project_context.ProjectContextResult | None,
 ) -> dict[str, Any]:
@@ -8097,6 +8202,9 @@ class ProcessManager:
                     card=card,
                     authorization=replay_authorization,
                 )
+            model = validate_workforce_identity(
+                runner, adapter_id, model, risk_tier=card.get("risk_tier")
+            )
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             authority_repo = _task_authority_repo(self.repo, card)
             context_result = _launch_project_context(
@@ -8993,6 +9101,9 @@ class ProcessManager:
         try:
             _validate_adapter_identity(runner, adapter_id)
             card = self._preflight_card(task_id, runner, topic, adapter_id)
+            model = validate_workforce_identity(
+                runner, adapter_id, model, risk_tier=card.get("risk_tier")
+            )
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             context_result = project_context.collect_project_context(self.repo, card)
             provider_env, model = self._resolve_provider_env(adapter_id, model)

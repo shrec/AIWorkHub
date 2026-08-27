@@ -1333,6 +1333,163 @@ def test_coordinator_runner_is_never_accepted_as_worker_identity() -> None:
         process_launcher._validate_adapter_identity("codex", "glm_vscode_lm")
 
 
+def test_workforce_identity_rejects_absent_literal_model() -> None:
+    with pytest.raises(process_launcher.LaunchRejected, match="workforce_model_mismatch"):
+        process_launcher.validate_workforce_identity(
+            "claude_sonnet-5", "claude_cli", "claude-sonnet-4.6"
+        )
+
+
+def test_workforce_identity_rejects_mismatched_runner_and_model() -> None:
+    with pytest.raises(process_launcher.LaunchRejected, match="workforce_route_absent"):
+        process_launcher.validate_workforce_identity(
+            "claude_sonnet-4.6", "claude_cli", "claude-haiku-4.5"
+        )
+
+
+def test_workforce_identity_accepts_valid_alias_for_high_risk_task() -> None:
+    canonical = process_launcher.validate_workforce_identity(
+        "claude_sonnet-5", "claude_cli", "sonnet", risk_tier="high"
+    )
+    assert canonical == "claude-sonnet-5"
+
+
+def test_workforce_identity_rejects_risk_incapable_route() -> None:
+    with pytest.raises(
+        process_launcher.LaunchRejected, match="workforce_route_risk_incapable"
+    ):
+        process_launcher.validate_workforce_identity(
+            "claude_haiku-4.5", "claude_cli", "haiku", risk_tier="critical"
+        )
+
+
+def test_workforce_identity_rejects_disabled_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    disabled = dict(process_launcher._CANONICAL_WORKFORCE[("claude_sonnet-5", "claude_cli")])
+    disabled["enabled"] = False
+    monkeypatch.setitem(
+        process_launcher._CANONICAL_WORKFORCE, ("claude_sonnet-5", "claude_cli"), disabled
+    )
+    with pytest.raises(process_launcher.LaunchRejected, match="workforce_route_disabled"):
+        process_launcher.validate_workforce_identity("claude_sonnet-5", "claude_cli", "sonnet")
+
+
+def test_workforce_identity_rejects_unavailable_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    unavailable = dict(process_launcher._CANONICAL_WORKFORCE[("claude_sonnet-5", "claude_cli")])
+    unavailable["available"] = False
+    monkeypatch.setitem(
+        process_launcher._CANONICAL_WORKFORCE, ("claude_sonnet-5", "claude_cli"), unavailable
+    )
+    with pytest.raises(process_launcher.LaunchRejected, match="workforce_route_unavailable"):
+        process_launcher.validate_workforce_identity("claude_sonnet-5", "claude_cli", "sonnet")
+
+
+def test_workforce_identity_is_scoped_to_claude_runner_family() -> None:
+    # A non-claude runner family (grok, glm, deepseek, codex, copilot) keeps its
+    # existing, unchanged identity handling -- this repository's canonical
+    # workforce table only ever governs the claude_* family.
+    assert (
+        process_launcher.validate_workforce_identity(
+            "grok_runner", "grok_kilo_cli", "xai/grok-4.6"
+        )
+        == "xai/grok-4.6"
+    )
+
+
+def test_workforce_identity_skips_unpinned_model() -> None:
+    # A launch that never pins a model is unaffected: existing exact-match
+    # launches without an explicit model keep their prior behavior unchanged.
+    assert (
+        process_launcher.validate_workforce_identity("claude_worker_b1", "claude_cli", None)
+        is None
+    )
+
+
+def test_launch_rejects_workforce_absent_model_before_provider_spawn(
+    tmp_path, monkeypatch,
+) -> None:
+    _open_gates(monkeypatch)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: {**_card(), "runner": "claude_sonnet-5"}),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    monkeypatch.setattr(
+        manager,
+        "_resolve_provider_env",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("provider credentials must not be resolved")
+        ),
+    )
+
+    result = manager.launch(
+        task_id="TASK_B1",
+        runner="claude_sonnet-5",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        model="claude-sonnet-4.6",
+        timeout_seconds=30,
+    )
+
+    assert result["ok"] is False
+    assert "workforce_model_mismatch" in result["blocked_reason"]
+
+
+def test_launch_rejects_mismatched_runner_and_model_before_provider_spawn(
+    tmp_path, monkeypatch,
+) -> None:
+    _open_gates(monkeypatch)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: {**_card(), "runner": "claude_sonnet-4.6"}),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    monkeypatch.setattr(
+        manager,
+        "_resolve_provider_env",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("provider credentials must not be resolved")
+        ),
+    )
+
+    result = manager.launch(
+        task_id="TASK_B1",
+        runner="claude_sonnet-4.6",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        model="claude-haiku-4.5",
+        timeout_seconds=30,
+    )
+
+    assert result["ok"] is False
+    assert "workforce_route_absent" in result["blocked_reason"]
+
+
+def test_launch_accepts_valid_canonical_tuple_for_high_risk_task(
+    tmp_path, monkeypatch,
+) -> None:
+    _open_gates(monkeypatch)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(
+            lambda: {**_card(), "runner": "claude_sonnet-5", "risk_tier": "high"}
+        ),
+        argv=[sys.executable, "-c", "print('claimed only')"],
+    )
+
+    launched = manager.launch(
+        task_id="TASK_B1",
+        runner="claude_sonnet-5",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        model="sonnet",
+        timeout_seconds=30,
+    )
+
+    assert launched["ok"] is True
+    result = _wait_terminal(manager, launched["request_id"])
+    assert result["state"] == "exited_without_review"
+
+
 def test_real_shell_free_process_reaches_review_ready(monkeypatch, tmp_path):
     _open_gates(monkeypatch)
     marker = tmp_path / "review.marker"

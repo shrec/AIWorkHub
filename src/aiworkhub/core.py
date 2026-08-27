@@ -5192,6 +5192,203 @@ def retry_terminal_task(
     return _reconcile_retained_workspaces(result)
 
 
+def _has_retained_candidate_delta(card: Mapping[str, Any]) -> bool:
+    """A retained rework predecessor's changed paths, if any, are the exact
+    candidate delta a reroute must never silently discard."""
+    predecessor = card.get("rework_predecessor")
+    if not isinstance(predecessor, dict):
+        return False
+    changed = predecessor.get("changed_path_hashes")
+    return isinstance(changed, dict) and bool(changed)
+
+
+def reroute_launch_identity(
+    task_id: str,
+    *,
+    from_runner: str,
+    to_runner: str,
+    to_adapter_id: str,
+    to_model: str,
+    reason: str = "",
+    topic: str | None = None,
+) -> dict[str, Any]:
+    """Atomically reroute one pending/unclaimed card's invalid pinned runner
+    to an enabled, available, risk-capable canonical workforce tuple.
+
+    Permitted only for a card that already carries an exact operational
+    ``terminal_retry`` receipt (see ``retry_terminal_task``) and no retained
+    candidate/rework delta. Preserves task ID, topic, scope, template
+    provenance and history -- mutates only ``runner`` plus a bounded audited
+    old/new identity receipt. Fails closed for a claimed or non-pending task,
+    a retained delta, an arbitrary/ambiguous target identity, a disabled,
+    unavailable or risk-incapable canonical route, and a compare-and-swap
+    race against a concurrent claim or mutation.
+    """
+    from . import process_launcher  # local import: cycle-safe (see _reconcile_retained_workspaces)
+
+    from_runner = str(from_runner or "").strip()
+    to_runner = str(to_runner or "").strip()
+    to_adapter_id = str(to_adapter_id or "").strip()
+    bounded_reason = str(reason or "").strip()[:500]
+
+    card, error = _live_card(task_id)
+    if error:
+        return error
+    assert card is not None
+    expected_updated_at = str(card.get("updated_at") or "")
+    live_topic = str(card.get("topic") or "")
+    if not live_topic:
+        return _lifecycle_error("task has no exact topic identity")
+    if topic is not None and topic != live_topic:
+        return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+
+    if (
+        _lifecycle_state(card) != "pending"
+        or str(card.get("worker_status") or "") != "unclaimed"
+        or card.get("claimed_by")
+    ):
+        return _lifecycle_error("reroute_not_pending_unclaimed")
+
+    terminal_retry = card.get("terminal_retry")
+    retry_request_id = (
+        str(terminal_retry.get("request_id") or "").strip()
+        if isinstance(terminal_retry, dict)
+        else ""
+    )
+    retry_substatus = (
+        str(terminal_retry.get("terminal_substatus") or "").strip()
+        if isinstance(terminal_retry, dict)
+        else ""
+    )
+    if (
+        not isinstance(terminal_retry, dict)
+        or terminal_retry.get("schema_id") != "aiworkhub.terminal_retry.v1"
+        or not retry_request_id
+        or len(retry_request_id) > 120
+        or retry_substatus not in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES
+    ):
+        return _lifecycle_error("reroute_requires_terminal_retry_provenance")
+
+    if _has_retained_candidate_delta(card):
+        return _lifecycle_error("reroute_retained_candidate_delta")
+
+    card_runner = str(card.get("runner") or "")
+    if card_runner != from_runner:
+        return _lifecycle_error(
+            f"reroute_from_identity_mismatch:expected={card_runner}:got={from_runner}"
+        )
+
+    if (to_runner, to_adapter_id) not in process_launcher._CANONICAL_WORKFORCE:
+        return _lifecycle_error(
+            "reroute_target_rejected:workforce_route_absent:"
+            f"runner={to_runner}:adapter={to_adapter_id}"
+        )
+    try:
+        canonical_model = process_launcher.validate_workforce_identity(
+            to_runner, to_adapter_id, to_model, risk_tier=card.get("risk_tier")
+        )
+    except process_launcher.LaunchRejected as exc:
+        return _lifecycle_error(f"reroute_target_rejected:{exc}")
+
+    if to_runner == card_runner:
+        return _lifecycle_error("reroute_target_identical_to_source")
+
+    command = ["reroute-launch-identity", task_id, "--to-runner", to_runner]
+    gate = _canonical_write_gate(
+        "retry-terminal",
+        runner=CODEX_RUNNER,
+        topic=live_topic,
+        coordinator_capability=True,
+        task_id=task_id,
+    )
+    if gate is not None:
+        return gate
+
+    now = datetime.now(timezone.utc).isoformat()
+    semantic_card = task_store.persistable_card_payload(card)
+    semantic_card["runner"] = to_runner
+    semantic_card["identity_reroute"] = {
+        "schema_id": "aiworkhub.identity_reroute.v1",
+        "from_runner": card_runner,
+        "to_runner": to_runner,
+        "to_adapter_id": to_adapter_id,
+        "to_model": canonical_model,
+        "reason": bounded_reason,
+        "rerouted_at": now,
+    }
+    encoded_card = json.dumps(semantic_card, ensure_ascii=False, sort_keys=True)
+    try:
+        conn = _canonical_connect()
+    except task_store.TaskStoreError as exc:
+        return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    try:
+        row = conn.execute(
+            "SELECT status, worker_status, runner, card_json, updated_at FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or str(row["status"] or "") != "pending"
+            or str(row["worker_status"] or "") != "unclaimed"
+            or str(row["runner"] or "") != card_runner
+            or str(row["updated_at"] or "") != expected_updated_at
+        ):
+            conn.rollback()
+            return _canonical_result(
+                ok=False,
+                returncode=1,
+                stderr=f"reroute_transition_conflict:task_id={task_id}",
+                command=command,
+            )
+        cur = conn.execute(
+            "UPDATE tasks SET runner=?, card_json=?, updated_at=? "
+            "WHERE task_id=? AND status='pending' AND worker_status='unclaimed' "
+            "AND runner=? AND updated_at=?",
+            (to_runner, encoded_card, now, task_id, card_runner, expected_updated_at),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return _canonical_result(
+                ok=False,
+                returncode=1,
+                stderr=f"reroute_transition_conflict:task_id={task_id}",
+                command=command,
+            )
+        conn.execute(
+            "INSERT INTO task_events "
+            "(task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
+            (
+                task_id,
+                "reroute_launch_identity",
+                _verified_manager_actor(),
+                json.dumps(
+                    {
+                        "topic": live_topic,
+                        "from_runner": card_runner,
+                        "to_runner": to_runner,
+                        "to_adapter_id": to_adapter_id,
+                        "to_model": canonical_model,
+                        "reason": bounded_reason,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    card2 = task_store.get_task(repo_root(), task_id)
+    stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
+    result = _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result["from_runner"] = card_runner
+    result["to_runner"] = to_runner
+    result["to_model"] = canonical_model
+    return _reconcile_retained_workspaces(result)
+
+
 def archive_task(task_id: str, reason: str = "", topic: str | None = None) -> dict[str, Any]:
     """Coordinator-only: archive a stale task (Issue 3).
 

@@ -194,3 +194,332 @@ def test_retry_terminal_rejects_semantic_or_review_outcomes(
     assert result["ok"] is False
     assert "substatus_not_operational" in result["stderr"]
     assert _row(coordinator_repo, task_id)["status"] == "blocked"
+
+
+def _insert_pending_reroutable(
+    repo: Path,
+    *,
+    task_id: str,
+    runner: str = "claude_sonnet-4.6",
+    status: str = "pending",
+    worker_status: str = "unclaimed",
+    claimed_by: str | None = None,
+    terminal_retry: dict | None = "default",  # type: ignore[assignment]
+    rework_predecessor: dict | None = None,
+    risk_tier: str | None = None,
+) -> None:
+    readiness = task_store.storage_readiness(repo)
+    now = "2026-08-03T00:00:00+00:00"
+    if terminal_retry == "default":
+        terminal_retry = {
+            "schema_id": "aiworkhub.terminal_retry.v1",
+            "request_id": "r" * 32,
+            "terminal_substatus": "worker_failed",
+            "reason": "route repaired",
+            "retried_at": now,
+        }
+    card = {
+        "task_id": task_id,
+        "runner": runner,
+        "topic": "terminal_retry",
+        "objective": "retry exact operational failure",
+        "status": status,
+        "worker_status": worker_status,
+        "claimed_by": claimed_by,
+    }
+    if terminal_retry is not None:
+        card["terminal_retry"] = terminal_retry
+    if rework_predecessor is not None:
+        card["rework_predecessor"] = rework_predecessor
+    if risk_tier is not None:
+        card["risk_tier"] = risk_tier
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        conn.execute(
+            "INSERT INTO tasks "
+            "(task_id,runner,topic,mode,status,worker_status,priority,objective,"
+            "card_json,created_at,updated_at,claimed_by) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                task_id,
+                runner,
+                "terminal_retry",
+                "solo",
+                status,
+                worker_status,
+                "normal",
+                "retry exact operational failure",
+                json.dumps(card, ensure_ascii=False, sort_keys=True),
+                now,
+                now,
+                claimed_by,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_reroute_launch_identity_repairs_invalid_pinned_runner(
+    coordinator_repo: Path,
+) -> None:
+    task_id = "REROUTE_OK"
+    _insert_pending_reroutable(coordinator_repo, task_id=task_id, runner="claude_sonnet-4.6")
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+        reason="route repaired",
+    )
+
+    assert result["ok"] is True, result
+    assert result["to_model"] == "claude-sonnet-5"
+    row = _row(coordinator_repo, task_id)
+    assert row["runner"] == "claude_sonnet-5"
+    assert row["status"] == "pending"
+    assert row["worker_status"] == "unclaimed"
+    card = json.loads(row["card_json"])
+    assert card["task_id"] == task_id
+    assert card["topic"] == "terminal_retry"
+    assert card["terminal_retry"]["request_id"] == "r" * 32
+    receipt = card["identity_reroute"]
+    assert receipt["schema_id"] == "aiworkhub.identity_reroute.v1"
+    assert receipt["from_runner"] == "claude_sonnet-4.6"
+    assert receipt["to_runner"] == "claude_sonnet-5"
+    assert receipt["to_model"] == "claude-sonnet-5"
+
+
+def test_reroute_launch_identity_rejects_claimed_task(coordinator_repo: Path) -> None:
+    task_id = "REROUTE_CLAIMED"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        status="processing",
+        worker_status="claimed",
+        claimed_by="claude_sonnet-4.6",
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    assert result["ok"] is False
+    assert "reroute_not_pending_unclaimed" in result["stderr"]
+
+
+def test_reroute_launch_identity_requires_terminal_retry_provenance(
+    coordinator_repo: Path,
+) -> None:
+    task_id = "REROUTE_NO_PROVENANCE"
+    _insert_pending_reroutable(coordinator_repo, task_id=task_id, terminal_retry=None)
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    assert result["ok"] is False
+    assert "reroute_requires_terminal_retry_provenance" in result["stderr"]
+
+
+@pytest.mark.parametrize(
+    "terminal_retry",
+    [
+        {},
+        {
+            "schema_id": "aiworkhub.terminal_retry.v0",
+            "request_id": "r" * 32,
+            "terminal_substatus": "worker_failed",
+        },
+        {
+            "schema_id": "aiworkhub.terminal_retry.v1",
+            "request_id": "",
+            "terminal_substatus": "worker_failed",
+        },
+        {
+            "schema_id": "aiworkhub.terminal_retry.v1",
+            "request_id": "r" * 121,
+            "terminal_substatus": "worker_failed",
+        },
+        {
+            "schema_id": "aiworkhub.terminal_retry.v1",
+            "request_id": "r" * 32,
+            "terminal_substatus": "validation_failed",
+        },
+    ],
+)
+def test_reroute_launch_identity_rejects_malformed_or_nonoperational_retry(
+    coordinator_repo: Path,
+    terminal_retry: dict,
+) -> None:
+    task_id = "REROUTE_BAD_PROVENANCE"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        terminal_retry=terminal_retry,
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    assert result["ok"] is False
+    assert "reroute_requires_terminal_retry_provenance" in result["stderr"]
+    row = _row(coordinator_repo, task_id)
+    assert row["runner"] == "claude_sonnet-4.6"
+    assert json.loads(row["card_json"])["terminal_retry"] == terminal_retry
+
+
+def test_reroute_launch_identity_rejects_retained_candidate_delta(
+    coordinator_repo: Path,
+) -> None:
+    task_id = "REROUTE_RETAINED_DELTA"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        rework_predecessor={
+            "schema_id": "aiworkhub.rework_predecessor.v1",
+            "changed_path_hashes": {"out/result.py": "deadbeef"},
+        },
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    assert result["ok"] is False
+    assert "reroute_retained_candidate_delta" in result["stderr"]
+    assert _row(coordinator_repo, task_id)["runner"] == "claude_sonnet-4.6"
+
+
+def test_reroute_launch_identity_allows_stub_rework_predecessor_without_delta(
+    coordinator_repo: Path,
+) -> None:
+    task_id = "REROUTE_STUB_PREDECESSOR"
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        rework_predecessor={"schema_id": "aiworkhub.rework_predecessor.v1"},
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    assert result["ok"] is True, result
+
+
+@pytest.mark.parametrize(
+    ("to_runner", "to_adapter_id", "to_model", "risk_tier"),
+    [
+        ("claude_haiku-4.5", "claude_cli", "haiku", "high"),  # insufficient risk
+        ("claude_sonnet-4.6", "claude_cli", "claude-sonnet-4.6", None),  # route absent
+        ("made_up_runner", "claude_cli", "made_up_model", None),  # arbitrary identity
+        ("claude_sonnet-5", "codex_cli", "sonnet", None),  # wrong adapter
+    ],
+)
+def test_reroute_launch_identity_fails_closed_for_bad_targets(
+    coordinator_repo: Path,
+    to_runner: str,
+    to_adapter_id: str,
+    to_model: str,
+    risk_tier: str | None,
+) -> None:
+    task_id = f"REROUTE_BAD_{to_runner}_{to_adapter_id}"
+    _insert_pending_reroutable(coordinator_repo, task_id=task_id, risk_tier=risk_tier)
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner=to_runner,
+        to_adapter_id=to_adapter_id,
+        to_model=to_model,
+    )
+
+    assert result["ok"] is False
+    assert "reroute_target_rejected" in result["stderr"]
+    assert _row(coordinator_repo, task_id)["runner"] == "claude_sonnet-4.6"
+
+
+def test_reroute_launch_identity_rejects_stale_from_identity(
+    coordinator_repo: Path,
+) -> None:
+    task_id = "REROUTE_STALE_FROM"
+    _insert_pending_reroutable(coordinator_repo, task_id=task_id, runner="claude_sonnet-4.6")
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="a_different_pinned_runner",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    assert result["ok"] is False
+    assert "reroute_from_identity_mismatch" in result["stderr"]
+
+
+def test_reroute_launch_identity_fails_closed_on_concurrent_mutation(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compare-and-swap race: the live card read by ``reroute_launch_identity``
+    is stale by the time it commits, because a concurrent writer already
+    mutated the row underneath it."""
+    task_id = "REROUTE_RACE"
+    _insert_pending_reroutable(coordinator_repo, task_id=task_id, runner="claude_sonnet-4.6")
+
+    stale_card, error = core._live_card(task_id)
+    assert error is None
+
+    readiness = task_store.storage_readiness(coordinator_repo)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        conn.execute(
+            "UPDATE tasks SET updated_at=? WHERE task_id=?",
+            ("2026-08-03T00:00:01+00:00", task_id),
+        )
+        mutated = dict(stale_card)
+        mutated["reason_for_race"] = "concurrent-writer-touched-this-row"
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(mutated, ensure_ascii=False, sort_keys=True), task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(core, "_live_card", lambda _task_id: (stale_card, None))
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    assert result["ok"] is False
+    assert "reroute_transition_conflict" in result["stderr"]
+    assert _row(coordinator_repo, task_id)["runner"] == "claude_sonnet-4.6"
