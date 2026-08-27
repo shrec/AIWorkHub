@@ -209,9 +209,10 @@ class TestTargetVerification:
         target.write_text("x", encoding="utf-8")
         fd, root = _scratch_fd_root(scratch)
         try:
-            verified = worker_workspace._metadata_broker_verify_target(
+            verified, mutate = worker_workspace._metadata_broker_verify_target(
                 str(target), fd, root
             )
+            assert mutate is True
             try:
                 info = os.fstat(verified)
                 assert stat.S_ISREG(info.st_mode)
@@ -228,10 +229,16 @@ class TestTargetVerification:
         target.write_text("x", encoding="utf-8")
         fd, root = _scratch_fd_root(scratch)
         try:
-            verified = worker_workspace._metadata_broker_verify_target(
+            verified, mutate = worker_workspace._metadata_broker_verify_target(
                 str(target), fd, root
             )
-            os.close(verified)
+            assert mutate is True
+            try:
+                info = os.fstat(verified)
+                assert stat.S_ISREG(info.st_mode)
+                assert os.stat(target).st_ino == info.st_ino
+            finally:
+                os.close(verified)
         finally:
             os.close(fd)
 
@@ -279,9 +286,10 @@ class TestTargetVerification:
         subdir.mkdir()
         fd, root = _scratch_fd_root(scratch)
         try:
-            verified = worker_workspace._metadata_broker_verify_target(
+            verified, mutate = worker_workspace._metadata_broker_verify_target(
                 str(subdir), fd, root
             )
+            assert mutate is True
             try:
                 info = os.fstat(verified)
                 assert stat.S_ISDIR(info.st_mode)
