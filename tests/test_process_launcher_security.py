@@ -54,6 +54,209 @@ def _ensure_deepseek_credentials_stub() -> None:
 
 _ensure_deepseek_credentials_stub()
 
+def test_quality_reviewer_reservation_is_exact_durable_and_replays_before_ack(
+    tmp_path, monkeypatch
+):
+    """NF-442-r4 regression: ``launch_quality_reviewer`` acknowledges only
+    after exactly one durable pid-null ``starting`` reservation exists whose
+    ``quality_review_attempt`` binds the exact target request, target task
+    and lens.  Same-ID replays reconcile to that one reservation through the
+    production replay contract, and lens drift for the same reviewer is an
+    exact ``quality_review_attempt_identity_mismatch`` with no second
+    starting event and no pending/unclaimed starting ghost."""
+    _ensure_deepseek_credentials_stub()
+    from aiworkhub import process_launcher
+
+    target_request_id = "target-req-NF-442"
+    target_task_id = "TARGET_TASK_NF442"
+    reviewer_task_id = "REVIEWER_TASK_NF442"
+    lens = "correctness"
+    drift_lens = next(
+        name
+        for name in sorted(process_launcher.quality_evidence.JUDGMENT_LENSES)
+        if name != lens
+    )
+
+    ledger = tmp_path / "nf442_events.jsonl"
+    appended_before_ack: list[dict] = []
+    bound_calls: list[dict] = []
+    reserve_calls: list[dict] = []
+
+    class _NullRegistryLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *exc_info):
+            return False
+
+    def _load_latest():
+        latest: dict = {}
+        if ledger.exists():
+            for line in ledger.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    event = json.loads(line)
+                    latest[str(event["request_id"])] = event
+        return latest
+
+    def _append_event(event):
+        with open(ledger, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event) + "\n")
+        os.chmod(ledger, 0o600)
+        appended_before_ack.append(dict(event))
+
+    def _parse(payload, task_id):
+        return {"task_id": task_id}
+
+    def _assess(**kwargs):
+        return {"can_launch": True}
+
+    def _stable():
+        return _load_latest()
+
+    def _proven(snapshot):
+        return (_load_latest(), "proven")
+
+    def _reconcile(proven, resolved=True):
+        return None
+
+    def _active(latest):
+        return 0
+
+    def _settle():
+        return None
+
+    def _show(task_id):
+        return "{}"
+
+    def _prewarm(event):
+        return False
+
+    def _bind_card(**kwargs):
+        bound_calls.append(dict(kwargs))
+        return {"ok": True, "request_id": kwargs["request_id"]}
+
+    def _reviewer_receipt(request_id, latest):
+        event = latest.get(request_id) or {}
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "task_id": event.get("task_id"),
+            "state": event.get("state"),
+            "launch_request_id": request_id,
+            "already_reserved": True,
+        }
+
+    def _spawn_reserved(**kwargs):
+        return None
+
+    def _reserve(**kwargs):
+        reserve_calls.append(kwargs)
+        return manager_cls._reserve_quality_reviewer_attempt(pm, **kwargs)
+
+    monkeypatch.setattr(process_launcher, "_parse_card", _parse)
+    monkeypatch.setattr(
+        process_launcher.quality_review, "assess_reviewer_launch_target", _assess
+    )
+
+    manager_cls = process_launcher.ProcessManager
+    pm = manager_cls.__new__(manager_cls)
+    pm._lock = process_launcher.threading.RLock()
+    pm._live = {}
+    pm._registry_lock = _NullRegistryLock
+    pm._latest_by_request = _load_latest
+    pm._latest_by_request_stable = _stable
+    pm._proven_reservation_snapshot = _proven
+    pm._reconcile_expired_starting_reservations = _reconcile
+    pm._active_count = _active
+    pm._append_event = _append_event
+    pm._settle_reviewer_terminal_intents_contained = _settle
+    pm._show_task = _show
+    pm._reviewer_source_graph_prewarm_live_event = _prewarm
+    pm._ensure_quality_reviewer_card_bound = _bind_card
+    pm._reviewer_receipt = _reviewer_receipt
+    pm._launch_reserved_quality_reviewer = _spawn_reserved
+    pm._reserve_quality_reviewer_attempt = _reserve
+
+    launch_kwargs = {
+        "target_request_id": target_request_id,
+        "target_task_id": target_task_id,
+        "reviewer_task_id": reviewer_task_id,
+        "runner": "pytest-runner-nf442",
+        "adapter_id": "pytest-adapter-nf442",
+        "lens": lens,
+        "model": None,
+        "timeout_seconds": 1800,
+    }
+
+    ack = pm.launch_quality_reviewer(**launch_kwargs)
+
+    # Canary: the acknowledgement proves exactly one durable starting
+    # reservation bound to the exact reviewer identity was already written.
+    assert ack["ok"] is True
+    request_id = ack["request_id"]
+    assert ack["launch_request_id"] == request_id
+    assert ack["task_id"] == reviewer_task_id
+    assert ack["topic"] == "quality_review"
+    assert ack["state"] == "starting"
+    assert ack["already_reserved"] is False
+    events = _load_latest()
+    assert list(events) == [request_id]
+    assert len(appended_before_ack) == 1
+    assert appended_before_ack == [events[request_id]]
+    reserved = events[request_id]
+    assert reserved["request_id"] == request_id
+    assert reserved["task_id"] == reviewer_task_id
+    assert reserved["topic"] == "quality_review"
+    assert reserved["state"] == "starting"
+    assert not int(reserved.get("pid") or 0)
+    assert reserved["quality_review_attempt"] == {
+        "target_request_id": target_request_id,
+        "target_task_id": target_task_id,
+        "lens": lens,
+    }
+    assert bound_calls and bound_calls[0]["request_id"] == request_id
+    assert bound_calls[0]["target_request_id"] == target_request_id
+    assert bound_calls[0]["target_task_id"] == target_task_id
+    assert bound_calls[0]["lens"] == lens
+
+    # Same-ID replay reconciles the exact reservation via the production
+    # replay contract: same request id and still exactly one starting event.
+    replay = pm.launch_quality_reviewer(**launch_kwargs)
+    assert replay["ok"] is True
+    assert replay["request_id"] == request_id
+    assert replay["launch_request_id"] == request_id
+    assert replay["state"] == "starting"
+    assert len(reserve_calls) == 1
+    events_after_replay = _load_latest()
+    assert list(events_after_replay) == [request_id]
+    assert events_after_replay[request_id] == reserved
+    replayed_starting = [
+        event
+        for event in events_after_replay.values()
+        if event.get("state") == "starting"
+    ]
+    assert replayed_starting == [reserved]
+
+    # Lens drift for the same reviewer identity is an exact mismatch without
+    # a second starting reservation or a pending/unclaimed starting ghost.
+    drift_kwargs = dict(launch_kwargs)
+    drift_kwargs["lens"] = drift_lens
+    drift_result = pm.launch_quality_reviewer(**drift_kwargs)
+    expected_mismatch = {
+        "ok": False,
+        "error": "quality_review_attempt_identity_mismatch",
+    }
+    assert drift_result == expected_mismatch
+    assert len(reserve_calls) == 1
+    events_final = _load_latest()
+    assert list(events_final) == [request_id]
+    assert events_final[request_id] == reserved
+    final_starting = [
+        event for event in events_final.values() if event.get("state") == "starting"
+    ]
+    assert final_starting == [reserved]
+
+
 from aiworkhub import process_launcher, worker_workspace  # noqa: E402
 
 
