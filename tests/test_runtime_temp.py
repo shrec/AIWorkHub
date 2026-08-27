@@ -232,6 +232,20 @@ def test_read_owner_manifest_rejects_post_read_replacement(
     assert replaced is True
 
 
+def _stat_with(
+    info: os.stat_result,
+    *,
+    st_nlink: int | None = None,
+    st_size: int | None = None,
+) -> os.stat_result:
+    values = list(info)
+    if st_nlink is not None:
+        values[3] = st_nlink
+    if st_size is not None:
+        values[6] = st_size
+    return os.stat_result(values)
+
+
 def test_read_owner_manifest_windows_identity_accepts_valid_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -249,7 +263,7 @@ def test_read_owner_manifest_windows_identity_accepts_valid_manifest(
     assert manifest["request_id"] == "windows-valid"
 
 
-def test_read_owner_manifest_windows_uses_stable_identity_before_read(
+def test_read_owner_manifest_windows_reads_with_posix_metadata_divergence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     owner_dir = _write_manifest(
@@ -263,11 +277,23 @@ def test_read_owner_manifest_windows_uses_stable_identity_before_read(
     original_identity_from_path = (10, 20, 30, 1, original.stat().st_size)
     original_identity_from_fd = (10, 20, 128, 1, original.stat().st_size)
     replacement_identity = (10, 21, 128, 1, replacement.stat().st_size)
+    real_fstat = os.fstat
+    real_lstat = Path.lstat
     real_read = os.read
     replaced = False
 
     def path_identity(path: Path) -> tuple[int, ...]:
         return replacement_identity if replaced else original_identity_from_path
+
+    def fstat_with_windows_metadata(fd: int) -> os.stat_result:
+        info = real_fstat(fd)
+        return _stat_with(info, st_nlink=17, st_size=info.st_size + 3)
+
+    def lstat_with_windows_metadata(self: Path) -> os.stat_result:
+        info = real_lstat(self)
+        if self == original:
+            return _stat_with(info, st_nlink=23, st_size=info.st_size + 5)
+        return info
 
     def swap_after_read(fd: int, n: int) -> bytes:
         nonlocal replaced
@@ -281,6 +307,8 @@ def test_read_owner_manifest_windows_uses_stable_identity_before_read(
     monkeypatch.setattr(
         runtime_temp, "_windows_fd_identity", lambda fd: original_identity_from_fd
     )
+    monkeypatch.setattr(runtime_temp.os, "fstat", fstat_with_windows_metadata)
+    monkeypatch.setattr(runtime_temp.Path, "lstat", lstat_with_windows_metadata)
     monkeypatch.setattr(runtime_temp.os, "read", swap_after_read)
 
     assert runtime_temp.read_owner_manifest(owner_dir) is None

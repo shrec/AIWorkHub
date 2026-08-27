@@ -516,16 +516,20 @@ def read_owner_manifest(directory: Path) -> dict[str, Any] | None:
         after = path.lstat()
         opened_identity = _manifest_fd_identity(fd, opened)
         after_identity = _manifest_path_identity(path, after)
+        windows_identity = _is_windows()
         if (
             not stat.S_ISREG(opened.st_mode)
             or not stat.S_ISREG(after.st_mode)
             or opened_identity != pre_identity
             or after_identity != pre_identity
-            or opened.st_nlink != info.st_nlink
+            or opened.st_size > MAX_MANIFEST_BYTES
+        ):
+            return None
+        if not windows_identity and (
+            opened.st_nlink != info.st_nlink
             or after.st_nlink != info.st_nlink
             or opened.st_size != info.st_size
             or after.st_size != info.st_size
-            or opened.st_size > MAX_MANIFEST_BYTES
         ):
             return None
 
@@ -542,11 +546,14 @@ def read_owner_manifest(directory: Path) -> dict[str, Any] | None:
             or not stat.S_ISREG(reread_path.st_mode)
             or reread_opened_identity != pre_identity
             or reread_path_identity != pre_identity
-            or reread_opened.st_nlink != info.st_nlink
+            or reread_opened.st_size > MAX_MANIFEST_BYTES
+        ):
+            return None
+        if not windows_identity and (
+            reread_opened.st_nlink != info.st_nlink
             or reread_path.st_nlink != info.st_nlink
             or reread_opened.st_size != info.st_size
             or reread_path.st_size != info.st_size
-            or reread_opened.st_size > MAX_MANIFEST_BYTES
         ):
             return None
 
