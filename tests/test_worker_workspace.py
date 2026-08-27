@@ -5624,3 +5624,191 @@ def test_open_broker_scratch_root_rejects_symlinked_root(tmp_path: Path) -> None
     os.symlink(real, link)
     with pytest.raises(worker_workspace.WorkspaceError):
         worker_workspace._open_broker_scratch_root(link)
+
+
+def test_pytest_validation_seeds_transitive_local_test_import_closure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    """Request b58052793245430ea57f689fa516b4e4: pytest collection fails when a
+    declared test file imports a sibling test helper that is absent from the
+    sparse workspace. Extend seeding to include transitive imports for test
+    files extracted from pytest validation commands, so helper modules are
+    provisioned without broad copying."""
+    _commit_validation_worker_package(repo)
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(exist_ok=True)
+    (tests_dir / "_taskdb_compat.py").write_text(
+        "SCHEMA_VERSION = 'v1'\n", encoding="utf-8"
+    )
+    (tests_dir / "test_learning_commit_store.py").write_text(
+        "from _taskdb_compat import SCHEMA_VERSION\n\n"
+        "def test_schema():\n"
+        "    assert SCHEMA_VERSION == 'v1'\n",
+        encoding="utf-8",
+    )
+    (tests_dir / "test_unused.py").write_text(
+        "def test_unused():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    assert _git(repo, "add", "tests").returncode == 0
+    assert _git(repo, "commit", "-qm", "test closure fixture").returncode == 0
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "pytest-closure-worktrees"),
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "pytest-test-closure",
+        {
+            "allowed_writes": ["src/aiworkhub/new_candidate_module.py"],
+            "read_first": ["src/aiworkhub/worker_workspace.py"],
+            "validation": ["python3 -m pytest -q tests/test_learning_commit_store.py"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        assert (workspace.path / "tests/test_learning_commit_store.py").is_file()
+        assert (workspace.path / "tests/_taskdb_compat.py").is_file()
+        assert not (workspace.path / "tests/test_unused.py").exists()
+        (workspace.path / "src/aiworkhub/new_candidate_module.py").write_text(
+            "VALUE = 'candidate-new-module'\n", encoding="utf-8"
+        )
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["python3 -m pytest -q tests/test_learning_commit_store.py"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+        assert result["returncode"] == 0
+        assert "1 passed" in result["stdout_head"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_pytest_validation_with_direct_pytest_command_seeds_test_closure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    """Direct pytest invocation (without python -m) also seeds test import closure."""
+    _commit_validation_worker_package(repo)
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(exist_ok=True)
+    (tests_dir / "_helper.py").write_text("HELPER = True\n", encoding="utf-8")
+    (tests_dir / "test_with_helper.py").write_text(
+        "from _helper import HELPER\n\n"
+        "def test_helper():\n"
+        "    assert HELPER\n",
+        encoding="utf-8",
+    )
+    assert _git(repo, "add", "tests").returncode == 0
+    assert _git(repo, "commit", "-qm", "pytest direct test").returncode == 0
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "pytest-direct-worktrees"),
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "pytest-direct-closure",
+        {
+            "allowed_writes": ["src/aiworkhub/new_candidate_module.py"],
+            "read_first": ["src/aiworkhub/worker_workspace.py"],
+            "validation": ["pytest tests/test_with_helper.py"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        assert (workspace.path / "tests/test_with_helper.py").is_file()
+        assert (workspace.path / "tests/_helper.py").is_file()
+        (workspace.path / "src/aiworkhub/new_candidate_module.py").write_text(
+            "VALUE = 'ok'\n", encoding="utf-8"
+        )
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["pytest tests/test_with_helper.py"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+        assert result["returncode"] == 0
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_pytest_validation_seeds_closure_with_pytest_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    """Test file closure seeding works with pytest flags and node selectors."""
+    _commit_validation_worker_package(repo)
+    tests_dir = repo / "tests"
+    tests_dir.mkdir(exist_ok=True)
+    (tests_dir / "_support.py").write_text("VALUE = 'support'\n", encoding="utf-8")
+    (tests_dir / "test_flags.py").write_text(
+        "from _support import VALUE\n\n"
+        "def test_one():\n"
+        "    assert VALUE == 'support'\n"
+        "def test_two():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    assert _git(repo, "add", "tests").returncode == 0
+    assert _git(repo, "commit", "-qm", "pytest flags test").returncode == 0
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "pytest-flags-worktrees"),
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "pytest-flags-closure",
+        {
+            "allowed_writes": ["src/aiworkhub/new_candidate_module.py"],
+            "read_first": ["src/aiworkhub/worker_workspace.py"],
+            "validation": ["python3 -m pytest -v tests/test_flags.py::test_one"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        assert (workspace.path / "tests/test_flags.py").is_file()
+        assert (workspace.path / "tests/_support.py").is_file()
+        (workspace.path / "src/aiworkhub/new_candidate_module.py").write_text(
+            "VALUE = 'ok'\n", encoding="utf-8"
+        )
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["python3 -m pytest -v tests/test_flags.py::test_one"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+        assert result["returncode"] == 0
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_pytest_validation_rejects_test_paths_outside_repo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    """Pytest validation must reject test paths that escape the repository."""
+    _commit_validation_worker_package(repo)
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "pytest-escape-worktrees"),
+    )
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="unsafe_repo_path"
+    ):
+        worker_workspace.create_workspace(
+            repo,
+            "pytest-escape",
+            {
+                "allowed_writes": ["src/aiworkhub/new_candidate_module.py"],
+                "read_first": ["tests/test.py"],
+                "validation": ["python3 -m pytest ../outside/test.py"],
+            },
+            "glm_vscode_lm",
+        )

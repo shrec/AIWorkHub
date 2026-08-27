@@ -1098,6 +1098,44 @@ def _expand_declared(repo: Path, declared: Iterable[str]) -> list[str]:
         raise WorkspaceError(f"seed_file_limit_exceeded:{len(rows)}")
     return sorted(rows)
 
+def _extract_pytest_test_files(repo: Path, validation_rows: Iterable[str]) -> tuple[str, ...]:
+    """Extract test file paths from pytest validation commands.
+
+    Parse validation commands to find pytest invocations and extract the test
+    file arguments. Returns paths relative to the repository root.
+    """
+    test_files: set[str] = set()
+
+    for cmd in validation_rows:
+        parts = shlex.split(cmd)
+        if not parts:
+            continue
+
+        is_pytest = False
+        skip_next = False
+
+        for i, part in enumerate(parts):
+            if skip_next:
+                skip_next = False
+                continue
+            if part in ("pytest", "python", "python3"):
+                is_pytest = part == "pytest"
+                continue
+            if part == "-m" and i + 1 < len(parts) and parts[i + 1] == "pytest":
+                is_pytest = True
+                skip_next = True
+                continue
+
+            if is_pytest and part and not part.startswith("-"):
+                # A pytest node ID authenticates its file component; the
+                # ``::class::test`` suffix is selection metadata, not a path.
+                relative = _relative_repo_path(part.split("::", 1)[0])
+                candidate = repo / relative
+                if candidate.is_file() and relative.endswith(".py"):
+                    test_files.add(relative)
+
+    return tuple(sorted(test_files))
+
 
 def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str, ...]:
     """Return the bounded static package-local import closure for Python seeds.
@@ -1130,10 +1168,17 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
         if relative.endswith(".py") and (repo / relative).is_file():
             package_context(relative)
 
-    def module_file(parts: tuple[str, ...]) -> tuple[Path, Path] | None:
+    def module_file(
+        parts: tuple[str, ...], preferred_root: Path | None = None
+    ) -> tuple[Path, Path] | None:
         if not parts:
             return None
-        for root in sorted(roots, key=lambda value: value.as_posix()):
+        ordered_roots = sorted(roots, key=lambda value: value.as_posix())
+        if preferred_root is not None:
+            ordered_roots = [preferred_root] + [
+                root for root in ordered_roots if root != preferred_root
+            ]
+        for root in ordered_roots:
             module = root.joinpath(*parts).with_suffix(".py")
             package = root.joinpath(*parts, "__init__.py")
             for candidate in (module, package):
@@ -1147,8 +1192,13 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
                     return root, candidate
         return None
 
-    def add_module(parts: tuple[str, ...], pending: list[str], rows: set[str]) -> bool:
-        resolved = module_file(parts)
+    def add_module(
+        parts: tuple[str, ...],
+        pending: list[str],
+        rows: set[str],
+        preferred_root: Path | None = None,
+    ) -> bool:
+        resolved = module_file(parts, preferred_root)
         if resolved is None:
             return False
         root, candidate = resolved
@@ -1192,11 +1242,13 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
             raise WorkspaceError(
                 f"validation_python_import_parse_failed:{relative}"
             ) from exc
-        _root, package_parts = package_context(relative)
+        source_root, package_parts = package_context(relative)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    add_module(tuple(alias.name.split(".")), pending, rows)
+                    add_module(
+                        tuple(alias.name.split(".")), pending, rows, source_root
+                    )
                 continue
             if not isinstance(node, ast.ImportFrom):
                 continue
@@ -1208,18 +1260,25 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
                         f"level={node.level}"
                     )
                 base = package_parts[: len(package_parts) - node.level + 1] + module_parts
-                if module_parts and not add_module(base, pending, rows):
+                if module_parts and not add_module(
+                    base, pending, rows, source_root
+                ):
                     raise WorkspaceError(
                         f"validation_python_relative_import_unresolved:{relative}:"
                         + ".".join(base)
                     )
             else:
                 base = module_parts
-                add_module(base, pending, rows)
+                add_module(base, pending, rows, source_root)
             for alias in node.names:
                 if alias.name == "*":
                     continue
-                add_module(base + tuple(alias.name.split(".")), pending, rows)
+                add_module(
+                    base + tuple(alias.name.split(".")),
+                    pending,
+                    rows,
+                    source_root,
+                )
     return tuple(sorted(rows))
 
 
@@ -3160,8 +3219,10 @@ def create_workspace(
             if relative not in live_seeded
         )
     if validation_rows:
+        test_files = _extract_pytest_test_files(repo, validation_rows)
+        seeds_for_python_closure = (*live_seeded, *support_seeded, *test_files)
         python_seeded = _resolve_local_python_imports(
-            repo, (*live_seeded, *support_seeded)
+            repo, seeds_for_python_closure
         )
         support_seeded = tuple(
             sorted(set(support_seeded) | (set(python_seeded) - set(live_seeded)))
