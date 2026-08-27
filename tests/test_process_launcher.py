@@ -7575,6 +7575,7 @@ def test_quality_reviewer_reserved_launch_handoff_skips_second_claim(
         "target": {"claim_epoch": 1},
         "lens": "correctness",
     }
+    read_only_input_paths = ["README.md", "docs/SOURCE_GRAPH.md"]
 
     def fake_prep(*_a, **_k):
         return {
@@ -7583,6 +7584,7 @@ def test_quality_reviewer_reserved_launch_handoff_skips_second_claim(
                 "worker_adapter_id": "claude_cli",
                 "workspace": fake_workspace,
                 "changed_hashes": {"module.py": "h"},
+                "read_only_input_paths": read_only_input_paths,
                 "packet": packet,
             },
         }
@@ -7599,6 +7601,8 @@ def test_quality_reviewer_reserved_launch_handoff_skips_second_claim(
 
     def fake_spawn(request_id, binding=None, **_k):
         spawn_calls.append(str(request_id))
+        assert binding is not None
+        assert binding.get("read_only_input_paths") == read_only_input_paths
         return True
 
     monkeypatch.setattr(manager, "_reviewer_spawn_transition", fake_spawn)
@@ -7617,8 +7621,11 @@ def test_quality_reviewer_reserved_launch_handoff_skips_second_claim(
         )
         assert process_launcher.core._lifecycle_state(card) == "processing"
         assert card.get("launch_request_id") == reserved
+        quality_review_binding = kwargs.get("quality_review_binding")
+        assert quality_review_binding is not None
+        assert quality_review_binding.get("read_only_input_paths") == read_only_input_paths
         manager._reviewer_spawn_transition(
-            reserved, binding=kwargs.get("quality_review_binding")
+            reserved, binding=quality_review_binding
         )
         process = manager._popen([sys.executable, "-c", "pass"])
         result = {
@@ -8006,3 +8013,90 @@ def test_appcontainer_style_explicit_mandatory_output_unchanged_fails_closed_wit
     diagnostics = json.loads(str(excinfo.value).split(":", 1)[1])
     assert diagnostics["unchanged_mandatory_outputs"] == ["src/app_container.py"]
     assert diagnostics["primary_validation_result"] == []
+
+
+def test_quality_review_packet_binding_carries_explicit_target_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "e" * 32
+    manager = _manager(
+        tmp_path,
+        show_task=lambda _task_id: {"returncode": 1, "stdout": "", "stderr": ""},
+        argv=[sys.executable, "-c", "pass"],
+    )
+    repo = manager.repo
+    workspace_path = tmp_path / "worktrees" / request_id / "worktree"
+    home = tmp_path / "worktrees" / request_id / "home"
+    workspace_path.mkdir(parents=True)
+    home.mkdir(parents=True)
+    (repo / "docs").mkdir(parents=True)
+    (repo / "README.md").write_text("readme\n", encoding="utf-8")
+    (repo / "docs" / "SOURCE_GRAPH.md").write_text("graph\n", encoding="utf-8")
+    (workspace_path / "src").mkdir()
+    candidate = workspace_path / "src" / "changed.py"
+    candidate.write_text("value = 2\n", encoding="utf-8")
+    changed_hashes = {
+        "src/changed.py": hashlib.sha256(candidate.read_bytes()).hexdigest()
+    }
+    workspace = process_launcher.WorkerWorkspace(
+        request_id=request_id,
+        repo=repo,
+        path=workspace_path,
+        home=home,
+        allowed_writes=("src/changed.py",),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    card = _card(task_id="TARGET_TASK", state="review")
+    card.update(
+        {
+            "claim_epoch": 1,
+            "allowed_writes": ["src/changed.py"],
+            "read_first": ["README.md"],
+            "immutable_inputs": ["docs/SOURCE_GRAPH.md"],
+            "terminal_review": {
+                "evidence": {
+                    "workspace": workspace.as_metadata(),
+                    "changed_path_hashes": changed_hashes,
+                    "quality_gate": {"checks": []},
+                    "validation": [],
+                }
+            },
+        }
+    )
+    manager._show_task = _show(lambda: card)
+    manager._append_event(
+        {
+            "request_id": request_id,
+            "task_id": "TARGET_TASK",
+            "runner": "worker",
+            "topic": "code",
+            "adapter_id": "worker_adapter",
+            "state": "review_ready",
+        }
+    )
+    monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(tmp_path / "worktrees"))
+    monkeypatch.setattr(
+        manager,
+        "_quality_review_source_evidence",
+        lambda *_args, **_kwargs: {"schema_id": "test.source_evidence.v1"},
+    )
+    monkeypatch.setattr(
+        process_launcher.quality_review_scope,
+        "build_scoped_audits",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        process_launcher.quality_reviewer,
+        "build_review_packet",
+        lambda **_kwargs: {"packet_sha256": "a" * 64},
+    )
+
+    result = manager._build_quality_review_packet(request_id, "TARGET_TASK")
+
+    assert result["ok"] is True, result
+    prepared = result["prepared"]
+    assert prepared["read_only_input_paths"] == [
+        "README.md",
+        "docs/SOURCE_GRAPH.md",
+    ]

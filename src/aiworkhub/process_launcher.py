@@ -7072,6 +7072,11 @@ class ProcessManager:
             target_claim_epoch = card.get("claim_epoch")
             if type(target_claim_epoch) is not int or target_claim_epoch < 1:
                 raise WorkspaceError("quality_review_target_claim_epoch_invalid")
+            read_only_input_paths = _worker_workspace.quality_review_read_only_input_paths(
+                self.repo,
+                read_first=card.get("read_first") or [],
+                immutable_inputs=card.get("immutable_inputs") or [],
+            )
             packet = quality_reviewer.build_review_packet(
                 request_id=target_request_id,
                 task_id=target_task_id,
@@ -7107,6 +7112,7 @@ class ProcessManager:
             "worker_adapter_id": str(latest.get("adapter_id") or ""),
             "workspace": workspace,
             "changed_hashes": dict(current_hashes),
+            "read_only_input_paths": read_only_input_paths,
             "packet": packet,
         }
         return {"ok": True, "prepared": prepared}
@@ -7730,6 +7736,9 @@ class ProcessManager:
                 "adapter_id": adapter_id,
                 "source_workspace": prepared["workspace"].as_metadata(),
                 "candidate_paths": sorted(prepared["changed_hashes"]),
+                "read_only_input_paths": list(
+                    prepared.get("read_only_input_paths") or []
+                ),
                 "packet": prepared["packet"],
                 "lens": lens,
                 "independence": independence,
@@ -8279,6 +8288,7 @@ class ProcessManager:
                         request_id,
                         quality_review_binding["candidate_paths"],
                         adapter_id,
+                        quality_review_binding.get("read_only_input_paths") or (),
                     )
                     review_packet_path = (
                         workspace.home

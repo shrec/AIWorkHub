@@ -1282,8 +1282,14 @@ def test_review_workspace_materializes_candidate_but_is_read_only(
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "AIWorkHub Test"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "AIWorkHub Test"], cwd=repo, check=True
+    )
     source_file = repo / "source.py"
     source_file.write_text("value = 1\n", encoding="utf-8")
     subprocess.run(["git", "add", "source.py"], cwd=repo, check=True)
@@ -1324,3 +1330,131 @@ def test_review_workspace_materializes_candidate_but_is_read_only(
         if review is not None:
             worker_workspace.cleanup_workspace(repo, review.path, review.home)
         worker_workspace.cleanup_workspace(repo, source.path, source.home)
+
+
+def _quality_review_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "AIWorkHub Test"], cwd=repo, check=True
+    )
+    monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(tmp_path / "worktrees"))
+    return repo
+
+
+def test_nf469_review_workspace_materializes_explicit_target_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _quality_review_repo(tmp_path, monkeypatch)
+    (repo / "README.md").write_text("contract\n", encoding="utf-8")
+    (repo / "docs").mkdir()
+    (repo / "docs" / "SOURCE_GRAPH.md").write_text("source graph\n", encoding="utf-8")
+    (repo / "source.py").write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md", "docs/SOURCE_GRAPH.md", "source.py"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=repo, check=True)
+
+    source = worker_workspace.create_workspace(
+        repo,
+        "c" * 32,
+        {"allowed_writes": ["source.py"], "required_outputs": []},
+        "validation",
+    )
+    review = None
+    try:
+        (source.path / "source.py").write_text("value = 2\n", encoding="utf-8")
+        review, evidence = worker_workspace.create_quality_review_workspace(
+            source,
+            "d" * 32,
+            ["source.py"],
+            "validation",
+            ["README.md", "docs/SOURCE_GRAPH.md"],
+        )
+
+        assert review.allowed_writes == ()
+        assert (review.path / "source.py").read_text(encoding="utf-8") == "value = 2\n"
+        assert (review.path / "README.md").read_text(encoding="utf-8") == "contract\n"
+        assert (
+            review.path / "docs" / "SOURCE_GRAPH.md"
+        ).read_text(encoding="utf-8") == "source graph\n"
+        assert evidence["read_only_input_paths"] == [
+            "README.md",
+            "docs/SOURCE_GRAPH.md",
+        ]
+        assert evidence["read_only_input_hashes"] == {
+            "README.md": worker_workspace._hash_path(review.path / "README.md"),
+            "docs/SOURCE_GRAPH.md": worker_workspace._hash_path(
+                review.path / "docs" / "SOURCE_GRAPH.md"
+            ),
+        }
+        assert worker_workspace.enforce_scope(review) == []
+    finally:
+        if review is not None:
+            worker_workspace.cleanup_workspace(repo, review.path, review.home)
+        worker_workspace.cleanup_workspace(repo, source.path, source.home)
+
+
+def test_quality_review_read_only_input_paths_are_strict_path_declarations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _quality_review_repo(tmp_path, monkeypatch)
+    (repo / "README.md").write_text("readme\n", encoding="utf-8")
+    (repo / "Makefile").write_text("all:\n", encoding="utf-8")
+    (repo / "docs").mkdir()
+    (repo / "docs" / "path with spaces.md").write_text("spaces\n", encoding="utf-8")
+    (repo / "docs" / "contract.md").write_text("contract\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "git",
+            "add",
+            "README.md",
+            "Makefile",
+            "docs/path with spaces.md",
+            "docs/contract.md",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=repo, check=True)
+
+    assert worker_workspace.quality_review_read_only_input_paths(
+        repo, read_first=["README.md"], immutable_inputs=["Makefile"]
+    ) == ["Makefile", "README.md"]
+    assert worker_workspace.quality_review_read_only_input_paths(
+        repo, read_first=["docs/path with spaces.md"], immutable_inputs=[]
+    ) == ["docs/path with spaces.md"]
+    assert worker_workspace.quality_review_read_only_input_paths(
+        repo, read_first=["docs/*.md"], immutable_inputs=[]
+    ) == ["docs/contract.md", "docs/path with spaces.md"]
+
+    for invalid in (
+        "/absolute",
+        "../outside",
+        "missing.md",
+    ):
+        with pytest.raises(worker_workspace.WorkspaceError):
+            worker_workspace.quality_review_read_only_input_paths(
+                repo, read_first=[invalid], immutable_inputs=[]
+            )
+
+    symlink = repo / "link.md"
+    try:
+        symlink.symlink_to("README.md")
+    except (OSError, NotImplementedError):
+        return
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="symlink_path_component_forbidden",
+    ):
+        worker_workspace.quality_review_read_only_input_paths(
+            repo, read_first=["link.md"], immutable_inputs=[]
+        )

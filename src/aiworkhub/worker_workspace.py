@@ -3841,11 +3841,62 @@ def create_combined_validation_workspace(
         raise
 
 
+def _quality_review_read_only_input_paths(
+    repo: Path,
+    declarations: Iterable[str],
+) -> list[str]:
+    inputs = _expand_declared(repo, declarations)
+    for relative in inputs:
+        source = repo / relative
+        _require_beneath(repo, source)
+        if source.is_symlink():
+            raise WorkspaceError(f"quality_review_read_only_input_symlink:{relative}")
+        if not source.exists():
+            raise WorkspaceError(f"quality_review_read_only_input_missing:{relative}")
+        if not source.is_file():
+            raise WorkspaceError(f"quality_review_read_only_input_not_file:{relative}")
+    return inputs
+
+
+def quality_review_read_only_input_paths(
+    repo: Path,
+    *,
+    read_first: Iterable[str],
+    immutable_inputs: Iterable[str],
+) -> list[str]:
+    return _quality_review_read_only_input_paths(
+        repo,
+        [*read_first, *immutable_inputs],
+    )
+
+
+def _overlay_quality_review_read_only_input(
+    source_root: Path,
+    target_root: Path,
+    relative: str,
+) -> None:
+    source = source_root / relative
+    target = target_root / relative
+    _require_beneath(source_root, source)
+    _require_beneath(target_root, target)
+    if source.is_symlink():
+        raise WorkspaceError(f"quality_review_read_only_input_symlink:{relative}")
+    if not source.exists():
+        raise WorkspaceError(f"quality_review_read_only_input_missing:{relative}")
+    if not source.is_file():
+        raise WorkspaceError(f"quality_review_read_only_input_not_file:{relative}")
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise WorkspaceError(f"quality_review_read_only_target_not_regular:{relative}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+
+
 def create_quality_review_workspace(
     source_workspace: WorkerWorkspace,
     request_id: str,
     candidate_changed_paths: Iterable[str],
     adapter_id: str,
+    read_only_input_paths: Iterable[str] = (),
 ) -> tuple[WorkerWorkspace, dict[str, Any]]:
     """Materialize one candidate for a strictly read-only reviewer.
 
@@ -3859,8 +3910,9 @@ def create_quality_review_workspace(
     candidate = sorted({_relative_repo_path(value) for value in candidate_changed_paths})
     if not candidate:
         raise WorkspaceError("quality_review_candidate_empty")
+    read_only_inputs = _quality_review_read_only_input_paths(repo, read_only_input_paths)
     canonical_delta = _canonical_worktree_delta_paths(repo)
-    seed_paths = sorted(set(candidate) | set(canonical_delta))
+    seed_paths = sorted(set(candidate) | set(canonical_delta) | set(read_only_inputs))
     if len(seed_paths) > MAX_SEED_FILES:
         raise WorkspaceError(f"quality_review_path_limit_exceeded:{len(seed_paths)}")
     seed_card = {
@@ -3871,10 +3923,16 @@ def create_quality_review_workspace(
     }
     review_workspace = create_workspace(repo, request_id, seed_card, adapter_id)
     try:
+        for relative in read_only_inputs:
+            _overlay_quality_review_read_only_input(
+                repo, review_workspace.path, relative
+            )
         for relative in canonical_delta:
             _overlay_regular_path(repo, review_workspace.path, relative)
         baseline_paths = sorted(
-            set(review_workspace.workspace_baseline) | set(canonical_delta)
+            set(review_workspace.workspace_baseline)
+            | set(canonical_delta)
+            | set(read_only_inputs)
         )
         canonical_baseline = {
             relative: _hash_path(review_workspace.path / relative)
@@ -3890,19 +3948,26 @@ def create_quality_review_workspace(
                 "quality_review_candidate_mismatch:"
                 + ",".join(sorted(set(observed) ^ set(candidate))[:20])
             )
+        workspace_baseline_paths = sorted(set(baseline_paths) | set(candidate))
         readonly = replace(
             review_workspace,
             allowed_writes=(),
             parent_baseline={},
             workspace_baseline={
                 relative: _hash_path(review_workspace.path / relative)
-                for relative in sorted(set(baseline_paths) | set(candidate))
+                for relative in workspace_baseline_paths
             },
         )
+        read_only_input_hashes = {
+            relative: _hash_path(readonly.path / relative)
+            for relative in read_only_inputs
+        }
         return readonly, {
             "schema_id": "aiworkhub.quality_review_workspace.v1",
             "candidate_paths": candidate,
             "canonical_delta_paths": canonical_delta,
+            "read_only_input_paths": read_only_inputs,
+            "read_only_input_hashes": read_only_input_hashes,
             "readonly": True,
         }
     except Exception:
