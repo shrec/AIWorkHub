@@ -10,6 +10,7 @@ from aiworkhub import (
     core,
     evidence_levels,
     feature_settings,
+    learning_commit,
     learning_commit_store,
     manager_ai_tools,
     task_store,
@@ -60,7 +61,7 @@ def _accepted_card(root: Path, *, task_id: str, request_id: str) -> None:
         con.close()
 
 
-def _setup(tmp_path: Path, monkeypatch) -> tuple[Path, str, str]:
+def _setup_repo(tmp_path: Path, monkeypatch) -> Path:
     root = tmp_path / "repo"
     root.mkdir()
     assert task_store.initialize_repository(root)["ok"]
@@ -71,10 +72,43 @@ def _setup(tmp_path: Path, monkeypatch) -> tuple[Path, str, str]:
     )
     monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
     monkeypatch.setattr(core, "writes_allowed", lambda: True)
+    return root
+
+
+def _setup(tmp_path: Path, monkeypatch) -> tuple[Path, str, str]:
+    root = _setup_repo(tmp_path, monkeypatch)
     task_id = "TASK-LEARNING-1"
     request_id = "request-learning-0001"
     _accepted_card(root, task_id=task_id, request_id=request_id)
     return root, task_id, request_id
+
+
+def _review_card(
+    root: Path, *, task_id: str, request_id: str, substatus: str,
+    sealed_diagnostics: dict | None = None,
+) -> None:
+    """Seed a card still in review, carrying only structured worker evidence
+    (terminal_review.substatus / a provider-sealed diagnostic) -- never a
+    manager reason or root-cause prose, which the classifier must never read.
+    """
+    evidence: dict = {"request_identity": {"request_id": request_id}}
+    if sealed_diagnostics is not None:
+        evidence["provider_error"] = sealed_diagnostics
+    card = {
+        "task_id": task_id,
+        "runner": "worker",
+        "topic": "learning",
+        "mode": "edit",
+        "status": "review",
+        "worker_status": "review",
+        "terminal_review": {"substatus": substatus, "evidence": evidence},
+    }
+    con = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    con.row_factory = sqlite3.Row
+    try:
+        upsert_card(con, card)
+    finally:
+        con.close()
 
 
 def _commit(task_id: str, request_id: str) -> dict:
@@ -207,3 +241,221 @@ def test_learning_commit_resumes_only_failed_projection(tmp_path, monkeypatch):
         assert row is not None and row[1] == "completed"
     finally:
         con.close()
+
+
+def test_rejected_finalization_creates_one_idempotent_commit_classified_candidate_code(
+    tmp_path, monkeypatch,
+):
+    root = _setup_repo(tmp_path, monkeypatch)
+    task_id = "TASK-REJECTED-1"
+    request_id = "request-rejected-0001"
+    _review_card(root, task_id=task_id, request_id=request_id, substatus="validation_failed")
+
+    def _reject() -> dict:
+        return manager_ai_tools.learning_commit(
+            task_id=task_id,
+            request_id=request_id,
+            repo_area="src/aiworkhub",
+            outcome="rejected",
+            evidence_ids=[],
+            idempotency_key="learning-manager-rejected-0001",
+            provenance="manager rejection regression test",
+        )
+
+    first = _reject()
+    second = _reject()
+
+    assert first["ok"] is True
+    assert first["failure_category"] == "candidate_code"
+    assert second["idempotent"] is True
+    assert second["commit_id"] == first["commit_id"]
+
+    registry = task_store.storage_readiness(root)
+    con = sqlite3.connect(registry.canonical_db)
+    try:
+        count = con.execute(
+            "SELECT COUNT(*) FROM learning_commits WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert count == 1
+
+
+def test_blocked_finalization_creates_one_idempotent_inconclusive_commit_classified_provider_runtime(
+    tmp_path, monkeypatch,
+):
+    root = _setup_repo(tmp_path, monkeypatch)
+    task_id = "TASK-BLOCKED-1"
+    request_id = "request-blocked-0001"
+    _review_card(
+        root, task_id=task_id, request_id=request_id, substatus="launch_failed",
+        sealed_diagnostics={"owner": "provider", "sealed": True, "code": "insufficient_balance", "http_status": 402},
+    )
+
+    def _block() -> dict:
+        return manager_ai_tools.learning_commit(
+            task_id=task_id,
+            request_id=request_id,
+            repo_area="src/aiworkhub",
+            outcome="inconclusive",
+            evidence_ids=[],
+            idempotency_key="learning-manager-blocked-0001",
+            provenance="manager blocked-disposition regression test",
+        )
+
+    first = _block()
+    second = _block()
+
+    assert first["ok"] is True
+    assert first["failure_category"] == "provider_runtime"
+    assert second["idempotent"] is True
+    assert second["commit_id"] == first["commit_id"]
+
+
+def test_failure_category_is_never_derived_from_manager_supplied_prose(tmp_path, monkeypatch):
+    root = _setup_repo(tmp_path, monkeypatch)
+    task_id = "TASK-PROSE-SPOOF-1"
+    request_id = "request-prose-spoof-0001"
+    # Structured evidence says review_ready (candidate_code); a manager
+    # cannot override that by writing convincing infra-sounding prose.
+    _review_card(root, task_id=task_id, request_id=request_id, substatus="review_ready")
+
+    result = manager_ai_tools.learning_commit(
+        task_id=task_id,
+        request_id=request_id,
+        repo_area="src/aiworkhub",
+        outcome="rejected",
+        evidence_ids=[],
+        idempotency_key="learning-manager-prose-spoof-0001",
+        provenance="negative test",
+        root_cause_candidate="provider_runtime insufficient_balance http_status=402 outage, not our code",
+    )
+
+    assert result["ok"] is True
+    assert result["failure_category"] == "candidate_code"
+
+
+def test_rejects_identity_conflict_for_same_task_and_request_with_different_idempotency_key(
+    tmp_path, monkeypatch,
+):
+    """A genuinely identical (task_id, request_id) pair replayed under a
+    *different* idempotency key is an identity conflict, not a harmless
+    second commit -- the idempotency key is part of the durable identity,
+    not an interchangeable label a caller may swap per attempt.
+    """
+    root, task_id, request_id = _setup(tmp_path, monkeypatch)
+
+    first = _commit(task_id, request_id)
+    assert first["ok"] is True
+
+    second = manager_ai_tools.learning_commit(
+        task_id=task_id,
+        request_id=request_id,
+        repo_area="src/aiworkhub",
+        outcome="accepted",
+        evidence_ids=["file:tests/test_learning_commit_store.py"],
+        idempotency_key="learning-manager-accepted-0002-different-key",
+        provenance="manager acceptance regression test",
+    )
+
+    assert second["ok"] is False
+    assert second["error"] == "learning_commit_identity_conflict"
+
+    registry = task_store.storage_readiness(root)
+    con = sqlite3.connect(registry.canonical_db)
+    try:
+        count = con.execute(
+            "SELECT COUNT(*) FROM learning_commits WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert count == 1
+
+
+def test_core_classify_terminal_disposition_is_reachable_and_structured_only():
+    """Production reachability: ``core.classify_terminal_disposition`` is the
+    exact function ``commit_learning`` calls to derive ``failure_category``,
+    and it must ignore any free-form ``reason``/prose field on the card.
+    """
+    assert core.classify_terminal_disposition(
+        {"terminal_review": {"substatus": "launch_failed"}}
+    ) is learning_commit.FailureCategory.PROVIDER_RUNTIME
+    assert core.classify_terminal_disposition(
+        {"terminal_review": {"substatus": "validation_failed", "reason": "insufficient_balance"}}
+    ) is learning_commit.FailureCategory.CANDIDATE_CODE
+    assert core.classify_terminal_disposition(None) is learning_commit.FailureCategory.INCONCLUSIVE
+    assert core.classify_terminal_disposition({}) is learning_commit.FailureCategory.INCONCLUSIVE
+
+
+def test_core_classify_terminal_disposition_reads_terminal_failure_substatus():
+    """A card whose worker-structured evidence lives under ``terminal_failure``
+    (not ``terminal_review``) must classify identically -- the two are
+    alternate structured shapes for the same worker-owned terminal report.
+    """
+    assert core.classify_terminal_disposition(
+        {"terminal_failure": {"substatus": "timed_out"}}
+    ) is learning_commit.FailureCategory.CANCELLATION_OR_TIMEOUT
+    assert core.classify_terminal_disposition(
+        {"terminal_failure": {"substatus": "review_ready", "reason": "looks like an outage"}}
+    ) is learning_commit.FailureCategory.CANDIDATE_CODE
+
+
+def test_core_classify_terminal_disposition_reads_sealed_diagnostics_from_either_shape():
+    """A provider-sealed structured diagnostic attached under either
+    ``terminal_review.evidence.provider_error`` or
+    ``terminal_failure.evidence.provider_error`` overrides an otherwise
+    code-quality-looking substatus -- but only when genuinely sealed by the
+    provider transport.
+    """
+    assert core.classify_terminal_disposition({
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {"provider_error": {
+                "owner": "provider", "sealed": True,
+                "code": "insufficient_balance", "http_status": 402,
+            }},
+        },
+    }) is learning_commit.FailureCategory.PROVIDER_RUNTIME
+    assert core.classify_terminal_disposition({
+        "terminal_failure": {
+            "substatus": "review_ready",
+            "evidence": {"provider_error": {
+                "owner": "provider", "sealed": True, "code": "route_unavailable",
+            }},
+        },
+    }) is learning_commit.FailureCategory.DEPENDENCY_OR_ROUTE
+    # Unsealed (model-authored) diagnostic is never trusted, even matching shape.
+    assert core.classify_terminal_disposition({
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {"provider_error": {
+                "owner": "model", "sealed": False, "code": "insufficient_balance",
+            }},
+        },
+    }) is learning_commit.FailureCategory.CANDIDATE_CODE
+
+
+def test_core_classify_terminal_disposition_falls_back_to_top_level_terminal_substatus():
+    """When neither ``terminal_review`` nor ``terminal_failure`` is present,
+    the worker's own top-level ``terminal_substatus`` field is consulted.
+    """
+    assert core.classify_terminal_disposition(
+        {"terminal_substatus": "process_lost"}
+    ) is learning_commit.FailureCategory.PROVIDER_RUNTIME
+    assert core.classify_terminal_disposition(
+        {"terminal_substatus": "output_budget_exceeded"}
+    ) is learning_commit.FailureCategory.POLICY_OR_SCOPE
+
+
+def test_core_classify_terminal_disposition_falls_back_to_top_level_worker_status():
+    """With no ``terminal_review``/``terminal_failure``/``terminal_substatus``,
+    the worker's own top-level ``worker_status`` is the last structured
+    fallback -- still never a manager/assistant free-form field.
+    """
+    assert core.classify_terminal_disposition(
+        {"worker_status": "cancelled"}
+    ) is learning_commit.FailureCategory.CANCELLATION_OR_TIMEOUT
+    # An empty terminal_substatus is falsy, so worker_status is still consulted.
+    assert core.classify_terminal_disposition(
+        {"terminal_substatus": "", "worker_status": "cancelled"}
+    ) is learning_commit.FailureCategory.CANCELLATION_OR_TIMEOUT

@@ -28,6 +28,129 @@ class Outcome(Enum):
     INCONCLUSIVE = "inconclusive"
 
 
+class FailureCategory(Enum):
+    """Canonical, closed taxonomy for a finalized task's failure signal.
+
+    Classification (see :func:`classify_failure_category`) consults only the
+    worker's own structured terminal substatus and a provider-sealed
+    structured diagnostic -- never manager, assistant or provider free-form
+    prose -- so a rejection reason or root-cause candidate written by a model
+    can never spoof its own category.
+    """
+    CANDIDATE_CODE = "candidate_code"
+    VALIDATION_ENVIRONMENT = "validation_environment"
+    PROVIDER_RUNTIME = "provider_runtime"
+    DEPENDENCY_OR_ROUTE = "dependency_or_route"
+    POLICY_OR_SCOPE = "policy_or_scope"
+    CANCELLATION_OR_TIMEOUT = "cancellation_or_timeout"
+    INCONCLUSIVE = "inconclusive"
+
+
+# Substatus vocabulary is the worker's own structured terminal report (never
+# manager/assistant prose).  "review_ready" is included here because these
+# groups are consulted only when the finalization outcome is *not* accepted:
+# a manager-rejected task whose worker reported review_ready means the worker
+# believed it succeeded but a human found a genuine candidate defect.
+_CODE_QUALITY_TERMINAL_SUBSTATUSES: FrozenSet[str] = frozenset({
+    "review_ready", "validation_failed",
+})
+_ENVIRONMENT_TERMINAL_SUBSTATUSES: FrozenSet[str] = frozenset({"finalize_failed"})
+_PROVIDER_RUNTIME_TERMINAL_SUBSTATUSES: FrozenSet[str] = frozenset({
+    "launch_failed", "worker_failed", "process_lost", "liveness_lost",
+})
+_CANCELLATION_TERMINAL_SUBSTATUSES: FrozenSet[str] = frozenset({"timed_out", "cancelled"})
+_POLICY_TERMINAL_SUBSTATUSES: FrozenSet[str] = frozenset({"output_budget_exceeded"})
+
+# Single canonical source of "this terminal substatus is an infrastructure
+# failure, not a candidate-code failure" -- reused by workforce_catalog so
+# code-quality rates and learning-commit classification never disagree.
+INFRASTRUCTURE_TERMINAL_SUBSTATUSES: FrozenSet[str] = frozenset(
+    _PROVIDER_RUNTIME_TERMINAL_SUBSTATUSES
+    | _CANCELLATION_TERMINAL_SUBSTATUSES
+    | _ENVIRONMENT_TERMINAL_SUBSTATUSES
+)
+
+INFRASTRUCTURE_FAILURE_CATEGORIES: FrozenSet[FailureCategory] = frozenset({
+    FailureCategory.PROVIDER_RUNTIME,
+    FailureCategory.DEPENDENCY_OR_ROUTE,
+    FailureCategory.CANCELLATION_OR_TIMEOUT,
+    FailureCategory.VALIDATION_ENVIRONMENT,
+})
+CODE_QUALITY_FAILURE_CATEGORIES: FrozenSet[FailureCategory] = frozenset({
+    FailureCategory.CANDIDATE_CODE,
+})
+
+_SEALED_PROVIDER_QUOTA_CODES: FrozenSet[str] = frozenset({
+    "insufficient_balance", "insufficient_quota",
+    "balance_exhausted", "quota_exhausted",
+})
+_SEALED_PROVIDER_AUTH_CODES: FrozenSet[str] = frozenset({
+    "invalid_grant", "unknown_refresh_token",
+    "invalid_api_key", "unauthorized",
+    "authentication_failed", "authorization_failed",
+})
+_SEALED_PROVIDER_DEPENDENCY_CODES: FrozenSet[str] = frozenset({
+    "dependency_unavailable", "route_unavailable",
+    "upstream_unavailable", "mcp_unavailable",
+})
+
+
+def _sealed_provider_diagnostic(value: Any) -> Optional[Dict[str, Any]]:
+    """Return ``value`` only if the provider transport sealed it itself.
+
+    ``owner`` must be exactly ``"provider"`` and ``sealed`` exactly ``True``.
+    Any other shape -- including a structured-looking dict an assistant wrote
+    about itself -- is untrusted and ignored, so substring/dict spoofing
+    cannot forge a classification.
+    """
+    if not isinstance(value, dict):
+        return None
+    if str(value.get("owner") or "").strip().casefold() != "provider":
+        return None
+    if value.get("sealed") is not True:
+        return None
+    return value
+
+
+def classify_failure_category(
+    *,
+    terminal_substatus: Optional[str] = None,
+    sealed_diagnostics: Optional[Dict[str, Any]] = None,
+) -> FailureCategory:
+    """Classify one finalized task's failure into the canonical taxonomy.
+
+    Only the worker's own structured ``terminal_substatus`` and a
+    provider-sealed structured diagnostic are consulted.  Free-form prose (a
+    manager's reject reason, a root-cause candidate, an assistant's
+    self-reported error text) is never scanned.
+    """
+    substatus = str(terminal_substatus or "").strip().lower()
+    sealed = _sealed_provider_diagnostic(sealed_diagnostics)
+    if sealed is not None:
+        code = str(sealed.get("code") or "").strip().casefold()
+        status = sealed.get("http_status")
+        status_code = status if isinstance(status, int) and not isinstance(status, bool) else 0
+        if (
+            status_code in (401, 402, 403)
+            or code in _SEALED_PROVIDER_QUOTA_CODES
+            or code in _SEALED_PROVIDER_AUTH_CODES
+        ):
+            return FailureCategory.PROVIDER_RUNTIME
+        if code in _SEALED_PROVIDER_DEPENDENCY_CODES:
+            return FailureCategory.DEPENDENCY_OR_ROUTE
+    if substatus in _CODE_QUALITY_TERMINAL_SUBSTATUSES:
+        return FailureCategory.CANDIDATE_CODE
+    if substatus in _ENVIRONMENT_TERMINAL_SUBSTATUSES:
+        return FailureCategory.VALIDATION_ENVIRONMENT
+    if substatus in _PROVIDER_RUNTIME_TERMINAL_SUBSTATUSES:
+        return FailureCategory.PROVIDER_RUNTIME
+    if substatus in _POLICY_TERMINAL_SUBSTATUSES:
+        return FailureCategory.POLICY_OR_SCOPE
+    if substatus in _CANCELLATION_TERMINAL_SUBSTATUSES:
+        return FailureCategory.CANCELLATION_OR_TIMEOUT
+    return FailureCategory.INCONCLUSIVE
+
+
 @dataclass(frozen=True)
 class EdgeCandidate:
     """A proposed Context Graph edge connecting two nodes with a relation."""
@@ -51,6 +174,7 @@ ALLOWED_COMMIT_FIELDS: FrozenSet[str] = frozenset({
     "repository_id",
     "repo_area",
     "outcome",
+    "failure_category",
     "evidence_ids",
     "root_cause_candidate",
     "invariant_candidate",
@@ -127,6 +251,7 @@ class LearningCommit:
     task_id: str
     repo_area: str
     outcome: Outcome
+    failure_category: Optional[FailureCategory] = None
     evidence_ids: Tuple[str, ...] = field(default_factory=tuple)
     root_cause_candidate: Optional[str] = None
     invariant_candidate: Optional[str] = None
@@ -144,6 +269,14 @@ class LearningCommit:
             _bounded_text(self.repository_id, "repository_id", maximum=256)
         if not isinstance(self.outcome, Outcome):
             raise ValueError(f"outcome must be an Outcome, got {type(self.outcome).__name__}")
+        if self.failure_category is not None:
+            if not isinstance(self.failure_category, FailureCategory):
+                raise ValueError(
+                    "failure_category must be a FailureCategory, got "
+                    f"{type(self.failure_category).__name__}"
+                )
+            if self.outcome == Outcome.ACCEPTED:
+                raise ValueError("failure_category must be None for outcome ACCEPTED")
 
         evidence_ids = self.evidence_ids
         if not isinstance(evidence_ids, (list, tuple)):
@@ -241,6 +374,25 @@ def learning_commit_from_dict(data: Dict[str, Any]) -> LearningCommit:
             f"'outcome' must be an Outcome or string, got {type(outcome_raw).__name__}"
         )
 
+    category_raw = data.get("failure_category")
+    if category_raw is None:
+        failure_category: Optional[FailureCategory] = None
+    elif isinstance(category_raw, FailureCategory):
+        failure_category = category_raw
+    elif isinstance(category_raw, str):
+        try:
+            failure_category = FailureCategory(category_raw.lower())
+        except ValueError:
+            raise ValueError(
+                f"Invalid failure_category value: {category_raw!r}; "
+                f"expected one of {[c.value for c in FailureCategory]}"
+            )
+    else:
+        raise TypeError(
+            "'failure_category' must be a FailureCategory or string, got "
+            f"{type(category_raw).__name__}"
+        )
+
     raw_edges = data.get("edge_candidates", [])
     if not isinstance(raw_edges, list):
         raise ValueError("edge_candidates must be a list")
@@ -265,6 +417,7 @@ def learning_commit_from_dict(data: Dict[str, Any]) -> LearningCommit:
         task_id=data["task_id"],
         repo_area=data["repo_area"],
         outcome=outcome,
+        failure_category=failure_category,
         repository_id=data.get("repository_id"),
         evidence_ids=data.get("evidence_ids", []),
         root_cause_candidate=data.get("root_cause_candidate"),

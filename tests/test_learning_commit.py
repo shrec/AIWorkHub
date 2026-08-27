@@ -7,7 +7,11 @@ import pytest
 from aiworkhub.learning_commit import (
     LearningCommit,
     Outcome,
+    FailureCategory,
     EdgeCandidate,
+    INFRASTRUCTURE_FAILURE_CATEGORIES,
+    CODE_QUALITY_FAILURE_CATEGORIES,
+    classify_failure_category,
     validate_repo_match,
     learning_commit_from_dict,
 )
@@ -423,3 +427,138 @@ class TestImmutableCollections:
         c = learning_commit_from_dict(d)
         assert isinstance(c.evidence_ids, tuple)
         assert isinstance(c.edge_candidates, tuple)
+
+
+class TestCanonicalFailureTaxonomy:
+    """The taxonomy is closed and every member is reachable and classified
+    from structured terminal-substatus evidence alone."""
+
+    def test_taxonomy_covers_exactly_the_seven_canonical_categories(self):
+        assert {member.value for member in FailureCategory} == {
+            "candidate_code",
+            "validation_environment",
+            "provider_runtime",
+            "dependency_or_route",
+            "policy_or_scope",
+            "cancellation_or_timeout",
+            "inconclusive",
+        }
+
+    def test_infrastructure_and_code_quality_groupings_are_disjoint(self):
+        assert INFRASTRUCTURE_FAILURE_CATEGORIES.isdisjoint(CODE_QUALITY_FAILURE_CATEGORIES)
+        assert FailureCategory.CANDIDATE_CODE in CODE_QUALITY_FAILURE_CATEGORIES
+        assert FailureCategory.PROVIDER_RUNTIME in INFRASTRUCTURE_FAILURE_CATEGORIES
+
+    @pytest.mark.parametrize(
+        "terminal_substatus,expected",
+        [
+            ("validation_failed", FailureCategory.CANDIDATE_CODE),
+            ("review_ready", FailureCategory.CANDIDATE_CODE),
+            ("finalize_failed", FailureCategory.VALIDATION_ENVIRONMENT),
+            ("launch_failed", FailureCategory.PROVIDER_RUNTIME),
+            ("worker_failed", FailureCategory.PROVIDER_RUNTIME),
+            ("process_lost", FailureCategory.PROVIDER_RUNTIME),
+            ("liveness_lost", FailureCategory.PROVIDER_RUNTIME),
+            ("output_budget_exceeded", FailureCategory.POLICY_OR_SCOPE),
+            ("timed_out", FailureCategory.CANCELLATION_OR_TIMEOUT),
+            ("cancelled", FailureCategory.CANCELLATION_OR_TIMEOUT),
+            ("", FailureCategory.INCONCLUSIVE),
+            ("never_seen_before", FailureCategory.INCONCLUSIVE),
+        ],
+    )
+    def test_classifies_from_terminal_substatus_alone(self, terminal_substatus, expected):
+        assert classify_failure_category(terminal_substatus=terminal_substatus) is expected
+
+    def test_sealed_provider_quota_error_classifies_as_provider_runtime(self):
+        result = classify_failure_category(
+            terminal_substatus="worker_failed",
+            sealed_diagnostics={
+                "owner": "provider", "sealed": True,
+                "code": "insufficient_balance", "http_status": 402,
+            },
+        )
+        assert result is FailureCategory.PROVIDER_RUNTIME
+
+    def test_sealed_provider_dependency_error_classifies_as_dependency_or_route(self):
+        result = classify_failure_category(
+            terminal_substatus="review_ready",
+            sealed_diagnostics={
+                "owner": "provider", "sealed": True, "code": "route_unavailable",
+            },
+        )
+        assert result is FailureCategory.DEPENDENCY_OR_ROUTE
+
+    def test_unsealed_diagnostic_is_never_trusted_even_with_matching_code(self):
+        # Not sealed by the provider transport -- must fall back to substatus,
+        # never be read as classification evidence, however code-shaped.
+        result = classify_failure_category(
+            terminal_substatus="review_ready",
+            sealed_diagnostics={
+                "owner": "model", "sealed": False, "code": "route_unavailable",
+            },
+        )
+        assert result is FailureCategory.CANDIDATE_CODE
+
+    def test_prose_shaped_string_is_never_scanned_as_sealed_diagnostics(self):
+        # A bare string (e.g. free-form provider/model prose) is not a mapping
+        # and must never be treated as a sealed diagnostic.
+        result = classify_failure_category(
+            terminal_substatus="review_ready",
+            sealed_diagnostics="insufficient_balance http_status=402",  # type: ignore[arg-type]
+        )
+        assert result is FailureCategory.CANDIDATE_CODE
+
+
+class TestFailureCategoryOnLearningCommit:
+    def test_accepted_forbids_failure_category(self):
+        with pytest.raises(ValueError, match="failure_category must be None"):
+            LearningCommit(
+                task_id="t", repo_area="r", outcome=Outcome.ACCEPTED,
+                failure_category=FailureCategory.CANDIDATE_CODE,
+            )
+
+    def test_rejected_allows_failure_category(self):
+        c = LearningCommit(
+            task_id="t", repo_area="r", outcome=Outcome.REJECTED,
+            failure_category=FailureCategory.CANDIDATE_CODE,
+        )
+        assert c.failure_category is FailureCategory.CANDIDATE_CODE
+
+    def test_inconclusive_allows_infrastructure_category(self):
+        c = LearningCommit(
+            task_id="t", repo_area="r", outcome=Outcome.INCONCLUSIVE,
+            failure_category=FailureCategory.PROVIDER_RUNTIME,
+        )
+        assert c.failure_category is FailureCategory.PROVIDER_RUNTIME
+
+    def test_rejects_invalid_failure_category_type(self):
+        with pytest.raises(ValueError, match="failure_category must be a FailureCategory"):
+            LearningCommit(
+                task_id="t", repo_area="r", outcome=Outcome.REJECTED,
+                failure_category="candidate_code",  # type: ignore[arg-type]
+            )
+
+    def test_default_failure_category_is_none(self):
+        c = LearningCommit(task_id="t", repo_area="r", outcome=Outcome.REJECTED)
+        assert c.failure_category is None
+
+    def test_from_dict_parses_string_failure_category(self):
+        d = {
+            "task_id": "t", "repo_area": "r", "outcome": "rejected",
+            "failure_category": "candidate_code",
+        }
+        c = learning_commit_from_dict(d)
+        assert c.failure_category is FailureCategory.CANDIDATE_CODE
+
+    def test_from_dict_rejects_invalid_failure_category_string(self):
+        d = {
+            "task_id": "t", "repo_area": "r", "outcome": "rejected",
+            "failure_category": "not_a_real_category",
+        }
+        with pytest.raises(ValueError, match="Invalid failure_category"):
+            learning_commit_from_dict(d)
+
+    def test_from_dict_accepted_with_no_failure_category(self):
+        d = {"task_id": "t", "repo_area": "r", "outcome": "accepted"}
+        c = learning_commit_from_dict(d)
+        assert c.failure_category is None

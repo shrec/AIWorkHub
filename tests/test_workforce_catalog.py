@@ -6,7 +6,7 @@ import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
-from aiworkhub import model_settings, workforce_catalog, workforce_router
+from aiworkhub import core, learning_commit, model_settings, workforce_catalog, workforce_router
 
 
 def test_catalog_atomic_write_skips_redundant_chmod_when_already_private(
@@ -155,6 +155,34 @@ def test_catalog_scores_only_attributed_canonical_outcomes(tmp_path: Path) -> No
     assert untouched["availability_observed"] is False
 
 
+def test_catalog_uses_canonical_taxonomy_for_infrastructure_substatuses(
+    tmp_path: Path,
+) -> None:
+    """workforce_catalog and learning_commit must never disagree about which
+    terminal substatuses are infrastructure failures -- so this exercises a
+    substatus (``process_lost``) that only the shared canonical taxonomy
+    (not workforce_catalog's old private, narrower set) recognizes.
+    """
+    assert "process_lost" in learning_commit.INFRASTRUCTURE_TERMINAL_SUBSTATUSES
+    root = _root(tmp_path)
+    cards = [
+        {"task_id": "T1", "status": "blocked", "terminal_substatus": "process_lost"},
+        {"task_id": "T2", "status": "finished", "terminal_substatus": "review_ready"},
+    ]
+    processes = [
+        {"request_id": "r1", "task_id": "T1", "adapter_id": "glm_vscode_lm", "model": "glm-5.2"},
+        {"request_id": "r2", "task_id": "T2", "adapter_id": "glm_vscode_lm", "model": "glm-5.2"},
+    ]
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=cards, process_rows=processes, preflight=_preflight()
+    )
+    glm = next(item for item in snapshot["workers"] if item["worker_id"] == "glm-5.2")
+    assert glm["outcomes"]["sample_count"] == 1
+    assert glm["outcomes"]["attempted_task_count"] == 2
+    assert glm["outcomes"]["infrastructure_failure_count"] == 1
+    assert glm["outcomes"]["accepted_rate"] == 1.0
+
+
 def test_infrastructure_failures_do_not_poison_model_quality_evidence(
     tmp_path: Path,
 ) -> None:
@@ -180,6 +208,87 @@ def test_infrastructure_failures_do_not_poison_model_quality_evidence(
     assert glm["outcomes"]["review_ready_rate"] == 1.0
     assert glm["outcomes"]["validation_failure_rate"] == 0.0
     assert glm["observed_score"] == 100.0
+
+
+def test_sealed_dependency_diagnostic_excludes_card_via_canonical_failure_category(
+    tmp_path: Path,
+) -> None:
+    """Infrastructure exclusion must consume the canonical FailureCategory
+    grouping (``learning_commit.INFRASTRUCTURE_FAILURE_CATEGORIES``) through
+    the same ``core.classify_terminal_disposition`` the learning-commit path
+    uses -- not merely a private terminal_substatus allowlist. A card whose
+    terminal_substatus looks candidate-code-shaped (``review_ready``) but
+    carries a provider-sealed dependency/route diagnostic is still an
+    infrastructure failure and must not poison the model's quality rate.
+    """
+    root = _root(tmp_path)
+    cards = [
+        {
+            "task_id": "T1",
+            "status": "blocked",
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {"provider_error": {
+                    "owner": "provider", "sealed": True, "code": "route_unavailable",
+                }},
+            },
+        },
+        {"task_id": "T2", "status": "finished", "terminal_substatus": "review_ready"},
+    ]
+    processes = [
+        {"request_id": "r1", "task_id": "T1", "adapter_id": "glm_vscode_lm", "model": "glm-5.2"},
+        {"request_id": "r2", "task_id": "T2", "adapter_id": "glm_vscode_lm", "model": "glm-5.2"},
+    ]
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=cards, process_rows=processes, preflight=_preflight()
+    )
+    glm = next(item for item in snapshot["workers"] if item["worker_id"] == "glm-5.2")
+    assert glm["outcomes"]["sample_count"] == 1
+    assert glm["outcomes"]["attempted_task_count"] == 2
+    assert glm["outcomes"]["infrastructure_failure_count"] == 1
+    assert glm["outcomes"]["accepted_rate"] == 1.0
+
+
+def test_failure_rate_stays_aligned_when_canonical_taxonomy_changes(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """workforce_catalog's ``validation_failure_rate`` must be derived only
+    through the shared canonical classifier
+    (``core.classify_terminal_disposition`` +
+    ``learning_commit.CODE_QUALITY_FAILURE_CATEGORIES``), never a private
+    literal duplicated in workforce_catalog.py. Prove it by widening what the
+    canonical taxonomy classifies as CANDIDATE_CODE for a substatus the old
+    hardcoded set never recognized, and confirming the catalog's failure rate
+    reacts -- with zero changes to workforce_catalog.py itself.
+    """
+    root = _root(tmp_path)
+    cards = [
+        {"task_id": "T1", "status": "review", "terminal_substatus": "custom_new_failure_substatus"},
+    ]
+    processes = [
+        {"request_id": "r1", "task_id": "T1", "adapter_id": "glm_vscode_lm", "model": "glm-5.2"},
+    ]
+
+    before = workforce_catalog.build_catalog(
+        root, cards=cards, process_rows=processes, preflight=_preflight()
+    )
+    glm_before = next(item for item in before["workers"] if item["worker_id"] == "glm-5.2")
+    assert glm_before["outcomes"]["validation_failure_rate"] == 0.0
+
+    real_classify = core.classify_terminal_disposition
+
+    def widened_classify(card):
+        if isinstance(card, dict) and card.get("terminal_substatus") == "custom_new_failure_substatus":
+            return learning_commit.FailureCategory.CANDIDATE_CODE
+        return real_classify(card)
+
+    monkeypatch.setattr(workforce_catalog.core, "classify_terminal_disposition", widened_classify)
+
+    after = workforce_catalog.build_catalog(
+        root, cards=cards, process_rows=processes, preflight=_preflight()
+    )
+    glm_after = next(item for item in after["workers"] if item["worker_id"] == "glm-5.2")
+    assert glm_after["outcomes"]["validation_failure_rate"] == 1.0
 
 
 def test_repository_model_policy_removes_disabled_routes_from_ranking(

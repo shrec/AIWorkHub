@@ -32,6 +32,7 @@ from . import task_store
 from . import callback_store
 from . import task_plan
 from . import dependency_autolaunch
+from .learning_commit import FailureCategory, classify_failure_category
 
 
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("AIWORKHUB_TIMEOUT", "60"))
@@ -4346,6 +4347,41 @@ def _resolve_reject_review_predecessor(
     ):
         return None, f"predecessor_request_id_stale:{stripped}"
     return None, f"predecessor_request_id {stripped} not found in retained review evidence"
+
+
+def classify_terminal_disposition(card: Mapping[str, Any] | None) -> FailureCategory:
+    """Classify one finalized task's failure from structured card evidence only.
+
+    Consults the worker's own structured terminal substatus
+    (``terminal_review``/``terminal_failure``/``terminal_substatus``) and any
+    provider-sealed structured diagnostic already attached to that evidence.
+    A manager's rejection ``reason``, a root-cause candidate, or any other
+    free-form prose is never read here -- see
+    :func:`aiworkhub.learning_commit.classify_failure_category`.
+    """
+    if not isinstance(card, Mapping):
+        return FailureCategory.INCONCLUSIVE
+    terminal_review = card.get("terminal_review")
+    terminal_failure = card.get("terminal_failure")
+    substatus = ""
+    if isinstance(terminal_review, Mapping):
+        substatus = str(terminal_review.get("substatus") or "")
+    if not substatus and isinstance(terminal_failure, Mapping):
+        substatus = str(terminal_failure.get("substatus") or "")
+    if not substatus:
+        substatus = str(card.get("terminal_substatus") or card.get("worker_status") or "")
+    sealed_diagnostics = None
+    for source in (terminal_review, terminal_failure):
+        if isinstance(source, Mapping):
+            evidence = source.get("evidence")
+            if isinstance(evidence, Mapping):
+                candidate = evidence.get("provider_error")
+                if isinstance(candidate, Mapping):
+                    sealed_diagnostics = candidate
+                    break
+    return classify_failure_category(
+        terminal_substatus=substatus, sealed_diagnostics=sealed_diagnostics,
+    )
 
 
 def reject_review(

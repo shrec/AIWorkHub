@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, cast
 
-from . import context_graph, context_writes, evidence_levels, feature_settings, task_store
+from . import context_graph, context_writes, core, evidence_levels, feature_settings, task_store
 from .learning_commit import LearningCommit, Outcome, learning_commit_from_dict, validate_repo_match
 
 
@@ -76,6 +76,13 @@ def _json(value: Any) -> str:
     return encoded
 
 
+def _edge_dicts(commit: LearningCommit) -> list[dict[str, str]]:
+    return [
+        {"source": edge.source, "target": edge.target, "relation": edge.relation}
+        for edge in commit.edge_candidates
+    ]
+
+
 def _commit_payload(commit: LearningCommit) -> dict[str, Any]:
     return {
         "schema_id": SCHEMA_ID,
@@ -83,14 +90,12 @@ def _commit_payload(commit: LearningCommit) -> dict[str, Any]:
         "repository_id": commit.repository_id,
         "repo_area": commit.repo_area,
         "outcome": commit.outcome.value,
+        "failure_category": commit.failure_category.value if commit.failure_category else None,
         "evidence_ids": list(commit.evidence_ids),
         "root_cause_candidate": commit.root_cause_candidate,
         "invariant_candidate": commit.invariant_candidate,
         "lesson_candidate": commit.lesson_candidate,
-        "edge_candidates": [
-            {"source": edge.source, "target": edge.target, "relation": edge.relation}
-            for edge in commit.edge_candidates
-        ],
+        "edge_candidates": _edge_dicts(commit),
         "promotion_eligible_ai_memory": commit.promotion_eligible_ai_memory,
         "promotion_eligible_context_graph": commit.promotion_eligible_context_graph,
         "promotion_eligible_kb": commit.promotion_eligible_kb,
@@ -258,13 +263,11 @@ def _summary(commit_id: str, request_id: str, commit: LearningCommit) -> dict[st
         "repository_id": commit.repository_id,
         "repo_area": commit.repo_area,
         "outcome": commit.outcome.value,
+        "failure_category": commit.failure_category.value if commit.failure_category else None,
         "root_cause": commit.root_cause_candidate,
         "invariant": commit.invariant_candidate,
         "lesson": commit.lesson_candidate,
-        "edges": [
-            {"source": edge.source, "target": edge.target, "relation": edge.relation}
-            for edge in commit.edge_candidates
-        ],
+        "edges": _edge_dicts(commit),
         "evidence_count": len(commit.evidence_ids),
         "evidence_sha256": hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
         "primary_evidence": commit.evidence_ids[0] if commit.evidence_ids else "",
@@ -311,6 +314,14 @@ def commit_learning(
     elif not _request_matches_candidate(card, request_id):
         raise LearningCommitStoreError("learning_commit_request_identity_mismatch")
     normalized["evidence_ids"] = evidence_ids
+    # The failure taxonomy is never caller-suppliable: it is always derived
+    # server-side from the canonical card's own structured terminal evidence,
+    # never from a manager-authored reason or root-cause candidate string, so
+    # a model cannot talk its way into a false category.
+    normalized["failure_category"] = (
+        None if outcome == Outcome.ACCEPTED
+        else core.classify_terminal_disposition(card).value
+    )
     try:
         commit = learning_commit_from_dict(normalized)
         validate_repo_match(commit, readiness.repo_id)
@@ -356,10 +367,7 @@ def commit_learning(
             task_id=commit.task_id,
             metadata={
                 "commit_id": commit_id,
-                "learning_edges": [
-                    {"source": edge.source, "target": edge.target, "relation": edge.relation}
-                    for edge in commit.edge_candidates
-                ],
+                "learning_edges": _edge_dicts(commit),
             },
         ),
         "ai_memory": lambda: context_writes.memory_write(
@@ -426,6 +434,7 @@ def commit_learning(
         "task_id": commit.task_id,
         "request_id": request_id,
         "outcome": commit.outcome.value,
+        "failure_category": commit.failure_category.value if commit.failure_category else None,
         "state": state,
         "idempotent": idempotent,
         "projections": projections,

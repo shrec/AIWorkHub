@@ -20,7 +20,9 @@ from statistics import median
 from typing import Any, Iterable, Mapping
 
 from . import (
+    core,
     cost_ledger,
+    learning_commit,
     model_settings,
     repo_policy,
     runtime_adapters,
@@ -753,13 +755,18 @@ def build_catalog(
             )
         ]
         matched_cards = [card_by_task[task_id] for task_id in task_ids if task_id in card_by_task]
-        infrastructure_substatuses = {
-            "launch_failed", "timed_out", "worker_failed", "finalize_failed"
-        }
+        # The canonical taxonomy (aiworkhub.learning_commit.FailureCategory) is
+        # the single source of truth for "this finalized task's failure is
+        # infrastructure, not a candidate-code failure" -- classification
+        # reuses core.classify_terminal_disposition (the exact function the
+        # learning-commit path calls) so code-quality rates and
+        # learning-commit classification can never disagree, and so a sealed
+        # provider diagnostic (e.g. a dependency/route failure hidden behind
+        # an otherwise-successful terminal substatus) is excluded here too.
         infrastructure_cards = [
             item for item in matched_cards
-            if str(item.get("terminal_substatus") or "")
-            in infrastructure_substatuses
+            if core.classify_terminal_disposition(item)
+            in learning_commit.INFRASTRUCTURE_FAILURE_CATEGORIES
         ]
         quality_cards = [
             item for item in matched_cards if item not in infrastructure_cards
@@ -775,11 +782,21 @@ def build_catalog(
         )
         failed = 0
         for item in quality_cards:
-            substatus = str(item.get("terminal_substatus") or "")
             verification = item.get("deterministic_verification")
-            if substatus in {"validation_failed", "launch_failed", "timed_out"} or (
+            verification_failed = (
                 isinstance(verification, Mapping) and verification.get("passed") is False
-            ):
+            )
+            # Same single source of truth as infrastructure_cards above: a
+            # quality card only counts as a code-quality failure when the
+            # canonical taxonomy classifies it CANDIDATE_CODE and it was not
+            # itself manager-accepted (an accepted review_ready card is a
+            # success, not a failure) -- never a private literal here.
+            code_quality_failure = (
+                str(item.get("status") or "") != "finished"
+                and core.classify_terminal_disposition(item)
+                in learning_commit.CODE_QUALITY_FAILURE_CATEGORIES
+            )
+            if code_quality_failure or verification_failed:
                 failed += 1
         latencies = [
             value
