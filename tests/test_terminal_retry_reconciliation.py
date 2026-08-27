@@ -4,11 +4,13 @@ import json
 import os
 import sqlite3
 import stat
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from aiworkhub import core, task_store
+from aiworkhub import core, process_launcher, task_store
 
 
 @pytest.fixture
@@ -201,6 +203,7 @@ def _insert_pending_reroutable(
     *,
     task_id: str,
     runner: str = "claude_sonnet-4.6",
+    topic: str = "terminal_retry",
     status: str = "pending",
     worker_status: str = "unclaimed",
     claimed_by: str | None = None,
@@ -221,11 +224,18 @@ def _insert_pending_reroutable(
     card = {
         "task_id": task_id,
         "runner": runner,
-        "topic": "terminal_retry",
+        "topic": topic,
         "objective": "retry exact operational failure",
         "status": status,
         "worker_status": worker_status,
         "claimed_by": claimed_by,
+        "allowed_writes": ["out/result.json"],
+        "forbidden": ["do not modify core.py"],
+        "required_outputs": ["out/result.json"],
+        "validation": ["python -m pytest tests/test_process_launcher.py"],
+        "template_id": "nf398-terminal-retry",
+        "template_provenance": {"schema_id": "aiworkhub.template_provenance.v1"},
+        "history": [{"event": "terminal_retry_requeued"}],
     }
     if terminal_retry is not None:
         card["terminal_retry"] = terminal_retry
@@ -243,7 +253,7 @@ def _insert_pending_reroutable(
             (
                 task_id,
                 runner,
-                "terminal_retry",
+                topic,
                 "solo",
                 status,
                 worker_status,
@@ -290,6 +300,132 @@ def test_reroute_launch_identity_repairs_invalid_pinned_runner(
     assert receipt["from_runner"] == "claude_sonnet-4.6"
     assert receipt["to_runner"] == "claude_sonnet-5"
     assert receipt["to_model"] == "claude-sonnet-5"
+
+
+def test_terminal_retry_spark_card_requires_explicit_native_codex_reroute(
+    coordinator_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = "NF398_SPARK_RETRY"
+    topic = "nf460_reroute_mcp_wiring"
+    scope = ["out/result.json"]
+    _insert_pending_reroutable(
+        coordinator_repo,
+        task_id=task_id,
+        runner="codex_gpt-5.3-codex-spark",
+        topic=topic,
+        terminal_retry={
+            "schema_id": "aiworkhub.terminal_retry.v1",
+            "request_id": "9" * 32,
+            "terminal_substatus": "worker_failed",
+            "reason": "native route unavailable",
+            "retried_at": "2026-08-03T00:00:00+00:00",
+        },
+        risk_tier="critical",
+    )
+    before = _row(coordinator_repo, task_id)
+    before_card = json.loads(before["card_json"])
+    before_card["allowed_writes"] = scope
+    before_card["required_outputs"] = scope
+    readiness = task_store.storage_readiness(coordinator_repo)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(before_card, ensure_ascii=False, sort_keys=True), task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
+    monkeypatch.setattr(
+        process_launcher.project_context,
+        "collect_project_context",
+        lambda *_: None,
+    )
+    manager = process_launcher.ProcessManager(
+        repo=coordinator_repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=lambda requested: {
+            "returncode": 0,
+            "stdout": json.dumps(task_store.get_task(coordinator_repo, requested)),
+            "stderr": "",
+        },
+        collision_guard=lambda **_: {"returncode": 0, "stdout": "{}", "stderr": ""},
+        adapter_builder=lambda **_: SimpleNamespace(
+            argv=[sys.executable, "-c", "pass"],
+            cwd=str(coordinator_repo),
+            launchable=True,
+            reason="",
+        ),
+        isolation_enabled=False,
+    )
+
+    rejected = manager.launch(
+        task_id=task_id,
+        runner="codex_gpt-5.5",
+        topic=topic,
+        adapter_id="codex_cli",
+        model="gpt-5.5",
+        timeout_seconds=30,
+    )
+
+    assert rejected["ok"] is False
+    assert "runner_mismatch:codex_gpt-5.3-codex-spark" in rejected["blocked_reason"]
+    row = _row(coordinator_repo, task_id)
+    assert row["runner"] == "codex_gpt-5.3-codex-spark"
+    card = json.loads(row["card_json"])
+    assert card["task_id"] == task_id
+    assert card["topic"] == topic
+    assert card["allowed_writes"] == scope
+    assert card["template_id"] == "nf398-terminal-retry"
+    assert card["history"] == [{"event": "terminal_retry_requeued"}]
+    assert "identity_reroute" not in card
+
+    rerouted = core.reroute_launch_identity(
+        task_id,
+        from_runner="codex_gpt-5.3-codex-spark",
+        to_runner="codex_gpt-5.5",
+        to_adapter_id="codex_cli",
+        to_model="gpt-5.5",
+        reason="explicit native route repair",
+        topic=topic,
+    )
+
+    assert rerouted["ok"] is True, rerouted
+    row = _row(coordinator_repo, task_id)
+    assert row["runner"] == "codex_gpt-5.5"
+    card = json.loads(row["card_json"])
+    assert card["task_id"] == task_id
+    assert card["topic"] == topic
+    assert card["allowed_writes"] == scope
+    assert card["required_outputs"] == scope
+    assert card["template_id"] == "nf398-terminal-retry"
+    assert card["history"] == [{"event": "terminal_retry_requeued"}]
+    receipt = card["identity_reroute"]
+    assert receipt["schema_id"] == "aiworkhub.identity_reroute.v1"
+    assert receipt["from_runner"] == "codex_gpt-5.3-codex-spark"
+    assert receipt["to_runner"] == "codex_gpt-5.5"
+    assert receipt["to_adapter_id"] == "codex_cli"
+    assert receipt["to_model"] == "gpt-5.5"
+    assert len(json.dumps(receipt, ensure_ascii=False).encode("utf-8")) < 1024
+
+    launched = manager.launch(
+        task_id=task_id,
+        runner="codex_gpt-5.5",
+        topic=topic,
+        adapter_id="codex_cli",
+        model="gpt-5.5",
+        timeout_seconds=30,
+    )
+
+    assert launched["ok"] is True, launched
+    assert launched["runner"] == "codex_gpt-5.5"
+    assert launched["adapter_id"] == "codex_cli"
+    assert launched["model"] == "gpt-5.5"
 
 
 def test_reroute_launch_identity_rejects_claimed_task(coordinator_repo: Path) -> None:

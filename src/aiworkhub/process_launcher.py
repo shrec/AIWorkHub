@@ -3138,6 +3138,12 @@ _CANONICAL_WORKFORCE: dict[tuple[str, str], dict[str, Any]] = {
         "available": True,
         "risk_tiers": frozenset({"low", "medium"}),
     },
+    ("codex_gpt-5.5", "codex_cli"): {
+        "model": "gpt-5.5",
+        "enabled": True,
+        "available": True,
+        "risk_tiers": frozenset({"low", "medium", "high", "critical"}),
+    },
 }
 
 
@@ -3156,12 +3162,12 @@ def validate_workforce_identity(
     """Validate an exact, explicitly-pinned (runner, adapter_id, model) tuple
     against the canonical workforce before any provider reservation/spawn.
 
-    Scoped to the ``claude_*`` runner family this repository owns a canonical
-    workforce table for -- every other runner family (grok, glm, deepseek,
-    codex, copilot) keeps its existing, unchanged identity handling. A launch
-    that does not pin a specific model is likewise unaffected: this only
-    guards an explicit, exact model pin, never one inferred from a display
-    name or editor inventory. Normalizes only a documented workforce alias
+    Scoped to canonical table rows and to the ``claude_*`` runner family this
+    repository already governed. Other non-table runner families keep their
+    existing, unchanged identity handling. A launch that does not pin a
+    specific model is likewise unaffected: this only guards an explicit, exact
+    model pin, never one inferred from a display name or editor inventory.
+    Normalizes only a documented workforce alias
     (``_WORKFORCE_MODEL_ALIASES``). Returns the canonical model name (or the
     original ``model`` when this validation does not apply). Raises
     ``LaunchRejected`` with a typed reason for any pinned runner/adapter/model
@@ -3169,11 +3175,11 @@ def validate_workforce_identity(
     or for a disabled, unavailable, or risk-incapable route.
     """
     _validate_adapter_identity(runner, adapter_id)
-    if not runner.startswith("claude_"):
+    route = _CANONICAL_WORKFORCE.get((runner, adapter_id))
+    if route is None and not runner.startswith("claude_"):
         return model
     if model is None or not str(model).strip():
         return model
-    route = _CANONICAL_WORKFORCE.get((runner, adapter_id))
     if route is None:
         raise LaunchRejected(
             f"workforce_route_absent:runner={runner}:adapter={adapter_id}"

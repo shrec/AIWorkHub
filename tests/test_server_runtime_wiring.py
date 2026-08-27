@@ -198,6 +198,48 @@ def test_server_recover_blocked_rework_forwards_public_schema(monkeypatch):
     assert calls == [("T_BLOCKED", "focused repair", False, False)]
 
 
+def test_server_reroute_launch_identity_forwards_public_schema(monkeypatch):
+    calls = []
+
+    def reroute(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, **kwargs}
+
+    monkeypatch.setattr(core, "reroute_launch_identity", reroute)
+
+    result = server.aiworkhub_task_reroute_launch_identity(
+        "T_REROUTE",
+        from_runner="codex_gpt-5.3-codex-spark",
+        to_runner="codex_gpt-5.5",
+        to_adapter_id="codex_cli",
+        to_model="gpt-5.5",
+        reason="operational retry route repaired",
+        topic="nf460_reroute_mcp_wiring",
+    )
+
+    assert result == {
+        "ok": True,
+        "task_id": "T_REROUTE",
+        "from_runner": "codex_gpt-5.3-codex-spark",
+        "to_runner": "codex_gpt-5.5",
+        "to_adapter_id": "codex_cli",
+        "to_model": "gpt-5.5",
+        "reason": "operational retry route repaired",
+        "topic": "nf460_reroute_mcp_wiring",
+    }
+    assert calls == [
+        {
+            "task_id": "T_REROUTE",
+            "from_runner": "codex_gpt-5.3-codex-spark",
+            "to_runner": "codex_gpt-5.5",
+            "to_adapter_id": "codex_cli",
+            "to_model": "gpt-5.5",
+            "reason": "operational retry route repaired",
+            "topic": "nf460_reroute_mcp_wiring",
+        }
+    ]
+
+
 def test_core_recover_blocked_rework_uses_canonical_gate_and_transaction(monkeypatch):
     calls = []
     card = {"task_id": "T_BLOCKED", "topic": "blocked_rework"}

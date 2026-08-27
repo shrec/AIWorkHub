@@ -1395,6 +1395,29 @@ def test_workforce_identity_is_scoped_to_claude_runner_family() -> None:
     )
 
 
+def test_workforce_identity_accepts_canonical_native_codex_route() -> None:
+    canonical = process_launcher.validate_workforce_identity(
+        "codex_gpt-5.5", "codex_cli", "gpt-5.5", risk_tier="critical"
+    )
+    assert canonical == "gpt-5.5"
+
+
+def test_workforce_identity_rejects_native_codex_route_model_mismatch() -> None:
+    with pytest.raises(process_launcher.LaunchRejected, match="workforce_model_mismatch"):
+        process_launcher.validate_workforce_identity(
+            "codex_gpt-5.5", "codex_cli", "gpt-5.4", risk_tier="high"
+        )
+
+
+def test_workforce_identity_keeps_non_table_codex_route_unchanged() -> None:
+    assert (
+        process_launcher.validate_workforce_identity(
+            "codex_gpt-5.4", "codex_cli", "gpt-5.4", risk_tier="critical"
+        )
+        == "gpt-5.4"
+    )
+
+
 def test_workforce_identity_skips_unpinned_model() -> None:
     # A launch that never pins a model is unaffected: existing exact-match
     # launches without an explicit model keep their prior behavior unchanged.

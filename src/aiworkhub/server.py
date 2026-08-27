@@ -1529,6 +1529,30 @@ def aiworkhub_task_retry_terminal(
 
 @mcp.tool()
 @_serialize_task_lifecycle_write
+def aiworkhub_task_reroute_launch_identity(
+    task_id: str,
+    from_runner: str,
+    to_runner: str,
+    to_adapter_id: str,
+    to_model: str,
+    reason: str = "",
+    topic: str | None = None,
+) -> dict[str, Any]:
+    """COORDINATOR WRITE: explicitly reroute one pending retry launch identity."""
+
+    return core.reroute_launch_identity(
+        task_id=task_id,
+        from_runner=from_runner,
+        to_runner=to_runner,
+        to_adapter_id=to_adapter_id,
+        to_model=to_model,
+        reason=reason,
+        topic=topic,
+    )
+
+
+@mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_task_archive(
     task_id: str,
     reason: str = "",
