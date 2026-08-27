@@ -439,6 +439,9 @@ RUNNER_TOPIC_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ("codex_gpt55_signal_atlas_runtime_root_reconciliation_b622_v3", "signal_atlas"): frozenset({"claim-start", "review", "usage"}),
     ("codex_gpt55_signal_atlas_runtime_root_reconciliation_b622_v4", "signal_atlas"): frozenset({"claim-start", "review", "usage"}),
     ("codex_gpt55_task_mcp_current_tree_policy_repair_b623", "tasking_system"): frozenset({"claim-start", "review", "usage"}),
+    # NF462: canonical native codex_cli workforce review identity. Keep exact:
+    # no codex_* prefix or Spark/native-looking wildcard is permitted here.
+    ("codex_gpt-5.5", "quality_review"): frozenset({"review"}),
 }
 
 # codex is the coordinator: matches ANY topic (topic="*" in the design
@@ -544,4 +547,3 @@ def check_runner_topic_allowlist(
         return {"allowed": True, "reason": "per_wave_prefix_allowlisted"}
 
     return {"allowed": False, "reason": "unknown_runner_topic_pair"}
-
