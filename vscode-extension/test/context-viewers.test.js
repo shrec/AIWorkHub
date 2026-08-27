@@ -76,7 +76,11 @@ test("app.js implements identity-based focus/scroll restore for the Models modal
 test("app.css keeps the settings dialog bounded, single-scroll and wrap-safe", () => {
   assert.ok(css.includes(".diagnostic-dialog.settings-dialog"));
   assert.ok(css.includes("width: min(880px, calc(100vw - 40px))"));
+  assert.ok(css.includes("grid-template-rows: auto minmax(0, 1fr) auto"));
+  assert.ok(css.includes("height: min(650px, calc(100vh - 60px))"));
   assert.ok(css.includes(".settings-list {"));
+  assert.ok(css.includes("height: 100%"));
+  assert.ok(css.includes(".settings-state"));
   assert.ok(css.includes(".settings-copy strong"));
   assert.ok(css.includes("overflow-wrap: anywhere"));
   assert.ok(css.includes(".settings-metric-grid,"));
@@ -190,6 +194,7 @@ class FakeElement {
     this.scrollHeight = 0;
   }
   get className() { return Array.from(this.classList.set).join(" "); }
+  get childNodes() { return this.children; }
   set className(value) {
     this.classList.set = new Set(String(value || "").split(/\s+/).filter(Boolean));
   }
@@ -459,4 +464,75 @@ test("Models modal falls back to the Models tab when the entire provider disappe
   assert.strictEqual(run("elements.settingsList.children.length > 0"), true, "modal must not go blank");
   assert.strictEqual(run("state.settingsTab"), "models", "tab selection itself must survive the fallback");
   assert.strictEqual(run("document.activeElement && document.activeElement.dataset.settingsTab"), "models");
+});
+
+test("Settings dialog renders a nonblank loading shell before the first settings payload", () => {
+  const { run } = buildDomHarness();
+
+  run('elements.openSettings._trigger("click", elements.openSettings);');
+
+  assert.strictEqual(run("elements.settingsDialog.open"), true);
+  assert.strictEqual(run("elements.settingsSummary.textContent"), "Loading repository feature settings");
+  assert.strictEqual(run("elements.settingsList.children.length > 0"), true);
+  assert.match(run("elements.settingsList.textContent"), /Loading repository feature settings/);
+  assert.strictEqual(run('elements.settingsList.getAttribute("aria-busy")'), null);
+  assert.deepStrictEqual(run("__posted.map((msg) => msg.type)"), ["ready", "requestSettings"]);
+});
+
+test("Models modal preserves last-good body and recovers pending controls after invalid and error payloads", () => {
+  const { run } = buildDomHarness();
+  const providers = { openai: true, glm: true };
+  renderPayload(run, WORKERS_WITH_GLM, providers);
+  focusModelsTab(run);
+  focusRoute(run, "glm", "glm-4");
+  run("elements.settingsDialog.showModal(); elements.settingsList.scrollTop = 88; elements.settingsDialog.scrollTop = 6; document.scrollingElement.scrollTop = 21;");
+
+  run(`(() => {
+    const route = Array.from(elements.settingsList.querySelectorAll("input"))
+      .find((i) => i.dataset.modelProvider === "glm" && i.dataset.modelName === "glm-4");
+    route.checked = false;
+    elements.settingsList._trigger("change", route);
+  })();`);
+
+  assert.strictEqual(run("elements.settingsDialog.open"), true);
+  assert.strictEqual(run('elements.settingsList.getAttribute("aria-busy")'), "true");
+  assert.strictEqual(run("document.activeElement && document.activeElement.disabled"), true);
+  assert.strictEqual(run("document.activeElement && document.activeElement.dataset.settingsPending"), "true");
+  assert.deepStrictEqual(JSON.parse(run("JSON.stringify(__posted.slice(-1)[0])")), {
+    type: "updateModelSetting",
+    provider: "glm",
+    adapter: "vscode_lm",
+    model: "glm-4",
+    enabled: false,
+    expectedRevision: 5,
+  });
+
+  run('renderSettings({ ok: true, revision: 6, features: null });');
+  assert.strictEqual(run("elements.settingsDialog.open"), true);
+  assert.strictEqual(run("state.settingsTab"), "models");
+  assert.strictEqual(run("elements.settingsList.children.length > 0"), true);
+  assert.match(run("elements.settingsList.textContent"), /Repository model routes/);
+  assert.strictEqual(run('elements.settingsList.getAttribute("aria-busy")'), "false");
+  assert.strictEqual(run("document.activeElement && document.activeElement.dataset.modelProvider"), "glm");
+  assert.strictEqual(run("document.activeElement && document.activeElement.dataset.modelName"), "glm-4");
+  assert.strictEqual(run("document.activeElement && document.activeElement.disabled"), false);
+  assert.strictEqual(run("elements.settingsList.scrollTop"), 88);
+  assert.strictEqual(run("elements.settingsDialog.scrollTop"), 6);
+  assert.strictEqual(run("document.scrollingElement.scrollTop"), 21);
+
+  run('renderSettings({ ok: false, error: "Rejected settings update" });');
+  assert.strictEqual(run("elements.settingsDialog.open"), true);
+  assert.strictEqual(run("elements.settingsSummary.textContent"), "Rejected settings update");
+  assert.match(run("elements.settingsList.textContent"), /Repository model routes/);
+  assert.strictEqual(run("document.activeElement && document.activeElement.disabled"), false);
+});
+
+test("Settings CSS declares stable desktop and narrow modal geometry with list-only scroll", () => {
+  assert.ok(css.includes("min-width: min(520px, calc(100vw - 40px))"));
+  assert.ok(css.includes("max-height: min(650px, calc(100vh - 60px))"));
+  assert.ok(css.includes("width: calc(100vw - 24px)"));
+  assert.ok(css.includes("max-height: calc(100vh - 24px)"));
+  assert.ok(css.includes("overflow: hidden"));
+  assert.ok(css.includes("overflow-y: auto"));
+  assert.ok(css.includes("overscroll-behavior: contain"));
 });

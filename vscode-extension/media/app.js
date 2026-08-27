@@ -52,6 +52,7 @@ const state = {
   roadmapEntries: [],
   roadmapDetail: null,
   featureSettings: null,
+  settingsPendingIdentity: null,
   settingsTab: "features",
   planScope: persisted.planScope === "all" ? "all" : "active",
   planSearch: "",
@@ -4179,6 +4180,17 @@ function restoreSettingsFocus(previousIdentity) {
   elements.settingsDialog.focus();
 }
 
+function settingsStateMessage(className, message) {
+  const stateEl = createElement("div", className, message);
+  stateEl.setAttribute("role", className.includes("error-state") ? "alert" : "status");
+  return stateEl;
+}
+
+function setSettingsPending(identity, pending) {
+  state.settingsPendingIdentity = pending ? identity : null;
+  elements.settingsList.setAttribute("aria-busy", String(Boolean(pending)));
+}
+
 function renderSettings(payload) {
   const activeControl = elements.settingsList.contains(document.activeElement)
     ? document.activeElement
@@ -4188,15 +4200,33 @@ function renderSettings(payload) {
   const previousDialogScrollTop = elements.settingsDialog.scrollTop;
   const previousPageScrollTop = document.scrollingElement ? document.scrollingElement.scrollTop : 0;
   if (!payload || payload.ok !== true || !payload.features) {
-    state.featureSettings = null;
-    elements.settingsSummary.textContent = (payload && payload.error) || "Settings unavailable";
-    elements.settingsList.replaceChildren(Object.assign(document.createElement("div"), {
-      className: "panel-state error-state",
-      textContent: "Repository settings could not be loaded",
-    }));
+    const message = (payload && payload.error) || "Settings unavailable";
+    if (state.featureSettings && state.featureSettings.ok === true) {
+      setSettingsPending(null, false);
+      renderSettings(state.featureSettings);
+      elements.settingsSummary.textContent = message;
+      return;
+    }
+    setSettingsPending(null, false);
+    elements.settingsSummary.textContent = message;
+    if (!state.featureSettings || !elements.settingsList.children.length) {
+      elements.settingsList.replaceChildren(settingsStateMessage(
+        "panel-state error-state settings-state",
+        "Repository settings could not be loaded",
+      ));
+    }
+    elements.settingsList.scrollTop = elements.settingsList.scrollHeight
+      ? Math.min(previousScrollTop, elements.settingsList.scrollHeight)
+      : previousScrollTop;
+    elements.settingsDialog.scrollTop = previousDialogScrollTop;
+    if (document.scrollingElement) {
+      document.scrollingElement.scrollTop = previousPageScrollTop;
+    }
+    restoreSettingsFocus(previousIdentity);
     return;
   }
   state.featureSettings = payload;
+  setSettingsPending(null, false);
   elements.settingsSummary.textContent = `Repository-local · revision ${Number(payload.revision || 0)}`;
   const fragment = document.createDocumentFragment();
   const tabs = createElement("div", "settings-tabs");
@@ -4242,6 +4272,10 @@ function renderSettings(payload) {
     input.type = "checkbox";
     input.checked = Boolean(payload.features[key]);
     input.dataset.featureSetting = key;
+    if (settingsControlIdentity(input) === state.settingsPendingIdentity) {
+      input.disabled = true;
+      input.dataset.settingsPending = "true";
+    }
     input.setAttribute("aria-label", `${label} enabled`);
     const track = document.createElement("span");
     track.className = "switch-track";
@@ -4286,6 +4320,10 @@ function renderSettings(payload) {
       input.checked = enabled;
       input.dataset.modelProvider = provider;
       input.dataset.modelRevision = String(Number(modelPolicy.revision || 0));
+      if (settingsControlIdentity(input) === state.settingsPendingIdentity) {
+        input.disabled = true;
+        input.dataset.settingsPending = "true";
+      }
       input.setAttribute("aria-label", `${provider} provider enabled`);
       control.append(input, createElement("span", "switch-track"));
       row.append(copy, control);
@@ -4314,6 +4352,10 @@ function renderSettings(payload) {
         routeInput.dataset.modelAdapter = String(route.adapter || "");
         routeInput.dataset.modelName = String(route.model || "");
         routeInput.dataset.modelRevision = String(Number(modelPolicy.revision || 0));
+        if (settingsControlIdentity(routeInput) === state.settingsPendingIdentity) {
+          routeInput.disabled = true;
+          routeInput.dataset.settingsPending = "true";
+        }
         routeInput.setAttribute("aria-label", `${String(route.model || "model")} enabled`);
         routeControl.append(routeInput, createElement("span", "switch-track"));
         routeRow.append(routeCopy, routeControl);
@@ -4360,6 +4402,10 @@ function renderSettings(payload) {
       input.checked = Boolean(language.enabled);
       input.dataset.sourceGraphLanguage = String(language.id || "");
       input.dataset.sourceGraphRevision = String(Number(policy.revision || 0));
+      if (settingsControlIdentity(input) === state.settingsPendingIdentity) {
+        input.disabled = true;
+        input.dataset.settingsPending = "true";
+      }
       input.setAttribute("aria-label", `${languageTitle.textContent} indexing enabled`);
       const track = document.createElement("span");
       track.className = "switch-track";
@@ -4408,12 +4454,15 @@ function renderSettings(payload) {
   ));
   for (const section of Object.values(sections)) fragment.appendChild(section);
   elements.settingsList.replaceChildren(fragment);
-  elements.settingsList.scrollTop = Math.min(previousScrollTop, elements.settingsList.scrollHeight);
+  elements.settingsList.scrollTop = elements.settingsList.scrollHeight
+    ? Math.min(previousScrollTop, elements.settingsList.scrollHeight)
+    : previousScrollTop;
   elements.settingsDialog.scrollTop = previousDialogScrollTop;
   if (document.scrollingElement) {
     document.scrollingElement.scrollTop = previousPageScrollTop;
   }
   restoreSettingsFocus(previousIdentity);
+  setSettingsPending(null, false);
 }
 
 // ── Fixed-enum inbound message handling from the extension host ───────────
@@ -4925,13 +4974,21 @@ elements.openOperations.addEventListener("click", () => {
 elements.openSettings.addEventListener("click", () => {
   elements.settingsDialog.showModal();
   elements.settingsSummary.textContent = "Loading repository feature settings";
+  if (!state.featureSettings && !elements.settingsList.children.length) {
+    elements.settingsList.replaceChildren(settingsStateMessage(
+      "panel-state settings-state",
+      "Loading repository feature settings",
+    ));
+  }
   vscode.postMessage({ type: "requestSettings" });
 });
 
 elements.settingsList.addEventListener("change", (event) => {
   const modelInput = event.target.closest("[data-model-provider]");
   if (modelInput && state.featureSettings) {
+    setSettingsPending(settingsControlIdentity(modelInput), true);
     modelInput.disabled = true;
+    modelInput.dataset.settingsPending = "true";
     vscode.postMessage({
       type: "updateModelSetting",
       provider: modelInput.dataset.modelProvider,
@@ -4944,7 +5001,9 @@ elements.settingsList.addEventListener("change", (event) => {
   }
   const languageInput = event.target.closest("[data-source-graph-language]");
   if (languageInput && state.featureSettings) {
+    setSettingsPending(settingsControlIdentity(languageInput), true);
     languageInput.disabled = true;
+    languageInput.dataset.settingsPending = "true";
     vscode.postMessage({
       type: "updateSourceGraphLanguage",
       language: languageInput.dataset.sourceGraphLanguage,
@@ -4955,7 +5014,9 @@ elements.settingsList.addEventListener("change", (event) => {
   }
   const input = event.target.closest("[data-feature-setting]");
   if (!input || !state.featureSettings) return;
+  setSettingsPending(settingsControlIdentity(input), true);
   input.disabled = true;
+  input.dataset.settingsPending = "true";
   vscode.postMessage({
     type: "updateFeatureSetting",
     feature: input.dataset.featureSetting,

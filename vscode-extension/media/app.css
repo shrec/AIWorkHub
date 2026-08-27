@@ -2020,6 +2020,8 @@ tbody tr.is-selected td:first-child {
 .diagnostic-dialog.settings-dialog {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
+  min-width: min(520px, calc(100vw - 40px));
+  max-height: min(650px, calc(100vh - 60px));
   overflow: hidden;
 }
 
@@ -2461,14 +2463,19 @@ tbody tr.is-selected td:first-child {
 
 .settings-list {
   box-sizing: border-box;
+  align-self: stretch;
   min-width: 0;
   min-height: 0;
-  height: auto;
+  height: 100%;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
   padding: 10px;
+}
+
+.settings-state {
+  min-height: 320px;
 }
 
 .settings-tabs {
@@ -2554,6 +2561,12 @@ tbody tr.is-selected td:first-child {
 }
 
 @media (max-width: 620px) {
+  .diagnostic-dialog.settings-dialog {
+    width: calc(100vw - 24px);
+    min-width: 0;
+    height: min(650px, calc(100vh - 24px));
+    max-height: calc(100vh - 24px);
+  }
   .settings-row { align-items: flex-start; gap: 10px; padding: 9px; }
   .settings-model-route { width: calc(100% - 8px); margin-left: 8px; }
   .switch-control { flex: 0 0 auto; margin-top: 2px; }
