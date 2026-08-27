@@ -1711,12 +1711,13 @@ def _validation_only_replay_authorization(
         raise LaunchRejected("validation_only_replay_claim_epoch_invalid") from None
     if authorized_epoch != claim_epoch:
         raise LaunchRejected("validation_only_replay_claim_epoch_mismatch")
-    if not list(card.get("required_outputs") or []):
-        raise LaunchRejected("validation_only_replay_required_outputs_missing")
     # A replay may exist solely to re-finalize hash-pinned inherited outputs
-    # after an operational finalizer failure. An explicitly empty validation
-    # contract is authoritative and must not force executable scratch or a
-    # provider call; required-output/hash verification still gates review.
+    # after an operational finalizer failure. The authenticated predecessor
+    # hash manifest above is the replay authority; ``required_outputs`` may be
+    # empty when the template authorizes changed paths without declaring every
+    # allowed path as a mandatory changed output. An explicitly empty
+    # validation contract is also authoritative and must not force executable
+    # scratch or a provider call.
     return dict(raw)
 
 

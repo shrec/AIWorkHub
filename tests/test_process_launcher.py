@@ -2433,6 +2433,17 @@ def test_validation_only_replay_authorization_fails_closed_before_launch():
         "out/result.json": digest
     }
 
+    no_required_outputs = json.loads(json.dumps(card))
+    no_required_outputs["required_outputs"] = []
+    exact_no_required_outputs = (
+        process_launcher._validation_only_replay_authorization(
+            no_required_outputs, "TASK_REPLAY"
+        )
+    )
+    assert exact_no_required_outputs["changed_path_hashes"] == {
+        "out/result.json": digest
+    }
+
     stale = json.loads(json.dumps(card))
     stale["validation_only_replay_authorization"]["next_claim_epoch"] = 3
     with pytest.raises(
