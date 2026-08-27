@@ -777,6 +777,134 @@ def test_codex_worker_requires_current_exact_model_capability_receipt(
     assert unsupported["available"] is False
 
 
+def test_codex_capability_model_ids_are_matched_exactly(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight={"providers": [{
+            "adapter_id": "codex_cli",
+            "launchable": True,
+            "access_observed": True,
+            "observed_models": ["openai/gpt-5.5"],
+            "status": "ready_unverified",
+        }]},
+    )
+    worker = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "gpt-5.5"
+    )
+    assert worker["available"] is False
+
+
+def test_disabled_copilot_policy_never_becomes_codex_effective_fallback(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    model_settings.update(
+        root, provider="copilot", enabled=False, expected_revision=0
+    )
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight={"providers": [
+            {
+                "adapter_id": "codex_cli",
+                "launchable": False,
+                "access_observed": False,
+                "status": "access_unavailable",
+            },
+            {
+                "adapter_id": "vscode_lm",
+                "launchable": True,
+                "access_observed": True,
+                "observed_models": ["gpt-5.5"],
+                "status": "ready_unverified",
+            },
+        ]},
+    )
+    worker = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "gpt-5.5"
+    )
+    assert worker["effective_adapter_id"] == "codex_cli"
+    assert worker["adapter_fallback_used"] is False
+    assert worker["available"] is False
+
+
+def test_disabled_copilot_parent_wins_over_enabled_exact_fallback_model(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    model_settings.update(
+        root, provider="copilot", enabled=False, expected_revision=0
+    )
+    model_settings.update(
+        root,
+        provider="copilot",
+        adapter="vscode_lm",
+        model="gpt-5.5",
+        enabled=True,
+        expected_revision=1,
+    )
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight={"providers": [
+            {"adapter_id": "codex_cli", "launchable": False},
+            {
+                "adapter_id": "vscode_lm",
+                "launchable": True,
+                "access_observed": True,
+                "observed_models": ["gpt-5.5"],
+                "status": "ready_unverified",
+            },
+        ]},
+    )
+    worker = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "gpt-5.5"
+    )
+    assert worker["effective_adapter_id"] == "codex_cli"
+    assert worker["available"] is False
+
+
+def test_explicitly_enabled_copilot_codex_fallback_remains_labeled(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    model_settings.update(
+        root, provider="copilot", enabled=True, expected_revision=0
+    )
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight={"providers": [
+            {
+                "adapter_id": "codex_cli",
+                "launchable": False,
+                "access_observed": False,
+                "status": "access_unavailable",
+            },
+            {
+                "adapter_id": "vscode_lm",
+                "launchable": True,
+                "access_observed": True,
+                "observed_models": ["gpt-5.5"],
+                "status": "ready_unverified",
+            },
+        ]},
+    )
+    worker = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "gpt-5.5"
+    )
+    assert worker["effective_adapter_id"] == "vscode_lm"
+    assert worker["adapter_fallback_used"] is True
+    assert worker["policy_provider"] == "copilot"
+    assert worker["available"] is True
+
+
 def test_canonical_usage_rows_supply_tokens_and_labeled_unknown_cost(tmp_path: Path) -> None:
     root = _root(tmp_path)
     snapshot = workforce_catalog.build_catalog(

@@ -162,6 +162,45 @@ def test_catalog_codex_workers_report_ready_unverified_when_quota_unobserved(tmp
     assert codex53["quota_state"] == "unavailable_from_provider_api"
 
 
+def test_codex_provider_capability_keeps_quota_explicitly_unobserved(
+    monkeypatch, tmp_path
+):
+    root = _root(tmp_path)
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda _adapter: type("Resolution", (), {
+            "ok": True, "executable": "/safe/codex", "reason": ""
+        })(),
+    )
+    monkeypatch.setattr(
+        repo_policy.codex_auth,
+        "capability_status",
+        lambda _executable=None: {
+            "launchable": True,
+            "authenticated": True,
+            "access_observed": True,
+            "observed_models": ["gpt-5.5"],
+            "quota_observed": False,
+            "quota_state": "unavailable_from_provider_api",
+            "blocker_reason": "",
+        },
+    )
+
+    provider = repo_policy._provider_status(
+        root,
+        "codex_cli",
+        policy={"providers": {"allowed_adapters": ["codex_cli"]}},
+        sandbox_backend="bubblewrap",
+        sandbox_error="",
+    )
+    assert provider["launchable"] is True
+    assert provider["access_observed"] is True
+    assert provider["quota_observed"] is False
+    assert provider["quota_state"] == "unavailable_from_provider_api"
+    assert provider["status"] == "ready_unverified"
+
+
 def test_available_stays_boolean_and_readiness_status_distinguishes(
     monkeypatch, tmp_path
 ):

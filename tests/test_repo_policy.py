@@ -72,6 +72,55 @@ def test_grok_kilo_preflight_uses_local_xai_auth_without_exposing_it(
     assert "token" not in json.dumps(status, sort_keys=True).lower()
 
 
+def test_codex_preflight_uses_exact_secret_free_capability_receipt(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = _initialized_root(tmp_path)
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: SimpleNamespace(
+            ok=True, executable="/safe/codex", reason="ready"
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.codex_auth,
+        "capability_status",
+        lambda _executable=None: {
+            "launchable": True,
+            "authenticated": True,
+            "access_observed": True,
+            "observed_models": ["gpt-5.5", "gpt-5.3-codex"],
+            "quota_observed": False,
+            "quota_state": "unavailable_from_provider_api",
+            "blocker_reason": "",
+            "cache_hit": False,
+            "cache_ttl_seconds": 300.0,
+            "model_catalog_complete": True,
+            "private_account": "must-not-propagate",
+        },
+    )
+
+    status = repo_policy._provider_status(
+        root,
+        "codex_cli",
+        repo_policy.load_policy(root),
+        "bubblewrap",
+        "",
+    )
+
+    assert status["launchable"] is True
+    assert status["access_observed"] is True
+    assert status["observed_models"] == ["gpt-5.5", "gpt-5.3-codex"]
+    assert status["quota_observed"] is False
+    assert status["status"] == "ready_unverified"
+    assert status["cache_hit"] is False
+    assert status["cache_ttl_seconds"] == 300.0
+    assert status["model_catalog_complete"] is True
+    assert "private_account" not in status
+    assert "/safe/codex" not in json.dumps(status, sort_keys=True)
+
+
 def test_legacy_allow_all_policy_gains_grok_but_custom_denial_does_not(
     tmp_path: Path,
 ) -> None:

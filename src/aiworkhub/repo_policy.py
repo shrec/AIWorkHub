@@ -19,6 +19,7 @@ from typing import Any, Mapping
 
 from . import (
     claude_auth,
+    codex_auth,
     kilo_auth,
     model_settings,
     quality_evidence,
@@ -371,6 +372,8 @@ def _provider_status(
             )
         elif adapter_id == "claude_cli":
             readiness = claude_auth.auth_status(resolution.executable)
+        elif adapter_id == "codex_cli":
+            readiness = codex_auth.capability_status(resolution.executable)
         elif adapter_id == runtime_adapters.GROK_KILO_ADAPTER:
             readiness = kilo_auth.auth_status(
                 home=Path.home(),
@@ -426,6 +429,9 @@ def _provider_status(
             "freshest_age_seconds",
             "access_state",
             "consent_required",
+            "cache_hit",
+            "cache_ttl_seconds",
+            "model_catalog_complete",
         ):
             value = readiness.get(key)
             if value is not None:

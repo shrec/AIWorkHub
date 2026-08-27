@@ -544,9 +544,30 @@ def _canonical_cards(root: Path) -> list[dict[str, Any]]:
 def _resolve_effective_adapter(
     worker: Mapping[str, Any],
     ready_by_adapter: Mapping[str, Mapping[str, Any]],
+    model_policy: Mapping[str, Any],
 ) -> tuple[str, Mapping[str, Any]]:
+    def policy_enabled(adapter_id: str) -> bool:
+        provider, adapter = policy_route_identity(
+            str(worker.get("provider") or ""), adapter_id
+        )
+        model = str(worker.get("model") or "")
+        return bool(
+            model_settings.evaluate_state(
+                model_policy,
+                provider=provider,
+                adapter=adapter,
+                model=model,
+            )
+            and model_settings.evaluate_state(
+                model_policy,
+                provider=str(worker.get("provider") or ""),
+                adapter=adapter_id,
+                model=model,
+            )
+        )
+
     def launchable(adapter_id: str, readiness: Mapping[str, Any]) -> bool:
-        if not readiness.get("launchable"):
+        if not readiness.get("launchable") or not policy_enabled(adapter_id):
             return False
         observed = readiness.get("observed_models")
         model = str(worker.get("model") or "")
@@ -728,7 +749,7 @@ def build_catalog(
     attributed_process_ids: set[int] = set()
     for worker in _expand_discovered_workers(catalog["workers"], ready_by_adapter):
         effective_adapter, adapter_ready = _resolve_effective_adapter(
-            worker, ready_by_adapter
+            worker, ready_by_adapter, model_policy
         )
         adapter_ids_to_match = {worker["adapter_id"], effective_adapter}
         matched: list[dict[str, Any]] = []
