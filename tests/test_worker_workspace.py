@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -5581,10 +5583,11 @@ def test_metadata_broker_verify_target_any_authorizes_both_request_roots(
     ]
     try:
         # Beneath the worker temp authority (the second root) -> acquired.
-        fd = worker_workspace._metadata_broker_verify_target_any(
+        fd, mutate = worker_workspace._metadata_broker_verify_target_any(
             str(lock.resolve()), specs
         )
         assert fd >= 0
+        assert mutate is True
         os.close(fd)
         # A target beneath neither authorized root is denied, not widened.
         outside = tmp_path / "outside.lock"
@@ -5604,6 +5607,352 @@ def test_metadata_broker_verify_target_any_authorizes_both_request_roots(
         ):
             worker_workspace._metadata_broker_verify_target_any(
                 str(evil / "passwd"), specs
+            )
+    finally:
+        for spec_fd, _root in specs:
+            os.close(spec_fd)
+
+
+# ── NF448: bounded PPID ancestry for nested setsid descendants ─────────────
+
+
+def _read_pipe_line(read_fd: int, timeout: float = 5.0) -> bytes:
+    selector = selectors.DefaultSelector()
+    selector.register(read_fd, selectors.EVENT_READ)
+    try:
+        deadline = time.monotonic() + timeout
+        data = b""
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if not selector.select(timeout=max(0.0, remaining)):
+                break
+            chunk = os.read(read_fd, 256)
+            if not chunk:
+                break
+            data += chunk
+            if b"\n" in data:
+                break
+        return data
+    finally:
+        selector.close()
+
+
+def _kill_and_reap(pid: int, *, is_direct_child: bool) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    if is_direct_child:
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+
+@pytest.mark.skipif(os.name == "nt", reason="PPID ancestry walk is POSIX /proc")
+def test_authenticate_pid_accepts_nested_setsid_descendant_via_ppid_ancestry(
+) -> None:
+    """NF-2026-00448: a nested descendant that calls ``setsid`` (e.g. a
+    sub-subprocess ``git``/``pytest`` spawns) gets a fresh ``pgid`` equal to
+    its own pid, so the pgid fast path no longer matches it. It must still be
+    accepted because its live PPID chain -- leaf -> mid -> broker child --
+    reaches the exact broker child pid."""
+    read_fd, write_fd = os.pipe()
+    top_pid = os.fork()
+    if top_pid == 0:
+        os.close(read_fd)
+        os.setsid()  # emulate the broker child's own session leadership
+        inner_read, inner_write = os.pipe()
+        mid_pid = os.fork()
+        if mid_pid == 0:
+            os.close(inner_read)
+            leaf_read, leaf_write = os.pipe()
+            leaf_pid = os.fork()
+            if leaf_pid == 0:
+                os.close(leaf_read)
+                os.setsid()  # nested descendant starts its own session
+                os.write(leaf_write, b"ready\n")
+                os.close(leaf_write)
+                time.sleep(30)
+                os._exit(0)
+            os.close(leaf_write)
+            os.read(leaf_read, 6)
+            os.close(leaf_read)
+            os.write(inner_write, f"{leaf_pid}\n".encode())
+            os.close(inner_write)
+            time.sleep(30)
+            os._exit(0)
+        os.close(inner_write)
+        payload = _read_pipe_line(inner_read)
+        os.close(inner_read)
+        os.write(write_fd, f"{mid_pid} {payload.decode().strip()}\n".encode())
+        os.close(write_fd)
+        time.sleep(30)
+        os._exit(0)
+    os.close(write_fd)
+    try:
+        payload = _read_pipe_line(read_fd)
+        assert payload, "child process tree failed to report pids in time"
+        mid_pid_str, leaf_pid_str = payload.decode().strip().split()
+        mid_pid, leaf_pid = int(mid_pid_str), int(leaf_pid_str)
+
+        # The pgid fast path still covers the direct, non-setsid descendant.
+        assert worker_workspace._metadata_broker_process_pgid(mid_pid) == top_pid
+        worker_workspace._metadata_broker_authenticate_pid(mid_pid, top_pid)
+
+        # The nested setsid descendant breaks the pgid fast path...
+        assert worker_workspace._metadata_broker_process_pgid(leaf_pid) != top_pid
+        # ...but its bounded, live PPID ancestry still reaches the broker child.
+        worker_workspace._metadata_broker_authenticate_pid(leaf_pid, top_pid)
+    finally:
+        os.close(read_fd)
+        for pid, is_direct_child in ((top_pid, True),):
+            _kill_and_reap(pid, is_direct_child=is_direct_child)
+
+
+def _spawn_setsid_leaf() -> int:
+    """Fork a direct child that starts its own session and reports ready."""
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        os.setsid()
+        os.write(write_fd, b"ready\n")
+        os.close(write_fd)
+        time.sleep(30)
+        os._exit(0)
+    os.close(write_fd)
+    try:
+        assert _read_pipe_line(read_fd), "leaf process failed to start in time"
+    finally:
+        os.close(read_fd)
+    return pid
+
+
+@pytest.mark.skipif(os.name == "nt", reason="PPID ancestry walk is POSIX /proc")
+def test_authenticate_pid_rejects_unrelated_live_foreign_process() -> None:
+    """A live process that merely happens to be alive (and owned by the same
+    uid) but whose ancestry never passes through the broker child is denied
+    -- liveness/ownership alone must never be mistaken for ancestry. Both
+    pids are independent, direct children of the test process (siblings),
+    so neither is on the other's PPID chain."""
+    unrelated_pid = _spawn_setsid_leaf()
+    sibling_broker_child_pid = _spawn_setsid_leaf()
+    try:
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="metadata_broker_foreign_pid"
+        ):
+            worker_workspace._metadata_broker_authenticate_pid(
+                unrelated_pid, sibling_broker_child_pid
+            )
+    finally:
+        _kill_and_reap(unrelated_pid, is_direct_child=True)
+        _kill_and_reap(sibling_broker_child_pid, is_direct_child=True)
+
+
+def test_ppid_ancestry_reaches_accepts_multi_hop_live_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = {300: 200, 200: 100}
+    monkeypatch.setattr(
+        worker_workspace, "_metadata_broker_process_ppid", lambda pid: graph[pid]
+    )
+    assert worker_workspace._metadata_broker_ppid_ancestry_reaches(300, 100) is True
+
+
+def test_ppid_ancestry_reaches_rejects_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    graph = {100: 200, 200: 100}
+    monkeypatch.setattr(
+        worker_workspace, "_metadata_broker_process_ppid", lambda pid: graph[pid]
+    )
+    assert worker_workspace._metadata_broker_ppid_ancestry_reaches(100, 999) is False
+
+
+def test_ppid_ancestry_reaches_rejects_reparented_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chain that bottoms out at pid 1 (init) never reached the broker
+    child -- an intermediate ancestor died and the descendant was reparented,
+    so it must be rejected rather than trusted."""
+    graph = {500: 400, 400: 1}
+    monkeypatch.setattr(
+        worker_workspace, "_metadata_broker_process_ppid", lambda pid: graph[pid]
+    )
+    assert worker_workspace._metadata_broker_ppid_ancestry_reaches(500, 999) is False
+
+
+def test_ppid_ancestry_reaches_rejects_dead_or_malformed_proc_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_ppid(pid: int) -> int:
+        raise worker_workspace.WorkspaceError(f"metadata_broker_pid_unavailable:{pid}")
+
+    monkeypatch.setattr(worker_workspace, "_metadata_broker_process_ppid", fake_ppid)
+    assert worker_workspace._metadata_broker_ppid_ancestry_reaches(700, 999) is False
+
+
+def test_ppid_ancestry_reaches_rejects_chain_exceeding_bounded_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chain that WOULD reach the broker child, but only beyond the bounded
+    walk depth, is rejected fail-closed rather than walked indefinitely."""
+    depth_limit = worker_workspace._METADATA_BROKER_MAX_ANCESTRY_DEPTH
+    child_pid = 2
+    graph: dict[int, int] = {}
+    base = 100000
+    chain = [base + offset for offset in range(depth_limit + 3)]
+    for current, parent in zip(chain, chain[1:]):
+        graph[current] = parent
+    graph[chain[-1]] = child_pid  # only reachable past the bounded depth
+    monkeypatch.setattr(
+        worker_workspace, "_metadata_broker_process_ppid", lambda pid: graph[pid]
+    )
+    assert (
+        worker_workspace._metadata_broker_ppid_ancestry_reaches(chain[0], child_pid)
+        is False
+    )
+
+
+def test_process_ppid_and_pgid_reject_malformed_proc_stat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+
+    real_open = open
+    fake_pid = 999999919
+
+    def fake_open(path, *args, **kwargs):
+        if path == f"/proc/{fake_pid}/stat":
+            return io.BytesIO(b"garbage-with-no-closing-paren")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="metadata_broker_stat_malformed"
+    ):
+        worker_workspace._metadata_broker_process_ppid(fake_pid)
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="metadata_broker_stat_malformed"
+    ):
+        worker_workspace._metadata_broker_process_pgid(fake_pid)
+
+
+# ── NF-2026-00448: hardlinked regular file chmod permission-bit no-op ──────
+
+
+def _hardlink_or_skip(target: Path, link_path: Path) -> None:
+    if not hasattr(os, "link"):
+        pytest.skip("os.link not available")
+    try:
+        os.link(target, link_path)
+    except (OSError, PermissionError) as exc:
+        pytest.skip(f"os.link denied in this sandbox: {exc}")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="hardlink st_nlink guard is POSIX")
+def test_verify_fd_accepts_exact_mode_noop_on_hardlinked_regular_file(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "config.lock"
+    target.write_text("[core]\n", encoding="utf-8")
+    target.chmod(0o644)
+    _hardlink_or_skip(target, tmp_path / "config.lock.link")
+    fd = os.open(target, os.O_RDONLY)
+    try:
+        current_mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        mutate = worker_workspace._metadata_broker_verify_fd(
+            fd, str(target), current_mode
+        )
+        assert mutate is False
+        # The permission bits are genuinely untouched -- no fchmod was called.
+        assert stat.S_IMODE(os.fstat(fd).st_mode) == current_mode
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="hardlink st_nlink guard is POSIX")
+def test_verify_fd_denies_any_mode_change_on_hardlinked_regular_file(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "config.lock"
+    target.write_text("[core]\n", encoding="utf-8")
+    target.chmod(0o644)
+    _hardlink_or_skip(target, tmp_path / "config.lock.link")
+    fd = os.open(target, os.O_RDONLY)
+    try:
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="metadata_broker_hardlink_forbidden"
+        ):
+            worker_workspace._metadata_broker_verify_fd(fd, str(target), 0o600)
+        # An unknown requested mode (no mode context available) stays denied,
+        # exactly as before this fix -- never a blanket hardlink allowance.
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="metadata_broker_hardlink_forbidden"
+        ):
+            worker_workspace._metadata_broker_verify_fd(fd, str(target))
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="hardlink st_nlink guard is POSIX")
+def test_verify_fd_hardlink_noop_still_enforces_foreign_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "config.lock"
+    target.write_text("[core]\n", encoding="utf-8")
+    target.chmod(0o644)
+    _hardlink_or_skip(target, tmp_path / "config.lock.link")
+    fd = os.open(target, os.O_RDONLY)
+    try:
+        current_mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        original_uid = os.getuid()
+        monkeypatch.setattr(os, "getuid", lambda: original_uid + 1)
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="metadata_broker_foreign_owner"
+        ):
+            worker_workspace._metadata_broker_verify_fd(fd, str(target), current_mode)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="openat2 target acquisition is POSIX")
+@pytest.mark.skipif(
+    not worker_workspace._openat2_available(),
+    reason="openat2(2) unavailable on this kernel",
+)
+def test_verify_target_any_hardlink_same_mode_noop_accepted_different_mode_denied(
+    tmp_path: Path,
+) -> None:
+    scratch = (tmp_path / "scratch").resolve()
+    scratch.mkdir()
+    target = scratch / "config.lock"
+    target.write_text("[core]\n", encoding="utf-8")
+    target.chmod(0o644)
+    _hardlink_or_skip(target, scratch / "config.lock.link")
+    specs = [worker_workspace._open_broker_scratch_root(scratch)]
+    try:
+        fd, mutate = worker_workspace._metadata_broker_verify_target_any(
+            str(target.resolve()), specs, 0o644
+        )
+        try:
+            assert fd >= 0
+            assert mutate is False
+        finally:
+            os.close(fd)
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="metadata_broker_hardlink_forbidden"
+        ):
+            worker_workspace._metadata_broker_verify_target_any(
+                str(target.resolve()), specs, 0o600
+            )
+        # root-beneath/symlink/owner/inode checks remain fully enforced.
+        outside = tmp_path / "outside.lock"
+        outside.write_text("x", encoding="utf-8")
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="metadata_broker_outside_scratch"
+        ):
+            worker_workspace._metadata_broker_verify_target_any(
+                str(outside.resolve()), specs, 0o644
             )
     finally:
         for spec_fd, _root in specs:

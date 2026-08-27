@@ -5657,30 +5657,50 @@ def _metadata_broker_verify_flags(flags: int) -> int:
     return flags
 
 
-def _metadata_broker_verify_fd(fd: int, candidate: str) -> None:
+def _metadata_broker_verify_fd(
+    fd: int, candidate: str, requested_mode: int | None = None
+) -> bool:
     """Fail closed unless ``fd`` is a scratch-owned target beneath the request scratch.
 
     Owned directories are permitted so validators can manage scratch-directory
     metadata (e.g. ``os.chmod(parent, 0o700)`` after ``path.parent.mkdir``).
-    Regular files still require ``st_nlink == 1`` (no hardlinks). Special files
-    (devices, sockets, FIFOs) remain denied.
+    Regular files still require ``st_nlink == 1`` (no hardlinks) UNLESS
+    ``requested_mode`` is given and already equals the file's current
+    permission bits exactly -- that one metadata no-op is accepted so a
+    validator that redundantly re-chmods a hardlinked file to its own mode
+    (e.g. a nested Git/pytest ``config.lock``) is not spuriously denied, while
+    any actual requested mode change against a hardlink stays denied. Special
+    files (devices, sockets, FIFOs) remain denied.
+
+    Returns ``True`` when the caller should perform the mutation, ``False``
+    when the fd is verified but the mutation is an already-satisfied hardlink
+    no-op that must be skipped entirely (no ``fchmod`` call at all, so no
+    ctime bump is ever visible through the file's other hardlinked names).
     """
     info = os.fstat(fd)
     if stat.S_ISDIR(info.st_mode):
         if info.st_uid != os.getuid():
             raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
-        return
+        return True
     if not stat.S_ISREG(info.st_mode):
         raise WorkspaceError(f"metadata_broker_not_regular_file:{candidate}")
     if info.st_nlink != 1:
-        raise WorkspaceError(f"metadata_broker_hardlink_forbidden:{candidate}")
+        if info.st_uid != os.getuid():
+            raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
+        if requested_mode is None or stat.S_IMODE(info.st_mode) != requested_mode:
+            raise WorkspaceError(f"metadata_broker_hardlink_forbidden:{candidate}")
+        return False
     if info.st_uid != os.getuid():
         raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
+    return True
 
 
 def _metadata_broker_verify_target(
-    candidate: str, scratch_fd: int, scratch_root: PurePosixPath
-) -> int:
+    candidate: str,
+    scratch_fd: int,
+    scratch_root: PurePosixPath,
+    requested_mode: int | None = None,
+) -> "tuple[int, bool]":
     """Open and return a verified, mutable fd strictly beneath the scratch.
 
     ``scratch_fd`` is a stable directory descriptor for the exact request-owned
@@ -5690,8 +5710,9 @@ def _metadata_broker_verify_target(
     fails closed on traversal, absolute/outside paths, symlinked roots and
     symlink targets -- never a userspace string-prefix comparison. The returned
     descriptor passes ``_metadata_broker_verify_fd`` (owned directories are
-    permitted; regular files require ``st_nlink == 1``); the caller mutates
-    that exact fd and closes it.
+    permitted; regular files require ``st_nlink == 1`` unless ``requested_mode``
+    is an exact permission-bit no-op); the caller mutates that exact fd -- only
+    when the paired ``bool`` is ``True`` -- and closes it.
 
     For directories the first ``openat2`` with ``O_RDONLY|O_NOCTTY`` yields an
     O_PATH descriptor that cannot be ``fchmod``'d.  A second ``openat2`` with
@@ -5732,19 +5753,21 @@ def _metadata_broker_verify_target(
                 raise WorkspaceError(
                     f"metadata_broker_directory_inode_drift:{candidate}"
                 )
-            _metadata_broker_verify_fd(fd, candidate)
-            return fd
-        _metadata_broker_verify_fd(fd, candidate)
+            mutate = _metadata_broker_verify_fd(fd, candidate, requested_mode)
+            return fd, mutate
+        mutate = _metadata_broker_verify_fd(fd, candidate, requested_mode)
     except BaseException:
         if fd >= 0:
             os.close(fd)
         raise
-    return fd
+    return fd, mutate
 
 
 def _metadata_broker_verify_target_any(
-    candidate: str, scratch_specs: "list[tuple[int, PurePosixPath]]"
-) -> int:
+    candidate: str,
+    scratch_specs: "list[tuple[int, PurePosixPath]]",
+    requested_mode: int | None = None,
+) -> "tuple[int, bool]":
     """Open and return a verified fd beneath the first authorized scratch root
     that actually contains ``candidate``.
 
@@ -5760,11 +5783,17 @@ def _metadata_broker_verify_target_any(
     denies fail-closed.  A target beneath none of the authorized roots is
     rejected -- authority is never widened to the repository or an arbitrary
     path.
+
+    Returns ``(fd, mutate)``: ``mutate`` is ``False`` only for the accepted
+    hardlink permission-bit no-op (see ``_metadata_broker_verify_fd``); the
+    caller must skip the actual ``fchmod`` in that case.
     """
     outside: WorkspaceError | None = None
     for scratch_fd, scratch_root in scratch_specs:
         try:
-            return _metadata_broker_verify_target(candidate, scratch_fd, scratch_root)
+            return _metadata_broker_verify_target(
+                candidate, scratch_fd, scratch_root, requested_mode
+            )
         except WorkspaceError as exc:
             if str(exc).startswith("metadata_broker_outside_scratch"):
                 outside = exc
@@ -5773,11 +5802,11 @@ def _metadata_broker_verify_target_any(
     raise outside or WorkspaceError(f"metadata_broker_outside_scratch:{candidate}")
 
 
-def _metadata_broker_process_pgid(pid: int) -> int:
-    """Return ``pid``'s process-group id parsed from ``/proc/<pid>/stat``.
+def _metadata_broker_process_stat_fields(pid: int) -> list[bytes]:
+    """Return the ``/proc/<pid>/stat`` fields after the ``comm`` field.
 
     The ``comm`` field can contain spaces and parentheses, so the fields after
-    the final ``)`` are used: ``state ppid pgrp ...`` -- ``pgrp`` is the third.
+    the final ``)`` are used: ``state ppid pgrp ...``.
     """
     try:
         with open(f"/proc/{pid}/stat", "rb") as handle:
@@ -5790,26 +5819,82 @@ def _metadata_broker_process_pgid(pid: int) -> int:
     fields = data[close_paren + 1:].split()
     if len(fields) < 3:
         raise WorkspaceError(f"metadata_broker_stat_malformed:{pid}")
+    return fields
+
+
+def _metadata_broker_process_pgid(pid: int) -> int:
+    """Return ``pid``'s process-group id (``pgrp``, the third stat field)."""
+    fields = _metadata_broker_process_stat_fields(pid)
     try:
         return int(fields[2])
     except ValueError as exc:
         raise WorkspaceError(f"metadata_broker_stat_malformed:{pid}") from exc
 
 
-def _metadata_broker_authenticate_pid(pid: int, child_pid: int) -> None:
-    """Accept only the broker child or a live descendant in its process group.
+def _metadata_broker_process_ppid(pid: int) -> int:
+    """Return ``pid``'s live parent pid (``ppid``, the second stat field)."""
+    fields = _metadata_broker_process_stat_fields(pid)
+    try:
+        return int(fields[1])
+    except ValueError as exc:
+        raise WorkspaceError(f"metadata_broker_stat_malformed:{pid}") from exc
 
-    The disposable child calls ``setsid`` before ``exec``, so every legitimate
-    validator descendant shares ``pgid == child_pid`` and no unrelated process
-    can join that freshly created session. Re-read on every request so a dead,
-    reused or foreign pid is rejected fail-closed.
+
+_METADATA_BROKER_MAX_ANCESTRY_DEPTH = 32
+
+
+def _metadata_broker_ppid_ancestry_reaches(pid: int, child_pid: int) -> bool:
+    """Walk ``pid``'s live PPID chain, bounded, for the exact ``child_pid``.
+
+    A descendant that itself calls ``setsid`` gets a fresh ``pgid`` (its own
+    pid), so the pgid fast path in ``_metadata_broker_authenticate_pid`` no
+    longer matches it even though it is a legitimate nested validator process
+    (e.g. a nested ``git``/``pytest`` subprocess). Its live PPID chain still
+    leads back to the broker child as long as it was never reparented.
+    Reparenting (a dead intermediate ancestor reaped by init/a subreaper), a
+    cycle, a malformed ``/proc`` entry or exceeding the bounded depth all fail
+    closed (``False``) rather than trusting anything but the kernel's current,
+    live ancestry.
+    """
+    seen: set[int] = set()
+    current = pid
+    for _ in range(_METADATA_BROKER_MAX_ANCESTRY_DEPTH):
+        if current in seen:
+            return False
+        seen.add(current)
+        try:
+            ppid = _metadata_broker_process_ppid(current)
+        except WorkspaceError:
+            return False
+        if ppid == child_pid:
+            return True
+        if ppid <= 1:
+            return False
+        current = ppid
+    return False
+
+
+def _metadata_broker_authenticate_pid(pid: int, child_pid: int) -> None:
+    """Accept the broker child, its process group, or a bounded PPID descendant.
+
+    The disposable child calls ``setsid`` before ``exec``, so most legitimate
+    validator descendants share ``pgid == child_pid`` and no unrelated process
+    can join that freshly created session (the fast path). A nested descendant
+    that itself calls ``setsid`` breaks that fast path, so it is additionally
+    accepted when its bounded, live PPID ancestry chain reaches the exact
+    ``child_pid`` -- never merely because it is alive or owned by the same
+    uid. Re-read on every request so a dead, reused, reparented or foreign pid
+    is rejected fail-closed.
     """
     if pid <= 0:
         raise WorkspaceError(f"metadata_broker_bad_pid:{pid}")
     if pid == child_pid:
         return
-    if _metadata_broker_process_pgid(pid) != child_pid:
-        raise WorkspaceError(f"metadata_broker_foreign_pid:{pid}")
+    if _metadata_broker_process_pgid(pid) == child_pid:
+        return
+    if _metadata_broker_ppid_ancestry_reaches(pid, child_pid):
+        return
+    raise WorkspaceError(f"metadata_broker_foreign_pid:{pid}")
 
 
 def _kill_validator_group(child_pid: int) -> None:
@@ -6004,7 +6089,9 @@ def _metadata_broker_apply(
         link = _metadata_broker_child_link(pid, f"fd/{raw_fd}")
         if link.endswith(" (deleted)"):
             raise WorkspaceError("metadata_broker_deleted_fd")
-        verified_fd = _metadata_broker_verify_target_any(link, scratch_specs)
+        verified_fd, _verified_mutate = _metadata_broker_verify_target_any(
+            link, scratch_specs, mode
+        )
         try:
             verified_info = os.fstat(verified_fd)
             # verified_fd is kernel-resolved via openat2; for directories it
@@ -6030,12 +6117,15 @@ def _metadata_broker_apply(
                     verified_info.st_ino,
                 ):
                     raise WorkspaceError("metadata_broker_fd_inode_drift")
-                _metadata_broker_verify_fd(fd_target, f"/proc/{pid}/fd/{raw_fd}")
+                mutate = _metadata_broker_verify_fd(
+                    fd_target, f"/proc/{pid}/fd/{raw_fd}", mode
+                )
                 _metadata_broker_check_notification(library, listener_fd, request.id)
-                # Mutate the exact descriptor the child blocked on, proven by
-                # inode identity to be the same beneath-scratch file --
-                # never a readlink+reopen-by-name that a swap could race.
-                os.fchmod(fd_target, mode)
+                if mutate:
+                    # Mutate the exact descriptor the child blocked on, proven
+                    # by inode identity to be the same beneath-scratch file --
+                    # never a readlink+reopen-by-name that a swap could race.
+                    os.fchmod(fd_target, mode)
             finally:
                 os.close(fd_target)
         finally:
@@ -6071,10 +6161,13 @@ def _metadata_broker_apply(
         raise WorkspaceError(f"metadata_broker_unsupported_syscall:{name}")
 
     _metadata_broker_check_notification(library, listener_fd, request.id)
-    verified_fd = _metadata_broker_verify_target_any(raw_target, scratch_specs)
+    verified_fd, mutate = _metadata_broker_verify_target_any(
+        raw_target, scratch_specs, mode
+    )
     try:
         _metadata_broker_check_notification(library, listener_fd, request.id)
-        os.fchmod(verified_fd, mode)
+        if mutate:
+            os.fchmod(verified_fd, mode)
     finally:
         os.close(verified_fd)
 
