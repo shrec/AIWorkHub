@@ -232,6 +232,54 @@ def test_read_owner_manifest_rejects_post_read_replacement(
     assert replaced is True
 
 
+def test_read_owner_manifest_windows_identity_accepts_valid_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner_dir = _write_manifest(
+        tmp_path / "windows-valid", "windows-valid", pid=111, starttime=111
+    )
+    identity = (10, 20, 30, 1, 99)
+
+    monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
+    monkeypatch.setattr(runtime_temp, "_windows_path_identity", lambda path: identity)
+    monkeypatch.setattr(runtime_temp, "_windows_fd_identity", lambda fd: identity)
+
+    manifest = runtime_temp.read_owner_manifest(owner_dir)
+    assert manifest is not None
+    assert manifest["request_id"] == "windows-valid"
+
+
+def test_read_owner_manifest_windows_rejects_post_read_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner_dir = _write_manifest(
+        tmp_path / "windows-post-read-race", "race", pid=111, starttime=111
+    )
+    original_identity = (10, 20, 30, 1, 99)
+    replacement_identity = (10, 21, 30, 1, 99)
+    replaced = False
+    real_read = os.read
+
+    def path_identity(path: Path) -> tuple[int, ...]:
+        return replacement_identity if replaced else original_identity
+
+    def swap_after_read(fd: int, n: int) -> bytes:
+        nonlocal replaced
+        raw = real_read(fd, n)
+        replaced = True
+        return raw
+
+    monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
+    monkeypatch.setattr(runtime_temp, "_windows_path_identity", path_identity)
+    monkeypatch.setattr(
+        runtime_temp, "_windows_fd_identity", lambda fd: original_identity
+    )
+    monkeypatch.setattr(runtime_temp.os, "read", swap_after_read)
+
+    assert runtime_temp.read_owner_manifest(owner_dir) is None
+    assert replaced is True
+
+
 def test_owner_alive_live_dead_reused_and_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = {
         "schema_id": runtime_temp.OWNER_SCHEMA_ID,
