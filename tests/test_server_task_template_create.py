@@ -280,3 +280,104 @@ def test_from_template_provenance_error_is_lifecycle_error(
         **_from_template_kwargs()  # type: ignore[arg-type]
     )
     _assert_lifecycle_error(result, "classification_reason_invalid")
+
+
+def test_task_template_list_is_deterministic_and_repository_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ready_repo(tmp_path, monkeypatch)
+
+    first = server.aiworkhub_task_template_list()
+    second = server.aiworkhub_task_template_list()
+
+    assert first == second
+    assert first["ok"] is True
+    assert first["registry_version"] == task_templates.REGISTRY_VERSION
+    assert first["repository"] == core.repository_current()
+    assert first["repository"]["repo_id"]
+    templates = first["templates"]
+    assert [item["name"] for item in templates] == list(
+        task_templates.TEMPLATE_IDS
+    )
+    assert [item["full_id"] for item in templates] == [
+        task_templates.template_full_id(name)
+        for name in task_templates.TEMPLATE_IDS
+    ]
+
+
+def test_task_template_list_exposes_creation_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ready_repo(tmp_path, monkeypatch)
+    item = server.aiworkhub_task_template_list()["templates"][0]
+    assert {
+        "name",
+        "full_id",
+        "definition_digest",
+        "title",
+        "objective",
+        "task_type",
+        "work_kind",
+        "read_only",
+        "production_path_policy",
+        "test_path_policy",
+        "read_first_fields",
+        "generates_pytest",
+        "generates_lint",
+        "generates_diff_check",
+    } <= item.keys()
+
+
+def test_task_template_show_short_and_full_ids_are_equivalent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ready_repo(tmp_path, monkeypatch)
+    name = "bugfix_with_regression"
+    full_id = task_templates.template_full_id(name)
+
+    short = server.aiworkhub_task_template_show(name)
+    full = server.aiworkhub_task_template_show(full_id)
+
+    assert short == full
+    assert short["ok"] is True
+    assert short["template"]["name"] == name
+    assert short["template"]["full_id"] == full_id
+
+
+@pytest.mark.parametrize(
+    ("template_id", "reason"),
+    [
+        ("missing", "template_unknown"),
+        ("bugfix_with_regression@v0:" + ("a" * 64), "template_version_stale"),
+        (
+            "bugfix_with_regression@v1:" + ("a" * 64),
+            "template_digest_mismatch",
+        ),
+    ],
+)
+def test_task_template_show_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    template_id: str,
+    reason: str,
+) -> None:
+    _ready_repo(tmp_path, monkeypatch)
+    result = server.aiworkhub_task_template_show(template_id)
+    assert result["ok"] is False
+    assert result["reason"] == reason
+    assert result["repository"]["repo_id"]
+
+
+def test_task_template_show_documents_deterministic_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ready_repo(tmp_path, monkeypatch)
+    guidance = server.aiworkhub_task_template_show(
+        "implementation_with_tests"
+    )["creation_guidance"]
+    assert "aiworkhub_task_create_from_template" in guidance["selection"]
+    assert "read_first" in guidance["scope"]
+    assert "not mandatory changed outputs" in guidance["scope"]
+    assert "behavioral roles" in guidance["validation"]
+    assert "uncapped by default" in guidance["token_budget"]
+    assert task_templates.AUDITED_CUSTOM_ESCAPE in guidance["exception"]

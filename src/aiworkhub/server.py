@@ -1195,6 +1195,103 @@ def aiworkhub_task_create_from_template(
     }
 
 
+def _task_template_discovery_payload(
+    spec: task_templates.TaskTemplateSpec,
+) -> dict[str, Any]:
+    """Return the public, deterministic discovery shape for one template."""
+
+    full_id = task_templates.template_full_id(spec.name)
+    return {
+        "name": spec.name,
+        "full_id": full_id,
+        "definition_digest": full_id.rsplit(":", 1)[1],
+        "title": spec.title,
+        "objective": spec.objective,
+        "task_type": spec.task_type,
+        "work_kind": spec.work_kind,
+        "read_only": spec.read_only,
+        "production_path_policy": {
+            "required": spec.production_path_policy.required,
+            "allowed": spec.production_path_policy.allowed,
+        },
+        "test_path_policy": {
+            "required": spec.test_path_policy.required,
+            "allowed": spec.test_path_policy.allowed,
+        },
+        "read_first_fields": list(spec.read_first_fields),
+        "generates_pytest": spec.generates_pytest,
+        "generates_lint": spec.generates_lint,
+        "generates_diff_check": spec.generates_diff_check,
+    }
+
+
+@mcp.tool()
+def aiworkhub_task_template_list() -> dict[str, Any]:
+    """MANAGER READ: list the bounded repository-bound template registry."""
+
+    return {
+        "ok": True,
+        "schema_id": "aiworkhub.task_template_list.v1",
+        "repository": core.repository_current(),
+        "registry_version": task_templates.REGISTRY_VERSION,
+        "templates": [
+            _task_template_discovery_payload(
+                task_templates.resolve_template(template_id)
+            )
+            for template_id in task_templates.TEMPLATE_IDS
+        ],
+    }
+
+
+@mcp.tool()
+def aiworkhub_task_template_show(template_id: str) -> dict[str, Any]:
+    """MANAGER READ: show one exact short or full template ID, fail closed."""
+
+    repository = core.repository_current()
+    try:
+        template = _task_template_discovery_payload(
+            task_templates.resolve_template(template_id)
+        )
+    except task_templates.TaskTemplateError as exc:
+        return {
+            "ok": False,
+            "schema_id": "aiworkhub.task_template_show.v1",
+            "repository": repository,
+            "registry_version": task_templates.REGISTRY_VERSION,
+            "reason": str(exc),
+        }
+    return {
+        "ok": True,
+        "schema_id": "aiworkhub.task_template_show.v1",
+        "repository": repository,
+        "registry_version": task_templates.REGISTRY_VERSION,
+        "template": template,
+        "creation_guidance": {
+            "selection": (
+                "Discover with aiworkhub_task_template_list, then pass the "
+                "exact short name or current full_id to "
+                "aiworkhub_task_create_from_template."
+            ),
+            "scope": (
+                "production_paths and test_paths expand allowed_writes and "
+                "read_first; they are not mandatory changed outputs."
+            ),
+            "validation": (
+                "The template deterministically generates validation commands "
+                "and their behavioral roles."
+            ),
+            "token_budget": (
+                "Tasks are uncapped by default; set max_live_tokens only from "
+                "an explicit owner cap or registered repository policy."
+            ),
+            "exception": (
+                "Only raw unclassified task creation may use the audited "
+                f"escape token {task_templates.AUDITED_CUSTOM_ESCAPE}."
+            ),
+        },
+    }
+
+
 def _compact_task_plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     """Project a full Plan-DAG snapshot through the canonical summariser.
 
