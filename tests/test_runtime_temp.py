@@ -249,6 +249,44 @@ def test_read_owner_manifest_windows_identity_accepts_valid_manifest(
     assert manifest["request_id"] == "windows-valid"
 
 
+def test_read_owner_manifest_windows_uses_stable_identity_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner_dir = _write_manifest(
+        tmp_path / "windows-pre-read-stable", "race", pid=111, starttime=111
+    )
+    replacement_dir = _write_manifest(
+        tmp_path / "windows-pre-read-replacement", "replacement", pid=222, starttime=222
+    )
+    original = owner_dir / runtime_temp.OWNER_MANIFEST_NAME
+    replacement = replacement_dir / runtime_temp.OWNER_MANIFEST_NAME
+    original_identity_from_path = (10, 20, 30, 1, original.stat().st_size)
+    original_identity_from_fd = (10, 20, 128, 1, original.stat().st_size)
+    replacement_identity = (10, 21, 128, 1, replacement.stat().st_size)
+    real_read = os.read
+    replaced = False
+
+    def path_identity(path: Path) -> tuple[int, ...]:
+        return replacement_identity if replaced else original_identity_from_path
+
+    def swap_after_read(fd: int, n: int) -> bytes:
+        nonlocal replaced
+        raw = real_read(fd, n)
+        os.replace(replacement, original)
+        replaced = True
+        return raw
+
+    monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
+    monkeypatch.setattr(runtime_temp, "_windows_path_identity", path_identity)
+    monkeypatch.setattr(
+        runtime_temp, "_windows_fd_identity", lambda fd: original_identity_from_fd
+    )
+    monkeypatch.setattr(runtime_temp.os, "read", swap_after_read)
+
+    assert runtime_temp.read_owner_manifest(owner_dir) is None
+    assert replaced is True
+
+
 def test_read_owner_manifest_windows_rejects_post_read_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -274,6 +312,38 @@ def test_read_owner_manifest_windows_rejects_post_read_replacement(
     monkeypatch.setattr(
         runtime_temp, "_windows_fd_identity", lambda fd: original_identity
     )
+    monkeypatch.setattr(runtime_temp.os, "read", swap_after_read)
+
+    assert runtime_temp.read_owner_manifest(owner_dir) is None
+    assert replaced is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows file identity")
+def test_read_owner_manifest_native_windows_rejects_post_read_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner_dir = _write_manifest(
+        tmp_path / "native-windows-post-read-race", "race", pid=111, starttime=111
+    )
+    replacement_dir = _write_manifest(
+        tmp_path / "native-windows-post-read-replacement",
+        "replacement",
+        pid=222,
+        starttime=222,
+    )
+    original = owner_dir / runtime_temp.OWNER_MANIFEST_NAME
+    replacement = replacement_dir / runtime_temp.OWNER_MANIFEST_NAME
+    real_read = os.read
+    replaced = False
+
+    def swap_after_read(fd: int, n: int) -> bytes:
+        nonlocal replaced
+        raw = real_read(fd, n)
+        if not replaced:
+            os.replace(replacement, original)
+            replaced = True
+        return raw
+
     monkeypatch.setattr(runtime_temp.os, "read", swap_after_read)
 
     assert runtime_temp.read_owner_manifest(owner_dir) is None

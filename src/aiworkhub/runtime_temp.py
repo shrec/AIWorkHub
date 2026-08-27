@@ -413,9 +413,6 @@ def _windows_handle_identity(handle: int) -> tuple[int, ...] | None:
     return (
         int(info.volume_serial_number),
         (int(info.file_index_high) << 32) | int(info.file_index_low),
-        int(info.file_attributes),
-        int(info.number_of_links),
-        (int(info.file_size_high) << 32) | int(info.file_size_low),
     )
 
 
@@ -478,15 +475,21 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def _stable_windows_identity(identity: tuple[int, ...] | None) -> tuple[int, int] | None:
+    if identity is None or len(identity) < 2:
+        return None
+    return (int(identity[0]), int(identity[1]))
+
+
 def _manifest_fd_identity(fd: int, info: os.stat_result) -> tuple[int, ...] | None:
     if _is_windows():
-        return _windows_fd_identity(fd)
+        return _stable_windows_identity(_windows_fd_identity(fd))
     return _manifest_identity(info)
 
 
 def _manifest_path_identity(path: Path, info: os.stat_result) -> tuple[int, ...] | None:
     if _is_windows():
-        return _windows_path_identity(path)
+        return _stable_windows_identity(_windows_path_identity(path))
     return _manifest_identity(info)
 
 
@@ -515,8 +518,13 @@ def read_owner_manifest(directory: Path) -> dict[str, Any] | None:
         after_identity = _manifest_path_identity(path, after)
         if (
             not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(after.st_mode)
             or opened_identity != pre_identity
             or after_identity != pre_identity
+            or opened.st_nlink != info.st_nlink
+            or after.st_nlink != info.st_nlink
+            or opened.st_size != info.st_size
+            or after.st_size != info.st_size
             or opened.st_size > MAX_MANIFEST_BYTES
         ):
             return None
@@ -534,6 +542,10 @@ def read_owner_manifest(directory: Path) -> dict[str, Any] | None:
             or not stat.S_ISREG(reread_path.st_mode)
             or reread_opened_identity != pre_identity
             or reread_path_identity != pre_identity
+            or reread_opened.st_nlink != info.st_nlink
+            or reread_path.st_nlink != info.st_nlink
+            or reread_opened.st_size != info.st_size
+            or reread_path.st_size != info.st_size
             or reread_opened.st_size > MAX_MANIFEST_BYTES
         ):
             return None
