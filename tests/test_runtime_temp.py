@@ -773,21 +773,33 @@ def test_read_owner_manifest_native_windows_rejects_post_read_replacement(
     )
     original = owner_dir / runtime_temp.OWNER_MANIFEST_NAME
     replacement = replacement_dir / runtime_temp.OWNER_MANIFEST_NAME
+    original_bytes = original.read_bytes()
+    replacement_bytes = replacement.read_bytes()
     real_read_handle = runtime_temp._windows_read_handle
-    replaced = False
+    replace_error: OSError | None = None
+    replace_attempted = False
 
     def swap_after_read(handle: int, size: int) -> bytes | None:
-        nonlocal replaced
+        nonlocal replace_attempted, replace_error
         raw = real_read_handle(handle, size)
-        if raw is not None and not replaced:
-            os.replace(replacement, original)
-            replaced = True
+        if raw is not None and not replace_attempted:
+            replace_attempted = True
+            try:
+                os.replace(replacement, original)
+            except OSError as exc:
+                replace_error = exc
         return raw
 
     monkeypatch.setattr(runtime_temp, "_windows_read_handle", swap_after_read)
 
-    assert runtime_temp.read_owner_manifest(owner_dir) is None
-    assert replaced is True
+    manifest = runtime_temp.read_owner_manifest(owner_dir)
+    assert manifest is not None
+    assert manifest["request_id"] == "race"
+    assert manifest["pid"] == 111
+    assert replace_attempted is True
+    assert isinstance(replace_error, PermissionError)
+    assert original.read_bytes() == original_bytes
+    assert replacement.read_bytes() == replacement_bytes
 
 
 def test_owner_alive_live_dead_reused_and_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
