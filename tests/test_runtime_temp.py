@@ -235,15 +235,35 @@ def test_read_owner_manifest_rejects_post_read_replacement(
 def _stat_with(
     info: os.stat_result,
     *,
+    st_mode: int | None = None,
+    st_ino: int | None = None,
     st_nlink: int | None = None,
     st_size: int | None = None,
 ) -> os.stat_result:
     values = list(info)
+    if st_mode is not None:
+        values[0] = st_mode
+    if st_ino is not None:
+        values[1] = st_ino
     if st_nlink is not None:
         values[3] = st_nlink
     if st_size is not None:
         values[6] = st_size
     return os.stat_result(values)
+
+
+def _windows_metadata(
+    size: int,
+    *,
+    last_write_time: int = 100,
+    change_time: int = 200,
+) -> runtime_temp._WindowsHandleMetadata:
+    return runtime_temp._WindowsHandleMetadata(
+        file_attributes=0x80,
+        last_write_time=last_write_time,
+        change_time=change_time,
+        end_of_file=size,
+    )
 
 
 def test_read_owner_manifest_windows_identity_accepts_valid_manifest(
@@ -252,15 +272,253 @@ def test_read_owner_manifest_windows_identity_accepts_valid_manifest(
     owner_dir = _write_manifest(
         tmp_path / "windows-valid", "windows-valid", pid=111, starttime=111
     )
-    identity = (10, 20, 30, 1, 99)
+    raw = (owner_dir / runtime_temp.OWNER_MANIFEST_NAME).read_bytes()
+    identity = (10, (1 << 96) + 20)
+    handle = 1234
+    read_sizes = []
 
     monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
     monkeypatch.setattr(runtime_temp, "_windows_path_identity", lambda path: identity)
-    monkeypatch.setattr(runtime_temp, "_windows_fd_identity", lambda fd: identity)
+    monkeypatch.setattr(
+        runtime_temp, "_windows_open_manifest_handle", lambda path: handle
+    )
+    monkeypatch.setattr(
+        runtime_temp, "_windows_handle_identity", lambda value: identity
+    )
+    monkeypatch.setattr(
+        runtime_temp, "_windows_handle_metadata", lambda value: _windows_metadata(len(raw))
+    )
+    monkeypatch.setattr(runtime_temp, "_windows_close_handle", lambda value: None)
+
+    def read_handle(value: int, size: int) -> bytes:
+        assert value == handle
+        read_sizes.append(size)
+        return raw
+
+    monkeypatch.setattr(runtime_temp, "_windows_read_handle", read_handle)
 
     manifest = runtime_temp.read_owner_manifest(owner_dir)
     assert manifest is not None
     assert manifest["request_id"] == "windows-valid"
+    assert read_sizes == [runtime_temp.MAX_MANIFEST_BYTES + 1]
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_trace"),
+    [
+        ("pre-lstat", ["pre-lstat"]),
+        ("pre-identity", ["pre-lstat", "pre-identity"]),
+        ("open", ["pre-lstat", "pre-identity", "open"]),
+        (
+            "opened-stat/type",
+            ["pre-lstat", "pre-identity", "open", "opened-stat/type"],
+        ),
+        (
+            "path-identity",
+            [
+                "pre-lstat",
+                "pre-identity",
+                "open",
+                "opened-stat/type",
+                "path-identity",
+            ],
+        ),
+        (
+            "read-entry",
+            [
+                "pre-lstat",
+                "pre-identity",
+                "open",
+                "opened-stat/type",
+                "path-identity",
+                "read-entry",
+            ],
+        ),
+    ],
+)
+def test_read_owner_manifest_windows_stage_bound_pre_read_rejections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    expected_trace: list[str],
+) -> None:
+    owner_dir = _write_manifest(
+        tmp_path / f"windows-stage-{failure_stage}", "stage", pid=111, starttime=111
+    )
+    manifest_path = owner_dir / runtime_temp.OWNER_MANIFEST_NAME
+    real_lstat = Path.lstat
+    identity = (10, (1 << 80) + 20)
+    handle = 1234
+    trace: list[str] = []
+
+    def lstat_gate(self: Path) -> os.stat_result:
+        info = real_lstat(self)
+        if self != manifest_path:
+            return info
+        if not trace:
+            trace.append("pre-lstat")
+            if failure_stage == "pre-lstat":
+                return _stat_with(info, st_mode=(info.st_mode & ~0o170000) | 0o040000)
+        return info
+
+    path_identity_calls = 0
+
+    def path_identity(path: Path) -> tuple[int, int] | None:
+        nonlocal path_identity_calls
+        path_identity_calls += 1
+        trace.append("pre-identity" if path_identity_calls == 1 else "path-identity")
+        if path_identity_calls == 1 and failure_stage == "pre-identity":
+            return None
+        if path_identity_calls > 1 and failure_stage == "path-identity":
+            return None
+        return identity
+
+    def open_handle(path: Path) -> int | None:
+        trace.append("open")
+        return None if failure_stage == "open" else handle
+
+    handle_identity_calls = 0
+
+    def handle_identity(value: int) -> tuple[int, int] | None:
+        nonlocal handle_identity_calls
+        assert value == handle
+        handle_identity_calls += 1
+        if handle_identity_calls == 1:
+            trace.append("opened-stat/type")
+            if failure_stage == "opened-stat/type":
+                return None
+        return identity
+
+    def read_handle(value: int, size: int) -> bytes | None:
+        assert value == handle
+        assert size == runtime_temp.MAX_MANIFEST_BYTES + 1
+        trace.append("read-entry")
+        return None if failure_stage == "read-entry" else manifest_path.read_bytes()
+
+    monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
+    monkeypatch.setattr(runtime_temp.Path, "lstat", lstat_gate)
+    monkeypatch.setattr(runtime_temp, "_windows_path_identity", path_identity)
+    monkeypatch.setattr(runtime_temp, "_windows_open_manifest_handle", open_handle)
+    monkeypatch.setattr(runtime_temp, "_windows_handle_identity", handle_identity)
+    monkeypatch.setattr(
+        runtime_temp,
+        "_windows_handle_metadata",
+        lambda value: _windows_metadata(manifest_path.stat().st_size),
+    )
+    monkeypatch.setattr(runtime_temp, "_windows_read_handle", read_handle)
+    monkeypatch.setattr(runtime_temp, "_windows_close_handle", lambda value: None)
+
+    assert runtime_temp.read_owner_manifest(owner_dir) is None
+    assert trace == expected_trace
+
+
+@pytest.mark.parametrize(
+    "missing_stage", ["pre", "opened", "path", "zero-pre", "zero-opened", "zero-path"]
+)
+def test_read_owner_manifest_windows_fails_closed_for_missing_full_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_stage: str
+) -> None:
+    owner_dir = _write_manifest(
+        tmp_path / f"windows-missing-{missing_stage}", "missing", pid=111, starttime=111
+    )
+    identity = (10, (1 << 72) + 20)
+    zero_identity = (10, 0)
+    handle = 1234
+    path_calls = 0
+    read_called = False
+
+    def path_identity(path: Path) -> tuple[int, int] | None:
+        nonlocal path_calls
+        path_calls += 1
+        if missing_stage == "pre" and path_calls == 1:
+            return None
+        if missing_stage == "path" and path_calls > 1:
+            return None
+        if missing_stage == "zero-pre" and path_calls == 1:
+            return zero_identity
+        if missing_stage == "zero-path" and path_calls > 1:
+            return zero_identity
+        return identity
+
+    def handle_identity(value: int) -> tuple[int, int] | None:
+        if missing_stage == "opened":
+            return None
+        if missing_stage == "zero-opened":
+            return zero_identity
+        return identity
+
+    def read_handle(value: int, size: int) -> bytes:
+        nonlocal read_called
+        read_called = True
+        return b"{}"
+
+    monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
+    monkeypatch.setattr(runtime_temp, "_windows_path_identity", path_identity)
+    monkeypatch.setattr(
+        runtime_temp, "_windows_open_manifest_handle", lambda path: handle
+    )
+    monkeypatch.setattr(runtime_temp, "_windows_handle_identity", handle_identity)
+    monkeypatch.setattr(runtime_temp, "_windows_read_handle", read_handle)
+    monkeypatch.setattr(runtime_temp, "_windows_close_handle", lambda value: None)
+
+    assert runtime_temp.read_owner_manifest(owner_dir) is None
+    assert read_called is False
+
+
+def test_read_owner_manifest_windows_rejects_replacement_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner_dir = _write_manifest(
+        tmp_path / "windows-before-open-race", "race", pid=111, starttime=111
+    )
+    replacement_dir = _write_manifest(
+        tmp_path / "windows-before-open-replacement",
+        "replacement",
+        pid=222,
+        starttime=222,
+    )
+    original = owner_dir / runtime_temp.OWNER_MANIFEST_NAME
+    replacement = replacement_dir / runtime_temp.OWNER_MANIFEST_NAME
+    original_identity = (10, (1 << 88) + 20)
+    replacement_identity = (10, (1 << 88) + 21)
+    handle = 1234
+    replaced = False
+    read_called = False
+
+    def path_identity(path: Path) -> tuple[int, int]:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            os.replace(replacement, original)
+            return original_identity
+        return replacement_identity
+
+    def open_handle(path: Path) -> int:
+        assert replaced is True
+        return handle
+
+    def read_handle(value: int, size: int) -> bytes:
+        nonlocal read_called
+        read_called = True
+        return original.read_bytes()
+
+    monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
+    monkeypatch.setattr(runtime_temp, "_windows_path_identity", path_identity)
+    monkeypatch.setattr(runtime_temp, "_windows_open_manifest_handle", open_handle)
+    monkeypatch.setattr(
+        runtime_temp, "_windows_handle_identity", lambda value: replacement_identity
+    )
+    monkeypatch.setattr(
+        runtime_temp,
+        "_windows_handle_metadata",
+        lambda value: _windows_metadata(original.stat().st_size),
+    )
+    monkeypatch.setattr(runtime_temp, "_windows_read_handle", read_handle)
+    monkeypatch.setattr(runtime_temp, "_windows_close_handle", lambda value: None)
+
+    assert runtime_temp.read_owner_manifest(owner_dir) is None
+    assert replaced is True
+    assert read_called is False
 
 
 def test_read_owner_manifest_windows_reads_with_posix_metadata_divergence(
@@ -274,30 +532,28 @@ def test_read_owner_manifest_windows_reads_with_posix_metadata_divergence(
     )
     original = owner_dir / runtime_temp.OWNER_MANIFEST_NAME
     replacement = replacement_dir / runtime_temp.OWNER_MANIFEST_NAME
-    original_identity_from_path = (10, 20, 30, 1, original.stat().st_size)
-    original_identity_from_fd = (10, 20, 128, 1, original.stat().st_size)
-    replacement_identity = (10, 21, 128, 1, replacement.stat().st_size)
-    real_fstat = os.fstat
+    original_identity = (10, (1 << 96) + 20)
+    replacement_identity = (10, (1 << 96) + 21)
     real_lstat = Path.lstat
-    real_read = os.read
     replaced = False
+    handle = 1234
 
-    def path_identity(path: Path) -> tuple[int, ...]:
-        return replacement_identity if replaced else original_identity_from_path
-
-    def fstat_with_windows_metadata(fd: int) -> os.stat_result:
-        info = real_fstat(fd)
-        return _stat_with(info, st_nlink=17, st_size=info.st_size + 3)
+    def path_identity(path: Path) -> tuple[int, int]:
+        return replacement_identity if replaced else original_identity
 
     def lstat_with_windows_metadata(self: Path) -> os.stat_result:
         info = real_lstat(self)
         if self == original:
-            return _stat_with(info, st_nlink=23, st_size=info.st_size + 5)
+            return _stat_with(
+                info, st_ino=20, st_nlink=23, st_size=info.st_size + 5
+            )
         return info
 
-    def swap_after_read(fd: int, n: int) -> bytes:
+    def swap_after_read(value: int, size: int) -> bytes:
         nonlocal replaced
-        raw = real_read(fd, n)
+        assert value == handle
+        assert size == runtime_temp.MAX_MANIFEST_BYTES + 1
+        raw = original.read_bytes()
         os.replace(replacement, original)
         replaced = True
         return raw
@@ -305,11 +561,21 @@ def test_read_owner_manifest_windows_reads_with_posix_metadata_divergence(
     monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
     monkeypatch.setattr(runtime_temp, "_windows_path_identity", path_identity)
     monkeypatch.setattr(
-        runtime_temp, "_windows_fd_identity", lambda fd: original_identity_from_fd
+        runtime_temp, "_windows_open_manifest_handle", lambda path: handle
     )
-    monkeypatch.setattr(runtime_temp.os, "fstat", fstat_with_windows_metadata)
+    monkeypatch.setattr(
+        runtime_temp,
+        "_windows_handle_identity",
+        lambda value: original_identity,
+    )
+    monkeypatch.setattr(
+        runtime_temp,
+        "_windows_handle_metadata",
+        lambda value: _windows_metadata(original.stat().st_size),
+    )
     monkeypatch.setattr(runtime_temp.Path, "lstat", lstat_with_windows_metadata)
-    monkeypatch.setattr(runtime_temp.os, "read", swap_after_read)
+    monkeypatch.setattr(runtime_temp, "_windows_read_handle", swap_after_read)
+    monkeypatch.setattr(runtime_temp, "_windows_close_handle", lambda value: None)
 
     assert runtime_temp.read_owner_manifest(owner_dir) is None
     assert replaced is True
@@ -321,29 +587,123 @@ def test_read_owner_manifest_windows_rejects_post_read_replacement(
     owner_dir = _write_manifest(
         tmp_path / "windows-post-read-race", "race", pid=111, starttime=111
     )
-    original_identity = (10, 20, 30, 1, 99)
-    replacement_identity = (10, 21, 30, 1, 99)
+    original = owner_dir / runtime_temp.OWNER_MANIFEST_NAME
+    original_identity = (10, (1 << 80) + 20)
+    replacement_identity = (10, (1 << 80) + 21)
     replaced = False
-    real_read = os.read
+    handle = 1234
 
-    def path_identity(path: Path) -> tuple[int, ...]:
+    def path_identity(path: Path) -> tuple[int, int]:
         return replacement_identity if replaced else original_identity
 
-    def swap_after_read(fd: int, n: int) -> bytes:
+    def swap_after_read(value: int, size: int) -> bytes:
         nonlocal replaced
-        raw = real_read(fd, n)
+        assert value == handle
+        assert size == runtime_temp.MAX_MANIFEST_BYTES + 1
+        raw = original.read_bytes()
         replaced = True
         return raw
 
     monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
     monkeypatch.setattr(runtime_temp, "_windows_path_identity", path_identity)
     monkeypatch.setattr(
-        runtime_temp, "_windows_fd_identity", lambda fd: original_identity
+        runtime_temp, "_windows_open_manifest_handle", lambda path: handle
     )
-    monkeypatch.setattr(runtime_temp.os, "read", swap_after_read)
+    monkeypatch.setattr(
+        runtime_temp, "_windows_handle_identity", lambda value: original_identity
+    )
+    monkeypatch.setattr(
+        runtime_temp,
+        "_windows_handle_metadata",
+        lambda value: _windows_metadata(original.stat().st_size),
+    )
+    monkeypatch.setattr(runtime_temp, "_windows_read_handle", swap_after_read)
+    monkeypatch.setattr(runtime_temp, "_windows_close_handle", lambda value: None)
 
     assert runtime_temp.read_owner_manifest(owner_dir) is None
     assert replaced is True
+
+
+def test_read_owner_manifest_windows_rejects_same_length_in_place_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner_dir = _write_manifest(
+        tmp_path / "windows-same-length-rewrite", "race", pid=111, starttime=111
+    )
+    original = owner_dir / runtime_temp.OWNER_MANIFEST_NAME
+    raw = original.read_bytes()
+    replacement = raw.replace(b'"race"', b'"swap"')
+    assert len(replacement) == len(raw)
+    identity = (10, (1 << 96) + 20)
+    handle = 1234
+    metadata_calls = 0
+
+    def metadata(value: int) -> runtime_temp._WindowsHandleMetadata:
+        nonlocal metadata_calls
+        assert value == handle
+        metadata_calls += 1
+        return _windows_metadata(
+            len(raw),
+            change_time=200 if metadata_calls == 1 else 201,
+        )
+
+    def rewrite_during_read(value: int, size: int) -> bytes:
+        assert value == handle
+        assert size == runtime_temp.MAX_MANIFEST_BYTES + 1
+        original.write_bytes(replacement)
+        return raw
+
+    monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
+    monkeypatch.setattr(runtime_temp, "_windows_path_identity", lambda path: identity)
+    monkeypatch.setattr(
+        runtime_temp, "_windows_open_manifest_handle", lambda path: handle
+    )
+    monkeypatch.setattr(runtime_temp, "_windows_handle_identity", lambda value: identity)
+    monkeypatch.setattr(runtime_temp, "_windows_handle_metadata", metadata)
+    monkeypatch.setattr(runtime_temp, "_windows_read_handle", rewrite_during_read)
+    monkeypatch.setattr(runtime_temp, "_windows_close_handle", lambda value: None)
+
+    assert runtime_temp.read_owner_manifest(owner_dir) is None
+    assert original.read_bytes() == replacement
+    assert metadata_calls == 2
+
+
+@pytest.mark.parametrize("metadata_stage", ["pre-missing", "post-missing", "pre-zero"])
+def test_read_owner_manifest_windows_fails_closed_for_missing_handle_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata_stage: str
+) -> None:
+    owner_dir = _write_manifest(
+        tmp_path / f"windows-metadata-{metadata_stage}", "metadata", pid=111, starttime=111
+    )
+    raw = (owner_dir / runtime_temp.OWNER_MANIFEST_NAME).read_bytes()
+    identity = (10, (1 << 96) + 20)
+    handle = 1234
+    calls = 0
+
+    def metadata(value: int) -> runtime_temp._WindowsHandleMetadata | None:
+        nonlocal calls
+        assert value == handle
+        calls += 1
+        if metadata_stage == "pre-missing" and calls == 1:
+            return None
+        if metadata_stage == "post-missing" and calls == 2:
+            return None
+        if metadata_stage == "pre-zero" and calls == 1:
+            return _windows_metadata(len(raw), change_time=0)
+        return _windows_metadata(len(raw))
+
+    monkeypatch.setattr(runtime_temp, "_is_windows", lambda: True)
+    monkeypatch.setattr(runtime_temp, "_windows_path_identity", lambda path: identity)
+    monkeypatch.setattr(
+        runtime_temp, "_windows_open_manifest_handle", lambda path: handle
+    )
+    monkeypatch.setattr(runtime_temp, "_windows_handle_identity", lambda value: identity)
+    monkeypatch.setattr(runtime_temp, "_windows_handle_metadata", metadata)
+    monkeypatch.setattr(runtime_temp, "_windows_read_handle", lambda value, size: raw)
+    monkeypatch.setattr(runtime_temp, "_windows_close_handle", lambda value: None)
+
+    assert runtime_temp.read_owner_manifest(owner_dir) is None
+    assert calls == (1 if metadata_stage != "post-missing" else 2)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows file identity")
@@ -361,18 +721,18 @@ def test_read_owner_manifest_native_windows_rejects_post_read_replacement(
     )
     original = owner_dir / runtime_temp.OWNER_MANIFEST_NAME
     replacement = replacement_dir / runtime_temp.OWNER_MANIFEST_NAME
-    real_read = os.read
+    real_read_handle = runtime_temp._windows_read_handle
     replaced = False
 
-    def swap_after_read(fd: int, n: int) -> bytes:
+    def swap_after_read(handle: int, size: int) -> bytes | None:
         nonlocal replaced
-        raw = real_read(fd, n)
-        if not replaced:
+        raw = real_read_handle(handle, size)
+        if raw is not None and not replaced:
             os.replace(replacement, original)
             replaced = True
         return raw
 
-    monkeypatch.setattr(runtime_temp.os, "read", swap_after_read)
+    monkeypatch.setattr(runtime_temp, "_windows_read_handle", swap_after_read)
 
     assert runtime_temp.read_owner_manifest(owner_dir) is None
     assert replaced is True

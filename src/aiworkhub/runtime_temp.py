@@ -378,7 +378,15 @@ def _manifest_identity(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _windows_handle_identity(handle: int) -> tuple[int, ...] | None:
+def _windows_kernel32() -> Any:
+    return getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+
+
+def _windows_invalid_handle_value() -> int:
+    return int(ctypes.c_void_p(-1).value)
+
+
+def _windows_handle_attributes(handle: int) -> int | None:
     class _ByHandleFileInformation(ctypes.Structure):
         _fields_ = [
             ("file_attributes", ctypes.c_uint32),
@@ -396,8 +404,7 @@ def _windows_handle_identity(handle: int) -> tuple[int, ...] | None:
             ("file_index_low", ctypes.c_uint32),
         ]
 
-    file_attribute_reparse_point = 0x400
-    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    kernel32 = _windows_kernel32()
     kernel32.GetFileInformationByHandle.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(_ByHandleFileInformation),
@@ -408,40 +415,148 @@ def _windows_handle_identity(handle: int) -> tuple[int, ...] | None:
         ctypes.c_void_p(handle), ctypes.byref(info)
     ):
         return None
-    if int(info.file_attributes) & file_attribute_reparse_point:
+    return int(info.file_attributes)
+
+
+def _valid_windows_identity(identity: tuple[int, ...] | None) -> tuple[int, int] | None:
+    if identity is None or len(identity) != 2:
         return None
-    return (
-        int(info.volume_serial_number),
-        (int(info.file_index_high) << 32) | int(info.file_index_low),
+    volume_serial = int(identity[0])
+    file_id = int(identity[1])
+    if volume_serial <= 0 or file_id <= 0:
+        return None
+    return (volume_serial, file_id)
+
+
+@dataclass(frozen=True)
+class _WindowsHandleMetadata:
+    file_attributes: int
+    last_write_time: int
+    change_time: int
+    end_of_file: int
+
+
+def _valid_windows_metadata(
+    metadata: _WindowsHandleMetadata | None,
+) -> _WindowsHandleMetadata | None:
+    file_attribute_reparse_point = 0x400
+    if (
+        metadata is None
+        or metadata.file_attributes <= 0
+        or metadata.file_attributes & file_attribute_reparse_point
+        or metadata.last_write_time <= 0
+        or metadata.change_time <= 0
+        or metadata.end_of_file <= 0
+    ):
+        return None
+    return metadata
+
+
+def _windows_handle_metadata(handle: int) -> _WindowsHandleMetadata | None:
+    class _FileBasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("creation_time", ctypes.c_longlong),
+            ("last_access_time", ctypes.c_longlong),
+            ("last_write_time", ctypes.c_longlong),
+            ("change_time", ctypes.c_longlong),
+            ("file_attributes", ctypes.c_uint32),
+        ]
+
+    class _FileStandardInfo(ctypes.Structure):
+        _fields_ = [
+            ("allocation_size", ctypes.c_longlong),
+            ("end_of_file", ctypes.c_longlong),
+            ("number_of_links", ctypes.c_uint32),
+            ("delete_pending", ctypes.c_ubyte),
+            ("directory", ctypes.c_ubyte),
+        ]
+
+    file_basic_info = 0
+    file_standard_info = 1
+
+    kernel32 = _windows_kernel32()
+    kernel32.GetFileInformationByHandleEx.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
+    basic = _FileBasicInfo()
+    if not kernel32.GetFileInformationByHandleEx(
+        ctypes.c_void_p(handle),
+        ctypes.c_int(file_basic_info),
+        ctypes.byref(basic),
+        ctypes.c_uint32(ctypes.sizeof(basic)),
+    ):
+        return None
+    standard = _FileStandardInfo()
+    if not kernel32.GetFileInformationByHandleEx(
+        ctypes.c_void_p(handle),
+        ctypes.c_int(file_standard_info),
+        ctypes.byref(standard),
+        ctypes.c_uint32(ctypes.sizeof(standard)),
+    ):
+        return None
+
+    attrs = int(basic.file_attributes)
+    last_write_time = int(basic.last_write_time)
+    change_time = int(basic.change_time)
+    end_of_file = int(standard.end_of_file)
+    if int(standard.directory) or int(standard.delete_pending):
+        return None
+    return _valid_windows_metadata(
+        _WindowsHandleMetadata(
+            file_attributes=attrs,
+            last_write_time=last_write_time,
+            change_time=change_time,
+            end_of_file=end_of_file,
+        )
     )
 
 
-def _windows_fd_identity(fd: int) -> tuple[int, ...] | None:
-    import msvcrt  # type: ignore[import-not-found]
+def _windows_handle_identity(handle: int) -> tuple[int, int] | None:
+    class _FileIdInfo(ctypes.Structure):
+        _fields_ = [
+            ("volume_serial_number", ctypes.c_uint64),
+            ("file_id", ctypes.c_ubyte * 16),
+        ]
 
-    handle = msvcrt.get_osfhandle(fd)
-    if handle == -1:
-        return None
-    return _windows_handle_identity(int(handle))
-
-
-def _windows_path_identity(path: Path) -> tuple[int, ...] | None:
     file_attribute_reparse_point = 0x400
+    file_id_info = 18
+    attrs = _windows_handle_attributes(handle)
+    if attrs is None or attrs & file_attribute_reparse_point:
+        return None
+
+    kernel32 = _windows_kernel32()
+    kernel32.GetFileInformationByHandleEx.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
+    info = _FileIdInfo()
+    if not kernel32.GetFileInformationByHandleEx(
+        ctypes.c_void_p(handle),
+        ctypes.c_int(file_id_info),
+        ctypes.byref(info),
+        ctypes.c_uint32(ctypes.sizeof(info)),
+    ):
+        return None
+    return _valid_windows_identity(
+        (int(info.volume_serial_number), int.from_bytes(bytes(info.file_id), "little"))
+    )
+
+
+def _windows_open_manifest_handle(path: Path) -> int | None:
     file_flag_open_reparse_point = 0x00200000
-    invalid_file_attributes = 0xFFFFFFFF
     generic_read = 0x80000000
     share_all = 0x00000001 | 0x00000002 | 0x00000004
     open_existing = 3
     file_attribute_normal = 0x80
-    invalid_handle_value = ctypes.c_void_p(-1).value
 
-    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
-    kernel32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
-    kernel32.GetFileAttributesW.restype = ctypes.c_uint32
-    attrs = int(kernel32.GetFileAttributesW(str(path)))
-    if attrs == invalid_file_attributes or attrs & file_attribute_reparse_point:
-        return None
-
+    kernel32 = _windows_kernel32()
     kernel32.CreateFileW.argtypes = [
         ctypes.c_wchar_p,
         ctypes.c_uint32,
@@ -452,8 +567,6 @@ def _windows_path_identity(path: Path) -> tuple[int, ...] | None:
         ctypes.c_void_p,
     ]
     kernel32.CreateFileW.restype = ctypes.c_void_p
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = ctypes.c_int
     handle = kernel32.CreateFileW(
         str(path),
         generic_read,
@@ -463,51 +576,161 @@ def _windows_path_identity(path: Path) -> tuple[int, ...] | None:
         file_attribute_normal | file_flag_open_reparse_point,
         None,
     )
-    if not handle or handle == invalid_handle_value:
+    if not handle or handle == _windows_invalid_handle_value():
+        return None
+    return int(handle)
+
+
+def _windows_close_handle(handle: int) -> None:
+    kernel32 = _windows_kernel32()
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def _windows_read_handle(handle: int, size: int) -> bytes | None:
+    kernel32 = _windows_kernel32()
+    kernel32.ReadFile.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_void_p,
+    ]
+    kernel32.ReadFile.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(size)
+    read = ctypes.c_uint32(0)
+    if not kernel32.ReadFile(
+        ctypes.c_void_p(handle),
+        buffer,
+        ctypes.c_uint32(size),
+        ctypes.byref(read),
+        None,
+    ):
+        return None
+    return bytes(buffer.raw[: int(read.value)])
+
+
+def _windows_fd_identity(fd: int) -> tuple[int, int] | None:
+    import msvcrt  # type: ignore[import-not-found]
+
+    handle = msvcrt.get_osfhandle(fd)
+    if handle == -1:
+        return None
+    return _windows_handle_identity(int(handle))
+
+
+def _windows_path_identity(path: Path) -> tuple[int, int] | None:
+    file_attribute_reparse_point = 0x400
+    invalid_file_attributes = 0xFFFFFFFF
+
+    kernel32 = _windows_kernel32()
+    kernel32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+    kernel32.GetFileAttributesW.restype = ctypes.c_uint32
+    attrs = int(kernel32.GetFileAttributesW(str(path)))
+    if attrs == invalid_file_attributes or attrs & file_attribute_reparse_point:
+        return None
+
+    handle = _windows_open_manifest_handle(path)
+    if handle is None:
         return None
     try:
-        return _windows_handle_identity(int(handle))
+        return _windows_handle_identity(handle)
     finally:
-        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        _windows_close_handle(handle)
 
 
 def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def _stable_windows_identity(identity: tuple[int, ...] | None) -> tuple[int, int] | None:
-    if identity is None or len(identity) < 2:
+@dataclass(frozen=True)
+class _WindowsOpenedManifest:
+    handle: int
+    identity: tuple[int, int]
+
+
+def _windows_open_manifest_read_handle(path: Path) -> _WindowsOpenedManifest | None:
+    handle = _windows_open_manifest_handle(path)
+    if handle is None:
         return None
-    return (int(identity[0]), int(identity[1]))
+    identity = _valid_windows_identity(_windows_handle_identity(handle))
+    if identity is None:
+        _windows_close_handle(handle)
+        return None
+    return _WindowsOpenedManifest(handle=handle, identity=identity)
 
 
 def _manifest_fd_identity(fd: int, info: os.stat_result) -> tuple[int, ...] | None:
     if _is_windows():
-        return _stable_windows_identity(_windows_fd_identity(fd))
+        return _valid_windows_identity(_windows_fd_identity(fd))
     return _manifest_identity(info)
 
 
 def _manifest_path_identity(path: Path, info: os.stat_result) -> tuple[int, ...] | None:
     if _is_windows():
-        return _stable_windows_identity(_windows_path_identity(path))
+        return _valid_windows_identity(_windows_path_identity(path))
     return _manifest_identity(info)
 
 
-def read_owner_manifest(directory: Path) -> dict[str, Any] | None:
-    """Return a valid owner manifest, or None for an unknown/invalid owner."""
-    path = Path(directory) / OWNER_MANIFEST_NAME
+def _read_owner_manifest_windows(path: Path, info: os.stat_result) -> bytes | None:
+    pre_identity = _valid_windows_identity(_manifest_path_identity(path, info))
+    if pre_identity is None:
+        return None
+
+    opened = _windows_open_manifest_read_handle(path)
+    if opened is None:
+        return None
+    handle = opened.handle
+    identity = opened.identity
+    try:
+        after = path.lstat()
+        after_identity = _valid_windows_identity(_manifest_path_identity(path, after))
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or identity != pre_identity
+            or after_identity != pre_identity
+            or after.st_size > MAX_MANIFEST_BYTES
+        ):
+            return None
+
+        before_read = _valid_windows_metadata(_windows_handle_metadata(handle))
+        if before_read is None or before_read.end_of_file > MAX_MANIFEST_BYTES:
+            return None
+
+        raw = _windows_read_handle(handle, MAX_MANIFEST_BYTES + 1)
+        if (
+            raw is None
+            or len(raw) > MAX_MANIFEST_BYTES
+            or len(raw) != before_read.end_of_file
+        ):
+            return None
+
+        after_read = _valid_windows_metadata(_windows_handle_metadata(handle))
+        reread_opened_identity = _valid_windows_identity(_windows_handle_identity(handle))
+        reread_path = path.lstat()
+        reread_path_identity = _valid_windows_identity(
+            _manifest_path_identity(path, reread_path)
+        )
+        if (
+            after_read is None
+            or after_read != before_read
+            or not stat.S_ISREG(reread_path.st_mode)
+            or reread_opened_identity != identity
+            or reread_path_identity != identity
+            or reread_path.st_size > MAX_MANIFEST_BYTES
+        ):
+            return None
+        return raw
+    finally:
+        _windows_close_handle(handle)
+
+
+def _read_owner_manifest_posix(path: Path, info: os.stat_result) -> bytes | None:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     fd: int | None = None
     try:
-        info = path.lstat()
-        if (
-            stat.S_ISLNK(info.st_mode)
-            or not stat.S_ISREG(info.st_mode)
-            or info.st_size > MAX_MANIFEST_BYTES
-        ):
-            return None
-
         pre_identity = _manifest_path_identity(path, info)
         if pre_identity is None:
             return None
@@ -516,20 +739,16 @@ def read_owner_manifest(directory: Path) -> dict[str, Any] | None:
         after = path.lstat()
         opened_identity = _manifest_fd_identity(fd, opened)
         after_identity = _manifest_path_identity(path, after)
-        windows_identity = _is_windows()
         if (
             not stat.S_ISREG(opened.st_mode)
             or not stat.S_ISREG(after.st_mode)
             or opened_identity != pre_identity
             or after_identity != pre_identity
-            or opened.st_size > MAX_MANIFEST_BYTES
-        ):
-            return None
-        if not windows_identity and (
-            opened.st_nlink != info.st_nlink
+            or opened.st_nlink != info.st_nlink
             or after.st_nlink != info.st_nlink
             or opened.st_size != info.st_size
             or after.st_size != info.st_size
+            or opened.st_size > MAX_MANIFEST_BYTES
         ):
             return None
 
@@ -546,26 +765,43 @@ def read_owner_manifest(directory: Path) -> dict[str, Any] | None:
             or not stat.S_ISREG(reread_path.st_mode)
             or reread_opened_identity != pre_identity
             or reread_path_identity != pre_identity
-            or reread_opened.st_size > MAX_MANIFEST_BYTES
-        ):
-            return None
-        if not windows_identity and (
-            reread_opened.st_nlink != info.st_nlink
+            or reread_opened.st_nlink != info.st_nlink
             or reread_path.st_nlink != info.st_nlink
             or reread_opened.st_size != info.st_size
             or reread_path.st_size != info.st_size
+            or reread_opened.st_size > MAX_MANIFEST_BYTES
         ):
             return None
-
-        value = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
+        return raw
     finally:
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def read_owner_manifest(directory: Path) -> dict[str, Any] | None:
+    """Return a valid owner manifest, or None for an unknown/invalid owner."""
+    path = Path(directory) / OWNER_MANIFEST_NAME
+    try:
+        info = path.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_size > MAX_MANIFEST_BYTES
+        ):
+            return None
+
+        if _is_windows():
+            raw = _read_owner_manifest_windows(path, info)
+        else:
+            raw = _read_owner_manifest_posix(path, info)
+        if raw is None:
+            return None
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
     if not isinstance(value, dict) or value.get("schema_id") != OWNER_SCHEMA_ID:
         return None
     return value
