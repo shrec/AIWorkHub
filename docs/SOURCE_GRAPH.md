@@ -7,7 +7,7 @@ first index; the repository daemon refreshes changed files incrementally.
 
 ## Query modes
 
-The manager and worker MCP surfaces expose the same bounded modes. All modes
+The manager and worker MCP surfaces expose exactly 37 bounded modes. All modes
 read the one canonical repository database; analytics never create a parallel
 index or decision store.
 
@@ -16,6 +16,7 @@ index or decision store.
 | `focus` | Ranked symbols, hot paths, tests, ownership and churn around a target |
 | `slice` | Minimal dependency and call slice needed to change a target |
 | `context` | File or symbol structure with neighboring entities and edges |
+| `file`, `function`, `class`, `body`, `bodygrep`, `deps` | Exact-target file, symbol, body-search and dependency evidence for bounded worker reads and semantic-edit preparation |
 | `impact` | Bidirectional callers, dependencies and affected files |
 | `trace` | Compact incoming/outgoing execution trace with supporting evidence |
 | `bundle` | Task-shaped evidence bundle for bugfix, feature, refactor, audit, optimize or explore work |
