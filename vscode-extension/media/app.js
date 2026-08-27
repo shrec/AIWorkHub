@@ -1341,27 +1341,82 @@ function renderKpis(snapshot) {
   fragment.appendChild(cards);
 
   const chartGrid = createElement("div", "kpi-chart-grid");
+  // The canonical daily terminal order is emitted by the backend KPI
+  // payload (dashboard_kpis.DAILY_STATE_ORDER) so the Webview never keeps
+  // an independent copy of it that could drift out of sync.
+  const DAILY_STATE_ORDER = asArray(kpis.daily_state_order).map((name) => String(name));
+  const MIN_SEGMENT_SHARE = 0.03;
+  const humanizeState = (name) => String(name || "unknown").replaceAll("_", " ");
+  // Ordinal (code-point) comparison, not localeCompare/Intl.Collator, so
+  // unknown-state ordering is identical regardless of the Webview host's
+  // configured locale.
+  const byCodePoint = (left, right) => (left < right ? -1 : left > right ? 1 : 0);
+  // Golden-angle hue stepping gives every palette index its own hue, so
+  // colors never cycle back to an earlier state's color no matter how many
+  // distinct states are observed -- there is no fixed-size swatch pool to
+  // wrap around.
+  const stateColor = (index) => {
+    const hue = (index * 137.508) % 360;
+    return `hsl(${hue.toFixed(2)} 65% 55%)`;
+  };
+
   const dailyPanel = createElement("section", "kpi-chart-panel");
   dailyPanel.appendChild(createElement("h3", "kpi-chart-title", "Daily worker outcomes"));
   const days = asArray(kpis.daily);
   if (days.length) {
     const maxRuns = Math.max(1, ...days.map((item) => numberValue(item.runs)));
+    const stateTotals = new Map();
+    for (const day of days) {
+      for (const entry of asArray(day.states)) {
+        const name = String((entry && entry.state) || "").trim();
+        if (!name) continue;
+        stateTotals.set(name, numberValue(stateTotals.get(name)) + numberValue(entry.count));
+      }
+    }
+    const nonterminalObserved = Array.from(stateTotals.keys())
+      .filter((name) => !DAILY_STATE_ORDER.includes(name))
+      .sort(byCodePoint);
+    const paletteOrder = [...DAILY_STATE_ORDER, ...nonterminalObserved];
+    const orderedStateNames = paletteOrder.filter((name) => numberValue(stateTotals.get(name)) > 0);
+    const paletteIndex = new Map(paletteOrder.map((name, index) => [name, index]));
+    // Every name in stateTotals is guaranteed to be in paletteOrder above
+    // (it is either a canonical terminal state or was folded into
+    // nonterminalObserved), so paletteIndex always has an entry here --
+    // there is no unmatched-name case left to fall back for.
+    const colorForState = (name) => stateColor(paletteIndex.get(name));
+
     const chart = createElement("div", "kpi-daily-chart");
     chart.setAttribute("role", "img");
-    chart.setAttribute("aria-label", "Daily observed worker outcomes: review-ready, validation-failed and other states");
+    chart.setAttribute(
+      "aria-label",
+      `Daily observed worker outcomes across ${orderedStateNames.length} states: ${orderedStateNames.map(humanizeState).join(", ")}`,
+    );
     for (const day of days) {
       const total = Math.max(1, numberValue(day.runs));
-      const review = numberValue(day.review_ready);
-      const failed = numberValue(day.validation_failed);
-      const other = Math.max(0, total - review - failed);
+      const dayStates = asArray(day.states)
+        .filter((entry) => entry && numberValue(entry.count) > 0)
+        .sort((left, right) => paletteIndex.get(left.state) - paletteIndex.get(right.state));
       const column = createElement("div", "kpi-day-column");
-      column.title = `${day.date}: ${total} runs, ${review} review-ready, ${failed} validation-failed`;
+      const titleParts = dayStates.map((entry) => `${numberValue(entry.count)} ${humanizeState(entry.state)}`);
+      column.title = `${day.date}: ${total} runs${titleParts.length ? ` (${titleParts.join(", ")})` : ""}`;
       const stack = createElement("div", "kpi-day-stack");
       stack.style.height = `${Math.max(6, Math.round((total / maxRuns) * 100))}%`;
-      for (const [count, tone] of [[other, "neutral"], [failed, "bad"], [review, "good"]]) {
-        if (!count) continue;
-        const segment = createElement("span", `kpi-day-segment ${tone}`);
-        segment.style.height = `${Math.max(3, Math.round((count / total) * 100))}%`;
+      // Flex-grow weights, not percentage heights: flex distributes exactly
+      // the stack's own height among segments in proportion to their
+      // weight, so the segments can never sum past 100% no matter how many
+      // low-count states share the day. The floor on the weight (not on a
+      // height percentage) keeps rare states visible without risking
+      // overflow, since flex normalizes weights to the container size.
+      const minShare = total * MIN_SEGMENT_SHARE;
+      for (const entry of dayStates) {
+        const count = numberValue(entry.count);
+        const label = humanizeState(entry.state);
+        const segment = createElement("span", "kpi-day-segment");
+        segment.style.flexGrow = String(Math.max(count, minShare));
+        segment.style.flexBasis = "0%";
+        segment.style.background = colorForState(entry.state);
+        segment.title = `${day.date}: ${count} ${label}`;
+        segment.setAttribute("aria-label", `${label}: ${count} on ${day.date}`);
         stack.appendChild(segment);
       }
       column.append(stack, createElement("span", "kpi-day-label", String(day.date || "").slice(5)));
@@ -1369,9 +1424,15 @@ function renderKpis(snapshot) {
     }
     dailyPanel.appendChild(chart);
     const legend = createElement("div", "kpi-legend");
-    for (const [tone, label] of [["good", "Review-ready"], ["bad", "Validation failed"], ["neutral", "Other/active"]]) {
+    for (const name of orderedStateNames) {
+      const label = humanizeState(name);
       const item = createElement("span", "kpi-legend-item");
-      item.append(createElement("i", tone), document.createTextNode(label));
+      item.title = label;
+      item.setAttribute("aria-label", label);
+      const swatch = createElement("i");
+      swatch.style.background = colorForState(name);
+      swatch.setAttribute("aria-hidden", "true");
+      item.append(swatch, document.createTextNode(label));
       legend.appendChild(item);
     }
     dailyPanel.appendChild(legend);

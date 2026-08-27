@@ -1,4 +1,4 @@
-from aiworkhub.dashboard_kpis import build_kpi_snapshot
+from aiworkhub.dashboard_kpis import DAILY_STATE_ORDER, TERMINAL_STATES, build_kpi_snapshot
 from aiworkhub.dashboard import _compact_ai_infra, _merge_ai_infra
 
 
@@ -519,3 +519,188 @@ def test_kpis_no_false_reviewer_receipts_from_implementation_tasks():
     assert result["headline"]["reviewer_receipt_runs"] == 0
     assert result["headline"]["actionable_review_ready_rate"] == 100.0
     assert result["headline"]["reviewer_receipt_rate"] == 0.0
+
+
+def test_kpis_daily_states_cover_every_terminal_state_and_observed_nonterminal_states():
+    processes = [
+        _run("A", "review_ready", "2026-08-01T12:00:00Z"),
+        _run("B", "validation_failed", "2026-08-01T12:01:00Z"),
+        _run("C", "worker_failed", "2026-08-01T12:02:00Z"),
+        _run("D", "launch_failed", "2026-08-01T12:03:00Z"),
+        _run("E", "timed_out", "2026-08-01T12:04:00Z"),
+        _run("F", "cancelled", "2026-08-01T12:05:00Z"),
+        _run("G", "scope_rejected", "2026-08-01T12:06:00Z"),
+        _run("H", "blocked", "2026-08-01T12:07:00Z"),
+        _run("I", "exited", "2026-08-01T12:08:00Z"),
+        _run("J", "processing", "2026-08-01T12:09:00Z"),
+        _run("K", "pending", "2026-08-01T12:10:00Z"),
+    ]
+
+    result = _build(processes)
+    daily = {row["date"]: row for row in result["daily"]}
+    aug1 = daily["2026-08-01"]
+    order = [entry["state"] for entry in aug1["states"]]
+    counts = {entry["state"]: entry["count"] for entry in aug1["states"]}
+
+    assert order[:9] == [
+        "review_ready",
+        "validation_failed",
+        "worker_failed",
+        "launch_failed",
+        "timed_out",
+        "cancelled",
+        "scope_rejected",
+        "blocked",
+        "exited",
+    ]
+    assert order[9:] == ["pending", "processing"]
+    assert all(counts[state] == 1 for state in order)
+    assert sum(counts.values()) == len(processes)
+    assert set(counts) == set(order)
+
+
+def test_kpis_daily_states_default_unobserved_terminal_states_to_zero():
+    result = _build([_run("Z", "review_ready", "2026-08-05T09:00:00Z")])
+
+    daily = {row["date"]: row for row in result["daily"]}
+    states = {entry["state"]: entry["count"] for entry in daily["2026-08-05"]["states"]}
+
+    assert states["review_ready"] == 1
+    assert states["validation_failed"] == 0
+    assert states["worker_failed"] == 0
+    assert states["launch_failed"] == 0
+    assert states["timed_out"] == 0
+    assert states["cancelled"] == 0
+    assert states["scope_rejected"] == 0
+    assert states["blocked"] == 0
+    assert states["exited"] == 0
+    assert len(states) == 9
+
+
+def test_kpis_daily_states_ordering_is_stable_across_days_with_different_states():
+    processes = [
+        _run("A", "review_ready", "2026-08-01T12:00:00Z"),
+        _run("B", "custom_nonterminal_beta", "2026-08-01T12:01:00Z"),
+        _run("C", "custom_nonterminal_alpha", "2026-08-01T12:02:00Z"),
+        _run("D", "validation_failed", "2026-08-02T12:00:00Z"),
+    ]
+
+    result = _build(processes)
+    daily = {row["date"]: row for row in result["daily"]}
+    aug1_order = [entry["state"] for entry in daily["2026-08-01"]["states"]]
+    aug2_order = [entry["state"] for entry in daily["2026-08-02"]["states"]]
+
+    assert aug1_order[9:] == ["custom_nonterminal_alpha", "custom_nonterminal_beta"]
+    assert aug1_order[:9] == aug2_order[:9]
+    assert aug2_order[9:] == []
+
+
+def test_kpis_daily_states_do_not_change_outcome_mix_or_headline_semantics():
+    processes = [
+        _run("A", "review_ready", "2026-08-01T12:00:00Z"),
+        _run("B", "validation_failed", "2026-08-01T12:01:00Z"),
+        _run("C", "worker_failed", "2026-08-01T12:02:00Z"),
+    ]
+
+    result = _build(processes)
+
+    assert result["headline"]["review_ready_runs"] == 1
+    assert result["headline"]["validation_failed_runs"] == 1
+    assert result["headline"]["terminal_runs"] == 3
+    assert {row["state"]: row["count"] for row in result["outcome_mix"]} == {
+        "review_ready": 1,
+        "validation_failed": 1,
+        "worker_failed": 1,
+    }
+
+
+def test_kpis_expose_canonical_daily_state_order_for_the_webview_to_consume():
+    result = _build([_run("A", "review_ready", "2026-08-01T12:00:00Z")])
+
+    assert result["daily_state_order"] == list(DAILY_STATE_ORDER)
+    assert result["daily_state_order"] == [
+        "review_ready",
+        "validation_failed",
+        "worker_failed",
+        "launch_failed",
+        "timed_out",
+        "cancelled",
+        "scope_rejected",
+        "blocked",
+        "exited",
+    ]
+
+
+def test_kpis_daily_states_account_exactly_for_more_than_twelve_observed_states():
+    processes = [
+        _run("A", "review_ready", "2026-08-01T12:00:00Z"),
+        _run("B", "validation_failed", "2026-08-01T12:01:00Z"),
+        _run("C", "worker_failed", "2026-08-01T12:02:00Z"),
+        _run("D", "launch_failed", "2026-08-01T12:03:00Z"),
+        _run("E", "timed_out", "2026-08-01T12:04:00Z"),
+        _run("F", "cancelled", "2026-08-01T12:05:00Z"),
+        _run("G", "scope_rejected", "2026-08-01T12:06:00Z"),
+        _run("H", "blocked", "2026-08-01T12:07:00Z"),
+        _run("I", "exited", "2026-08-01T12:08:00Z"),
+        _run("J", "custom_nonterminal_delta", "2026-08-01T12:09:00Z"),
+        _run("K", "custom_nonterminal_charlie", "2026-08-01T12:10:00Z"),
+        _run("L", "custom_nonterminal_bravo", "2026-08-01T12:11:00Z"),
+        _run("M", "custom_nonterminal_alpha", "2026-08-01T12:12:00Z"),
+    ]
+
+    result = _build(processes)
+    daily = {row["date"]: row for row in result["daily"]}
+    aug1 = daily["2026-08-01"]
+    order = [entry["state"] for entry in aug1["states"]]
+    counts = {entry["state"]: entry["count"] for entry in aug1["states"]}
+
+    assert len(order) == 13
+    assert order[:9] == [
+        "review_ready",
+        "validation_failed",
+        "worker_failed",
+        "launch_failed",
+        "timed_out",
+        "cancelled",
+        "scope_rejected",
+        "blocked",
+        "exited",
+    ]
+    assert order[9:] == [
+        "custom_nonterminal_alpha",
+        "custom_nonterminal_bravo",
+        "custom_nonterminal_charlie",
+        "custom_nonterminal_delta",
+    ]
+    assert all(counts[state] == 1 for state in order)
+    assert sum(counts.values()) == len(processes)
+    assert {row["state"]: row["count"] for row in result["outcome_mix"]} == {
+        state: 1 for state in order
+    }
+
+
+def test_terminal_states_is_derived_from_daily_state_order_and_cannot_drift():
+    # TERMINAL_STATES must be derived from DAILY_STATE_ORDER (not an
+    # independent enumeration) so a future terminal state can never count
+    # toward the terminal aggregate while vanishing from per-day states.
+    assert TERMINAL_STATES == frozenset(DAILY_STATE_ORDER)
+    assert len(DAILY_STATE_ORDER) == len(set(DAILY_STATE_ORDER))
+
+
+def test_kpis_every_terminal_state_is_accounted_for_in_daily_rows_via_live_lookup():
+    # Walks TERMINAL_STATES itself (not a hardcoded literal copy) so this
+    # fails loudly if TERMINAL_STATES and DAILY_STATE_ORDER ever diverge
+    # again, instead of silently dropping a terminal state from the chart.
+    processes = [
+        _run(f"T{index}", state, "2026-08-01T12:00:00Z")
+        for index, state in enumerate(sorted(TERMINAL_STATES))
+    ]
+
+    result = _build(processes)
+    daily = {row["date"]: row for row in result["daily"]}
+    aug1 = daily["2026-08-01"]
+    counts = {entry["state"]: entry["count"] for entry in aug1["states"]}
+
+    for state in TERMINAL_STATES:
+        assert counts.get(state) == 1, f"terminal state {state!r} missing from daily states"
+    assert result["headline"]["terminal_runs"] == len(TERMINAL_STATES)

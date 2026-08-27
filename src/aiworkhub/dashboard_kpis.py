@@ -14,19 +14,29 @@ from typing import Any, Mapping
 from . import context_economics
 
 
-TERMINAL_STATES = frozenset(
-    {
-        "review_ready",
-        "validation_failed",
-        "launch_failed",
-        "timed_out",
-        "cancelled",
-        "worker_failed",
-        "scope_rejected",
-        "blocked",
-        "exited",
-    }
+# Single source of truth for terminal states: this deterministic per-day
+# rendering order. Every entry is emitted daily (count 0 if unobserved) so
+# the Webview never has to collapse an unlisted terminal state into an
+# "Other" bucket. TERMINAL_STATES is derived from this tuple below rather
+# than re-enumerated, so a state can never count toward the terminal
+# aggregate while silently missing from daily_rows[*]["states"].
+DAILY_STATE_ORDER = (
+    "review_ready",
+    "validation_failed",
+    "worker_failed",
+    "launch_failed",
+    "timed_out",
+    "cancelled",
+    "scope_rejected",
+    "blocked",
+    "exited",
 )
+if len(DAILY_STATE_ORDER) != len(set(DAILY_STATE_ORDER)):
+    raise AssertionError(
+        "DAILY_STATE_ORDER contains a duplicate state; fix the tuple above"
+    )
+
+TERMINAL_STATES = frozenset(DAILY_STATE_ORDER)
 NON_GREEN_STATES = TERMINAL_STATES - {"review_ready"}
 QUALITY_REVIEW_TOPIC = "quality_review"
 MAX_DAILY_BUCKETS = 30
@@ -177,6 +187,11 @@ def build_kpi_snapshot(
             "policy_violations": 0,
         }
     )
+    # Exact per-day, per-state accounting. Every terminal state (including
+    # ones with zero same-day occurrences) plus every observed nonterminal
+    # state is derived from this counter -- no state is folded into a
+    # review/failed/other three-bucket collapse.
+    daily_state_counts: dict[str, Counter[str]] = defaultdict(Counter)
     invalid_timestamps = 0
     adapters: dict[str, dict[str, Any]] = defaultdict(
         lambda: {
@@ -391,6 +406,7 @@ def build_kpi_snapshot(
         if day is None:
             invalid_timestamps += 1
             continue
+        daily_state_counts[day][state] += 1
         bucket = daily[day]
         bucket["runs"] += 1
         if state in TERMINAL_STATES:
@@ -512,6 +528,18 @@ def build_kpi_snapshot(
     truncated = bool(process_report.get("truncated")) or total_requests > observed
     ordered_days = sorted(daily)[-MAX_DAILY_BUCKETS:]
     daily_rows = [{"date": day, **daily[day]} for day in ordered_days]
+    for row_data in daily_rows:
+        state_counts = daily_state_counts.get(row_data["date"], Counter())
+        observed_nonterminal = sorted(
+            state for state in state_counts if state not in TERMINAL_STATES
+        )
+        row_data["states"] = [
+            {"state": state, "count": state_counts.get(state, 0)}
+            for state in DAILY_STATE_ORDER
+        ] + [
+            {"state": state, "count": state_counts[state]}
+            for state in observed_nonterminal
+        ]
 
     raw_context_bytes = economics["pre_optimization_section_bytes"]
     delivered_bundle_bytes = economics["delivered_bundle_bytes"]
@@ -697,6 +725,10 @@ def build_kpi_snapshot(
             )
         ],
         "daily": daily_rows,
+        # Canonical rendering order for "daily[*].states", published so the
+        # Webview never keeps its own independent copy of this order that
+        # could drift out of sync with the backend.
+        "daily_state_order": list(DAILY_STATE_ORDER),
         "adapters": adapter_rows,
         "topics": topic_rows[:12],
         "source_graph_modes": mode_rows,
