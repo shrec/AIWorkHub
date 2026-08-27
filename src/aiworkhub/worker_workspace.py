@@ -1223,6 +1223,99 @@ def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[st
     return tuple(sorted(rows))
 
 
+# NF-2026-00448: a declared JS validation entrypoint may ``require('./x')`` a
+# sibling module the task card never listed, mirroring the Python relative-
+# import closure above. Only relative requires (``./x``, ``../x``) are
+# followed -- they are unambiguously repository-local; a bare specifier
+# (``require('vscode')``, ``require('fs')``) is a Node builtin or an
+# ``npm``-managed dependency, and ``_npm_validation_support`` already requires
+# a dependency-free ``node_modules`` tree, so there is nothing local left to
+# seed for it.
+_JS_LOCAL_REQUIRE_RE = re.compile(r"""require\(\s*['"](\.\.?/[^'"]*)['"]\s*\)""")
+
+
+def _resolve_one_local_js_require(
+    repo: Path, including_dir: Path, target: str
+) -> Path | None:
+    """Bounded Node-local resolution for one relative ``require`` target.
+
+    Deliberately narrower than Node's full resolver: an explicit ``.js``/
+    ``.json`` target resolves to exactly that file (so ``require('../package
+    .json')`` -- used by canonical fixtures such as ``vscode-extension/test/
+    stable-runtime-upgrade.test.js`` -- seeds the JSON file itself instead of
+    being mangled into a nonexistent ``package.json.js``); an extensionless
+    target tries ``<target>.js``, then ``<target>.json``, then
+    ``<target>/index.js``, then ``<target>/index.json``, mirroring Node's own
+    file-before-directory order. Every candidate still passes through
+    ``_require_beneath`` (beneath + symlink enforcement), so this only widens
+    which filenames are considered -- never where they may resolve.
+    """
+    base = including_dir / PurePosixPath(target)
+    if base.suffix in (".js", ".json"):
+        candidates = (base,)
+    else:
+        candidates = (
+            base.parent / f"{base.name}.js",
+            base.parent / f"{base.name}.json",
+            base / "index.js",
+            base / "index.json",
+        )
+    for candidate in candidates:
+        resolved = _require_beneath(repo, candidate)
+        if resolved.is_symlink():
+            raise WorkspaceError(
+                "validation_js_require_symlink:"
+                + resolved.relative_to(repo).as_posix()
+            )
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _resolve_local_js_requires(repo: Path, seeded: Iterable[str]) -> tuple[str, ...]:
+    """Return the bounded static local ``require('./x')`` closure for JS seeds.
+
+    Sparse validation must run a candidate's own CommonJS sibling modules from
+    the retained worktree, not fail with a bare ``MODULE_NOT_FOUND`` for a
+    sibling the task card never declared (NF-2026-00448/458, the GLM
+    ``extension.js`` -> ``./runtime-retention`` -> ``./runtime-language-model-
+    bridge`` -> ``./runtime-provider-boundary`` reproduction). An unresolved
+    relative require fails closed, exactly like the Python closure's relative
+    imports, since it is unambiguously repository-local.
+    """
+    repo = repo.resolve()
+    rows = set(seeded)
+    pending = [relative for relative in rows if relative.endswith(".js")]
+    parsed: set[str] = set()
+    while pending:
+        relative = pending.pop()
+        if relative in parsed:
+            continue
+        parsed.add(relative)
+        source_path = repo / relative
+        if source_path.is_symlink() or not source_path.is_file():
+            continue
+        try:
+            text = source_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        including_dir = source_path.parent
+        for match in _JS_LOCAL_REQUIRE_RE.finditer(text):
+            target = match.group(1)
+            candidate = _resolve_one_local_js_require(repo, including_dir, target)
+            if candidate is None:
+                raise WorkspaceError(
+                    f"validation_js_require_unresolved:{relative}:{target}"
+                )
+            candidate_relative = candidate.relative_to(repo).as_posix()
+            if candidate_relative not in rows:
+                rows.add(candidate_relative)
+                pending.append(candidate_relative)
+                if len(rows) > MAX_SEED_FILES:
+                    raise WorkspaceError(f"seed_file_limit_exceeded:{len(rows)}")
+    return tuple(sorted(rows))
+
+
 def _npm_validation_prefixes(commands: Iterable[str]) -> tuple[str, ...]:
     """Return exact repository-relative ``npm --prefix`` validation roots."""
     prefixes: set[str] = set()
@@ -3073,6 +3166,10 @@ def create_workspace(
         support_seeded = tuple(
             sorted(set(support_seeded) | (set(python_seeded) - set(live_seeded)))
         )
+        js_seeded = _resolve_local_js_requires(repo, (*live_seeded, *support_seeded))
+        support_seeded = tuple(
+            sorted(set(support_seeded) | (set(js_seeded) - set(live_seeded)))
+        )
     npm_support_seeded = tuple(
         relative
         for relative in _npm_validation_support(repo, validation_rows)
@@ -3965,6 +4062,11 @@ def validate_required_outputs(
 ) -> list[dict[str, Any]]:
     """Validate every declared required output exists, is non-empty, and changed.
 
+    Every declared pattern is inspected before failure. Mismatches are returned
+    in one deterministic ``required_output_mismatch`` diagnostic with separate
+    missing, unchanged, scope-violation, and passing-record buckets so rework
+    receives the complete repair target instead of entering a one-error loop.
+
     ``allow_empty`` is an exact, repo-relative path allowlist for deliberately
     zero-byte outputs (e.g. a contradiction lane that honestly produced no rows).
     Paths not in this set are still rejected for zero bytes.  The caller must pass
@@ -3991,26 +4093,52 @@ def validate_required_outputs(
             raise WorkspaceError(f"allow_unchanged_not_in_allowed_writes:{path}")
         unchanged_allowed.add(path)
     records: list[dict[str, Any]] = []
+    missing_required_artifacts: list[str] = []
+    unchanged_mandatory_outputs: list[str] = []
+    scope_violations: list[dict[str, str]] = []
+    legacy_error_codes: list[str] = []
     for pattern in required_patterns:
         if not _matches(pattern, workspace.allowed_writes):
-            raise WorkspaceError(f"required_output_not_allowed:{pattern}")
+            scope_violations.append(
+                {"path": pattern, "reason": "required_output_not_allowed"}
+            )
+            legacy_error_codes.append(f"required_output_not_allowed:{pattern}")
+            continue
         matches: list[str]
         if any(ch in pattern for ch in "*?["):
             matches = _required_output_glob_matches(workspace.path, pattern)
             if not matches:
-                raise WorkspaceError(f"required_output_no_matches:{pattern}")
+                missing_required_artifacts.append(pattern)
+                legacy_error_codes.append(f"required_output_no_matches:{pattern}")
+                continue
         else:
             matches = [pattern]
         for relative in matches:
             target = workspace.path / relative
             _require_beneath(workspace.path, target)
             if target.is_symlink():
-                raise WorkspaceError(f"required_output_symlink:{relative}")
+                scope_violations.append(
+                    {"path": relative, "reason": "required_output_symlink"}
+                )
+                legacy_error_codes.append(f"required_output_symlink:{relative}")
+                continue
             if not target.is_file():
-                raise WorkspaceError(f"required_output_missing:{relative}")
+                if not target.exists():
+                    missing_required_artifacts.append(relative)
+                    legacy_error_codes.append(f"required_output_missing:{relative}")
+                else:
+                    scope_violations.append(
+                        {"path": relative, "reason": "required_output_non_file"}
+                    )
+                    legacy_error_codes.append(f"required_output_missing:{relative}")
+                continue
             size = target.stat().st_size
             if size <= 0 and (allow_empty is None or relative not in allow_empty):
-                raise WorkspaceError(f"required_output_zero_bytes:{relative}")
+                scope_violations.append(
+                    {"path": relative, "reason": "required_output_zero_bytes"}
+                )
+                legacy_error_codes.append(f"required_output_zero_bytes:{relative}")
+                continue
             current_hash = _hash_path(target)
             inherited_change = (
                 relative in workspace.inherited_rework_paths
@@ -4036,12 +4164,29 @@ def validate_required_outputs(
                             claim_epoch=replay_claim_epoch,
                         )
                     if replay_evidence is None:
-                        raise WorkspaceError(f"required_output_unchanged:{relative}")
+                        unchanged_mandatory_outputs.append(relative)
+                        legacy_error_codes.append(f"required_output_unchanged:{relative}")
+                        continue
                 parent_hash = workspace.parent_baseline.get(relative)
                 if current_hash != parent_hash:
-                    raise WorkspaceError(f"required_output_unchanged_parent_mismatch:{relative}")
+                    scope_violations.append(
+                        {
+                            "path": relative,
+                            "reason": "required_output_unchanged_parent_mismatch",
+                        }
+                    )
+                    legacy_error_codes.append(
+                        f"required_output_unchanged_parent_mismatch:{relative}"
+                    )
+                    continue
                 if current_hash is None or target.is_symlink() or not target.is_file() or size <= 0:
-                    raise WorkspaceError(f"required_output_unchanged_invalid:{relative}")
+                    scope_violations.append(
+                        {"path": relative, "reason": "required_output_unchanged_invalid"}
+                    )
+                    legacy_error_codes.append(
+                        f"required_output_unchanged_invalid:{relative}"
+                    )
+                    continue
             record = {
                 "pattern": pattern,
                 "path": relative,
@@ -4052,6 +4197,18 @@ def validate_required_outputs(
             if replay_evidence is not None:
                 record["replay_evidence"] = replay_evidence
             records.append(record)
+    if missing_required_artifacts or unchanged_mandatory_outputs or scope_violations:
+        diagnostics = {
+            "missing_required_artifacts": missing_required_artifacts,
+            "unchanged_mandatory_outputs": unchanged_mandatory_outputs,
+            "scope_violations": scope_violations,
+            "primary_validation_result": records,
+            "legacy_error_codes": legacy_error_codes,
+        }
+        raise WorkspaceError(
+            "required_output_mismatch:"
+            + json.dumps(diagnostics, sort_keys=True, separators=(",", ":"))
+        )
     return records
 
 
@@ -4868,20 +5025,15 @@ def _normalize_trusted_validation_executable_argv(
     return normalized
 
 
+_BARE_PYTHON_INTERPRETER_RE = re.compile(r"^python(3(\.[0-9]+)?)?$")
+
+
 def _normalize_trusted_validation_executable_argv_with_roots(
     argv: list[str], repo: Path | None = None
 ) -> tuple[list[str], tuple[Path, ...]]:
     if not argv:
         return [], ()
     head = argv[0]
-    # AIWorkHub itself requires Python 3, while many POSIX hosts deliberately
-    # expose only ``python3`` in the credential-free validation PATH.  Treat
-    # the common ``python`` spelling as the portable Python-3 alias instead
-    # of letting execvpe fail against a non-existent /bin/python.  Explicit
-    # python3/path spellings remain untouched.
-    if os.name != "nt" and head == "python":
-        argv = ["python3", *argv[1:]]
-        head = argv[0]
     if (
         len(argv) >= 3
         and Path(head).name.startswith("python")
@@ -4896,6 +5048,17 @@ def _normalize_trusted_validation_executable_argv_with_roots(
         if repo_relative is None:
             return list(argv), ()
         return [str(repo_relative.path), *argv[1:]], (repo_relative.root,)
+    # NF-2026-00448: a bare ``python``/``python3``/``python3.NN`` head is
+    # resolved directly to the trusted coordinator interpreter instead of
+    # trusting execvpe's PATH search -- the credential-free validation PATH
+    # does not reliably expose a working ``python3`` on every host, while
+    # ``sys.executable`` is always the exact interpreter already running this
+    # code. Explicit relative (handled above, or already resolved to an
+    # absolute path by ``_normalize_validation_interpreter_argv`` before this
+    # function runs) and absolute interpreter declarations are never touched
+    # here, preserving their existing fail-closed rules.
+    if _BARE_PYTHON_INTERPRETER_RE.match(head):
+        return [sys.executable, *argv[1:]], ()
     if head not in _TRUSTED_VALIDATION_BARE_EXECUTABLES:
         return list(argv), ()
     executable = _resolve_trusted_validation_executable(head, repo)
@@ -7211,6 +7374,27 @@ def _probe_absent_validator_modules(
     return tuple(name for name in modules if name in reported)
 
 
+def _exec_scratch_environment_restriction(detail: str) -> str | None:
+    """Classify a scratch-provisioning failure as a named sandbox restriction.
+
+    ``provision_validation_exec_scratch`` fails closed with one aggregate
+    ``tried`` detail describing every candidate root's rejection reason
+    (NF-2026-00458). Delegates the classification itself to
+    ``validation_runner.exec_scratch_denied_restriction`` -- the single source
+    of truth for which rejection details reflect the OUTER sandbox denying the
+    exact metadata syscalls git's own ``config.lock`` chmod/utime needs, before
+    any candidate command ran (infrastructure evidence, never a candidate gate
+    failure) -- so the two modules cannot drift on what counts as a refused
+    chmod. Returns ``None`` for any other rejection reason (a genuinely
+    noexec-only root, a missing directory, ...) so the caller re-raises the
+    original ``WorkspaceError`` unchanged rather than mis-classifying an
+    unrelated provisioning failure.
+    """
+    from . import validation_runner
+
+    return validation_runner.exec_scratch_denied_restriction(detail)
+
+
 def _validation_unsupported_in_sandbox_error(restriction: str) -> WorkspaceError:
     """Wrap a sandbox-provisioning restriction with its truthful terminal name.
 
@@ -7282,7 +7466,24 @@ def run_validations(
     # torn down in the ``finally`` below regardless of how the run ends
     # (every command passing, a failing command's WorkspaceError, a timeout,
     # or any other exception propagating out of this function).
-    scratch_dir = provision_validation_exec_scratch(workspace)
+    try:
+        scratch_dir = provision_validation_exec_scratch(workspace)
+    except WorkspaceError as exc:
+        # NF-2026-00458: no candidate command has run yet, so a scratch root
+        # rejected specifically because the outer sandbox denies the exact
+        # chmod/utime-family metadata syscalls git's own config.lock needs is
+        # infrastructure evidence, not a candidate gate failure -- terminalize
+        # it as the recoverable ``validation_environment_blocked`` state
+        # instead of letting an untyped ``WorkspaceError`` surface as
+        # ``validation_failed``.
+        restriction = _exec_scratch_environment_restriction(str(exc))
+        if restriction is None:
+            raise
+        raise ValidationEnvironmentBlocked(
+            f"{VALIDATION_ENVIRONMENT_BLOCKED}:{restriction}:{exc}",
+            [],
+            restriction=restriction,
+        ) from exc
     scratch_env_value = (
         str(scratch_dir)
         if selected_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}

@@ -44,6 +44,34 @@
       }
     },
     {
+      "id": "self_hosting_break_glass",
+      "topic": "self_hosting_break_glass",
+      "kind": "coding_convention",
+      "applicability": {},
+      "allow": [
+        "independent_manager_validation",
+        "measured_task_system_blocker",
+        "minimal_intermediate_fix",
+        "replacement_artifact_install",
+        "return_to_canonical_task_flow"
+      ],
+      "forbid": [
+        "continued_use_of_known_broken_plugin",
+        "scope_expansion_during_break_glass",
+        "silent_task_system_bypass",
+        "unmeasured_break_glass"
+      ],
+      "payload": {
+        "guideline_ids": [
+          "record_blocker_evidence",
+          "preserve_unrelated_work",
+          "restore_task_system_only",
+          "validate_replacement_independently"
+        ],
+        "severity": "error"
+      }
+    },
+    {
       "id": "hot_path_allocation",
       "topic": "hot_path_allocation",
       "kind": "performance",

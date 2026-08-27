@@ -3014,11 +3014,6 @@ def create_task(
             return _lifecycle_error("read_only_output_exceptions_forbidden", 2)
     elif not writes2 and not outputs2:
         return _lifecycle_error("read_only_declaration_required", 2)
-    elif not outputs2:
-        # Launch rejects a writable card with no authenticated result and
-        # promotion contract. Reject it before durable task creation too, so
-        # task_create and launch cannot disagree after provider work is queued.
-        return _lifecycle_error("required_outputs_invalid", 2)
     if task_type == "code" and (writes2 or outputs2) and not validation2:
         return _lifecycle_error("code_task_validation_required", 2)
     from . import quality_evidence

@@ -18,7 +18,12 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import platform_io, process_launcher, worker_ai_tools_mcp  # noqa: E402
+from aiworkhub import (  # noqa: E402
+    platform_io,
+    process_launcher,
+    task_templates,
+    worker_ai_tools_mcp,
+)
 
 
 def _card(task_id: str = "TASK_B1", state: str = "pending") -> dict:
@@ -446,6 +451,32 @@ def test_launch_contract_rejects_legacy_required_output_prose():
     with pytest.raises(
         process_launcher.LaunchRejected,
         match="required_output_not_allowed",
+    ):
+        process_launcher._validate_required_outputs_contract(card)
+
+
+def test_launch_contract_accepts_authenticated_empty_mandatory_change_set():
+    expanded = task_templates.expand_template(
+        "implementation_with_tests",
+        production_paths=["src/app.py"],
+        test_paths=["tests/test_app.py"],
+    )
+    card = {
+        **expanded,
+        "template_provenance": task_templates.template_provenance_payload(
+            expanded, classification_reason="explicit_template"
+        ),
+    }
+    assert card["required_outputs"] == []
+
+    process_launcher._validate_required_outputs_contract(card)
+
+    card["template_provenance"] = {
+        **card["template_provenance"],
+        "expanded_contract_digest": "0" * 64,
+    }
+    with pytest.raises(
+        process_launcher.LaunchRejected, match="required_outputs_invalid"
     ):
         process_launcher._validate_required_outputs_contract(card)
 
@@ -2328,7 +2359,9 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
     # still applies (this must never silently pass).
     unauthorized_event = _run("req-replay-unauthorized", None)
     assert unauthorized_event["state"] == "validation_failed"
-    assert "required_output_unchanged:out/result.json" in unauthorized_event["error"]
+    assert '"unchanged_mandatory_outputs":["out/result.json"]' in unauthorized_event[
+        "error"
+    ]
     assert unauthorized_event["attempt_artifact_manifest"]["verified"] is True
     assert process_launcher.attempt_artifacts.verify_json_bundle(
         Path(unauthorized_event["attempt_artifact_manifest"]["manifest_path"]).parent
@@ -2346,7 +2379,7 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
     }
     stale_event = _run("req-replay-stale-epoch", stale_authorization)
     assert stale_event["state"] == "validation_failed"
-    assert "required_output_unchanged:out/result.json" in stale_event["error"]
+    assert '"unchanged_mandatory_outputs":["out/result.json"]' in stale_event["error"]
 
     # Exact matching authorization: reaches review with structured replay
     # evidence attached, and manager acceptance/promotion gates untouched.
@@ -7485,3 +7518,173 @@ def test_quality_reviewer_supervisor_handoff_rejects_missing_script(
         process_launcher.LaunchRejected, match="worker_supervisor_script_missing"
     ):
         process_launcher._worker_supervisor_script()
+
+
+# --- NF-2026-00456: scope (allowed_writes/read_first) vs. explicit
+# mandatory-change (required_outputs) is authenticated separately, and every
+# observed required-output mismatch is retained as a distinct structured
+# diagnostic instead of failing closed on the first one. -------------------
+
+
+def test_expand_template_scope_is_not_implicit_mandatory_change() -> None:
+    expanded = task_templates.expand_template(
+        "implementation_with_tests",
+        production_paths=["a.py", "b.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    assert expanded["allowed_writes"] == ["a.py", "b.py", "tests/test_a.py"]
+    assert expanded["required_outputs"] == []
+
+
+def test_expand_template_mandatory_changed_output_must_be_in_scope() -> None:
+    with pytest.raises(
+        task_templates.TaskTemplateError,
+        match="mandatory_changed_output_out_of_scope",
+    ):
+        task_templates.expand_template(
+            "implementation_with_tests",
+            production_paths=["a.py"],
+            test_paths=["tests/test_a.py"],
+            mandatory_changed_outputs=["not_in_scope.py"],
+        )
+
+
+def test_expand_template_explicit_mandatory_changed_output_is_narrow() -> None:
+    expanded = task_templates.expand_template(
+        "implementation_with_tests",
+        production_paths=["a.py", "b.py"],
+        test_paths=["tests/test_a.py"],
+        mandatory_changed_outputs=["a.py"],
+    )
+    assert expanded["required_outputs"] == ["a.py"]
+    assert expanded["allowed_writes"] == ["a.py", "b.py", "tests/test_a.py"]
+
+
+def _seeded_workspace(
+    tmp_path: Path,
+    *,
+    files: dict[str, bytes],
+    baselines: dict[str, str],
+    allowed_writes: tuple[str, ...] | None = None,
+) -> process_launcher.WorkerWorkspace:
+    """Build an isolated ``WorkerWorkspace`` fixture; never a live task store."""
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "request" / "worktree"
+    home = tmp_path / "request" / "home"
+    for directory in (repo, worktree, home):
+        directory.mkdir(parents=True, exist_ok=True)
+    for relative, content in files.items():
+        path = worktree / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    normalized_baselines = {}
+    for relative, digest in baselines.items():
+        if digest.startswith("file:"):
+            normalized_baselines[relative] = digest
+            continue
+        mode = (worktree / relative).stat().st_mode & 0o777
+        normalized_baselines[relative] = f"file:{mode:o}:{digest}"
+    return process_launcher.WorkerWorkspace(
+        request_id="req",
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=allowed_writes or tuple(files),
+        parent_baseline=normalized_baselines,
+        workspace_baseline=normalized_baselines,
+    )
+
+
+def test_validate_required_outputs_unrelated_authorized_output_survives_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Reproduce the two-file-delta-terminalized-on-an-unrelated-unchanged-
+    authorized-output shape: a real delta at a.py/b.py must not be killed by
+    an untouched, merely-authorized c.py that was never declared mandatory."""
+    workspace = _seeded_workspace(
+        tmp_path,
+        files={"a.py": b"changed-a", "b.py": b"changed-b", "c.py": b"unchanged"},
+        baselines={"c.py": hashlib.sha256(b"unchanged").hexdigest()},
+    )
+    expanded = task_templates.expand_template(
+        "implementation_with_tests",
+        production_paths=["a.py", "b.py", "c.py"],
+        test_paths=["tests/test_x.py"],
+        mandatory_changed_outputs=["a.py", "b.py"],
+    )
+    assert expanded["allowed_writes"] == ["a.py", "b.py", "c.py", "tests/test_x.py"]
+    records = process_launcher._fallback_validate_required_outputs(
+        workspace, expanded["required_outputs"]
+    )
+    assert {record["path"] for record in records} == {"a.py", "b.py"}
+
+
+def test_validate_required_outputs_zero_edits_yield_no_mandatory_records(
+    tmp_path: Path,
+) -> None:
+    """Reproduce the had-no-edits-but-terminalized-as-required_output_unchanged
+    shape: with no explicit mandatory-change declaration, an all-unchanged
+    workspace validates cleanly here; overall no-op detection is a separate
+    gate, not a false single-file required_output_unchanged."""
+    workspace = _seeded_workspace(
+        tmp_path,
+        files={"process_launcher.py": b"unchanged-content"},
+        baselines={
+            "process_launcher.py": hashlib.sha256(b"unchanged-content").hexdigest()
+        },
+    )
+    expanded = task_templates.expand_template(
+        "implementation_with_tests",
+        production_paths=["process_launcher.py"],
+        test_paths=["tests/test_x.py"],
+    )
+    assert expanded["required_outputs"] == []
+    records = process_launcher._fallback_validate_required_outputs(
+        workspace, expanded["required_outputs"]
+    )
+    assert records == []
+
+
+def test_validate_required_outputs_explicit_mandatory_output_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    workspace = _seeded_workspace(
+        tmp_path,
+        files={"a.py": b"same"},
+        baselines={"a.py": hashlib.sha256(b"same").hexdigest()},
+    )
+    expanded = task_templates.expand_template(
+        "implementation_with_tests",
+        production_paths=["a.py"],
+        test_paths=["tests/test_x.py"],
+        mandatory_changed_outputs=["a.py"],
+    )
+    assert expanded["required_outputs"] == ["a.py"]
+    with pytest.raises(process_launcher.WorkspaceError, match="required_output_mismatch"):
+        process_launcher._fallback_validate_required_outputs(
+            workspace, expanded["required_outputs"]
+        )
+
+
+def test_validate_required_outputs_retains_all_distinct_mismatch_categories(
+    tmp_path: Path,
+) -> None:
+    workspace = _seeded_workspace(
+        tmp_path,
+        files={"mandatory.py": b"same-content", "empty.py": b""},
+        baselines={"mandatory.py": hashlib.sha256(b"same-content").hexdigest()},
+        allowed_writes=("missing.py", "mandatory.py", "empty.py"),
+    )
+    with pytest.raises(process_launcher.WorkspaceError) as excinfo:
+        process_launcher.validate_required_outputs(
+            workspace, ["missing.py", "mandatory.py", "empty.py"]
+        )
+    message = str(excinfo.value)
+    assert message.startswith("required_output_mismatch:")
+    diagnostics = json.loads(message.split(":", 1)[1])
+    assert diagnostics["missing_required_artifacts"] == ["missing.py"]
+    assert diagnostics["unchanged_mandatory_outputs"] == ["mandatory.py"]
+    assert diagnostics["scope_violations"] == [
+        {"path": "empty.py", "reason": "required_output_zero_bytes"}
+    ]
+    assert diagnostics["primary_validation_result"] == []

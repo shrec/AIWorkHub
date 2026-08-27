@@ -777,6 +777,151 @@ def test_npm_prefix_validation_fails_closed_for_unbound_dependency_tree(
         )
 
 
+def test_js_validation_seeds_transitive_local_require_closure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    """GLM runtime-retention MODULE_NOT_FOUND reproduction (NF-2026-00448/458):
+    a declared JS validation entrypoint's local ``require('./x')`` chain must
+    be seeded transitively so the sparse worktree never fails with
+    ``MODULE_NOT_FOUND`` for a sibling module the task card never declared."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    extension = repo / "vscode-extension"
+    extension.mkdir()
+    (extension / "extension.js").write_text(
+        "const { retain } = require('./runtime-retention');\n"
+        "console.log(retain());\n",
+        encoding="utf-8",
+    )
+    (extension / "runtime-retention.js").write_text(
+        "const { bridge } = require('./runtime-language-model-bridge');\n"
+        "module.exports = { retain: () => bridge() };\n",
+        encoding="utf-8",
+    )
+    (extension / "runtime-language-model-bridge.js").write_text(
+        "const { boundary } = require('./runtime-provider-boundary');\n"
+        "module.exports = { bridge: () => boundary() };\n",
+        encoding="utf-8",
+    )
+    (extension / "runtime-provider-boundary.js").write_text(
+        "module.exports = { boundary: () => 'runtime-retention-closure-ok' };\n",
+        encoding="utf-8",
+    )
+    (extension / "unused.js").write_text(
+        "module.exports = { unused: () => 'not-seeded' };\n", encoding="utf-8"
+    )
+    assert _git(repo, "add", "vscode-extension").returncode == 0
+    assert _git(repo, "commit", "-qm", "js require closure fixture").returncode == 0
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "js-closure-worktrees"),
+    )
+
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "js-require-closure",
+        {
+            "allowed_writes": ["vscode-extension/extension.js"],
+            "read_first": ["vscode-extension/extension.js"],
+            "validation": ["node vscode-extension/extension.js"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        assert (workspace.path / "vscode-extension/runtime-retention.js").is_file()
+        assert (
+            workspace.path / "vscode-extension/runtime-language-model-bridge.js"
+        ).is_file()
+        assert (
+            workspace.path / "vscode-extension/runtime-provider-boundary.js"
+        ).is_file()
+        assert not (workspace.path / "vscode-extension/unused.js").exists()
+
+        (result,) = worker_workspace.run_validations(
+            workspace,
+            ["node vscode-extension/extension.js"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+        assert result["returncode"] == 0, result["stderr_tail"]
+        assert "MODULE_NOT_FOUND" not in result["stderr_tail"]
+        assert "runtime-retention-closure-ok" in result["stdout_tail"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_js_validation_seeds_relative_package_json_require(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    """Review finding (NF-2026-00448/458 rework): ``_resolve_one_local_js_require``
+    matched only an exact ``.js`` suffix or ``<target>/index.js``, so an explicit
+    ``require('../package.json')`` -- as used by canonical fixtures such as
+    ``vscode-extension/test/stable-runtime-upgrade.test.js`` and
+    ``multirepo-connecting.test.js`` -- was mangled into a nonexistent
+    ``package.json.js`` and raised ``validation_js_require_unresolved`` during
+    sparse workspace creation. Bounded Node-local resolution must seed the exact
+    ``.json`` file the require names, while a sibling file no require ever
+    reaches stays absent from the sparse worktree."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    extension = repo / "vscode-extension"
+    extension.mkdir()
+    (extension / "package.json").write_text(
+        json.dumps({"name": "pkg-require-fixture", "version": "1.2.3"}),
+        encoding="utf-8",
+    )
+    test_dir = extension / "test"
+    test_dir.mkdir()
+    (test_dir / "pkg-require.test.js").write_text(
+        "const pkg = require('../package.json');\n"
+        "console.log(pkg.version);\n",
+        encoding="utf-8",
+    )
+    (test_dir / "unused-fixture.js").write_text(
+        "module.exports = { unused: () => 'not-seeded' };\n", encoding="utf-8"
+    )
+    assert _git(repo, "add", "vscode-extension").returncode == 0
+    assert (
+        _git(repo, "commit", "-qm", "js relative package.json require fixture").returncode
+        == 0
+    )
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "js-package-json-worktrees"),
+    )
+
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "js-require-package-json",
+        {
+            "allowed_writes": ["vscode-extension/test/pkg-require.test.js"],
+            "read_first": ["vscode-extension/test/pkg-require.test.js"],
+            "validation": ["node vscode-extension/test/pkg-require.test.js"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        assert (workspace.path / "vscode-extension/package.json").is_file()
+        assert not (workspace.path / "vscode-extension/test/unused-fixture.js").exists()
+
+        (result,) = worker_workspace.run_validations(
+            workspace,
+            ["node vscode-extension/test/pkg-require.test.js"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+        assert result["returncode"] == 0, result["stderr_tail"]
+        assert "1.2.3" in result["stdout_tail"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
 def test_git_subprocess_environment_is_noninteractive_and_closed_stdin(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1614,7 +1759,7 @@ def test_validate_required_outputs_replay_authorization_permits_hash_pinned_unch
         assert successor.inherited_rework_paths == ("out/result.txt",)
 
         with pytest.raises(
-            worker_workspace.WorkspaceError, match="required_output_unchanged:"
+            worker_workspace.WorkspaceError, match="required_output_mismatch:"
         ):
             worker_workspace.validate_required_outputs(successor, ["out/result.txt"])
 
@@ -1655,7 +1800,7 @@ def test_validate_required_outputs_replay_authorization_permits_hash_pinned_unch
             {**authorization, "next_claim_epoch": 4},
         ):
             with pytest.raises(
-                worker_workspace.WorkspaceError, match="required_output_unchanged:"
+                worker_workspace.WorkspaceError, match="required_output_mismatch:"
             ):
                 worker_workspace.validate_required_outputs(
                     successor,
@@ -1672,7 +1817,7 @@ def test_validate_required_outputs_replay_authorization_permits_hash_pinned_unch
         ):
             mismatched_identity = {**current_identity, bad_key: bad_value}
             with pytest.raises(
-                worker_workspace.WorkspaceError, match="required_output_unchanged:"
+                worker_workspace.WorkspaceError, match="required_output_mismatch:"
             ):
                 worker_workspace.validate_required_outputs(
                     successor,
@@ -1683,7 +1828,7 @@ def test_validate_required_outputs_replay_authorization_permits_hash_pinned_unch
 
         # Ordinary non-authorized rework still fails closed.
         with pytest.raises(
-            worker_workspace.WorkspaceError, match="required_output_unchanged:"
+            worker_workspace.WorkspaceError, match="required_output_mismatch:"
         ):
             worker_workspace.validate_required_outputs(successor, ["out/result.txt"])
     finally:
@@ -2392,6 +2537,47 @@ def test_required_output_out_of_scope_rejected(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+def test_required_output_validation_aggregates_every_mismatch_category(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "worktree"
+    home = tmp_path / "home"
+    path.mkdir()
+    home.mkdir()
+    (path / "unchanged.py").write_bytes(b"same")
+    (path / "empty.py").write_bytes(b"")
+    (path / "valid.py").write_bytes(b"changed")
+    unchanged_hash = worker_workspace._hash_path(path / "unchanged.py")
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="aggregate-required-output-mismatch",
+        repo=tmp_path,
+        path=path,
+        home=home,
+        allowed_writes=("missing.py", "unchanged.py", "empty.py", "valid.py"),
+        parent_baseline={"unchanged.py": unchanged_hash},
+        workspace_baseline={"unchanged.py": unchanged_hash},
+    )
+
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace.validate_required_outputs(
+            workspace,
+            ["missing.py", "unchanged.py", "empty.py", "valid.py", "outside.py"],
+        )
+
+    message = str(excinfo.value)
+    assert message.startswith("required_output_mismatch:")
+    diagnostics = json.loads(message.split(":", 1)[1])
+    assert diagnostics["missing_required_artifacts"] == ["missing.py"]
+    assert diagnostics["unchanged_mandatory_outputs"] == ["unchanged.py"]
+    assert diagnostics["scope_violations"] == [
+        {"path": "empty.py", "reason": "required_output_zero_bytes"},
+        {"path": "outside.py", "reason": "required_output_not_allowed"},
+    ]
+    assert [record["path"] for record in diagnostics["primary_validation_result"]] == [
+        "valid.py"
+    ]
+
+
 def test_allow_unchanged_required_outputs_accepts_exact_baseline_match(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2650,7 +2836,8 @@ def test_validation_pythonpath_override_is_scoped_to_one_subprocess(
                 "python3 check_pythonpath.py",
             ],
         )
-        assert first["argv"][0] == "python3"
+        assert first["argv"][0] == sys.executable
+        assert second["argv"][0] == sys.executable
         assert first["env_override"] == {
             "variable": "PYTHONPATH", "components": list(components)
         }
@@ -3049,6 +3236,33 @@ def test_repo_relative_executable_passes_through_unrelated_and_rejects_untrusted
     ) == ([".venv/bin/mypy", "src"], ())
 
 
+def test_bare_python_heads_resolve_to_trusted_coordinator_interpreter() -> None:
+    """NF-2026-00448: ``python``/``python3``/``python3.NN`` validation heads
+    resolve directly to ``sys.executable`` -- the credential-free validation
+    PATH does not reliably expose a working bare ``python3``. Explicit
+    relative and absolute interpreter declarations are untouched here."""
+    for head in ("python", "python3", "python3.11", "python3.9"):
+        assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            [head, "-c", "pass"]
+        ) == ([sys.executable, "-c", "pass"], ())
+    # Near-misses never match the bare-interpreter regex.
+    for unmatched in ("python2", "pythonic", "python3.11.2", "python33"):
+        assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            [unmatched, "-c", "pass"]
+        ) == ([unmatched, "-c", "pass"], ())
+    # An absolute interpreter declaration keeps its existing fail-closed rule
+    # (passed through byte-for-byte, never rewritten).
+    assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+        ["/usr/bin/python3", "-c", "pass"]
+    ) == (["/usr/bin/python3", "-c", "pass"], ())
+    # A relative interpreter declaration with a path separator also keeps its
+    # existing fail-closed rule: it is resolved (or left untouched) by the
+    # repo-relative trusted-executable path, never by the bare-head regex.
+    assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+        [".venv/bin/python3", "-c", "pass"]
+    ) == ([".venv/bin/python3", "-c", "pass"], ())
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
 @pytest.mark.skipif(
     worker_workspace.landlock_abi_version() < 1,
@@ -3252,6 +3466,36 @@ def test_provision_validation_exec_scratch_fails_closed_without_metadata_root(
     assert "no_metadata" in str(caught.value)
     # Fail-closed: no half-provisioned scratch directory is left behind.
     assert list(only.iterdir()) == []
+
+
+def test_run_validations_classifies_scratch_chmod_denial_as_environment_blocked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NF-2026-00458: an outer-sandbox EPERM/chmod denial on every exec-scratch
+    candidate must terminalize as the recoverable
+    ``validation_environment_blocked`` state -- never an untyped
+    ``WorkspaceError`` a caller cannot distinguish from a genuine candidate
+    gate failure. No candidate command has run yet, so ``results`` is empty."""
+    monkeypatch.setattr(worker_workspace.sys, "platform", "linux")
+    only = tmp_path / "only"
+    only.mkdir()
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace, "_DEFAULT_EXEC_SCRATCH_ROOTS", (only,))
+    monkeypatch.setattr(worker_workspace, "_probe_exec_capable_dir", lambda _d: True)
+    monkeypatch.setattr(worker_workspace, "_probe_metadata_capable_dir", lambda _d: False)
+    workspace = _bare_workspace(tmp_path, "scratch-blocked")
+    with pytest.raises(worker_workspace.ValidationEnvironmentBlocked) as caught:
+        worker_workspace.run_validations(
+            workspace,
+            ["echo ok"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+    assert caught.value.terminal_state == worker_workspace.VALIDATION_ENVIRONMENT_BLOCKED
+    assert caught.value.restriction == "refused_chmod"
+    assert caught.value.recoverable is True
+    assert caught.value.requires_supersede is False
+    assert caught.value.results == []
 
 
 def test_provisioned_scratch_supports_git_init(

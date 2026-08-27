@@ -2,6 +2,7 @@ import copy
 import dataclasses
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
@@ -87,6 +88,34 @@ def _rule_by_id(manifest, rule_id):
         if rule.id == rule_id:
             return rule
     raise AssertionError(f"rule {rule_id!r} not found")
+
+
+def test_repository_manifest_pins_self_hosting_break_glass_contract():
+    manifest_path = Path(__file__).resolve().parents[1] / ".aiworkhub/config/development_rules.json"
+    manifest = dr.parse_manifest_bytes(manifest_path.read_bytes())
+    rule = _rule_by_id(manifest, "self_hosting_break_glass")
+
+    assert rule.topic == "self_hosting_break_glass"
+    assert set(rule.allow) == {
+        "independent_manager_validation",
+        "measured_task_system_blocker",
+        "minimal_intermediate_fix",
+        "replacement_artifact_install",
+        "return_to_canonical_task_flow",
+    }
+    assert set(rule.forbid) == {
+        "continued_use_of_known_broken_plugin",
+        "scope_expansion_during_break_glass",
+        "silent_task_system_bypass",
+        "unmeasured_break_glass",
+    }
+    assert set(rule.payload.guideline_ids) == {
+        "record_blocker_evidence",
+        "preserve_unrelated_work",
+        "restore_task_system_only",
+        "validate_replacement_independently",
+    }
+    assert rule.payload.severity is dr.Severity.ERROR
 
 
 # --- deterministic digest ---------------------------------------------------

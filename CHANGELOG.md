@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.62] - 2026-08-27
+
+### Fixed
+
+- Required-output validation now reports missing artifacts, unchanged mandatory
+  outputs, scope violations and passing records together, preventing one-error
+  rework loops in the production worker finalization path.
+- Sparse JavaScript validation follows bounded local CommonJS dependencies,
+  including explicit and extensionless JSON modules, while bare Python
+  validators use the trusted coordinator interpreter.
+- Validation scratch failures are classified as refused metadata operations
+  only when every candidate carries that measured restriction; mixed failures
+  remain fail-closed under their original error.
+- A measured self-hosting break-glass rule now authorizes the manager to apply,
+  validate, package and install only the smallest Task MCP/plugin recovery fix,
+  then requires an immediate return to canonical task flow.
+
 ## [0.10.61] - 2026-08-26
 
 ### Fixed

@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.62 — 2026-08-27
+
+### Fixed
+
+- Task finalization reports every required-output mismatch in one structured
+  result instead of sending rework through a one-error-at-a-time loop.
+- Sparse JavaScript validation retains bounded local CommonJS JavaScript and
+  JSON dependencies, and Python validation resolves to the trusted runtime.
+- Mixed exec-scratch failures no longer masquerade as a metadata-only sandbox
+  restriction.
+- The manager has a measured, tightly scoped self-hosting recovery path for
+  replacing a Task MCP/plugin build that blocks canonical development.
+
 ## 0.10.61 — 2026-08-26
 
 ### Fixed

@@ -24,6 +24,18 @@ Path contract (fail-closed, never coerced):
   rejected with stable reasons before any command is generated, so every
   generated validation command preserves exact, deterministic argv
   tokenization (single-space split, no quoting).
+
+Scope vs. mandatory-change contract:
+
+* ``production_paths``/``test_paths`` (and the ``allowed_writes``/``write_set``
+  they expand into) are authenticated read/write *scope*: paths a worker is
+  authorized to touch. They are never an implicit assertion that every one
+  of them must change.
+* ``required_outputs`` -- the set a downstream finalizer treats as
+  ``required_output_unchanged``-eligible -- defaults to empty. A path only
+  becomes mandatory-to-change when explicitly listed in
+  ``mandatory_changed_outputs``, and any such path must already be part of
+  the write scope; a mandatory path outside scope fails closed.
 """
 
 from __future__ import annotations
@@ -555,12 +567,19 @@ def expand_template(
     test_paths: Sequence[Any] | None = None,
     title: Any = None,
     objective: Any = None,
+    mandatory_changed_outputs: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Expand one template plus explicit bounded paths into card fields.
 
     Returns plain data for the existing authoritative ``create_task`` card:
-    read-first targets, an atomic write-set checklist that the outputs and
-    allowed writes cover exactly, and deterministic validation commands.
+    read-first targets, an allowed-write scope, and deterministic validation
+    commands. ``allowed_writes``/``write_set`` is the full authorized scope;
+    ``required_outputs`` is the (by default empty) subset a downstream
+    finalizer must observe as changed. A path only lands in
+    ``required_outputs`` when it is explicitly passed via
+    ``mandatory_changed_outputs``, and only if it is already in scope --
+    an out-of-scope mandatory path fails closed rather than silently
+    expanding the write set.
     """
     spec = resolve_template(template_id)
     production = _bounded_paths(
@@ -571,6 +590,16 @@ def expand_template(
     if set(production) & set(tests):
         raise TaskTemplateError("duplicate_path_across_fields")
     write_set: list[str] = [] if spec.read_only else [*production, *tests]
+    mandatory = _bounded_paths(
+        () if mandatory_changed_outputs is None else mandatory_changed_outputs,
+        "mandatory_changed_output",
+    )
+    write_scope = set(write_set)
+    for path in mandatory:
+        if path not in write_scope:
+            raise TaskTemplateError("mandatory_changed_output_out_of_scope")
+    mandatory_set = set(mandatory)
+    required_outputs = [path for path in write_set if path in mandatory_set]
     read_first: list[str] = []
     for field_name in spec.read_first_fields:
         read_first.extend(production if field_name == "production" else tests)
@@ -596,7 +625,7 @@ def expand_template(
         "read_only": spec.read_only,
         "read_first": read_first,
         "allowed_writes": list(write_set),
-        "required_outputs": list(write_set),
+        "required_outputs": required_outputs,
         "write_set": list(write_set),
         "validation": validation,
         "validation_roles": validation_roles,
@@ -872,7 +901,10 @@ def classify_task_card(
     for name, reason in candidates:
         try:
             expanded = expand_template(
-                name, production_paths=production, test_paths=tests
+                name,
+                production_paths=production,
+                test_paths=tests,
+                mandatory_changed_outputs=outputs,
             )
         except TaskTemplateError:
             continue

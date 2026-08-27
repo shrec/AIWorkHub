@@ -46,6 +46,49 @@ const {
   packageWithVersionGate,
 } = require("./package-vsix");
 
+function assertCanonicalRepositoryVersionsMatch() {
+  const repositoryRoot = path.resolve(__dirname, "..", "..");
+  const canonicalSource = fs.readFileSync(
+    path.join(repositoryRoot, "src", "aiworkhub", "_version.py"),
+    "utf8",
+  );
+  const extensionSource = fs.readFileSync(
+    path.join(repositoryRoot, "vscode-extension", "extension.js"),
+    "utf8",
+  );
+  const packageJson = JSON.parse(fs.readFileSync(
+    path.join(repositoryRoot, "vscode-extension", "package.json"),
+    "utf8",
+  ));
+  const packageLock = JSON.parse(fs.readFileSync(
+    path.join(repositoryRoot, "vscode-extension", "package-lock.json"),
+    "utf8",
+  ));
+  const canonical = canonicalSource.match(/^__version__ = "([^"]+)"$/m);
+  const expectedRuntime = extensionSource.match(
+    /^const EXPECTED_MCP_PACKAGE_VERSION = "([^"]+)";$/m,
+  );
+  assert.ok(canonical, "canonical Python version must be present");
+  assert.ok(expectedRuntime, "extension runtime version must be present");
+  assert.deepStrictEqual(
+    {
+      packageJson: packageJson.version,
+      packageLock: packageLock.version,
+      packageLockRoot: packageLock.packages && packageLock.packages[""].version,
+      expectedRuntime: expectedRuntime[1],
+    },
+    {
+      packageJson: canonical[1],
+      packageLock: canonical[1],
+      packageLockRoot: canonical[1],
+      expectedRuntime: canonical[1],
+    },
+    "all release version surfaces must match src/aiworkhub/_version.py",
+  );
+}
+
+assertCanonicalRepositoryVersionsMatch();
+
 function fakeStat({ dev = 1n, ino = 2n, size, mtimeNs = 3n, ctimeNs = 4n } = {}) {
   return {
     dev,

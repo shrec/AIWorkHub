@@ -1819,6 +1819,25 @@ def _enqueue_terminal_callback_row(
     return True
 
 
+def _deterministic_verification_for_evidence(
+    substatus: str, evidence_payload: Mapping[str, Any], *, claim_epoch: int
+) -> Any:
+    """Evaluate deterministic verification from one terminal evidence payload.
+
+    ``evidence_payload["required_outputs"]`` is the mandatory-changed-output
+    validation result (see ``task_templates.expand_template``'s
+    ``mandatory_changed_outputs`` and ``process_launcher.validate_required_outputs``),
+    never the full authorized production/test write scope -- an
+    authorized-but-untouched path must never appear here.
+    """
+    return task_fsm.deterministic_verification(
+        substatus,
+        evidence_payload.get("validation"),
+        evidence_payload.get("required_outputs"),
+        claim_epoch=claim_epoch,
+    )
+
+
 def _mark_terminal_review_transaction(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1876,11 +1895,8 @@ def _mark_terminal_review_transaction(
             claim_epoch = max(0, int(card.get("claim_epoch") or 0))
         except (TypeError, ValueError):
             claim_epoch = 0
-        deterministic_verification = task_fsm.deterministic_verification(
-            substatus,
-            evidence_payload.get("validation"),
-            evidence_payload.get("required_outputs"),
-            claim_epoch=claim_epoch,
+        deterministic_verification = _deterministic_verification_for_evidence(
+            substatus, evidence_payload, claim_epoch=claim_epoch
         )
         terminal = {
             "substatus": substatus[:120],
@@ -2278,11 +2294,8 @@ def mark_terminal_failure(
                 f"claim_epoch_mismatch:expected={claim_epoch}"
                 f":current={card_claim_epoch}"
             )
-        deterministic_verification = task_fsm.deterministic_verification(
-            substatus,
-            evidence_payload.get("validation"),
-            evidence_payload.get("required_outputs"),
-            claim_epoch=card_claim_epoch,
+        deterministic_verification = _deterministic_verification_for_evidence(
+            substatus, evidence_payload, claim_epoch=card_claim_epoch
         )
         now = datetime.now(timezone.utc).isoformat()
         terminal = {

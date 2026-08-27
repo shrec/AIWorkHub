@@ -134,6 +134,29 @@ def test_four_distinct_restrictions_map_to_recoverable_environment_blocked() -> 
     assert len(seen) == 4
 
 
+def test_exec_scratch_metadata_denial_requires_every_candidate_to_match() -> None:
+    all_metadata_denied = (
+        "validation_exec_scratch_unavailable:"
+        "/dev/shm:no_metadata;/tmp:mkdir_failed:[Errno 1] EPERM"
+    )
+    mixed_noexec = (
+        "validation_exec_scratch_unavailable:"
+        "/dev/shm:no_metadata;/tmp:noexec"
+    )
+    mixed_unavailable = (
+        "validation_exec_scratch_unavailable:"
+        "/dev/shm:no_metadata;/missing:unavailable"
+    )
+
+    assert (
+        validation_runner.exec_scratch_denied_restriction(all_metadata_denied)
+        == validation_runner.RESTRICTION_REFUSED_CHMOD
+    )
+    assert validation_runner.exec_scratch_denied_restriction(mixed_noexec) is None
+    assert validation_runner.exec_scratch_denied_restriction(mixed_unavailable) is None
+    assert validation_runner.exec_scratch_denied_restriction("no_metadata") is None
+
+
 # ── TWO: validation_failed unchanged for a genuine gate failure ──────────────
 
 

@@ -44,6 +44,20 @@ ROLE_STATEMENTS = (
 )
 
 
+BREAK_GLASS_STATEMENTS = (
+    "Self-hosting break-glass authority:",
+    "installed AIWorkHub plugin or Task MCP itself blocks canonical task progress",
+    "manager may temporarily bypass Task MCP",
+    "implement the smallest replacement fix",
+    "validate it independently, build and install the replacement",
+    "return immediately to canonical Task MCP flow",
+    "record the blocker and evidence",
+    "preserve unrelated work",
+    "keep scope limited to restoring the task system",
+    "never use the exception for ordinary feature development",
+)
+
+
 # NF-2026-00294: the multicore-by-default principle rides the shared POLICY, so
 # it must reach EVERY provider projection (not just the Claude preamble) and
 # cannot silently regress. Each fragment is a distinctive slice of one of the
@@ -107,6 +121,21 @@ def test_role_is_in_the_shared_canonical_not_claude_only() -> None:
     canonical = instr.render_canonical()
     assert "Manager role:" in canonical
     for statement in ROLE_STATEMENTS:
+        assert statement in canonical, statement
+
+
+def test_self_hosting_break_glass_authority_reaches_every_provider() -> None:
+    rendered = instr.render_all()
+    for provider, text in rendered.items():
+        for statement in BREAK_GLASS_STATEMENTS:
+            assert statement in text, f"{provider!r} missing break-glass statement: {statement!r}"
+
+
+def test_self_hosting_break_glass_authority_is_manager_only_and_bounded() -> None:
+    canonical = instr.render_canonical()
+    assert canonical.index("Manager role:") < canonical.index("Self-hosting break-glass authority:")
+    assert canonical.index("Self-hosting break-glass authority:") < canonical.index("Order:")
+    for statement in BREAK_GLASS_STATEMENTS:
         assert statement in canonical, statement
 
 

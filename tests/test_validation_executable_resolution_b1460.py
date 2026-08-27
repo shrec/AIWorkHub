@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -91,8 +92,7 @@ def test_bare_python_validation_uses_portable_python3_alias() -> None:
         )
     )
 
-    expected = "python" if os.name == "nt" else "python3"
-    assert argv == [expected, "-m", "compileall", "-q", "src"]
+    assert argv == [sys.executable, "-m", "compileall", "-q", "src"]
     assert roots == ()
 
 

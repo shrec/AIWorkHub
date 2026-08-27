@@ -232,6 +232,44 @@ def row_restriction(row: Mapping[str, Any]) -> str | None:
     return None
 
 
+# ---- exec-scratch provisioning restriction (NF-2026-00458) -----------------
+# ``provision_validation_exec_scratch`` (worker_workspace.py) fails closed with
+# one aggregate ``tried`` detail describing every candidate root's rejection
+# reason. This is the single source of truth for reading that detail: when
+# every candidate was rejected because the exact metadata syscalls git's own
+# ``config.lock`` chmod/utime needs are themselves denied by the OUTER sandbox
+# hosting the worker process -- ``no_metadata`` from
+# ``_probe_metadata_capable_dir``, or an EPERM/"Permission denied" ``OSError``
+# on the candidate directory's own ``mkdir`` -- this is infrastructure
+# evidence, never a candidate gate failure. worker_workspace delegates to this
+# function instead of re-deriving the same token list, so the two modules
+# cannot drift on what counts as a refused chmod.
+def exec_scratch_denied_restriction(detail: str) -> str | None:
+    """Classify a scratch-provisioning rejection ``detail``, else ``None``.
+
+    Returns ``None`` for any other rejection reason (a genuinely noexec-only
+    root, a missing directory, ...) so the caller re-raises its original error
+    unchanged rather than mis-classifying an unrelated provisioning failure.
+    """
+    prefix = "validation_exec_scratch_unavailable:"
+    lowered = detail.strip().lower()
+    if not lowered.startswith(prefix):
+        return None
+    candidates = [row.strip() for row in lowered[len(prefix) :].split(";") if row.strip()]
+    if not candidates:
+        return None
+
+    def _metadata_denied(row: str) -> bool:
+        if row.endswith(":no_metadata"):
+            return True
+        return ":mkdir_failed:" in row and (
+            "eperm" in row or "permission denied" in row
+        )
+
+    denied = all(_metadata_denied(row) for row in candidates)
+    return RESTRICTION_REFUSED_CHMOD if denied else None
+
+
 def _is_failing_row(row: Mapping[str, Any]) -> bool:
     # Mirror ``run_validations``: a row failed if it timed out or exited nonzero
     # (launch/timeout rows carry returncode ``None``).
@@ -651,6 +689,7 @@ __all__ = [
     "assert_card_validation_sandbox_runnable",
     "classify_validation_results",
     "dash_m_validator_modules",
+    "exec_scratch_denied_restriction",
     "row_restriction",
     "sandbox_unrunnable_reason",
 ]

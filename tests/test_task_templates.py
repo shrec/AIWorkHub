@@ -110,7 +110,8 @@ def test_bugfix_outputs_exactly_cover_atomic_write_set():
     )
     expected = ["src/a.py", "src/b.py", "tests/test_a.py"]
     assert card["allowed_writes"] == expected
-    assert card["required_outputs"] == expected
+    assert card["required_outputs"] == []
+    assert card["write_set"] == expected
     assert card["write_set"] == expected
     assert card["read_only"] is False
     assert card["read_first"] == expected
@@ -128,7 +129,8 @@ def test_implementation_with_tests_matches_bugfix_contract():
         test_paths=["tests/test_mod.py"],
     )
     expected = ["src/mod.py", "tests/test_mod.py"]
-    assert card["required_outputs"] == expected
+    assert card["required_outputs"] == []
+    assert card["allowed_writes"] == expected
     assert card["allowed_writes"] == expected
     assert card["validation"] == [
         "python -m pytest -q tests/test_mod.py",
@@ -149,7 +151,8 @@ def test_test_only_requires_tests_and_rejects_production_paths():
             test_paths=["tests/test_a.py"],
         )
     card = expand_template("test_only", test_paths=["tests/test_a.py"])
-    assert card["required_outputs"] == ["tests/test_a.py"]
+    assert card["required_outputs"] == []
+    assert card["allowed_writes"] == ["tests/test_a.py"]
     assert card["allowed_writes"] == ["tests/test_a.py"]
     assert card["read_first"] == ["tests/test_a.py"]
     assert card["validation"] == [
@@ -169,7 +172,8 @@ def test_docs_change_requires_docs_paths_and_rejects_test_paths():
             test_paths=["tests/test_x.py"],
         )
     card = expand_template("docs_change", production_paths=["docs/guide.md"])
-    assert card["required_outputs"] == ["docs/guide.md"]
+    assert card["required_outputs"] == []
+    assert card["allowed_writes"] == ["docs/guide.md"]
     assert card["allowed_writes"] == ["docs/guide.md"]
     assert card["task_type"] == "code"
     assert card["work_kind"] == "generic"

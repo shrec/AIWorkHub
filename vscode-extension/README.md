@@ -12,12 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.61
+## What's new in 0.10.62
 
-- The Development Rules card now reports the repository's validated manifest,
-  digest and resolved rule counts instead of a false `No sample` state.
-- AIWorkHub's repository manifest defines deterministic hot-path allocation,
-  multicore, cache, SQLite, subprocess, model-budget and cross-platform rules.
+- Required-output failures arrive as one complete structured diagnostic, so
+  rework can repair missing, unchanged and out-of-scope outputs together.
+- Sparse validation retains local CommonJS JavaScript/JSON dependencies and
+  uses the trusted Python runtime across restricted hosts.
+- A measured self-hosting recovery rule permits a minimal validated replacement
+  build when the installed Task MCP/plugin itself blocks development.
 
 ## Architecture at a glance
 

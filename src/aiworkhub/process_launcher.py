@@ -63,6 +63,7 @@ from . import runtime_temp
 from . import task_engine
 from . import task_fsm
 from . import task_store
+from . import task_templates
 try:
     from . import project_context
 except ImportError:
@@ -154,52 +155,110 @@ else:
             raise WorkspaceError("gc_workspace_request_id_mismatch")
         return path.parent.parent
 
+def _fallback_validate_required_outputs(
+    workspace: WorkerWorkspace,
+    required_outputs: list[str] | tuple[str, ...],
+    allow_empty: tuple[str, ...] | None = None,
+    allow_unchanged: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate the explicit mandatory-change set, never the full write scope.
+
+    Bound as the module-level ``validate_required_outputs`` only when
+    ``worker_workspace`` (AppContainer/self-hosting degraded environments
+    included) does not already provide one; always callable directly for
+    deterministic regression coverage regardless of which branch bound it.
+
+    ``required_outputs`` is expected to already be the narrow,
+    explicitly-declared mandatory subset (see
+    ``task_templates.expand_template``'s ``mandatory_changed_outputs``), not
+    every authorized production/test path. Every entry is checked
+    regardless of earlier mismatches so a caller sees the complete picture
+    in one pass: missing artifacts, unchanged mandatory outputs and scope
+    violations (symlink/non-file/zero-byte/parent-baseline) are collected
+    into distinct, named diagnostic buckets alongside the primary
+    validation result (the records that passed), instead of failing closed
+    on the first mismatch and hiding the rest.
+    """
+    unchanged_allowed = {str(v).strip().replace("\\", "/") for v in (allow_unchanged or [])}
+    records: list[dict[str, Any]] = []
+    missing_required_artifacts: list[str] = []
+    unchanged_mandatory_outputs: list[str] = []
+    scope_violations: list[dict[str, str]] = []
+    legacy_error_codes: list[str] = []
+    for raw in required_outputs:
+        pattern = str(raw or "").strip().replace("\\", "/")
+        if not pattern:
+            raise WorkspaceError("required_output_invalid")
+        matches = sorted(workspace.path.glob(pattern))
+        if not matches:
+            missing_required_artifacts.append(pattern)
+            code = (
+                "required_output_no_matches"
+                if any(ch in pattern for ch in "*?[")
+                else "required_output_missing"
+            )
+            legacy_error_codes.append(f"{code}:{pattern}")
+            continue
+        for path in matches:
+            relative = path.relative_to(workspace.path).as_posix()
+            if path.is_symlink():
+                scope_violations.append({"path": relative, "reason": "symlink"})
+                legacy_error_codes.append(f"required_output_symlink:{relative}")
+                continue
+            if not path.is_file():
+                scope_violations.append({"path": relative, "reason": "non_file"})
+                legacy_error_codes.append(f"required_output_missing:{relative}")
+                continue
+            size = path.stat().st_size
+            if size <= 0 and (allow_empty is None or relative not in allow_empty):
+                scope_violations.append({"path": relative, "reason": "zero_bytes"})
+                legacy_error_codes.append(f"required_output_zero_bytes:{relative}")
+                continue
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            baseline = workspace.workspace_baseline.get(relative)
+            current = f"file:{path.stat().st_mode & 0o777:o}:{digest}"
+            is_unchanged = baseline in {digest, current}
+            if is_unchanged:
+                if relative not in unchanged_allowed:
+                    unchanged_mandatory_outputs.append(relative)
+                    legacy_error_codes.append(f"required_output_unchanged:{relative}")
+                    continue
+                if workspace.parent_baseline.get(relative) != current:
+                    scope_violations.append(
+                        {"path": relative, "reason": "unchanged_parent_mismatch"}
+                    )
+                    legacy_error_codes.append(
+                        f"required_output_unchanged_parent_mismatch:{relative}"
+                    )
+                    continue
+                if size <= 0:
+                    unchanged_mandatory_outputs.append(relative)
+                    continue
+            records.append({
+                "path": relative,
+                "bytes": size,
+                "sha256": current,
+                "unchanged_allowed": is_unchanged,
+            })
+    if missing_required_artifacts or unchanged_mandatory_outputs or scope_violations:
+        diagnostics = {
+            "missing_required_artifacts": missing_required_artifacts,
+            "unchanged_mandatory_outputs": unchanged_mandatory_outputs,
+            "scope_violations": scope_violations,
+            "primary_validation_result": records,
+            "legacy_error_codes": legacy_error_codes,
+        }
+        raise WorkspaceError(
+            "required_output_mismatch:"
+            + json.dumps(diagnostics, sort_keys=True, separators=(",", ":"))
+        )
+    return records
+
+
 if hasattr(_worker_workspace, "validate_required_outputs"):
     validate_required_outputs = _worker_workspace.validate_required_outputs
 else:
-    def validate_required_outputs(
-        workspace: WorkerWorkspace,
-        required_outputs: list[str] | tuple[str, ...],
-        allow_empty: tuple[str, ...] | None = None,
-        allow_unchanged: tuple[str, ...] | None = None,
-    ) -> list[dict[str, Any]]:
-        unchanged_allowed = {str(v).strip().replace("\\", "/") for v in (allow_unchanged or [])}
-        records: list[dict[str, Any]] = []
-        for raw in required_outputs:
-            pattern = str(raw or "").strip().replace("\\", "/")
-            if not pattern:
-                raise WorkspaceError("required_output_invalid")
-            matches = sorted(workspace.path.glob(pattern))
-            if not matches:
-                raise WorkspaceError(f"required_output_no_matches:{pattern}")
-            for path in matches:
-                relative = path.relative_to(workspace.path).as_posix()
-                if path.is_symlink():
-                    raise WorkspaceError(f"required_output_symlink:{relative}")
-                if not path.is_file():
-                    raise WorkspaceError(f"required_output_non_file:{relative}")
-                size = path.stat().st_size
-                if size <= 0 and (allow_empty is None or relative not in allow_empty):
-                    raise WorkspaceError(f"required_output_zero_bytes:{relative}")
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
-                baseline = workspace.workspace_baseline.get(relative)
-                current = f"file:{path.stat().st_mode & 0o777:o}:{digest}"
-                is_unchanged = baseline in {digest, current}
-                if is_unchanged:
-                    if relative not in unchanged_allowed:
-                        raise WorkspaceError(f"required_output_unchanged:{relative}")
-                    if workspace.parent_baseline.get(relative) != current:
-                        raise WorkspaceError(f"required_output_unchanged_parent_mismatch:{relative}")
-                if is_unchanged and size <= 0:
-                    raise WorkspaceError(f"required_output_unchanged:{relative}")
-                records.append({
-                    "path": relative,
-                    "bytes": size,
-                    "sha256": current,
-                    "unchanged_allowed": is_unchanged,
-                })
-        return records
-
+    validate_required_outputs = _fallback_validate_required_outputs
     _worker_workspace.validate_required_outputs = validate_required_outputs
 
 
@@ -2849,12 +2908,22 @@ def _validate_required_outputs_contract(card: dict[str, Any]) -> None:
     if not isinstance(raw, list):
         raise LaunchRejected("required_outputs_invalid")
     if not raw:
-        # Its evidence is the authenticated worker transcript/MCP receipt.
-        # The intent must be explicit so an accidentally empty code card does
-        # not spend provider tokens on an unpromotable result.
         if card.get("read_only") is True and not (card.get("allowed_writes") or []):
             return
-        raise LaunchRejected("required_outputs_invalid")
+        # Writable templates distinguish authorized scope from an explicitly
+        # empty mandatory-change set. Accept that only when canonical template
+        # provenance authenticates the exact expanded contract; arbitrary
+        # writable cards cannot smuggle an accidental empty list to launch.
+        try:
+            provenance = task_templates.validate_template_provenance(
+                card.get("template_provenance")
+            )
+            expected_digest = task_templates.expanded_contract_digest(card)
+        except task_templates.TaskTemplateError as exc:
+            raise LaunchRejected("required_outputs_invalid") from exc
+        if provenance["expanded_contract_digest"] != expected_digest:
+            raise LaunchRejected("required_outputs_invalid")
+        return
     allowed = card.get("allowed_writes") or []
     if not isinstance(allowed, list):
         raise LaunchRejected("allowed_writes_invalid")

@@ -28,8 +28,12 @@ from typing import Any, Literal
 # The caps are raised to sit just above the largest measured output, keeping the
 # same modest headroom the role change used (canonical 6300 >= 6211; projection
 # 8200 >= CLAUDE.md 8065). No rule was shortened or dropped to fit.
-CANONICAL_MAX_BYTES = 6300
-PROJECTION_MAX_BYTES = 8200
+#
+# The self-hosting break-glass authority adds two manager-role lines. The caps
+# move with that measured policy growth; the renderer still enforces a bounded
+# contract and all provider projections remain covered by tests.
+CANONICAL_MAX_BYTES = 7200
+PROJECTION_MAX_BYTES = 9200
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
 PROVIDERS = ("AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md")
@@ -82,6 +86,8 @@ POLICY = ToolPolicy(
         "A card's allowed_writes must include the tests that assert the contract it changes and the production call sites it must wire, or correct work is unwinnable.",
         "Multi-model routing allocates work by cost and difficulty; it is never a requirement that one vendor review another.",
         "Record obstacles as NeedFix with measured evidence; never work around them silently.",
+        "Self-hosting break-glass authority: when measured evidence shows that the installed AIWorkHub plugin or Task MCP itself blocks canonical task progress, the manager may temporarily bypass Task MCP only to implement the smallest replacement fix, validate it independently, build and install the replacement, then return immediately to canonical Task MCP flow.",
+        "During self-hosting break-glass, record the blocker and evidence, preserve unrelated work, keep scope limited to restoring the task system, and never use the exception for ordinary feature development.",
     ),
     order=(
         "validate the injected AIWorkHub Task MCP receipt, identity and scope",
