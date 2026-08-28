@@ -8053,7 +8053,9 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
             "claim_epoch": 1,
             "allowed_writes": ["src/changed.py"],
             "read_first": ["README.md"],
-            "immutable_inputs": ["docs/SOURCE_GRAPH.md"],
+            "immutable_inputs": [
+                "The archived predecessor passed its tests before this review."
+            ],
             "immutable_input_paths": ["docs/SOURCE_GRAPH.md"],
             "terminal_review": {
                 "evidence": {
@@ -8080,17 +8082,25 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
     monkeypatch.setattr(
         manager,
         "_quality_review_source_evidence",
-        lambda *_args, **_kwargs: {"schema_id": "test.source_evidence.v1"},
+        lambda *_args, **_kwargs: {
+            "src/changed.py": {"sha256": changed_hashes["src/changed.py"]}
+        },
     )
+    scoped_kwargs = {}
     monkeypatch.setattr(
         process_launcher.quality_review_scope,
         "build_scoped_audits",
-        lambda **_kwargs: {},
+        lambda **kwargs: scoped_kwargs.update(
+            {**kwargs, "source_evidence": dict(kwargs["source_evidence"])}
+        )
+        or {},
     )
+    packet_kwargs = {}
     monkeypatch.setattr(
         process_launcher.quality_reviewer,
         "build_review_packet",
-        lambda **_kwargs: {"packet_sha256": "a" * 64},
+        lambda **kwargs: packet_kwargs.update(kwargs)
+        or {"packet_sha256": "a" * 64},
     )
 
     result = manager._build_quality_review_packet(request_id, "TARGET_TASK")
@@ -8100,4 +8110,8 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
     assert prepared["read_only_input_paths"] == [
         "README.md",
         "docs/SOURCE_GRAPH.md",
+    ]
+    assert set(scoped_kwargs["source_evidence"]) == {"src/changed.py"}
+    assert packet_kwargs["source_evidence"]["immutable_inputs"] == [
+        "The archived predecessor passed its tests before this review."
     ]

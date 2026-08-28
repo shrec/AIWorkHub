@@ -7046,12 +7046,6 @@ class ProcessManager:
             source_evidence = self._quality_review_source_evidence(
                 workspace, current_hashes
             )
-            # Immutable evidence is authenticated reviewer context, not path
-            # authority. Keep the prose inside the packet-hashed evidence while
-            # the explicit read-only fields below alone select filesystem inputs.
-            source_evidence["immutable_inputs"] = list(
-                card.get("immutable_inputs") or []
-            )
             initial_gate = evidence.get("quality_gate") or {}
             mark("scope_audits_started")
             scoped_audits = quality_review_scope.build_scoped_audits(
@@ -7075,6 +7069,13 @@ class ProcessManager:
                 lenses=quality_evidence.JUDGMENT_LENSES,
             )
             mark("scope_audits_complete")
+            # Immutable evidence is authenticated reviewer context, not path
+            # authority. Add prose only after the changed-path keyed scope has
+            # been built; the explicit read-only fields below alone select
+            # filesystem inputs.
+            source_evidence["immutable_inputs"] = list(
+                card.get("immutable_inputs") or []
+            )
             target_claim_epoch = card.get("claim_epoch")
             if type(target_claim_epoch) is not int or target_claim_epoch < 1:
                 raise WorkspaceError("quality_review_target_claim_epoch_invalid")
