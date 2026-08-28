@@ -4885,8 +4885,13 @@ def test_run_validations_canonical_trusted_owner_venv_python_preserves_execution
     try:
         execution_path = workspace.repo / ".venv" / "bin" / "python"
         execution_path.parent.mkdir(parents=True)
-        endpoint = Path(sys.executable).resolve(strict=True)
+        coordinator = Path(sys.executable).resolve(strict=True)
+        endpoint = tmp_path / "trusted-coordinator-python"
+        shutil.copy2(coordinator, endpoint)
+        endpoint.chmod(0o700)
+        monkeypatch.setattr(worker_workspace.sys, "executable", str(endpoint))
         assert endpoint.stat().st_uid in {0, os.getuid()}
+        assert stat.S_IMODE(endpoint.stat().st_mode) == 0o700
         execution_path.symlink_to(endpoint)
         (result,) = _run_interpreter_validation(
             workspace, ".venv/bin/python -c pass"
