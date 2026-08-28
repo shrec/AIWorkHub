@@ -17,10 +17,9 @@ Lifecycle:
     ``MIN_REFRESH_INTERVAL_SECONDS``) via ``threading.Event.wait`` so
     ``stop()`` interrupts the wait immediately instead of blocking on a
     plain ``time.sleep``.
-  * A single ``threading.Lock`` per daemon (``_build_lock``) makes the
-    periodic loop and an explicit ``refresh_now()`` call mutually
-    exclusive: a build already in flight is never joined by a second one
-    against the same repository's database.
+  * A single ``threading.Lock`` per daemon (``_build_lock``) serializes
+    the periodic loop and an explicit ``refresh_now()`` call: they never
+    overlap against the same repository's database.
   * A failed build is caught, recorded (``degraded`` status + bounded
     ``last_error``), and never re-raised -- one bad build must not crash
     the daemon thread, let alone the parent MCP process.
