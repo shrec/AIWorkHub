@@ -718,8 +718,24 @@ def iter_source_files(repo_root: Path) -> list[Path]:
     repo_root = repo_root.resolve()
     policy = load_ignore_policy(repo_root)
     out: list[Path] = []
+    traversal_errors: list[str] = []
     indexed_extensions = policy.indexed_extensions
-    for current, dirnames, filenames in os.walk(repo_root, followlinks=False):
+
+    def capture_traversal_error(exc: OSError) -> None:
+        location = str(exc.filename or repo_root)
+        try:
+            location = Path(location).relative_to(repo_root).as_posix()
+        except ValueError:
+            pass
+        location = location.replace("\n", " ")[:256]
+        detail = str(exc).replace("\n", " ")[:512]
+        traversal_errors.append(f"{location}: {detail or type(exc).__name__}")
+
+    for current, dirnames, filenames in os.walk(
+        repo_root,
+        followlinks=False,
+        onerror=capture_traversal_error,
+    ):
         current_path = Path(current)
         kept_dirs: list[str] = []
         for dirname in dirnames:
@@ -739,6 +755,9 @@ def iter_source_files(repo_root: Path) -> list[Path]:
             if _glob_ignored(rel, policy.exclude_globs):
                 continue
             out.append(path)
+    if traversal_errors:
+        evidence = "; ".join(traversal_errors[:8])[:2048]
+        raise SourceGraphError(f"source_graph_traversal_error:{evidence}")
     return sorted(set(out))
 
 

@@ -1801,6 +1801,75 @@ def test_rename_regression_no_stale_edge_survives(tmp_path):
         conn.close()
 
 
+def test_traversal_error_preserves_unobserved_subtree_evidence(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "traversal_error")
+    kept = repo / "healthy" / "kept.py"
+    lost = repo / "lost" / "prior.py"
+    _write(
+        kept,
+        "from lost.prior import lost_symbol\n\ndef kept_symbol():\n    return lost_symbol()\n",
+    )
+    _write(
+        lost,
+        "def lost_helper():\n    return 1\n\ndef lost_symbol():\n    return lost_helper()\n",
+    )
+    first = sg.build_index(repo, incremental=True)
+    assert first.errors == []
+
+    db_path = sg.resolve_db_path(repo)
+    conn = sg.connect(db_path)
+    try:
+        before_files = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE file_path='lost/prior.py'"
+        ).fetchone()[0]
+        before_entities = conn.execute(
+            "SELECT COUNT(*) FROM entities WHERE file_path='lost/prior.py'"
+        ).fetchone()[0]
+        before_edges = conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE file_path='lost/prior.py'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert before_files == 1
+    assert before_entities > 0
+    assert before_edges > 0
+
+    _write(
+        kept,
+        "from lost.prior import lost_symbol\n\ndef kept_symbol():\n    return lost_symbol() + 1\n",
+    )
+    original_scandir = os.scandir
+
+    def failing_scandir(path):
+        if Path(path) == lost.parent:
+            raise OSError(errno.EACCES, "injected lost subtree failure", path)
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", failing_scandir)
+    with pytest.raises(sg.SourceGraphError, match="source_graph_traversal_error") as exc:
+        sg.build_index(repo, incremental=True)
+    assert "lost" in str(exc.value)
+    assert "injected lost subtree failure" in str(exc.value)
+    assert len(str(exc.value)) <= 1024
+
+    conn = sg.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM files WHERE file_path='lost/prior.py'"
+        ).fetchone()[0] == before_files
+        assert conn.execute(
+            "SELECT COUNT(*) FROM entities WHERE file_path='lost/prior.py'"
+        ).fetchone()[0] == before_entities
+        assert conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE file_path='lost/prior.py'"
+        ).fetchone()[0] == before_edges
+        matches = sg.func(conn, "lost_symbol")
+        assert any(row["file_path"] == "lost/prior.py" for row in matches)
+        assert sg.context(conn, "lost/prior.py")["found"] is True
+    finally:
+        conn.close()
+
+
 def test_delete_without_replacement_removes_entities_and_edges(tmp_path):
     repo = _new_repo(tmp_path, "repo")
     doomed = repo / "pkg" / "doomed.py"
