@@ -166,9 +166,9 @@ _RISK_SIGNAL_FLOORS = {
 QUALITY_POLICY_SELF_WEAKENED_SIGNAL = "quality_policy_self_weakened"
 
 _SOURCE_CODE_SUFFIXES = frozenset({
-    ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js",
-    ".jsx", ".kt", ".php", ".py", ".pyi", ".rb", ".rs", ".swift",
-    ".ts", ".tsx",
+    ".bash", ".c", ".cc", ".cjs", ".cpp", ".cs", ".go", ".h", ".hpp",
+    ".java", ".js", ".jsx", ".kt", ".mjs", ".php", ".ps1", ".py", ".pyi",
+    ".rb", ".rs", ".sh", ".swift", ".ts", ".tsx", ".zsh",
 })
 
 
@@ -472,7 +472,13 @@ def derive_risk_signals(
     lowered = tuple(path.replace("\\", "/").lower() for path in paths)
     signals: set[str] = set()
     task_type = str(card.get("task_type") or "").strip().lower()
-    if task_type == "code" or any(Path(path).suffix.lower() in _SOURCE_CODE_SUFFIXES for path in paths):
+    if not task_type:
+        project_context = card.get("project_context")
+        if isinstance(project_context, Mapping):
+            task_type = str(project_context.get("task_type") or "").strip().lower()
+    if task_type == "code" or any(
+        Path(path).suffix.lower() in _SOURCE_CODE_SUFFIXES for path in paths
+    ):
         signals.add("code_change")
     if task_type == "code" and not (card.get("validation") or []):
         signals.add("missing_validation")

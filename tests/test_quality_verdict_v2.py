@@ -417,3 +417,49 @@ def test_negative_fixture_matrix_good_green_each_bad_red(tmp_path) -> None:
     assert matrix["good"]["passed"] is True
     assert matrix["bad_syntax"]["passed"] is False
     assert matrix["bad_unavailable"]["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "scripts/build.sh",
+        "scripts/build.bash",
+        "scripts/build.zsh",
+        "scripts/module.mjs",
+        "scripts/module.cjs",
+        "scripts/build.ps1",
+        "scripts/BUILD.SH",
+    ],
+)
+def test_script_and_module_suffixes_are_code_changes(path: str) -> None:
+    signals = qe.derive_risk_signals(
+        {"task_type": "docs", "validation": ["pytest -q"]},
+        [path],
+    )
+
+    assert "code_change" in signals
+
+
+def test_production_project_context_code_task_cannot_bypass_validation_floor() -> None:
+    signals = qe.derive_risk_signals(
+        {"project_context": {"task_type": "code"}},
+        ["scripts/run_stdio.sh"],
+    )
+
+    assert {"code_change", "missing_validation"} <= set(signals)
+    profile = qe.resolve_risk_profile("low", signals=signals)
+    assert profile["effective_tier"] != qe.RISK_LOW
+    assert profile["required_reviewer_lenses"]
+
+
+def test_explicit_non_code_task_type_overrides_project_context() -> None:
+    signals = qe.derive_risk_signals(
+        {
+            "task_type": "docs",
+            "project_context": {"task_type": "code"},
+        },
+        ["README.md"],
+    )
+
+    assert "code_change" not in signals
+    assert "missing_validation" not in signals
