@@ -78,6 +78,47 @@ def _manager(tmp_path: Path, *, show_task, argv) -> process_launcher.ProcessMana
     )
 
 
+def test_launch_reservation_refreshes_snapshot_after_lock_handoff_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    stale_generation = ("stale",)
+    fresh_generation = ("fresh",)
+    snapshots = iter(
+        [
+            ({"stale-request": {"state": "finished"}}, stale_generation),
+            ({"fresh-request": {"state": "finished"}}, fresh_generation),
+        ]
+    )
+    snapshot_calls = 0
+
+    def stable_snapshot():
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return next(snapshots)
+
+    monkeypatch.setattr(manager, "_latest_by_request_stable", stable_snapshot)
+    monkeypatch.setattr(manager, "_ledger_generation", lambda: fresh_generation)
+
+    with manager._launch_reservation(
+        {
+            "request_id": "req-ledger-handoff-race",
+            "task_id": "TASK_B1",
+            "runner": "claude_worker_b1",
+            "topic": "task_mcp",
+            "adapter_id": "claude_cli",
+        }
+    ):
+        pass
+
+    assert snapshot_calls == 2
+    assert manager._events()[-1]["state"] == "starting"
+
+
 def test_grok_kilo_provider_preflight_resolves_only_supported_model(tmp_path) -> None:
     manager = _manager(
         tmp_path,

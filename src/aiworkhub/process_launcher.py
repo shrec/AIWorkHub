@@ -5026,22 +5026,22 @@ class ProcessManager:
         snapshot = self._latest_by_request_stable()
         try:
             with self._lock, self._registry_lock():
-                # ONE sweep re-proves the handed-in snapshot for this whole
-                # critical section.  Everything below decides admission from
-                # it and never re-parses: ``_append_event`` does not take this
-                # lock, so a plain parse here could be interleaved by another
-                # ProcessManager -- or by a supervisor publishing its
-                # ``running`` row -- and would simply not see the reservation
-                # or duplicate it is about to contradict.  Reconciliation
-                # mirrors the rows it retires back into the snapshot, so it
-                # keeps describing the ledger exactly across both halves.
-                latest, generation = self._resolved_reservation_snapshot(snapshot)
-                if generation is None:
+                # Re-prove the handed-in snapshot for this whole critical
+                # section.  The cheap path is one generation sweep.  If a
+                # sibling appended while this launch waited for the lock, take
+                # one fresh bounded bracketed snapshot now that the ledger is
+                # serialized instead of rejecting an otherwise healthy launch.
+                # Reconciliation mirrors the rows it retires back into the
+                # snapshot, so it keeps describing the ledger exactly across
+                # both halves.
+                proven = self._proven_reservation_snapshot(snapshot)
+                if proven is None:
                     # No stable generation could be shown, so any row read
                     # here may be one append behind.  Admitting on that could
                     # duplicate a live task or overrun the limit, so the
                     # launch defers instead of guessing.
                     raise LaunchRejected("ledger_snapshot_unproven")
+                latest, generation = proven
                 self._reconcile_expired_starting_reservations(
                     (latest, generation), resolved=True
                 )
