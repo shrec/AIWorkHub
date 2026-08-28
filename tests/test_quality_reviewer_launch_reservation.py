@@ -2350,7 +2350,8 @@ def test_an_append_between_the_snapshot_and_the_cas_is_never_hidden(tmp_path):
     # the pre-lock snapshot and the admission CAS.  Deciding admission from a
     # plain parse there can simply not see that row -- and the row it misses
     # is the live duplicate of the very task being launched.  The one-sweep
-    # re-proof sees the ledger moved and the launch defers instead.
+    # re-proof sees the ledger moved, and the bounded fresh snapshot exposes
+    # the exact duplicate without admitting on the stale read.
     manager = _manager(tmp_path)
     appender = _manager(tmp_path)
     exact_registry_lock = manager._registry_lock
@@ -2381,22 +2382,11 @@ def test_an_append_between_the_snapshot_and_the_cas_is_never_hidden(tmp_path):
         "topic": TOPIC,
         "adapter_id": ADAPTER,
     }
-    with pytest.raises(process_launcher.LaunchRejected) as deferred:
+    with pytest.raises(process_launcher.LaunchRejected) as duplicate:
         with manager._launch_reservation(dict(launch)):
             pass
 
     assert raced == [True], "the interleaving append must actually have run"
-    assert str(deferred.value) == "ledger_snapshot_unproven"
-    # Nothing was admitted on the unproven read.
-    assert _latest(manager, "racer-req") == {}
-
-    # And the deferral is not a way of losing the conflict: once the ledger is
-    # quiet the very same launch reads the rival row and refuses it for what
-    # it is, so the duplicate is caught rather than merely postponed.
-    manager._registry_lock = exact_registry_lock
-    with pytest.raises(process_launcher.LaunchRejected) as duplicate:
-        with manager._launch_reservation(dict(launch)):
-            pass
     assert str(duplicate.value) == "duplicate_reserved_task:rival-req"
     assert _latest(manager, "racer-req") == {}
     assert _latest(manager, "rival-req")["state"] == "starting"
