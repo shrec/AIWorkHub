@@ -655,15 +655,24 @@ def _expand_discovered_workers(
 
     Configuration is populated from what VS Code reported, never by hand: a
     model newly exposed by the endpoint appears as its own row without a code
-    change. A seed whose own declared model the editor did not report is
-    preserved (readiness marks it unavailable by name) rather than dropped, and
-    a seed for an adapter with no live catalog stays a single row (cold start).
+    change. Explicit concrete rows remain authoritative for their model, while
+    the first configured family row projects any otherwise undeclared models.
+    A seed for an adapter with no live catalog stays a single row (cold start).
     """
 
+    configured = [dict(worker) for worker in workers]
+    explicit_models = {
+        (
+            str(worker.get("adapter_id") or ""),
+            str(worker.get("model") or ""),
+        )
+        for worker in configured
+    }
     expanded: list[dict[str, Any]] = []
-    for worker in workers:
-        row_worker = dict(worker)
-        if str(row_worker.get("adapter_id") or "") not in _DISCOVERY_ADAPTERS:
+    emitted_identities: set[tuple[str, str]] = set()
+    for row_worker in configured:
+        adapter_id = str(row_worker.get("adapter_id") or "")
+        if adapter_id not in _DISCOVERY_ADAPTERS:
             expanded.append(row_worker)
             continue
         discovered = _discovered_family_models(row_worker, ready_by_adapter)
@@ -673,14 +682,23 @@ def _expand_discovered_workers(
         seed_model = str(row_worker.get("model") or "")
         seed_worker_id = str(row_worker.get("worker_id") or "")
         for name in discovered:
-            projected = dict(row_worker, model=name)
-            projected["worker_id"] = seed_worker_id if name == seed_model else name
+            if name != seed_model and (adapter_id, name) in explicit_models:
+                continue
+            projected_worker_id = seed_worker_id if name == seed_model else name
+            identity = (projected_worker_id, name)
+            if identity in emitted_identities:
+                continue
+            projected = dict(row_worker, model=name, worker_id=projected_worker_id)
             projected["discovered_from_editor"] = True
             expanded.append(projected)
+            emitted_identities.add(identity)
         if seed_model and seed_model not in discovered:
-            preserved = dict(row_worker)
-            preserved["discovered_from_editor"] = False
-            expanded.append(preserved)
+            identity = (seed_worker_id, seed_model)
+            if identity not in emitted_identities:
+                preserved = dict(row_worker)
+                preserved["discovered_from_editor"] = False
+                expanded.append(preserved)
+                emitted_identities.add(identity)
     return expanded
 
 

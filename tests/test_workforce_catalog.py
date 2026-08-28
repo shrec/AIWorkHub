@@ -380,6 +380,91 @@ def test_copilot_exact_model_switch_does_not_disable_sibling_model(tmp_path: Pat
     assert by_model["glm-5.3"]["available"] is False
 
 
+def test_explicit_disabled_discovered_model_overrides_family_projection(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    path, _ = workforce_catalog.ensure_catalog(root)
+    catalog = workforce_catalog.load_catalog(root)
+    seed = next(
+        row for row in catalog["workers"] if row["worker_id"] == "glm-5.2"
+    )
+    concrete = dict(seed, worker_id="glm-5.3", model="glm-5.3", enabled=False)
+    catalog["workers"] = [seed, concrete]
+    path.write_text(json.dumps(catalog) + "\n", encoding="utf-8")
+    preflight = {
+        "providers": [{
+            "adapter_id": "glm_vscode_lm",
+            "launchable": True,
+            "status": "ready",
+            "observed_models": ["glm-5.2", "glm-5.3"],
+        }]
+    }
+
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=preflight
+    )
+    relevant = [
+        row
+        for row in snapshot["workers"]
+        if row["adapter_id"] == "glm_vscode_lm"
+        and row["model"] in {"glm-5.2", "glm-5.3"}
+    ]
+    identities = [(row["worker_id"], row["model"]) for row in relevant]
+    assert identities == [("glm-5.2", "glm-5.2"), ("glm-5.3", "glm-5.3")]
+    assert len(identities) == len(set(identities))
+    disabled = next(row for row in relevant if row["model"] == "glm-5.3")
+    assert disabled["enabled"] is False
+    assert disabled["available"] is False
+
+    task = workforce_router.TaskRequirements.build(
+        task_id="T-disabled-discovered",
+        repo_id="repo",
+        kinds=["code"],
+        tool_needs=["filesystem"],
+    )
+    decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
+    candidates = [
+        row for row in decision["candidates"] if row["worker_id"] == "glm-5.3"
+    ]
+    assert len(candidates) == 1
+    assert candidates[0]["excluded"] is True
+    assert decision["selected_worker_id"] != "glm-5.3"
+    assert decision["launch_contract"]["model"] != "glm-5.3"
+
+
+def test_explicit_enabled_discovered_model_stays_authoritative_and_dynamic() -> None:
+    seed = dict(
+        next(
+            row
+            for row in workforce_catalog.DEFAULT_WORKERS
+            if row["worker_id"] == "glm-5.2"
+            and row["adapter_id"] == "glm_vscode_lm"
+            and row["model"] == "glm-5.2"
+        ),
+        manager_score_adjustment=1.0,
+    )
+    concrete = dict(
+        seed,
+        worker_id="glm-5.3",
+        model="glm-5.3",
+        manager_score_adjustment=7.0,
+    )
+    expanded = workforce_catalog._expand_discovered_workers(
+        [seed, concrete],
+        {"glm_vscode_lm": {"observed_models": ["glm-5.2", "glm-5.3", "glm-5.4"]}},
+    )
+
+    assert [(row["worker_id"], row["model"]) for row in expanded] == [
+        ("glm-5.2", "glm-5.2"),
+        ("glm-5.4", "glm-5.4"),
+        ("glm-5.3", "glm-5.3"),
+    ]
+    by_model = {row["model"]: row for row in expanded}
+    assert by_model["glm-5.3"]["manager_score_adjustment"] == 7.0
+    assert by_model["glm-5.4"]["manager_score_adjustment"] == 1.0
+
+
 def test_rank_task_uses_manager_adjustment_without_fabricating_outcomes(tmp_path: Path) -> None:
     root = _root(tmp_path)
     workers = [
