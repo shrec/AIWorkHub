@@ -7069,13 +7069,6 @@ class ProcessManager:
                 lenses=quality_evidence.JUDGMENT_LENSES,
             )
             mark("scope_audits_complete")
-            # Immutable evidence is authenticated reviewer context, not path
-            # authority. Add prose only after the changed-path keyed scope has
-            # been built; the explicit read-only fields below alone select
-            # filesystem inputs.
-            source_evidence["immutable_inputs"] = list(
-                card.get("immutable_inputs") or []
-            )
             target_claim_epoch = card.get("claim_epoch")
             if type(target_claim_epoch) is not int or target_claim_epoch < 1:
                 raise WorkspaceError("quality_review_target_claim_epoch_invalid")
@@ -7099,6 +7092,20 @@ class ProcessManager:
                 source_evidence=source_evidence,
                 scoped_audits=scoped_audits,
             )
+            # Immutable prose is authenticated reviewer contract context, not
+            # candidate path evidence. Keep both exact-path gates pure, then
+            # bind the prose into the sealed packet contract and refresh the
+            # canonical digest before the packet is persisted.
+            contract = packet.get("contract")
+            if not isinstance(contract, dict):
+                raise quality_reviewer.ReviewerEvidenceError(
+                    "review_packet_contract_invalid"
+                )
+            contract["immutable_inputs"] = list(card.get("immutable_inputs") or [])
+            packet_body = {
+                key: value for key, value in packet.items() if key != "packet_sha256"
+            }
+            packet["packet_sha256"] = quality_reviewer._canonical_digest(packet_body)
         except task_store.TaskQueueContended as exc:
             # Distinct from ``quality_review_target_invalid``: the target card is
             # not invalid, the task queue was write-locked by finalization.

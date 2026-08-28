@@ -8100,7 +8100,12 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
         process_launcher.quality_reviewer,
         "build_review_packet",
         lambda **kwargs: packet_kwargs.update(kwargs)
-        or {"packet_sha256": "a" * 64},
+        or {
+            "schema_id": "aiworkhub.quality_review.packet.v1",
+            "contract": {},
+            "candidate": {},
+            "packet_sha256": "a" * 64,
+        },
     )
 
     result = manager._build_quality_review_packet(request_id, "TARGET_TASK")
@@ -8112,6 +8117,15 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
         "docs/SOURCE_GRAPH.md",
     ]
     assert set(scoped_kwargs["source_evidence"]) == {"src/changed.py"}
-    assert packet_kwargs["source_evidence"]["immutable_inputs"] == [
+    assert set(packet_kwargs["source_evidence"]) == {"src/changed.py"}
+    assert prepared["packet"]["contract"]["immutable_inputs"] == [
         "The archived predecessor passed its tests before this review."
     ]
+    packet_body = {
+        key: value
+        for key, value in prepared["packet"].items()
+        if key != "packet_sha256"
+    }
+    assert prepared["packet"]["packet_sha256"] == (
+        process_launcher.quality_reviewer._canonical_digest(packet_body)
+    )
