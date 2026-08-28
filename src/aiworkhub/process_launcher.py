@@ -7046,6 +7046,12 @@ class ProcessManager:
             source_evidence = self._quality_review_source_evidence(
                 workspace, current_hashes
             )
+            # Immutable evidence is authenticated reviewer context, not path
+            # authority. Keep the prose inside the packet-hashed evidence while
+            # the explicit read-only fields below alone select filesystem inputs.
+            source_evidence["immutable_inputs"] = list(
+                card.get("immutable_inputs") or []
+            )
             initial_gate = evidence.get("quality_gate") or {}
             mark("scope_audits_started")
             scoped_audits = quality_review_scope.build_scoped_audits(
@@ -7075,7 +7081,7 @@ class ProcessManager:
             read_only_input_paths = _worker_workspace.quality_review_read_only_input_paths(
                 self.repo,
                 read_first=card.get("read_first") or [],
-                immutable_inputs=card.get("immutable_inputs") or [],
+                immutable_input_paths=card.get("immutable_input_paths") or [],
             )
             packet = quality_reviewer.build_review_packet(
                 request_id=target_request_id,
@@ -7582,6 +7588,7 @@ class ProcessManager:
         """
 
         snapshot = self._latest_by_request_stable()
+        terminal_intent_recorded = False
         with self._registry_lock():
             if request_id in self._live:
                 return
@@ -7593,10 +7600,15 @@ class ProcessManager:
                 return
             if latest.get("state") != "starting":
                 return
+            terminal_intent_recorded = self._record_reviewer_terminal_intent(
+                request_id, latest, reason
+            ) in {"recorded", "already_recorded"}
             self._blocked(
                 task_id, runner, "quality_review", adapter_id, reason,
                 request_id=request_id,
             )
+        if terminal_intent_recorded:
+            self._settle_reviewer_terminal_intents_contained()
 
     def _reviewer_source_graph_prewarm_live_event(
         self, event: dict[str, Any]

@@ -1427,13 +1427,15 @@ def test_quality_review_read_only_input_paths_are_strict_path_declarations(
     subprocess.run(["git", "commit", "-qm", "baseline"], cwd=repo, check=True)
 
     assert worker_workspace.quality_review_read_only_input_paths(
-        repo, read_first=["README.md"], immutable_inputs=["Makefile"]
+        repo, read_first=["README.md"], immutable_input_paths=["Makefile"]
     ) == ["Makefile", "README.md"]
     assert worker_workspace.quality_review_read_only_input_paths(
-        repo, read_first=["docs/path with spaces.md"], immutable_inputs=[]
+        repo,
+        read_first=[str(repo / "docs" / "path with spaces.md")],
+        immutable_input_paths=[],
     ) == ["docs/path with spaces.md"]
     assert worker_workspace.quality_review_read_only_input_paths(
-        repo, read_first=["docs/*.md"], immutable_inputs=[]
+        repo, read_first=["docs/*.md"], immutable_input_paths=[]
     ) == ["docs/contract.md", "docs/path with spaces.md"]
 
     for invalid in (
@@ -1443,7 +1445,7 @@ def test_quality_review_read_only_input_paths_are_strict_path_declarations(
     ):
         with pytest.raises(worker_workspace.WorkspaceError):
             worker_workspace.quality_review_read_only_input_paths(
-                repo, read_first=[invalid], immutable_inputs=[]
+                repo, read_first=[invalid], immutable_input_paths=[]
             )
 
     symlink = repo / "link.md"
@@ -1456,5 +1458,5 @@ def test_quality_review_read_only_input_paths_are_strict_path_declarations(
         match="symlink_path_component_forbidden",
     ):
         worker_workspace.quality_review_read_only_input_paths(
-            repo, read_first=["link.md"], immutable_inputs=[]
+            repo, read_first=["link.md"], immutable_input_paths=[]
         )

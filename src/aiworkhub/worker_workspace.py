@@ -3845,7 +3845,16 @@ def _quality_review_read_only_input_paths(
     repo: Path,
     declarations: Iterable[str],
 ) -> list[str]:
-    inputs = _expand_declared(repo, declarations)
+    normalized: list[str] = []
+    repo = repo.resolve()
+    for declaration in declarations:
+        raw = str(declaration)
+        declared = Path(raw)
+        if declared.is_absolute():
+            _require_beneath(repo, declared)
+            raw = declared.relative_to(repo).as_posix()
+        normalized.append(raw)
+    inputs = _expand_declared(repo, normalized)
     for relative in inputs:
         source = repo / relative
         _require_beneath(repo, source)
@@ -3862,11 +3871,18 @@ def quality_review_read_only_input_paths(
     repo: Path,
     *,
     read_first: Iterable[str],
-    immutable_inputs: Iterable[str],
+    immutable_input_paths: Iterable[str] = (),
 ) -> list[str]:
+    """Resolve only schema-declared reviewer file inputs.
+
+    ``immutable_inputs`` is narrative task evidence and is intentionally not
+    accepted here. File materialization authority comes from explicit path
+    fields, so prose can never become a filesystem declaration.
+    """
+
     return _quality_review_read_only_input_paths(
         repo,
-        [*read_first, *immutable_inputs],
+        [*read_first, *immutable_input_paths],
     )
 
 

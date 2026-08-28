@@ -8054,6 +8054,7 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
             "allowed_writes": ["src/changed.py"],
             "read_first": ["README.md"],
             "immutable_inputs": ["docs/SOURCE_GRAPH.md"],
+            "immutable_input_paths": ["docs/SOURCE_GRAPH.md"],
             "terminal_review": {
                 "evidence": {
                     "workspace": workspace.as_metadata(),
