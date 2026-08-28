@@ -4036,6 +4036,69 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     reaches this count, so a worker cannot satisfy the gate by writing text
     that merely looks like an audit entry.
     """
+    inherited_gate_receipt = (metadata.get("worker_mcp") or {}).get(
+        "inherited_predecessor_gate"
+    )
+    if metadata.get("execution_mode") == "validation_only_replay" and isinstance(
+        inherited_gate_receipt, dict
+    ):
+        predecessor = metadata.get("rework_predecessor") or {}
+        authorization = metadata.get("validation_only_replay_authorization") or {}
+        bindings_match = (
+            inherited_gate_receipt.get("task_id") == metadata.get("task_id")
+            and inherited_gate_receipt.get("predecessor_request_id")
+            == predecessor.get("request_id")
+            == authorization.get("predecessor_request_id")
+            and inherited_gate_receipt.get("changed_path_hashes")
+            == predecessor.get("changed_path_hashes")
+            == authorization.get("changed_path_hashes")
+            and inherited_gate_receipt.get("next_claim_epoch")
+            == metadata.get("claim_epoch")
+            == authorization.get("next_claim_epoch")
+        )
+        inherited_gate = inherited_gate_receipt.get("worker_mcp_gate")
+        inherited_verification = (
+            inherited_gate.get("verification")
+            if isinstance(inherited_gate, dict)
+            else None
+        )
+        if (
+            not bindings_match
+            or not isinstance(inherited_gate, dict)
+            or inherited_gate.get("gated") is not True
+            or inherited_gate.get("satisfied") is not True
+            or not isinstance(inherited_verification, dict)
+            or inherited_verification.get("ok") is not True
+        ):
+            return {
+                "gated": True,
+                "task_type": str(inherited_gate_receipt.get("task_type") or "code"),
+                "required_tools": list(
+                    inherited_gate_receipt.get("required_tools") or []
+                ),
+                "missing_tools": [],
+                "satisfied": False,
+                "reason": "validation_only_replay_predecessor_mcp_receipt_mismatch",
+                "observation_only": False,
+                "inherited_predecessor_evidence": True,
+            }
+        result = dict(inherited_gate)
+        required_tools = list(result.get("required_tools") or [])
+        result.update({
+            "gated": True,
+            "satisfied": True,
+            "observation_only": False,
+            "required_tools": required_tools,
+            "missing_tools": [],
+            "reason": "",
+            "inherited_predecessor_evidence": True,
+            "fresh_current_request_worker_calls": False,
+            "satisfaction_by_tool": {
+                tool: "authenticated_predecessor_gate" for tool in required_tools
+            },
+        })
+        return result
+
     context_metadata = metadata.get("project_context") or {}
     task_type = str(
         (context_metadata.get("task_context_policy") or {}).get("task_type") or ""
@@ -4053,9 +4116,9 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             )
         except repo_policy.RepoPolicyError as exc:
             policy_error = f"repo_policy_invalid:{exc}"
-    required_tools: list[str] = []
+    gate_required_tools: list[str] = []
     if task_type == "code" and tools_policy.get("source_graph_required_for_code"):
-        required_tools.append("source_graph")
+        gate_required_tools.append("source_graph")
     if (
         task_type == "code"
         and tools_policy.get("session_memory_kb_required_for_nontrivial")
@@ -4066,9 +4129,9 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             name = str(section.get("name") or "")
             if (
                 name in {"session_current_state", "ai_memory", "kb"}
-                and name not in required_tools
+                and name not in gate_required_tools
             ):
-                required_tools.append(name)
+                gate_required_tools.append(name)
     # An explicit required project-context contract is stronger than the
     # repository's generic code-task defaults.  Research/read-only cards use
     # this path too, so derive their blocking tools from the exact requested
@@ -4078,14 +4141,14 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             if not isinstance(section, dict) or not section.get("requested", True):
                 continue
             name = str(section.get("name") or "")
-            if name in _GATEABLE_CONTEXT_SECTIONS and name not in required_tools:
-                required_tools.append(name)
-    gated = bool(required_tools) and (task_type == "code" or context_required)
-    result: dict[str, Any] = {
+            if name in _GATEABLE_CONTEXT_SECTIONS and name not in gate_required_tools:
+                gate_required_tools.append(name)
+    gated = bool(gate_required_tools) and (task_type == "code" or context_required)
+    gate_result: dict[str, Any] = {
         "gated": gated,
         "task_type": task_type,
         "project_context_required": context_required,
-        "required_tools": required_tools if gated else [],
+        "required_tools": gate_required_tools if gated else [],
         "missing_tools": [],
         "satisfied": True,
         "reason": "",
@@ -4111,20 +4174,20 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     # data-classification tasks as well, while preserving their non-gated
     # completion semantics.
     injected_acknowledged, injected_tools = _injected_context_satisfaction(metadata)
-    result["injected_context_acknowledged"] = injected_acknowledged
+    gate_result["injected_context_acknowledged"] = injected_acknowledged
     if policy_error:
-        result["gated"] = True
-        result["satisfied"] = False
-        result["reason"] = policy_error
-        return result
+        gate_result["gated"] = True
+        gate_result["satisfied"] = False
+        gate_result["reason"] = policy_error
+        return gate_result
     ledger_path = worker_mcp_meta.get("audit_ledger_path")
     key_path = worker_mcp_meta.get("audit_hmac_key_path")
     if not ledger_path or not key_path:
-        result["telemetry_reason"] = "worker_mcp_runtime_not_provisioned"
+        gate_result["telemetry_reason"] = "worker_mcp_runtime_not_provisioned"
         if gated:
-            result["satisfied"] = False
-            result["reason"] = "worker_mcp_runtime_not_provisioned"
-        return result
+            gate_result["satisfied"] = False
+            gate_result["reason"] = "worker_mcp_runtime_not_provisioned"
+        return gate_result
     verification = worker_ai_tools_mcp.verify_audit_ledger(
         Path(str(ledger_path)),
         Path(str(key_path)),
@@ -4135,9 +4198,11 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     )
     # Bounded/redacted by construction: verify_audit_ledger never returns raw
     # paths, prompts, or database contents -- only counts and a short reason.
-    result["verification"] = {k: v for k, v in verification.items() if k != "schema_id"}
-    result["telemetry_observed"] = bool(verification.get("ok"))
-    result["telemetry_reason"] = str(verification.get("reason") or "")
+    gate_result["verification"] = {
+        k: v for k, v in verification.items() if k != "schema_id"
+    }
+    gate_result["telemetry_observed"] = bool(verification.get("ok"))
+    gate_result["telemetry_reason"] = str(verification.get("reason") or "")
     # Authenticated-ledger numeric decoding fails closed with a named refusal:
     # a malformed count is never an exception escaping this gate boundary.
     policy_violations = _decode_ledger_int(verification.get("policy_violations"))
@@ -4165,16 +4230,16 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
                 break
             successful[str(tool_name)] = decoded_count
     if ledger_decode_failure:
-        result["gated"] = True
-        result["satisfied"] = False
-        result["reason"] = (
+        gate_result["gated"] = True
+        gate_result["satisfied"] = False
+        gate_result["reason"] = (
             "audit_ledger_numeric_decode_failed:" + ledger_decode_failure
         )
-        return result
-    result["policy_warning"] = policy_violations > 0
-    result["policy_warning_count"] = policy_violations
+        return gate_result
+    gate_result["policy_warning"] = policy_violations > 0
+    gate_result["policy_warning_count"] = policy_violations
     if policy_violations:
-        result["warnings"] = [
+        gate_result["warnings"] = [
             f"denied_aiworkhub_tool_requests_recovered:{policy_violations}"
         ]
     # A receipt that declares itself blocking is authority to refuse, not a
@@ -4189,17 +4254,17 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             for item in (receipt_conformance.get("blockers") or [])
             if str(item)
         ]
-        result["gated"] = True
-        result["satisfied"] = False
-        result["receipt_conformance_blocking"] = True
-        result["reason"] = (
+        gate_result["gated"] = True
+        gate_result["satisfied"] = False
+        gate_result["receipt_conformance_blocking"] = True
+        gate_result["reason"] = (
             "receipt_conformance_blocking:" + ",".join(blockers)
             if blockers
             else "receipt_conformance_blocking"
         )
-        return result
+        return gate_result
     if not gated:
-        return result
+        return gate_result
     # ``successful`` was decoded above with fail-closed numeric handling.
     # Injected context accelerates startup but does not prove continuous tool
     # use.  In particular, Source Graph must have a fresh authenticated worker
@@ -4225,7 +4290,7 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     else:
         missing.append("source_graph")
     rework_attempt = _is_rework_attempt(metadata)
-    for tool in required_tools:
+    for tool in gate_required_tools:
         if tool == "source_graph":
             continue
         if int(successful.get(tool) or 0) > 0:
@@ -4242,11 +4307,11 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             satisfaction_by_tool[tool] = "rework_predecessor_receipt"
         else:
             missing.append(tool)
-    result["missing_tools"] = missing
-    result["stale_tools"] = stale
-    result["satisfaction_by_tool"] = satisfaction_by_tool
+    gate_result["missing_tools"] = missing
+    gate_result["stale_tools"] = stale
+    gate_result["satisfaction_by_tool"] = satisfaction_by_tool
     if not verification.get("ok") or missing or stale:
-        result["satisfied"] = False
+        gate_result["satisfied"] = False
         reasons: list[str] = []
         if missing:
             prefix = (
@@ -4257,8 +4322,8 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             reasons.append(prefix + ",".join(missing))
         if stale:
             reasons.append("source_graph_stale_or_cached:" + ",".join(stale))
-        result["reason"] = verification.get("reason") or "; ".join(reasons)
-    return result
+        gate_result["reason"] = verification.get("reason") or "; ".join(reasons)
+    return gate_result
 
 
 _QUALITY_REVIEW_RECEIPT_TOP_KEYS = frozenset(
@@ -6440,6 +6505,81 @@ class ProcessManager:
     ) -> int:
         return len(self._active_request_ids(latest))
 
+    def _validation_replay_predecessor_mcp_receipt(
+        self,
+        card: Mapping[str, Any],
+        authorization: Mapping[str, Any],
+        task_id: str,
+    ) -> dict[str, Any] | None:
+        """Return exact authenticated predecessor MCP truth for a code replay."""
+
+        context = card.get("project_context")
+        context = context if isinstance(context, dict) else {}
+        task_type = str(context.get("task_type") or "")
+        if task_type != "code" and context.get("required") is not True:
+            return None
+        predecessor_request_id = str(
+            authorization.get("predecessor_request_id") or ""
+        )
+        predecessor_event = next(
+            (
+                event
+                for event in reversed(self._events())
+                if event.get("request_id") == predecessor_request_id
+                and event.get("task_id") == task_id
+                and event.get("state") in TERMINAL_PROCESS_STATES
+            ),
+            None,
+        )
+        if predecessor_event is None:
+            raise LaunchRejected(
+                "validation_only_replay_predecessor_terminal_event_missing"
+            )
+        gate = predecessor_event.get("worker_mcp_gate")
+        if not isinstance(gate, dict):
+            raise LaunchRejected(
+                "validation_only_replay_predecessor_worker_mcp_gate_missing"
+            )
+        verification = gate.get("verification")
+        if (
+            gate.get("gated") is not True
+            or gate.get("satisfied") is not True
+            or not isinstance(verification, dict)
+            or verification.get("ok") is not True
+        ):
+            verification_reason = (
+                verification.get("reason") if isinstance(verification, dict) else ""
+            )
+            raise LaunchRejected(
+                "validation_only_replay_predecessor_worker_mcp_gate_unsatisfied:"
+                + str(gate.get("reason") or verification_reason)[:200]
+            )
+        required_tools = [str(tool) for tool in (gate.get("required_tools") or [])]
+        return {
+            "schema_id": "aiworkhub.task_mcp.validation_replay_predecessor_gate.v1",
+            "task_id": task_id,
+            "predecessor_request_id": predecessor_request_id,
+            "changed_path_hashes": dict(
+                authorization.get("changed_path_hashes") or {}
+            ),
+            "next_claim_epoch": authorization.get("next_claim_epoch"),
+            "task_type": str(gate.get("task_type") or task_type),
+            "required_tools": required_tools,
+            "worker_mcp_gate": {
+                "gated": True,
+                "task_type": str(gate.get("task_type") or task_type),
+                "project_context_required": bool(
+                    gate.get("project_context_required")
+                ),
+                "required_tools": required_tools,
+                "missing_tools": [],
+                "satisfied": True,
+                "reason": "",
+                "observation_only": False,
+                "verification": dict(verification),
+            },
+        }
+
     def launch(
         self,
         *,
@@ -6505,6 +6645,9 @@ class ProcessManager:
         sandboxed validation, review evidence, and the terminal transition.
         """
 
+        predecessor_mcp_receipt = self._validation_replay_predecessor_mcp_receipt(
+            card, authorization, task_id
+        )
         request_id = uuid.uuid4().hex
         workspace: WorkerWorkspace | None = None
         claimed = False
@@ -6587,12 +6730,38 @@ class ProcessManager:
                         "total_bytes": 0,
                         "byte_labels_are_token_truth": False,
                     },
-                    "project_context": None,
+                    "project_context": (
+                        {
+                            "required": bool(
+                                predecessor_mcp_receipt["worker_mcp_gate"].get(
+                                    "project_context_required"
+                                )
+                            ),
+                            "task_context_policy": {
+                                "task_type": predecessor_mcp_receipt["task_type"]
+                            },
+                            "sections": [
+                                {"name": tool, "requested": True}
+                                for tool in predecessor_mcp_receipt["required_tools"]
+                            ],
+                            "inherited_predecessor_evidence": True,
+                        }
+                        if predecessor_mcp_receipt is not None
+                        else None
+                    ),
                     "project_context_delivery": {
                         "injected": False,
-                        "reason": "deterministic_validation_only_replay",
+                        "reason": (
+                            "authenticated_predecessor_gate_inherited"
+                            if predecessor_mcp_receipt is not None
+                            else "deterministic_validation_only_replay"
+                        ),
                     },
-                    "worker_mcp": {},
+                    "worker_mcp": (
+                        {"inherited_predecessor_gate": predecessor_mcp_receipt}
+                        if predecessor_mcp_receipt is not None
+                        else {}
+                    ),
                     "sandbox_backend": "deterministic_validation",
                     "validation": list(card.get("validation") or []),
                     "validation_roles": list(card.get("validation_roles") or []),

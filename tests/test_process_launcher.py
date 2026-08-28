@@ -2686,6 +2686,135 @@ def test_validation_only_replay_authorization_fails_closed_before_launch():
         )
 
 
+def test_validation_only_replay_code_task_requires_satisfied_exact_predecessor_mcp_gate(
+    monkeypatch, tmp_path
+):
+    card = {
+        "task_id": "TASK_REPLAY",
+        "project_context": {"task_type": "code", "required": True},
+    }
+    authorization = {
+        "predecessor_request_id": "predecessor-7",
+        "changed_path_hashes": {"out/result.py": "b" * 64},
+        "next_claim_epoch": 7,
+    }
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(task_id="TASK_REPLAY")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "create_workspace",
+        lambda *a, **k: pytest.fail("workspace must not be created"),
+    )
+
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match="validation_only_replay_predecessor_terminal_event_missing",
+    ):
+        manager._launch_validation_only_replay(
+            task_id="TASK_REPLAY",
+            runner="claude_worker_b1",
+            topic="task_mcp",
+            adapter_id="claude_cli",
+            model=None,
+            timeout_seconds=30,
+            card=card,
+            authorization=authorization,
+        )
+
+    manager._append_event({
+        "request_id": "predecessor-7",
+        "task_id": "TASK_REPLAY",
+        "state": "validation_failed",
+        "worker_mcp_gate": {
+            "gated": True,
+            "satisfied": False,
+            "required_tools": ["source_graph", "session_current_state"],
+            "reason": "worker_mcp_required_tools_missing:session_current_state",
+            "verification": {"ok": True},
+        },
+    })
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match="validation_only_replay_predecessor_worker_mcp_gate_unsatisfied",
+    ):
+        manager._validation_replay_predecessor_mcp_receipt(
+            card, authorization, "TASK_REPLAY"
+        )
+
+
+def test_validation_only_replay_inherits_authenticated_predecessor_mcp_truth(tmp_path):
+    card = {
+        "task_id": "TASK_REPLAY",
+        "project_context": {"task_type": "code", "required": True},
+    }
+    authorization = {
+        "predecessor_request_id": "predecessor-green",
+        "changed_path_hashes": {"out/result.py": "c" * 64},
+        "next_claim_epoch": 8,
+    }
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(task_id="TASK_REPLAY")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event({
+        "request_id": "predecessor-green",
+        "task_id": "TASK_REPLAY",
+        "state": "review_ready",
+        "worker_mcp_gate": {
+            "gated": True,
+            "task_type": "code",
+            "project_context_required": True,
+            "required_tools": [
+                "source_graph",
+                "session_current_state",
+                "ai_memory",
+                "kb",
+            ],
+            "satisfied": True,
+            "verification": {"ok": True, "verified_entries": 4},
+        },
+    })
+    receipt = manager._validation_replay_predecessor_mcp_receipt(
+        card, authorization, "TASK_REPLAY"
+    )
+    metadata = {
+        "execution_mode": "validation_only_replay",
+        "request_id": "replay-8",
+        "task_id": "TASK_REPLAY",
+        "claim_epoch": 8,
+        "rework_predecessor": {
+            "request_id": "predecessor-green",
+            "changed_path_hashes": {"out/result.py": "c" * 64},
+        },
+        "validation_only_replay_authorization": authorization,
+        "worker_mcp": {"inherited_predecessor_gate": receipt},
+    }
+
+    gate = process_launcher._worker_mcp_live_call_gate(metadata, "replay-8")
+    assert gate["satisfied"] is True
+    assert gate["required_tools"] == [
+        "source_graph",
+        "session_current_state",
+        "ai_memory",
+        "kb",
+    ]
+    assert gate["fresh_current_request_worker_calls"] is False
+    assert set(gate["satisfaction_by_tool"].values()) == {
+        "authenticated_predecessor_gate"
+    }
+
+    metadata["rework_predecessor"]["changed_path_hashes"] = {
+        "out/result.py": "d" * 64
+    }
+    assert process_launcher._worker_mcp_live_call_gate(metadata, "replay-8")[
+        "satisfied"
+    ] is False
+
+
 def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
     monkeypatch, tmp_path
 ):
