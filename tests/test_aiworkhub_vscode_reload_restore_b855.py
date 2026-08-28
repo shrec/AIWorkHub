@@ -66,7 +66,7 @@ def test_revive_dashboard_panel_disposes_stale_controller_first() -> None:
     McpStdioClient binding) must be disposed before the new one is adopted."""
     revive_block = _function_body(_EXT_SOURCE, r"function reviveDashboardPanel\(", max_len=800)
     dispose_index = revive_block.find(".dispose(")
-    panel_assignment_index = revive_block.find("panel = webviewPanel;")
+    panel_assignment_index = revive_block.find("panel = ownedPanel;")
     assert dispose_index != -1, "reviveDashboardPanel must dispose a stale controller"
     assert panel_assignment_index != -1
     assert dispose_index < panel_assignment_index, (
