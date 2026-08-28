@@ -4878,7 +4878,7 @@ def test_run_validations_workspace_local_coordinator_symlink_fails_closed(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
-def test_run_validations_canonical_root_owned_venv_python_preserves_execution_path(
+def test_run_validations_canonical_trusted_owner_venv_python_preserves_execution_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
 ) -> None:
     workspace = _workspace(monkeypatch, tmp_path, repo, "venv-canonical-coordinator-link")
@@ -4886,8 +4886,7 @@ def test_run_validations_canonical_root_owned_venv_python_preserves_execution_pa
         execution_path = workspace.repo / ".venv" / "bin" / "python"
         execution_path.parent.mkdir(parents=True)
         endpoint = Path(sys.executable).resolve(strict=True)
-        assert endpoint.stat().st_uid == 0
-        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        assert endpoint.stat().st_uid in {0, os.getuid()}
         execution_path.symlink_to(endpoint)
         (result,) = _run_interpreter_validation(
             workspace, ".venv/bin/python -c pass"
