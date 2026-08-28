@@ -73,7 +73,7 @@ def test_task_create_schema_remains_unchanged():
     ]
 
 
-def test_create_from_template_rejects_scope_and_validation_overrides():
+def test_create_from_template_rejects_scope_but_accepts_validation_overrides():
     params = inspect.signature(server.aiworkhub_task_create_from_template).parameters
     for name in (
         "allowed_writes",
@@ -82,10 +82,10 @@ def test_create_from_template_rejects_scope_and_validation_overrides():
         "read_only",
         "task_type",
         "work_kind",
-        "validation",
-        "validation_roles",
     ):
         assert name not in params
+    assert params["validation"].default is None
+    assert params["validation_roles"].default is None
 
 
 def test_create_from_template_bugfix_forwards_generated_fields(monkeypatch):

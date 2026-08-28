@@ -1120,15 +1120,19 @@ def aiworkhub_task_create_from_template(
     immutable_inputs: list[str] | None = None,
     max_live_tokens: int | None = None,
     risk_tier: str | None = None,
+    validation: list[str] | None = None,
+    validation_roles: list[str] | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one task from an authenticated template.
 
     Callers supply routing fields, task text/acceptance, a template ID, and
     explicit production/test paths. Generated ``allowed_writes``,
     ``required_outputs``, ``read_first``, ``read_only``, ``task_type``,
-    ``work_kind``, ``validation`` and ``validation_roles`` are taken from
-    template expansion and cannot be overridden. Malformed, stale, or forged
-    template IDs and unsafe paths fail closed before ``create_task``.
+    ``work_kind`` are taken from template expansion. Validation commands and
+    their one-to-one roles may be overridden together; when both are omitted,
+    the generated defaults are preserved. Malformed, stale, or forged template
+    IDs, unsafe paths, and incomplete validation overrides fail closed before
+    ``create_task``. Provenance authenticates the final expanded contract.
     """
     try:
         card = task_templates.expand_template(
@@ -1138,11 +1142,31 @@ def aiworkhub_task_create_from_template(
             title=title,
             objective=objective,
         )
-        quality_evidence.normalize_behavioral_contract(
-            card["work_kind"],
-            card["validation"],
-            card["validation_roles"],
-        )
+        override_requested = validation is not None or validation_roles is not None
+        if override_requested:
+            if validation is None or validation_roles is None:
+                raise task_templates.TaskTemplateError(
+                    "validation_override_pair_required"
+                )
+            task_templates.validate_custom_validation_roles(
+                validation, validation_roles
+            )
+            _work_kind, normalized_roles = (
+                quality_evidence.normalize_behavioral_contract(
+                    card["work_kind"], validation, validation_roles
+                )
+            )
+            card = {
+                **card,
+                "validation": list(validation),
+                "validation_roles": normalized_roles,
+            }
+        else:
+            quality_evidence.normalize_behavioral_contract(
+                card["work_kind"],
+                card["validation"],
+                card["validation_roles"],
+            )
         provenance = task_templates.template_provenance_payload(
             card, classification_reason="explicit_template"
         )

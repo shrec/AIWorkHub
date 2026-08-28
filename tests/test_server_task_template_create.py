@@ -282,6 +282,88 @@ def test_from_template_provenance_error_is_lifecycle_error(
     _assert_lifecycle_error(result, "classification_reason_invalid")
 
 
+def test_from_template_validation_override_is_authenticated_and_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _ready_repo(tmp_path, monkeypatch)
+    validation = [
+        "python3 scripts/release_metadata.py check --tag v0.10.65",
+        "python3 scripts/check_release_assurance.py",
+        "python3 scripts/check_evidence_pack.py",
+        "python3 scripts/check_public_docs.py",
+        "git diff --check",
+    ]
+    roles = ["generic"] * len(validation)
+    kwargs = _from_template_kwargs(
+        task_id="TASK_NF489_OVERRIDE",
+        template_id="docs_change",
+        production_paths=["CHANGELOG.md", "vscode-extension/README.md"],
+        test_paths=None,
+        validation=validation,
+        validation_roles=roles,
+    )
+
+    first = server.aiworkhub_task_create_from_template(**kwargs)  # type: ignore[arg-type]
+    assert first["ok"] is True
+    stored = task_store.get_task(repo, "TASK_NF489_OVERRIDE")
+    assert stored is not None
+    assert stored["validation"] == validation
+    assert stored["validation_roles"] == roles
+    assert first["template_provenance"] == stored["template_provenance"]
+    assert first["template_provenance"]["expanded_contract_digest"] == (
+        task_templates.expanded_contract_digest(stored)
+    )
+
+    retry = server.aiworkhub_task_create_from_template(**kwargs)  # type: ignore[arg-type]
+    assert retry["ok"] is True
+    assert retry["created"] is False
+    assert retry["reconciled"] is True
+    assert retry["receipt_state"] == "existing_identical"
+
+    changed = server.aiworkhub_task_create_from_template(  # type: ignore[arg-type]
+        **{**kwargs, "validation": [*validation[:-1], "git status --short"]}
+    )
+    assert changed["ok"] is False
+    assert changed["stderr"] == "task_already_exists:TASK_NF489_OVERRIDE"
+    assert {"validation", "template_provenance"} <= set(
+        changed["conflict_fields"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "stderr"),
+    [
+        ({"validation": ["git diff --check"]}, "validation_override_pair_required"),
+        ({"validation_roles": ["generic"]}, "validation_override_pair_required"),
+        (
+            {
+                "validation": ["git diff --check", "git status --short"],
+                "validation_roles": ["generic"],
+            },
+            "validation_roles_length_mismatch",
+        ),
+        (
+            {
+                "validation": ["git diff --check"],
+                "validation_roles": ["not-a-role"],
+            },
+            "invalid_validation_role",
+        ),
+    ],
+)
+def test_from_template_validation_override_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+    stderr: str,
+) -> None:
+    _ready_repo(tmp_path, monkeypatch)
+    result = server.aiworkhub_task_create_from_template(  # type: ignore[arg-type]
+        **_from_template_kwargs(**overrides)
+    )
+    _assert_lifecycle_error(result, stderr)
+
+
 def test_task_template_list_is_deterministic_and_repository_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
