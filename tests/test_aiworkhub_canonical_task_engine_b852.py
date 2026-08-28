@@ -1087,6 +1087,21 @@ def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
     result = core.manager_bootstrap()
     assert result["role"] == "manager"
+    matrix = result["responsibility_matrix"]
+    assert matrix["schema_id"] == "aiworkhub.manager_responsibility_matrix.v1"
+    system = matrix["aiworkhub_system"]
+    assert "lifecycle and liveness" in system["owned_duties"][0]
+    assert "cancellation" in system["owned_duties"][2]
+    assert "Does not infer acceptance" in system["fail_closed_limitations"][0]
+    assert "completion inbox" in system["recovery_surfaces"][2]
+    manager = matrix["manager"]
+    assert "Source Graph-first" in manager["owned_duties"][1]
+    assert "callbacks" in manager["fail_closed_limitations"][1]
+    assert "aiworkhub_task_mark_done" in manager["recovery_surfaces"][2]
+    worker = matrix["worker_model"]
+    assert "exact card scope" in worker["owned_duties"][0]
+    assert "allowed writes" in worker["fail_closed_limitations"][0]
+    assert "aiworkhub_task_mark_review" in worker["recovery_surfaces"][2]
     contract = result["operating_contract"]
     assert contract["schema_id"] == "aiworkhub.manager_operating_contract.v1"
     assert contract["mandatory"] is True

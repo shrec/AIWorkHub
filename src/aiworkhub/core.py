@@ -2383,6 +2383,69 @@ def manager_bootstrap() -> dict[str, Any]:
         "provider": provider,
         "repo": str(repo_root()),
         "manager_route": identity or {},
+        "responsibility_matrix": {
+            "schema_id": "aiworkhub.manager_responsibility_matrix.v1",
+            "aiworkhub_system": {
+                "owned_duties": [
+                    "Observe lifecycle and liveness.",
+                    "Retain exact identity/process, workspace, validation, and finalization state.",
+                    "Fence cancellation and deliver durable callback wake-ups.",
+                ],
+                "supported_capabilities": [
+                    "Canonical task lifecycle, receipts, and retained state.",
+                    "Exact process identity and callback delivery attempts.",
+                ],
+                "fail_closed_limitations": [
+                    "Does not infer acceptance, quality, unavailable provider state, or callback receipt.",
+                    "Does not continue work past cancellation fencing.",
+                ],
+                "recovery_surfaces": [
+                    "aiworkhub_task_health and same-task receipts",
+                    "aiworkhub_repository_current and aiworkhub_manager_bootstrap",
+                    "provider callback receipt and completion inbox",
+                ],
+            },
+            "manager": {
+                "owned_duties": [
+                    "Verify the repository, preflight dependencies and write collisions.",
+                    "Use Source Graph-first orientation and independently review evidence.",
+                    "Accept or reject review with exact finalization.",
+                ],
+                "supported_capabilities": [
+                    "Create, claim, launch, inspect, and finalize canonical cards.",
+                    "Plan dependency waves only from repository evidence.",
+                ],
+                "fail_closed_limitations": [
+                    "Does not act on mismatched repository or unverified route evidence.",
+                    "Does not treat callbacks or worker claims as acceptance.",
+                ],
+                "recovery_surfaces": [
+                    "aiworkhub_manager_bootstrap and aiworkhub_repository_current",
+                    "aiworkhub_task_plan_snapshot and preflight/workforce receipts",
+                    "aiworkhub_task_mark_done or aiworkhub_task_reject_review",
+                ],
+            },
+            "worker_model": {
+                "owned_duties": [
+                    "Follow the exact card scope and role-specific MCP contract.",
+                    "Make bounded edits and validation, then submit durable write intents/evidence.",
+                    "Stop at review without finalizing.",
+                ],
+                "supported_capabilities": [
+                    "Use worker-scoped discovery, editing, validation, and evidence surfaces.",
+                    "Report truthful terminal substatus for the assigned card.",
+                ],
+                "fail_closed_limitations": [
+                    "Does not exceed allowed writes, broaden authority, or finalize review.",
+                    "Stops when scope, receipt, tool, or validation authority is unavailable.",
+                ],
+                "recovery_surfaces": [
+                    "same task_id, card receipts, and worker session state",
+                    "role-specific Source Graph and bounded validation logs",
+                    "aiworkhub_task_mark_review for manager review",
+                ],
+            },
+        },
         "operating_contract": {
             "schema_id": "aiworkhub.manager_operating_contract.v1",
             "mandatory": True,
