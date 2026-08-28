@@ -73,8 +73,19 @@ const {
   const valid = '{\n  "custom": true,\n  "servers": { "Other": { "command": "node" } }\n}\n';
   fs.writeFileSync(configPath, valid, "utf8");
   fakeVscode.workspace.workspaceFolders = [{ uri: { fsPath: root } }];
+  const normalizeRenameDestination = (target) => {
+    const normalized = path.join(
+      fs.realpathSync.native(path.dirname(target)),
+      path.basename(target),
+    );
+    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  const normalizedConfigPath = normalizeRenameDestination(configPath);
   const originalRename = fs.renameSync;
-  fs.renameSync = (from, to) => { if (to === configPath) throw new Error("interrupted"); return originalRename(from, to); };
+  fs.renameSync = (from, to) => {
+    if (normalizeRenameDestination(to) === normalizedConfigPath) throw new Error("interrupted");
+    return originalRename(from, to);
+  };
   try { ensureWorkspaceMcpConfigsRepaired({ extensionUri: { fsPath: "/extension" } }); } finally { fs.renameSync = originalRename; }
   assert.strictEqual(fs.readFileSync(configPath, "utf8"), valid);
   assert.strictEqual(ensureWorkspaceMcpConfigsRepaired({ extensionUri: { fsPath: "/extension" } }), 1);
