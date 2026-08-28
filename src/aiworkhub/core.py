@@ -3364,19 +3364,42 @@ def create_task(
     card["template_provenance"] = bound_provenance
     requested_payload["template_provenance"] = bound_provenance
 
-    def reconcile_existing(existing_json: Any) -> dict[str, Any]:
+    def reconcile_existing(existing_row: Any) -> dict[str, Any]:
+        existing_raw = dict(existing_row)
         try:
-            existing_card = json.loads(existing_json or "{}")
+            existing_card = json.loads(existing_raw["card_json"] or "{}")
         except (TypeError, json.JSONDecodeError):
             existing_card = {}
         if not isinstance(existing_card, dict):
             existing_card = {}
-        # A retry landing on a LIVE row is the lost-response recovery path and
-        # must still hand back that card (the contract depends on it). But a
-        # finished/archived/superseded row is closed: reconciling it returns a
-        # card the caller cannot use and does not know is dead. Return a receipt
-        # naming the terminal state instead of pretending a usable card exists.
-        existing_lifecycle = _lifecycle_state(existing_card)
+        # Preserve the stored columns before canonical_status projects the row
+        # through card_json.  Those columns are authoritative when they name a
+        # closed row, even if the embedded card still says pending.
+        raw_status = str(existing_raw.get("status") or "").strip().lower()
+        raw_worker_status = str(
+            existing_raw.get("worker_status") or ""
+        ).strip().lower()
+        if (
+            str(existing_raw.get("archived_at") or "").strip()
+            or raw_status == "archived"
+        ):
+            raw_lifecycle = "archived"
+        elif raw_status == "superseded" or raw_worker_status == "superseded":
+            raw_lifecycle = "superseded"
+        elif (
+            raw_status in {"finished", "completed", "stale_already_done"}
+            or raw_worker_status in {"done", "failed"}
+        ):
+            raw_lifecycle = "finished"
+        else:
+            projected = dict(existing_raw)
+            projected["status"] = task_store.canonical_status(existing_raw)
+            raw_lifecycle = _lifecycle_state(projected)
+        existing_lifecycle = (
+            raw_lifecycle
+            if raw_lifecycle in {"finished", "archived", "superseded"}
+            else _lifecycle_state(existing_card)
+        )
         if existing_lifecycle in {"finished", "archived", "superseded"}:
             result = _canonical_result(
                 ok=False,
@@ -3476,11 +3499,13 @@ def create_task(
         callback_store.init_db(conn)
         conn.execute("BEGIN IMMEDIATE")
         existing_row = conn.execute(
-            "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+            "SELECT status, worker_status, archived_at, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
         ).fetchone()
         if existing_row is not None:
             conn.rollback()
-            return reconcile_existing(existing_row["card_json"])
+            return reconcile_existing(existing_row)
         if coordinator_worker_runner:
             conn.rollback()
             result = _lifecycle_error(
@@ -3538,10 +3563,12 @@ def create_task(
     except sqlite3.IntegrityError:
         conn.rollback()
         existing_row = conn.execute(
-            "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+            "SELECT status, worker_status, archived_at, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
         ).fetchone()
         if existing_row is not None:
-            return reconcile_existing(existing_row["card_json"])
+            return reconcile_existing(existing_row)
         return _canonical_result(
             ok=False, returncode=1, stderr="task_create_integrity_error", command=command
         )

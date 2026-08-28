@@ -154,6 +154,45 @@ def test_create_task_terminal_row_returns_named_receipt(tmp_path, monkeypatch, t
     assert f"task_terminal:{terminal}" in retry["stderr"]
 
 
+@pytest.mark.parametrize(
+    ("status", "worker_status", "archived_at", "terminal"),
+    [
+        ("finished", "unclaimed", "", "finished"),
+        ("completed", "unclaimed", "", "finished"),
+        ("stale_already_done", "unclaimed", "", "finished"),
+        ("pending", "done", "", "finished"),
+        ("pending", "failed", "", "finished"),
+        ("archived", "unclaimed", "", "archived"),
+        ("pending", "unclaimed", "2026-08-28T00:00:00+00:00", "archived"),
+        ("superseded", "unclaimed", "", "superseded"),
+    ],
+)
+def test_create_task_raw_terminal_overrides_stale_card_json(
+    tmp_path, monkeypatch, status, worker_status, archived_at, terminal
+):
+    root = _init_repo(tmp_path)
+    _patch_manager(monkeypatch, root)
+    args = _create_args(f"SCAN-RAW-{terminal.upper()}-{worker_status.upper()}")
+
+    assert core.create_task(**args)["created"] is True
+    conn = core._canonical_connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET status=?, worker_status=?, archived_at=? WHERE task_id=?",
+            (status, worker_status, archived_at, args["task_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    retry = core.create_task(**args)
+    assert retry["ok"] is False
+    assert retry["reconciled"] is False
+    assert retry["receipt_state"] == "existing_terminal"
+    assert retry["terminal_state"] == terminal
+    assert retry["receipt_state"] != "existing_identical"
+
+
 # ---------------------------------------------------------------------------
 # Defect FIVE: long-poll completion inbox claims at route level.
 # ---------------------------------------------------------------------------
