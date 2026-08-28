@@ -39,12 +39,17 @@ class _Manager(pl.ProcessManager):
 
 @pytest.fixture()
 def manager(tmp_path, monkeypatch):
-    workspace_dir = tmp_path / "ws"
+    canonical_repo = (tmp_path / "repo").resolve()
+    canonical_repo.mkdir()
+    workspace_dir = (tmp_path / "ws").resolve()
     (workspace_dir / "src").mkdir(parents=True)
+    assert canonical_repo != workspace_dir
+    assert canonical_repo == canonical_repo.resolve()
+    assert workspace_dir == workspace_dir.resolve()
     candidate = workspace_dir / "src" / "mod.py"
     candidate.write_text("print('candidate marker')\n", encoding="utf-8")
     digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
-    workspace = _Workspace(workspace_dir, "repo-1", "req1")
+    workspace = _Workspace(workspace_dir, canonical_repo, "req1")
     card = {
         "claim_epoch": 1,
         "objective": "objective",
@@ -76,7 +81,7 @@ def manager(tmp_path, monkeypatch):
             "runner": "vscode_lm",
         }
     ]
-    return _Manager("repo-1", events), candidate
+    return _Manager(canonical_repo, events), candidate
 
 
 def test_three_lenses_reuse_one_preparation(manager):
