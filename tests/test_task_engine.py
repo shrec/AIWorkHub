@@ -149,6 +149,79 @@ def test_accept_review_promotes_and_finishes(tmp_path: Path) -> None:
     assert events[0]["event"] == "accept_review"
 
 
+def test_accept_review_cas_preserves_rival_terminal_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo_with_review_ready_task(tmp_path)
+    _readiness, db_path = task_store._require_ready(repo)
+    real_connect = task_store._connect
+
+    class InterleavingCursor:
+        def __init__(self, cursor: sqlite3.Cursor) -> None:
+            self.cursor = cursor
+
+        def fetchone(self) -> sqlite3.Row | None:
+            row = self.cursor.fetchone()
+            rival = real_connect(db_path)
+            try:
+                rival.execute(
+                    "UPDATE tasks SET status='rejected', worker_status='failed' "
+                    "WHERE task_id=?",
+                    ("TASK_B891",),
+                )
+                rival.commit()
+            finally:
+                rival.close()
+            return row
+
+    class InterleavingConnection:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self.conn = conn
+            self.interleaved = False
+
+        def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> object:
+            cursor = self.conn.execute(sql, parameters)
+            if not self.interleaved and sql.startswith("SELECT runner, topic, status"):
+                self.interleaved = True
+                return InterleavingCursor(cursor)
+            return cursor
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.conn, name)
+
+    def interleaving_connect(
+        path: Path, *args: object, **kwargs: object
+    ) -> sqlite3.Connection | InterleavingConnection:
+        conn = real_connect(path, *args, **kwargs)
+        if kwargs.get("readonly") is True:
+            return conn
+        return InterleavingConnection(conn)
+
+    monkeypatch.setattr(task_store, "_connect", interleaving_connect)
+
+    result = task_engine.accept_review(
+        repo,
+        "TASK_B891",
+        runner="codex_worker_b891",
+        topic="task_mcp",
+        request_id="req-accept-b1",
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"] == "accept_review_preimage_changed"
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT status, worker_status FROM tasks WHERE task_id=?",
+            ("TASK_B891",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row == ("rejected", "failed")
+    assert not task_store.get_task_events(repo, "TASK_B891")
+
+
 def test_missing_review_workspace_enqueues_finalize_failed_callback(tmp_path: Path) -> None:
     request_id = "req-review-workspace-gone"
     repo = _repo_with_review_ready_task(tmp_path, request_id=request_id)

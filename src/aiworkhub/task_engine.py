@@ -701,12 +701,33 @@ def accept_review(
         card["accepted_by"] = runner
         card["accepted_at"] = now
         card["accept_evidence"] = dict(evidence or {})
-        conn.execute(
+        update = conn.execute(
             "UPDATE tasks SET status='finished', worker_status='done', "
             "completed_at=COALESCE(NULLIF(completed_at, ''), ?), updated_at=?, card_json=? "
-            "WHERE task_id=?",
-            (now, now, json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
+            "WHERE task_id=? AND runner IS ? AND topic IS ? AND status IS ? "
+            "AND worker_status IS ? AND claimed_by IS ? AND card_json IS ?",
+            (
+                now,
+                now,
+                json.dumps(card, ensure_ascii=False, sort_keys=True),
+                task_id,
+                row["runner"],
+                row["topic"],
+                row["status"],
+                row["worker_status"],
+                row["claimed_by"],
+                row["card_json"],
+            ),
         )
+        if update.rowcount != 1:
+            conn.rollback()
+            return {
+                "ok": False,
+                "returncode": 1,
+                "command": command,
+                "stdout": "",
+                "stderr": "accept_review_preimage_changed",
+            }
         conn.execute(
             "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
             (
