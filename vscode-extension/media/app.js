@@ -4186,12 +4186,46 @@ function settingsStateMessage(className, message) {
   return stateEl;
 }
 
+function settingsTabDefinitions() {
+  return [
+    ["features", "Features"],
+    ["models", "Models"],
+    ["source-graph", "Source Graph"],
+    ["retention", "Retention"],
+    ["telemetry", "Telemetry"],
+  ];
+}
+
+function renderSettingsPlaceholder(message, className = "panel-state settings-state") {
+  const fragment = document.createDocumentFragment();
+  const tabs = createElement("div", "settings-tabs");
+  const sections = {};
+  for (const [id, label] of settingsTabDefinitions()) {
+    const button = createElement("button", "settings-tab", label);
+    button.type = "button";
+    button.dataset.settingsTab = id;
+    button.classList.toggle("is-active", state.settingsTab === id);
+    button.setAttribute("aria-pressed", String(state.settingsTab === id));
+    tabs.appendChild(button);
+    const section = createElement("section", "settings-tab-panel");
+    section.dataset.settingsPanel = id;
+    section.hidden = state.settingsTab !== id;
+    sections[id] = section;
+  }
+  const activeSection = sections[state.settingsTab] || sections.features;
+  activeSection.appendChild(settingsStateMessage(className, message));
+  fragment.appendChild(tabs);
+  for (const section of Object.values(sections)) fragment.appendChild(section);
+  elements.settingsList.replaceChildren(fragment);
+}
+
 function setSettingsPending(identity, pending) {
   state.settingsPendingIdentity = pending ? identity : null;
   elements.settingsList.setAttribute("aria-busy", String(Boolean(pending)));
 }
 
-function renderSettings(payload) {
+function renderSettings(payload, options = {}) {
+  const preservePending = Boolean(options.preservePending && state.settingsPendingIdentity);
   const activeControl = elements.settingsList.contains(document.activeElement)
     ? document.activeElement
     : null;
@@ -4200,20 +4234,28 @@ function renderSettings(payload) {
   const previousDialogScrollTop = elements.settingsDialog.scrollTop;
   const previousPageScrollTop = document.scrollingElement ? document.scrollingElement.scrollTop : 0;
   if (!payload || payload.ok !== true || !payload.features) {
-    const message = (payload && payload.error) || "Settings unavailable";
+    const hasPendingPayload = Boolean(payload && payload.ok === true && !payload.features);
+    const shouldPreservePending = hasPendingPayload && Boolean(state.settingsPendingIdentity);
+    const message = payload && payload.error
+      ? payload.error
+      : payload && payload.ok === true
+        ? "Loading repository feature settings"
+        : "Settings unavailable";
     if (state.featureSettings && state.featureSettings.ok === true) {
-      setSettingsPending(null, false);
-      renderSettings(state.featureSettings);
+      if (!shouldPreservePending) {
+        setSettingsPending(null, false);
+      }
+      renderSettings(state.featureSettings, { preservePending: shouldPreservePending });
       elements.settingsSummary.textContent = message;
       return;
     }
     setSettingsPending(null, false);
     elements.settingsSummary.textContent = message;
     if (!state.featureSettings || !elements.settingsList.children.length) {
-      elements.settingsList.replaceChildren(settingsStateMessage(
-        "panel-state error-state settings-state",
-        "Repository settings could not be loaded",
-      ));
+      renderSettingsPlaceholder(
+        payload && payload.error ? "Repository settings could not be loaded" : message,
+        payload && payload.error ? "panel-state error-state settings-state" : "panel-state settings-state",
+      );
     }
     elements.settingsList.scrollTop = elements.settingsList.scrollHeight
       ? Math.min(previousScrollTop, elements.settingsList.scrollHeight)
@@ -4226,18 +4268,14 @@ function renderSettings(payload) {
     return;
   }
   state.featureSettings = payload;
-  setSettingsPending(null, false);
+  if (!preservePending) {
+    setSettingsPending(null, false);
+  }
   elements.settingsSummary.textContent = `Repository-local · revision ${Number(payload.revision || 0)}`;
   const fragment = document.createDocumentFragment();
   const tabs = createElement("div", "settings-tabs");
   const sections = {};
-  for (const [id, label] of [
-    ["features", "Features"],
-    ["models", "Models"],
-    ["source-graph", "Source Graph"],
-    ["retention", "Retention"],
-    ["telemetry", "Telemetry"],
-  ]) {
+  for (const [id, label] of settingsTabDefinitions()) {
     const button = createElement("button", "settings-tab", label);
     button.type = "button";
     button.dataset.settingsTab = id;
@@ -4462,7 +4500,9 @@ function renderSettings(payload) {
     document.scrollingElement.scrollTop = previousPageScrollTop;
   }
   restoreSettingsFocus(previousIdentity);
-  setSettingsPending(null, false);
+  if (!preservePending) {
+    setSettingsPending(null, false);
+  }
 }
 
 // ── Fixed-enum inbound message handling from the extension host ───────────
@@ -4974,11 +5014,9 @@ elements.openOperations.addEventListener("click", () => {
 elements.openSettings.addEventListener("click", () => {
   elements.settingsDialog.showModal();
   elements.settingsSummary.textContent = "Loading repository feature settings";
-  if (!state.featureSettings && !elements.settingsList.children.length) {
-    elements.settingsList.replaceChildren(settingsStateMessage(
-      "panel-state settings-state",
-      "Loading repository feature settings",
-    ));
+  const hasSettingsShell = Boolean(elements.settingsList.querySelector("[data-settings-tab]"));
+  if (!state.featureSettings && !hasSettingsShell) {
+    renderSettingsPlaceholder("Loading repository feature settings");
   }
   vscode.postMessage({ type: "requestSettings" });
 });

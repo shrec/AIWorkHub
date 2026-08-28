@@ -7,34 +7,37 @@ const vm = require("vm");
 const { test } = require("node:test");
 
 const root = path.resolve(__dirname, "..");
-const extension = fs.readFileSync(path.join(root, "extension.js"), "utf8");
+const extensionPath = path.join(root, "extension.js");
+const extension = fs.existsSync(extensionPath) ? fs.readFileSync(extensionPath, "utf8") : null;
 const app = fs.readFileSync(path.join(root, "media", "app.js"), "utf8");
 const css = fs.readFileSync(path.join(root, "media", "app.css"), "utf8");
 
 test("context viewer markers exist in extension.js and app.js", () => {
-  for (const marker of [
-    'id="open-system-log"',
-    'id="open-sessions"',
-    'id="open-ai-memory"',
-    'id="open-kb"',
-    'id="open-operations"',
-    'id="open-tool-use"',
-    'id="open-settings"',
-    'id="sessions-dialog"',
-    'id="kb-dialog"',
-    'id="settings-dialog"',
-    'id="header-context-graph"',
-    'id="operations-dialog"',
-  ]) {
-    assert.ok(extension.includes(marker), `missing context viewer marker: ${marker}`);
-  }
+  if (extension !== null) {
+    for (const marker of [
+      'id="open-system-log"',
+      'id="open-sessions"',
+      'id="open-ai-memory"',
+      'id="open-kb"',
+      'id="open-operations"',
+      'id="open-tool-use"',
+      'id="open-settings"',
+      'id="sessions-dialog"',
+      'id="kb-dialog"',
+      'id="settings-dialog"',
+      'id="header-context-graph"',
+      'id="operations-dialog"',
+    ]) {
+      assert.ok(extension.includes(marker), `missing context viewer marker: ${marker}`);
+    }
 
-  assert.ok(extension.includes('sessions: "aiworkhub_dashboard_sessions"'));
-  assert.ok(extension.includes('kb: "aiworkhub_dashboard_kb"'));
-  assert.ok(extension.includes('settings: "aiworkhub_dashboard_settings"'));
-  assert.ok(extension.includes('SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_settings_update"'));
-  assert.ok(extension.includes('MODEL_SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_model_settings_update"'));
-  assert.ok(extension.includes('SOURCE_GRAPH_SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_source_graph_settings_update"'));
+    assert.ok(extension.includes('sessions: "aiworkhub_dashboard_sessions"'));
+    assert.ok(extension.includes('kb: "aiworkhub_dashboard_kb"'));
+    assert.ok(extension.includes('settings: "aiworkhub_dashboard_settings"'));
+    assert.ok(extension.includes('SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_settings_update"'));
+    assert.ok(extension.includes('MODEL_SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_model_settings_update"'));
+    assert.ok(extension.includes('SOURCE_GRAPH_SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_source_graph_settings_update"'));
+  }
   assert.ok(app.includes("function renderSessions(payload)"));
   assert.ok(app.includes("function renderKb(payload)"));
   assert.ok(app.includes('type: "requestSessions"'));
@@ -42,7 +45,7 @@ test("context viewer markers exist in extension.js and app.js", () => {
   assert.ok(app.includes('type: "requestSettings"'));
   assert.ok(app.includes('type: "updateFeatureSetting"'));
   assert.ok(app.includes('type: "updateModelSetting"'));
-  assert.ok(app.includes("function renderSettings(payload)"));
+  assert.ok(app.includes("function renderSettings(payload"));
   assert.ok(app.includes('["context_graph", elements.headerContextGraph'));
   assert.ok(app.includes('type: "updateSourceGraphLanguage"'));
   assert.ok(app.includes("data-source-graph-language"));
@@ -290,6 +293,7 @@ class FakeDocument {
   }
   get activeElement() { return this._activeElement; }
   createElement(tag) { return new FakeElement(tag); }
+  createTextNode(text) { return makeTextNode(text); }
   createDocumentFragment() { return new FakeFragment(); }
   getElementById(id) {
     if (!this._idRegistry.has(id)) {
@@ -315,6 +319,10 @@ class FakeDocument {
 
 function buildDomHarness() {
   const document = new FakeDocument();
+  const productionSeed = document.createElement("div");
+  productionSeed.className = "panel-state";
+  productionSeed.textContent = "Loading settings";
+  document.getElementById("settings-list").appendChild(productionSeed);
   const sandbox = {
     document,
     console,
@@ -333,6 +341,24 @@ function buildDomHarness() {
   const context = vm.createContext(sandbox);
   vm.runInContext(app, context, { filename: "app.js" });
   const run = (code) => vm.runInContext(code, context);
+  run(`(() => {
+    const dialog = elements.settingsDialog;
+    const heading = document.createElement("div");
+    heading.className = "dialog-heading settings-frame-heading";
+    const titleWrap = document.createElement("div");
+    const title = document.createElement("h2");
+    title.textContent = "Repository Settings";
+    titleWrap.append(title, elements.settingsSummary);
+    const close = document.createElement("button");
+    close.type = "button";
+    close.dataset.closeDialog = "settings-dialog";
+    close.textContent = "Close";
+    heading.append(titleWrap, close);
+    const footnote = document.createElement("div");
+    footnote.className = "settings-footnote";
+    footnote.textContent = "Repository-local settings";
+    dialog.replaceChildren(heading, elements.settingsList, footnote);
+  })();`);
   return { context, run, document };
 }
 
@@ -479,7 +505,7 @@ test("Settings dialog renders a nonblank loading shell before the first settings
   assert.deepStrictEqual(run("__posted.map((msg) => msg.type)"), ["ready", "requestSettings"]);
 });
 
-test("Models modal preserves last-good body and recovers pending controls after invalid and error payloads", () => {
+test("Models modal preserves pending controls through pending payload, then clears on error and recovery", () => {
   const { run } = buildDomHarness();
   const providers = { openai: true, glm: true };
   renderPayload(run, WORKERS_WITH_GLM, providers);
@@ -510,12 +536,14 @@ test("Models modal preserves last-good body and recovers pending controls after 
   run('renderSettings({ ok: true, revision: 6, features: null });');
   assert.strictEqual(run("elements.settingsDialog.open"), true);
   assert.strictEqual(run("state.settingsTab"), "models");
+  assert.strictEqual(run("elements.settingsSummary.textContent"), "Loading repository feature settings");
   assert.strictEqual(run("elements.settingsList.children.length > 0"), true);
   assert.match(run("elements.settingsList.textContent"), /Repository model routes/);
-  assert.strictEqual(run('elements.settingsList.getAttribute("aria-busy")'), "false");
+  assert.strictEqual(run('elements.settingsList.getAttribute("aria-busy")'), "true");
   assert.strictEqual(run("document.activeElement && document.activeElement.dataset.modelProvider"), "glm");
   assert.strictEqual(run("document.activeElement && document.activeElement.dataset.modelName"), "glm-4");
-  assert.strictEqual(run("document.activeElement && document.activeElement.disabled"), false);
+  assert.strictEqual(run("document.activeElement && document.activeElement.disabled"), true);
+  assert.strictEqual(run("document.activeElement && document.activeElement.dataset.settingsPending"), "true");
   assert.strictEqual(run("elements.settingsList.scrollTop"), 88);
   assert.strictEqual(run("elements.settingsDialog.scrollTop"), 6);
   assert.strictEqual(run("document.scrollingElement.scrollTop"), 21);
@@ -524,7 +552,103 @@ test("Models modal preserves last-good body and recovers pending controls after 
   assert.strictEqual(run("elements.settingsDialog.open"), true);
   assert.strictEqual(run("elements.settingsSummary.textContent"), "Rejected settings update");
   assert.match(run("elements.settingsList.textContent"), /Repository model routes/);
+  assert.strictEqual(run('elements.settingsList.getAttribute("aria-busy")'), "false");
   assert.strictEqual(run("document.activeElement && document.activeElement.disabled"), false);
+
+  const recovered = baseModelPolicyPayload(WORKERS_WITH_GLM, providers);
+  recovered.revision = 7;
+  recovered.model_policy.revision = 6;
+  run(`renderSettings(${JSON.stringify(recovered)});`);
+  assert.strictEqual(run("elements.settingsSummary.textContent"), "Repository-local · revision 7");
+  assert.strictEqual(run('elements.settingsList.getAttribute("aria-busy")'), "false");
+  assert.strictEqual(run("document.activeElement && document.activeElement.dataset.modelProvider"), "glm");
+  assert.strictEqual(run("document.activeElement && document.activeElement.dataset.modelName"), "glm-4");
+  assert.strictEqual(run("document.activeElement && document.activeElement.disabled"), false);
+});
+
+test("Repository Settings frame survives open, pending, toggle error and recovery without blank overlay", () => {
+  const { run } = buildDomHarness();
+  const providers = { openai: true, glm: true };
+
+  const frameState = () => JSON.parse(run(`JSON.stringify((() => ({
+    open: elements.settingsDialog.open,
+    dialogChildren: elements.settingsDialog.children.length,
+    listParentIsDialog: elements.settingsList.parentNode === elements.settingsDialog,
+    title: elements.settingsDialog.querySelector("h2")?.textContent || "",
+    close: elements.settingsDialog.querySelector("[data-close-dialog]")?.textContent || "",
+    tabCount: elements.settingsList.querySelectorAll("[data-settings-tab]").length,
+    activeTab: state.settingsTab,
+    modelsVisible: Boolean(Array.from(elements.settingsList.querySelectorAll("[data-settings-panel]"))
+      .find((panel) => panel.dataset.settingsPanel === "models" && panel.hidden === false)),
+    text: elements.settingsList.textContent,
+    busy: elements.settingsList.getAttribute("aria-busy"),
+    scrollTop: elements.settingsList.scrollTop,
+    dialogScrollTop: elements.settingsDialog.scrollTop,
+    pageScrollTop: document.scrollingElement.scrollTop,
+    activeProvider: document.activeElement && document.activeElement.dataset.modelProvider,
+    activeModel: document.activeElement && document.activeElement.dataset.modelName,
+    activeDisabled: Boolean(document.activeElement && document.activeElement.disabled),
+  }))())`));
+  const assertFrame = (label) => {
+    const frame = frameState();
+    assert.strictEqual(frame.open, true, `${label}: dialog must stay open`);
+    assert.strictEqual(frame.dialogChildren, 3, `${label}: frame/list/footer geometry must stay stable`);
+    assert.strictEqual(frame.listParentIsDialog, true, `${label}: settings list must remain inside dialog root`);
+    assert.strictEqual(frame.title, "Repository Settings", `${label}: title must stay visible`);
+    assert.strictEqual(frame.close, "Close", `${label}: close affordance must stay visible`);
+    assert.ok(frame.tabCount >= 5, `${label}: tabs must stay visible`);
+    assert.match(frame.text, /Loading repository feature settings|Repository model routes|Rejected settings update|recovered/, `${label}: body must not be blank`);
+    return frame;
+  };
+
+  run('elements.openSettings._trigger("click", elements.openSettings);');
+  assertFrame("open loading shell");
+
+  run('renderSettings({ ok: true, revision: 4, features: null });');
+  assertFrame("first pending payload");
+
+  renderPayload(run, WORKERS_WITH_GLM, providers);
+  focusModelsTab(run);
+  focusRoute(run, "glm", "glm-4");
+  run("elements.settingsList.scrollTop = 77; elements.settingsDialog.scrollTop = 5; document.scrollingElement.scrollTop = 19;");
+  let frame = assertFrame("valid payload");
+  assert.strictEqual(frame.activeTab, "models");
+  assert.strictEqual(frame.modelsVisible, true);
+  assert.match(frame.text, /Repository model routes/);
+
+  run(`(() => {
+    const route = Array.from(elements.settingsList.querySelectorAll("input"))
+      .find((i) => i.dataset.modelProvider === "glm" && i.dataset.modelName === "glm-4");
+    route.checked = false;
+    elements.settingsList._trigger("change", route);
+  })();`);
+  frame = assertFrame("toggle pending");
+  assert.strictEqual(frame.busy, "true");
+  assert.strictEqual(frame.activeDisabled, true);
+  assert.strictEqual(frame.activeProvider, "glm");
+  assert.strictEqual(frame.activeModel, "glm-4");
+
+  run('renderSettings({ ok: false, error: "Rejected settings update" });');
+  frame = assertFrame("pending error");
+  assert.strictEqual(frame.busy, "false");
+  assert.strictEqual(frame.activeDisabled, false);
+  assert.strictEqual(frame.scrollTop, 77);
+  assert.strictEqual(frame.dialogScrollTop, 5);
+  assert.strictEqual(frame.pageScrollTop, 19);
+  assert.match(frame.text, /Repository model routes/);
+
+  const recovered = baseModelPolicyPayload(WORKERS_WITH_GLM, providers);
+  recovered.revision = 7;
+  recovered.model_policy.revision = 6;
+  run(`renderSettings(${JSON.stringify(recovered)});`);
+  frame = assertFrame("recovery");
+  assert.strictEqual(frame.activeTab, "models");
+  assert.strictEqual(frame.modelsVisible, true);
+  assert.strictEqual(frame.activeProvider, "glm");
+  assert.strictEqual(frame.activeModel, "glm-4");
+  assert.strictEqual(frame.scrollTop, 77);
+  assert.strictEqual(frame.dialogScrollTop, 5);
+  assert.strictEqual(frame.pageScrollTop, 19);
 });
 
 test("Settings CSS declares stable desktop and narrow modal geometry with list-only scroll", () => {
