@@ -10,20 +10,22 @@ guarantees.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import errno
 import hashlib
 import hmac
 import json
 import os
 import re
 import sqlite3
-import errno
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 from . import context_writes, storage_registry
-from .sqlite_readonly import connect_readonly
 from .platform_io import chmod_fd
+from .sqlite_readonly import connect_readonly
 
 
 INTENT_SCHEMA_ID = "aiworkhub.context_write_intent.v1"
@@ -34,6 +36,7 @@ Decision = Literal["accepted", "rejected"]
 MAX_INTENT_BYTES = 40 * 1024
 MAX_REASON_BYTES = 2048
 MAX_INTENTS_PER_REQUEST = 64
+_LOCK_TIMEOUT_SECONDS = 5.0
 _ID_RE = re.compile(r"^[a-f0-9]{64}$")
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{7,191}$")
 
@@ -65,6 +68,37 @@ def _signature(entry: dict[str, Any], key: bytes) -> str:
     return hmac.new(key, _canonical_json(entry), hashlib.sha256).hexdigest()
 
 
+@contextmanager
+def _intent_append_lock(ledger_path: Path) -> Iterator[None]:
+    lock_path = ledger_path.with_name(f"{ledger_path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(lock_path.parent, 0o700)
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    fd: int | None = None
+    while fd is None:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exc:
+            if time.monotonic() >= deadline:
+                raise ContextWriteIntentError("intent_ledger_locked") from exc
+            time.sleep(0.01)
+    try:
+        try:
+            chmod_fd(fd, 0o600)
+        except OSError as exc:
+            mode = os.fstat(fd).st_mode & 0o777
+            if exc.errno not in {errno.EPERM, errno.EACCES} or mode != 0o600:
+                raise
+        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+        yield
+    finally:
+        os.close(fd)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _append_line_0600(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
@@ -82,6 +116,58 @@ def _append_line_0600(path: Path, payload: dict[str, Any]) -> None:
         os.write(fd, json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n")
     finally:
         os.close(fd)
+
+
+def _load_verified_intents(
+    *, ledger_path: Path, key_path: Path, task_id: str, runner: str,
+    topic: str, request_id: str, authority_repo: Path, strict: bool,
+) -> list[dict[str, Any]]:
+    try:
+        key = key_path.read_bytes()
+    except OSError as exc:
+        raise ContextWriteIntentError("intent_key_unreadable") from exc
+    if len(key) < 32:
+        raise ContextWriteIntentError("intent_key_invalid")
+    try:
+        lines = ledger_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ContextWriteIntentError("intent_ledger_unreadable") from exc
+    expected_repo = str(authority_repo.resolve())
+    unique: dict[str, dict[str, Any]] = {}
+    for raw in lines:
+        try:
+            signed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as exc:
+            if strict:
+                raise ContextWriteIntentError("intent_ledger_invalid_json") from exc
+            continue
+        if not isinstance(signed, dict) or signed.get("schema_id") != INTENT_SCHEMA_ID:
+            continue
+        digest = signed.get("hmac_sha256")
+        entry = {k: v for k, v in signed.items() if k != "hmac_sha256"}
+        if not isinstance(digest, str) or not hmac.compare_digest(_signature(entry, key), digest):
+            if strict:
+                raise ContextWriteIntentError("intent_ledger_hmac_invalid")
+            continue
+        if (
+            str(entry.get("task_id")) != task_id
+            or str(entry.get("runner")) != runner
+            or str(entry.get("topic")) != topic
+            or str(entry.get("request_id")) != request_id
+            or str(entry.get("authority_repo")) != expected_repo
+        ):
+            continue
+        intent_id = str(entry.get("intent_id") or "")
+        stable = {k: v for k, v in entry.items() if k not in {"timestamp", "intent_id"}}
+        expected_intent_id = hashlib.sha256(_canonical_json(stable)).hexdigest()
+        if not _ID_RE.fullmatch(intent_id) or expected_intent_id != intent_id:
+            if strict:
+                raise ContextWriteIntentError("intent_ledger_identity_invalid")
+            continue
+        unique.setdefault(intent_id, entry)
+        if len(unique) > MAX_INTENTS_PER_REQUEST:
+            raise ContextWriteIntentError("intent_capacity_exceeded")
+    return list(unique.values())
 
 
 def append_intent(
@@ -129,14 +215,15 @@ def append_intent(
     entry = {**body, "intent_id": intent_id}
     if ledger_path.is_symlink() or key_path.is_symlink():
         raise ContextWriteIntentError("intent_runtime_symlink_forbidden")
-    try:
-        key = key_path.read_bytes()
-    except OSError as exc:
-        raise ContextWriteIntentError("intent_key_unreadable") from exc
-    if len(key) < 32:
-        raise ContextWriteIntentError("intent_key_invalid")
-    try:
-        existing = read_verified_intents(
+
+    with _intent_append_lock(ledger_path):
+        try:
+            key = key_path.read_bytes()
+        except OSError as exc:
+            raise ContextWriteIntentError("intent_key_unreadable") from exc
+        if len(key) < 32:
+            raise ContextWriteIntentError("intent_key_invalid")
+        existing = _load_verified_intents(
             ledger_path=ledger_path,
             key_path=key_path,
             task_id=binding["task_id"],
@@ -144,20 +231,21 @@ def append_intent(
             topic=binding["topic"],
             request_id=binding["request_id"],
             authority_repo=authority_repo,
+            strict=True,
         )
-    except ContextWriteIntentError:
-        existing = []
-    if any(str(row.get("intent_id")) == intent_id for row in existing):
-        return {
-            "ok": True,
-            "idempotent": True,
-            "intent_id": intent_id,
-            "component": component,
-            "action": action,
-            "status": "pending_manager_review",
-        }
-    signed = {**entry, "hmac_sha256": _signature(entry, key)}
-    _append_line_0600(ledger_path, signed)
+        if any(str(row.get("intent_id")) == intent_id for row in existing):
+            return {
+                "ok": True,
+                "idempotent": True,
+                "intent_id": intent_id,
+                "component": component,
+                "action": action,
+                "status": "pending_manager_review",
+            }
+        if len(existing) >= MAX_INTENTS_PER_REQUEST:
+            raise ContextWriteIntentError("intent_capacity_exceeded")
+        signed = {**entry, "hmac_sha256": _signature(entry, key)}
+        _append_line_0600(ledger_path, signed)
     return {
         "ok": True,
         "idempotent": False,
@@ -174,38 +262,16 @@ def read_verified_intents(
 ) -> list[dict[str, Any]]:
     """Return unique, valid proposals for one exact immutable request binding."""
 
-    try:
-        key = key_path.read_bytes()
-        lines = ledger_path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise ContextWriteIntentError("intent_ledger_unreadable") from exc
-    expected_repo = str(authority_repo.resolve())
-    unique: dict[str, dict[str, Any]] = {}
-    for raw in lines:
-        try:
-            signed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(signed, dict) or signed.get("schema_id") != INTENT_SCHEMA_ID:
-            continue
-        digest = signed.get("hmac_sha256")
-        entry = {k: v for k, v in signed.items() if k != "hmac_sha256"}
-        if not isinstance(digest, str) or not hmac.compare_digest(_signature(entry, key), digest):
-            continue
-        if (
-            str(entry.get("task_id")) != task_id
-            or str(entry.get("runner")) != runner
-            or str(entry.get("topic")) != topic
-            or str(entry.get("request_id")) != request_id
-            or str(entry.get("authority_repo")) != expected_repo
-        ):
-            continue
-        intent_id = str(entry.get("intent_id") or "")
-        stable = {k: v for k, v in entry.items() if k not in {"timestamp", "intent_id"}}
-        if not _ID_RE.fullmatch(intent_id) or hashlib.sha256(_canonical_json(stable)).hexdigest() != intent_id:
-            continue
-        unique.setdefault(intent_id, entry)
-    return list(unique.values())[-MAX_INTENTS_PER_REQUEST:]
+    return _load_verified_intents(
+        ledger_path=ledger_path,
+        key_path=key_path,
+        task_id=task_id,
+        runner=runner,
+        topic=topic,
+        request_id=request_id,
+        authority_repo=authority_repo,
+        strict=False,
+    )
 
 
 def _decision_connection(repo: Path, *, writable: bool) -> sqlite3.Connection:

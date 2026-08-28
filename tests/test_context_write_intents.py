@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import sqlite3
 from pathlib import Path
@@ -47,6 +48,23 @@ def _read(ctx: worker_tools.WorkerToolContext) -> list[dict]:
         topic=ctx.topic,
         request_id=ctx.request_id,
         authority_repo=ctx.authority_repo,
+    )
+
+
+def _append_session(ctx: worker_tools.WorkerToolContext, index: int) -> dict:
+    return context_write_intents.append_intent(
+        ledger_path=ctx.audit_ledger_path,
+        key_path=ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+        authority_repo=ctx.authority_repo,
+        component="session",
+        action="checkpoint",
+        payload={"topic": ctx.session_topic, "content": f"capacity checkpoint {index}"},
+        idempotency_key=f"session:capacity:{index:04d}",
+        provenance="capacity evidence",
     )
 
 
@@ -154,6 +172,12 @@ def test_intents_are_hmac_verified_deduplicated_and_decisions_are_idempotent(tmp
     forged["payload"]["content"] = "tampered"
     ctx.audit_ledger_path.write_text(json.dumps(forged) + "\n", encoding="utf-8")
     assert _read(ctx) == []
+    with pytest.raises(
+        context_write_intents.ContextWriteIntentError,
+        match="intent_ledger_hmac_invalid",
+    ):
+        _append_session(ctx, 1)
+    assert len(ctx.audit_ledger_path.read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_registered_worker_write_intents_expose_no_identity_or_path_override(tmp_path: Path) -> None:
@@ -180,6 +204,88 @@ def test_registered_worker_write_intents_expose_no_identity_or_path_override(tmp
         assert name in fake.registered
         params = set(__import__("inspect").signature(fake.registered[name]).parameters)
         assert not params.intersection({"repo", "repo_root", "task_id", "runner", "topic", "request_id", "db_path"})
+
+
+def test_capacity_overflow_preserves_oldest_retry_and_manager_disposition(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    ctx = _ctx(tmp_path, repo)
+
+    submitted = [
+        _append_session(ctx, index)
+        for index in range(context_write_intents.MAX_INTENTS_PER_REQUEST)
+    ]
+    assert all(row["idempotent"] is False for row in submitted)
+    visible = _read(ctx)
+    assert len(visible) == context_write_intents.MAX_INTENTS_PER_REQUEST
+    assert [row["intent_id"] for row in visible] == [row["intent_id"] for row in submitted]
+
+    with pytest.raises(
+        context_write_intents.ContextWriteIntentError,
+        match="intent_capacity_exceeded",
+    ):
+        _append_session(ctx, context_write_intents.MAX_INTENTS_PER_REQUEST)
+    assert len(ctx.audit_ledger_path.read_text(encoding="utf-8").splitlines()) == len(submitted)
+
+    oldest_retry = _append_session(ctx, 0)
+    assert oldest_retry["intent_id"] == submitted[0]["intent_id"]
+    assert oldest_retry["idempotent"] is True
+    assert len(ctx.audit_ledger_path.read_text(encoding="utf-8").splitlines()) == len(submitted)
+
+    decision = context_write_intents.record_decision(
+        repo,
+        intent=visible[0],
+        decision="accepted",
+        reason="oldest remains manager visible",
+        manager_provider="codex",
+        manager_session_id="thread-manager-1",
+        result={"ok": True, "applied": False},
+    )
+    assert decision["decision"] == "accepted"
+
+
+def test_concurrent_idempotent_appends_create_one_physical_capacity_record(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    ctx = _ctx(tmp_path, repo)
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = [executor.submit(_append_session, ctx, 7) for _ in range(16)]
+        results = [future.result() for future in as_completed(futures)]
+
+    assert {result["intent_id"] for result in results} == {results[0]["intent_id"]}
+    assert sum(result["idempotent"] is False for result in results) == 1
+    assert sum(result["idempotent"] is True for result in results) == 15
+    assert len(ctx.audit_ledger_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert len(_read(ctx)) == 1
+
+
+def test_concurrent_distinct_capacity_appends_do_not_oversubscribe(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    ctx = _ctx(tmp_path, repo)
+    for index in range(context_write_intents.MAX_INTENTS_PER_REQUEST - 1):
+        _append_session(ctx, index)
+
+    def attempt(index: int) -> tuple[str, dict | str]:
+        try:
+            return "ok", _append_session(ctx, index)
+        except context_write_intents.ContextWriteIntentError as exc:
+            return "err", str(exc)
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        futures = [executor.submit(attempt, 100 + index) for index in range(12)]
+        results = [future.result() for future in as_completed(futures)]
+
+    successes = [result for status, result in results if status == "ok"]
+    errors = [result for status, result in results if status == "err"]
+    assert len(successes) == 1
+    assert all(
+        isinstance(result, dict) and result["idempotent"] is False
+        for result in successes
+    )
+    assert errors == ["intent_capacity_exceeded"] * 11
+    assert len(_read(ctx)) == context_write_intents.MAX_INTENTS_PER_REQUEST
+    assert len(ctx.audit_ledger_path.read_text(encoding="utf-8").splitlines()) == (
+        context_write_intents.MAX_INTENTS_PER_REQUEST
+    )
 
 
 def test_verified_manager_can_inspect_and_accept_exact_request_intent(
