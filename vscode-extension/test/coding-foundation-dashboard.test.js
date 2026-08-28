@@ -1,11 +1,28 @@
 "use strict";
 
 const assert = require("assert");
+const crypto = require("crypto");
+const fs = require("fs");
 const Module = require("module");
 const path = require("path");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
+const extensionRoot = path.dirname(extensionPath);
 const originalLoad = Module._load;
+
+function mockUri(fsPath, query = "") {
+  return {
+    fsPath,
+    query,
+    with(changes) {
+      return mockUri(changes.fsPath || fsPath, changes.query ?? query);
+    },
+    toString() {
+      return `vscode-webview-resource:${fsPath}${query ? `?${query}` : ""}`;
+    },
+  };
+}
+
 const fakeVscode = {
   workspace: {
     workspaceFolders: [],
@@ -14,7 +31,9 @@ const fakeVscode = {
   window: {
     createOutputChannel: () => ({ appendLine: () => {}, dispose: () => {} }),
   },
-  Uri: { joinPath: (...parts) => ({ fsPath: parts.map((part) => part.fsPath || part).join("/") }) },
+  Uri: {
+    joinPath: (...parts) => mockUri(path.join(...parts.map((part) => part.fsPath || part))),
+  },
   ViewColumn: { Active: 1 },
   ConfigurationTarget: { Global: 1 },
 };
@@ -61,11 +80,21 @@ function snapshotHtml() {
       cspSource: "https://example.vscode-cdn.net",
       asWebviewUri: (uri) => uri,
     },
-    { fsPath: "/ext" },
+    { fsPath: extensionRoot },
   );
 }
 
+function contentAddressedAssetUri(fileName) {
+  const assetPath = path.join(extensionRoot, "media", fileName);
+  const digest = crypto.createHash("sha256").update(fs.readFileSync(assetPath)).digest("hex").slice(0, 16);
+  return `vscode-webview-resource:${assetPath}?v=${digest}`;
+}
+
 const html = snapshotHtml();
+const stylesheetUri = contentAddressedAssetUri("app.css");
+const scriptUri = contentAddressedAssetUri("app.js");
+assert.ok(html.includes(`href="${stylesheetUri}"`), "stylesheet URI must include its content identity");
+assert.ok(html.includes(`src="${scriptUri}"`), "script URI must include its content identity");
 const insights = html.match(/<div class="header-insights"[\s\S]*?<\/div>\s*<\/header>/);
 assert.ok(insights, "header-insights grid missing");
 assert.match(insights[0], /id="header-development-rules"/);
@@ -74,10 +103,10 @@ assert.match(insights[0], /id="header-skills"/);
 assert.match(insights[0], />Skills</);
 assert.match(insights[0], /id="header-tool-recipes"/);
 assert.match(insights[0], />Tool Recipes</);
-assert.match(insights[0], /id="header-development-rules-value">No sample</);
-assert.match(insights[0], /id="header-skills-value">No sample</);
-assert.match(insights[0], /id="header-tool-recipes-value">No sample</);
-assert.doesNotMatch(insights[0], /id="header-development-rules-value">0</);
+assert.match(insights[0], /id="header-development-rules-value">No sample/);
+assert.match(insights[0], /id="header-skills-value">No sample/);
+assert.match(insights[0], /id="header-tool-recipes-value">No sample/);
+assert.doesNotMatch(insights[0], /id="header-development-rules-value">0/);
 assert.doesNotMatch(insights[0], /id="header-skills-value">0</);
 assert.doesNotMatch(insights[0], /id="header-tool-recipes-value">0</);
 assert.match(insights[0], /id="header-storage"/);

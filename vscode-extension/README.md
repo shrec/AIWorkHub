@@ -12,15 +12,25 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.64
+## What's new in 0.10.65
 
-- Model settings remain visible, responsive and dimensionally stable while
-  provider and model switches change.
-- Quality reviewers now receive declared immutable runtime dependencies in
-  sparse workspaces, preventing missing-file false positives.
-- After several important blocker fixes land with the owner present, the
-  manager freezes scope, cuts and installs an intermediate release, then moves
-  development to the next version.
+- Reviewer evidence now keeps prose out of path authority and changed-path scope,
+  then seals immutable prose into the digest-bound review packet.
+- Legacy Source Graph migration is read-only, and refresh documentation matches
+  the tested serialization behavior.
+- The Models settings modal retains its visible shell, pending state and prior
+  content while repository settings load.
+- A fail-closed Windows AppContainer lifecycle foundation adds deterministic
+  identity, job ownership and cleanup evidence; it remains gated and is not yet
+  wired into native worker launch.
+- Authenticated task-template validation and role overrides are sealed into the
+  template contract.
+- The native Repository Settings dialog now uses content-addressed webview
+  assets and an intrinsic layout, avoiding a blank frame while keeping the
+  wrapped footer visible and only the settings list scrollable.
+- Known limitation: `AIWORKHUB_01065_NF453_GLM_VSCODE_LM_TOOL_LOOP_V5`
+  remains unresolved, its candidate was not promoted, and this release makes no
+  claim that the GLM VS Code LM tool loop is fixed.
 
 ## Architecture at a glance
 

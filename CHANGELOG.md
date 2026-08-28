@@ -8,15 +8,39 @@ noted by package/extension version and release tag.
 
 ## [0.10.65] - 2026-08-28
 
+### Added
+
+- A fail-closed Windows AppContainer lifecycle foundation now provides
+  deterministic container identity, shell-free process launch, job ownership,
+  structured lifecycle results and cleanup evidence. It remains behind the
+  existing runtime gate and is not yet wired into native worker launch.
+
 ### Fixed
 
 - Quality-review packet construction separates authenticated narrative evidence
   from explicit read-only filesystem authority, so prose is never materialized
   as a missing path and pre-provider failures terminalize cleanly.
+- Reviewer scope is constructed before immutable prose evidence is added,
+  keeping changed-path evidence ordering deterministic.
+- Immutable prose evidence is bound into the sealed reviewer contract and the
+  canonical packet digest is refreshed before persistence.
 - Legacy Source Graph migrations open their source SQLite database through a
   read-only URI, preventing source mutation and WAL/SHM sidecar creation.
 - Source Graph daemon documentation now states the tested refresh serialization
   invariant without implying that concurrent callers join an in-flight build.
+- The Models settings modal preserves its visible shell, pending identity and
+  prior rendered state while repository settings are loading.
+- Authenticated task-template validation and role overrides are sealed into the
+  template contract, preserving their exact authority through validation.
+- The native Repository Settings dialog no longer opens as a blank frame:
+  content-addressed webview assets and an intrinsic layout keep the wrapped
+  footer visible while only the settings list scrolls.
+
+### Known limitations
+
+- `AIWORKHUB_01065_NF453_GLM_VSCODE_LM_TOOL_LOOP_V5` remains unresolved.
+  Its candidate was not promoted, and this release makes no claim that the GLM
+  VS Code LM tool loop is fixed.
 
 ## [0.10.64] - 2026-08-27
 
