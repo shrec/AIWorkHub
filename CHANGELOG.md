@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.65] - 2026-08-28
+
+### Fixed
+
+- Quality-review packet construction separates authenticated narrative evidence
+  from explicit read-only filesystem authority, so prose is never materialized
+  as a missing path and pre-provider failures terminalize cleanly.
+- Legacy Source Graph migrations open their source SQLite database through a
+  read-only URI, preventing source mutation and WAL/SHM sidecar creation.
+- Source Graph daemon documentation now states the tested refresh serialization
+  invariant without implying that concurrent callers join an in-flight build.
+
 ## [0.10.64] - 2026-08-27
 
 ### Fixed

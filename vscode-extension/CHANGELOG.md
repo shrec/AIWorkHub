@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.65 — 2026-08-28
+
+### Fixed
+
+- Quality-review packets distinguish narrative evidence from explicit
+  read-only files and close pre-provider preparation failures cleanly.
+- Legacy Source Graph database migration is read-only at the source boundary.
+- Source Graph refresh documentation matches the serialized runtime invariant.
+
 ## 0.10.64 — 2026-08-27
 
 ### Fixed
