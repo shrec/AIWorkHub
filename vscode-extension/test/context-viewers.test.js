@@ -161,7 +161,7 @@ test("narrow wrapped settings footer stays inside the frame and leaves only the 
   assert.strictEqual(footerBottom, dialogHeight);
   assert.ok(listContentHeight > listHeight, "fixture must require list scrolling");
   assert.match(css, /@media \(max-width: 620px\)[\s\S]*?\.settings-footnote\s*\{[^}]*overflow-wrap:\s*anywhere/);
-  const footnoteRule = css.match(/(?:^|\n\n)\.settings-footnote \{([^}]*)\}/)[1];
+  const footnoteRule = css.match(/(?:^|\r?\n\r?\n)\.settings-footnote \{([^}]*)\}/)[1];
   assert.match(footnoteRule, /min-height:\s*40px/);
   assert.doesNotMatch(footnoteRule, /(?:^|\n)\s*height:\s*40px/);
   assert.doesNotMatch(css, /\.settings-dialog[^}]*overflow:\s*(?:auto|scroll|hidden)/s);
