@@ -205,6 +205,10 @@ def test_read_owner_manifest_rejects_lstat_open_substitution(
     assert runtime_temp.read_owner_manifest(owner_dir) is None
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="exercises POSIX fd/path replacement semantics; native Windows denies replacement by share mode",
+)
 def test_read_owner_manifest_rejects_post_read_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
