@@ -9580,31 +9580,32 @@ async function openDashboardCommand(extensionUri) {
     panel.reveal(vscode.ViewColumn.Active, false);
     return;
   }
-  panel = vscode.window.createWebviewPanel(
+  const ownedPanel = vscode.window.createWebviewPanel(
     PANEL_VIEW_TYPE,
     "AIWorkHub",
     vscode.ViewColumn.Active,
     { retainContextWhenHidden: true }
   );
+  panel = ownedPanel;
   recordSystemLog("[webview] dashboard panel opened");
-  applyWebviewOptions(panel.webview, extensionUri);
-  panel.webview.html = getHtmlForWebview(panel.webview, extensionUri);
+  applyWebviewOptions(ownedPanel.webview, extensionUri);
+  ownedPanel.webview.html = getHtmlForWebview(ownedPanel.webview, extensionUri);
 
   const view = new ViewState((msg) => {
-    if (panel) {
-      panel.webview.postMessage(msg);
+    if (ownedPanel.__aiworkhubViewState === view) {
+      ownedPanel.webview.postMessage(msg);
     }
   });
-  panel.__aiworkhubViewState = view;
+  ownedPanel.__aiworkhubViewState = view;
 
   // A newly created visible panel likewise may not emit a view-state change.
   // Start its host-side polling schedule at creation time.
-  view.setVisible(panel.visible);
+  view.setVisible(ownedPanel.visible);
 
-  panel.webview.onDidReceiveMessage((message) => handleInboundMessage(view, message));
+  ownedPanel.webview.onDidReceiveMessage((message) => handleInboundMessage(view, message));
 
   // Push the active repository label once the Webview reports ready.
-  panel.webview.onDidReceiveMessage((message) => {
+  ownedPanel.webview.onDidReceiveMessage((message) => {
     if (message && message.type === "ready") {
       pushRepositoryInfo(view, activeRepoIdentity);
       runBackgroundTask("dashboard runtime info", () => pushRuntimeInfo(view));
@@ -9612,15 +9613,20 @@ async function openDashboardCommand(extensionUri) {
     }
   });
 
-  panel.onDidChangeViewState(() => {
-    view.setVisible(panel.visible);
-    if (panel.visible) {
+  ownedPanel.onDidChangeViewState(() => {
+    view.setVisible(ownedPanel.visible);
+    if (ownedPanel.visible) {
       runBackgroundTask("dashboard visibility refresh", () => pushSnapshot(view));
     }
   });
-  panel.onDidDispose(() => {
-    view.dispose();
-    panel = null;
+  ownedPanel.onDidDispose(() => {
+    if (ownedPanel.__aiworkhubViewState === view) {
+      ownedPanel.__aiworkhubViewState = null;
+      view.dispose();
+    }
+    if (panel === ownedPanel) {
+      panel = null;
+    }
   });
 
   runBackgroundTask("dashboard initial snapshot", () => pushSnapshot(view));
@@ -9632,42 +9638,53 @@ function reviveDashboardPanel(webviewPanel, extensionUri, context) {
   // so a reload/deserialize cycle -- however many times it repeats -- never
   // leaves two live pollers or an orphaned ViewState running in the
   // background. See test_aiworkhub_vscode_reload_restore_b855.py.
-  if (panel && panel !== webviewPanel && panel.__aiworkhubViewState) {
+  const ownedPanel = webviewPanel;
+  if (panel && panel !== ownedPanel && panel.__aiworkhubViewState) {
     panel.__aiworkhubViewState.dispose();
+    panel.__aiworkhubViewState = null;
   }
-  panel = webviewPanel;
+  if (ownedPanel.__aiworkhubViewState) {
+    ownedPanel.__aiworkhubViewState.dispose();
+    ownedPanel.__aiworkhubViewState = null;
+  }
+  panel = ownedPanel;
   recordSystemLog("[webview] dashboard panel revived");
-  applyWebviewOptions(panel.webview, extensionUri);
-  panel.webview.html = getHtmlForWebview(panel.webview, extensionUri);
+  applyWebviewOptions(ownedPanel.webview, extensionUri);
+  ownedPanel.webview.html = getHtmlForWebview(ownedPanel.webview, extensionUri);
   // Re-create a fresh McpStdioClient binding for the revived panel -- the
   // extension host, not the Webview, owns MCP identity/session state, and a
   // deserialized panel starts with none of it until this call.
   const client = getMcpClient(context);
   const view = new ViewState((msg) => {
-    if (panel) {
-      panel.webview.postMessage(msg);
+    if (ownedPanel.__aiworkhubViewState === view) {
+      ownedPanel.webview.postMessage(msg);
     }
   });
   view.bindClient(client);
-  panel.__aiworkhubViewState = view;
-  view.setVisible(panel.visible);
-  panel.webview.onDidReceiveMessage((message) => handleInboundMessage(view, message));
-  panel.webview.onDidReceiveMessage((message) => {
+  ownedPanel.__aiworkhubViewState = view;
+  view.setVisible(ownedPanel.visible);
+  ownedPanel.webview.onDidReceiveMessage((message) => handleInboundMessage(view, message));
+  ownedPanel.webview.onDidReceiveMessage((message) => {
     if (message && message.type === "ready") {
       pushRepositoryInfo(view, activeRepoIdentity);
       runBackgroundTask("revived dashboard runtime info", () => pushRuntimeInfo(view));
       pushCoordinatorTargets(view);
     }
   });
-  panel.onDidChangeViewState(() => {
-    view.setVisible(panel.visible);
-    if (panel.visible) {
+  ownedPanel.onDidChangeViewState(() => {
+    view.setVisible(ownedPanel.visible);
+    if (ownedPanel.visible) {
       runBackgroundTask("revived dashboard visibility refresh", () => pushSnapshot(view));
     }
   });
-  panel.onDidDispose(() => {
-    view.dispose();
-    panel = null;
+  ownedPanel.onDidDispose(() => {
+    if (ownedPanel.__aiworkhubViewState === view) {
+      ownedPanel.__aiworkhubViewState = null;
+      view.dispose();
+    }
+    if (panel === ownedPanel) {
+      panel = null;
+    }
   });
   runBackgroundTask("revived dashboard snapshot", () => pushSnapshot(view));
 }
