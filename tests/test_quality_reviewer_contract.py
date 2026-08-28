@@ -1460,3 +1460,64 @@ def test_quality_review_read_only_input_paths_are_strict_path_declarations(
         worker_workspace.quality_review_read_only_input_paths(
             repo, read_first=["link.md"], immutable_input_paths=[]
         )
+
+
+def test_rm33_new_production_and_test_candidates_prepare_read_only_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _quality_review_repo(tmp_path, monkeypatch)
+    (repo / "README.md").write_text("canonical input\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=repo, check=True)
+    candidates = ["src/new_feature.py", "tests/test_new_feature.py"]
+    source = worker_workspace.create_workspace(
+        repo,
+        "e" * 32,
+        {"allowed_writes": candidates, "required_outputs": []},
+        "validation",
+    )
+    review = None
+    try:
+        for relative, body in zip(candidates, ("VALUE = 33\n", "def test_value(): pass\n")):
+            path = source.path / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        canonical_inputs = worker_workspace.quality_review_read_only_input_paths(
+            repo,
+            read_first=["README.md", *candidates],
+            candidate_changed_paths=candidates,
+        )
+        assert canonical_inputs == ["README.md"]
+        review, evidence = worker_workspace.create_quality_review_workspace(
+            source, "f" * 32, candidates, "validation", canonical_inputs
+        )
+        assert review.allowed_writes == ()
+        assert evidence["candidate_paths"] == candidates
+        assert evidence["read_only_input_paths"] == ["README.md"]
+        assert (review.path / "README.md").read_text(encoding="utf-8") == "canonical input\n"
+        assert (review.path / candidates[0]).read_text(encoding="utf-8") == "VALUE = 33\n"
+        assert (review.path / candidates[1]).read_text(encoding="utf-8") == "def test_value(): pass\n"
+        assert worker_workspace.enforce_scope(review) == []
+    finally:
+        if review is not None:
+            worker_workspace.cleanup_workspace(repo, review.path, review.home)
+        worker_workspace.cleanup_workspace(repo, source.path, source.home)
+
+
+def test_candidate_authority_does_not_excuse_invalid_canonical_declarations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _quality_review_repo(tmp_path, monkeypatch)
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside\n", encoding="utf-8")
+    (repo / "README.md").write_text("readme\n", encoding="utf-8")
+    link = repo / "link.md"
+    link.symlink_to("README.md")
+
+    for declaration in ("missing.md", "../outside.md", str(outside), "link.md"):
+        with pytest.raises(worker_workspace.WorkspaceError):
+            worker_workspace.quality_review_read_only_input_paths(
+                repo,
+                read_first=[declaration],
+                candidate_changed_paths=["src/new_feature.py"],
+            )

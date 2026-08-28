@@ -7076,6 +7076,7 @@ class ProcessManager:
                 self.repo,
                 read_first=card.get("read_first") or [],
                 immutable_input_paths=card.get("immutable_input_paths") or [],
+                candidate_changed_paths=current_hashes,
             )
             packet = quality_reviewer.build_review_packet(
                 request_id=target_request_id,

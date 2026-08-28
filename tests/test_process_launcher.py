@@ -8052,7 +8052,7 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
         {
             "claim_epoch": 1,
             "allowed_writes": ["src/changed.py"],
-            "read_first": ["README.md"],
+            "read_first": ["README.md", "src/changed.py"],
             "immutable_inputs": [
                 "The archived predecessor passed its tests before this review."
             ],

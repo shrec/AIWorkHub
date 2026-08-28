@@ -3872,18 +3872,38 @@ def quality_review_read_only_input_paths(
     *,
     read_first: Iterable[str],
     immutable_input_paths: Iterable[str] = (),
+    candidate_changed_paths: Iterable[str] = (),
 ) -> list[str]:
     """Resolve only schema-declared reviewer file inputs.
 
-    ``immutable_inputs`` is narrative task evidence and is intentionally not
-    accepted here. File materialization authority comes from explicit path
-    fields, so prose can never become a filesystem declaration.
+    Narrative immutable inputs are intentionally not accepted here. File
+    materialization authority comes from explicit path fields, so prose can
+    never become a filesystem declaration. Exact authenticated candidate paths
+    absent from canonical root are materialized by the sealed candidate overlay.
     """
 
-    return _quality_review_read_only_input_paths(
-        repo,
-        [*read_first, *immutable_input_paths],
-    )
+    repo = repo.resolve()
+    candidates = {
+        _relative_repo_path(value) for value in candidate_changed_paths
+    }
+    canonical_declarations: list[str] = []
+    for declaration in [*read_first, *immutable_input_paths]:
+        raw = str(declaration)
+        declared = Path(raw)
+        if declared.is_absolute():
+            _require_beneath(repo, declared)
+            raw = declared.relative_to(repo).as_posix()
+        normalized = _relative_repo_path(raw)
+        canonical_source = repo / normalized
+        if (
+            normalized in candidates
+            and not canonical_source.exists()
+            and not canonical_source.is_symlink()
+        ):
+            continue
+        canonical_declarations.append(raw)
+
+    return _quality_review_read_only_input_paths(repo, canonical_declarations)
 
 
 def _overlay_quality_review_read_only_input(
