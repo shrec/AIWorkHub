@@ -303,40 +303,40 @@ def enforce_caas(
     return decorator
 
 
-# In the CAAS documentation the owner-canonical phrase is everywhere, so the
-# forbidden expansion legitimately appears in this repository's own correction
-# text. Which appearances are corrections is DECLARED here, not inferred from
-# nearby words: an occurrence of a forbidden expansion is a violation UNLESS the
-# ``(repository-relative POSIX path, exact phrase)`` pair is listed below. There
-# is no cue list and no proximity window — intent is not a substring question.
-#
-# Each entry records why the site is allowed. Adding a site is a deliberate,
-# reviewable act, which is exactly the property we want: exempting a misuse must
-# require someone to write down that they are doing it. Keying on the phrase (not
-# the surrounding sentence) means the exemption survives the document being
-# rewritten around the quote.
-ALLOWED_CORRECTION_SITES: dict[tuple[str, str], str] = {
-    ("README.md", "Continuous Automated Assurance System"): (
-        "The README quotes the forbidden expansion in order to correct it to the "
-        "owner-canonical 'Continuous Audit as a Service'."
-    ),
-    ("docs/CAAS_PROTOCOL.md", "Continuous Automated Assurance System"): (
-        "The protocol contract names the forbidden expansion in order to declare "
-        "it wrong and point at the UltrafastSecp256k1 README that carries it."
-    ),
-}
+@dataclass(frozen=True)
+class CorrectionOccurrence:
+    """One reviewable, exact occurrence of forbidden text used as a correction."""
 
-#: Repository root, used to key a scanned file against ALLOWED_CORRECTION_SITES.
+    path: str
+    line: int
+    column: int
+    phrase: str
+    reason: str
+
+
+# Corrections are authorized by exact path, 1-based line and column, and exact
+# content. A moved, re-cased, duplicated, or otherwise stale declaration matches
+# nothing and therefore suppresses nothing.
+ALLOWED_CORRECTION_SITES: tuple[CorrectionOccurrence, ...] = (
+    CorrectionOccurrence(
+        "README.md", 60, 41, "Continuous Automated Assurance System",
+        "The README quotes the upstream expansion while correcting it.",
+    ),
+    CorrectionOccurrence(
+        "docs/CAAS_PROTOCOL.md", 4, 42, "Continuous Automated Assurance System",
+        "The protocol declares this expansion wrong.",
+    ),
+    CorrectionOccurrence(
+        "docs/CAAS_PROTOCOL.md", 50, 39, "Continuous Automated Assurance System",
+        "The named external residual identifies the upstream text to correct.",
+    ),
+)
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _relative_site(path: Path) -> str | None:
-    """Return ``path`` as a repo-relative POSIX string, or ``None`` if outside.
-
-    Only files inside this repository can be declared correction sites; anything
-    else (a temp file, another checkout) can never match the allowlist and so is
-    always subject to the check.
-    """
+    """Return path as a repo-relative POSIX string, or None if outside."""
 
     try:
         return path.resolve().relative_to(_REPO_ROOT).as_posix()
@@ -344,54 +344,68 @@ def _relative_site(path: Path) -> str | None:
         return None
 
 
-def scan_text_for_forbidden_expansion(text: str) -> list[str]:
-    """Return every forbidden CAAS expansion present in ``text``.
+def _forbidden_occurrences(text: str) -> list[tuple[str, int, int]]:
+    """Return longest-attributed occurrences as (phrase, line, column)."""
 
-    This is pure detection with no notion of intent. Matching is
-    case-insensitive on both sides, so a lowercased or otherwise re-cased
-    forbidden phrase cannot slip through. Text handed here has no file identity,
-    so nothing is exempt at this level; the declared-correction allowlist is
-    applied one level up in :func:`scan_paths_for_forbidden_expansion`, where the
-    file is known. This keeps the correction docs passing without teaching the
-    check to guess which sentences mean to condemn the phrase.
-
-    Overlapping variants are attributed to the longest forbidden expansion that
-    occupies a span: a shorter phrase that is only ever a substring of a longer
-    one (e.g. "Continuous Automated Assurance" inside "…Assurance System") is not
-    counted separately, so one wrong phrase yields one finding.
-    """
-
-    # Compare case-folded throughout so case variants match; report the canonical
-    # spelling. Longest first, so a longer phrase claims its character span before
-    # any shorter substring is evaluated.
     haystack = text.casefold()
-    order = sorted(FORBIDDEN_EXPANSIONS, key=len, reverse=True)
     claimed: list[tuple[int, int]] = []
-    found: list[str] = []
-    for bad in order:
+    matches: list[tuple[int, str, int, int]] = []
+    for bad in sorted(FORBIDDEN_EXPANSIONS, key=len, reverse=True):
         needle = bad.casefold()
-        present = False
         start = haystack.find(needle)
         while start != -1:
             end = start + len(needle)
-            covered = any(s <= start and end <= e for s, e in claimed)
-            if not covered:
+            if not any(s <= start and end <= e for s, e in claimed):
                 claimed.append((start, end))
-                present = True
+                line = text.count("\n", 0, start) + 1
+                line_start = text.rfind("\n", 0, start) + 1
+                matches.append((start, bad, line, start - line_start + 1))
             start = haystack.find(needle, start + 1)
-        if present:
-            found.append(bad)
-    return found
+    return [(bad, line, column) for _, bad, line, column in sorted(matches)]
+
+
+def scan_text_for_forbidden_expansion(text: str) -> list[str]:
+    """Return each forbidden expansion present in text.
+
+    Matching is case-insensitive. Overlapping variants are attributed to the
+    longest expansion occupying a span.
+    """
+
+    present = {bad for bad, _, _ in _forbidden_occurrences(text)}
+    return [
+        bad
+        for bad in sorted(FORBIDDEN_EXPANSIONS, key=len, reverse=True)
+        if bad in present
+    ]
+
+
+def _declared_locators(relative_path: str | None) -> set[tuple[str, int, int]]:
+    """Return valid unique locators; invalid declarations fail closed."""
+
+    candidates = [
+        site
+        for site in ALLOWED_CORRECTION_SITES
+        if isinstance(site, CorrectionOccurrence) and site.path == relative_path
+    ]
+    counts: dict[tuple[str, int, int], int] = {}
+    for site in candidates:
+        locator = (site.phrase, site.line, site.column)
+        valid = (
+            site.path == Path(site.path).as_posix()
+            and not Path(site.path).is_absolute()
+            and ".." not in Path(site.path).parts
+            and site.phrase in FORBIDDEN_EXPANSIONS
+            and site.line > 0
+            and site.column > 0
+            and bool(site.reason.strip())
+        )
+        if valid:
+            counts[locator] = counts.get(locator, 0) + 1
+    return {locator for locator, count in counts.items() if count == 1}
 
 
 def scan_paths_for_forbidden_expansion(paths: Iterable[Any]) -> dict[str, list[str]]:
-    """Scan repo-controlled doc paths, returning {path: [forbidden expansions]}.
-
-    An occurrence is dropped only when its ``(repo-relative path, phrase)`` pair
-    is a declared correction site in :data:`ALLOWED_CORRECTION_SITES`. Nothing
-    else is exempt: a forbidden expansion in any file not on that list — quoted,
-    condemned, or otherwise — is reported, full stop.
-    """
+    """Scan paths and report every unmatched forbidden expansion occurrence."""
 
     hits: dict[str, list[str]] = {}
     for raw in paths:
@@ -399,11 +413,13 @@ def scan_paths_for_forbidden_expansion(paths: Iterable[Any]) -> dict[str, list[s
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
-        rel = _relative_site(path)
+        allowed = _declared_locators(_relative_site(path))
+        lines = text.splitlines()
         reported = [
             bad
-            for bad in scan_text_for_forbidden_expansion(text)
-            if (rel, bad) not in ALLOWED_CORRECTION_SITES
+            for bad, line, column in _forbidden_occurrences(text)
+            if (bad, line, column) not in allowed
+            or lines[line - 1][column - 1 : column - 1 + len(bad)] != bad
         ]
         if reported:
             hits[str(path)] = reported

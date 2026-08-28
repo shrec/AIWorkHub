@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import aiworkhub.caas_enforcement as caas_enforcement
 from aiworkhub.caas_enforcement import (
     ALLOWED_CORRECTION_SITES,
     CAAS_EXPANSION,
@@ -17,6 +18,7 @@ from aiworkhub.caas_enforcement import (
     CaasComplianceError,
     CaasComplianceState,
     CaasEnforcer,
+    CorrectionOccurrence,
     Enforceability,
     assert_compliant,
     enforce_caas,
@@ -121,7 +123,7 @@ def test_partial_property_p6_names_the_needfix_store_residual():
 # --- Discrimination: the exemption is DECLARED, not inferred. -----------------
 #
 # An occurrence of the forbidden expansion is a violation unless the
-# (repo-relative file, phrase) pair is a declared correction site. There is no
+# (repo-relative path, line, column, exact phrase) occurrence is declared. There is no
 # cue list and no proximity window: intent is not guessed from nearby words.
 # Both directions are tested, plus the two cases that prove the design — a doc
 # that looks like a correction but is not declared must FAIL, and a case-variant
@@ -130,32 +132,53 @@ def test_partial_property_p6_names_the_needfix_store_residual():
 BAD = "Continuous Automated Assurance System"
 
 
-def test_allowlist_entries_are_keyed_on_file_and_phrase_with_a_reason():
-    """The exemption is a reviewable declaration: each correction site is keyed on
-    (repo-relative path, exact phrase) and carries a non-empty reason."""
+def test_allowlist_entries_are_exact_reviewable_occurrences():
+    assert [(site.path, site.line, site.column) for site in ALLOWED_CORRECTION_SITES] == [
+        ("README.md", 60, 41),
+        ("docs/CAAS_PROTOCOL.md", 4, 42),
+        ("docs/CAAS_PROTOCOL.md", 50, 39),
+    ]
+    assert all(site.phrase == BAD and site.reason.strip() for site in ALLOWED_CORRECTION_SITES)
 
-    assert ("README.md", BAD) in ALLOWED_CORRECTION_SITES
-    assert ("docs/CAAS_PROTOCOL.md", BAD) in ALLOWED_CORRECTION_SITES
-    assert all(reason.strip() for reason in ALLOWED_CORRECTION_SITES.values())
+
+def test_allowlisted_path_reports_additional_occurrence(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    readme = repo / "README.md"
+    declared_line = "x" * 40 + BAD
+    readme.write_text(
+        "\n" * 59 + declared_line + "\nAdditional misuse: " + BAD,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(caas_enforcement, "_REPO_ROOT", repo)
+
+    assert scan_paths_for_forbidden_expansion([readme]) == {str(readme): [BAD]}
+
+
+def test_duplicate_declaration_fails_closed(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    readme = repo / "README.md"
+    readme.write_text("\n" * 59 + "x" * 40 + BAD, encoding="utf-8")
+    declaration = CorrectionOccurrence("README.md", 60, 41, BAD, "correction")
+    monkeypatch.setattr(caas_enforcement, "_REPO_ROOT", repo)
+    monkeypatch.setattr(
+        caas_enforcement, "ALLOWED_CORRECTION_SITES", (declaration, declaration)
+    )
+
+    assert scan_paths_for_forbidden_expansion([readme]) == {str(readme): [BAD]}
 
 
 def test_repo_correction_docs_are_not_reported_as_violations():
-    """README.md and docs/CAAS_PROTOCOL.md are declared correction sites; they
-    quote the wrong expansion to condemn it and appear on the allowlist. The
-    scanner must not flag the very text that fixes the problem."""
-
     readme = REPO_ROOT / "README.md"
     protocol = REPO_ROOT / "docs" / "CAAS_PROTOCOL.md"
 
-    # The precondition: both files really do contain the quoted wrong expansion,
-    # otherwise this test would pass vacuously.
-    assert BAD in readme.read_text(encoding="utf-8")
-    assert BAD in protocol.read_text(encoding="utf-8")
+    assert readme.read_text(encoding="utf-8").count(BAD) == 1
+    assert protocol.read_text(encoding="utf-8").count(BAD) == 2
 
     hits = scan_paths_for_forbidden_expansion([readme, protocol])
     assert hits == {}, f"declared correction docs wrongly flagged: {hits}"
 
-    # And the derived compliance state passes P1 for the real docs.
     state = CaasComplianceState.from_docs([readme, protocol])
     assert CaasEnforcer().evaluate(state).compliant
 
