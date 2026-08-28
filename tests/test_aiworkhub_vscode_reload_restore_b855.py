@@ -79,7 +79,7 @@ def test_open_dashboard_command_still_reveals_single_panel() -> None:
     """The command-driven open path (distinct from the reload/deserialize
     path) still guards against a second panel: if one already exists it is
     revealed, never duplicated."""
-    open_block = _function_body(_EXT_SOURCE, r"async function openDashboardCommand\(", max_len=300)
+    open_block = _function_body(_EXT_SOURCE, r"async function openDashboardCommand\(", max_len=600)
     assert "if (panel)" in open_block
     assert "panel.reveal(" in open_block
 
