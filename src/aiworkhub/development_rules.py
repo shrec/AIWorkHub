@@ -638,10 +638,10 @@ def _validate_resolve_language(value: object, *, known_languages: frozenset[str]
     return validated
 
 
-def _validate_resolve_task(value: object) -> str | None:
+def _validate_resolve_task(value: object, *, path: str = "task") -> str | None:
     if value is None:
         return None
-    return _validate_identifier(value, path="task")
+    return _validate_identifier(value, path=path)
 
 
 def _validate_resolve_path(value: object) -> str | None:
@@ -736,6 +736,266 @@ def resolve(
     )
 
 
+# --- inert construction-template registry ----------------------------------
+
+CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_ID = "aiworkhub.construction_template_registry"
+CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_VERSION = "1.0.0"
+
+_TEMPLATE_DIGEST_DOMAIN = b"aiworkhub.construction_template.digest.v1\n"
+_REGISTRY_DIGEST_DOMAIN = b"aiworkhub.construction_template_registry.digest.v1\n"
+
+
+class LogicSlotType(Enum):
+    EXPRESSION = "expression"
+    STATEMENT = "statement"
+    IDENTIFIER = "identifier"
+    TYPE = "type"
+
+
+@dataclass(frozen=True, slots=True)
+class ConstructionTemplateSlot:
+    id: str
+    type: LogicSlotType
+    required: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LiteralPatternNode:
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class LogicSlotReferenceNode:
+    slot_id: str
+
+
+PatternNode = Union[LiteralPatternNode, LogicSlotReferenceNode]
+
+
+@dataclass(frozen=True, slots=True)
+class ConstructionTemplate:
+    id: str
+    applicability: "TemplateApplicability"
+    slots: tuple[ConstructionTemplateSlot, ...]
+    pattern: tuple[PatternNode, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateApplicability:
+    languages: tuple[str, ...]
+    symbol_kinds: tuple[str, ...]
+    task_kinds: tuple[str, ...]
+    risk_levels: tuple[RiskLevel, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ConstructionTemplateRegistry:
+    schema: str
+    schema_version: str
+    languages: tuple[str, ...]
+    templates: tuple[ConstructionTemplate, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateSelectionReceipt:
+    language: str | None
+    symbol_kind: str | None
+    task_kind: str | None
+    risk: RiskLevel | None
+    template_ids: tuple[str, ...]
+    template_digests: tuple[str, ...]
+    registry_digest: str
+
+
+def _parse_template_applicability(mapping: object, *, path: str, known_languages: frozenset[str]) -> TemplateApplicability:
+    if mapping is None:
+        return TemplateApplicability((), (), (), ())
+    allowed = frozenset({"languages", "symbol_kinds", "task_kinds", "risk_levels"})
+    _check_keys(mapping, allowed, required=frozenset(), path=path)
+    languages = _validate_identifier_tuple(mapping.get("languages", []), path=f"{path}.languages", allow_empty=True)
+    for language in languages:
+        if language not in known_languages:
+            raise ManifestValidationError(
+                ReasonCode.UNKNOWN_LANGUAGE_REFERENCE, f"{path}.languages: {language!r} not declared in $.languages"
+            )
+    symbol_kinds = _validate_identifier_tuple(mapping.get("symbol_kinds", []), path=f"{path}.symbol_kinds", allow_empty=True)
+    task_kinds = _validate_identifier_tuple(mapping.get("task_kinds", []), path=f"{path}.task_kinds", allow_empty=True)
+    risk_raw = mapping.get("risk_levels", [])
+    if not isinstance(risk_raw, list):
+        raise ManifestValidationError(ReasonCode.WRONG_TYPE, f"{path}.risk_levels: expected array")
+    risk_levels = [
+        _parse_enum(value, RiskLevel, path=f"{path}.risk_levels[{index}]")
+        for index, value in enumerate(risk_raw)
+    ]
+    if len(set(risk_levels)) != len(risk_levels):
+        raise ManifestValidationError(ReasonCode.DUPLICATE_IDENTIFIER, f"{path}.risk_levels: duplicate risk level")
+    return TemplateApplicability(
+        languages,
+        symbol_kinds,
+        task_kinds,
+        tuple(sorted(risk_levels, key=lambda value: _RISK_ORDER[value])),
+    )
+
+
+def _parse_template_slot(mapping: object, *, path: str) -> ConstructionTemplateSlot:
+    keys = frozenset({"id", "type", "required"})
+    _check_keys(mapping, keys, required=keys, path=path)
+    return ConstructionTemplateSlot(
+        id=_validate_identifier(mapping["id"], path=f"{path}.id"),
+        type=_parse_enum(mapping["type"], LogicSlotType, path=f"{path}.type"),
+        required=_expect_bool(mapping["required"], path=f"{path}.required"),
+    )
+
+
+def _parse_pattern_node(mapping: object, *, path: str) -> PatternNode:
+    _check_keys(mapping, frozenset({"literal", "logic_slot"}), required=frozenset(), path=path)
+    has_literal = "literal" in mapping
+    has_slot = "logic_slot" in mapping
+    if has_literal == has_slot:
+        raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{path}: exactly one pattern node kind is required")
+    if has_literal:
+        source = mapping["literal"]
+        if not isinstance(source, str):
+            raise ManifestValidationError(ReasonCode.WRONG_TYPE, f"{path}.literal: expected str")
+        return LiteralPatternNode(source=source)
+    return LogicSlotReferenceNode(slot_id=_validate_identifier(mapping["logic_slot"], path=f"{path}.logic_slot"))
+
+
+def _parse_construction_template(mapping: object, *, path: str, known_languages: frozenset[str]) -> ConstructionTemplate:
+    _check_keys(
+        mapping,
+        frozenset({"id", "applicability", "slots", "pattern"}),
+        required=frozenset({"id", "slots", "pattern"}),
+        path=path,
+    )
+    slots_raw = mapping["slots"]
+    if not isinstance(slots_raw, list):
+        raise ManifestValidationError(ReasonCode.WRONG_TYPE, f"{path}.slots: expected array")
+    slots = tuple(
+        _parse_template_slot(slot, path=f"{path}.slots[{index}]") for index, slot in enumerate(slots_raw)
+    )
+    slot_ids = tuple(slot.id for slot in slots)
+    if len(set(slot_ids)) != len(slot_ids):
+        raise ManifestValidationError(ReasonCode.DUPLICATE_IDENTIFIER, f"{path}.slots: duplicate slot id")
+    pattern_raw = mapping["pattern"]
+    if not isinstance(pattern_raw, list) or not pattern_raw:
+        raise ManifestValidationError(ReasonCode.EMPTY_COLLECTION, f"{path}.pattern: must be a non-empty array")
+    pattern = tuple(
+        _parse_pattern_node(node, path=f"{path}.pattern[{index}]") for index, node in enumerate(pattern_raw)
+    )
+    referenced = {node.slot_id for node in pattern if isinstance(node, LogicSlotReferenceNode)}
+    unknown_slots = referenced - set(slot_ids)
+    if unknown_slots:
+        raise ManifestValidationError(ReasonCode.MALFORMED_IDENTIFIER, f"{path}.pattern: dangling slot reference {sorted(unknown_slots)}")
+    unreferenced_required = {slot.id for slot in slots if slot.required} - referenced
+    if unreferenced_required:
+        raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{path}.slots: unreferenced required slot {sorted(unreferenced_required)}")
+    return ConstructionTemplate(
+        id=_validate_identifier(mapping["id"], path=f"{path}.id"),
+        applicability=_parse_template_applicability(
+            mapping.get("applicability"), path=f"{path}.applicability", known_languages=known_languages
+        ),
+        slots=tuple(sorted(slots, key=lambda slot: slot.id)),
+        pattern=pattern,
+    )
+
+
+def parse_construction_template_registry(mapping: object) -> ConstructionTemplateRegistry:
+    """Parse inert construction-template data without rendering or executing it."""
+    required = frozenset({"schema", "schema_version", "languages", "templates"})
+    _check_keys(mapping, required, required=required, path="$")
+    if mapping["schema"] != CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_ID:
+        raise ManifestValidationError(ReasonCode.UNKNOWN_SCHEMA, "$.schema: unsupported construction-template registry schema")
+    version = mapping["schema_version"]
+    if not isinstance(version, str) or not _VERSION_RE.match(version):
+        raise ManifestValidationError(ReasonCode.MALFORMED_VERSION, "$.schema_version: malformed version")
+    if version != CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_VERSION:
+        raise ManifestValidationError(ReasonCode.UNSUPPORTED_SCHEMA_VERSION, "$.schema_version: unsupported version")
+    languages = _validate_identifier_tuple(mapping["languages"], path="$.languages", allow_empty=False)
+    templates_raw = mapping["templates"]
+    if not isinstance(templates_raw, list) or not templates_raw:
+        raise ManifestValidationError(ReasonCode.EMPTY_COLLECTION, "$.templates: must be a non-empty array")
+    templates = tuple(
+        _parse_construction_template(
+            template, path=f"$.templates[{index}]", known_languages=frozenset(languages)
+        )
+        for index, template in enumerate(templates_raw)
+    )
+    if len({template.id for template in templates}) != len(templates):
+        raise ManifestValidationError(ReasonCode.DUPLICATE_IDENTIFIER, "$.templates: duplicate template id")
+    return ConstructionTemplateRegistry(
+        schema=CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_ID,
+        schema_version=version,
+        languages=languages,
+        templates=tuple(sorted(templates, key=lambda template: template.id)),
+    )
+
+
+def _template_canonical(template: ConstructionTemplate) -> dict[str, object]:
+    return {
+        "id": template.id,
+        "applicability": {
+            "languages": list(template.applicability.languages),
+            "symbol_kinds": list(template.applicability.symbol_kinds),
+            "task_kinds": list(template.applicability.task_kinds),
+            "risk_levels": [risk.value for risk in template.applicability.risk_levels],
+        },
+        "slots": [{"id": slot.id, "type": slot.type.value, "required": slot.required} for slot in template.slots],
+        "pattern": [
+            {"literal": node.source} if isinstance(node, LiteralPatternNode) else {"logic_slot": node.slot_id}
+            for node in template.pattern
+        ],
+    }
+
+
+def construction_template_digest(template: ConstructionTemplate) -> str:
+    encoded = json.dumps(
+        _template_canonical(template), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(_TEMPLATE_DIGEST_DOMAIN + encoded).hexdigest()
+
+
+def construction_template_registry_digest(registry: ConstructionTemplateRegistry) -> str:
+    canonical = {
+        "schema": registry.schema,
+        "schema_version": registry.schema_version,
+        "languages": list(registry.languages),
+        "templates": [_template_canonical(template) for template in registry.templates],
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(_REGISTRY_DIGEST_DOMAIN + encoded).hexdigest()
+
+
+def select_construction_templates(
+    registry: ConstructionTemplateRegistry,
+    *,
+    language: str | None = None,
+    symbol_kind: str | None = None,
+    task_kind: str | None = None, risk: RiskLevel | str | None = None,
+) -> TemplateSelectionReceipt:
+    """Select declared inert templates only; this never renders or expands authority."""
+    validated_language = _validate_resolve_language(language, known_languages=frozenset(registry.languages))
+    validated_symbol_kind = _validate_resolve_task(symbol_kind, path="symbol_kind")
+    validated_task_kind = _validate_resolve_task(task_kind, path="task_kind")
+    resolved_risk = _coerce_risk(risk)
+    selected = tuple(
+        template for template in registry.templates
+        if _dimension_matches(template.applicability.languages, validated_language)
+        and _dimension_matches(template.applicability.symbol_kinds, validated_symbol_kind)
+        and _dimension_matches(template.applicability.task_kinds, validated_task_kind)
+        and _dimension_matches(template.applicability.risk_levels, resolved_risk)
+    )
+    return TemplateSelectionReceipt(
+        language=validated_language,
+        symbol_kind=validated_symbol_kind,
+        task_kind=validated_task_kind,
+        risk=resolved_risk,
+        template_ids=tuple(template.id for template in selected),
+        template_digests=tuple(construction_template_digest(template) for template in selected),
+        registry_digest=construction_template_registry_digest(registry),
+    )
+
+
 __all__ = [
     "SCHEMA_ID",
     "SCHEMA_VERSION",
@@ -758,8 +1018,22 @@ __all__ = [
     "DevelopmentRule",
     "DevelopmentRulesManifest",
     "ResolvedRuleSet",
+    "CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_ID",
+    "CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_VERSION",
+    "LogicSlotType",
+    "ConstructionTemplateSlot",
+    "LiteralPatternNode",
+    "LogicSlotReferenceNode",
+    "TemplateApplicability",
+    "ConstructionTemplate",
+    "ConstructionTemplateRegistry",
+    "TemplateSelectionReceipt",
     "parse_manifest",
     "parse_manifest_bytes",
     "canonical_digest",
     "resolve",
+    "parse_construction_template_registry",
+    "construction_template_digest",
+    "construction_template_registry_digest",
+    "select_construction_templates",
 ]

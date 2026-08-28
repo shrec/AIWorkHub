@@ -622,3 +622,114 @@ def test_valid_manifest_is_round_trip_deep_copyable_without_mutation_sharing():
     manifest_a = dr.parse_manifest(mapping)
     manifest_b = dr.parse_manifest(copy.deepcopy(mapping))
     assert dr.canonical_digest(manifest_a) == dr.canonical_digest(manifest_b)
+
+
+# --- inert construction-template registry ----------------------------------
+
+
+def _template_registry_mapping():
+    return {
+        "schema": dr.CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_ID,
+        "schema_version": dr.CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_VERSION,
+        "languages": ["python", "rust"],
+        "templates": [
+            {
+                "id": "python_guard",
+                "applicability": {
+                    "languages": ["python"],
+                    "symbol_kinds": ["function"],
+                    "task_kinds": ["refactor"],
+                    "risk_levels": ["medium", "high"],
+                },
+                "slots": [{"id": "condition", "type": "expression", "required": True}],
+                "pattern": [{"literal": "if "}, {"logic_slot": "condition"}, {"literal": ":\n    pass\n"}],
+            },
+            {
+                "id": "generic_marker",
+                "slots": [],
+                "pattern": [{"literal": "# inert marker\n"}],
+            },
+        ],
+    }
+
+
+def test_construction_template_registry_is_immutable_inert_and_deterministic():
+    registry = dr.parse_construction_template_registry(_template_registry_mapping())
+    template = next(template for template in registry.templates if template.id == "python_guard")
+
+    assert isinstance(template.pattern[0], dr.LiteralPatternNode)
+    assert isinstance(template.pattern[1], dr.LogicSlotReferenceNode)
+    assert template.pattern[0].source == "if "
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        template.id = "changed"
+    with pytest.raises(AttributeError):
+        template.pattern.append(template.pattern[0])
+
+
+def test_construction_template_digests_ignore_mapping_key_order():
+    mapping = _template_registry_mapping()
+
+    def reorder_mapping_keys(value):
+        if isinstance(value, dict):
+            return {key: reorder_mapping_keys(value[key]) for key in reversed(value)}
+        if isinstance(value, list):
+            return [reorder_mapping_keys(item) for item in value]
+        return value
+
+    reordered = reorder_mapping_keys(mapping)
+    registry_a = dr.parse_construction_template_registry(mapping)
+    registry_b = dr.parse_construction_template_registry(reordered)
+
+    assert dr.construction_template_registry_digest(registry_a) == dr.construction_template_registry_digest(registry_b)
+    assert dr.construction_template_digest(registry_a.templates[0]) == dr.construction_template_digest(registry_b.templates[0])
+
+
+def test_select_construction_templates_returns_stable_provenance_receipt():
+    registry = dr.parse_construction_template_registry(_template_registry_mapping())
+    receipt = dr.select_construction_templates(
+        registry, language="python", symbol_kind="function", task_kind="refactor", risk="high"
+    )
+
+    assert receipt.template_ids == ("generic_marker", "python_guard")
+    assert receipt.template_digests == tuple(
+        dr.construction_template_digest(next(template for template in registry.templates if template.id == template_id))
+        for template_id in receipt.template_ids
+    )
+    assert receipt.registry_digest == dr.construction_template_registry_digest(registry)
+
+
+def test_select_construction_templates_reports_malformed_symbol_kind_name():
+    registry = dr.parse_construction_template_registry(_template_registry_mapping())
+
+    with pytest.raises(dr.ManifestValidationError) as excinfo:
+        dr.select_construction_templates(registry, symbol_kind="Bad-Symbol!")
+
+    assert excinfo.value.reason is dr.ReasonCode.MALFORMED_IDENTIFIER
+    assert excinfo.value.detail.startswith("symbol_kind:")
+
+
+def test_select_construction_templates_reports_malformed_task_kind_name():
+    registry = dr.parse_construction_template_registry(_template_registry_mapping())
+
+    with pytest.raises(dr.ManifestValidationError) as excinfo:
+        dr.select_construction_templates(registry, task_kind="Bad-Task!")
+
+    assert excinfo.value.reason is dr.ReasonCode.MALFORMED_IDENTIFIER
+    assert excinfo.value.detail.startswith("task_kind:")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda mapping: mapping["templates"][0].update({"command": "echo unsafe"}),
+        lambda mapping: mapping["templates"][0]["pattern"].append({"command": "echo unsafe"}),
+        lambda mapping: mapping["templates"][0]["pattern"].__setitem__(1, {"logic_slot": "missing"}),
+        lambda mapping: mapping["templates"][0]["pattern"].__setitem__(1, {"literal": "no reference"}),
+        lambda mapping: mapping["templates"][0]["applicability"].update({"symbol_kinds": ["Bad-Kind!"]}),
+    ],
+)
+def test_construction_template_registry_malformed_inputs_fail_closed(mutate):
+    mapping = _template_registry_mapping()
+    mutate(mapping)
+    with pytest.raises(dr.ManifestValidationError):
+        dr.parse_construction_template_registry(mapping)
