@@ -1,6 +1,8 @@
 "use strict";
 
 const assert = require("assert");
+const fs = require("fs");
+const os = require("os");
 const Module = require("module");
 const path = require("path");
 
@@ -42,7 +44,61 @@ const {
   repairClaudeMcpConfigObject,
   portableWorkspaceMcpCommand,
   ensureCodexMcpRegistrationTomlText,
+  McpStdioClient,
+  ensureWorkspaceMcpConfigsRepaired,
 } = extensionModule.__testInternals;
+
+{
+  const client = new McpStdioClient("/repo", { appendLine: () => {} }, { repoId: "repo_test" }, "episode");
+  const child = { pid: 42, killed: false };
+  client.child = child;
+  client.lifecycleChild = child;
+  client.lifecyclePid = child.pid;
+  let received;
+  client._onMessage = (_child, line) => { received = JSON.parse(line); };
+  const expected = { jsonrpc: "2.0", id: 1, result: { payload: `${"x".repeat(70 * 1024)} საქართველო 😀` } };
+  const frame = Buffer.from(`${JSON.stringify(expected)}\n`, "utf8");
+  const split = frame.indexOf(Buffer.from("საქართველო", "utf8")) + 1;
+  client._onStdout(child, frame.subarray(0, split));
+  client._onStdout(child, frame.subarray(split, split + 2));
+  client._onStdout(child, frame.subarray(split + 2));
+  assert.deepStrictEqual(received, expected);
+  assert.ok(!JSON.stringify(received).includes("\uFFFD"));
+}
+
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-mcp-repair-"));
+  const configPath = path.join(root, ".vscode", "mcp.json");
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  const valid = '{\n  "custom": true,\n  "servers": { "Other": { "command": "node" } }\n}\n';
+  fs.writeFileSync(configPath, valid, "utf8");
+  fakeVscode.workspace.workspaceFolders = [{ uri: { fsPath: root } }];
+  const originalRename = fs.renameSync;
+  fs.renameSync = (from, to) => { if (to === configPath) throw new Error("interrupted"); return originalRename(from, to); };
+  try { ensureWorkspaceMcpConfigsRepaired({ extensionUri: { fsPath: "/extension" } }); } finally { fs.renameSync = originalRename; }
+  assert.strictEqual(fs.readFileSync(configPath, "utf8"), valid);
+  assert.strictEqual(ensureWorkspaceMcpConfigsRepaired({ extensionUri: { fsPath: "/extension" } }), 1);
+  const preserved = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  assert.strictEqual(preserved.custom, true);
+  assert.deepStrictEqual(preserved.servers.Other, { command: "node" });
+  assert.ok(preserved.servers.AIWorkHub);
+  fs.writeFileSync(configPath, "{ partial", "utf8");
+  ensureWorkspaceMcpConfigsRepaired({ extensionUri: { fsPath: "/extension" } });
+  const repaired = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  assert.ok(repaired.servers.AIWorkHub);
+  for (const invalidRoot of ["[]", "null"]) {
+    fs.writeFileSync(configPath, invalidRoot, "utf8");
+    assert.strictEqual(ensureWorkspaceMcpConfigsRepaired({ extensionUri: { fsPath: "/extension" } }), 1);
+    const normalized = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    assert.ok(normalized && typeof normalized === "object" && !Array.isArray(normalized));
+    assert.ok(normalized.servers.AIWorkHub);
+  }
+  fs.writeFileSync(configPath, JSON.stringify(repaired, null, 2) + "\n", "utf8");
+  const before = fs.readFileSync(configPath, "utf8");
+  assert.strictEqual(ensureWorkspaceMcpConfigsRepaired({ extensionUri: { fsPath: "/extension" } }), 0);
+  assert.strictEqual(fs.readFileSync(configPath, "utf8"), before);
+  fs.rmSync(root, { recursive: true, force: true });
+}
 
 {
   const result = repairWorkspaceMcpConfigObject(

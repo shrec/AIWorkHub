@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { StringDecoder } = require("string_decoder");
 const runtimeRetention = require("./runtime-retention");
 
 const EXT_ID = "aiworkhub";
@@ -1579,6 +1580,7 @@ class McpStdioClient {
     this.lifecycleChild = null;
     this.lifecyclePid = null;
     this.buffer = "";
+    this.stdoutDecoder = new StringDecoder("utf8");
     this.nextId = 1;
     this.pending = new Map();
     this.pendingChildren = new Map();
@@ -1881,6 +1883,7 @@ class McpStdioClient {
     this.dispatcherEnsurePromise = null;
     this.backgroundConvergencePromise = null;
     this.buffer = "";
+    this._resetStdoutDecoder();
     this.nextId = 1;
     this.pending.clear();
     this.pendingChildren.clear();
@@ -2044,8 +2047,8 @@ class McpStdioClient {
 
   _onStdout(emittingChild, chunk) {
     if (emittingChild !== this.child || !this._ownsChild(emittingChild)) return;
-    this.buffer += chunk.toString("utf8");
-    if (this.buffer.length > MCP_MAX_LINE_BYTES) {
+    this.buffer += this.stdoutDecoder.write(chunk);
+    if (Buffer.byteLength(this.buffer, "utf8") > MCP_MAX_LINE_BYTES) {
       this.outputChannel.appendLine("[mcp] unterminated stdout exceeded the response-size cap -- restarting");
       this._failPending(new Error("mcp_response_too_large"));
       this.stop({ restart: true });
@@ -2143,6 +2146,8 @@ class McpStdioClient {
     }
     this.child = null;
     this._clearLifecycleOwnership(exitedChild);
+    this.buffer = "";
+    this._resetStdoutDecoder();
     this.initialized = false;
     this.runtimePreflight = null;
     this.dispatcherEnsurePromise = null;
@@ -2224,6 +2229,13 @@ class McpStdioClient {
     this._outbound = [];
     this._outboundWriting = false;
     this._outboundEpoch += 1;
+  }
+
+  _resetStdoutDecoder() {
+    // Flush and discard an unfinished frame before another child can own the
+    // stream. A partial UTF-8 sequence must never be joined to a new child.
+    if (this.stdoutDecoder) this.stdoutDecoder.end();
+    this.stdoutDecoder = new StringDecoder("utf8");
   }
 
   _enqueueWrite(child, payload, callback) {
@@ -2372,6 +2384,8 @@ class McpStdioClient {
     this.runtimePreflight = null;
     this.dispatcherEnsurePromise = null;
     this.backgroundConvergencePromise = null;
+    this.buffer = "";
+    this._resetStdoutDecoder();
     this._resetOutbound();
     this._failPendingForChild(child, new Error(restart ? "mcp_restarting" : "mcp_stopped"));
     this._terminateOwnedChild(child);
@@ -6868,8 +6882,10 @@ function assertMcpConfigConsumable(document, options = {}) {
 }
 
 function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, python, options = {}) {
+  let changed = false;
   if (!document || typeof document !== "object" || Array.isArray(document)) {
-    return { document, changed: false };
+    document = {};
+    changed = true;
   }
   if (!document[containerKey] || typeof document[containerKey] !== "object" || Array.isArray(document[containerKey])) {
     document[containerKey] = {};
@@ -6896,7 +6912,6 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
   // so portableWorkspaceMcpCommand preserves it verbatim. options.vscodeVariables
   // still governs the downstream assertMcpConfigConsumable gate, not the command.
   const portableCommand = portableWorkspaceMcpCommand(python.command, repoRoot);
-  let changed = false;
   let found = false;
   for (const [name, value] of Object.entries(servers)) {
     if (!value || typeof value !== "object") continue;
@@ -6965,36 +6980,36 @@ function ensureWorkspaceMcpConfigsRepaired(context) {
       { configPath: path.join(repoRoot, ".mcp.json"), container: "mcpServers", label: "Claude Code", vscodeVariables: false },
     ]) {
       let document = {};
+      let corrupt = false;
       try {
         document = JSON.parse(fs.readFileSync(spec.configPath, "utf8"));
       } catch (err) {
         if (err && err.code !== "ENOENT") {
-          outputChannel.appendLine(`[mcp] ${spec.label} config is invalid/unreadable; preserved without overwrite`);
-          continue;
+          corrupt = true;
+          if (outputChannel) outputChannel.appendLine(`[mcp] ${spec.label} config is invalid/unreadable; repairing atomically`);
         }
       }
       const result = repairMcpConfigObject(document, spec.container, runtimeDir, repoRoot, python, { vscodeVariables: spec.vscodeVariables });
-      if (!result.changed) continue;
+      if (!result.changed && !corrupt) continue;
       // Refuse to persist a config a downstream consumer cannot use: a file
       // read outside VS Code must never carry an unexpanded VS Code variable
       // (NF-2026-00243). Log the named reason and skip rather than write a
       // command that names a token where a directory belongs.
       const consumable = assertMcpConfigConsumable(result.document, { vscodeVariables: spec.vscodeVariables });
       if (!consumable.ok) {
-        outputChannel.appendLine(`[mcp] refused to register ${spec.label} MCP: ${consumable.reason}`);
+        if (outputChannel) outputChannel.appendLine(`[mcp] refused to register ${spec.label} MCP: ${consumable.reason}`);
         continue;
       }
       try {
-        fs.mkdirSync(path.dirname(spec.configPath), { recursive: true });
-        fs.writeFileSync(spec.configPath, `${JSON.stringify(result.document, null, 2)}\n`, "utf8");
+        atomicWriteText(spec.configPath, `${JSON.stringify(result.document, null, 2)}\n`);
         repaired += 1;
       } catch (err) {
-        outputChannel.appendLine(`[mcp] failed to register ${spec.label} MCP: ${sanitizeErrorMessage(err)}`);
+        if (outputChannel) outputChannel.appendLine(`[mcp] failed to register ${spec.label} MCP: ${sanitizeErrorMessage(err)}`);
       }
     }
   }
   if (repaired) {
-    outputChannel.appendLine(`[mcp] repaired ${repaired} repository-local AIWorkHub MCP registration(s) to bundled runtime`);
+    if (outputChannel) outputChannel.appendLine(`[mcp] repaired ${repaired} repository-local AIWorkHub MCP registration(s) to bundled runtime`);
   }
   return repaired;
 }
