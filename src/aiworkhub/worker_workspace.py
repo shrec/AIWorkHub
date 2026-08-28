@@ -5121,18 +5121,36 @@ def _recognized_venv_python_spelling(head: str) -> str | None:
     return None
 
 
-def _verify_validation_interpreter(candidate: Path, bound_root: Path) -> Path:
+def _verify_validation_interpreter(
+    candidate: Path,
+    bound_root: Path,
+    *,
+    authenticated_external_endpoint: Path | None = None,
+) -> Path:
     bound = bound_root.resolve(strict=False)
     try:
+        resolved_parent = candidate.parent.resolve(strict=True)
         resolved = candidate.resolve(strict=True)
     except OSError as exc:
         raise WorkspaceError("validation_environment:interpreter_missing") from exc
     try:
-        resolved.relative_to(bound)
+        resolved_parent.relative_to(bound)
     except ValueError as exc:
         raise WorkspaceError(
             "validation_environment:interpreter_symlink_escape"
         ) from exc
+    authenticated_external = False
+    try:
+        resolved.relative_to(bound)
+    except ValueError as exc:
+        if (
+            authenticated_external_endpoint is None
+            or resolved != authenticated_external_endpoint.resolve(strict=True)
+        ):
+            raise WorkspaceError(
+                "validation_environment:interpreter_symlink_escape"
+            ) from exc
+        authenticated_external = True
     if not resolved.is_file():
         raise WorkspaceError("validation_environment:interpreter_missing")
     if not os.access(resolved, os.X_OK):
@@ -5141,11 +5159,28 @@ def _verify_validation_interpreter(candidate: Path, bound_root: Path) -> Path:
         info = resolved.stat()
     except OSError as exc:
         raise WorkspaceError("validation_environment:interpreter_missing") from exc
-    if os.name != "nt" and info.st_uid != os.getuid():
+    if (
+        os.name != "nt"
+        and info.st_uid != os.getuid()
+        and not (authenticated_external and info.st_uid == 0)
+    ):
         raise WorkspaceError("validation_environment:interpreter_untrusted_owner")
     if posix_path_modes_supported(os.name) and stat.S_IMODE(info.st_mode) & 0o002:
         raise WorkspaceError("validation_environment:interpreter_world_writable")
     return resolved
+
+
+def _interpreter_authority_receipt(
+    *, declared: str, source: str, execution_path: Path, endpoint: Path
+) -> dict[str, Any]:
+    return {
+        "schema_id": _VALIDATION_INTERPRETER_AUTHORITY_SCHEMA,
+        "declared": declared,
+        "source": source,
+        "execution_path": str(execution_path),
+        "authenticated_endpoint": str(endpoint),
+        "resolved": str(endpoint),
+    }
 
 
 def _normalize_validation_interpreter_argv(
@@ -5159,22 +5194,27 @@ def _normalize_validation_interpreter_argv(
     relative = Path(*PurePosixPath(spelling).parts)
     local = workspace.path / relative
     if local.exists() or local.is_symlink():
-        resolved = _verify_validation_interpreter(local, workspace.path)
-        return [str(resolved), *argv[1:]], {
-            "schema_id": _VALIDATION_INTERPRETER_AUTHORITY_SCHEMA,
-            "declared": argv[0],
-            "source": "workspace_local",
-            "resolved": str(resolved),
-        }
+        endpoint = _verify_validation_interpreter(local, workspace.path)
+        return [str(endpoint), *argv[1:]], _interpreter_authority_receipt(
+            declared=argv[0],
+            source="workspace_local",
+            execution_path=endpoint,
+            endpoint=endpoint,
+        )
     canonical = workspace.repo / relative
     if canonical.exists() or canonical.is_symlink():
-        resolved = _verify_validation_interpreter(canonical, workspace.repo)
-        return [str(resolved), *argv[1:]], {
-            "schema_id": _VALIDATION_INTERPRETER_AUTHORITY_SCHEMA,
-            "declared": argv[0],
-            "source": "canonical_repository",
-            "resolved": str(resolved),
-        }
+        endpoint = _verify_validation_interpreter(
+            canonical,
+            workspace.repo,
+            authenticated_external_endpoint=Path(sys.executable).resolve(strict=True),
+        )
+        execution_path = canonical.absolute()
+        return [str(execution_path), *argv[1:]], _interpreter_authority_receipt(
+            declared=argv[0],
+            source="canonical_repository",
+            execution_path=execution_path,
+            endpoint=endpoint,
+        )
     raise WorkspaceError("validation_environment:interpreter_missing")
 
 

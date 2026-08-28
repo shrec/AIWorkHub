@@ -4697,6 +4697,8 @@ def test_run_validations_workspace_local_venv_python_receipt(
             "schema_id": "aiworkhub.validation_interpreter_authority.v1",
             "declared": ".venv/bin/python",
             "source": "workspace_local",
+            "execution_path": str(expected),
+            "authenticated_endpoint": str(expected),
             "resolved": str(expected),
         }
         assert "ran-workspace-local-python" in result["stdout_tail"]
@@ -4710,17 +4712,20 @@ def test_run_validations_canonical_venv_python_when_workspace_local_missing(
 ) -> None:
     workspace = _workspace(monkeypatch, tmp_path, repo, "venv-python-canonical")
     try:
-        expected = _install_venv_python(
+        endpoint = _install_venv_python(
             workspace.repo, ".venv/bin/python", "ran-canonical-python"
         )
+        execution_path = workspace.repo / ".venv" / "bin" / "python"
         (result,) = _run_interpreter_validation(
             workspace, ".venv/bin/python -c pass"
         )
         assert result["returncode"] == 0, result["stderr_tail"]
         assert result["declared_argv"] == [".venv/bin/python", "-c", "pass"]
-        assert result["executed_argv"] == [str(expected), "-c", "pass"]
+        assert result["executed_argv"] == [str(execution_path), "-c", "pass"]
         assert result["interpreter_authority"]["source"] == "canonical_repository"
-        assert result["interpreter_authority"]["resolved"] == str(expected)
+        assert result["interpreter_authority"]["execution_path"] == str(execution_path)
+        assert result["interpreter_authority"]["authenticated_endpoint"] == str(endpoint)
+        assert result["interpreter_authority"]["resolved"] == str(endpoint)
         assert "ran-canonical-python" in result["stdout_tail"]
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
@@ -4845,6 +4850,97 @@ def test_run_validations_symlink_escaping_venv_python_fails_closed(
         link = workspace.path / ".venv" / "bin" / "python"
         link.parent.mkdir(parents=True, exist_ok=True)
         link.symlink_to(outside)
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="validation_environment:interpreter_symlink_escape",
+        ):
+            _run_interpreter_validation(workspace, ".venv/bin/python -c pass")
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_run_validations_workspace_local_coordinator_symlink_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-local-coordinator-link")
+    try:
+        link = workspace.path / ".venv" / "bin" / "python"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(Path(sys.executable).resolve(strict=True))
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="validation_environment:interpreter_symlink_escape",
+        ):
+            _run_interpreter_validation(workspace, ".venv/bin/python -c pass")
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_run_validations_canonical_root_owned_venv_python_preserves_execution_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-canonical-coordinator-link")
+    try:
+        execution_path = workspace.repo / ".venv" / "bin" / "python"
+        execution_path.parent.mkdir(parents=True)
+        endpoint = Path(sys.executable).resolve(strict=True)
+        assert endpoint.stat().st_uid == 0
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        execution_path.symlink_to(endpoint)
+        (result,) = _run_interpreter_validation(
+            workspace, ".venv/bin/python -c pass"
+        )
+        assert result["returncode"] == 0, result["stderr_tail"]
+        assert result["declared_argv"] == [".venv/bin/python", "-c", "pass"]
+        assert result["executed_argv"] == [str(execution_path), "-c", "pass"]
+        assert result["argv"] == result["executed_argv"]
+        assert result["argv_rewritten"] is True
+        assert result["interpreter_authority"] == {
+            "schema_id": "aiworkhub.validation_interpreter_authority.v1",
+            "declared": ".venv/bin/python",
+            "source": "canonical_repository",
+            "execution_path": str(execution_path),
+            "authenticated_endpoint": str(endpoint),
+            "resolved": str(endpoint),
+        }
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_run_validations_canonical_other_endpoint_symlink_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-canonical-other-link")
+    try:
+        outside = tmp_path / "other-python"
+        outside.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(outside, 0o755)
+        link = workspace.repo / ".venv" / "bin" / "python"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(outside)
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="validation_environment:interpreter_symlink_escape",
+        ):
+            _run_interpreter_validation(workspace, ".venv/bin/python -c pass")
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_run_validations_canonical_symlinked_parent_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "venv-canonical-parent-link")
+    try:
+        outside = tmp_path / "external-venv"
+        python = outside / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.symlink_to(Path(sys.executable).resolve(strict=True))
+        (workspace.repo / ".venv").symlink_to(outside, target_is_directory=True)
         with pytest.raises(
             worker_workspace.WorkspaceError,
             match="validation_environment:interpreter_symlink_escape",
