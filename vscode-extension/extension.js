@@ -8843,10 +8843,20 @@ function codingFoundationDashboardSource() {
 
 // Strict nonce CSP: only webview.cspSource + this exact nonce may run/style
 // the page -- no remote origin, no inline handler, no eval, no embedded frame.
+function dashboardAssetUri(webview, mediaUri, fileName) {
+  const assetUri = vscode.Uri.joinPath(mediaUri, fileName);
+  const assetIdentity = crypto
+    .createHash("sha256")
+    .update(fs.readFileSync(assetUri.fsPath))
+    .digest("hex")
+    .slice(0, 16);
+  return webview.asWebviewUri(assetUri.with({ query: `v=${assetIdentity}` }));
+}
+
 function getHtmlForWebview(webview, extensionUri) {
   const mediaUri = vscode.Uri.joinPath(extensionUri, "media");
-  const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaUri, "app.js"));
-  const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaUri, "app.css"));
+  const scriptUri = dashboardAssetUri(webview, mediaUri, "app.js");
+  const styleUri = dashboardAssetUri(webview, mediaUri, "app.css");
   const logoUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaUri, "aiworkhub-icon.png"));
   const nonceValue = nonce();
   const csp = [
@@ -9392,14 +9402,16 @@ function getHtmlForWebview(webview, extensionUri) {
   </dialog>
 
   <dialog class="diagnostic-dialog settings-dialog" id="settings-dialog">
-    <div class="dialog-heading">
-      <div><h2>Repository Settings</h2><span id="settings-summary">Loading repository feature settings</span></div>
-      <button type="button" class="dialog-close" data-close-dialog="settings-dialog">Close</button>
+    <div class="settings-frame">
+      <div class="dialog-heading">
+        <div><h2>Repository Settings</h2><span id="settings-summary">Loading repository feature settings</span></div>
+        <button type="button" class="dialog-close" data-close-dialog="settings-dialog">Close</button>
+      </div>
+      <div class="settings-list" id="settings-list">
+        <div class="panel-state">Loading settings</div>
+      </div>
+      <div class="settings-footnote">Stored only in this repository's <code>.aiworkhub/config/features.json</code>, <code>.aiworkhub/config/source_graph.json</code> and <code>.aiworkhub/config/models.json</code>. Task orchestration and callback routing remain protected core services.</div>
     </div>
-    <div class="settings-list" id="settings-list">
-      <div class="panel-state">Loading settings</div>
-    </div>
-    <div class="settings-footnote">Stored only in this repository's <code>.aiworkhub/config/features.json</code>, <code>.aiworkhub/config/source_graph.json</code> and <code>.aiworkhub/config/models.json</code>. Task orchestration and callback routing remain protected core services.</div>
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
@@ -9546,6 +9558,10 @@ vscode.postMessage({type:"ready"});
 
 async function openDashboardCommand(extensionUri) {
   if (panel) {
+    // Rebuild the document before reveal so a retained Webview cannot keep
+    // extension assets from an older installed build.
+    applyWebviewOptions(panel.webview, extensionUri);
+    panel.webview.html = getHtmlForWebview(panel.webview, extensionUri);
     panel.reveal(vscode.ViewColumn.Active, false);
     return;
   }

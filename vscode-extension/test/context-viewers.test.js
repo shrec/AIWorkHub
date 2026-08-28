@@ -76,18 +76,95 @@ test("app.js implements identity-based focus/scroll restore for the Models modal
   assert.ok(app.includes("restoreSettingsFocus(previousIdentity)"));
 });
 
+test("dashboard assets use content identities and retained panels rebuild HTML before reveal", () => {
+  const helperSource = extension.match(/function dashboardAssetUri\([\s\S]*?\n\}/)[0];
+  const dashboardAssetUri = vm.runInNewContext(
+    `(${helperSource.replace("function dashboardAssetUri", "function")})`,
+    {
+      crypto: require("crypto"),
+      fs,
+      vscode: {
+        Uri: {
+          joinPath(base, fileName) {
+            const asset = {
+              fsPath: path.join(base.fsPath, fileName),
+              with(change) {
+                return { ...asset, query: change.query };
+              },
+            };
+            return asset;
+          },
+        },
+      },
+    },
+  );
+  const webview = {
+    asWebviewUri(uri) {
+      return `webview://asset/${path.basename(uri.fsPath)}?${uri.query}`;
+    },
+  };
+  const mediaUri = { fsPath: path.join(root, "media") };
+  const scriptUri = dashboardAssetUri(webview, mediaUri, "app.js");
+  const styleUri = dashboardAssetUri(webview, mediaUri, "app.css");
+  assert.match(scriptUri, /^webview:\/\/asset\/app\.js\?v=[a-f0-9]{16}$/);
+  assert.match(styleUri, /^webview:\/\/asset\/app\.css\?v=[a-f0-9]{16}$/);
+  assert.notStrictEqual(scriptUri, styleUri);
+  assert.ok(extension.includes('<link rel="stylesheet" href="${styleUri}">'));
+  assert.ok(extension.includes('src="${scriptUri}"'));
+  const revealBranch = extension.match(/if \(panel\) \{[\s\S]*?panel\.reveal\([\s\S]*?return;/)[0];
+  assert.ok(revealBranch.indexOf("panel.webview.html = getHtmlForWebview") < revealBranch.indexOf("panel.reveal"));
+});
+
+test("native settings dialog uses block geometry with list-only scrolling", () => {
+  const dialogRule = css.match(/\.diagnostic-dialog\.settings-dialog \{([^}]*)\}/)[1];
+  assert.doesNotMatch(dialogRule, /display:\s*grid/);
+  assert.doesNotMatch(dialogRule, /display:\s*flex/);
+  assert.doesNotMatch(dialogRule, /overflow:\s*hidden/);
+  assert.match(dialogRule, /max-height:\s*min\(650px, calc\(100vh - 60px\)\)/);
+  const frameRule = css.match(/(?:^|\n)\.settings-frame \{([^}]*)\}/)[1];
+  assert.match(frameRule, /display:\s*flex/);
+  assert.match(frameRule, /height:\s*100%/);
+  assert.match(frameRule, /min-height:\s*0/);
+  assert.match(frameRule, /flex-direction:\s*column/);
+  assert.match(css, /\.settings-frame > \.dialog-heading,\s*\.settings-frame > \.settings-footnote\s*\{[^}]*flex:\s*0 0 auto/s);
+  assert.match(css, /\.settings-frame > \.settings-list\s*\{[^}]*flex:\s*1 1 auto/s);
+  const listRule = css.match(/(?:^|\n)\.settings-list \{([^}]*)\}/)[1];
+  assert.match(listRule, /min-height:\s*0/);
+  assert.match(listRule, /height:\s*auto/);
+  assert.match(listRule, /overflow-y:\s*auto/);
+  assert.match(extension, /<dialog class="diagnostic-dialog settings-dialog"[^>]*>\s*<div class="settings-frame">\s*<div class="dialog-heading">[\s\S]*Repository Settings[\s\S]*Close[\s\S]*<div class="settings-list"[^>]*>[\s\S]*<div class="settings-footnote">/);
+});
+
 test("app.css keeps the settings dialog bounded, single-scroll and wrap-safe", () => {
   assert.ok(css.includes(".diagnostic-dialog.settings-dialog"));
   assert.ok(css.includes("width: min(880px, calc(100vw - 40px))"));
-  assert.ok(css.includes("grid-template-rows: auto minmax(0, 1fr) auto"));
+  assert.doesNotMatch(css, /\.settings-dialog[^}]*height:\s*calc\(100% - 92px\)/s);
   assert.ok(css.includes("height: min(650px, calc(100vh - 60px))"));
   assert.ok(css.includes(".settings-list {"));
-  assert.ok(css.includes("height: 100%"));
+  assert.ok(css.includes("height: auto"));
   assert.ok(css.includes(".settings-state"));
   assert.ok(css.includes(".settings-copy strong"));
   assert.ok(css.includes("overflow-wrap: anywhere"));
   assert.ok(css.includes(".settings-metric-grid,"));
   assert.ok(css.includes(".settings-language-grid { grid-template-columns: 1fr; }"));
+});
+
+test("narrow wrapped settings footer stays inside the frame and leaves only the list scrollable", () => {
+  const dialogHeight = 300;
+  const headerHeight = 68;
+  const wrappedFooterHeight = 96;
+  const listContentHeight = 520;
+  const listHeight = Math.max(0, dialogHeight - headerHeight - wrappedFooterHeight);
+  const footerBottom = headerHeight + listHeight + wrappedFooterHeight;
+
+  assert.strictEqual(listHeight, 136);
+  assert.strictEqual(footerBottom, dialogHeight);
+  assert.ok(listContentHeight > listHeight, "fixture must require list scrolling");
+  assert.match(css, /@media \(max-width: 620px\)[\s\S]*?\.settings-footnote\s*\{[^}]*overflow-wrap:\s*anywhere/);
+  const footnoteRule = css.match(/(?:^|\n\n)\.settings-footnote \{([^}]*)\}/)[1];
+  assert.match(footnoteRule, /min-height:\s*40px/);
+  assert.doesNotMatch(footnoteRule, /(?:^|\n)\s*height:\s*40px/);
+  assert.doesNotMatch(css, /\.settings-dialog[^}]*overflow:\s*(?:auto|scroll|hidden)/s);
 });
 
 // ── Minimal, dependency-free DOM harness ───────────────────────────────────
