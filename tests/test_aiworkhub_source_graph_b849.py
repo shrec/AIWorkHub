@@ -130,6 +130,41 @@ def test_db_path_requires_manifest_never_falls_back_to_cwd(tmp_path, monkeypatch
         sg.resolve_db_path(unmanaged)
 
 
+def test_migrate_legacy_db_reads_uri_quoted_source_without_wal_sidecars(tmp_path):
+    repo = _new_repo(tmp_path, "readonly_migration")
+    legacy = tmp_path / "legacy source #1?.sqlite"
+    conn = sqlite3.connect(legacy)
+    try:
+        conn.execute("CREATE TABLE symbols (name TEXT NOT NULL)")
+        conn.execute("INSERT INTO symbols (name) VALUES ('alpha')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    sidecars = [Path(f"{legacy}-wal"), Path(f"{legacy}-shm")]
+    for sidecar in sidecars:
+        sidecar.unlink(missing_ok=True)
+    before_bytes = legacy.read_bytes()
+    before_mtime_ns = legacy.stat().st_mtime_ns
+
+    report = sgm.migrate_legacy_db(
+        repo, db_id="source_graph", legacy_source=legacy, dry_run=False,
+    )
+
+    assert report.status == "migrated_and_verified"
+    assert report.parity_ok is True
+    assert legacy.read_bytes() == before_bytes
+    assert legacy.stat().st_mtime_ns == before_mtime_ns
+    assert all(not sidecar.exists() for sidecar in sidecars)
+
+    canonical = sg.resolve_db_path(repo)
+    dest_conn = sqlite3.connect(canonical)
+    try:
+        assert dest_conn.execute("SELECT name FROM symbols").fetchall() == [("alpha",)]
+    finally:
+        dest_conn.close()
+
+
 def test_multi_repository_isolation_distinct_paths_no_cross_contamination(tmp_path):
     repo_a = _new_repo(tmp_path, "repo_a")
     repo_b = _new_repo(tmp_path, "repo_b")

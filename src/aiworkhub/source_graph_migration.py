@@ -160,7 +160,7 @@ def migrate_legacy_db(
         raise MigrationError(f"canonical_path_unresolved:{exc}") from exc
 
     legacy_sha = _sha256_file(legacy_path)
-    legacy_conn = sqlite3.connect(str(legacy_path))
+    legacy_conn = sqlite3.connect(f"{legacy_path.as_uri()}?mode=ro", uri=True)
     try:
         legacy_integrity = legacy_conn.execute("PRAGMA integrity_check").fetchone()[0]
         legacy_tables = _table_row_counts(legacy_conn)
