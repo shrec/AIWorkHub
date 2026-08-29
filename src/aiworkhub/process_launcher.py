@@ -6885,6 +6885,8 @@ class ProcessManager:
             )
 
     _QUALITY_REVIEW_PREP_LOCK = threading.Lock()
+    _QUALITY_REVIEW_PREP_CAPACITY = threading.Condition(_QUALITY_REVIEW_PREP_LOCK)
+    _QUALITY_REVIEW_PREP_ACTIVE_BUILDERS = 0
     _QUALITY_REVIEW_PREP_MAX = 8
     # Bounded waiter ceiling for single-flight preparation reuse. A waiter runs
     # under its own per-lens background owner (never the MCP handler) and the
@@ -7073,26 +7075,40 @@ class ProcessManager:
         *and* failure propagate truthfully, so a waiter never masks a real
         preparation error with an independent rebuild.
 
-        The elected owner's build is itself bounded: it runs under
-        ``_QUALITY_REVIEW_PREP_OWNER_SECONDS`` and a build that outlives the
-        ceiling becomes a truthful ``quality_review_preparation_timeout``
-        terminal failure instead of a silent pid-null reservation.
+        Each caller's wait is bounded. A caller timeout is truthful but never
+        retires a still-running builder: that builder remains authoritative,
+        publishes its eventual result, and releases its flight and capacity.
         """
 
         key = (target_request_id, target_task_id)
-        with self._QUALITY_REVIEW_PREP_LOCK:
-            cache = self.__dict__.setdefault("_quality_review_prepared", {})
-            prepared = cache.get(key)
-            if prepared is not None:
-                return {"ok": True, "prepared": prepared}
-            flights = self.__dict__.setdefault("_quality_review_flights", {})
-            flight = flights.get(key)
-            if flight is None:
-                flight = _QualityReviewPrepFlight()
-                flights[key] = flight
-                owner = True
-            else:
-                owner = False
+        capacity_deadline = time.monotonic() + self._QUALITY_REVIEW_PREP_WAIT_SECONDS
+        with self._QUALITY_REVIEW_PREP_CAPACITY:
+            while True:
+                cache = self.__dict__.setdefault("_quality_review_prepared", {})
+                prepared = cache.get(key)
+                if prepared is not None:
+                    return {"ok": True, "prepared": prepared}
+                flights = self.__dict__.setdefault("_quality_review_flights", {})
+                flight = flights.get(key)
+                if flight is not None:
+                    owner = False
+                    break
+                if (
+                    self._QUALITY_REVIEW_PREP_ACTIVE_BUILDERS
+                    < self._QUALITY_REVIEW_PREP_MAX
+                ):
+                    flight = _QualityReviewPrepFlight()
+                    flights[key] = flight
+                    type(self)._QUALITY_REVIEW_PREP_ACTIVE_BUILDERS += 1
+                    owner = True
+                    break
+                remaining = capacity_deadline - time.monotonic()
+                if remaining <= 0:
+                    return {
+                        "ok": False,
+                        "error": "quality_review_preparation_timeout",
+                    }
+                self._QUALITY_REVIEW_PREP_CAPACITY.wait(timeout=remaining)
 
         if not owner:
             with flight.condition:
@@ -7107,48 +7123,65 @@ class ProcessManager:
                 return {"ok": False, "error": "quality_review_preparation_timeout"}
             return result
 
-        result_box: dict[str, dict[str, Any]] = {}
-
         def _run_owner_build() -> None:
             try:
-                result_box["result"] = self._build_quality_review_packet(
+                result = self._build_quality_review_packet(
                     target_request_id, target_task_id, progress=progress
                 )
             except Exception as exc:  # noqa: BLE001 -- propagate owner failure truthfully
-                result_box["result"] = {
+                result = {
                     "ok": False,
                     "error": f"quality_review_target_invalid:{exc}",
                 }
+            with self._QUALITY_REVIEW_PREP_CAPACITY:
+                if result.get("ok"):
+                    cache = self.__dict__.setdefault("_quality_review_prepared", {})
+                    cache[key] = result["prepared"]
+                    while len(cache) > self._QUALITY_REVIEW_PREP_MAX:
+                        cache.pop(next(iter(cache)))
+                with flight.condition:
+                    flight.result = result
+                    flight.done = True
+                    flight.condition.notify_all()
+                flights = self.__dict__.setdefault("_quality_review_flights", {})
+                if flights.get(key) is flight:
+                    flights.pop(key)
+                    type(self)._QUALITY_REVIEW_PREP_ACTIVE_BUILDERS -= 1
+                    self._QUALITY_REVIEW_PREP_CAPACITY.notify_all()
 
         builder = threading.Thread(
             target=_run_owner_build,
             name=f"aiworkhub-reviewer-prep-{target_request_id[:8]}",
             daemon=True,
         )
-        builder.start()
-        builder.join(self._QUALITY_REVIEW_PREP_OWNER_SECONDS)
-        if builder.is_alive():
+        try:
+            builder.start()
+        except Exception as exc:  # noqa: BLE001 -- thread launch can fail at runtime
             result = {
                 "ok": False,
-                "error": "quality_review_preparation_timeout",
+                "error": f"quality_review_target_invalid:{exc}",
             }
-        else:
-            result = result_box.get("result") or {
-                "ok": False,
-                "error": "quality_review_preparation_no_result",
-            }
-        with self._QUALITY_REVIEW_PREP_LOCK:
-            if result.get("ok"):
-                cache = self.__dict__.setdefault("_quality_review_prepared", {})
-                cache[key] = result["prepared"]
-                while len(cache) > self._QUALITY_REVIEW_PREP_MAX:
-                    cache.pop(next(iter(cache)))
+            with self._QUALITY_REVIEW_PREP_CAPACITY:
+                with flight.condition:
+                    flight.result = result
+                    flight.done = True
+                    flight.condition.notify_all()
+                flights = self.__dict__.setdefault("_quality_review_flights", {})
+                if flights.get(key) is flight:
+                    flights.pop(key)
+                    type(self)._QUALITY_REVIEW_PREP_ACTIVE_BUILDERS -= 1
+                    self._QUALITY_REVIEW_PREP_CAPACITY.notify_all()
+            return result
         with flight.condition:
-            flight.result = result
-            flight.done = True
-            flight.condition.notify_all()
-        with self._QUALITY_REVIEW_PREP_LOCK:
-            flights.pop(key, None)
+            deadline = time.monotonic() + self._QUALITY_REVIEW_PREP_OWNER_SECONDS
+            while not flight.done:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                flight.condition.wait(timeout=remaining)
+            result = flight.result if flight.done else None
+        if result is None:
+            return {"ok": False, "error": "quality_review_preparation_timeout"}
         return result
 
     def _build_quality_review_packet(

@@ -14,10 +14,12 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
 from aiworkhub import quality_reviewer
+from aiworkhub import process_launcher
 from aiworkhub import repository_state
 from aiworkhub import source_graph
 from aiworkhub import storage_registry
@@ -108,6 +110,158 @@ def _partition_file_rows(db_path: Path) -> int:
         return int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
     finally:
         conn.close()
+
+
+def _bare_process_manager(monkeypatch):
+    manager = process_launcher.ProcessManager.__new__(process_launcher.ProcessManager)
+    manager._quality_review_prepared = {}
+    manager._quality_review_flights = {}
+    monkeypatch.setattr(
+        process_launcher.ProcessManager, "_QUALITY_REVIEW_PREP_ACTIVE_BUILDERS", 0
+    )
+    return manager
+
+
+def test_quality_review_active_builder_and_flight_capacity_bound(
+    monkeypatch,
+) -> None:
+    manager = _bare_process_manager(monkeypatch)
+    assert manager._QUALITY_REVIEW_PREP_MAX == 8
+    monkeypatch.setattr(manager, "_QUALITY_REVIEW_PREP_WAIT_SECONDS", 0.15)
+    monkeypatch.setattr(manager, "_QUALITY_REVIEW_PREP_OWNER_SECONDS", 0.15)
+    release = threading.Event()
+    builders_started = threading.Condition()
+    active = 0
+    peak_active = 0
+    peak_flights = 0
+
+    def blocked_build(request_id, task_id, progress=None):
+        nonlocal active, peak_active, peak_flights
+        with builders_started:
+            active += 1
+            peak_active = max(peak_active, active)
+            peak_flights = max(peak_flights, len(manager._quality_review_flights))
+            builders_started.notify_all()
+        release.wait(timeout=2)
+        with builders_started:
+            active -= 1
+        return {"ok": True, "prepared": {"request_id": request_id, "task_id": task_id}}
+
+    manager._build_quality_review_packet = blocked_build
+    barrier = threading.Barrier(13)
+    results = []
+
+    def call(index):
+        barrier.wait()
+        results.append(manager._prepared_quality_review(f"request-{index}", f"task-{index}"))
+
+    callers = [threading.Thread(target=call, args=(index,)) for index in range(12)]
+    for caller in callers:
+        caller.start()
+    barrier.wait()
+    with builders_started:
+        assert builders_started.wait_for(lambda: active == 8, timeout=1)
+    for caller in callers:
+        caller.join(timeout=1)
+        assert not caller.is_alive()
+
+    assert peak_active == 8
+    assert peak_flights <= 8
+    assert len(manager._quality_review_flights) == 8
+    assert manager._QUALITY_REVIEW_PREP_ACTIVE_BUILDERS == 8
+    assert len(results) == 12
+    assert {result["error"] for result in results} == {
+        "quality_review_preparation_timeout"
+    }
+
+    release.set()
+    with manager._QUALITY_REVIEW_PREP_CAPACITY:
+        assert manager._QUALITY_REVIEW_PREP_CAPACITY.wait_for(
+            lambda: manager._QUALITY_REVIEW_PREP_ACTIVE_BUILDERS == 0, timeout=2
+        )
+    assert manager._quality_review_flights == {}
+    assert len(manager._quality_review_prepared) == 8
+
+
+def test_quality_review_single_flight_survives_caller_timeout(monkeypatch) -> None:
+    manager = _bare_process_manager(monkeypatch)
+    monkeypatch.setattr(manager, "_QUALITY_REVIEW_PREP_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(manager, "_QUALITY_REVIEW_PREP_OWNER_SECONDS", 0.05)
+    release = threading.Event()
+    started = threading.Event()
+    calls = 0
+
+    def blocked_build(request_id, task_id, progress=None):
+        nonlocal calls
+        calls += 1
+        started.set()
+        release.wait(timeout=2)
+        return {"ok": True, "prepared": {"packet": "authoritative"}}
+
+    manager._build_quality_review_packet = blocked_build
+    first = manager._prepared_quality_review("same-request", "same-task")
+    assert started.is_set()
+    assert first == {"ok": False, "error": "quality_review_preparation_timeout"}
+    second = manager._prepared_quality_review("same-request", "same-task")
+    assert second == first
+    assert calls == 1
+    assert len(manager._quality_review_flights) == 1
+
+    release.set()
+    with manager._QUALITY_REVIEW_PREP_CAPACITY:
+        assert manager._QUALITY_REVIEW_PREP_CAPACITY.wait_for(
+            lambda: manager._QUALITY_REVIEW_PREP_ACTIVE_BUILDERS == 0, timeout=2
+        )
+    assert manager._quality_review_flights == {}
+    cached = manager._prepared_quality_review("same-request", "same-task")
+    assert cached == {"ok": True, "prepared": {"packet": "authoritative"}}
+    assert calls == 1
+
+
+def test_quality_review_single_flight_exception_notifies_and_cleans_up(
+    monkeypatch,
+) -> None:
+    manager = _bare_process_manager(monkeypatch)
+
+    def failed_build(request_id, task_id, progress=None):
+        raise RuntimeError("packet exploded")
+
+    manager._build_quality_review_packet = failed_build
+    result = manager._prepared_quality_review("failed-request", "failed-task")
+    assert result == {
+        "ok": False,
+        "error": "quality_review_target_invalid:packet exploded",
+    }
+    assert manager._quality_review_flights == {}
+    assert manager._QUALITY_REVIEW_PREP_ACTIVE_BUILDERS == 0
+
+
+def test_quality_review_single_flight_thread_start_exception_cleans_up(
+    monkeypatch,
+) -> None:
+    manager = _bare_process_manager(monkeypatch)
+
+    def unexpected_build(request_id, task_id, progress=None):
+        raise AssertionError("builder body must not run when Thread.start fails")
+
+    def failed_start(_thread):
+        raise RuntimeError("thread refused")
+
+    manager._build_quality_review_packet = unexpected_build
+    monkeypatch.setattr(process_launcher.threading.Thread, "start", failed_start)
+
+    started = time.monotonic()
+    result = manager._prepared_quality_review("failed-start-request", "failed-start-task")
+    elapsed = time.monotonic() - started
+
+    assert result == {
+        "ok": False,
+        "error": "quality_review_target_invalid:thread refused",
+    }
+    assert elapsed < manager._QUALITY_REVIEW_PREP_WAIT_SECONDS
+    assert manager._quality_review_flights == {}
+    assert manager._QUALITY_REVIEW_PREP_ACTIVE_BUILDERS == 0
+    assert manager._quality_review_prepared == {}
 
 
 def test_prewarm_six_changed_files_makes_no_full_copy(
