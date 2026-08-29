@@ -30,6 +30,10 @@ __all__ = [
     "ALLOWED_REVIEW_LENSES",
     "ALLOWED_SYMBOL_KINDS",
     "ALLOWED_VALIDATION_KINDS",
+    "AUDIT_COVERAGE_STATUSES",
+    "AuditCoverageRecord",
+    "AuditCoverageReport",
+    "AuditModuleCoverage",
     "BLOCKER_MIN_EVIDENCE_LEVEL",
     "ChangedPath",
     "DuplicateIdentityError",
@@ -37,6 +41,7 @@ __all__ = [
     "EvidenceReference",
     "KnownUnknown",
     "MAX_COLLECTION_SIZE",
+    "MAX_AUDIT_FINDING_COUNT",
     "MAX_IDENTITY_LENGTH",
     "MAX_PATH_LENGTH",
     "MAX_RATIONALE_LENGTH",
@@ -51,6 +56,7 @@ __all__ = [
     "UngroundedBlockerError",
     "ValidationExpectation",
     "canonical_json",
+    "build_audit_coverage_report",
     "packet_fingerprint",
 ]
 
@@ -99,10 +105,12 @@ ALLOWED_EVIDENCE_KINDS: frozenset[str] = frozenset(
 ALLOWED_VALIDATION_KINDS: frozenset[str] = frozenset(
     {"unit", "integration", "static_type", "linter", "build", "manual"}
 )
+AUDIT_COVERAGE_STATUSES: frozenset[str] = frozenset({"AUDITED", "UNKNOWN"})
 
 MAX_PATH_LENGTH = 512
 MAX_TEXT_LENGTH = 1024
 MAX_COLLECTION_SIZE = 64
+MAX_AUDIT_FINDING_COUNT = 1_000_000
 MAX_RATIONALE_LENGTH = 256
 MAX_IDENTITY_LENGTH = 200
 
@@ -632,6 +640,203 @@ class ScopedAuditPacket:
                 v.as_json() for v in self.validation_expectations
             ],
         }
+
+
+def _validate_module_path(value: Any, *, name: str = "module_path") -> str:
+    path = _validate_path(value, name=name)
+    if any(part in {"", "."} for part in path.split("/")):
+        raise MalformedPathError(f"'{name}' must be a normalized repo-relative path")
+    if not path.endswith(".py"):
+        raise MalformedPathError(f"'{name}' must identify a Python module")
+    return path
+
+
+@dataclass(frozen=True, slots=True)
+class AuditCoverageRecord:
+    """Immutable proof that one audit pass examined one module revision."""
+
+    module_path: str
+    source_revision: str
+    audit_pass_identity: str
+    successful: bool
+    finding_count: int
+
+    def __post_init__(self) -> None:
+        _validate_module_path(self.module_path)
+        _ensure_identity(self.source_revision, name="source_revision")
+        _ensure_identity(self.audit_pass_identity, name="audit_pass_identity")
+        if not isinstance(self.successful, bool):
+            raise ScopedAuditValidationError("'successful' must be a bool")
+        if (
+            not isinstance(self.finding_count, int)
+            or isinstance(self.finding_count, bool)
+            or self.finding_count < 0
+            or self.finding_count > MAX_AUDIT_FINDING_COUNT
+        ):
+            raise ScopedAuditValidationError(
+                "'finding_count' must be a bounded nonnegative integer"
+            )
+
+    @property
+    def identity(self) -> tuple[str, str, str]:
+        return (
+            self.module_path,
+            self.source_revision,
+            self.audit_pass_identity,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AuditModuleCoverage:
+    """Deterministic coverage result for one expected module."""
+
+    module_path: str
+    source_revision: str
+    status: str
+    finding_count: int
+    audit_pass_identities: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _validate_module_path(self.module_path)
+        _ensure_identity(self.source_revision, name="source_revision")
+        _validate_vocab(
+            self.status, AUDIT_COVERAGE_STATUSES, name="audit_coverage_status"
+        )
+        if (
+            not isinstance(self.finding_count, int)
+            or isinstance(self.finding_count, bool)
+            or self.finding_count < 0
+            or self.finding_count > MAX_AUDIT_FINDING_COUNT
+        ):
+            raise ScopedAuditValidationError(
+                "'finding_count' must be a bounded nonnegative integer"
+            )
+        identities = _ensure_tuple(
+            self.audit_pass_identities, name="audit_pass_identities"
+        )
+        for identity in identities:
+            _ensure_identity(identity, name="audit_pass_identity")
+        if len(set(identities)) != len(identities):
+            raise DuplicateIdentityError("duplicate audit-pass identity")
+        if self.status == "UNKNOWN" and (
+            self.finding_count != 0 or identities
+        ):
+            raise ScopedAuditValidationError(
+                "UNKNOWN coverage must not claim findings or audit passes"
+            )
+        if self.status == "AUDITED" and not identities:
+            raise ScopedAuditValidationError(
+                "AUDITED coverage requires a successful audit pass"
+            )
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "module_path": self.module_path,
+            "source_revision": self.source_revision,
+            "status": self.status,
+            "finding_count": self.finding_count,
+            "audit_pass_identities": list(self.audit_pass_identities),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AuditCoverageReport:
+    """Bounded coverage report for an explicit module set and revision."""
+
+    source_revision: str
+    modules: tuple[AuditModuleCoverage, ...]
+
+    def __post_init__(self) -> None:
+        _ensure_identity(self.source_revision, name="source_revision")
+        modules = _ensure_tuple(self.modules, name="modules")
+        paths: set[str] = set()
+        for module in modules:
+            if not isinstance(module, AuditModuleCoverage):
+                raise ScopedAuditValidationError(
+                    "'modules' entries must be AuditModuleCoverage instances"
+                )
+            if module.source_revision != self.source_revision:
+                raise ScopedAuditValidationError(
+                    "module coverage revision must match report revision"
+                )
+            if module.module_path in paths:
+                raise DuplicateIdentityError("duplicate module coverage")
+            paths.add(module.module_path)
+        object.__setattr__(
+            self,
+            "modules",
+            _sorted(modules, lambda module: module.module_path),
+        )
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "source_revision": self.source_revision,
+            "modules": [module.as_json() for module in self.modules],
+        }
+
+
+def build_audit_coverage_report(
+    *,
+    expected_modules: tuple[str, ...],
+    source_revision: str,
+    records: tuple[AuditCoverageRecord, ...],
+) -> AuditCoverageReport:
+    """Report only successful, exact-revision audit passes as ``AUDITED``."""
+    _ensure_identity(source_revision, name="source_revision")
+    _ensure_tuple(expected_modules, name="expected_modules")
+    _ensure_tuple(records, name="records")
+    if not expected_modules:
+        raise ScopedAuditValidationError("'expected_modules' must not be empty")
+
+    normalized_modules = tuple(
+        _validate_module_path(path, name="expected_module")
+        for path in expected_modules
+    )
+    if len(set(normalized_modules)) != len(normalized_modules):
+        raise DuplicateIdentityError("duplicate expected module")
+
+    seen_records: set[tuple[str, str, str]] = set()
+    for record in records:
+        if not isinstance(record, AuditCoverageRecord):
+            raise ScopedAuditValidationError(
+                "'records' entries must be AuditCoverageRecord instances"
+            )
+        if record.identity in seen_records:
+            raise DuplicateIdentityError(
+                "duplicate module/revision/audit-pass identity"
+            )
+        seen_records.add(record.identity)
+
+    results: list[AuditModuleCoverage] = []
+    for module_path in sorted(normalized_modules):
+        matching = sorted(
+            (
+                record
+                for record in records
+                if record.module_path == module_path
+                and record.source_revision == source_revision
+                and record.successful
+            ),
+            key=lambda record: record.audit_pass_identity,
+        )
+        finding_count = sum(record.finding_count for record in matching)
+        if finding_count > MAX_AUDIT_FINDING_COUNT:
+            raise ScopedAuditValidationError(
+                "aggregated finding count exceeds maximum "
+                f"{MAX_AUDIT_FINDING_COUNT}"
+            )
+        results.append(
+            AuditModuleCoverage(
+                module_path=module_path,
+                source_revision=source_revision,
+                status="AUDITED" if matching else "UNKNOWN",
+                finding_count=finding_count,
+                audit_pass_identities=tuple(
+                    record.audit_pass_identity for record in matching
+                ),
+            )
+        )
+    return AuditCoverageReport(source_revision, tuple(results))
 
 
 def canonical_json(packet: ScopedAuditPacket) -> str:

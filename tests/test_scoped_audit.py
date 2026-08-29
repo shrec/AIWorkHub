@@ -18,6 +18,10 @@ from aiworkhub.evidence_levels import EvidenceLevel as CanonicalEvidenceLevel
 from aiworkhub.scoped_audit import (
     ALLOWED_REVIEW_LENSES,
     BLOCKER_MIN_EVIDENCE_LEVEL,
+    MAX_AUDIT_FINDING_COUNT,
+    AuditCoverageRecord,
+    AuditCoverageReport,
+    AuditModuleCoverage,
     ChangedPath,
     DuplicateIdentityError,
     EvidenceLevel,
@@ -32,6 +36,7 @@ from aiworkhub.scoped_audit import (
     UngroundedBlockerError,
     UnknownLensError,
     ValidationExpectation,
+    build_audit_coverage_report,
     canonical_json,
     packet_fingerprint,
 )
@@ -369,3 +374,175 @@ class TestRejectDump:
     def test_no_validation_expectations_rejected(self) -> None:
         with pytest.raises(ScopedAuditValidationError):
             _make_packet(validation_expectations=())
+
+
+class TestAuditCoverageTruth:
+    CALLBACK = "src/aiworkhub/callback_bridge.py"
+    INBOX = "src/aiworkhub/completion_inbox.py"
+    REVISION = "rev-deadbeef"
+
+    @classmethod
+    def _record(
+        cls,
+        module_path: str,
+        pass_id: str,
+        *,
+        revision: str | None = None,
+        successful: bool = True,
+        findings: int = 0,
+    ) -> AuditCoverageRecord:
+        return AuditCoverageRecord(
+            module_path=module_path,
+            source_revision=revision or cls.REVISION,
+            audit_pass_identity=pass_id,
+            successful=successful,
+            finding_count=findings,
+        )
+
+    def _report(
+        self, records: tuple[AuditCoverageRecord, ...] = ()
+    ) -> Any:
+        return build_audit_coverage_report(
+            expected_modules=(self.INBOX, self.CALLBACK),
+            source_revision=self.REVISION,
+            records=records,
+        )
+
+    def test_direct_report_construction_sorts_modules_canonically(self) -> None:
+        callback = AuditModuleCoverage(
+            module_path=self.CALLBACK,
+            source_revision=self.REVISION,
+            status="UNKNOWN",
+            finding_count=0,
+            audit_pass_identities=(),
+        )
+        inbox = AuditModuleCoverage(
+            module_path=self.INBOX,
+            source_revision=self.REVISION,
+            status="UNKNOWN",
+            finding_count=0,
+            audit_pass_identities=(),
+        )
+
+        report = AuditCoverageReport(
+            source_revision=self.REVISION,
+            modules=(inbox, callback),
+        )
+
+        assert report.modules == (callback, inbox)
+        assert [row["module_path"] for row in report.as_json()["modules"]] == [
+            self.CALLBACK,
+            self.INBOX,
+        ]
+
+    def test_never_looked_at_modules_are_unknown_and_sorted(self) -> None:
+        report = self._report()
+        assert tuple(row.module_path for row in report.modules) == (
+            self.CALLBACK,
+            self.INBOX,
+        )
+        assert all(row.status == "UNKNOWN" for row in report.modules)
+        assert all(row.finding_count == 0 for row in report.modules)
+        assert all(row.audit_pass_identities == () for row in report.modules)
+
+    def test_stale_revision_and_unsuccessful_pass_are_unknown(self) -> None:
+        report = self._report(
+            (
+                self._record(self.CALLBACK, "pass-stale", revision="old-rev"),
+                self._record(
+                    self.INBOX, "pass-failed", successful=False, findings=7
+                ),
+            )
+        )
+        assert [row.status for row in report.modules] == ["UNKNOWN", "UNKNOWN"]
+
+    def test_successful_zero_finding_pass_is_audited(self) -> None:
+        report = self._report((self._record(self.CALLBACK, "pass-zero"),))
+        callback, inbox = report.modules
+        assert callback.status == "AUDITED"
+        assert callback.finding_count == 0
+        assert callback.audit_pass_identities == ("pass-zero",)
+        assert inbox.status == "UNKNOWN"
+
+    def test_multiple_passes_aggregate_once_and_preserve_identities(self) -> None:
+        report = self._report(
+            (
+                self._record(self.INBOX, "pass-z", findings=3),
+                self._record(self.INBOX, "pass-a", findings=2),
+            )
+        )
+        inbox = report.modules[1]
+        assert inbox.status == "AUDITED"
+        assert inbox.finding_count == 5
+        assert inbox.audit_pass_identities == ("pass-a", "pass-z")
+
+    def test_duplicate_module_revision_pass_identity_is_rejected(self) -> None:
+        duplicate = self._record(self.CALLBACK, "same-pass")
+        with pytest.raises(DuplicateIdentityError):
+            self._report((duplicate, duplicate))
+
+    @pytest.mark.parametrize(
+        "bad_path",
+        ["", "/src/x.py", "../x.py", "src//x.py", "src/./x.py", "src/x"],
+    )
+    def test_malformed_or_unnormalized_module_path_rejected(
+        self, bad_path: str
+    ) -> None:
+        with pytest.raises(MalformedPathError):
+            self._record(bad_path, "pass")
+
+    @pytest.mark.parametrize(
+        ("pass_id", "findings"),
+        [("", 0), ("has space", 0), ("pass", -1), ("pass", True)],
+    )
+    def test_invalid_identity_or_finding_count_rejected(
+        self, pass_id: str, findings: int
+    ) -> None:
+        with pytest.raises(ScopedAuditValidationError):
+            self._record(self.CALLBACK, pass_id, findings=findings)
+
+    def test_empty_source_revision_rejected(self) -> None:
+        with pytest.raises(ScopedAuditValidationError):
+            AuditCoverageRecord(
+                module_path=self.CALLBACK,
+                source_revision="",
+                audit_pass_identity="pass",
+                successful=True,
+                finding_count=0,
+            )
+
+    def test_finding_count_and_aggregate_are_bounded(self) -> None:
+        with pytest.raises(ScopedAuditValidationError):
+            self._record(
+                self.CALLBACK,
+                "too-many",
+                findings=MAX_AUDIT_FINDING_COUNT + 1,
+            )
+        with pytest.raises(ScopedAuditValidationError):
+            self._report(
+                (
+                    self._record(
+                        self.CALLBACK,
+                        "pass-a",
+                        findings=MAX_AUDIT_FINDING_COUNT,
+                    ),
+                    self._record(self.CALLBACK, "pass-b", findings=1),
+                )
+            )
+
+    def test_report_inputs_are_bounded_and_expected_modules_unique(self) -> None:
+        too_many = tuple(
+            f"src/aiworkhub/module_{index}.py" for index in range(65)
+        )
+        with pytest.raises(ScopedAuditValidationError):
+            build_audit_coverage_report(
+                expected_modules=too_many,
+                source_revision=self.REVISION,
+                records=(),
+            )
+        with pytest.raises(DuplicateIdentityError):
+            build_audit_coverage_report(
+                expected_modules=(self.CALLBACK, self.CALLBACK),
+                source_revision=self.REVISION,
+                records=(),
+            )
