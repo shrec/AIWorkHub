@@ -11,7 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
-from . import review_lifecycle, task_engine, task_store, workforce_catalog, workforce_router
+from . import (
+    needfix_store,
+    review_lifecycle,
+    task_engine,
+    task_store,
+    workforce_catalog,
+    workforce_router,
+)
 
 
 LENSES = ("correctness", "security", "code_quality")
@@ -363,11 +370,60 @@ class ReviewOrchestrator:
                 self._require_ok(result, "target_archive_failed")
             return self._receipt(action, reviewer_request_ids=reviewer_ids, result=result)
         if action.action_type == "needfix_close":
-            # The immutable NeedFix store is outside this card. Keep the
-            # canonical twelfth action leased/deferred instead of fabricating
-            # a completion receipt or silently dropping it from the plan.
-            return None
+            linked = self._linked_needfix_rows(target_task)
+            newly_resolved: list[str] = []
+            for row in linked:
+                if row["status"] != "task_created":
+                    continue
+                needfix_id = str(row["id"])
+                resolved = needfix_store.resolve_needfix(
+                    self.manager.repo,
+                    needfix_id,
+                    resolution_note=(
+                        "automatic review lifecycle accepted and archived task "
+                        + target_task
+                    ),
+                )
+                if (
+                    resolved.get("id") != needfix_id
+                    or resolved.get("status") != "resolved"
+                    or resolved.get("converted_task_id") != target_task
+                ):
+                    raise RuntimeError("needfix_close_receipt_invalid")
+                newly_resolved.append(needfix_id)
+            return self._receipt(
+                action,
+                needfix_ids=sorted(str(row["id"]) for row in linked),
+                needfix_newly_resolved=sorted(newly_resolved),
+                needfix_closed_count=len(linked),
+                result={"ok": True, "state": "resolved"},
+            )
         raise RuntimeError("unknown_review_action")
+
+    def _linked_needfix_rows(self, target_task_id: str) -> list[dict[str, Any]]:
+        """Return every durable NeedFix row already bound to this exact task."""
+        linked: list[dict[str, Any]] = []
+        for status in ("task_created", "resolved"):
+            offset = 0
+            while True:
+                page = needfix_store.list_needfix(
+                    self.manager.repo,
+                    status=status,
+                    include_archived=True,
+                    limit=500,
+                    offset=offset,
+                    order_by="created_at",
+                    order_dir="ASC",
+                )
+                linked.extend(
+                    row
+                    for row in page
+                    if str(row.get("converted_task_id") or "") == target_task_id
+                )
+                if len(page) < 500:
+                    break
+                offset += len(page)
+        return linked
 
     def _receipt(self, action: review_lifecycle.ReviewAction, **payload: Any) -> dict[str, Any]:
         result = payload.pop("result", {})

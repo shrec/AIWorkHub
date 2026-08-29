@@ -181,15 +181,37 @@ def test_terminal_receipt_card_event_mismatch_fails_closed(tmp_path: Path) -> No
         )
 
 
-def test_happy_path_is_exactly_ordered_and_needfix_stays_pending(
+def test_happy_path_is_exactly_ordered_and_closes_linked_needfix(
     monkeypatch, tmp_path: Path
 ) -> None:
     manager = _Manager(tmp_path)
     archived: list[str] = []
+    resolved: list[tuple[str, str]] = []
     monkeypatch.setattr(
         review_orchestrator.task_engine,
         "archive_task",
         lambda _repo, task_id, **_kwargs: archived.append(task_id) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        review_orchestrator.needfix_store,
+        "list_needfix",
+        lambda _repo, *, status, **_kwargs: (
+            [{"id": "NF-1", "status": status, "converted_task_id": "TARGET"}]
+            if status == "task_created"
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        review_orchestrator.needfix_store,
+        "resolve_needfix",
+        lambda _repo, needfix_id, *, resolution_note: (
+            resolved.append((needfix_id, resolution_note))
+            or {
+                "id": needfix_id,
+                "status": "resolved",
+                "converted_task_id": "TARGET",
+            }
+        ),
     )
     driver = review_orchestrator.ReviewOrchestrator(
         manager, db_path=tmp_path / "review.sqlite", route_selector=_route
@@ -201,23 +223,64 @@ def test_happy_path_is_exactly_ordered_and_needfix_stays_pending(
     for lens in review_orchestrator.LENSES:
         manager.status_results["review-request-" + lens] = _review_status(lens)
 
-    for _ in range(11):
+    for _ in range(12):
         result = driver.drain(max_actions=1, now=NOW)
         rows_now = review_lifecycle.rows_for_test(tmp_path / "review.sqlite")
         failed = [row["failure_reason"] for row in rows_now if row["state"] == "failed"]
         assert result.completed == 1, failed
         assert result.failed == 0
-    deferred = driver.drain(max_actions=1, now=NOW)
+    exhausted = driver.drain(max_actions=1, now=NOW)
 
-    assert deferred.pending == 1
+    assert exhausted.attempted == 0
     assert [row["lens"] for row in manager.launches] == list(review_orchestrator.LENSES)
     assert [row["runner"] for row in manager.launches] == [ROUTE["runner"]] * 3
     assert manager.accepts[-1] == ("target-request", "TARGET")
     assert archived[-1] == "TARGET"
+    assert resolved == [
+        ("NF-1", "automatic review lifecycle accepted and archived task TARGET")
+    ]
     rows = review_lifecycle.rows_for_test(tmp_path / "review.sqlite")
-    assert [row["state"] for row in rows[:11]] == ["completed"] * 11
+    assert [row["state"] for row in rows] == ["completed"] * 12
     assert rows[11]["action_type"] == "needfix_close"
-    assert rows[11]["state"] == "pending"
+    assert rows[11]["state"] == "completed"
+
+
+def test_needfix_close_without_linked_findings_completes_exactly_once(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manager = _Manager(tmp_path)
+    monkeypatch.setattr(
+        review_orchestrator.needfix_store,
+        "list_needfix",
+        lambda _repo, **_kwargs: [],
+    )
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "review.sqlite", route_selector=_route
+    )
+    monkeypatch.setattr(
+        driver,
+        "_receipts",
+        lambda _chain_id: [
+            {
+                "lens": lens,
+                "action_type": "accept",
+                "reviewer_request_id": "review-request-" + lens,
+            }
+            for lens in review_orchestrator.LENSES
+        ],
+    )
+    chain = driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    action = chain.actions[11]
+
+    receipt = driver._execute(action)
+
+    assert receipt is not None
+    assert receipt["needfix_ids"] == []
+    assert receipt["needfix_newly_resolved"] == []
+    assert receipt["needfix_closed_count"] == 0
 
 
 def test_default_route_uses_canonical_workforce_contract(monkeypatch, tmp_path: Path) -> None:
