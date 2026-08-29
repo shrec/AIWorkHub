@@ -12,6 +12,24 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.67 — 2026-08-29
+
+- Nested Landlock validation now authenticates exact request-owned worktree
+  authority, and Windows AppContainer supervision owns native process, job,
+  termination and cleanup lifecycles without fabricating terminal results.
+- Worker capacity adapts to available CPU and affinity limits, reserves capacity
+  on multi-CPU hosts, reports the applied ceiling, and constrains nested pools.
+- Decomposition previews return approval-required proposals with stable boundary
+  identifiers and the large, low-confidence action class.
+- A provider-response contract foundation supplies immutable normalized events,
+  strict JSON, canonical bytes and digests; callback-store readiness and WAL
+  setup failures return bounded categories without leaking operational details.
+- Launcher read-efficiency handling moved to a focused, parity-tested module
+  guarded by a size ratchet, and manager archives identify the verified provider
+  actor while retaining write-gate enforcement.
+- Python 3.14 lock-timeout tests isolate their intended descriptor attempts, and
+  Source Graph capacity tests verify the effective worker ceiling.
+
 ## What's new in 0.10.66
 
 - Bootstrap now gives managers and workers a clear responsibility matrix and

@@ -1,5 +1,42 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.67 — 2026-08-29
+
+### Added
+
+- Adaptive worker capacity uses the effective CPU and affinity budget, reserves
+  room on multi-CPU hosts, honors caps, reports the applied ceiling, and keeps
+  nested pools bounded.
+- Decomposition previews now return approval-required proposals with stable
+  boundary identifiers and the large, low-confidence action class.
+- A provider-response contract foundation supplies immutable normalized events,
+  preserved unknown types, strict JSON data, canonical bytes, digests and
+  stable error categories.
+
+### Fixed
+
+- Nested Landlock validation trusts outer authority only through an
+  authenticated request-owned worktree locator; hardlink no-ops stay bound to
+  authenticated descriptors instead of ambient paths.
+- Windows AppContainer supervision owns the native process and job lifecycle,
+  preserves terminal results, terminates process trees, and closes handles and
+  pipes idempotently.
+- Callback-store readiness and WAL-setup failures expose bounded categories
+  rather than SQLite, path or payload details; cleanup preserves the primary
+  database-open error.
+- Archive and supersede actions now record the verified manager provider actor
+  while preserving manager write-gate enforcement.
+
+### Changed
+
+- Launcher read-efficiency parsing and reporting moved into a focused module,
+  backed by parity tests and a descending module-size ratchet.
+
+### Tests
+
+- Python 3.14 lock-timeout tests isolate the intended descriptor attempts, and
+  Source Graph capacity tests assert the effective worker ceiling.
+
 ## 0.10.66 — 2026-08-29
 
 ### Added

@@ -6,6 +6,46 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.67] - 2026-08-29
+
+### Added
+
+- Worker capacity now adapts to the process CPU and affinity budget, reserves
+  capacity on multi-CPU hosts, honors explicit and soft caps, and reports the
+  applied ceiling while keeping nested pools constrained.
+- Decomposition previews now produce approval-required proposals with a stable
+  boundary identifier and the large, low-confidence action class; a closed
+  action-class enum establishes the foundation for other high-impact cases.
+- A provider-response contract foundation normalizes untrusted responses into
+  immutable detached events, preserves unknown types, rejects non-JSON and
+  non-finite data, and produces canonical bytes, digests and error categories.
+
+### Fixed
+
+- Nested Landlock validation accepts outer authority only from an authenticated
+  request-owned worktree locator and rejects ambient scratch-directory reuse;
+  metadata-broker hardlink no-ops remain bound to authenticated descriptors.
+- Windows AppContainer supervision owns the exact native process and job
+  handles, preserves terminal results, terminates process trees, and closes
+  handles and pipes idempotently without inventing a return code.
+- Callback-store readiness and WAL-setup failures no longer expose SQLite,
+  filesystem or payload details; callers receive bounded categories for WAL
+  operations and exhausted lock retries, and cleanup preserves the primary
+  database-open failure.
+- Manager archive and supersede operations attribute their actor to the
+  verified manager provider while retaining write-gate enforcement.
+
+### Changed
+
+- Provider read-efficiency parsing and reporting now live in a focused launcher
+  module with parity coverage and a descending module-size ratchet.
+
+### Tests
+
+- Windows lock-timeout coverage isolates the target descriptor attempts so
+  unrelated lock calls introduced by Python 3.14 do not cause false failures.
+- Source Graph capacity coverage now asserts the applied worker ceiling.
+
 ## [0.10.66] - 2026-08-29
 
 ### Added
