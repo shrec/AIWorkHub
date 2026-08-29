@@ -1617,7 +1617,7 @@ def aiworkhub_manager_task_archive(
     return task_engine.archive_task(
         core.repo_root(),
         task_id,
-        actor=core.CODEX_RUNNER,
+        actor=core._verified_manager_actor(),
         reason=reason,
         supersede=False,
     )
@@ -1636,7 +1636,7 @@ def aiworkhub_manager_task_supersede(
     return task_engine.archive_task(
         core.repo_root(),
         task_id,
-        actor=core.CODEX_RUNNER,
+        actor=core._verified_manager_actor(),
         reason=reason,
         supersede=True,
     )

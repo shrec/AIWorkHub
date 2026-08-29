@@ -38,6 +38,11 @@ def test_stdlib_backend_can_be_selected_even_when_sdk_is_installed() -> None:
 def test_manager_archive_and_supersede_tools_are_write_gated(monkeypatch) -> None:
     monkeypatch.setattr(server.core, "writes_allowed", lambda: False)
 
+    def unexpected_archive(*args, **kwargs):
+        raise AssertionError("archive_task must not run while the write gate is closed")
+
+    monkeypatch.setattr(server.task_engine, "archive_task", unexpected_archive)
+
     archive = server.aiworkhub_manager_task_archive("TASK_B891", reason="done")
     supersede = server.aiworkhub_manager_task_supersede("TASK_B891", reason="orphan")
 
@@ -45,42 +50,58 @@ def test_manager_archive_and_supersede_tools_are_write_gated(monkeypatch) -> Non
     assert supersede == {"ok": False, "error": "write_gate_closed", "task_id": "TASK_B891"}
 
 
-def test_manager_archive_and_supersede_dispatch_to_repo_bound_engine(monkeypatch, tmp_path: Path) -> None:
+def test_manager_archive_and_supersede_use_verified_manager_actor(
+    monkeypatch, tmp_path: Path
+) -> None:
     calls: list[dict] = []
+    expected_calls: list[dict] = []
     monkeypatch.setattr(server.core, "writes_allowed", lambda: True)
     monkeypatch.setattr(server.core, "repo_root", lambda: tmp_path)
-    monkeypatch.setattr(server.core, "CODEX_RUNNER", "codex")
+    monkeypatch.setattr(server.core, "CODEX_RUNNER", "unexpected-direct-runner")
 
     def fake_archive(repo, task_id, *, actor, reason="", supersede=False):
-        calls.append({
-            "repo": repo,
-            "task_id": task_id,
-            "actor": actor,
-            "reason": reason,
-            "supersede": supersede,
-        })
+        calls.append(
+            {
+                "repo": repo,
+                "task_id": task_id,
+                "actor": actor,
+                "reason": reason,
+                "supersede": supersede,
+            }
+        )
         return {"ok": True, "returncode": 0}
 
     monkeypatch.setattr(server.task_engine, "archive_task", fake_archive)
 
-    assert server.aiworkhub_manager_task_archive("TASK_ARCHIVE", reason="done")["ok"] is True
-    assert server.aiworkhub_manager_task_supersede("TASK_SUPERSEDE", reason="orphan")["ok"] is True
-    assert calls == [
-        {
-            "repo": tmp_path,
-            "task_id": "TASK_ARCHIVE",
-            "actor": "codex",
-            "reason": "done",
-            "supersede": False,
-        },
-        {
-            "repo": tmp_path,
-            "task_id": "TASK_SUPERSEDE",
-            "actor": "codex",
-            "reason": "orphan",
-            "supersede": True,
-        },
-    ]
+    for actor in ("claude", "codex"):
+        monkeypatch.setattr(server.core, "_verified_manager_actor", lambda: actor)
+        archive_task_id = f"TASK_ARCHIVE_{actor.upper()}"
+        supersede_task_id = f"TASK_SUPERSEDE_{actor.upper()}"
+        assert server.aiworkhub_manager_task_archive(archive_task_id, reason="done")["ok"] is True
+        assert (
+            server.aiworkhub_manager_task_supersede(supersede_task_id, reason="orphan")["ok"]
+            is True
+        )
+        expected_calls.extend(
+            [
+                {
+                    "repo": tmp_path,
+                    "task_id": archive_task_id,
+                    "actor": actor,
+                    "reason": "done",
+                    "supersede": False,
+                },
+                {
+                    "repo": tmp_path,
+                    "task_id": supersede_task_id,
+                    "actor": actor,
+                    "reason": "orphan",
+                    "supersede": True,
+                },
+            ]
+        )
+
+    assert calls == expected_calls
 
 
 def test_fallback_stdio_writer_is_binary_utf8_and_transport_safe() -> None:
