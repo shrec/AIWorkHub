@@ -118,6 +118,67 @@ class TestNormalizePacketFindings:
         assert isinstance(result, list)
         assert result[0]["id"] == "F002"
 
+    def test_structured_source_evidence_is_canonicalized_and_bound(self):
+        packet = _packet_with_findings()
+        findings = [{
+            "severity": "high",
+            "summary": "Unsafe input",
+            "evidence": {
+                "path": "src/module.py",
+                "line_start": 12,
+                "line_end": 14,
+            },
+        }]
+
+        result = quality_reviewer.normalize_packet_findings(
+            packet, lens="correctness", findings=findings,
+        )
+
+        assert result[0]["evidence"] == "src/module.py:12-14"
+        assert result[0]["evidence_reference"] == {
+            "kind": "source",
+            "path": "src/module.py",
+            "line_start": 12,
+            "line_end": 14,
+        }
+
+    def test_structured_evidence_conflict_and_unknown_keys_fail_closed(self):
+        packet = _packet_with_findings()
+        base = {"severity": "high", "summary": "Unsafe input"}
+        with pytest.raises(
+            ReviewerEvidenceError,
+            match="structured_evidence_conflict:path",
+        ):
+            quality_reviewer.normalize_packet_findings(
+                packet,
+                lens="correctness",
+                findings=[{
+                    **base,
+                    "path": "src/other.py",
+                    "evidence": {
+                        "path": "src/module.py",
+                        "line_start": 12,
+                        "line_end": 12,
+                    },
+                }],
+            )
+        with pytest.raises(
+            ReviewerEvidenceError,
+            match="structured_evidence_unknown_key:column",
+        ):
+            quality_reviewer.normalize_packet_findings(
+                packet,
+                lens="correctness",
+                findings=[{
+                    **base,
+                    "evidence": {
+                        "path": "src/module.py",
+                        "line_start": 12,
+                        "column": 3,
+                    },
+                }],
+            )
+
 
 class TestVerifyReviewerReceipt:
     def test_valid_receipt_passes(self) -> None:

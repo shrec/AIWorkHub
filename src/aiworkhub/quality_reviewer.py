@@ -38,7 +38,7 @@ QualityReviewFinding = TypedDict(
     {
         "severity": str,
         "summary": str,
-        "evidence": str,
+        "evidence": str | Mapping[str, object],
         "id": NotRequired[str],
         "disposition": NotRequired[str],
         "confidence": NotRequired[str],
@@ -89,7 +89,10 @@ QUALITY_REVIEW_FINDING_SCHEMA_DOC = (
     "observation and process_limit must be low severity), confidence "
     "(low|medium|high), symbol, claim, reproduction and required_validation. "
     "Defects must cite an exact packet-permitted path and line "
-    "(path/line_start/line_end) or a mechanical check_id. The tool derives "
+    "(path/line_start/line_end) or a mechanical check_id. Evidence may be a "
+    "string containing that exact reference or an object with exactly "
+    "path/line_start/line_end (or check_id); the supervisor canonicalizes the "
+    "object before validation. The tool derives "
     "actionable, evidence_level and evidence_reference; do not invent keys "
     "outside this shape. An empty findings list is valid."
 )
@@ -552,6 +555,7 @@ def normalize_packet_findings(
     for index, finding in enumerate(rows):
         if not isinstance(finding, Mapping):
             raise ReviewerEvidenceError(f"review_finding_{index}_not_object")
+        finding = _canonicalize_structured_evidence(finding, index=index)
         unknown = set(finding) - QUALITY_REVIEW_FINDING_INPUT_KEYS
         if unknown:
             raise ReviewerEvidenceError(
@@ -720,6 +724,61 @@ def normalize_packet_findings(
             normalized_finding["evidence_reference"] = evidence_reference
         normalized.append(normalized_finding)
     return normalized
+
+
+def _canonicalize_structured_evidence(
+    finding: Mapping[str, Any], *, index: int
+) -> dict[str, Any]:
+    """Convert one exact structured evidence reference to canonical input.
+
+    Reviewer providers commonly render a file/line citation as an ``evidence``
+    object even when the prompt requests sibling fields.  This conversion is
+    deliberately narrow: it accepts only the canonical source/check keys,
+    rejects conflicts with sibling fields, and leaves packet-scope validation
+    to ``normalize_packet_findings``.
+    """
+
+    canonical = dict(finding)
+    raw = canonical.get("evidence")
+    if not isinstance(raw, Mapping):
+        return canonical
+    allowed = {"path", "line_start", "line_end", "check_id"}
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_structured_evidence_unknown_key:"
+            f"{','.join(sorted(str(key) for key in unknown))}"
+        )
+    path = raw.get("path")
+    check_id = raw.get("check_id")
+    if bool(path) == bool(check_id):
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_structured_evidence_invalid"
+        )
+    transferred = (
+        ("path", path),
+        ("line_start", raw.get("line_start")),
+        ("line_end", raw.get("line_end")),
+        ("check_id", check_id),
+    )
+    for key, value in transferred:
+        if value is None:
+            continue
+        existing = canonical.get(key)
+        if existing not in (None, "") and existing != value:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_structured_evidence_conflict:{key}"
+            )
+        canonical[key] = value
+    if path:
+        start = raw.get("line_start")
+        end = raw.get("line_end", start)
+        canonical["evidence"] = (
+            f"{path}:{start}-{end}" if end != start else f"{path}:{start}"
+        )
+    else:
+        canonical["evidence"] = str(check_id)
+    return canonical
 
 
 def _scoped_audit_rows(
