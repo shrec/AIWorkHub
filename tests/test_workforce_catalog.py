@@ -376,7 +376,13 @@ def test_copilot_exact_model_switch_does_not_disable_sibling_model(tmp_path: Pat
         if row.get("policy_provider") == "copilot"
         and row["model"] in {"glm-5.2", "glm-5.3"}
     }
-    assert by_model["glm-5.2"]["available"] is True
+    assert by_model["glm-5.2"]["launch_eligible"] is True
+    assert by_model["glm-5.2"]["available"] is False
+    assert by_model["glm-5.2"]["availability_observed"] is False
+    assert by_model["glm-5.2"]["route_health"]["state"] == "unobserved"
+    assert by_model["glm-5.2"]["route_health"]["reason"] == "no_recent_terminal_execution"
+    assert by_model["glm-5.2"]["route_health"]["failure_kind"] == ""
+    assert by_model["glm-5.2"]["readiness_status"] == "route_unobserved"
     assert by_model["glm-5.3"]["available"] is False
 
 
@@ -430,7 +436,7 @@ def test_explicit_disabled_discovered_model_overrides_family_projection(
     assert len(candidates) == 1
     assert candidates[0]["excluded"] is True
     assert decision["selected_worker_id"] != "glm-5.3"
-    assert decision["launch_contract"]["model"] != "glm-5.3"
+    assert decision["launch_contract"] is None
 
 
 def test_explicit_enabled_discovered_model_stays_authoritative_and_dynamic() -> None:
@@ -677,7 +683,11 @@ def test_deepseek_uses_launchable_copilot_fallback_without_identity_drift(
         },
     )
     worker = next(row for row in snapshot["workers"] if row["worker_id"] == "deepseek-v4-pro")
-    assert worker["available"] is True
+    assert worker["launch_eligible"] is True
+    assert worker["available"] is False
+    assert worker["availability_observed"] is False
+    assert worker["route_health"]["state"] == "unobserved"
+    assert worker["readiness_status"] == "route_unobserved"
     assert worker["adapter_id"] == "deepseek_vscode_lm"
     assert worker["effective_adapter_id"] == "deepseek_copilot_cli"
     assert worker["adapter_fallback_used"] is True
@@ -699,7 +709,11 @@ def test_glm_uses_launchable_copilot_fallback(tmp_path: Path) -> None:
         },
     )
     worker = next(row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2")
-    assert worker["available"] is True
+    assert worker["launch_eligible"] is True
+    assert worker["available"] is False
+    assert worker["availability_observed"] is False
+    assert worker["route_health"]["state"] == "unobserved"
+    assert worker["readiness_status"] == "route_unobserved"
     assert worker["effective_adapter_id"] == "glm_copilot_cli"
     assert worker["adapter_fallback_used"] is True
 
@@ -1095,7 +1109,11 @@ def test_enabled_deepseek_copilot_route_survives_disabled_copilot_catalog_model(
     assert worker["effective_adapter_id"] == "deepseek_copilot_cli"
     assert worker["policy_provider"] == "deepseek"
     assert worker["policy_enabled"] is True
-    assert worker["available"] is True
+    assert worker["launch_eligible"] is True
+    assert worker["available"] is False
+    assert worker["availability_observed"] is False
+    assert worker["route_health"]["state"] == "unobserved"
+    assert worker["readiness_status"] == "route_unobserved"
 
 
 def test_canonical_usage_rows_supply_tokens_and_labeled_unknown_cost(tmp_path: Path) -> None:
@@ -1252,8 +1270,10 @@ def test_route_circuit_is_exact_adapter_model_and_never_shared_mcp(
     assert pro["route_health"]["consecutive_failures"] == 2
     assert pro["route_health"]["scope"] == "exact_adapter_and_model"
     assert pro["route_health"]["mcp_control_plane_affected"] is False
-    assert flash["available"] is True
-    assert flash["route_health"]["state"] == "closed"
+    assert flash["launch_eligible"] is True
+    assert flash["available"] is False
+    assert flash["availability_observed"] is False
+    assert flash["route_health"]["state"] == "unobserved"
 
     task = workforce_router.TaskRequirements.build(
         task_id="route-local-fallback",
@@ -1263,8 +1283,8 @@ def test_route_circuit_is_exact_adapter_model_and_never_shared_mcp(
         tool_needs=["source-graph"],
     )
     decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
-    assert decision["selected_worker_id"] == "deepseek-v4-flash"
-    assert decision["launch_contract"]["model"] == "deepseek-v4-flash"
+    assert decision["selected_worker_id"] is None
+    assert decision["launch_contract"] is None
 
 
 def test_route_success_resets_transient_circuit_and_auth_circuit_half_opens(
@@ -1315,7 +1335,9 @@ def test_route_success_resets_transient_circuit_and_auth_circuit_half_opens(
         row for row in cooled["workers"]
         if row["worker_id"] == "deepseek-v4-pro"
     )
-    assert pro["available"] is True
+    assert pro["launch_eligible"] is True
+    assert pro["available"] is False
+    assert pro["availability_observed"] is False
     assert pro["route_health"]["state"] == "half_open"
     assert pro["route_health"]["failure_kind"] == "auth"
 
@@ -1371,8 +1393,10 @@ def test_authenticated_http_402_quota_opens_exact_route_after_one_failure(
     assert pro["route_health"]["scope"] == "exact_adapter_and_model"
     assert pro["route_health"]["mcp_control_plane_affected"] is False
     # Sibling model on the same adapter stays healthy and rankable.
-    assert flash["available"] is True
-    assert flash["route_health"]["state"] == "closed"
+    assert flash["launch_eligible"] is True
+    assert flash["available"] is False
+    assert flash["availability_observed"] is False
+    assert flash["route_health"]["state"] == "unobserved"
 
     task = workforce_router.TaskRequirements.build(
         task_id="quota-route-local-fallback",
@@ -1382,7 +1406,8 @@ def test_authenticated_http_402_quota_opens_exact_route_after_one_failure(
         tool_needs=["source-graph"],
     )
     decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
-    assert decision["selected_worker_id"] == "deepseek-v4-flash"
+    assert decision["selected_worker_id"] is None
+    assert decision["launch_contract"] is None
     pro_candidate = next(
         item for item in decision["candidates"]
         if item["worker_id"] == "deepseek-v4-pro"
@@ -1443,8 +1468,10 @@ def test_only_sealed_provider_errors_classify_not_prose_or_spoofing(
             row for row in snapshot["workers"]
             if row["worker_id"] == "deepseek-v4-pro"
         )
-        assert pro["available"] is True, label
-        assert pro["route_health"]["state"] == "closed", label
+        assert pro["launch_eligible"] is True, label
+        assert pro["available"] is False, label
+        assert pro["availability_observed"] is False, label
+        assert pro["route_health"]["state"] == "unobserved", label
         assert pro["route_health"]["failure_kind"] == "", label
         assert pro["route_health"]["consecutive_failures"] == 0, label
 
@@ -1536,8 +1563,10 @@ def test_unsealed_auth_error_prose_never_opens_route_circuit(
             row for row in snapshot["workers"]
             if row["worker_id"] == "deepseek-v4-pro"
         )
-        assert pro["available"] is True, error
-        assert pro["route_health"]["state"] == "closed", error
+        assert pro["launch_eligible"] is True, error
+        assert pro["available"] is False, error
+        assert pro["availability_observed"] is False, error
+        assert pro["route_health"]["state"] == "unobserved", error
         assert pro["route_health"]["failure_kind"] == "", error
         assert pro["route_health"]["consecutive_failures"] == 0, error
 
@@ -1570,7 +1599,10 @@ def test_sealed_auth_401_403_open_only_exact_route_and_sealed_success_recovers(
         assert pro["route_health"]["consecutive_failures"] == 1, (http_status, code)
         assert pro["route_health"]["threshold"] == 1, (http_status, code)
         # Sibling model and the shared control plane stay healthy.
-        assert flash["available"] is True, (http_status, code)
+        assert flash["launch_eligible"] is True, (http_status, code)
+        assert flash["available"] is False, (http_status, code)
+        assert flash["availability_observed"] is False, (http_status, code)
+        assert flash["route_health"]["state"] == "unobserved", (http_status, code)
         assert pro["route_health"]["mcp_control_plane_affected"] is False
 
     # A later sealed authenticated success deterministically closes the circuit.

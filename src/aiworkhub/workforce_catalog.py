@@ -914,6 +914,34 @@ def build_catalog(
         )
         policy_enabled = route_policy_enabled and vendor_policy_enabled
         effective_enabled = bool(worker["enabled"] and policy_enabled)
+        launch_eligible = bool(
+            effective_enabled
+            and adapter_ready.get("launchable")
+            and route_available
+        )
+        exact_route_success_observed = any(
+            str(process.get("state") or "").strip().casefold()
+            in _ROUTE_SUCCESS_STATES
+            and (epoch := _process_event_epoch(process)) is not None
+            and 0.0 <= observed_now_epoch - epoch <= ROUTE_CIRCUIT_LOOKBACK_SECONDS
+            for process in matched
+        )
+        verified_provider_route = worker["provider"] in {"deepseek", "zhipu"}
+        if (
+            verified_provider_route
+            and not exact_route_success_observed
+            and route_health["state"] == "closed"
+        ):
+            route_health = {
+                **route_health,
+                "state": "unobserved",
+                "reason": "no_recent_terminal_execution",
+            }
+        availability_observed = (
+            exact_route_success_observed
+            if verified_provider_route
+            else access_observed or bool(sample_count > 0)
+        )
         model_routes = economics_by_model.get(worker["model"])
         if not isinstance(model_routes, Mapping):
             model_routes = {}
@@ -934,16 +962,25 @@ def build_catalog(
             "vendor_policy_enabled": vendor_policy_enabled,
             "effective_adapter_id": effective_adapter,
             "adapter_fallback_used": effective_adapter != worker["adapter_id"],
+            "launch_eligible": launch_eligible,
             "available": bool(
-                effective_enabled
-                and adapter_ready.get("launchable")
-                and route_available
+                launch_eligible
+                and (
+                    exact_route_success_observed
+                    if verified_provider_route
+                    else True
+                )
             ),
-            "availability_observed": access_observed or bool(sample_count > 0),
+            "availability_observed": availability_observed,
             "readiness_status": (
                 "route_circuit_open"
                 if not route_available
-                else str(adapter_ready.get("status") or "unobserved")
+                else (
+                    "route_unobserved"
+                    if verified_provider_route
+                    and not exact_route_success_observed
+                    else str(adapter_ready.get("status") or "unobserved")
+                )
             ),
             "route_health": route_health,
             "quota_observed": False,
