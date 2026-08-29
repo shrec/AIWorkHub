@@ -774,6 +774,7 @@ def test_owner_preparation_timeout_terminalizes_each_reservation_once(
 ):
     manager = _manager(tmp_path)
     manager._QUALITY_REVIEW_PREP_OWNER_SECONDS = 0.05
+    manager._QUALITY_REVIEW_PREP_WAIT_SECONDS = 0.05
 
     never = threading.Event()
 
@@ -825,7 +826,18 @@ def test_owner_preparation_timeout_terminalizes_each_reservation_once(
     assert launch_calls == []
     for idx in range(3):
         assert manager._live_reviewer_receipt(f"REVIEWER_TO_{idx}") is None
+
     never.set()
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        flights = manager.__dict__.get("_quality_review_flights", {})
+        active_builders = type(manager)._QUALITY_REVIEW_PREP_ACTIVE_BUILDERS
+        if flights == {} and active_builders == 0:
+            break
+        time.sleep(0.01)
+
+    assert manager.__dict__.get("_quality_review_flights", {}) == {}
+    assert type(manager)._QUALITY_REVIEW_PREP_ACTIVE_BUILDERS == 0
 
 
 def test_status_read_bounded_and_reports_phase_while_prep_blocks(
