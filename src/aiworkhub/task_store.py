@@ -52,6 +52,7 @@ from .storage_registry import (
     resolve_database_path,
 )
 from .provider_tool_guards import ProviderGuardError, apply_repository_guards
+from . import review_lifecycle
 from . import task_fsm
 from .sqlite_readonly import connect_readonly
 
@@ -158,11 +159,42 @@ REQUIRED_TABLES: tuple[str, ...] = (
     "task_events",
     "callback_outbox",
     "callback_batches",
+    "review_chains",
+    "review_action_outbox",
 )
 
 REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
-    "tasks": ("task_id", "runner", "topic", "status", "worker_status", "card_json", "origin_thread_id"),
+    "tasks": (
+        "task_id",
+        "runner",
+        "topic",
+        "status",
+        "worker_status",
+        "card_json",
+        "origin_thread_id",
+    ),
     "callback_outbox": ("task_id", "origin_thread_id", "episode_id", "batch_id", "state"),
+    "review_chains": (
+        "chain_id",
+        "target_task_id",
+        "target_request_id",
+        "claim_epoch",
+        "packet_sha256",
+        "candidate_sha256",
+        "chain_identity_sha256",
+    ),
+    "review_action_outbox": (
+        "chain_id",
+        "action_index",
+        "phase",
+        "action_type",
+        "descriptor_json",
+        "descriptor_sha256",
+        "receipt_commitment_sha256",
+        "completed_at",
+        "failure_reason",
+        "state",
+    ),
 }
 
 SCHEMA = """
@@ -363,6 +395,7 @@ def _atomic_init_schema(path: Path) -> None:
         conn = sqlite3.connect(str(tmp))
         try:
             conn.executescript(SCHEMA)
+            conn.executescript(review_lifecycle.SCHEMA)
             ensure_event_indexes(conn)
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.commit()
@@ -624,6 +657,7 @@ def _upgrade_compatible_schema(path: Path) -> bool:
                     f"ALTER TABLE callback_batches ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
                 )
                 changed = True
+        changed = review_lifecycle.ensure_schema(conn) or changed
         changed = ensure_event_indexes(conn) or changed
         conn.commit()
     finally:

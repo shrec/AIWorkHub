@@ -13,6 +13,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import task_store  # noqa: E402
+from aiworkhub import review_lifecycle  # noqa: E402
 
 
 def _insert_task(repo: Path, task_id: str, *, status: str) -> None:
@@ -58,6 +59,52 @@ def test_write_connections_use_bounded_wal_concurrency_pragmas(tmp_path: Path) -
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 1
     finally:
         connection.close()
+
+
+def test_initialize_repository_adds_review_lifecycle_tables_to_canonical_task_db(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    result = task_store.initialize_repository(repo)
+    assert result["ok"] is True
+    _readiness, db_path = task_store._require_ready(repo)
+    connection = sqlite3.connect(db_path)
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(review_action_outbox)")
+        }
+    finally:
+        connection.close()
+
+    assert {"review_chains", "review_action_outbox"} <= tables
+    assert {
+        "descriptor_json",
+        "descriptor_sha256",
+        "state",
+        "lease_token",
+        "receipt_commitment_sha256",
+        "completed_at",
+        "failure_reason",
+    } <= columns
+
+    chain = review_lifecycle.create_or_replay_chain(
+        db_path,
+        target_task_id="TASK_STORE_REVIEW",
+        target_request_id="req-store-review",
+        claim_epoch="1",
+        packet_sha256="a" * 64,
+        candidate_sha256="b" * 64,
+    )
+    assert len(chain.actions) == 12
 
 
 def test_atomic_json_closes_descriptor_when_fdopen_fails(
