@@ -12,7 +12,23 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.67 — 2026-08-29
+## What's new in 0.10.68 — 2026-08-29
+
+- Mandatory review mechanics now belong to the supervisor and durable task
+  system: structured reports are ingested automatically, reviewer evidence is
+  canonicalized, and correctness, security and code-quality actions run in a
+  leased, restart-safe sequence.
+- Each reviewer is selected from live workforce policy. Exact terminal receipts
+  are verified before acceptance, actionable findings stop the chain, and
+  accepted reviewer and target cards are archived automatically.
+- The final lifecycle action resolves exactly linked NeedFix records, while a
+  target without a linked finding completes idempotently instead of leaving a
+  permanent pending action.
+- DeepSeek and GLM routes with no authenticated success history are reported as
+  launch-eligible but not yet available or selectable; Windows and LM-discovery
+  tests now enforce that same provider-readiness truth.
+
+## What's new in 0.10.67
 
 - Nested Landlock validation now authenticates exact request-owned worktree
   authority, and Windows AppContainer supervision owns native process, job,

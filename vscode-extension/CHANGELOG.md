@@ -1,5 +1,32 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.68 — 2026-08-29
+
+### Added
+
+- A durable canonical review outbox now drives correctness, security and code
+  quality reviews in sequence, then accepts and archives the target and closes
+  its exactly linked NeedFix records.
+- Reviewer routes come from the live workforce policy and pending lifecycle
+  actions survive process restarts with authenticated receipts and leases.
+
+### Fixed
+
+- The supervisor now owns mandatory reviewer-report ingestion and structured
+  evidence canonicalization, so successful review no longer depends on a model
+  remembering to call the submission tool.
+- Review waits release their lease immediately; terminal receipts are bound to
+  the exact target, lens, packet, provider and single submission; actionable
+  findings stop acceptance and completed reviewer cards are archived.
+- Zero-history DeepSeek and GLM routes remain launch-eligible for a canary but
+  unavailable and unselectable until authenticated success is observed.
+
+### Tests
+
+- Windows provider and LM-discovery parity coverage follows the canonical
+  observed-readiness contract, and lifecycle tests cover restart replay,
+  archive order and linked-NeedFix cleanup.
+
 ## 0.10.67 — 2026-08-29
 
 ### Added

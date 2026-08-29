@@ -6,6 +6,40 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.68] - 2026-08-29
+
+### Added
+
+- The canonical task database now owns a durable review-chain outbox covering
+  three sequential review lenses, target acceptance, archival and linked
+  NeedFix closure with leased, replayable action receipts.
+- Review orchestration selects each reviewer from the live workforce contract
+  instead of a hard-coded vendor or runner and resumes pending work after a
+  process restart without creating a second lifecycle database.
+
+### Fixed
+
+- Reviewer models no longer have to remember or invoke the mandatory report
+  submission tool. The supervisor ingests their structured terminal report,
+  canonicalizes its evidence and persists the authenticated receipt itself.
+- Automatic review waits return their lease immediately, verify exact target,
+  reviewer, lens, packet, provider and submission bindings, reject actionable
+  findings before acceptance, and archive every accepted reviewer and target.
+- Accepted and archived targets now resolve every exactly linked
+  `task_created` NeedFix as the final durable lifecycle action; tasks without a
+  linked finding complete the same step idempotently.
+- Provider readiness distinguishes launch eligibility from authenticated,
+  observed route success, so zero-history DeepSeek and GLM routes are not
+  advertised as available or selected prematurely.
+
+### Tests
+
+- Windows workforce and LM-discovery parity tests now assert the same observed
+  provider truth as the canonical workforce catalog.
+- Review lifecycle coverage exercises restart replay, route selection,
+  terminal receipt authentication, finding rejection, ordered archival and
+  exact linked-NeedFix cleanup.
+
 ## [0.10.67] - 2026-08-29
 
 ### Added
