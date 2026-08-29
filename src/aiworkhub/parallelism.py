@@ -66,14 +66,24 @@ def compute_worker_count(
     candidate_count: int,
     reserve: int = 1,
     ceiling: int | None = None,
-    soft_max: int = 8,
+    soft_max: int | None = None,
     min_candidates: int = 2,
 ) -> tuple[int, WorkerSelection]:
     """Select a deterministic, bounded width and return truthful telemetry."""
 
-    capacity = get_cpu_capacity()
-    reserve = max(0, int(reserve))
-    hard_ceiling = max(1, int(ceiling if ceiling is not None else soft_max))
+    capacity = max(1, int(get_cpu_capacity()))
+    effective_reserve = max(0, int(reserve))
+    if capacity > 1:
+        effective_reserve = max(1, effective_reserve)
+
+    adaptive_ceiling = max(1, capacity - effective_reserve)
+    applied_ceiling = adaptive_ceiling
+    if ceiling is None:
+        if soft_max is not None:
+            applied_ceiling = min(applied_ceiling, max(1, int(soft_max)))
+    else:
+        applied_ceiling = min(applied_ceiling, max(1, int(ceiling)))
+
     nested = pool_is_nested()
 
     if nested:
@@ -87,8 +97,7 @@ def compute_worker_count(
         workers = 1
     else:
         workers = min(
-            max(1, capacity - reserve),
-            hard_ceiling,
+            applied_ceiling,
             max(1, int(candidate_count)),
         )
         reason = "capacity_based" if workers > 1 else "effective_single_worker"
@@ -96,8 +105,8 @@ def compute_worker_count(
     selection = WorkerSelection(
         available_cpus=capacity,
         selected_workers=int(workers),
-        reserve=reserve,
-        ceiling=hard_ceiling,
+        reserve=effective_reserve,
+        ceiling=applied_ceiling,
         nested=nested,
         reason=reason,
     )

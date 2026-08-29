@@ -25,20 +25,48 @@ def test_single_cpu_is_serial() -> None:
     assert receipt.reason == "single_cpu_serial"
 
 
-def test_capacity_reserve_ceiling_and_candidates_are_bounded() -> None:
-    with mock.patch.object(parallelism, "get_cpu_capacity", return_value=16):
+def test_omitted_ceiling_uses_adaptive_capacity() -> None:
+    with mock.patch.object(parallelism, "get_cpu_capacity", return_value=64):
         workers, receipt = parallelism.compute_worker_count(
-            candidate_count=3, reserve=1, ceiling=8,
+            candidate_count=100, reserve=1,
         )
-    assert workers == 3
+    assert workers == 63
     assert receipt.to_dict() == {
-        "available_cpus": 16,
-        "selected_workers": 3,
+        "available_cpus": 64,
+        "selected_workers": 63,
         "reserve": 1,
-        "ceiling": 8,
+        "ceiling": 63,
         "nested": False,
         "reason": "capacity_based",
     }
+
+
+def test_zero_reserve_keeps_one_interactive_core() -> None:
+    with mock.patch.object(parallelism, "get_cpu_capacity", return_value=64):
+        workers, receipt = parallelism.compute_worker_count(
+            candidate_count=100, reserve=0,
+        )
+    assert workers == 63
+    assert receipt.reserve == 1
+    assert receipt.ceiling == 63
+
+
+def test_explicit_ceiling_remains_authoritative() -> None:
+    with mock.patch.object(parallelism, "get_cpu_capacity", return_value=64):
+        workers, receipt = parallelism.compute_worker_count(
+            candidate_count=100, reserve=1, ceiling=8,
+        )
+    assert workers == 8
+    assert receipt.ceiling == 8
+
+
+def test_explicit_ceiling_reports_applied_capacity_bound() -> None:
+    with mock.patch.object(parallelism, "get_cpu_capacity", return_value=4):
+        workers, receipt = parallelism.compute_worker_count(
+            candidate_count=100, reserve=1, ceiling=100,
+        )
+    assert workers == 3
+    assert receipt.ceiling == 3
 
 
 def test_below_candidate_threshold_is_serial() -> None:
