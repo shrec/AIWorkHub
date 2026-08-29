@@ -94,3 +94,55 @@ def test_retry_with_normalized_explicit_report_is_logical_dedup():
     )
     assert result.status == "deduplicated"
     assert result.deduplicated is True
+
+
+def test_review_finding_aliases_are_copied_and_evidence_is_preserved():
+    original = {
+        "lens": "correctness",
+        "findings": [{
+            "severity": "high",
+            "summary": "missing validation",
+            "evidence": "validation is skipped",
+            "actionable": True,
+            "evidence_reference": {
+                "path": "src/aiworkhub/quality_review_ingest.py",
+                "line_start": 173,
+                "line_end": 180,
+            },
+        }],
+    }
+
+    normalized = ingest._normalize_review_finding_aliases(original)
+
+    assert original["findings"][0]["actionable"] is True
+    assert "evidence_reference" in original["findings"][0]
+    finding = normalized["findings"][0]
+    assert "actionable" not in finding
+    assert "evidence_reference" not in finding
+    assert finding["evidence"] == "validation is skipped"
+    assert finding["path"] == "src/aiworkhub/quality_review_ingest.py"
+    assert finding["line_start"] == 173
+    assert finding["line_end"] == 180
+
+
+@pytest.mark.parametrize(
+    "finding",
+    [
+        {"actionable": 1},
+        {"evidence_reference": "src/aiworkhub/quality_review_ingest.py:173"},
+        {"evidence_reference": {"path": "src/aiworkhub/quality_review_ingest.py", "line_start": True}},
+        {"evidence_reference": {"path": "src/aiworkhub/quality_review_ingest.py", "unknown": 1}},
+    ],
+)
+def test_review_finding_aliases_reject_malformed_values(finding):
+    with pytest.raises(ingest.ReviewProtocolError, match="structured_report_invalid"):
+        ingest._normalize_review_finding_aliases({"lens": "correctness", "findings": [finding]})
+
+
+def test_review_finding_alias_normalization_leaves_unknown_keys_fail_closed():
+    normalized = ingest._normalize_review_finding_aliases({
+        "lens": "correctness",
+        "findings": [{"actionable": False, "unexpected": "still rejected downstream"}],
+    })
+
+    assert normalized["findings"] == [{"unexpected": "still rejected downstream"}]

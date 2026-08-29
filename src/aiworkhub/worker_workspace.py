@@ -1137,6 +1137,138 @@ def _extract_pytest_test_files(repo: Path, validation_rows: Iterable[str]) -> tu
     return tuple(sorted(test_files))
 
 
+_VALIDATION_FILE_SUFFIXES = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".h",
+        ".hpp",
+        ".ini",
+        ".js",
+        ".json",
+        ".mjs",
+        ".py",
+        ".sh",
+        ".toml",
+        ".ts",
+        ".yaml",
+        ".yml",
+    }
+)
+_VALIDATION_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "-k",
+        "-m",
+        "--config",
+        "--ignore",
+        "--maxfail",
+        "--pyargs",
+        "--rootdir",
+    }
+)
+
+
+def _input_missing_error(field: str, index: int, relative: str) -> WorkspaceError:
+    """Return the bounded, machine-readable missing-input error."""
+    return WorkspaceError(
+        f"workspace_required_input_missing:field={field}:index={index}:path={relative}"
+    )
+
+
+def _exact_required_card_inputs(
+    repo: Path, card: Mapping[str, Any], allowed: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Validate and return existing exact immutable/read-first card inputs.
+
+    Outputs are deliberately not included: an allowed path is a capability, not
+    a promise that production or test output already exists.
+    """
+    rows: set[str] = set()
+    exempt = set(allowed) | {
+        _relative_repo_path(value) for value in (card.get("required_outputs") or [])
+    }
+    for field in ("immutable_inputs", "read_first"):
+        for index, raw in enumerate(card.get(field) or []):
+            relative = _relative_repo_path(raw)
+            if any(character in relative for character in "*?["):
+                continue
+            if relative in exempt:
+                continue
+            candidate = repo / relative
+            _require_beneath(repo, candidate)
+            if candidate.is_symlink() or not candidate.is_file():
+                raise _input_missing_error(field, index, relative)
+            rows.add(relative)
+    return tuple(sorted(rows))
+
+
+def _validation_file_operands(
+    repo: Path, card: Mapping[str, Any], allowed: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Return exact repository files explicitly named by validation commands.
+
+    Only path-shaped positional tokens are considered.  This intentionally
+    excludes options, their values, pytest node-id selectors, module names,
+    and ordinary command words such as ``check`` or ``diff``.
+    """
+    rows: set[str] = set()
+    exempt = set(allowed) | {
+        _relative_repo_path(value) for value in (card.get("required_outputs") or [])
+    }
+    for command_index, command in enumerate(card.get("validation") or []):
+        if not isinstance(command, str) or not command.strip():
+            continue
+        tokens, _components, _tmpdir, cd_relative = _parse_validation_command_detailed(
+            command
+        )
+        skip_next = False
+        for token_index, token in enumerate(tokens):
+            if skip_next:
+                skip_next = False
+                continue
+            if token in _VALIDATION_OPTIONS_WITH_VALUE:
+                skip_next = True
+                continue
+            if token_index == 0 or not token or token.startswith("-"):
+                continue
+            # Pytest's node-id suffix is selector metadata, never filesystem
+            # syntax.  A bare node id without a path remains non-path input.
+            raw_path = token.split("::", 1)[0]
+            if "::" in token or any(character in raw_path for character in "*?["):
+                continue
+            if (
+                raw_path == token
+                and "/" not in raw_path
+                and not raw_path.startswith(".")
+                and PurePosixPath(raw_path).suffix.lower()
+                not in _VALIDATION_FILE_SUFFIXES
+            ):
+                continue
+            try:
+                relative = _relative_repo_path(raw_path)
+                if cd_relative:
+                    relative = _relative_repo_path(
+                        (PurePosixPath(cd_relative) / PurePosixPath(relative)).as_posix()
+                    )
+            except WorkspaceError:
+                # Path-shaped operands must retain the existing fail-closed
+                # normalization behaviour; non-path command words were
+                # filtered above before reaching this branch.
+                raise
+            if relative in exempt:
+                continue
+            candidate = repo / relative
+            _require_beneath(repo, candidate)
+            if candidate.is_dir() and not candidate.is_symlink():
+                continue
+            if candidate.is_symlink() or not candidate.is_file():
+                raise _input_missing_error("validation", command_index, relative)
+            rows.add(relative)
+    return tuple(sorted(rows))
+
+
 def _resolve_local_python_imports(repo: Path, seeded: Iterable[str]) -> tuple[str, ...]:
     """Return the bounded static package-local import closure for Python seeds.
 
@@ -3193,10 +3325,18 @@ def _declared_workspace_seed_closure(
     allowed: tuple[str, ...],
 ) -> tuple[list[str], tuple[str, ...], list[str]]:
     """Resolve one declared dependency closure from ``source_root`` bytes."""
+    # This is the authoritative provisioning boundary.  Validate validation
+    # operands first so unsafe repository paths retain their established
+    # fail-closed precedence over missing exact card inputs, then add every
+    # materialized input to the sparse seed set before provider launch.
+    validation_inputs = _validation_file_operands(source_root, card, allowed)
+    required_card_inputs = _exact_required_card_inputs(source_root, card, allowed)
     declared = (
         list(card.get("read_first") or [])
         + list(card.get("immutable_inputs") or [])
         + list(allowed)
+        + list(required_card_inputs)
+        + list(validation_inputs)
     )
     live_seeded = _expand_declared(source_root, declared)
     live_seeded = _resolve_local_quoted_includes(
@@ -3406,6 +3546,12 @@ def create_workspace(
                     raise WorkspaceError(
                         f"validation_worker_support_missing:{relative}"
                     )
+        # Re-run the same exact-input checks against the sparse worktree after
+        # materialization.  This closes races in the canonical copy window and
+        # preserves field/index/path evidence if an input was not actually
+        # present for the provider despite being present during preflight.
+        _exact_required_card_inputs(path, card, allowed)
+        _validation_file_operands(path, card, allowed)
         # Landlock can grant file-specific write rights without exposing the
         # worktree's .git pointer. Precreating exact new outputs makes those
         # file-specific rules possible; unchanged placeholders are filtered by

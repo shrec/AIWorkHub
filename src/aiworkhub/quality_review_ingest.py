@@ -133,6 +133,69 @@ def ingest_structured_final(
     return IngestResult("submitted", report, submitted=True)
 
 
+def _normalize_review_finding_aliases(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Translate only supported provider aliases without changing review authority."""
+    normalized_report = dict(report)
+    normalized_findings: list[Any] = []
+    for index, raw_finding in enumerate(report.get("findings") or []):
+        if not isinstance(raw_finding, Mapping):
+            normalized_findings.append(raw_finding)
+            continue
+        finding = dict(raw_finding)
+        if "actionable" in finding:
+            if type(finding["actionable"]) is not bool:
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_actionable_invalid"
+                )
+            finding.pop("actionable")
+        if "evidence_reference" in finding:
+            raw_reference = finding.pop("evidence_reference")
+            if not isinstance(raw_reference, Mapping):
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
+                )
+            reference = dict(raw_reference)
+            allowed = {"path", "line_start", "line_end", "check_id"}
+            if any(not isinstance(key, str) for key in reference) or set(reference) - allowed:
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
+                )
+            path = reference.get("path")
+            check_id = reference.get("check_id")
+            if bool(path) == bool(check_id):
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
+                )
+            for key in ("path", "check_id"):
+                value = reference.get(key)
+                if value is not None and (
+                    not isinstance(value, str) or not value or len(value.encode("utf-8")) > 4096
+                ):
+                    raise ReviewProtocolError(
+                        f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
+                    )
+            for key in ("line_start", "line_end"):
+                value = reference.get(key)
+                if value is not None and (
+                    type(value) is not int or value < 1 or value > 1_000_000
+                ):
+                    raise ReviewProtocolError(
+                        f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
+                    )
+            for key, value in reference.items():
+                existing = finding.get(key)
+                if existing not in (None, "") and existing != value:
+                    raise ReviewProtocolError(
+                        f"structured_report_invalid:review_finding_{index}_evidence_reference_conflict:{key}"
+                    )
+                finding[key] = value
+            if "evidence" not in finding:
+                finding["evidence"] = reference
+        normalized_findings.append(finding)
+    normalized_report["findings"] = normalized_findings
+    return normalized_report
+
+
 def supervisor_ingest(
     *, metadata: Mapping[str, Any], workspace: Any, packet: Mapping[str, Any],
     packet_path: Path, request_id: str, expected_lens: str,
@@ -172,8 +235,10 @@ def supervisor_ingest(
 
     def normalize(report: dict[str, Any]) -> dict[str, Any]:
         try:
+            normalized_report = _normalize_review_finding_aliases(report)
             findings = quality_reviewer.normalize_packet_findings(
-                packet, lens=expected_lens, findings=list(report.get("findings") or []),
+                packet, lens=expected_lens,
+                findings=list(normalized_report.get("findings") or []),
             )
         except quality_reviewer.ReviewerEvidenceError as exc:
             raise ReviewProtocolError(f"structured_report_invalid:{exc}") from exc

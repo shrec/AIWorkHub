@@ -292,6 +292,96 @@ def _workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, requ
     )
 
 
+def test_workspace_seeds_omitted_exact_validation_script(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    script = repo / "scripts" / "validate.py"
+    script.parent.mkdir()
+    script.write_text("print('ok')\n", encoding="utf-8")
+    assert _git(repo, "add", "scripts/validate.py").returncode == 0
+    assert _git(repo, "commit", "-qm", "validation script").returncode == 0
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "req-validation-script",
+        {
+            "allowed_writes": ["out/result.txt"],
+            "read_first": ["read/input.txt"],
+            "validation": ["python scripts/validate.py"],
+        },
+        "validation",
+    )
+
+    assert (workspace.path / "scripts" / "validate.py").is_file()
+
+
+@pytest.mark.parametrize("field", ["immutable_inputs", "read_first"])
+def test_workspace_rejects_missing_exact_card_input_before_git_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, field: str
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+
+    def git_launch_forbidden(*_args, **_kwargs):
+        raise AssertionError("missing input must fail before worktree launch")
+
+    monkeypatch.setattr(worker_workspace, "_run", git_launch_forbidden)
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match=rf"workspace_required_input_missing:field={field}:index=0:path=missing/input.py",
+    ):
+        worker_workspace.create_workspace(
+            repo,
+            f"req-missing-{field}",
+            {"allowed_writes": ["out/result.txt"], field: ["missing/input.py"]},
+            "validation",
+        )
+
+
+def test_workspace_rejects_missing_validation_script_before_git_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+
+    def git_launch_forbidden(*_args, **_kwargs):
+        raise AssertionError("missing validation script must fail before worktree launch")
+
+    monkeypatch.setattr(worker_workspace, "_run", git_launch_forbidden)
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="workspace_required_input_missing:field=validation:index=0:path=scripts/missing.py",
+    ):
+        worker_workspace.create_workspace(
+            repo,
+            "req-missing-validation-script",
+            {
+                "allowed_writes": ["out/result.txt"],
+                "validation": ["python scripts/missing.py"],
+            },
+            "validation",
+        )
+
+
+def test_workspace_allows_intended_output_to_be_absent_from_inputs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "req-new-output",
+        {
+            "allowed_writes": ["generated/result.py"],
+            "required_outputs": ["generated/result.py"],
+            "read_first": ["generated/result.py"],
+            "validation": ["python generated/result.py"],
+        },
+        "validation",
+    )
+
+    assert (workspace.path / "generated" / "result.py").is_file()
+
+
 def test_pinned_workspace_is_exact_base_without_live_overlay_or_placeholders(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
