@@ -179,6 +179,74 @@ class TestNormalizePacketFindings:
                 }],
             )
 
+    def test_canonical_finding_reingress_is_idempotent_and_rederives_authority(self):
+        packet = _packet_with_findings()
+        canonical = quality_reviewer.normalize_packet_findings(
+            packet,
+            lens="correctness",
+            findings=[{
+                "severity": "high",
+                "summary": "Unsafe input",
+                "evidence": "src/module.py:12-14",
+                "path": "src/module.py",
+                "line_start": 12,
+                "line_end": 14,
+            }],
+        )[0]
+
+        contradictory = {**canonical, "actionable": False}
+        renormalized = quality_reviewer.normalize_packet_findings(
+            packet, lens="correctness", findings=[contradictory]
+        )[0]
+
+        assert renormalized == canonical
+        assert json.dumps(renormalized, sort_keys=True) == json.dumps(
+            canonical, sort_keys=True
+        )
+        assert renormalized["actionable"] is True
+
+    @pytest.mark.parametrize(
+        "reference, error",
+        [
+            (
+                {"kind": "source", "path": "src/other.py", "line_start": 1, "line_end": 1},
+                "path_out_of_scope",
+            ),
+            (
+                {"kind": "source", "path": "src/module.py", "line_start": 0, "line_end": 1},
+                "line_invalid",
+            ),
+            ({"kind": "check", "check_id": "invented"}, "check_out_of_scope"),
+            ({"kind": "test_target", "path": "tests/invented.py"}, "path_out_of_scope"),
+            ({"kind": "source", "path": "src/module.py"}, "evidence_reference_invalid"),
+        ],
+    )
+    def test_canonical_evidence_reference_is_revalidated(self, reference, error):
+        finding = {
+            "severity": "medium",
+            "summary": "Unsafe input",
+            "evidence": "src/module.py:12",
+            "evidence_reference": reference,
+            "actionable": True,
+        }
+        with pytest.raises(ReviewerEvidenceError, match=error):
+            quality_reviewer.normalize_packet_findings(
+                _packet_with_findings(), lens="correctness", findings=[finding]
+            )
+
+    def test_arbitrary_unknown_key_remains_rejected(self):
+        with pytest.raises(ReviewerEvidenceError, match="unknown_key:authority"):
+            quality_reviewer.normalize_packet_findings(
+                _packet_with_findings(),
+                lens="correctness",
+                findings=[{
+                    "severity": "medium",
+                    "summary": "Unsafe input",
+                    "evidence": "src/module.py:12",
+                    "authority": True,
+                }],
+            )
+
 
 class TestVerifyReviewerReceipt:
     def test_valid_receipt_passes(self) -> None:

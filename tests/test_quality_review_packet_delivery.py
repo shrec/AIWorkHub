@@ -7,6 +7,7 @@ import pytest
 
 from aiworkhub import quality_evidence as qe
 from aiworkhub import quality_review as qr
+from aiworkhub import quality_review_ingest
 from aiworkhub import quality_reviewer, runtime_adapters
 
 CANDIDATE_PATH = "src/aiworkhub/quality_review.py"
@@ -154,6 +155,53 @@ def test_blind_reviewer_can_cite_exact_path_and_line_from_content() -> None:
         "line_end": 42,
     }
     assert normalized[0]["actionable"] is True
+
+
+def test_rm44_canonical_second_ingress_reaches_durable_submit_boundary() -> None:
+    packet = _packet()
+    raw_finding = {
+        "severity": "medium",
+        "disposition": "defect",
+        "summary": "capability set omits a file-read tool",
+        "evidence": f"{CANDIDATE_PATH}:42 delivers the packet as content",
+        "path": CANDIDATE_PATH,
+        "line_start": 42,
+        "line_end": 42,
+    }
+    submitted: list[dict[str, object]] = []
+
+    def normalize(report: dict[str, object]) -> dict[str, object]:
+        return {
+            "lens": "correctness",
+            "findings": quality_reviewer.normalize_packet_findings(
+                packet,
+                lens="correctness",
+                findings=report.get("findings") or [],
+            ),
+        }
+
+    def durable_submit(report: dict[str, object]) -> None:
+        submitted.append(normalize(report))
+
+    provider_report = {"lens": "correctness", "findings": [raw_finding]}
+    event = json.dumps({"type": "result", "result": json.dumps(provider_report)})
+    result = quality_review_ingest.ingest_structured_final(
+        [event],
+        expected_lens="correctness",
+        normalize=normalize,
+        submit=durable_submit,
+    )
+
+    assert result.status == "submitted"
+    assert result.submitted is True
+    assert submitted == [result.report]
+    assert submitted[0]["findings"][0]["actionable"] is True
+    assert submitted[0]["findings"][0]["evidence_reference"] == {
+        "kind": "source",
+        "path": CANDIDATE_PATH,
+        "line_start": 42,
+        "line_end": 42,
+    }
 
 
 def test_capability_set_and_adapter_file_read_classification() -> None:

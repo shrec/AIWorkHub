@@ -63,6 +63,9 @@ QUALITY_REVIEW_FINDING_INPUT_REQUIRED_KEYS = frozenset(
     QualityReviewFinding.__required_keys__
 )
 QUALITY_REVIEW_FINDING_INPUT_KEYS = frozenset(QualityReviewFinding.__annotations__)
+QUALITY_REVIEW_FINDING_INGRESS_KEYS = QUALITY_REVIEW_FINDING_INPUT_KEYS | frozenset(
+    {"actionable", "evidence_reference"}
+)
 QUALITY_REVIEW_FINDING_REQUIRED_KEYS = frozenset(
     {
         "id",
@@ -555,12 +558,15 @@ def normalize_packet_findings(
     for index, finding in enumerate(rows):
         if not isinstance(finding, Mapping):
             raise ReviewerEvidenceError(f"review_finding_{index}_not_object")
-        finding = _canonicalize_structured_evidence(finding, index=index)
-        unknown = set(finding) - QUALITY_REVIEW_FINDING_INPUT_KEYS
+        unknown = set(finding) - QUALITY_REVIEW_FINDING_INGRESS_KEYS
         if unknown:
             raise ReviewerEvidenceError(
                 f"review_finding_{index}_unknown_key:{','.join(sorted(unknown))}"
             )
+        finding, supplied_reference = _canonicalize_ingress_finding(
+            finding, index=index
+        )
+        finding = _canonicalize_structured_evidence(finding, index=index)
         severity_raw = finding.get("severity")
         if severity_raw is None:
             raise ReviewerEvidenceError(f"review_finding_{index}_severity_missing")
@@ -583,10 +589,21 @@ def normalize_packet_findings(
         if not summary or not evidence:
             raise ReviewerEvidenceError(f"review_finding_{index}_text_missing")
 
-        evidence_reference: dict[str, Any] | None = None
+        evidence_reference = _validate_evidence_reference(
+            supplied_reference,
+            index=index,
+            permitted_paths=permitted_paths,
+            permitted_checks=permitted_checks,
+        )
         explicit_path = str(finding.get("path") or "")
         explicit_check = str(finding.get("check_id") or "")
-        if explicit_path:
+        if supplied_reference is not None and (explicit_path or explicit_check):
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_evidence_reference_conflict"
+            )
+        if evidence_reference is not None:
+            pass
+        elif explicit_path:
             if explicit_path not in permitted_paths:
                 raise ReviewerEvidenceError(
                     f"review_finding_{index}_path_out_of_scope"
@@ -724,6 +741,82 @@ def normalize_packet_findings(
             normalized_finding["evidence_reference"] = evidence_reference
         normalized.append(normalized_finding)
     return normalized
+
+
+def _canonicalize_ingress_finding(
+    finding: Mapping[str, Any], *, index: int
+) -> tuple[dict[str, Any], object]:
+    """Strip derived authority and retain a canonical reference for validation."""
+
+    canonical = dict(finding)
+    canonical.pop("actionable", None)
+    supplied_reference = canonical.pop("evidence_reference", None)
+    if supplied_reference is not None and not isinstance(supplied_reference, Mapping):
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_evidence_reference_invalid"
+        )
+    return canonical, supplied_reference
+
+
+def _validate_evidence_reference(
+    raw: object,
+    *,
+    index: int,
+    permitted_paths: set[str],
+    permitted_checks: set[str],
+) -> dict[str, Any] | None:
+    """Revalidate one supervisor-shaped reference against packet authority."""
+
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ReviewerEvidenceError(f"review_finding_{index}_evidence_reference_invalid")
+    kind = raw.get("kind")
+    if kind == "source":
+        allowed = {"kind", "path", "line_start", "line_end"}
+        if set(raw) != allowed:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_evidence_reference_invalid"
+            )
+        path = raw.get("path")
+        line_start = raw.get("line_start")
+        line_end = raw.get("line_end")
+        if path not in permitted_paths:
+            raise ReviewerEvidenceError(f"review_finding_{index}_path_out_of_scope")
+        if (
+            not isinstance(line_start, int)
+            or isinstance(line_start, bool)
+            or line_start < 1
+            or not isinstance(line_end, int)
+            or isinstance(line_end, bool)
+            or line_end < line_start
+        ):
+            raise ReviewerEvidenceError(f"review_finding_{index}_line_invalid")
+        return {
+            "kind": "source",
+            "path": path,
+            "line_start": line_start,
+            "line_end": line_end,
+        }
+    if kind == "check":
+        if set(raw) != {"kind", "check_id"}:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_evidence_reference_invalid"
+            )
+        check_id = raw.get("check_id")
+        if check_id not in permitted_checks:
+            raise ReviewerEvidenceError(f"review_finding_{index}_check_out_of_scope")
+        return {"kind": "check", "check_id": check_id}
+    if kind == "test_target":
+        if set(raw) != {"kind", "path"}:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_evidence_reference_invalid"
+            )
+        path = raw.get("path")
+        if path not in permitted_paths:
+            raise ReviewerEvidenceError(f"review_finding_{index}_path_out_of_scope")
+        return {"kind": "test_target", "path": path}
+    raise ReviewerEvidenceError(f"review_finding_{index}_evidence_reference_invalid")
 
 
 def _canonicalize_structured_evidence(
