@@ -46,12 +46,27 @@ def test_validation_failed_candidate_carries_pin_capable_request_identity(
     assert evidence["changed_path_hashes"] == {
         "candidate.py": hashlib.sha256(b"value = 2\n").hexdigest()
     }
-    assert evidence["workspace"] == workspace.as_metadata()
+    workspace_metadata = dict(evidence["workspace"])
+    nested_candidate_authority = workspace_metadata.pop("python_candidate_authority")
+    assert workspace_metadata == workspace.as_metadata()
+    assert nested_candidate_authority == evidence["python_candidate_authority"]
+    assert evidence["python_candidate_authority"]["sources"] == [
+        {
+            "path": "candidate.py",
+            "state": "added",
+            "bytes_sha256": evidence["changed_path_hashes"]["candidate.py"],
+        },
+    ]
     assert evidence["request_identity"] == {
         "request_id": "failed-request-1",
         "task_id": "FAILED_TASK_1",
         "runner": "deepseek_worker",
         "topic": "implementation",
+        "repo": str(workspace.repo),
+        "claim_epoch": None,
+        "allowed_writes": list(workspace.allowed_writes),
+        "base_oid": workspace.base_oid,
+        "parent_baseline": workspace.parent_baseline,
     }
     assert evidence["claim_state"] == "processing"
 
