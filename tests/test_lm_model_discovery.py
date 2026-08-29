@@ -181,7 +181,13 @@ def test_workforce_catalog_carries_one_row_per_discovered_model(tmp_path: Path) 
     assert {row["model"] for row in glm_rows} == set(discovered)
     assert len(glm_rows) == len(discovered)
     assert all(row.get("discovered_from_editor") for row in glm_rows)
-    assert all(row["available"] for row in glm_rows)
+    # Editor discovery makes each GLM row launch-eligible, but zero terminal
+    # history leaves it unavailable, unobserved, and on an unobserved route.
+    assert all(row["launch_eligible"] for row in glm_rows)
+    assert all(not row["available"] for row in glm_rows)
+    assert all(not row["availability_observed"] for row in glm_rows)
+    assert all(row["route_health"]["state"] == "unobserved" for row in glm_rows)
+    assert all(row["route_health"]["reason"] == "no_recent_terminal_execution" for row in glm_rows)
 
 
 def test_single_vocabulary_declaration_is_shared_across_consumers() -> None:
