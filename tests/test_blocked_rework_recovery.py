@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -20,12 +21,130 @@ _TERMINAL_REVIEW_EVIDENCE = {
 }
 
 
+def test_recover_blocked_terminal_failure_retained_delta_without_required_outputs(
+    tmp_path: Path,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    request_id = "a" * 32
+    workspace = repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+    baseline = repo / "src" / "aiworkhub" / "task_store.py"
+    baseline.parent.mkdir(parents=True)
+    baseline.write_bytes(b"baseline\n")
+    baseline_digest = hashlib.sha256(baseline.read_bytes()).hexdigest()
+    baseline_token = f"file:664:{baseline_digest}"
+    candidate = workspace / "src" / "aiworkhub" / "task_store.py"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"retained candidate\n")
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    authority = {
+        "schema_id": "aiworkhub.python_candidate_authority.v1",
+        "sources": [
+            {
+                "path": "src/aiworkhub/task_store.py",
+                "state": "modified",
+                "bytes_sha256": digest,
+            }
+        ],
+    }
+    workspace_metadata = {
+        "request_id": request_id,
+        "repo": str(repo),
+        "path": str(workspace),
+        "allowed_writes": ["src/aiworkhub/task_store.py"],
+        "parent_baseline": {"src/aiworkhub/task_store.py": baseline_token},
+        "base_oid": "b" * 40,
+        "python_candidate_authority": authority,
+    }
+    evidence = {
+        "required_outputs": [],
+        "changed_paths": ["src/aiworkhub/task_store.py"],
+        "changed_path_hashes": {"src/aiworkhub/task_store.py": digest},
+        "request_identity": {
+            "request_id": request_id,
+            "task_id": "BLOCKED_RETAINED_EMPTY_OUTPUTS",
+            "runner": "codex_worker_test",
+            "topic": "aiworkhub_blocked_rework_recovery",
+            "repo": str(repo),
+            "claim_epoch": 1,
+            "allowed_writes": ["src/aiworkhub/task_store.py"],
+            "parent_baseline": {"src/aiworkhub/task_store.py": baseline_token},
+            "base_oid": "b" * 40,
+        },
+        "workspace": workspace_metadata,
+        "python_candidate_authority": authority,
+    }
+    _insert_processing_task(
+        repo, "BLOCKED_RETAINED_EMPTY_OUTPUTS", request_id=request_id,
+    )
+    assert task_store.mark_terminal_failure(
+        repo,
+        "BLOCKED_RETAINED_EMPTY_OUTPUTS",
+        runner="codex_worker_test",
+        substatus="finalize_failed",
+        evidence=evidence,
+        request_id=request_id,
+        claim_epoch=1,
+    ) == (True, "blocked")
+
+    candidate.write_bytes(b"tampered retained candidate\n")
+    assert task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_RETAINED_EMPTY_OUTPUTS",
+        actor="coordinator",
+        feedback_reason="NeedFix: replay retained candidate",
+        validation_only_replay=True,
+    ) == (False, "retained_terminal_candidate_hash_mismatch")
+    blocked_card = _get_card(repo, "BLOCKED_RETAINED_EMPTY_OUTPUTS")
+    assert blocked_card["status"] == "blocked"
+    assert "rework_predecessor" not in blocked_card
+
+    candidate.write_bytes(b"retained candidate\n")
+    assert task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_RETAINED_EMPTY_OUTPUTS",
+        actor="coordinator",
+        feedback_reason="NeedFix: replay retained candidate",
+        validation_only_replay=True,
+    ) == (True, "recovered")
+    card = _get_card(repo, "BLOCKED_RETAINED_EMPTY_OUTPUTS")
+    assert card["rework_predecessor"]["request_id"] == request_id
+    assert card["rework_predecessor"]["changed_path_hashes"] == {
+        "src/aiworkhub/task_store.py": digest
+    }
+    assert card["validation_only_replay_authorization"]["next_claim_epoch"] == 2
+
+
 def _setup_repo(tmp_path: Path) -> Path:
     """Create and initialize a minimal repo for task_store tests."""
     repo = tmp_path / "repo"
     repo.mkdir()
     task_store.initialize_repository(repo)
     return repo
+
+
+def _insert_processing_task(repo: Path, task_id: str, *, request_id: str) -> None:
+    _readiness, db_path = task_store._require_ready(repo)
+    now = "2026-08-06T00:00:00+00:00"
+    card = {
+        "task_id": task_id,
+        "runner": "codex_worker_test",
+        "topic": "aiworkhub_blocked_rework_recovery",
+        "allowed_writes": ["src/aiworkhub/task_store.py"],
+        "claim_epoch": 1,
+        "launch_request_id": request_id,
+    }
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
+            "objective, card_json, created_at, updated_at, claimed_by, claimed_at, "
+            "started_at) VALUES (?, ?, ?, 'processing', 'in_progress', '', '', ?, ?, ?, ?, ?, ?)",
+            (task_id, "codex_worker_test", "aiworkhub_blocked_rework_recovery", json.dumps(card),
+             now, now, "codex_worker_test", now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _insert_blocked_task(

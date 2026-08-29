@@ -3581,33 +3581,52 @@ def _retained_candidate_identity_evidence(
     changed: list[str],
     claim_state: str,
 ) -> dict[str, Any]:
-    """Return the exact identity needed to preserve a failed candidate.
-
-    Mechanical validation failure is not acceptance, but it also is not
-    authority to discard already-produced bytes. ``core.reject_review`` can
-    pin and materialize a rework predecessor only when terminal evidence has
-    hashes, workspace metadata and exact request identity.
-    """
+    """Return mechanically bound identity for a retained failed candidate."""
 
     if not changed:
         return {}
     changed_path_hashes = _changed_path_hashes(workspace, changed)
-    if not changed_path_hashes:
+    if not changed_path_hashes or set(changed_path_hashes) != set(changed):
         return {}
+    workspace_metadata = workspace.as_metadata()
+    candidate_authority = {
+        "schema_id": "aiworkhub.python_candidate_authority.v1",
+        "sources": [
+            {
+                "path": path,
+                "state": (
+                    "added"
+                    if workspace.parent_baseline.get(path) is None
+                    else "modified"
+                ),
+                "bytes_sha256": changed_path_hashes[path],
+            }
+            for path in sorted(changed_path_hashes)
+        ],
+    }
+    workspace_metadata["python_candidate_authority"] = dict(candidate_authority)
     return {
         "changed_path_hashes": changed_path_hashes,
         "claim_state": claim_state,
-        "workspace": workspace.as_metadata(),
+        "python_candidate_authority": dict(candidate_authority),
+        "workspace": workspace_metadata,
         "request_identity": {
             "request_id": request_id,
             "task_id": str(metadata["task_id"]),
             "runner": str(metadata["runner"]),
             "topic": str(metadata["topic"]),
+            "repo": str(workspace.repo),
+            "claim_epoch": metadata.get("claim_epoch"),
+            "allowed_writes": list(workspace.allowed_writes),
+            "base_oid": workspace.base_oid,
+            "parent_baseline": dict(workspace.parent_baseline),
         },
     }
 
 
-DELTA_RETAINING_TERMINAL_STATES = frozenset({"validation_failed", "timed_out"})
+DELTA_RETAINING_TERMINAL_STATES = frozenset(
+    {"validation_failed", "timed_out", "worker_failed"}
+)
 
 
 def _is_rework_attempt(metadata: Mapping[str, Any]) -> bool:
@@ -11547,6 +11566,14 @@ class ProcessManager:
                             if retained:
                                 failure_evidence.update(retained)
                                 failure_evidence["changed_paths"] = timeout_changed
+                                rework_delta = _terminal_rework_delta_evidence(
+                                    workspace,
+                                    metadata,
+                                    request_id,
+                                    timeout_changed,
+                                )
+                                if rework_delta is not None:
+                                    failure_evidence["rework_delta"] = rework_delta
                         release_result = self._terminal_failure_exact(
                             metadata,
                             terminal_state,
@@ -11881,7 +11908,11 @@ class ProcessManager:
                 cleanup = False
                 if not ownership_lost and not promoted:
                     retained_candidate: dict[str, Any] = {}
-                    if terminal_state == "validation_failed":
+                    if terminal_state in {
+                        "validation_failed",
+                        "worker_failed",
+                        "finalize_failed",
+                    }:
                         try:
                             retained_candidate = _retained_candidate_identity_evidence(
                                 workspace,
@@ -11912,7 +11943,11 @@ class ProcessManager:
                         },
                         **retained_candidate,
                     }
-                    if terminal_state == "validation_failed":
+                    if terminal_state in {
+                        "validation_failed",
+                        "worker_failed",
+                        "finalize_failed",
+                    }:
                         rework_delta = _terminal_rework_delta_evidence(
                             workspace,
                             metadata,
@@ -11950,6 +11985,13 @@ class ProcessManager:
                 else:
                     terminal_state = "finalize_failed"
                     cleanup = False
+                    failed_candidate: dict[str, Any] = {}
+                    try:
+                        failed_candidate = _retained_candidate_identity_evidence(
+                            workspace, metadata, request_id, changed, claim_state
+                        )
+                    except WorkspaceError:
+                        pass
                     release_result = self._terminal_failure_exact(
                         metadata,
                         terminal_state,
@@ -11966,6 +12008,7 @@ class ProcessManager:
                                 "runner": str(metadata["runner"]),
                                 "topic": str(metadata["topic"]),
                             },
+                            **failed_candidate,
                         },
                     )
                     if not release_result.get("ok"):

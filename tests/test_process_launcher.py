@@ -5192,7 +5192,7 @@ def test_crash_retry_packet_carries_unsanitized_diagnostics_and_hashes_delivered
     )
 
 
-def _finalize_retry_manager(tmp_path: Path):
+def _finalize_retry_manager(tmp_path: Path, *, retained_delta: bool = False):
     from aiworkhub import worker_workspace
 
     manager = _manager(
@@ -5210,10 +5210,13 @@ def _finalize_retry_manager(tmp_path: Path):
         repo=manager.repo,
         path=worktree,
         home=home,
-        allowed_writes=(),
-        parent_baseline={},
-        workspace_baseline={},
+        allowed_writes=(("changed.py",) if retained_delta else ()),
+        parent_baseline=({"changed.py": None} if retained_delta else {}),
+        workspace_baseline=({"changed.py": None} if retained_delta else {}),
+        base_oid="b" * 40,
     )
+    if retained_delta:
+        (worktree / "changed.py").write_bytes(b"retained worker edit")
     stdout_path = tmp_path / f"{request_id}.stdout.log"
     stderr_path = tmp_path / f"{request_id}.stderr.log"
     stdout_path.write_text("", encoding="utf-8")
@@ -5235,9 +5238,61 @@ def _finalize_retry_manager(tmp_path: Path):
         "supervisor_status_path": str(status_path),
         "cancel_path": str(tmp_path / f"{request_id}.cancel.json"),
         "workspace": workspace.as_metadata(),
+        "claim_epoch": 2,
     }
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     return manager, request_id, metadata_path, status_path
+
+
+def test_process_manager_worker_failed_retains_scoped_delta_without_outputs(
+    monkeypatch, tmp_path
+):
+    from aiworkhub import worker_workspace
+
+    manager, request_id, metadata_path, status_path = _finalize_retry_manager(
+        tmp_path, retained_delta=True
+    )
+    worker_workspace.write_json_0600(
+        status_path, {"state": "supervisor_error", "error": "provider quota refusal"}
+    )
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "state": "finalizing",
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+        "pid": 999_999_999,
+        "pid_start_ticks": 1,
+    })
+    captured: dict = {}
+    monkeypatch.setattr(process_launcher, "enforce_scope", lambda *_a, **_k: ["changed.py"])
+    monkeypatch.setattr(manager, "_exact_claim_state", lambda _metadata: "processing")
+    monkeypatch.setattr(
+        process_launcher,
+        "_terminal_rework_delta_evidence",
+        lambda *_a, **_k: {"schema_id": "aiworkhub.rework_delta_descriptor.v1", "sealed": True},
+    )
+    monkeypatch.setattr(manager, "_persist_attempt_artifacts", lambda *_a, **_k: None)
+
+    def terminal_failure(_metadata, state, *, evidence, **_kwargs):
+        captured.update(evidence)
+        assert state == "worker_failed"
+        return {"ok": True, "stderr": ""}
+
+    monkeypatch.setattr(manager, "_terminal_failure_exact", terminal_failure)
+    event = manager._finalize_isolated_request(request_id, 1)
+
+    digest = hashlib.sha256(b"retained worker edit").hexdigest()
+    assert event["state"] == "worker_failed"
+    assert captured["changed_paths"] == ["changed.py"]
+    assert captured["changed_path_hashes"] == {"changed.py": digest}
+    assert captured["python_candidate_authority"]["sources"] == [
+        {"path": "changed.py", "state": "added", "bytes_sha256": digest}
+    ]
+    assert captured["rework_delta"]["sealed"] is True
 
 
 def test_release_pending_retry_records_provider_token_spend(monkeypatch, tmp_path):
@@ -5448,6 +5503,56 @@ def test_terminal_rework_delta_evidence_reports_seal_failure_without_descriptor(
     assert evidence["sealed"] is False
     assert evidence["reason"] == "rework_delta_seal_failed:synthetic_failure"
     assert "artifact_path" not in evidence
+
+
+@pytest.mark.parametrize("terminal_state", ["worker_failed", "finalize_failed"])
+def test_terminal_failure_retained_candidate_is_independent_of_required_outputs(
+    tmp_path: Path, terminal_state: str
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repo.mkdir()
+    worktree.mkdir()
+    candidate = worktree / "changed.py"
+    candidate.write_bytes(b"candidate")
+    workspace = SimpleNamespace(
+        path=worktree,
+        repo=repo,
+        allowed_writes=("changed.py",),
+        parent_baseline={"changed.py": None},
+        base_oid="b" * 40,
+        as_metadata=lambda: {
+            "request_id": "d" * 32,
+            "repo": str(repo),
+            "path": str(worktree),
+            "allowed_writes": ["changed.py"],
+            "parent_baseline": {"changed.py": None},
+            "base_oid": "b" * 40,
+        },
+    )
+    evidence = process_launcher._retained_candidate_identity_evidence(
+        workspace,
+        {
+            "task_id": "TASK-RETAINED",
+            "runner": "worker",
+            "topic": "code",
+            "claim_epoch": 2,
+            "required_outputs": [],
+        },
+        "d" * 32,
+        ["changed.py"],
+        terminal_state,
+    )
+    assert evidence["changed_path_hashes"] == {
+        "changed.py": hashlib.sha256(b"candidate").hexdigest()
+    }
+    assert evidence["python_candidate_authority"]["sources"] == [
+        {
+            "path": "changed.py",
+            "state": "added",
+            "bytes_sha256": hashlib.sha256(b"candidate").hexdigest(),
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------

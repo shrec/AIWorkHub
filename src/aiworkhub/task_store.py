@@ -3009,7 +3009,7 @@ def recover_blocked_rework(
     conn = _connect(db_path)
     try:
         row = conn.execute(
-            "SELECT task_id, runner, status, worker_status, claimed_by, "
+            "SELECT task_id, runner, topic, status, worker_status, claimed_by, "
             "claimed_at, card_json FROM tasks WHERE task_id=?",
             (task_id,),
         ).fetchone()
@@ -3287,11 +3287,12 @@ def recover_blocked_rework(
         ):
             return False, "live_claim_detected"
 
+        terminal_event = "terminal_failure" if validation_only_replay else "terminal_review"
         terminal_row = conn.execute(
             "SELECT runner, payload_json, created_at FROM task_events "
-            "WHERE task_id=? AND event='terminal_review' "
+            "WHERE task_id=? AND event=? "
             "ORDER BY rowid DESC LIMIT 1",
-            (task_id,),
+            (task_id, terminal_event),
         ).fetchone()
         if terminal_row is None:
             return False, "no_retained_predecessor_evidence"
@@ -3306,6 +3307,208 @@ def recover_blocked_rework(
         retained_predecessor = card.get("rework_predecessor")
         if not isinstance(retained_predecessor, dict):
             retained_predecessor = {}
+
+        # A terminal failure can leave a perfectly usable candidate without
+        # ever reaching reject_review (notably worker quota refusals and
+        # finalizer failures with required_outputs=[]).  For an explicit
+        # manager validation replay, authenticate the newest terminal event
+        # and synthesize the predecessor from its mechanically collected
+        # evidence.  Ordinary rework continues to use the historical path.
+        if validation_only_replay and not retained_predecessor:
+            recorded_failure = card.get("terminal_failure")
+            if recorded_failure != terminal_review:
+                return False, "retained_terminal_candidate_event_mismatch"
+            evidence = terminal_review.get("evidence")
+            for pid_key in ("pid", "provider_pid", "supervisor_pid", "stall_supervisor_pid"):
+                raw_pid = evidence.get(pid_key) if isinstance(evidence, dict) else None
+                if type(raw_pid) is int and raw_pid > 0:
+                    try:
+                        os.kill(raw_pid, 0)
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        return False, "retained_terminal_candidate_process_live"
+                    else:
+                        return False, "retained_terminal_candidate_process_live"
+            identity = evidence.get("request_identity") if isinstance(evidence, dict) else None
+            workspace = evidence.get("workspace") if isinstance(evidence, dict) else None
+            changed_paths = evidence.get("changed_paths") if isinstance(evidence, dict) else None
+            changed_hashes = evidence.get("changed_path_hashes") if isinstance(evidence, dict) else None
+            authority = evidence.get("python_candidate_authority") if isinstance(evidence, dict) else None
+            workspace_authority = workspace.get("python_candidate_authority") if isinstance(workspace, dict) else None
+            authority_hashes: dict[str, str] = {}
+            authority_sources = (
+                authority.get("sources") if isinstance(authority, dict) else None
+            )
+            if isinstance(authority_sources, dict):
+                if all(
+                    isinstance(path, str) and isinstance(digest, str)
+                    for path, digest in authority_sources.items()
+                ):
+                    authority_hashes = dict(authority_sources)
+            elif isinstance(authority_sources, list):
+                for source in authority_sources:
+                    if not isinstance(source, dict):
+                        authority_hashes = {}
+                        break
+                    path = source.get("path")
+                    state = source.get("state")
+                    digest = source.get("bytes_sha256")
+                    if (
+                        not isinstance(path, str)
+                        or not path
+                        or state not in {"added", "modified"}
+                        or not isinstance(digest, str)
+                        or path in authority_hashes
+                    ):
+                        authority_hashes = {}
+                        break
+                    authority_hashes[path] = digest
+            request_id = (
+                str(identity.get("request_id") or "").strip()
+                if isinstance(identity, dict)
+                else ""
+            )
+            allowed_writes = card.get("allowed_writes")
+            if (
+                not isinstance(evidence, dict)
+                or not isinstance(identity, dict)
+                or not isinstance(workspace, dict)
+                or not isinstance(changed_paths, list)
+                or not changed_paths
+                or not isinstance(changed_hashes, dict)
+                or set(changed_hashes) != set(changed_paths)
+                or not isinstance(allowed_writes, list)
+                or not allowed_writes
+                or not isinstance(authority, dict)
+                or authority != workspace_authority
+                or authority.get("schema_id") != "aiworkhub.python_candidate_authority.v1"
+                or authority_hashes != changed_hashes
+                or evidence.get("request_id") not in {None, "", request_id}
+                or identity.get("task_id") != task_id
+                or identity.get("runner") != card.get("runner")
+                or str(terminal_row["runner"] or "") != card.get("runner")
+                or identity.get("topic") != card.get("topic")
+                or identity.get("repo") != workspace.get("repo")
+                or identity.get("claim_epoch") != terminal_review.get("claim_epoch")
+                or identity.get("allowed_writes") != workspace.get("allowed_writes")
+                or identity.get("base_oid") != workspace.get("base_oid")
+                or identity.get("parent_baseline") != workspace.get("parent_baseline")
+                or workspace.get("request_id") != request_id
+                or set(workspace.get("allowed_writes") or ()) != set(allowed_writes)
+                or not request_id
+            ):
+                return False, "retained_terminal_candidate_identity_invalid"
+            if any(
+                not isinstance(path, str)
+                or not path
+                or path.startswith("/")
+                or "\\" in path
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+                or path not in allowed_writes
+                for path in changed_paths
+            ):
+                return False, "retained_terminal_candidate_scope_invalid"
+            parent_baseline = workspace.get("parent_baseline")
+            base_oid = workspace.get("base_oid")
+            if (
+                not isinstance(parent_baseline, dict)
+                or not isinstance(base_oid, str)
+                or not base_oid
+                or set(changed_paths) - set(parent_baseline)
+            ):
+                return False, "retained_terminal_candidate_baseline_invalid"
+            try:
+                authority_repo = Path(str(workspace.get("repo") or "")).resolve(strict=True)
+                expected_repo = Path(root).resolve(strict=True)
+                workspace_path = Path(str(workspace.get("path") or ""))
+                resolved_workspace = workspace_path.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                return False, "retained_terminal_candidate_workspace_invalid"
+            runtime_parts = (".aiworkhub", "runtime", "worktrees", request_id, "worktree")
+            if (
+                authority_repo != expected_repo
+                or not workspace_path.is_absolute()
+                or workspace_path.is_symlink()
+                or not resolved_workspace.is_dir()
+                or tuple(resolved_workspace.parts[-5:]) != runtime_parts
+                or resolved_workspace
+                != expected_repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+                or any(
+                    (expected_repo.joinpath(*runtime_parts[:index])).is_symlink()
+                    for index in range(1, len(runtime_parts) + 1)
+                )
+            ):
+                return False, "retained_terminal_candidate_workspace_invalid"
+            for path in changed_paths:
+                candidate = resolved_workspace.joinpath(*path.split("/"))
+                baseline_candidate = expected_repo.joinpath(*path.split("/"))
+                expected_hash = changed_hashes.get(path)
+                try:
+                    candidate_stat = candidate.lstat()
+                    resolved_candidate = candidate.resolve(strict=True)
+                except OSError:
+                    return False, "retained_terminal_candidate_bytes_invalid"
+                if (
+                    candidate.is_symlink()
+                    or expected_hash is None
+                    or not candidate.is_file()
+                    or candidate_stat.st_nlink != 1
+                    or not resolved_candidate.is_relative_to(resolved_workspace)
+                    or any(
+                        resolved_workspace.joinpath(*path.split("/")[:index]).is_symlink()
+                        for index in range(1, len(path.split("/")))
+                    )
+                ):
+                    return False, "retained_terminal_candidate_bytes_invalid"
+                if (
+                    not isinstance(expected_hash, str)
+                    or len(expected_hash) != 64
+                    or hashlib.sha256(candidate.read_bytes()).hexdigest() != expected_hash
+                ):
+                    return False, "retained_terminal_candidate_hash_mismatch"
+                try:
+                    baseline_hash = (
+                        hashlib.sha256(baseline_candidate.read_bytes()).hexdigest()
+                        if baseline_candidate.is_file() and not baseline_candidate.is_symlink()
+                        else None
+                    )
+                except OSError:
+                    return False, "retained_terminal_candidate_baseline_invalid"
+                recorded_baseline = parent_baseline.get(path)
+                if recorded_baseline is None:
+                    recorded_baseline_hash = None
+                elif isinstance(recorded_baseline, str):
+                    baseline_parts = recorded_baseline.split(":", 2)
+                    if (
+                        len(baseline_parts) != 3
+                        or baseline_parts[0] != "file"
+                        or not baseline_parts[1].isdigit()
+                        or len(baseline_parts[2]) != 64
+                    ):
+                        return False, "retained_terminal_candidate_baseline_invalid"
+                    recorded_baseline_hash = baseline_parts[2]
+                else:
+                    return False, "retained_terminal_candidate_baseline_invalid"
+                if recorded_baseline_hash != baseline_hash:
+                    return False, "retained_terminal_candidate_baseline_mismatch"
+            terminal_claim_epoch = terminal_review.get("claim_epoch")
+            if terminal_claim_epoch is None:
+                terminal_claim_epoch = card.get("claim_epoch")
+            if type(terminal_claim_epoch) is not int or terminal_claim_epoch < 1:
+                return False, "retained_terminal_candidate_claim_epoch_invalid"
+            retained_predecessor = {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": request_id,
+                "task_id": task_id,
+                "repo": str(expected_repo),
+                "claim_epoch": terminal_claim_epoch,
+                "allowed_writes": list(allowed_writes),
+                "changed_paths": list(changed_paths),
+                "changed_path_hashes": dict(changed_hashes),
+                "workspace": dict(workspace),
+            }
+            card["rework_predecessor"] = retained_predecessor
 
         predecessor_request_id = str(
             retained_predecessor.get("request_id") or ""
