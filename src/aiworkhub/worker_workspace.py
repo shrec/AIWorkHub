@@ -5472,6 +5472,13 @@ def _normalize_trusted_validation_executable_argv_with_roots(
         if repo_relative is None:
             return list(argv), ()
         return [str(repo_relative.path), *argv[1:]], (repo_relative.root,)
+    if (
+        len(argv) >= 3
+        and _BARE_PYTHON_INTERPRETER_RE.match(head)
+        and argv[1:3] == ["-m", "mypy"]
+    ):
+        executable = _resolve_trusted_validation_executable("mypy", repo)
+        return [str(executable.path), *argv[3:]], (executable.root,)
     # NF-2026-00448: a bare ``python``/``python3``/``python3.NN`` head is
     # resolved directly to the trusted coordinator interpreter instead of
     # trusting execvpe's PATH search -- the credential-free validation PATH

@@ -3417,6 +3417,65 @@ def test_bare_python_heads_resolve_to_trusted_coordinator_interpreter() -> None:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
+def test_bare_python_module_mypy_uses_trusted_executable_and_preserves_args(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    mypy = bin_dir / "mypy"
+    mypy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(mypy, 0o755)
+
+    declared = ["python3", "-m", "mypy", "--strict", "src/example.py"]
+    executed, roots = (
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            declared, tmp_path
+        )
+    )
+
+    assert executed == [str(mypy.resolve()), "--strict", "src/example.py"]
+    assert roots == ((tmp_path / ".venv").resolve(),)
+    assert executed[1:] == declared[3:]
+
+
+def test_python_module_mypy_rewrite_is_exact_and_preserves_existing_rules(
+    tmp_path: Path,
+) -> None:
+    unchanged = (
+        ["/usr/bin/python3", "-m", "mypy", "src"],
+        [".venv/bin/python3", "-m", "mypy", "src"],
+        ["python2", "-m", "mypy", "src"],
+    )
+    for declared in unchanged:
+        assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            list(declared), tmp_path
+        ) == (list(declared), ())
+
+    for tail in (("-m", "pytest", "src"), ("-m", "mypy.api", "src"), ("-mypy", "src")):
+        declared = ["python3", *tail]
+        assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            declared, tmp_path
+        ) == ([sys.executable, *declared[1:]], ())
+
+
+def test_bare_python_module_mypy_requires_trusted_executable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        worker_workspace,
+        "_trusted_validation_runtime_roots",
+        lambda _repo: (tmp_path / "missing-venv",),
+    )
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_executable_unavailable:mypy",
+    ):
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            ["python3", "-m", "mypy", "src"], tmp_path
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
 @pytest.mark.skipif(
     worker_workspace.landlock_abi_version() < 1,
     reason="Landlock is not supported by this kernel",
