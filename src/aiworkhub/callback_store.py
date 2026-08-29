@@ -19,6 +19,7 @@ upgrade.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -49,11 +50,77 @@ CALLBACK_BATCH_STATES: tuple[str, ...] = CALLBACK_OUTBOX_STATES
 
 
 class CallbackStoreError(RuntimeError):
-    """Base class for package-local callback store failures. Fail closed."""
+    """Bounded, non-sensitive callback store failure details. Fail closed."""
+
+    __slots__ = ("_category", "_reason")
+
+    _category: str
+    _reason: str
+
+    def __init__(self, category: str, reason: str) -> None:
+        safe_category = _sanitize_error_category(category)
+        safe_reason = _sanitize_error_reason(reason)
+        super().__init__(f"{safe_category}: {safe_reason}")
+        self._category = safe_category
+        self._reason = safe_reason
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in {"_category", "_reason"} and hasattr(self, name):
+            raise AttributeError(f"{name[1:]} is immutable")
+        super().__setattr__(name, value)
+
+    @property
+    def category(self) -> str:
+        """The bounded failure class; immutable after construction."""
+        return self._category
+
+    @property
+    def reason(self) -> str:
+        """The bounded public reason; immutable after construction."""
+        return self._reason
 
 
 class CallbackStoreNotReadyError(CallbackStoreError):
     """The canonical repository-local task queue is not initialized/ready."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(_NOT_READY_CATEGORY, reason)
+
+
+_SAFE_ERROR_TOKEN = re.compile(r"[a-z][a-z0-9_]{0,79}")
+_ERROR_CATEGORY_FALLBACK = "callback_store_error"
+_READINESS_REASON_FALLBACK = "storage_readiness_unavailable"
+_WAL_CATEGORY = "callback_store_wal_setup"
+_WAL_LOCK_EXHAUSTED_REASON = "wal_lock_retry_exhausted"
+_WAL_OPERATION_FAILED_REASON = "wal_operation_failed"
+_NOT_READY_CATEGORY = "callback_store_not_ready"
+_WAL_RETRY_COUNT = 5
+
+
+def _sanitize_error_category(value: object) -> str:
+    candidate = str(value).strip().lower()
+    if _SAFE_ERROR_TOKEN.fullmatch(candidate):
+        return candidate
+    return _ERROR_CATEGORY_FALLBACK
+
+
+def _sanitize_error_reason(value: object) -> str:
+    """Keep only canonical identifiers; never publish SQLite/path/payload text."""
+    candidate = str(value).strip().lower()
+    if _SAFE_ERROR_TOKEN.fullmatch(candidate):
+        return candidate
+    return _READINESS_REASON_FALLBACK
+
+
+def _close_db_quietly(conn: sqlite3.Connection | None) -> None:
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            # Cleanup must never replace the bounded primary error selected by
+            # open_db. In particular, mocked/drained sqlite connections can
+            # fail during close with sensitive driver details.
+            pass
 
 
 def utc_now() -> str:
@@ -73,20 +140,28 @@ def resolve_db_path(repo: str | Path) -> Path:
 
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    for attempt in range(5):
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            break
-        except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or attempt == 4:
-                conn.close()
-                raise
-            time.sleep(0.05 * (attempt + 1))
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(str(path), timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        for attempt in range(_WAL_RETRY_COUNT):
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    _close_db_quietly(conn)
+                    raise CallbackStoreError(_WAL_CATEGORY, _WAL_OPERATION_FAILED_REASON) from None
+                if attempt == _WAL_RETRY_COUNT - 1:
+                    _close_db_quietly(conn)
+                    raise CallbackStoreError(_WAL_CATEGORY, _WAL_LOCK_EXHAUSTED_REASON) from None
+                time.sleep(0.05 * (attempt + 1))
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+    except sqlite3.OperationalError:
+        _close_db_quietly(conn)
+        raise CallbackStoreError(_WAL_CATEGORY, _WAL_OPERATION_FAILED_REASON) from None
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:

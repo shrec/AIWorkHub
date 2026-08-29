@@ -11,13 +11,32 @@ enqueue->claim->ack cycle behaves as documented.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from aiworkhub import callback_store  # noqa: E402
+
+
+class _WalSetupConnection:
+    def __init__(self, failures: list[BaseException]) -> None:
+        self.failures = failures
+        self.executed: list[str] = []
+        self.close_count = 0
+        self.row_factory = None
+
+    def execute(self, statement: str):
+        self.executed.append(statement)
+        if statement == "PRAGMA journal_mode=WAL" and self.failures:
+            raise self.failures.pop(0)
+        return None
+
+    def close(self) -> None:
+        self.close_count += 1
 
 
 def _make_db(tmp_path):
@@ -61,6 +80,127 @@ def _seed_review_task(conn, task_id: str, session_id: str, *, provider: str = "c
 
 def _task_id() -> str:
     return f"TASK_{uuid.uuid4().hex[:12]}"
+
+
+def test_callback_store_error_has_immutable_typed_public_state():
+    error = callback_store.CallbackStoreError("callback_store_wal_setup", "wal_operation_failed")
+
+    assert error.category == "callback_store_wal_setup"
+    assert error.reason == "wal_operation_failed"
+    try:
+        error.category = "changed"
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("category must be read-only")
+    try:
+        error._reason = "changed"
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("backing reason must be immutable")
+
+
+def test_open_db_wal_lock_exhaustion_retries_then_closes_without_leaking(tmp_path, monkeypatch):
+    secret = "/private/queue.sqlite SELECT token FROM credentials payload=abc"
+    conn = _WalSetupConnection([sqlite3.OperationalError(f"database is locked: {secret}")] * 5)
+    sleeps: list[float] = []
+    monkeypatch.setattr(callback_store.sqlite3, "connect", lambda *_args, **_kwargs: conn)
+    monkeypatch.setattr(callback_store.time, "sleep", sleeps.append)
+
+    try:
+        callback_store.open_db(tmp_path / "task_queue.sqlite")
+    except callback_store.CallbackStoreError as error:
+        assert error.category == "callback_store_wal_setup"
+        assert error.reason == "wal_lock_retry_exhausted"
+        assert secret not in str(error)
+        assert secret not in repr(error)
+    else:
+        raise AssertionError("expected bounded WAL lock error")
+
+    assert conn.executed.count("PRAGMA journal_mode=WAL") == 5
+    assert sleeps == [0.05, 0.1, 0.15000000000000002, 0.2]
+    assert conn.close_count == 1
+
+
+def test_open_db_non_lock_wal_failure_closes_immediately_without_leaking(tmp_path, monkeypatch):
+    secret = "/private/queue.sqlite SELECT token FROM credentials payload=abc"
+    conn = _WalSetupConnection([sqlite3.OperationalError(f"disk I/O error: {secret}")])
+    sleeps: list[float] = []
+    monkeypatch.setattr(callback_store.sqlite3, "connect", lambda *_args, **_kwargs: conn)
+    monkeypatch.setattr(callback_store.time, "sleep", sleeps.append)
+
+    try:
+        callback_store.open_db(tmp_path / "task_queue.sqlite")
+    except callback_store.CallbackStoreError as error:
+        assert error.category == "callback_store_wal_setup"
+        assert error.reason == "wal_operation_failed"
+        assert secret not in str(error)
+        assert secret not in repr(error)
+    else:
+        raise AssertionError("expected bounded WAL operation error")
+
+    assert conn.executed.count("PRAGMA journal_mode=WAL") == 1
+    assert sleeps == []
+    assert conn.close_count == 1
+
+
+def test_open_db_preserves_primary_error_when_close_fails(tmp_path, monkeypatch):
+    secret = "/private/queue.sqlite SELECT token FROM credentials payload=abc"
+    conn = _WalSetupConnection([sqlite3.OperationalError(f"disk I/O error: {secret}")])
+    sleeps: list[float] = []
+
+    def close_with_sensitive_failure() -> None:
+        conn.close_count += 1
+        raise sqlite3.OperationalError(f"close failed: {secret}")
+
+    conn.close = close_with_sensitive_failure
+    monkeypatch.setattr(callback_store.sqlite3, "connect", lambda *_args, **_kwargs: conn)
+    monkeypatch.setattr(callback_store.time, "sleep", sleeps.append)
+
+    try:
+        callback_store.open_db(tmp_path / "task_queue.sqlite")
+    except callback_store.CallbackStoreError as error:
+        assert error.category == "callback_store_wal_setup"
+        assert error.reason == "wal_operation_failed"
+        assert secret not in str(error)
+        assert secret not in repr(error)
+    else:
+        raise AssertionError("expected bounded WAL operation error")
+
+    assert conn.executed.count("PRAGMA journal_mode=WAL") == 1
+    assert sleeps == []
+    assert conn.close_count == 1
+
+
+def test_not_ready_keeps_canonical_reason_but_sanitizes_payload(monkeypatch):
+    monkeypatch.setattr(
+        callback_store.task_store,
+        "storage_readiness",
+        lambda _repo: SimpleNamespace(ready=False, reason="storage_not_initialized"),
+    )
+    try:
+        callback_store.resolve_db_path("/private/repo")
+    except callback_store.CallbackStoreNotReadyError as error:
+        assert error.category == "callback_store_not_ready"
+        assert error.reason == "storage_not_initialized"
+    else:
+        raise AssertionError("expected not-ready error")
+
+    secret = "/private/repo payload=abc"
+    monkeypatch.setattr(
+        callback_store.task_store,
+        "storage_readiness",
+        lambda _repo: SimpleNamespace(ready=False, reason=secret),
+    )
+    try:
+        callback_store.resolve_db_path("/private/repo")
+    except callback_store.CallbackStoreNotReadyError as error:
+        assert error.reason == "storage_readiness_unavailable"
+        assert secret not in str(error)
+        assert secret not in repr(error)
+    else:
+        raise AssertionError("expected sanitized not-ready error")
 
 
 # ---------------------------------------------------------------------------
