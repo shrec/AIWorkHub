@@ -1749,7 +1749,7 @@ def test_source_graph_extraction_receipt_reports_capacity(monkeypatch):
         "available_cpus": 8,
         "selected_workers": 7,
         "reserve": 1,
-        "ceiling": sg.MAX_SOURCE_GRAPH_EXTRACT_WORKERS,
+        "ceiling": 7,
         "nested": False,
         "reason": "capacity_based",
     }
