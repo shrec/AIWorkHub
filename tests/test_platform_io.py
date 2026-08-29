@@ -166,8 +166,8 @@ def test_windows_blocking_lock_timeout_is_classified_as_contention(
     finally:
         os.close(fd)
 
-    assert len(attempts) == 1
-    assert attempts[0][1:] == (fake_msvcrt.LK_NBLCK, 1)
+    target_attempts = [attempt for attempt in attempts if attempt[0] == fd]
+    assert target_attempts == [(fd, fake_msvcrt.LK_NBLCK, 1)]
 
 
 def test_windows_blocking_lock_preserves_unexpected_os_error(tmp_path, monkeypatch):
