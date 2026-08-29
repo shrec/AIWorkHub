@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.66] - 2026-08-29
+
+### Added
+
+- Bootstrap now publishes a responsibility matrix and construction templates,
+  so manager and worker roles begin from explicit, bounded authority.
+- Scoped audit coverage records the relevant tool and change boundaries, while
+  Source Graph traversal fails closed when it cannot establish that authority.
+- Pending context intents retain Session, Memory and KB work that cannot yet be
+  resolved, instead of silently discarding it.
+
+### Fixed
+
+- Reviewer preparation enforces its bounds and preserves replay-context
+  evidence; recovery reconciles CAS state, raw-terminal outcomes, launch-ledger
+  records and retained-terminal work without fabricating a result.
+- VS Code repairs malformed repository configuration and revives a retained
+  dashboard after a recoverable runtime interruption.
+- The runtime uses the trusted interpreter, exposes discovered model settings,
+  and binds CaaS corrections to their verified evidence.
+
 ## [0.10.65] - 2026-08-28
 
 ### Added

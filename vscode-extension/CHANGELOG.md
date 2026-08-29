@@ -1,5 +1,24 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.66 — 2026-08-29
+
+### Added
+
+- Bootstrap responsibility matrices and construction templates make the
+  manager/worker handoff explicit, while pending context intents preserve
+  unresolved Session, Memory and KB work for a later bounded resolution.
+- Scoped audit coverage and fail-closed Source Graph traversal keep discovery
+  within verified authority instead of continuing from an untrusted path.
+
+### Fixed
+
+- Reviewer preparation now observes strict bounds and carries replay-context
+  evidence; CAS, raw-terminal, launch-ledger and retained-terminal recovery
+  reconcile interrupted work deterministically.
+- Repository configuration repair revives the retained VS Code dashboard, and
+  model settings reflect discovered capabilities through the trusted
+  interpreter. CaaS corrections remain bound to verified evidence.
+
 ## 0.10.65 — 2026-08-28
 
 ### Added

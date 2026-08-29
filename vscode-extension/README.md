@@ -12,6 +12,20 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.66
+
+- Bootstrap now gives managers and workers a clear responsibility matrix and
+  construction templates; unresolved Session, Memory and KB context is kept as
+  a pending intent for bounded follow-up.
+- Source Graph traversal fails closed outside verified authority, and scoped
+  audit coverage makes the inspected boundary explicit.
+- Reviewer preparation has enforceable bounds and replay-context evidence;
+  CAS, raw-terminal, launch-ledger and retained-terminal recovery reconcile
+  interrupted execution without inventing a terminal result.
+- The extension repairs recoverable repository configuration and revives its
+  retained dashboard. It uses the trusted interpreter, presents discovered
+  model settings, and keeps CaaS corrections bound to their verification.
+
 ## What's new in 0.10.65
 
 - Reviewer evidence now keeps prose out of path authority and changed-path scope,
