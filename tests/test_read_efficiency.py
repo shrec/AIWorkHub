@@ -5,9 +5,11 @@ import pytest
 try:
     from aiworkhub.read_efficiency import analyze_read_efficiency
     from aiworkhub import process_launcher
+    from aiworkhub import process_launcher_read_efficiency
 except ImportError:
     from src.aiworkhub.read_efficiency import analyze_read_efficiency
     from src.aiworkhub import process_launcher
+    from src.aiworkhub import process_launcher_read_efficiency
 
 
 def read(path='a.py', sha='h', offset=0, limit=10, timestamp=None, **extra):
@@ -436,3 +438,53 @@ def test_provider_output_without_read_evidence_is_not_false_zero(tmp_path):
     assert report['provider_records_scanned'] == 1
     assert report['recognized_read_events'] == 0
     assert report['total_reads'] == 0
+
+
+@pytest.mark.parametrize(
+    ('command', 'output'),
+    [
+        ("/usr/bin/bash -lc \"sed -n '2,4p' src/a.py\"", 'two\nthree\nfour\n'),
+        ('pwsh -Command "Get-Content -LiteralPath src/a.py -TotalCount 3"', 'a\nb\nc\n'),
+        ("sed -n 1,20p src/a.py | head", 'ambiguous\n'),
+        ('cat src/a.py && cat src/b.py', 'ambiguous\n'),
+    ],
+)
+def test_extracted_strict_parser_preserves_launcher_private_import(
+    command,
+    output,
+):
+    assert process_launcher._strict_read_command_event is (
+        process_launcher_read_efficiency._strict_read_command_event
+    )
+    assert process_launcher._strict_read_command_event(
+        command, output, timestamp=7.0,
+    ) == process_launcher_read_efficiency._strict_read_command_event(
+        command, output, timestamp=7.0,
+    )
+
+
+@pytest.mark.parametrize('accepted', [True, False])
+def test_extracted_provider_summary_matches_launcher_alias(tmp_path, accepted):
+    output = tmp_path / 'provider.jsonl'
+    record = (
+        {
+            'type': 'item.completed',
+            'item': {
+                'type': 'command_execution',
+                'command': "head -n 2 src/a.py",
+                'aggregated_output': 'one\ntwo\n',
+            },
+        }
+        if accepted
+        else {'type': 'result', 'result': 'done'}
+    )
+    output.write_text(json.dumps(record) + '\n', encoding='utf-8')
+
+    assert process_launcher._provider_read_efficiency_from_output is (
+        process_launcher_read_efficiency._provider_read_efficiency_from_output
+    )
+    launcher_report = process_launcher._provider_read_efficiency_from_output(output)
+    helper_report = (
+        process_launcher_read_efficiency._provider_read_efficiency_from_output(output)
+    )
+    assert launcher_report == helper_report
