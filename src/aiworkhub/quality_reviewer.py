@@ -471,9 +471,10 @@ def build_review_prompt(
         f"{scope_instruction}"
         "Report only concrete items supported by file/line or check evidence. "
         f"{QUALITY_REVIEW_FINDING_SCHEMA_DOC}\n"
-        f"Before finishing, call {submit_tool_name} exactly once with "
-        f'packet_sha256="{packet_digest}", lens="{lens}", and your findings array.\n'
-        "The tool call is the authoritative submission; prose is not evidence.\n"
+        "Finish with exactly one JSON object and no surrounding prose, using "
+        f'{{"lens":"{lens}","findings":[...]}}. The supervisor derives all '
+        "task, request, claim, target, reviewer, and packet identity and durably "
+        "submits the report. Do not invoke lifecycle or submission tools.\n"
         f"{packet_evidence}"
     )
 

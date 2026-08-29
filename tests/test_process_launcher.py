@@ -8404,3 +8404,63 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
     assert prepared["packet"]["packet_sha256"] == (
         process_launcher.quality_reviewer._canonical_digest(packet_body)
     )
+
+
+def test_verified_quality_review_receipt_ingests_jsonl_once_across_retry(
+    tmp_path: Path,
+) -> None:
+    from test_quality_reviewer_contract import _packet, _worker_context
+
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+    stdout_path = tmp_path / f"{ctx.request_id}.stdout.log"
+    stdout_path.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": json.dumps(
+                        {"lens": "correctness", "findings": []},
+                        separators=(",", ":"),
+                    ),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    metadata = {
+        "task_id": ctx.task_id,
+        "runner": ctx.runner,
+        "topic": ctx.topic,
+        "adapter_id": "claude_cli",
+        "stdout_path": str(stdout_path),
+        "worker_mcp": {
+            "audit_ledger_path": str(ctx.audit_ledger_path),
+            "audit_hmac_key_path": str(ctx.audit_hmac_key_path),
+        },
+        "quality_review": {
+            "packet_path": str(packet_path),
+            "lens": "correctness",
+        },
+    }
+    workspace = SimpleNamespace(repo=tmp_path, home=tmp_path)
+
+    first = process_launcher._verified_quality_review_receipt(
+        metadata, workspace, ctx.request_id
+    )
+    retried = process_launcher._verified_quality_review_receipt(
+        metadata, workspace, ctx.request_id
+    )
+
+    assert first["submission_id"] == retried["submission_id"]
+    assert first["physical_submission_count"] == 1
+    assert first["logical_submission_count"] == 1
+    ledger_lines = ctx.audit_ledger_path.read_text(encoding="utf-8").splitlines()
+    assert len(ledger_lines) == 1
+    authenticated_entry = json.loads(ledger_lines[0])
+    assert authenticated_entry["provenance"] == "live"
+    assert authenticated_entry["authority_source"] == "supervisor"

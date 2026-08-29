@@ -53,6 +53,7 @@ from .platform_io import (
     unlock_fd,
 )
 from . import quality_evidence
+from . import quality_review_ingest
 from . import quality_review_scope
 from . import process_event_ledger
 from .process_launcher_read_efficiency import (
@@ -4209,7 +4210,7 @@ def _verified_quality_review_receipt(
     workspace: WorkerWorkspace,
     request_id: str,
 ) -> dict[str, Any]:
-    """Resolve exactly one authenticated submission for a reviewer process."""
+    """Resolve exactly one authenticated logical submission for a reviewer process."""
 
     binding = metadata.get("quality_review")
     if not isinstance(binding, dict):
@@ -4230,22 +4231,18 @@ def _verified_quality_review_receipt(
         packet = json.loads(packet_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise WorkspaceError("quality_review_packet_unreadable") from exc
-    worker_meta = metadata.get("worker_mcp") or {}
-    verification = worker_ai_tools_mcp.verify_audit_ledger(
-        Path(str(worker_meta.get("audit_ledger_path") or "")),
-        Path(str(worker_meta.get("audit_hmac_key_path") or "")),
-        task_id=str(metadata.get("task_id") or ""),
-        runner=str(metadata.get("runner") or ""),
-        topic=str(metadata.get("topic") or ""),
-        request_id=request_id,
-    )
-    payloads = verification.get("verified_payloads") or []
-    if not payloads:
-        raise WorkspaceError("quality_review_submission_count:0")
-    # An immutable read-only receipt requires exactly one physical submission.
-    # Identical retries are deduplicated upstream; any additional authenticated
-    # payload here is a duplicate and must fail closed rather than collapse
-    # silently into a single logical receipt.
+    expected_lens = str(binding.get("lens") or "")
+    try:
+        verification, payloads = quality_review_ingest.supervisor_ingest(
+            metadata=metadata,
+            workspace=workspace,
+            packet=packet,
+            packet_path=packet_path,
+            request_id=request_id,
+            expected_lens=expected_lens,
+        )
+    except quality_review_ingest.ReviewProtocolError as exc:
+        raise WorkspaceError(str(exc)) from exc
     if len(payloads) != 1:
         raise WorkspaceError(f"quality_review_submission_count:{len(payloads)}")
     receipt_payload = payloads[0]
@@ -4253,11 +4250,6 @@ def _verified_quality_review_receipt(
     target = packet.get("target") if isinstance(packet, dict) else None
     if not isinstance(target, dict):
         raise WorkspaceError("quality_review_packet_target_missing")
-    # Independence is a recorded ladder, not a vendor check.  Resolve the rung
-    # first: a same-provider (or single-provider) review is no longer discarded
-    # here after it has already been launched, run and submitted -- it degrades
-    # to same_model_fresh_context and completes.  Refuse only when no rung in the
-    # ladder applies at all, naming both providers so the refusal is legible.
     worker_provider_name = str(target.get("worker_provider") or "")
     rung_record = quality_review.resolve_independence_rung(
         worker_provider=worker_provider_name,
@@ -4294,9 +4286,7 @@ def _verified_quality_review_receipt(
         )
     except quality_reviewer.ReviewerEvidenceError as exc:
         raise WorkspaceError(f"quality_review_receipt_invalid:{exc}") from exc
-    if str((verified.get("report") or {}).get("lens") or "") != str(
-        binding.get("lens") or ""
-    ):
+    if str((verified.get("report") or {}).get("lens") or "") != expected_lens:
         raise WorkspaceError("quality_review_lens_mismatch")
     verified["submission_id"] = hashlib.sha256(
         json.dumps(

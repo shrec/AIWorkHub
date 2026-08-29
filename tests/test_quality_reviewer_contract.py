@@ -712,6 +712,10 @@ def test_worker_submission_is_packet_bound_and_hmac_audited(tmp_path: Path) -> N
     assert audit["ok"] is True
     assert audit["call_count_by_tool"] == {"quality_review_submit": 1}
     assert len(audit["verified_payloads"]) == 1
+    authenticated_entry = json.loads(
+        ctx.audit_ledger_path.read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert authenticated_entry["authority_source"] == "runtime"
     payload = audit["verified_payloads"][0]
     assert payload["target"] == {
         "request_id": "target-request-1",
@@ -1183,7 +1187,7 @@ def test_missing_quality_review_submission_cannot_finalize_review_ready(
 
     with pytest.raises(
         worker_workspace.WorkspaceError,
-        match="quality_review_submission_count:0",
+        match="review_protocol:provider_events_unavailable",
     ):
         process_launcher._verified_quality_review_receipt(
             {

@@ -61,8 +61,9 @@ class TestBuildReviewPrompt:
             packet, lens="correctness",
             submit_tool_name="aiworkhub_worker_quality_review_submit",
         )
-        assert "aiworkhub_worker_quality_review_submit" in prompt
-        assert "packet_sha256=" in prompt
+        assert "aiworkhub_worker_quality_review_submit" not in prompt
+        assert "exactly one JSON object" in prompt
+        assert '"lens":"correctness","findings":[...]' in prompt
 
     def test_file_transport_references_file(self, tmp_path: Path):
         large_body = {

@@ -321,6 +321,7 @@ class WorkerToolContext:
     rework_overlay_packet_path: Path | None = None
     provider_call_id: str = ""
     provenance: str = ""
+    _supervisor_owned: bool = False
 
 
 def load_context_from_env(env: Any = None) -> WorkerToolContext:
@@ -4770,7 +4771,7 @@ def quality_review_submit(
         cache_hit=False,
         hit_count=len(normalized_findings),
         bytes_returned=0,
-        authority_source="runtime",
+        authority_source="supervisor" if ctx._supervisor_owned else "runtime",
         authority_state="process_bound",
         payload=receipt,
     )
