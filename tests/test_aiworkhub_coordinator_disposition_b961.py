@@ -1809,12 +1809,14 @@ def _make_blocked_rework_task_with_terminal_review(
     changed_path_hashes=None,
     feedback_reason="fix the flaky assertion",
     include_predecessor_identity=True,
+    terminal_failure=False,
+    include_terminal_event=True,
 ):
-    """Insert one blocked task card plus its append-only terminal_review event.
+    """Insert one blocked task card plus its append-only terminal event.
 
     Single correct local helper for validation_only_replay tests: creates the
     task row (status=blocked, with rework_predecessor and workspace) and
-    appends the matching terminal_review task_event row.
+    appends the matching terminal_review or terminal_failure task_event row.
     """
     import json as _json
     from datetime import datetime, timezone
@@ -1852,15 +1854,19 @@ def _make_blocked_rework_task_with_terminal_review(
             "claim_epoch": 1,
             "evidence": {"changed_path_hashes": changed_path_hashes},
         }
-        conn.execute(
-            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
-            "VALUES (?, 'terminal_review', 'codex', ?, ?)",
-            (
-                task_id,
-                _json.dumps(terminal_review_payload, ensure_ascii=False, sort_keys=True),
-                now,
-            ),
-        )
+        if include_terminal_event:
+            conn.execute(
+                "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                "VALUES (?, ?, 'codex', ?, ?)",
+                (
+                    task_id,
+                    "terminal_failure" if terminal_failure else "terminal_review",
+                    _json.dumps(
+                        terminal_review_payload, ensure_ascii=False, sort_keys=True
+                    ),
+                    now,
+                ),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -1880,11 +1886,31 @@ def test_recover_blocked_rework_validation_only_replay_default_false_unchanged(t
     assert "validation_only_replay_authorization" not in card
 
 
+def test_recover_blocked_rework_validation_only_replay_no_terminal_failure_rejected(tmp_path):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    task_id = _make_blocked_rework_task_with_terminal_review(
+        root, include_predecessor_identity=False, include_terminal_event=False
+    )
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor="coordinator",
+        feedback_reason="fix flaky test",
+        validation_only_replay=True,
+    )
+    assert ok is False
+    assert state == "no_retained_predecessor_evidence"
+    card = task_store.get_task(root, task_id)
+    assert "validation_only_replay_authorization" not in card
+    assert card.get("claim_epoch") == 1
+
+
 def test_recover_blocked_rework_validation_only_replay_missing_evidence_rejected(tmp_path):
     root = tmp_path
     task_store.initialize_repository(root)
     task_id = _make_blocked_rework_task_with_terminal_review(
-        root, include_predecessor_identity=False
+        root, include_predecessor_identity=False, terminal_failure=True
     )
     ok, state = task_store.recover_blocked_rework(
         root,
@@ -1895,16 +1921,16 @@ def test_recover_blocked_rework_validation_only_replay_missing_evidence_rejected
     )
     assert ok is False
     assert state == "validation_only_replay_missing_evidence"
-    card = task_store.get_task(root, task_id)
-    assert "validation_only_replay_authorization" not in card
-    assert card.get("claim_epoch") == 1
 
 
 def test_recover_blocked_rework_validation_only_replay_persists_authorization(tmp_path):
     root = tmp_path
     task_store.initialize_repository(root)
     task_id = _make_blocked_rework_task_with_terminal_review(
-        root, request_id="req-xyz789", changed_path_hashes={"a.py": "aaaa"}
+        root,
+        request_id="req-xyz789",
+        changed_path_hashes={"a.py": "aaaa"},
+        terminal_failure=True,
     )
     ok, state = task_store.recover_blocked_rework(
         root,
@@ -1935,6 +1961,7 @@ def test_pending_rework_rebinds_validation_only_replay_to_latest_episode(tmp_pat
         root,
         request_id=first_request,
         changed_path_hashes={"a.py": "1" * 64},
+        terminal_failure=True,
     )
     ok, state = task_store.recover_blocked_rework(
         root,
@@ -2123,6 +2150,7 @@ def test_pending_ordinary_recovery_consumes_stale_validation_only_replay_authori
         task_id="nf393-ordinary-consume-token",
         request_id=request_id,
         changed_path_hashes={"src/example.py": path_hash},
+        terminal_failure=True,
     )
     actor = core.CODEX_RUNNER
     ok, state = task_store.recover_blocked_rework(
@@ -2218,6 +2246,7 @@ def test_ordinary_consume_selects_process_manager_provider_launch_lane(
         task_id="nf393-process-manager-lane",
         request_id=request_id,
         changed_path_hashes={"src/example.py": path_hash},
+        terminal_failure=True,
     )
     actor = core.CODEX_RUNNER
     ok, state = task_store.recover_blocked_rework(
@@ -2271,6 +2300,7 @@ def test_second_block_ordinary_recovery_fences_claim_epoch_and_launch(
         task_id="nf393-second-block-ordinary",
         request_id=request_id,
         changed_path_hashes={"src/example.py": path_hash},
+        terminal_failure=True,
     )
     actor = core.CODEX_RUNNER
     ok, state = task_store.recover_blocked_rework(
