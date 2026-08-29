@@ -1283,6 +1283,353 @@ def test_run_declared_validations_keeps_genuine_failure_as_validation_run_error(
     assert exc.results[0]["behavioral_role"] == "gate"
 
 
+# RM43: schema-role mypy comparison is supervisor-owned. The candidate row
+# remains a truthful nonzero receipt even when its normalized diagnostic
+# multiset is fully covered by the pinned baseline.
+def _baseline_diagnostic_validation_row(
+    lines: list[str], *, role: str = "schema"
+) -> dict:
+    return {
+        "command": ".venv/bin/python -m mypy src",
+        "declared_command": ".venv/bin/python -m mypy src",
+        "argv": [".venv/bin/python", "-m", "mypy", "src"],
+        "declared_argv": [".venv/bin/python", "-m", "mypy", "src"],
+        "executed_argv": [".venv/bin/python", "-m", "mypy", "src"],
+        "interpreter_authority": {"path": ".venv/bin/python"},
+        "sandbox_backend": "landlock",
+        "execution_boundary": "os_sandbox",
+        "cwd": None,
+        "env_override": None,
+        "timeout_seconds": 30,
+        "returncode": 1,
+        "timed_out": False,
+        "stdout_tail": "\n".join(lines + ["Found %d errors" % len(lines)]),
+        "stderr_tail": "",
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        "behavioral_role": role,
+    }
+
+
+def _baseline_diagnostic_validation_workspace(tmp_path: Path):
+    path = tmp_path / "candidate"
+    home = tmp_path / "home"
+    path.mkdir()
+    home.mkdir()
+    return process_launcher.WorkerWorkspace(
+        request_id="candidate",
+        repo=tmp_path,
+        path=path,
+        home=home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+        base_oid="a" * 40,
+    )
+
+
+def _run_baseline_diagnostic_validation_compare(
+    monkeypatch, tmp_path, candidate, baseline
+):
+    workspace = _baseline_diagnostic_validation_workspace(tmp_path)
+    monkeypatch.setattr(
+        process_launcher, "create_workspace", lambda *_args, **_kwargs: workspace
+    )
+    monkeypatch.setattr(
+        process_launcher, "cleanup_workspace", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        process_launcher, "run_validations", lambda *_args, **_kwargs: [baseline]
+    )
+    return process_launcher._compare_schema_mypy_baseline(
+        workspace,
+        {"allowed_writes": [], "read_first": []},
+        {"adapter_id": "claude_cli", "sandbox_backend": "landlock"},
+        [candidate],
+    )
+
+
+def test_baseline_diagnostic_validation_identical_nine_diagnostics(
+    monkeypatch, tmp_path
+):
+    lines = [
+        f"src/a.py:{index}: error: bad {index}  [arg-type]"
+        for index in range(1, 10)
+    ]
+    rows = _run_baseline_diagnostic_validation_compare(
+        monkeypatch,
+        tmp_path,
+        _baseline_diagnostic_validation_row(lines),
+        _baseline_diagnostic_validation_row(lines),
+    )
+    assert rows[0]["returncode"] == 1
+    assert rows[0]["baseline_comparison"]["outcome"] == (
+        "baseline_no_new_diagnostics"
+    )
+    assert rows[0]["baseline_comparison"]["candidate_count"] == 9
+
+
+def test_baseline_diagnostic_validation_rejects_one_new_diagnostic(
+    monkeypatch, tmp_path
+):
+    candidate = _baseline_diagnostic_validation_row(
+        [
+            "src/a.py:1: error: old  [arg-type]",
+            "src/a.py:2: error: new  [arg-type]",
+        ]
+    )
+    baseline = _baseline_diagnostic_validation_row(
+        ["src/a.py:8: error: old  [arg-type]"]
+    )
+    with pytest.raises(
+        process_launcher.WorkspaceError, match="baseline_mypy_new_diagnostics"
+    ):
+        _run_baseline_diagnostic_validation_compare(
+            monkeypatch, tmp_path, candidate, baseline
+        )
+
+
+def test_baseline_diagnostic_validation_rejects_multiplicity_increase(
+    monkeypatch, tmp_path
+):
+    line = "src/a.py:1: error: duplicated  [arg-type]"
+    with pytest.raises(
+        process_launcher.WorkspaceError, match="baseline_mypy_new_diagnostics"
+    ):
+        _run_baseline_diagnostic_validation_compare(
+            monkeypatch,
+            tmp_path,
+            _baseline_diagnostic_validation_row([line, line]),
+            _baseline_diagnostic_validation_row([line]),
+        )
+
+
+def test_baseline_diagnostic_validation_ignores_line_shift_and_dot_prefix(
+    monkeypatch, tmp_path
+):
+    _run_baseline_diagnostic_validation_compare(
+        monkeypatch,
+        tmp_path,
+        _baseline_diagnostic_validation_row(
+            ["./src/a.py:99:4: error: stable  [arg-type]"]
+        ),
+        _baseline_diagnostic_validation_row(
+            ["src/a.py:2: error: stable  [arg-type]"]
+        ),
+    )
+
+
+def test_baseline_diagnostic_validation_requires_base_oid(monkeypatch, tmp_path):
+    workspace = process_launcher.replace(
+        _baseline_diagnostic_validation_workspace(tmp_path), base_oid=None
+    )
+    with pytest.raises(
+        process_launcher.WorkspaceError, match="baseline_base_oid_missing"
+    ):
+        process_launcher._compare_schema_mypy_baseline(
+            workspace,
+            {"allowed_writes": []},
+            {"adapter_id": "claude_cli"},
+            [
+                _baseline_diagnostic_validation_row(
+                    ["src/a.py:1: error: x  [arg-type]"]
+                )
+            ],
+        )
+
+
+def test_baseline_diagnostic_validation_rejects_baseline_execution_failure(
+    monkeypatch, tmp_path
+):
+    candidate = _baseline_diagnostic_validation_row(
+        ["src/a.py:1: error: x  [arg-type]"]
+    )
+    failed = _baseline_diagnostic_validation_row([])
+    failed["timed_out"] = True
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="baseline_mypy_candidate_not_comparable",
+    ):
+        _run_baseline_diagnostic_validation_compare(
+            monkeypatch, tmp_path, candidate, failed
+        )
+
+
+def test_baseline_diagnostic_validation_rejects_authority_mismatch(
+    monkeypatch, tmp_path
+):
+    candidate = _baseline_diagnostic_validation_row(
+        ["src/a.py:1: error: x  [arg-type]"]
+    )
+    baseline = _baseline_diagnostic_validation_row(
+        ["src/a.py:1: error: x  [arg-type]"]
+    )
+    baseline["sandbox_backend"] = "bubblewrap"
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="baseline_validation_authority_mismatch",
+    ):
+        _run_baseline_diagnostic_validation_compare(
+            monkeypatch, tmp_path, candidate, baseline
+        )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pytest", "-q", "-k", "mypy"],
+        ["python", "fake_mypy.py"],
+        ["ruff", "-m", "mypy"],
+        ["ruff", "check", "mypy"],
+    ],
+)
+def test_baseline_diagnostic_validation_rejects_mypy_lookalike_command(
+    tmp_path, argv
+):
+    row = _baseline_diagnostic_validation_row(
+        ["src/a.py:1: error: x  [arg-type]"]
+    )
+    row["argv"] = row["executed_argv"] = argv
+    with pytest.raises(
+        process_launcher.WorkspaceError, match="baseline_comparison_ineligible"
+    ):
+        process_launcher._compare_schema_mypy_baseline(
+            _baseline_diagnostic_validation_workspace(tmp_path),
+            {"allowed_writes": []},
+            {"adapter_id": "claude_cli"},
+            [row],
+        )
+
+
+def test_baseline_diagnostic_validation_identical_pytest_failure_remains_red(
+    tmp_path,
+):
+    pytest_row = _baseline_diagnostic_validation_row(
+        ["src/a.py:1: error: x  [arg-type]"], role="test"
+    )
+    pytest_row["command"] = pytest_row["declared_command"] = "pytest -q"
+    pytest_row["argv"] = pytest_row["executed_argv"] = ["pytest", "-q"]
+    with pytest.raises(
+        process_launcher.WorkspaceError, match="baseline_comparison_ineligible"
+    ):
+        process_launcher._compare_schema_mypy_baseline(
+            _baseline_diagnostic_validation_workspace(tmp_path),
+            {"allowed_writes": []},
+            {"adapter_id": "claude_cli"},
+            [pytest_row],
+        )
+
+
+def test_baseline_diagnostic_validation_rejects_unexpected_mypy_returncode(
+    monkeypatch, tmp_path
+):
+    candidate = _baseline_diagnostic_validation_row(
+        ["src/a.py:1: error: x  [arg-type]"]
+    )
+    baseline = _baseline_diagnostic_validation_row(
+        ["src/a.py:1: error: x  [arg-type]"]
+    )
+    baseline["returncode"] = 2
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="baseline_mypy_candidate_not_comparable",
+    ):
+        _run_baseline_diagnostic_validation_compare(
+            monkeypatch, tmp_path, candidate, baseline
+        )
+
+
+def test_run_declared_validations_accepts_only_baselined_mypy_failure(
+    monkeypatch, tmp_path
+):
+    candidate_mypy = _baseline_diagnostic_validation_row(
+        ["src/a.py:20: error: existing  [arg-type]"]
+    )
+    passing_pytest = {
+        "command": "pytest -q",
+        "declared_command": "pytest -q",
+        "argv": ["pytest", "-q"],
+        "executed_argv": ["pytest", "-q"],
+        "returncode": 0,
+        "timed_out": False,
+    }
+    baseline_mypy = _baseline_diagnostic_validation_row(
+        ["src/a.py:2: error: existing  [arg-type]"]
+    )
+    workspace = _baseline_diagnostic_validation_workspace(tmp_path)
+    calls = 0
+
+    def run(_workspace, commands, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if len(commands) == 2:
+            raise process_launcher.ValidationRunError(
+                "candidate failed", [candidate_mypy, passing_pytest]
+            )
+        raise process_launcher.ValidationRunError("baseline failed", [baseline_mypy])
+
+    monkeypatch.setattr(process_launcher, "run_validations", run)
+    monkeypatch.setattr(
+        process_launcher, "create_workspace", lambda *_args, **_kwargs: workspace
+    )
+    monkeypatch.setattr(
+        process_launcher, "cleanup_workspace", lambda *_args, **_kwargs: None
+    )
+    rows = process_launcher._run_declared_validations(
+        workspace,
+        {
+            "work_kind": "generic",
+            "validation": ["python -m mypy src/a.py", "pytest -q"],
+            "validation_roles": ["schema", "regression"],
+            "allowed_writes": [],
+        },
+        {"adapter_id": "claude_cli", "sandbox_backend": "landlock"},
+    )
+    assert calls == 2
+    assert len(rows) == 2
+    assert rows[0]["baseline_comparison"]["outcome"] == (
+        "baseline_no_new_diagnostics"
+    )
+    assert rows[1]["returncode"] == 0
+
+
+def test_run_declared_validations_keeps_mixed_mypy_and_pytest_failures_red(
+    monkeypatch, tmp_path
+):
+    candidate_mypy = _baseline_diagnostic_validation_row(
+        ["src/a.py:20: error: existing  [arg-type]"]
+    )
+    failed_pytest = {
+        "command": "pytest -q",
+        "declared_command": "pytest -q",
+        "argv": ["pytest", "-q"],
+        "executed_argv": ["pytest", "-q"],
+        "returncode": 1,
+        "timed_out": False,
+    }
+
+    def run(*_args, **_kwargs):
+        raise process_launcher.ValidationRunError(
+            "candidate failed", [candidate_mypy, failed_pytest]
+        )
+
+    monkeypatch.setattr(process_launcher, "run_validations", run)
+    with pytest.raises(
+        process_launcher.ValidationRunError,
+        match="baseline_comparison_failed:baseline_comparison_ineligible",
+    ):
+        process_launcher._run_declared_validations(
+            _baseline_diagnostic_validation_workspace(tmp_path),
+            {
+                "work_kind": "generic",
+                "validation": ["python -m mypy src/a.py", "pytest -q"],
+                "validation_roles": ["schema", "regression"],
+                "allowed_writes": [],
+            },
+            {"adapter_id": "claude_cli", "sandbox_backend": "landlock"},
+        )
+
+
 def test_reconcile_defers_live_windows_pid_without_start_ticks(monkeypatch, tmp_path):
     manager = _manager(
         tmp_path,

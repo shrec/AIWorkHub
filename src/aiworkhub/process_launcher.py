@@ -9,6 +9,7 @@ never selects a task by keywords and it never invokes a shell.
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import fnmatch
 import ctypes
 import difflib
@@ -33,7 +34,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping
 
 from . import core
@@ -575,6 +576,189 @@ def _requires_bridge_cancellation(metadata: Mapping[str, Any]) -> bool:
     )
 
 
+_MYPY_DIAGNOSTIC_RE = re.compile(
+    r"^(?P<path>[^:\n]+):\d+(?::\d+)?\s*: error: (?P<message>.+?)(?:\s+\[(?P<code>[^\]]+)\])?$"
+)
+
+
+def _exact_schema_mypy_invocation(row: Mapping[str, Any]) -> bool:
+    """Accept only the trusted mypy executable or ``python -m mypy``."""
+    argv = tuple(
+        str(value)
+        for value in (row.get("executed_argv") or row.get("argv") or ())
+    )
+    if not argv:
+        return False
+    executable = Path(argv[0]).name.lower()
+    if executable in {"mypy", "mypy.exe"}:
+        return True
+    return bool(
+        len(argv) >= 3
+        and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable)
+        and argv[1:3] == ("-m", "mypy")
+    )
+
+
+def _schema_mypy_diagnostics(row: Mapping[str, Any]) -> Counter[tuple[str, str, str]]:
+    """Parse exactly the comparable portion of a real mypy failure."""
+    if row.get("timed_out") or row.get("returncode") != 1:
+        raise WorkspaceError("baseline_mypy_candidate_not_comparable")
+    if _worker_workspace._validation_failure_class(row) != "type_check_failure":
+        raise WorkspaceError("baseline_mypy_candidate_not_comparable")
+    if row.get("stdout_truncated") or row.get("stderr_truncated"):
+        raise WorkspaceError("baseline_mypy_output_truncated")
+    output = "\n".join(
+        (str(row.get("stdout_tail") or ""), str(row.get("stderr_tail") or ""))
+    )
+    diagnostics: Counter[tuple[str, str, str]] = Counter()
+    saw_error = False
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("Found ") or line.startswith("Success:"):
+            continue
+        if " error: " not in line:
+            if "Traceback" in line or "INTERNAL ERROR" in line:
+                raise WorkspaceError("baseline_mypy_output_malformed")
+            continue
+        saw_error = True
+        match = _MYPY_DIAGNOSTIC_RE.fullmatch(line)
+        if match is None:
+            raise WorkspaceError("baseline_mypy_output_malformed")
+        raw_path = match.group("path").replace("\\", "/")
+        path_parts = PurePosixPath(raw_path).parts
+        if (
+            not path_parts
+            or raw_path.startswith("/")
+            or ".." in path_parts
+            or path_parts == (".",)
+        ):
+            raise WorkspaceError("baseline_mypy_path_invalid")
+        path = PurePosixPath(*path_parts).as_posix()
+        code = str(match.group("code") or "").strip()
+        message = " ".join(match.group("message").split())
+        if not code or not message:
+            raise WorkspaceError("baseline_mypy_output_malformed")
+        diagnostics[(path, code, message)] += 1
+    if not saw_error:
+        raise WorkspaceError("baseline_mypy_diagnostics_absent")
+    return diagnostics
+
+
+def _baseline_validation_identity(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return execution facts that must match before diagnostics compare."""
+    return {
+        "declared_command": str(row.get("declared_command") or row.get("command") or ""),
+        "declared_argv": list(row.get("declared_argv") or row.get("argv") or ()),
+        "executed_argv": list(row.get("executed_argv") or row.get("argv") or ()),
+        "interpreter_authority": row.get("interpreter_authority"),
+        "sandbox_backend": row.get("sandbox_backend"),
+        "execution_boundary": row.get("execution_boundary"),
+        "cwd": row.get("cwd"),
+        "env_override": row.get("env_override"),
+        "timeout_seconds": row.get("timeout_seconds"),
+    }
+
+
+def _diagnostic_multiset_digest(
+    diagnostics: Counter[tuple[str, str, str]],
+) -> str:
+    payload = [
+        {"path": key[0], "code": key[1], "message": key[2], "count": count}
+        for key, count in sorted(diagnostics.items())
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _compare_schema_mypy_baseline(
+    workspace: WorkerWorkspace,
+    authority: Mapping[str, Any],
+    route_metadata: Mapping[str, Any],
+    candidate: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    failed = [
+        row
+        for row in candidate
+        if row.get("timed_out") or row.get("returncode") != 0
+    ]
+    if not failed or any(
+        str(row.get("behavioral_role") or "").lower() != "schema"
+        or not _exact_schema_mypy_invocation(row)
+        for row in failed
+    ):
+        raise WorkspaceError("baseline_comparison_ineligible")
+    if not workspace.base_oid:
+        raise WorkspaceError("baseline_base_oid_missing")
+    adapter_id = str(route_metadata.get("adapter_id") or "").strip()
+    if not adapter_id:
+        raise WorkspaceError("baseline_validation_adapter_missing")
+    baseline_card = dict(authority)
+    baseline_card.pop("rework_predecessor", None)
+    baseline_workspace: WorkerWorkspace | None = None
+    try:
+        baseline_workspace = create_workspace(
+            workspace.repo,
+            f"baseline_{uuid.uuid4().hex}",
+            baseline_card,
+            adapter_id,
+            pinned_base_oid=workspace.base_oid,
+        )
+        for row in failed:
+            command = str(row.get("declared_command") or row.get("command") or "")
+            if not command:
+                raise WorkspaceError("baseline_mypy_command_missing")
+            try:
+                baseline_rows = run_validations(
+                    baseline_workspace,
+                    [command],
+                    **_validation_route_kwargs(route_metadata),
+                )
+            except ValidationRunError as exc:
+                baseline_rows = exc.results
+            if len(baseline_rows) != 1:
+                raise WorkspaceError("baseline_validation_receipt_count_mismatch")
+            baseline_row = dict(baseline_rows[0])
+            if _baseline_validation_identity(row) != _baseline_validation_identity(
+                baseline_row
+            ):
+                raise WorkspaceError("baseline_validation_authority_mismatch")
+            candidate_diagnostics = _schema_mypy_diagnostics(row)
+            baseline_diagnostics = _schema_mypy_diagnostics(baseline_row)
+            new_diagnostics = sorted(
+                (candidate_diagnostics - baseline_diagnostics).elements()
+            )
+            outcome = (
+                "baseline_no_new_diagnostics"
+                if not new_diagnostics
+                else "baseline_new_diagnostics"
+            )
+            row["baseline_comparison"] = {
+                "schema_id": "aiworkhub.baseline_comparison.v1",
+                "outcome": outcome,
+                "base_oid": workspace.base_oid,
+                "candidate_count": sum(candidate_diagnostics.values()),
+                "baseline_count": sum(baseline_diagnostics.values()),
+                "candidate_digest": _diagnostic_multiset_digest(candidate_diagnostics),
+                "baseline_digest": _diagnostic_multiset_digest(baseline_diagnostics),
+                "candidate_authority": _baseline_validation_identity(row),
+                "baseline_authority": _baseline_validation_identity(baseline_row),
+                "new_diagnostics": [list(value) for value in new_diagnostics],
+            }
+            if new_diagnostics:
+                raise WorkspaceError("baseline_mypy_new_diagnostics")
+        return candidate
+    finally:
+        if baseline_workspace is not None:
+            cleanup_workspace(
+                baseline_workspace.repo,
+                baseline_workspace.path,
+                baseline_workspace.home,
+            )
+
+
 def _run_declared_validations(
     workspace: WorkerWorkspace,
     authority: Mapping[str, Any],
@@ -615,7 +799,14 @@ def _run_declared_validations(
             # must not strip ``terminal_state``/``restriction``/``recoverable``.
             exc.results = rows
             raise
-        raise ValidationRunError(str(exc), rows) from exc
+        try:
+            return _compare_schema_mypy_baseline(
+                workspace, authority, route_metadata, rows
+            )
+        except WorkspaceError as baseline_exc:
+            raise ValidationRunError(
+                f"{exc}:baseline_comparison_failed:{baseline_exc}", rows
+            ) from baseline_exc
     return with_roles(results)
 
 

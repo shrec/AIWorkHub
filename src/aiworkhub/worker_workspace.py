@@ -3187,13 +3187,91 @@ def _legacy_worktree_root() -> Path:
     return (Path(tempfile.gettempdir()) / "aiworkhub-worktrees").resolve()
 
 
+def _declared_workspace_seed_closure(
+    source_root: Path,
+    card: Mapping[str, Any],
+    allowed: tuple[str, ...],
+) -> tuple[list[str], tuple[str, ...], list[str]]:
+    """Resolve one declared dependency closure from ``source_root`` bytes."""
+    declared = (
+        list(card.get("read_first") or [])
+        + list(card.get("immutable_inputs") or [])
+        + list(allowed)
+    )
+    live_seeded = _expand_declared(source_root, declared)
+    live_seeded = _resolve_local_quoted_includes(
+        source_root,
+        live_seeded,
+        include_roots=_include_roots_from_card(card),
+    )
+    validation_rows = tuple(
+        row
+        for row in (card.get("validation") or [])
+        if isinstance(row, str) and row.strip()
+    )
+    support_seeded: tuple[str, ...] = ()
+    if validation_rows and any(
+        relative.startswith("src/aiworkhub/") for relative in live_seeded
+    ):
+        support_seeded = tuple(
+            relative
+            for relative in _VALIDATION_WORKER_PACKAGE_SUPPORT
+            if relative not in live_seeded
+        )
+    if validation_rows:
+        test_files = _extract_pytest_test_files(source_root, validation_rows)
+        seeds_for_python_closure = (*live_seeded, *support_seeded, *test_files)
+        python_seeded = _resolve_local_python_imports(
+            source_root, seeds_for_python_closure
+        )
+        support_seeded = tuple(
+            sorted(set(support_seeded) | (set(python_seeded) - set(live_seeded)))
+        )
+        js_seeded = _resolve_local_js_requires(
+            source_root, (*live_seeded, *support_seeded)
+        )
+        support_seeded = tuple(
+            sorted(set(support_seeded) | (set(js_seeded) - set(live_seeded)))
+        )
+    npm_support_seeded = tuple(
+        relative
+        for relative in _npm_validation_support(source_root, validation_rows)
+        if relative not in live_seeded
+    )
+    support_seeded = tuple(
+        sorted(set(support_seeded) | set(npm_support_seeded))
+    )
+    seeded = sorted(set(live_seeded) | set(support_seeded))
+    ignore_candidates = {".gitignore"}
+    for relative in seeded:
+        parent = PurePosixPath(relative).parent
+        while str(parent) not in {"", "."}:
+            ignore_candidates.add((parent / ".gitignore").as_posix())
+            parent = parent.parent
+    ignore_seeded = {
+        relative
+        for relative in ignore_candidates
+        if (source_root / relative).is_file()
+        and not (source_root / relative).is_symlink()
+    }
+    live_seeded = sorted(set(live_seeded) | ignore_seeded)
+    seeded = sorted(set(live_seeded) | set(support_seeded))
+    return live_seeded, support_seeded, seeded
+
+
 def create_workspace(
     repo: Path,
     request_id: str,
     card: dict[str, Any],
     adapter_id: str,
+    *,
+    pinned_base_oid: str | None = None,
 ) -> WorkerWorkspace:
     repo = repo.resolve()
+    if pinned_base_oid is not None and re.fullmatch(
+        r"(?:[0-9a-f]{40}|[0-9a-f]{64})", pinned_base_oid
+    ) is None:
+        raise WorkspaceError("baseline_base_oid_invalid")
     if not _REQUEST_ID_RE.fullmatch(request_id):
         raise WorkspaceError("invalid_request_id")
     raw_allowed = card.get("allowed_writes")
@@ -3232,76 +3310,23 @@ def create_workspace(
     provisioning_started = time.monotonic()
     provisioning_timings_ms: dict[str, float] = {}
 
-    declared = list(card.get("read_first") or []) + list(card.get("immutable_inputs") or []) + list(allowed)
-    live_seeded = _expand_declared(repo, declared)
-    live_seeded = _resolve_local_quoted_includes(
-        repo,
-        live_seeded,
-        include_roots=_include_roots_from_card(card),
-    )
-    validation_rows = tuple(
-        row
-        for row in (card.get("validation") or [])
-        if isinstance(row, str) and row.strip()
-    )
-    support_seeded: tuple[str, ...] = ()
-    if validation_rows and any(
-        relative.startswith("src/aiworkhub/") for relative in live_seeded
-    ):
-        support_seeded = tuple(
-            relative
-            for relative in _VALIDATION_WORKER_PACKAGE_SUPPORT
-            if relative not in live_seeded
+    if pinned_base_oid is None:
+        live_seeded, support_seeded, seeded = _declared_workspace_seed_closure(
+            repo, card, allowed
         )
-    if validation_rows:
-        test_files = _extract_pytest_test_files(repo, validation_rows)
-        seeds_for_python_closure = (*live_seeded, *support_seeded, *test_files)
-        python_seeded = _resolve_local_python_imports(
-            repo, seeds_for_python_closure
-        )
-        support_seeded = tuple(
-            sorted(set(support_seeded) | (set(python_seeded) - set(live_seeded)))
-        )
-        js_seeded = _resolve_local_js_requires(repo, (*live_seeded, *support_seeded))
-        support_seeded = tuple(
-            sorted(set(support_seeded) | (set(js_seeded) - set(live_seeded)))
-        )
-    npm_support_seeded = tuple(
-        relative
-        for relative in _npm_validation_support(repo, validation_rows)
-        if relative not in live_seeded
-    )
-    support_seeded = tuple(sorted(set(support_seeded) | set(npm_support_seeded)))
-    seeded = sorted(set(live_seeded) | set(support_seeded))
-    # Git ignore rules participate in changed-path truth. Materialize the root
-    # rule file and rules in ancestors of declared files without checking out
-    # the rest of a potentially multi-gigabyte repository.
-    ignore_candidates = {".gitignore"}
-    for relative in seeded:
-        parent = PurePosixPath(relative).parent
-        while str(parent) not in {"", "."}:
-            ignore_candidates.add((parent / ".gitignore").as_posix())
-            parent = parent.parent
-    ignore_seeded = {
-            relative
-            for relative in ignore_candidates
-            if (repo / relative).is_file() and not (repo / relative).is_symlink()
-        }
-    live_seeded = sorted(set(live_seeded) | ignore_seeded)
-    seeded = sorted(set(live_seeded) | set(support_seeded))
+    else:
+        # A pinned comparator must derive its dependency closure from the
+        # pinned commit, never from newer live-canonical imports.
+        live_seeded, support_seeded, seeded = [], (), []
 
     try:
         phase_started = time.monotonic()
+        worktree_argv = ["git", "worktree", "add", "--detach"]
+        if pinned_base_oid is None:
+            worktree_argv.append("--no-checkout")
+        worktree_argv.extend((str(path), pinned_base_oid or "HEAD"))
         result = _run(
-            [
-                "git",
-                "worktree",
-                "add",
-                "--detach",
-                "--no-checkout",
-                str(path),
-                "HEAD",
-            ],
+            worktree_argv,
             cwd=repo,
             timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
             phase="workspace_provision",
@@ -3311,6 +3336,15 @@ def create_workspace(
         )
         if result.returncode == 0:
             phase_started = time.monotonic()
+            if pinned_base_oid is not None:
+                # The full pinned checkout exists only inside trusted manager
+                # provisioning. Resolve the exact historical import/JS/npm
+                # closure, then immediately prune to the same declared sparse
+                # authority used by candidate validation before any command
+                # executes.
+                live_seeded, support_seeded, seeded = (
+                    _declared_workspace_seed_closure(path, card, allowed)
+                )
             _prepare_sparse_worktree(
                 path,
                 seeded,
@@ -3352,43 +3386,48 @@ def create_workspace(
         # ``allowed_writes``, so their post-overlay bytes seed
         # ``workspace_baseline`` below and they remain read-only, never enter
         # the candidate delta, and can never be promoted.
-        for relative in live_seeded:
-            destination = path / relative
-            _require_beneath(path, destination)
-            _require_beneath(repo, repo / relative)
-            _copy_one(repo / relative, destination)
-        for relative in support_seeded:
-            source = repo / relative
-            support_path = path / relative
-            _require_beneath(repo, source)
-            _require_beneath(path, support_path)
-            if source.is_symlink() or not source.is_file():
-                raise WorkspaceError(
-                    f"validation_worker_support_missing:{relative}"
-                )
-            _copy_one(source, support_path)
-            if support_path.is_symlink() or not support_path.is_file():
-                raise WorkspaceError(
-                    f"validation_worker_support_missing:{relative}"
-                )
+        if pinned_base_oid is None:
+            for relative in live_seeded:
+                destination = path / relative
+                _require_beneath(path, destination)
+                _require_beneath(repo, repo / relative)
+                _copy_one(repo / relative, destination)
+            for relative in support_seeded:
+                source = repo / relative
+                support_path = path / relative
+                _require_beneath(repo, source)
+                _require_beneath(path, support_path)
+                if source.is_symlink() or not source.is_file():
+                    raise WorkspaceError(
+                        f"validation_worker_support_missing:{relative}"
+                    )
+                _copy_one(source, support_path)
+                if support_path.is_symlink() or not support_path.is_file():
+                    raise WorkspaceError(
+                        f"validation_worker_support_missing:{relative}"
+                    )
         # Landlock can grant file-specific write rights without exposing the
         # worktree's .git pointer. Precreating exact new outputs makes those
         # file-specific rules possible; unchanged placeholders are filtered by
         # workspace_baseline below.
-        for relative in allowed:
-            if not any(ch in relative for ch in "*?["):
-                _touch_placeholder(path, relative)
-        rework_seeded = _materialize_rework_predecessor(
-            repo, path, card, allowed
+        if pinned_base_oid is None:
+            for relative in allowed:
+                if not any(ch in relative for ch in "*?["):
+                    _touch_placeholder(path, relative)
+        rework_seeded = (
+            ()
+            if pinned_base_oid is not None
+            else _materialize_rework_predecessor(repo, path, card, allowed)
         )
         seeded = sorted(set(seeded) | set(rework_seeded))
         provisioning_timings_ms["declared_seed"] = round(
             (time.monotonic() - phase_started) * 1000.0, 3
         )
         phase_started = time.monotonic()
+        baseline_root = path if pinned_base_oid is not None else repo
         baseline: dict[str, str | None] = {}
-        for relative in _expand_declared(repo, allowed):
-            baseline[relative] = _hash_path(repo / relative)
+        for relative in _expand_declared(baseline_root, allowed):
+            baseline[relative] = _hash_path(baseline_root / relative)
         workspace_baseline = {
             relative: _hash_path(path / relative)
             for relative in sorted(set(seeded) | set(_expand_declared(path, allowed)))
@@ -3426,6 +3465,8 @@ def create_workspace(
     try:
         phase_started = time.monotonic()
         base_oid = _isolated_worktree_base_oid(repo, path)
+        if pinned_base_oid is not None and base_oid != pinned_base_oid:
+            raise WorkspaceError("baseline_base_oid_mismatch")
         provisioning_timings_ms["base_oid"] = round(
             (time.monotonic() - phase_started) * 1000.0, 3
         )
@@ -8019,6 +8060,7 @@ def run_validations(
                         "interpreter_authority": interpreter_authority,
                         "returncode": None,
                         "timed_out": True,
+                        "timeout_seconds": bounded_timeout,
                         "duration_seconds": round(time.monotonic() - started, 6),
                         "stdout_head": stdout[:4_096],
                         "stdout_tail": stdout[-4_096:],
@@ -8053,6 +8095,7 @@ def run_validations(
                     "interpreter_authority": interpreter_authority,
                     "returncode": None,
                     "timed_out": False,
+                    "timeout_seconds": bounded_timeout,
                     "launch_error": type(exc).__name__,
                     "launch_error_message": launch_message,
                     "duration_seconds": round(time.monotonic() - started, 6),
@@ -8084,6 +8127,7 @@ def run_validations(
                 "python_candidate_authority": candidate_authority,
                 "interpreter_authority": interpreter_authority,
                 "returncode": result.returncode,
+                "timeout_seconds": bounded_timeout,
                 "duration_seconds": round(time.monotonic() - started, 6),
                 "stdout_head": stdout[:4_096],
                 "stdout_tail": stdout[-4_096:],

@@ -292,6 +292,67 @@ def _workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, requ
     )
 
 
+def test_pinned_workspace_is_exact_base_without_live_overlay_or_placeholders(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    source = repo / "src" / "example.py"
+    source.parent.mkdir()
+    source.write_text("from base_dep import VALUE\n", encoding="utf-8")
+    (repo / "src" / "base_dep.py").write_text(
+        "VALUE = 'base'\n", encoding="utf-8"
+    )
+    assert _git(repo, "add", "src/example.py", "src/base_dep.py").returncode == 0
+    assert _git(repo, "commit", "-qm", "pinned base").returncode == 0
+    base_oid = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    source.write_text("from live_dep import VALUE\n", encoding="utf-8")
+    (repo / "src" / "live_dep.py").write_text(
+        "VALUE = 'live'\n", encoding="utf-8"
+    )
+    (repo / "src" / "new.py").write_text("NEW = True\n", encoding="utf-8")
+    assert (
+        _git(repo, "add", "src/example.py", "src/live_dep.py", "src/new.py").returncode
+        == 0
+    )
+    assert _git(repo, "commit", "-qm", "live successor").returncode == 0
+
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "pinned-worktrees"),
+    )
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "req-pinned-baseline",
+        {
+            "allowed_writes": ["src/example.py", "src/new.py"],
+            "read_first": ["src/example.py", "src/new.py"],
+            "validation": [".venv/bin/python -m mypy src/example.py"],
+        },
+        "validation",
+        pinned_base_oid=base_oid,
+    )
+    try:
+        assert workspace.base_oid == base_oid
+        assert (workspace.path / "src" / "example.py").read_text(
+            encoding="utf-8"
+        ) == "from base_dep import VALUE\n"
+        assert (workspace.path / "src" / "base_dep.py").read_text(
+            encoding="utf-8"
+        ) == "VALUE = 'base'\n"
+        assert not (workspace.path / "src" / "live_dep.py").exists()
+        assert not (workspace.path / "src" / "new.py").exists()
+        assert workspace.parent_baseline["src/example.py"] == (
+            workspace.workspace_baseline["src/example.py"]
+        )
+        assert workspace.parent_baseline["src/new.py"] is None
+        assert workspace.workspace_baseline["src/new.py"] is None
+        assert worker_workspace.python_candidate_authority(workspace)["sources"] == []
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
 def _commit_validation_worker_package(repo: Path) -> None:
     source_package = Path(worker_workspace.__file__).resolve().parent
     destination_package = repo / "src" / "aiworkhub"
