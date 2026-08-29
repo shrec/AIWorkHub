@@ -191,6 +191,9 @@ class AppContainerLifecycleState(str, enum.Enum):
     ERROR = "error"
 
 
+_TERMINATION_WAIT_MS = 5_000
+
+
 @dataclass(frozen=True)
 class AppContainerLifecycleResult:
     """One bounded observation of the exact process owned by a launch."""
@@ -226,6 +229,9 @@ class AppContainerLaunch:
     _process_handle_owned: bool = field(default=True, init=False, repr=False)
     _job_handle_owned: bool = field(default=True, init=False, repr=False)
     _termination_completed: bool = field(default=False, init=False, repr=False)
+    _terminal_result: AppContainerLifecycleResult | None = field(
+        default=None, init=False, repr=False
+    )
 
     def poll(self) -> AppContainerLifecycleResult:
         """Observe the owned process without blocking."""
@@ -239,6 +245,8 @@ class AppContainerLaunch:
         terminate_exit_code: int = 1,
     ) -> AppContainerLifecycleResult:
         """Wait at most ``timeout_ms`` for the exact owned process handle."""
+        if self._terminal_result is not None:
+            return self._terminal_result
         if not self._process_handle_owned:
             return AppContainerLifecycleResult(AppContainerLifecycleState.CLOSED)
         if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool):
@@ -248,10 +256,12 @@ class AppContainerLaunch:
         try:
             signaled = self.api.wait_process(self.creation, timeout_ms)
             if signaled:
-                return AppContainerLifecycleResult(
+                result = AppContainerLifecycleResult(
                     AppContainerLifecycleState.EXITED,
                     exit_code=self.api.get_process_exit_code(self.creation),
                 )
+                self._terminal_result = result
+                return result
         except _Win32Failure as exc:
             return AppContainerLifecycleResult(
                 AppContainerLifecycleState.ERROR,
@@ -275,19 +285,28 @@ class AppContainerLaunch:
         """Return an exit code only after this same process handle signals."""
         return self.poll()
 
-    def cancel(self, exit_code: int = 1) -> None:
+    def cancel(self, exit_code: int = 1) -> AppContainerLifecycleResult:
         """Explicitly kill the job-owned process tree and close resources."""
-        self.terminate(exit_code)
+        return self.terminate(exit_code)
 
-    def terminate(self, exit_code: int = 1) -> None:
-        """Kill the whole child tree, then release the owned handles."""
+    def terminate(self, exit_code: int = 1) -> AppContainerLifecycleResult:
+        """Kill the whole child tree without hiding its terminal outcome.
+
+        The process handle remains owned until :meth:`wait` observes the
+        native terminal state (or the caller explicitly closes the launch).
+        This is deliberate: caching the requested termination code, or closing
+        the process handle here, would let a Popen-shaped caller bypass the
+        authoritative wait result.
+        """
         if self.closed:
-            return
+            return self.wait(0)
         first_error: Exception | None = None
+        result: AppContainerLifecycleResult | None = None
         if self._job_handle_owned and not self._termination_completed:
             try:
                 self.api.terminate_job(self.job, exit_code)
                 self._termination_completed = True
+                result = self.wait(_TERMINATION_WAIT_MS)
             except Exception as exc:
                 first_error = exc
         try:
@@ -297,6 +316,9 @@ class AppContainerLaunch:
                 first_error = exc
         if first_error is not None:
             raise first_error
+        if result is None:
+            result = self.wait(0)
+        return result
 
     def close(self) -> None:
         """Release the process and job handles.  Idempotent."""

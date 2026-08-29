@@ -14,7 +14,12 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable, cast
+
+try:
+    from . import windows_appcontainer
+except ImportError:  # direct-script entrypoint
+    import windows_appcontainer  # type: ignore[no-redef]
 
 try:
     from .platform_io import atomic_replace, chmod_fd, chmod_path
@@ -187,7 +192,150 @@ def _open_0600(path: Path) -> BinaryIO:
     return os.fdopen(fd, "a+b", buffering=0)
 
 
-def _terminate_child(child: subprocess.Popen[bytes], grace: float = KILL_GRACE_SECONDS) -> int:
+class _AppContainerProcess:
+    """Popen-shaped owner for one authenticated AppContainer launch."""
+
+    def __init__(
+        self,
+        launch: windows_appcontainer.AppContainerLaunch,
+        stdout: BinaryIO,
+        stderr: BinaryIO,
+        owned_fds: tuple[int, ...] = (),
+    ) -> None:
+        self._launch = launch
+        self.stdout = stdout
+        self.stderr = stderr
+        self.pid = launch.pid
+        self.returncode: int | None = None
+        self._owned_fds = owned_fds
+        self._closed = False
+
+    def _observe(self, timeout_ms: int) -> int | None:
+        result = self._launch.wait(timeout_ms)
+        if result.state is windows_appcontainer.AppContainerLifecycleState.EXITED:
+            if result.exit_code is None:
+                raise OSError("appcontainer_wait_missing_exit_code")
+            self.returncode = int(result.exit_code)
+            self.close()
+            return self.returncode
+        if result.state is windows_appcontainer.AppContainerLifecycleState.ERROR:
+            raise OSError(
+                f"appcontainer_{result.operation or 'wait'}_failed:"
+                f"{result.win_error if result.win_error is not None else 'unknown'}"
+            )
+        if result.state is windows_appcontainer.AppContainerLifecycleState.CLOSED:
+            raise OSError("appcontainer_process_closed_before_terminal_outcome")
+        return None
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        return self._observe(0)
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        timeout_ms = 0xFFFFFFFE if timeout is None else max(0, int(timeout * 1000))
+        result = self._observe(timeout_ms)
+        if result is None:
+            if timeout is None:
+                raise OSError("appcontainer_unbounded_wait_returned_timeout")
+            raise subprocess.TimeoutExpired(
+                self._launch.command_line, float(timeout)
+            )
+        return result
+
+    def terminate(self) -> None:
+        # Never populate returncode here.  wait() must authenticate the native
+        # terminal transition after the Job-owned tree has been terminated.
+        result = self._launch.terminate(1)
+        if result.state is windows_appcontainer.AppContainerLifecycleState.ERROR:
+            raise OSError(
+                f"appcontainer_{result.operation or 'terminate_wait'}_failed:"
+                f"{result.win_error if result.win_error is not None else 'unknown'}"
+            )
+
+    def kill(self) -> None:
+        self.terminate()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        first_error: Exception | None = None
+        try:
+            self._launch.close()
+        except Exception as exc:
+            first_error = exc
+        for fd in self._owned_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._owned_fds = ()
+        self._closed = True
+        if first_error is not None:
+            raise first_error
+
+
+def _native_handle(fd: int) -> int:
+    try:
+        import msvcrt
+    except ImportError:
+        return fd
+    get_osfhandle = cast(
+        Callable[[int], int], getattr(msvcrt, "get_osfhandle")
+    )
+    return int(get_osfhandle(fd))
+
+
+def _launch_appcontainer_process(
+    argv: list[str], cwd: str, spec: dict[str, Any]
+) -> _AppContainerProcess:
+    launch: windows_appcontainer.AppContainerLaunch | None = None
+    stdin_fd = os.open(os.devnull, os.O_RDONLY)
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    fds = (stdin_fd, stdout_read, stdout_write, stderr_read, stderr_write)
+    try:
+        os.set_inheritable(stdout_write, True)
+        os.set_inheritable(stderr_write, True)
+        request = windows_appcontainer.AppContainerRequest(
+            argv=argv,
+            repo_id=str(spec["repo_id"]),
+            worker_kind=str(spec.get("worker_kind") or spec.get("adapter_id") or "worker"),
+            working_directory=cwd,
+            environment=os.environ.copy(),
+            stdin_handle=_native_handle(stdin_fd),
+            stdout_handle=_native_handle(stdout_write),
+            stderr_handle=_native_handle(stderr_write),
+        )
+        launch = windows_appcontainer.launch_appcontainer(request)
+        os.close(stdout_write)
+        os.close(stderr_write)
+        return _AppContainerProcess(
+            launch,
+            os.fdopen(stdout_read, "rb", buffering=0),
+            os.fdopen(stderr_read, "rb", buffering=0),
+            (stdin_fd,),
+        )
+    except Exception:
+        if launch is not None:
+            try:
+                launch.close()
+            except Exception:
+                pass
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+
+
+def _terminate_child(child: Any, grace: float = KILL_GRACE_SECONDS) -> int:
+    if isinstance(child, _AppContainerProcess):
+        child.terminate()
+        return int(child.wait(timeout=grace))
     if os.name == "nt":
         subprocess.run(
             ["taskkill", "/F", "/PID", str(child.pid), "/T"],
@@ -485,8 +633,12 @@ def supervise(spec: dict[str, Any]) -> int:
     supervisor_pid = os.getpid()
     supervisor_pid_start_ticks = _pid_start_ticks(supervisor_pid)
     started_epoch = time.time()
+    execution_backend = spec.get("execution_backend")
+    appcontainer_selected = execution_backend == "windows_appcontainer"
+    deadline_epoch = started_epoch + timeout if appcontainer_selected else None
+    deadline_monotonic = time.monotonic() + timeout if appcontainer_selected else None
     cancel_requested = False
-    child: subprocess.Popen[bytes] | None = None
+    child: subprocess.Popen[bytes] | _AppContainerProcess | None = None
     windows_job: _WindowsKillOnCloseJob | None = None
 
     def stop(_signum: int, _frame: Any) -> None:
@@ -502,31 +654,34 @@ def supervise(spec: dict[str, Any]) -> int:
         "supervisor_pid": supervisor_pid,
         "supervisor_pid_start_ticks": supervisor_pid_start_ticks,
         "started_at_epoch": started_epoch,
-        "deadline_epoch": None,
+        "deadline_epoch": deadline_epoch,
         "timeout_seconds": timeout,
-        "timeout_enforced": False,
+        "timeout_enforced": appcontainer_selected,
     })
 
     try:
         spawn_phase = "child_spawn"
         try:
-            popen_kwargs: dict[str, Any] = {
-                "cwd": cwd,
-                "env": os.environ.copy(),
-                "stdin": subprocess.DEVNULL,
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.PIPE,
-                "shell": False,
-            }
-            if os.name == "nt":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-                windows_job = _WindowsKillOnCloseJob()
+            if execution_backend == "windows_appcontainer":
+                child = _launch_appcontainer_process(argv, cwd, spec)
             else:
-                popen_kwargs.update(_posix_worker_spawn_kwargs())
-            child = subprocess.Popen(argv, **popen_kwargs)
-            if windows_job is not None:
-                spawn_phase = "job_assignment"
-                windows_job.assign(child)
+                popen_kwargs: dict[str, Any] = {
+                    "cwd": cwd,
+                    "env": os.environ.copy(),
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.PIPE,
+                    "shell": False,
+                }
+                if os.name == "nt":
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                    windows_job = _WindowsKillOnCloseJob()
+                else:
+                    popen_kwargs.update(_posix_worker_spawn_kwargs())
+                child = subprocess.Popen(argv, **popen_kwargs)
+                if windows_job is not None:
+                    spawn_phase = "job_assignment"
+                    windows_job.assign(child)
         except Exception as exc:
             if child is not None and child.poll() is None:
                 _terminate_child(child)
@@ -598,6 +753,10 @@ def supervise(spec: dict[str, Any]) -> int:
                 break
             if cancel_requested or cancel_path.exists():
                 final_state = "cancelled"
+                returncode = _terminate_child(child)
+                break
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                final_state = "timed_out"
                 returncode = _terminate_child(child)
                 break
             now_monotonic = time.monotonic()
@@ -760,9 +919,9 @@ def supervise(spec: dict[str, Any]) -> int:
             "exit_code": returncode,
             "started_at_epoch": started_epoch,
             "finished_at_epoch": time.time(),
-            "deadline_epoch": None,
+            "deadline_epoch": deadline_epoch,
             "timeout_seconds": timeout,
-            "timeout_enforced": False,
+            "timeout_enforced": appcontainer_selected,
             "heartbeat_seq": heartbeat_seq,
             "heartbeat_at_epoch": time.time(),
             "stdout_bytes": final_stdout_bytes,
@@ -792,8 +951,15 @@ def supervise(spec: dict[str, Any]) -> int:
             "error": "",
         })
     except Exception as exc:
-        if child is not None and child.poll() is None:
-            _terminate_child(child)
+        cleanup_error = ""
+        if child is not None:
+            try:
+                if child.poll() is None:
+                    _terminate_child(child)
+            except Exception as cleanup_exc:
+                cleanup_error = (
+                    f";cleanup={type(cleanup_exc).__name__}:{cleanup_exc}"
+                )[:250]
         # NF-2026-00082: preserve bounded child stdout/stderr/return-code
         # diagnostics so a missing/partial status artifact never hides what
         # the nested child actually produced. The supervisor owns
@@ -827,7 +993,7 @@ def supervise(spec: dict[str, Any]) -> int:
                 "child_returncode": _child_rc,
                 "stdout_tail": _stdout_tail,
                 "stderr_tail": _stderr_tail,
-                "error": f"{type(exc).__name__}:{exc}"[:500],
+                "error": (f"{type(exc).__name__}:{exc}" + cleanup_error)[:500],
                 "started_at_epoch": started_epoch,
                 "finished_at_epoch": time.time(),
                 "deadline_epoch": None,
@@ -849,7 +1015,9 @@ def supervise(spec: dict[str, Any]) -> int:
                         "child_returncode": _child_rc,
                         "stdout_tail": _stdout_tail[-1000:],
                         "stderr_tail": _stderr_tail[-1000:],
-                        "error": f"{type(exc).__name__}:{exc}"[:500],
+                        "error": (
+                            f"{type(exc).__name__}:{exc}" + cleanup_error
+                        )[:500],
                     },
                     separators=(",", ":"),
                 )
@@ -857,6 +1025,14 @@ def supervise(spec: dict[str, Any]) -> int:
             )
         return 126
     finally:
+        if isinstance(child, _AppContainerProcess):
+            try:
+                child.close()
+            except Exception:
+                # A lifecycle close error encountered on the normal path is
+                # raised by _observe and recorded above.  Cleanup retries must
+                # never replace that bounded primary diagnostic.
+                pass
         if windows_job is not None:
             windows_job.close()
         cancel_path.unlink(missing_ok=True)

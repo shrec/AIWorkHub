@@ -692,6 +692,50 @@ def test_supervisor_never_enables_shell_execution() -> None:
     assert "os.system(" not in source
 
 
+def test_appcontainer_terminate_then_wait_does_not_bypass_native_result(
+    tmp_path: Path,
+) -> None:
+    class FakeLaunch:
+        pid = 41
+        command_line = "worker.exe"
+
+        def __init__(self) -> None:
+            self.wait_calls = 0
+            self.close_calls = 0
+
+        def terminate(self, exit_code: int):
+            assert exit_code == 1
+            return worker_supervisor.windows_appcontainer.AppContainerLifecycleResult(
+                worker_supervisor.windows_appcontainer.AppContainerLifecycleState.EXITED,
+                exit_code=73,
+            )
+
+        def wait(self, timeout_ms: int):
+            self.wait_calls += 1
+            assert timeout_ms == 1000
+            return worker_supervisor.windows_appcontainer.AppContainerLifecycleResult(
+                worker_supervisor.windows_appcontainer.AppContainerLifecycleState.EXITED,
+                exit_code=73,
+            )
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    launch = FakeLaunch()
+    stdout = (tmp_path / "stdout").open("w+b")
+    stderr = (tmp_path / "stderr").open("w+b")
+    process = worker_supervisor._AppContainerProcess(launch, stdout, stderr)
+
+    process.terminate()
+    assert process.returncode is None
+    assert process.wait(timeout=1) == 73
+    assert process.returncode == 73
+    assert launch.wait_calls == 1
+    assert launch.close_calls == 1
+    process.close()
+    assert launch.close_calls == 1
+
+
 def test_posix_worker_spawn_kwargs_are_platform_specific() -> None:
     linux = worker_supervisor._posix_worker_spawn_kwargs("linux")
     macos = worker_supervisor._posix_worker_spawn_kwargs("darwin")

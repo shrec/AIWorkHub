@@ -487,17 +487,22 @@ def test_bounded_wait_timeout_can_leave_process_owned_and_running():
 
 def test_wait_timeout_can_kill_job_and_close_every_handle_exactly_once():
     fake = FakeWin32Api()
+    fake.wait_results = [False, True]
+    fake.exit_code = 9
     launch = launch_appcontainer(make_request(), api=fake)
 
     result = launch.wait(10, terminate_on_timeout=True, terminate_exit_code=9)
 
     assert result.state is AppContainerLifecycleState.TIMEOUT
     assert result.terminated is True
-    lifecycle = fake.events[-5:]
+    lifecycle = fake.events[-8:]
     assert lifecycle == [
         "wait_process",
         "wait_timeout:10",
         "terminate_job",
+        "wait_process",
+        f"wait_timeout:{wac._TERMINATION_WAIT_MS}",
+        "get_process_exit_code",
         "close_process_handle",
         "close_job",
     ]
@@ -509,16 +514,21 @@ def test_wait_timeout_can_kill_job_and_close_every_handle_exactly_once():
 
 def test_zero_timeout_termination_reports_timeout_and_closes_exactly_once():
     fake = FakeWin32Api()
+    fake.wait_results = [False, True]
+    fake.exit_code = 9
     launch = launch_appcontainer(make_request(), api=fake)
 
     result = launch.wait(0, terminate_on_timeout=True, terminate_exit_code=9)
 
     assert result.state is AppContainerLifecycleState.TIMEOUT
     assert result.terminated is True
-    assert fake.events[-5:] == [
+    assert fake.events[-8:] == [
         "wait_process",
         "wait_timeout:0",
         "terminate_job",
+        "wait_process",
+        f"wait_timeout:{wac._TERMINATION_WAIT_MS}",
+        "get_process_exit_code",
         "close_process_handle",
         "close_job",
     ]
@@ -538,7 +548,7 @@ def test_wait_and_exit_code_failures_are_structured_and_do_not_orphan():
     assert not wait_launch.closed and not wait_fake.job_terminated
 
     exit_fake = FakeWin32Api(fail_at="get_process_exit_code", fail_error=5)
-    exit_fake.wait_results = [True]
+    exit_fake.wait_results = [True, True]
     exit_launch = launch_appcontainer(make_request(), api=exit_fake)
     exit_result = exit_launch.exit_status()
     assert exit_result.state is AppContainerLifecycleState.ERROR
@@ -570,6 +580,8 @@ def test_wait_rejects_unbounded_or_negative_timeout(timeout):
 
 def test_terminate_kills_tree_then_releases_and_is_idempotent():
     fake = FakeWin32Api()
+    fake.wait_results = [True]
+    fake.exit_code = 1
     launch = launch_appcontainer(make_request(), api=fake)
 
     launch.terminate()
@@ -577,11 +589,30 @@ def test_terminate_kills_tree_then_releases_and_is_idempotent():
     assert fake.job_closed
     assert fake.process_handle_closed
     assert launch.closed
+    assert launch.wait(0).exit_code == 1
 
     fake.events.clear()
     launch.terminate()
     launch.close()
     assert fake.events == []
+
+
+def test_terminate_then_wait_uses_authenticated_native_exit_and_no_handles():
+    fake = FakeWin32Api()
+    fake.wait_results = [True]
+    fake.exit_code = 73
+    launch = launch_appcontainer(make_request(), api=fake)
+
+    result = launch.terminate(9)
+
+    assert result.state is AppContainerLifecycleState.EXITED
+    assert result.exit_code == 73
+    assert launch.wait(0) is result
+    assert launch.closed is True
+    assert fake.events.count("wait_process") == 1
+    assert fake.events.count("get_process_exit_code") == 1
+    assert fake.events.count("close_process_handle") == 1
+    assert fake.events.count("close_job") == 1
 
 
 def test_close_releases_without_terminating_and_is_idempotent():
