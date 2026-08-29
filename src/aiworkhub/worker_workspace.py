@@ -3085,6 +3085,36 @@ def verify_nested_landlock_authority_locator(
     return verified
 
 
+def _nested_landlock_validator_cwd(
+    cwd: Path, exec_scratch: Path
+) -> bool:
+    """Return whether cwd is in one exact request-owned nested worktree."""
+    try:
+        relative = cwd.relative_to(exec_scratch)
+    except ValueError:
+        return False
+    parts = relative.parts
+    if (
+        len(parts) < 3
+        or parts[0] != "nested-worktrees"
+        or parts[1] in ("", ".", "..")
+        or parts[2] != "worktree"
+    ):
+        return False
+    request_root = exec_scratch / "nested-worktrees" / parts[1]
+    for directory in (request_root, request_root / "worktree"):
+        try:
+            status = directory.stat()
+        except OSError:
+            return False
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or status.st_uid != os.geteuid()
+        ):
+            return False
+    return True
+
+
 def authenticated_outer_validation_context() -> dict[str, str] | None:
     """Return the coordinator outer-validation context when it is authentic.
 
@@ -3092,9 +3122,11 @@ def authenticated_outer_validation_context() -> dict[str, str] | None:
     context. The reserved authority file must verify HMAC and live in a
     directory this process owns and that is mode-writable, yet Landlock
     still denies creating a sibling. Nested Landlock lookups use a bounded
-    cwd-ancestor locator and re-verify that authority.
+    cwd-ancestor locator, require the planted request-worktree layout, and
+    re-verify that authority.
     """
-    current = Path.cwd().resolve()
+    validation_cwd = Path.cwd().resolve()
+    current = validation_cwd
     seen: set[Path] = set()
     for _ in range(_NESTED_LANDLOCK_AUTHORITY_LOCATOR_MAX_ANCESTORS + 1):
         if current in seen:
@@ -3104,7 +3136,10 @@ def authenticated_outer_validation_context() -> dict[str, str] | None:
         located = verify_nested_landlock_authority_locator(locator)
         if located is not None:
             try:
-                if current == Path(located["exec_scratch"]).resolve():
+                scratch = Path(located["exec_scratch"]).resolve()
+                if current == scratch and _nested_landlock_validator_cwd(
+                    validation_cwd, scratch
+                ):
                     return located
             except OSError:
                 pass
@@ -5801,22 +5836,21 @@ def _metadata_broker_verify_flags(flags: int) -> int:
 def _metadata_broker_verify_fd(
     fd: int, candidate: str, requested_mode: int | None = None
 ) -> bool:
-    """Fail closed unless ``fd`` is a scratch-owned target beneath the request scratch.
+    """Fail closed unless fd is a scratch-owned target beneath the request scratch.
 
     Owned directories are permitted so validators can manage scratch-directory
-    metadata (e.g. ``os.chmod(parent, 0o700)`` after ``path.parent.mkdir``).
-    Regular files still require ``st_nlink == 1`` (no hardlinks) UNLESS
-    ``requested_mode`` is given and already equals the file's current
+    metadata (e.g. os.chmod(parent, 0o700) after path.parent.mkdir).
+    Regular files still require st_nlink == 1 (no hardlinks) UNLESS
+    requested_mode is given and already equals the file's current
     permission bits exactly -- that one metadata no-op is accepted so a
     validator that redundantly re-chmods a hardlinked file to its own mode
-    (e.g. a nested Git/pytest ``config.lock``) is not spuriously denied, while
+    (e.g. a nested Git/pytest config.lock) is not spuriously denied, while
     any actual requested mode change against a hardlink stays denied. Special
     files (devices, sockets, FIFOs) remain denied.
 
-    Returns ``True`` when the caller should perform the mutation, ``False``
-    when the fd is verified but the mutation is an already-satisfied hardlink
-    no-op that must be skipped entirely (no ``fchmod`` call at all, so no
-    ctime bump is ever visible through the file's other hardlinked names).
+    Returns True only after the descriptor is authenticated for the real
+    fchmod syscall branch. For a hardlink, the exact current permission
+    bits are the sole accepted request, so the syscall cannot change its mode.
     """
     info = os.fstat(fd)
     if stat.S_ISDIR(info.st_mode):
@@ -5830,7 +5864,7 @@ def _metadata_broker_verify_fd(
             raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
         if requested_mode is None or stat.S_IMODE(info.st_mode) != requested_mode:
             raise WorkspaceError(f"metadata_broker_hardlink_forbidden:{candidate}")
-        return False
+        return True
     if info.st_uid != os.getuid():
         raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
     return True
@@ -5852,8 +5886,8 @@ def _metadata_broker_verify_target(
     symlink targets -- never a userspace string-prefix comparison. The returned
     descriptor passes ``_metadata_broker_verify_fd`` (owned directories are
     permitted; regular files require ``st_nlink == 1`` unless ``requested_mode``
-    is an exact permission-bit no-op); the caller mutates that exact fd -- only
-    when the paired ``bool`` is ``True`` -- and closes it.
+    is an exact permission-bit no-op); the caller executes ``fchmod`` on that
+    exact authenticated fd and closes it.
 
     For directories the first ``openat2`` with ``O_RDONLY|O_NOCTTY`` yields an
     O_PATH descriptor that cannot be ``fchmod``'d.  A second ``openat2`` with
@@ -5925,9 +5959,9 @@ def _metadata_broker_verify_target_any(
     rejected -- authority is never widened to the repository or an arbitrary
     path.
 
-    Returns ``(fd, mutate)``: ``mutate`` is ``False`` only for the accepted
-    hardlink permission-bit no-op (see ``_metadata_broker_verify_fd``); the
-    caller must skip the actual ``fchmod`` in that case.
+    Returns the authenticated fd and syscall-branch authorization. An accepted
+    hardlink request is necessarily an exact permission-bit no-op, but still
+    executes through the real ``fchmod`` branch on that descriptor.
     """
     outside: WorkspaceError | None = None
     for scratch_fd, scratch_root in scratch_specs:

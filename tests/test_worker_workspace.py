@@ -5232,6 +5232,19 @@ def test_nested_landlock_locator_resolves_from_separate_cwd(
     assert worker_workspace.nested_sandbox_requires_host_boundary() is True
 
 
+def test_nested_landlock_locator_rejects_ambient_non_nested_scratch_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _planted, _locator, _nested, scratch = _plant_nested_landlock_layout(tmp_path)
+    _deny_landlock_sibling_writes(monkeypatch)
+    ambient = scratch / "pytest-tmp" / "ambient"
+    ambient.mkdir(parents=True)
+    monkeypatch.chdir(ambient)
+    assert worker_workspace.authenticated_outer_validation_context() is None
+    assert worker_workspace.nested_sandbox_requires_host_boundary() is False
+
+
 def test_nested_landlock_locator_rejects_owner_mode_symlink_hmac_escape_copy(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -5963,8 +5976,9 @@ def test_verify_fd_accepts_exact_mode_noop_on_hardlinked_regular_file(
         mutate = worker_workspace._metadata_broker_verify_fd(
             fd, str(target), current_mode
         )
-        assert mutate is False
-        # The permission bits are genuinely untouched -- no fchmod was called.
+        assert mutate is True
+        # Authentication admits only the exact mode; the broker must still
+        # execute the real fchmod branch on this descriptor.
         assert stat.S_IMODE(os.fstat(fd).st_mode) == current_mode
     finally:
         os.close(fd)
@@ -6036,7 +6050,7 @@ def test_verify_target_any_hardlink_same_mode_noop_accepted_different_mode_denie
         )
         try:
             assert fd >= 0
-            assert mutate is False
+            assert mutate is True
         finally:
             os.close(fd)
         with pytest.raises(
@@ -6055,6 +6069,73 @@ def test_verify_target_any_hardlink_same_mode_noop_accepted_different_mode_denie
                 str(outside.resolve()), specs, 0o644
             )
     finally:
+        for spec_fd, _root in specs:
+            os.close(spec_fd)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fchmod descriptor race is POSIX")
+@pytest.mark.skipif(
+    not worker_workspace._openat2_available(),
+    reason="openat2(2) unavailable on this kernel",
+)
+def test_fchmod_hardlink_noop_unlink_race_uses_authenticated_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scratch = (tmp_path / "scratch").resolve()
+    scratch.mkdir()
+    target = scratch / "config.lock"
+    sibling = scratch / "config.lock.link"
+    target.write_text("original\n", encoding="utf-8")
+    target.chmod(0o644)
+    _hardlink_or_skip(target, sibling)
+    child_fd = os.open(target, os.O_RDONLY)
+    original_identity = os.fstat(child_fd).st_dev, os.fstat(child_fd).st_ino
+    specs = [worker_workspace._open_broker_scratch_root(scratch)]
+    request = worker_workspace._SeccompNotif()
+    request.id = 448
+    request.pid = os.getpid()
+    request.data.nr = 448
+    request.data.args[0] = child_fd
+    request.data.args[1] = 0o644
+    checks = 0
+    real_fchmod = os.fchmod
+    fchmod_identities: list[tuple[int, int]] = []
+
+    def check_notification(_library, _listener_fd, _notification_id):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            target.unlink()
+            sibling.unlink()
+            target.write_text("replacement\n", encoding="utf-8")
+            target.chmod(0o600)
+
+    def observed_fchmod(fd: int, mode: int) -> None:
+        info = os.fstat(fd)
+        fchmod_identities.append((info.st_dev, info.st_ino))
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr(
+        worker_workspace,
+        "_metadata_broker_syscall_names",
+        lambda _library: {448: "fchmod"},
+    )
+    monkeypatch.setattr(
+        worker_workspace, "_metadata_broker_check_notification", check_notification
+    )
+    monkeypatch.setattr(os, "fchmod", observed_fchmod)
+    try:
+        worker_workspace._metadata_broker_apply(
+            object(), -1, request, os.getpid(), specs
+        )
+        assert checks == 2
+        assert fchmod_identities == [original_identity]
+        assert target.read_text(encoding="utf-8") == "replacement\n"
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        assert stat.S_IMODE(os.fstat(child_fd).st_mode) == 0o644
+    finally:
+        os.close(child_fd)
         for spec_fd, _root in specs:
             os.close(spec_fd)
 
