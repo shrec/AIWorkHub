@@ -281,21 +281,37 @@ def test_windows_workforce_allocation_uses_only_launchable_editor_routes(
     )
 
     preflight = repo_policy.build_preflight(root)
-    catalog = workforce_catalog.build_catalog(
-        root,
-        cards=[],
-        process_rows=[],
-        preflight=preflight,
-    )
+    now_epoch = 2_000_000_000.0
     native_adapters = {
         "claude_cli",
         "codex_cli",
         "deepseek_copilot_cli",
         "glm_copilot_cli",
     }
+
+    # Zero-history GLM route: the editor bridge is launchable but no recent
+    # authenticated terminal success was observed, so the route stays
+    # unobserved and no worker is selected or launched.
+    zero_history = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight=preflight,
+        now_epoch=now_epoch,
+    )
+    glm = next(
+        worker for worker in zero_history["workers"]
+        if worker["worker_id"] == "glm-5.2"
+    )
+    assert glm["launch_eligible"] is True
+    assert glm["available"] is False
+    assert glm["availability_observed"] is False
+    assert glm["route_health"]["state"] == "unobserved"
+    assert glm["route_health"]["reason"] == "no_recent_terminal_execution"
+    assert glm["readiness_status"] == "route_unobserved"
     assert all(
         worker["available"] is False
-        for worker in catalog["workers"]
+        for worker in zero_history["workers"]
         if worker["effective_adapter_id"] in native_adapters
     )
 
@@ -307,8 +323,43 @@ def test_windows_workforce_allocation_uses_only_launchable_editor_routes(
         owner_model_pin="glm-5.2",
         tool_needs=["source-graph"],
     )
-    decision = workforce_catalog.rank_task(root, task, catalog=catalog)
+    decision = workforce_catalog.rank_task(root, task, catalog=zero_history)
+    assert decision["selected_worker_id"] is None
+    assert decision["launch_contract"] is None
 
+    # One exact recent authenticated terminal-success row for glm-5.2 on the
+    # glm_vscode_lm route makes the route observed, closed and rankable.
+    observed = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[{
+            "request_id": "glm-review-1",
+            "task_id": "T-glm-review",
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "state": "review_ready",
+            "runner": "glm_5.2",
+            "finished_at": "2033-05-18T03:33:10+00:00",
+        }],
+        preflight=preflight,
+        now_epoch=now_epoch,
+    )
+    glm = next(
+        worker for worker in observed["workers"]
+        if worker["worker_id"] == "glm-5.2"
+    )
+    assert glm["launch_eligible"] is True
+    assert glm["available"] is True
+    assert glm["availability_observed"] is True
+    assert glm["route_health"]["state"] == "closed"
+    assert glm["readiness_status"] != "route_unobserved"
+    assert all(
+        worker["available"] is False
+        for worker in observed["workers"]
+        if worker["effective_adapter_id"] in native_adapters
+    )
+
+    decision = workforce_catalog.rank_task(root, task, catalog=observed)
     assert decision["selected_worker_id"] == "glm-5.2"
     assert decision["selected_adapter_id"] == "glm_vscode_lm"
     assert decision["launch_contract"] == {
