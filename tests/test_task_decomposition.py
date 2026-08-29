@@ -68,6 +68,10 @@ def test_build_proposal_is_grounded_deterministic_and_non_mutating(tmp_path):
 
     assert first["proposal_digest"] == second["proposal_digest"]
     assert first["manager_approval_required"] is True
+    assert first["approval_boundary"] == {
+        "boundary_id": "aiworkhub_rm17_decomposition_approval_boundary",
+        "action_class": "low_confidence_large_decomposition",
+    }
     assert first["task_creation_performed"] is False
     assert first["task_launch_performed"] is False
     assert first["parallel_child_count"] == 1
@@ -75,6 +79,52 @@ def test_build_proposal_is_grounded_deterministic_and_non_mutating(tmp_path):
         {"index": 0, "task_ids": ["child-a"]},
         {"index": 1, "task_ids": ["child-b"]},
     ]
+
+
+def test_approval_action_class_registry_is_exact_and_stable():
+    assert task_decomposition.APPROVAL_ACTION_CLASSES == (
+        "architecture_broad_refactor",
+        "dependency_toolchain_change",
+        "destructive_storage",
+        "security_sensitive_change",
+        "release_promotion",
+        "low_confidence_large_decomposition",
+    )
+
+
+@pytest.mark.parametrize("action_class", [None, "", "release", "unknown"])
+def test_approval_boundary_fails_closed_for_omitted_or_unknown_class(action_class):
+    reason = (
+        "approval_action_class_required"
+        if action_class is None
+        else "unknown_approval_action_class"
+    )
+    with pytest.raises(task_decomposition.TaskDecompositionError, match=f"^{reason}$"):
+        task_decomposition.approval_boundary(action_class)
+
+
+def test_approval_boundary_identity_participates_in_digest(tmp_path, monkeypatch):
+    original = task_decomposition.APPROVAL_BOUNDARY_ID
+    first = task_decomposition.build_proposal(
+        tmp_path,
+        parent_task_id="parent",
+        objective="Split one verified change.",
+        source_graph_receipt=_receipt(tmp_path),
+        children=_children(),
+    )
+    monkeypatch.setattr(
+        task_decomposition, "APPROVAL_BOUNDARY_ID", f"{original}.changed"
+    )
+    second = task_decomposition.build_proposal(
+        tmp_path,
+        parent_task_id="parent",
+        objective="Split one verified change.",
+        source_graph_receipt=_receipt(tmp_path),
+        children=_children(),
+    )
+
+    assert first["approval_boundary"] != second["approval_boundary"]
+    assert first["proposal_digest"] != second["proposal_digest"]
 
 
 def test_build_proposal_rejects_tampered_source_graph_receipt(tmp_path):

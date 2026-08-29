@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -17,10 +18,36 @@ from . import task_plan
 SCHEMA_ID = "aiworkhub.task_decomposition_proposal.v1"
 MAX_CHILDREN = 16
 MAX_EVIDENCE_REFS = 16
+APPROVAL_BOUNDARY_ID = "aiworkhub_rm17_decomposition_approval_boundary"
+
+
+class ApprovalActionClass(str, Enum):
+    ARCHITECTURE_BROAD_REFACTOR = "architecture_broad_refactor"
+    DEPENDENCY_TOOLCHAIN_CHANGE = "dependency_toolchain_change"
+    DESTRUCTIVE_STORAGE = "destructive_storage"
+    SECURITY_SENSITIVE_CHANGE = "security_sensitive_change"
+    RELEASE_PROMOTION = "release_promotion"
+    LOW_CONFIDENCE_LARGE_DECOMPOSITION = "low_confidence_large_decomposition"
+
+
+APPROVAL_ACTION_CLASSES = tuple(action.value for action in ApprovalActionClass)
 
 
 class TaskDecompositionError(ValueError):
     pass
+
+
+def approval_boundary(action_class: ApprovalActionClass | str | None) -> dict[str, str]:
+    if action_class is None:
+        raise TaskDecompositionError("approval_action_class_required")
+    try:
+        resolved = ApprovalActionClass(action_class)
+    except (TypeError, ValueError) as exc:
+        raise TaskDecompositionError("unknown_approval_action_class") from exc
+    return {
+        "boundary_id": APPROVAL_BOUNDARY_ID,
+        "action_class": resolved.value,
+    }
 
 
 def _bounded_text(value: Any, field: str, limit: int) -> str:
@@ -191,8 +218,12 @@ def build_proposal(
     ])
     if not snapshot["dag_valid"]:
         raise TaskDecompositionError("child_dag_invalid")
+    boundary = approval_boundary(
+        ApprovalActionClass.LOW_CONFIDENCE_LARGE_DECOMPOSITION
+    )
     canonical = {
         "schema_id": SCHEMA_ID,
+        "approval_boundary": boundary,
         "parent_task_id": parent,
         "objective": objective_text,
         "source_graph": {
@@ -221,8 +252,12 @@ def build_proposal(
 
 
 __all__ = [
+    "APPROVAL_ACTION_CLASSES",
+    "APPROVAL_BOUNDARY_ID",
+    "ApprovalActionClass",
     "MAX_CHILDREN",
     "SCHEMA_ID",
     "TaskDecompositionError",
+    "approval_boundary",
     "build_proposal",
 ]
