@@ -22,13 +22,20 @@ from aiworkhub import process_launcher as pl
 class _FakeWorkspace:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.repo = path.parent
+        self.allowed_writes = ("delta.py",)
+        self.base_oid = "base-oid"
+        self.parent_baseline: dict[str, str] = {}
 
     def as_metadata(self) -> dict[str, Any]:
         return {
-            "repo": str(self.path.parent),
+            "repo": str(self.repo),
             "path": str(self.path),
             "home": str(self.path.parent / "home"),
             "request_id": "req-rework",
+            "allowed_writes": list(self.allowed_writes),
+            "parent_baseline": dict(self.parent_baseline),
+            "base_oid": self.base_oid,
         }
 
 
@@ -48,6 +55,23 @@ def test_timed_out_delta_is_retained_as_rework_predecessor(tmp_path: Path) -> No
     assert evidence["changed_path_hashes"]["delta.py"]
     assert "workspace" in evidence
     assert evidence["request_identity"]["request_id"] == "req-rework"
+    workspace_metadata = evidence["workspace"]
+    request_identity = evidence["request_identity"]
+    assert workspace_metadata["allowed_writes"] == list(workspace.allowed_writes)
+    assert workspace_metadata["allowed_writes"] == request_identity["allowed_writes"]
+    assert workspace_metadata["base_oid"] == workspace.base_oid
+    assert workspace_metadata["base_oid"] == request_identity["base_oid"]
+    assert workspace_metadata["parent_baseline"] == workspace.parent_baseline
+    assert workspace_metadata["parent_baseline"] == request_identity["parent_baseline"]
+    candidate_authority = evidence["python_candidate_authority"]
+    assert workspace_metadata["python_candidate_authority"] == candidate_authority
+    assert candidate_authority["sources"] == [
+        {
+            "path": "delta.py",
+            "state": "added",
+            "bytes_sha256": evidence["changed_path_hashes"]["delta.py"],
+        },
+    ]
     assert "timed_out" in pl.DELTA_RETAINING_TERMINAL_STATES
 
 
