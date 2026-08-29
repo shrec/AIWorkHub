@@ -62,6 +62,7 @@ from .process_launcher_read_efficiency import (
 )
 from . import provider_usage
 from . import repo_policy
+from . import review_orchestrator
 from . import runtime_temp
 from . import task_engine
 from . import task_fsm
@@ -10456,7 +10457,17 @@ class ProcessManager:
     def reconcile(self) -> dict[str, Any]:
         result = self._reconcile_persisted_requests()
         gc_result = self._gc_finalized_workspaces()
-        return {"ok": True, **result, **gc_result}
+        review_result: dict[str, Any] = dict(attempted=0, completed=0, failed=0, pending=0, review_actions={})
+        review_db = review_orchestrator.canonical_review_db(self)
+        if review_db is None:
+            automation_result = dict(automation_retried=0, automation_seeded=0,
+                automation_failed=0, automation_failures=[], automation_unavailable=True)
+        else:
+            automation_result = review_orchestrator.retry_pending_registrations(
+                self, db_path=review_db, events=self._latest_by_request())
+            driver = review_orchestrator.ReviewOrchestrator(self, db_path=review_db)
+            review_result = driver.drain(max_actions=1).as_dict()
+        return {"ok": True, **result, **gc_result, **review_result, **automation_result}
 
     def abandoned_finalizations(self) -> list[dict[str, Any]]:
         """Operator view of finalizers that terminally gave up.
@@ -11169,6 +11180,7 @@ class ProcessManager:
             attempt_artifact_receipt: dict[str, Any] | None = None
             attempt_artifact_error = ""
             outcome_evidence_record: dict[str, Any] | None = None
+            review_automation: dict[str, Any] = {}
             cleanup = True
             scope_duration_ms = 0.0
             validation_wall_duration_ms = 0.0
@@ -11588,6 +11600,25 @@ class ProcessManager:
                                 or release_result.get("stdout")
                                 or ""
                             )[:300]
+                        else:
+                            registration: dict[str, str] = {}
+                            try:
+                                registration = review_orchestrator.candidate_registration(
+                                    metadata=metadata, artifact_receipt=attempt_artifact_receipt,
+                                    changed_path_hashes=changed_path_hashes)
+                                review_db = review_orchestrator.canonical_review_db(self)
+                                if review_db is None:
+                                    raise RuntimeError("review_lifecycle_store_not_ready")
+                                chain = review_orchestrator.register_candidate(
+                                    self, db_path=review_db, registration=registration)
+                            except Exception as exc:
+                                review_automation = dict(
+                                    state="pending", registration=registration,
+                                    error=f"{type(exc).__name__}:{exc}"[:300])
+                            else:
+                                review_automation = dict(
+                                    state="seeded", registration=registration,
+                                    chain_identity_sha256=chain.chain_identity_sha256)
             except _QualityReviewFinalized:
                 pass
             except WorkspaceError as exc:
@@ -11871,6 +11902,7 @@ class ProcessManager:
                 "required_outputs": required_output_records,
                 "validation": validations,
                 "review_transition_ok": bool(review_result and review_result.get("ok")),
+                "review_automation": review_automation,
                 "release_transition_ok": bool(release_result and release_result.get("ok")),
                 "terminal_review_disposition": str(
                     (release_result or {}).get("terminal_review_disposition") or ""

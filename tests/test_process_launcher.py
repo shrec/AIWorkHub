@@ -2172,6 +2172,8 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
     event = manager._finalize_isolated_request("req-review-first-1", supervisor_returncode=0)
 
     assert event["state"] == "review_ready"
+    assert event["review_automation"]["state"] == "pending"
+    assert event["review_automation"]["error"].startswith("KeyError:")
     assert event["workspace_retained"] is True
     assert event["promoted_paths"] == []
     assert event["finalization_duration_ms"] >= 0
@@ -2233,6 +2235,124 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
         evidence_record.evidence_level
         == process_launcher.evidence_levels.EvidenceLevel.STATIC_EVIDENCE
     )
+
+
+def test_reconcile_retries_durable_review_automation_after_restart(
+    monkeypatch, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    kwargs = dict(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        isolation_enabled=False,
+    )
+    review_db = tmp_path / "canonical-task-queue.sqlite"
+    monkeypatch.setattr(
+        process_launcher.review_orchestrator,
+        "canonical_review_db",
+        lambda _manager: review_db,
+    )
+    first = process_launcher.ProcessManager(**kwargs)
+    registration = {
+        "target_task_id": "TASK_B1",
+        "target_request_id": "req-review-first-1",
+        "claim_epoch": "1",
+        "packet_sha256": "a" * 64,
+        "candidate_sha256": "b" * 64,
+    }
+    first._append_event({
+        "request_id": "req-review-first-1",
+        "task_id": "TASK_B1",
+        "state": "review_ready",
+        "review_automation": {"state": "pending", "registration": registration},
+    })
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_reconcile_persisted_requests",
+        lambda self: {"watched": 0, "finalized": 0},
+    )
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_gc_finalized_workspaces",
+        lambda self: {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0},
+    )
+    calls = []
+    monkeypatch.setattr(
+        process_launcher.review_orchestrator,
+        "register_candidate",
+        lambda manager, **values: calls.append((manager, values)) or object(),
+    )
+
+    restarted = process_launcher.ProcessManager(**kwargs)
+    result = restarted.reconcile()
+    assert result["automation_retried"] == 1
+    assert result["automation_seeded"] == 1
+    assert result["automation_failed"] == 0
+    assert calls[0][1]["registration"] == registration
+    latest = restarted._latest_by_request()["req-review-first-1"]
+    assert latest["state"] == "review_ready"
+    assert latest["review_automation"]["state"] == "seeded"
+
+    replay = process_launcher.ProcessManager(**kwargs).reconcile()
+    assert replay["automation_retried"] == 0
+    assert len(calls) == 1
+
+    monkeypatch.setattr(
+        process_launcher.review_orchestrator,
+        "register_candidate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("store unavailable")),
+    )
+    restarted._append_event({
+        "request_id": "req-review-unavailable-1",
+        "task_id": "TASK_B2",
+        "state": "review_ready",
+        "review_automation": {
+            "state": "pending",
+            "registration": {**registration, "target_task_id": "TASK_B2",
+                             "target_request_id": "req-review-unavailable-1"},
+        },
+    })
+    unavailable = process_launcher.ProcessManager(**kwargs).reconcile()
+    assert unavailable["automation_retried"] == 1
+    assert unavailable["automation_seeded"] == 0
+    assert unavailable["automation_failed"] == 1
+    assert unavailable["automation_failures"] == [{
+        "request_id": "req-review-unavailable-1",
+        "error": "OSError:store unavailable",
+    }]
+    unavailable_manager = process_launcher.ProcessManager(**kwargs)
+    failed_event = unavailable_manager._latest_by_request()["req-review-unavailable-1"]
+    assert failed_event["state"] == "review_ready"
+    assert failed_event["review_automation"]["state"] == "pending"
+    assert failed_event["review_automation"]["error"] == "OSError:store unavailable"
+
+
+def test_reconcile_contains_unready_review_store_without_second_database(
+    monkeypatch, tmp_path
+):
+    manager = process_launcher.ProcessManager(
+        repo=tmp_path / "missing-repository-authority",
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        isolation_enabled=False,
+    )
+    monkeypatch.setattr(
+        manager, "_reconcile_persisted_requests",
+        lambda: {"watched": 0, "finalized": 0},
+    )
+    monkeypatch.setattr(
+        manager, "_gc_finalized_workspaces",
+        lambda: {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0},
+    )
+
+    result = manager.reconcile()
+
+    assert result["automation_unavailable"] is True
+    assert result["attempted"] == 0
+    assert not hasattr(manager, "_review_lifecycle_db")
+    assert not (tmp_path / "processes" / "review_lifecycle.sqlite").exists()
 
 
 def test_quality_reviewer_finalization_seals_attempt_bundle(

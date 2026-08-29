@@ -439,6 +439,124 @@ def complete_action(
         conn.close()
 
 
+def fail_action(
+    db_path: str | Path,
+    *,
+    action_id: int,
+    owner: str,
+    lease_token: str,
+    reason: str,
+    now: datetime,
+) -> bool:
+    """Terminally fail the currently leased action using an exact preimage CAS."""
+    failure = str(reason or "action_failed")[:500]
+    now_text = _format_utc(now)
+    conn = _connect(db_path)
+    try:
+        ensure_schema(conn)
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM review_action_outbox WHERE action_id=?", (int(action_id),)
+        ).fetchone()
+        if row is None:
+            raise ReviewLifecycleError("action_missing")
+        chain_row = conn.execute(
+            "SELECT * FROM review_chains WHERE chain_id=?", (row["chain_id"],)
+        ).fetchone()
+        if chain_row is None:
+            raise ReviewLifecycleError("descriptor_tamper")
+        identity = _verify_chain_row(chain_row)
+        _verify_chain_actions(
+            conn, int(chain_row["chain_id"]), identity,
+            str(chain_row["chain_identity_sha256"]),
+        )
+        _verify_action_row(row, identity, str(chain_row["chain_identity_sha256"]))
+        if str(row["state"]) == "failed":
+            if row["failure_reason"] == failure:
+                conn.commit()
+                return True
+            raise ReviewLifecycleError("failure_conflict")
+        if (
+            str(row["state"]) != "reserved"
+            or row["owner"] != owner
+            or row["lease_token"] != lease_token
+        ):
+            raise ReviewLifecycleError("failure_conflict")
+        cursor = conn.execute(
+            "UPDATE review_action_outbox SET state='failed', failure_reason=?, "
+            "completed_at=?, updated_at=? "
+            f"WHERE action_id=? AND {_preimage_where_clause(row)}",
+            (failure, now_text, now_text, int(action_id), *_preimage_values(row)),
+        )
+        if cursor.rowcount != 1:
+            raise ReviewLifecycleError("cas_lost")
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def defer_action(
+    db_path: str | Path,
+    *,
+    action_id: int,
+    owner: str,
+    lease_token: str,
+    now: datetime,
+) -> bool:
+    """Release one exact lease back to pending without recording an effect."""
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM review_action_outbox WHERE action_id=?", (int(action_id),)
+        ).fetchone()
+        if row is None:
+            raise ReviewLifecycleError("action_missing")
+        chain = _hydrate_chain_by_id(conn, int(row["chain_id"]))
+        if (
+            str(row["state"]) != "reserved"
+            or row["owner"] != owner
+            or row["lease_token"] != lease_token
+        ):
+            raise ReviewLifecycleError("defer_conflict")
+        cursor = conn.execute(
+            "UPDATE review_action_outbox SET state='pending', owner='', lease_token='', "
+            "lease_expires_at='', updated_at=? "
+            f"WHERE action_id=? AND {_preimage_where_clause(row)}",
+            (_format_utc(now), int(action_id), *_preimage_values(row)),
+        )
+        if cursor.rowcount != 1:
+            raise ReviewLifecycleError("cas_lost")
+        conn.commit()
+        return chain.chain_id == int(row["chain_id"])
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def lifecycle_counts(db_path: str | Path) -> dict[str, int]:
+    """Return truthful bounded state counts after authenticating every chain."""
+    conn = _connect(db_path)
+    try:
+        ensure_schema(conn)
+        _verify_all_chains(conn)
+        counts = {state: 0 for state in sorted(VALID_STATES)}
+        for row in conn.execute(
+            "SELECT state, COUNT(*) AS count FROM review_action_outbox GROUP BY state"
+        ):
+            counts[str(row["state"])] = int(row["count"])
+        return counts
+    finally:
+        conn.close()
+
+
 def _connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -587,9 +705,9 @@ def _verify_action_row(
         raise ReviewLifecycleError("malformed_state")
     _parse_utc(str(row["created_at"]), "created_at")
     _parse_utc(str(row["updated_at"]), "updated_at")
-    if state in {"reserved", "completed"}:
+    if state in {"reserved", "completed", "failed"}:
         _parse_utc(str(row["lease_expires_at"]), "lease_expires_at")
-    if state == "completed":
+    if state in {"completed", "failed"}:
         _parse_utc(str(row["completed_at"]), "completed_at")
     if state == "pending":
         if any(
@@ -649,13 +767,19 @@ def _verify_action_row(
         ):
             raise ReviewLifecycleError("receipt_tamper")
     elif state == "failed":
-        if not str(row["failure_reason"]) or any(
-            str(row[column])
-            for column in (
-                "receipt_json",
-                "receipt_sha256",
-                "receipt_commitment_sha256",
-                "completed_at",
+        if (
+            not str(row["owner"])
+            or not str(row["lease_token"])
+            or not str(row["lease_expires_at"])
+            or not str(row["completed_at"])
+            or not str(row["failure_reason"])
+            or any(
+                str(row[column])
+                for column in (
+                    "receipt_json",
+                    "receipt_sha256",
+                    "receipt_commitment_sha256",
+                )
             )
         ):
             raise ReviewLifecycleError("descriptor_tamper")
@@ -794,6 +918,23 @@ def actions_for_chain(db_path: str | Path, chain_id: int) -> tuple[ReviewAction,
         if row is None:
             raise ReviewLifecycleError("chain_missing")
         return _hydrate_chain(conn, row).actions
+    finally:
+        conn.close()
+
+
+def completed_receipts_for_chain(
+    db_path: str | Path, chain_id: int
+) -> tuple[dict[str, Any], ...]:
+    """Return completed receipts only after authenticating the whole chain."""
+    conn = _connect(db_path)
+    try:
+        _hydrate_chain_by_id(conn, int(chain_id))
+        rows = conn.execute(
+            "SELECT receipt_json FROM review_action_outbox "
+            "WHERE chain_id=? AND state='completed' ORDER BY action_index",
+            (int(chain_id),),
+        ).fetchall()
+        return tuple(json.loads(str(row["receipt_json"])) for row in rows)
     finally:
         conn.close()
 

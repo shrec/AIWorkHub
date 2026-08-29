@@ -175,6 +175,8 @@ def test_canonical_twelve_action_order(tmp_path: Path) -> None:
         ("needfix", "needfix_close", ""),
     ]
     assert [a.action_index for a in actions] == list(range(12))
+    assert actions[-1].phase == "needfix"
+    assert actions[-1].action_type == "needfix_close"
 
 
 def test_two_connection_concurrency_blocks_behind_reserved_head_action(tmp_path: Path) -> None:
