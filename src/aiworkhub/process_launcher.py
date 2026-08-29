@@ -4037,7 +4037,7 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             continue
         if int(successful.get(tool) or 0) > 0:
             satisfaction_by_tool[tool] = "live_worker_call"
-        elif not context_required and injected_acknowledged and tool in injected_tools:
+        elif injected_acknowledged and tool in injected_tools:
             satisfaction_by_tool[tool] = "injected_receipt"
         elif rework_attempt:
             # A rework is a validation-only replay of an already-green

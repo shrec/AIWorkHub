@@ -87,6 +87,55 @@ def test_required_research_context_is_a_blocking_authenticated_tool_gate(
     )
 
 
+def test_required_context_accepts_acknowledged_supervisor_receipt(
+    monkeypatch, tmp_path
+) -> None:
+    metadata = _metadata()
+    bundle_sha256 = "a" * 64
+    stdout_path = tmp_path / "worker.jsonl"
+    stdout_path.write_text(
+        "PROJECT_CONTEXT_RECEIPT: "
+        + json.dumps(
+            {
+                "acknowledged": True,
+                "bundle_sha256": bundle_sha256,
+                "prompt_sha256": "",
+                "schema_id": process_launcher.project_context.RECEIPT_SCHEMA_ID,
+                "section_count": 4,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    metadata["stdout_path"] = str(stdout_path)
+    metadata["project_context"]["required"] = True
+    metadata["project_context"]["bundle_sha256"] = bundle_sha256
+    for section in metadata["project_context"]["sections"]:
+        section.update(executed=True, degraded_reason="")
+    monkeypatch.setattr(
+        process_launcher.worker_ai_tools_mcp,
+        "verify_audit_ledger",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "policy_violations": 0,
+            "live_source_graph_calls": 1,
+            "successful_call_count_by_tool": {"source_graph": 1},
+        },
+    )
+
+    result = process_launcher._worker_mcp_live_call_gate(metadata, "request-1")
+
+    assert result["satisfied"] is True
+    assert result["missing_tools"] == []
+    assert result["injected_context_acknowledged"] is True
+    assert result["satisfaction_by_tool"] == {
+        "source_graph": "live_worker_call",
+        "session_current_state": "injected_receipt",
+        "ai_memory": "injected_receipt",
+        "kb": "injected_receipt",
+    }
+
+
 def test_completion_gate_rejects_cache_only_source_graph_for_code_tasks(monkeypatch) -> None:
     """A successful ledger entry that is not a fresh live invocation remains
     fail-closed and is reported consistently as stale/cached, not missing."""
