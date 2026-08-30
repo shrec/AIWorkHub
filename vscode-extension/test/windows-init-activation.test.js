@@ -3,7 +3,9 @@
 const assert = require("assert");
 const childProcess = require("child_process");
 const { EventEmitter } = require("events");
+const fs = require("fs");
 const Module = require("module");
+const os = require("os");
 const path = require("path");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
@@ -34,6 +36,126 @@ try {
 }
 
 (async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "C_drive-work-repo-"));
+  const hubRoot = path.join(fixtureRoot, ".aiworkhub");
+  const manifestPath = path.join(hubRoot, "project.json");
+  fs.mkdirSync(hubRoot);
+  const manifest = {
+    schema_id: "aiworkhub.project_manifest.v1",
+    manifest_version: 1,
+    layout_version: 1,
+    repo_id: "repo_cccccccccccccccccccccccccccccccc",
+    repo_name: "Windows Repo",
+    layout: {
+      durable: { tasking: "tasking", source_graph: "source_graph", sessions: "sessions", memory: "memory", kb: "kb", config: "config" },
+      runtime: { path: "runtime", durable: false, ignored: true },
+    },
+  };
+  const manifestBytes = Buffer.from(`\ufeff${JSON.stringify(manifest)}\n`, "utf8");
+  fs.writeFileSync(manifestPath, manifestBytes);
+  const readManifest = extension.__testInternals.readRepositoryManifestInfo;
+  assert.strictEqual(readManifest(fixtureRoot, "repo").repoId, manifest.repo_id);
+  assert.deepStrictEqual(fs.readFileSync(manifestPath), manifestBytes, "discovery must not rewrite the manifest");
+
+  const reorderedManifest = {
+    ...manifest,
+    layout: {
+      ...manifest.layout,
+      durable: { config: "config", kb: "kb", memory: "memory", sessions: "sessions", source_graph: "source_graph", tasking: "tasking" },
+    },
+  };
+  const reorderedBytes = Buffer.from(JSON.stringify(reorderedManifest), "utf8");
+  fs.writeFileSync(manifestPath, reorderedBytes);
+  assert.strictEqual(readManifest(fixtureRoot, "repo").repoId, manifest.repo_id);
+  assert.deepStrictEqual(fs.readFileSync(manifestPath), reorderedBytes, "reordered discovery must not rewrite the manifest");
+
+  fs.writeFileSync(manifestPath, "{not json", "utf8");
+  assert.strictEqual(readManifest(fixtureRoot, "repo").storageStatus, "manifest_invalid");
+  fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, repo_id: "bad" }), "utf8");
+  assert.strictEqual(readManifest(fixtureRoot, "repo").storageStatus, "repo_id_invalid");
+  fs.unlinkSync(manifestPath);
+  assert.strictEqual(readManifest(fixtureRoot, "repo").storageStatus, "uninitialized");
+
+  const externalRoot = fs.mkdtempSync(path.join(os.tmpdir(), "D_drive-external-repo-"));
+  fs.rmdirSync(hubRoot);
+  fs.symlinkSync(externalRoot, hubRoot, "dir");
+  assert.strictEqual(
+    readManifest(fixtureRoot, "repo").storageStatus,
+    "manifest_invalid",
+    "a hub directory symlink to an empty external directory must never look uninitialized",
+  );
+  assert.deepStrictEqual(
+    fs.readdirSync(externalRoot),
+    [],
+    "hub symlink rejection must not mutate the external directory",
+  );
+  fs.unlinkSync(hubRoot);
+  fs.mkdirSync(hubRoot);
+
+  const externalManifestPath = path.join(externalRoot, "project.json");
+  fs.writeFileSync(externalManifestPath, manifestBytes);
+  fs.symlinkSync(externalManifestPath, manifestPath, "file");
+  assert.strictEqual(
+    readManifest(fixtureRoot, "repo").storageStatus,
+    "manifest_invalid",
+    "a manifest symlink must never adopt external repository identity",
+  );
+  assert.deepStrictEqual(
+    fs.readFileSync(externalManifestPath),
+    manifestBytes,
+    "symlink rejection must not mutate the external manifest",
+  );
+  fs.unlinkSync(manifestPath);
+  fs.writeFileSync(manifestPath, manifestBytes);
+
+  const externalRaceManifest = path.join(externalRoot, "race-project.json");
+  const externalRace = { ...manifest, repo_id: "repo_dddddddddddddddddddddddddddddddd" };
+  fs.writeFileSync(externalRaceManifest, JSON.stringify(externalRace), "utf8");
+  const originalOpenSync = fs.openSync;
+  let barrierRan = false;
+  fs.openSync = (file, ...args) => {
+    if (file === manifestPath && !barrierRan) {
+      barrierRan = true;
+      fs.unlinkSync(manifestPath);
+      fs.renameSync(externalRaceManifest, manifestPath);
+    }
+    return originalOpenSync(file, ...args);
+  };
+  try {
+    const raced = readManifest(fixtureRoot, "repo");
+    assert.strictEqual(barrierRan, true, "the deterministic pre-open replacement barrier must run");
+    assert.strictEqual(raced.storageStatus, "manifest_unreadable");
+    assert.notStrictEqual(raced.repoId, externalRace.repo_id, "replacement identity must never be adopted");
+  } finally {
+    fs.openSync = originalOpenSync;
+  }
+  assert.strictEqual(fs.existsSync(manifestPath), true, "race replacement must leave a manifest fixture");
+
+  const originalReadFileSync = fs.readFileSync;
+  const originalDeniedOpenSync = fs.openSync;
+  let deniedDescriptor;
+  fs.openSync = (file, ...args) => {
+    const descriptor = originalDeniedOpenSync(file, ...args);
+    if (file === manifestPath) deniedDescriptor = descriptor;
+    return descriptor;
+  };
+  fs.readFileSync = (file, ...args) => {
+    if (file === deniedDescriptor) {
+      const error = new Error("access denied");
+      error.code = "EACCES";
+      throw error;
+    }
+    return originalReadFileSync(file, ...args);
+  };
+  try {
+    assert.strictEqual(readManifest(fixtureRoot, "repo").storageStatus, "manifest_unreadable");
+  } finally {
+    fs.openSync = originalDeniedOpenSync;
+    fs.readFileSync = originalReadFileSync;
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    fs.rmSync(externalRoot, { recursive: true, force: true });
+  }
+
   const messages = [];
   let resolveSnapshot;
   let convergenceCalls = 0;

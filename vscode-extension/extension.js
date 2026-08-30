@@ -476,9 +476,109 @@ function isPoisonedInvalidParamsError(error) {
 // snapshot's ``storage`` field (see pushSnapshot / media/app.js) and updated
 // live after a successful "Initialize AIWorkHub" action.
 function readRepositoryManifestInfo(root, label) {
-  const manifestPath = path.join(root, ".aiworkhub", "project.json");
+  const hubPath = path.join(root, ".aiworkhub");
+  const manifestPath = path.join(hubPath, "project.json");
+  const missing = { repoId: "manifest-missing", repoName: label, storageReady: false, storageStatus: "uninitialized" };
+  const unreadable = { repoId: "manifest-unreadable", repoName: label, storageReady: false, storageStatus: "manifest_unreadable" };
+  const invalid = { repoId: "manifest-invalid", repoName: label, storageReady: false, storageStatus: "manifest_invalid" };
+  let hubStat;
   try {
-    const payload = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    hubStat = fs.lstatSync(hubPath);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return missing;
+    return unreadable;
+  }
+  if (hubStat.isSymbolicLink() || !hubStat.isDirectory()) return invalid;
+
+  let manifestStat;
+  try {
+    manifestStat = fs.lstatSync(manifestPath);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return missing;
+    return unreadable;
+  }
+  if (manifestStat.isSymbolicLink() || !manifestStat.isFile()) return invalid;
+
+  let rawManifest;
+  try {
+    const realRoot = fs.realpathSync.native(root);
+    const realHub = fs.realpathSync.native(hubPath);
+    const realManifest = fs.realpathSync.native(manifestPath);
+    const hubRelative = path.relative(realRoot, realHub);
+    const manifestRelative = path.relative(realRoot, realManifest);
+    const escapesRoot = (relative) => (
+      relative === ".."
+      || relative.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relative)
+    );
+    if (escapesRoot(hubRelative) || escapesRoot(manifestRelative)) return invalid;
+
+    const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+    let descriptor;
+    let operationFailed = false;
+    try {
+      descriptor = fs.openSync(manifestPath, fs.constants.O_RDONLY | noFollow);
+      const openedStat = fs.fstatSync(descriptor);
+      if (
+        !openedStat.isFile()
+        || openedStat.dev !== manifestStat.dev
+        || openedStat.ino !== manifestStat.ino
+      ) {
+        operationFailed = true;
+      } else {
+        rawManifest = fs.readFileSync(descriptor, "utf8");
+      }
+    } catch (_err) {
+      operationFailed = true;
+    } finally {
+      if (descriptor !== undefined) {
+        try {
+          fs.closeSync(descriptor);
+        } catch (_err) {
+          operationFailed = true;
+        }
+      }
+    }
+    if (operationFailed) return unreadable;
+  } catch (_err) {
+    return unreadable;
+  }
+  try {
+    const manifestText = rawManifest.charCodeAt(0) === 0xfeff ? rawManifest.slice(1) : rawManifest;
+    const payload = JSON.parse(manifestText);
+    const runtime = payload && payload.layout && payload.layout.runtime;
+    const durable = payload && payload.layout && payload.layout.durable;
+    const expectedDurable = {
+      tasking: "tasking",
+      source_graph: "source_graph",
+      sessions: "sessions",
+      memory: "memory",
+      kb: "kb",
+      config: "config",
+    };
+    const durableKeys = durable && typeof durable === "object" && !Array.isArray(durable)
+      ? Object.keys(durable)
+      : [];
+    const durableLayoutValid = (
+      durableKeys.length === Object.keys(expectedDurable).length
+      && durableKeys.every((key) => (
+        Object.prototype.hasOwnProperty.call(expectedDurable, key)
+        && durable[key] === expectedDurable[key]
+      ))
+    );
+    if (
+      !payload
+      || payload.schema_id !== "aiworkhub.project_manifest.v1"
+      || payload.manifest_version !== 1
+      || payload.layout_version !== 1
+      || !durableLayoutValid
+      || !runtime
+      || runtime.path !== "runtime"
+      || runtime.durable !== false
+      || runtime.ignored !== true
+    ) {
+      return { repoId: "manifest-invalid", repoName: label, storageReady: false, storageStatus: "manifest_invalid" };
+    }
     const repoId = String(payload.repo_id || "");
     if (!REPO_ID_RE.test(repoId)) {
       return { repoId: "manifest-invalid", repoName: label, storageReady: false, storageStatus: "repo_id_invalid" };
@@ -490,7 +590,7 @@ function readRepositoryManifestInfo(root, label) {
       storageStatus: "pending_verification",
     };
   } catch (_err) {
-    return { repoId: "manifest-missing", repoName: label, storageReady: false, storageStatus: "uninitialized" };
+    return { repoId: "manifest-invalid", repoName: label, storageReady: false, storageStatus: "manifest_invalid" };
   }
 }
 
@@ -10018,6 +10118,7 @@ module.exports = {
     pushSnapshotOnce,
     pushSnapshotNoRetry,
     pushRuntimeInfo,
+    readRepositoryManifestInfo,
     runBackgroundTask,
     findPythonCommand,
     findPythonCommandForLaunch,

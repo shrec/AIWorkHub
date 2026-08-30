@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -193,7 +194,7 @@ def _find_upward(start: Path, marker: Path, *, boundary: Path | None = None) -> 
     current = _resolve_existing_dir(start)
     for directory in (current, *current.parents):
         candidate = directory / marker
-        if candidate.exists():
+        if os.path.lexists(candidate):
             if _has_symlink_component(candidate):
                 raise PathEscapeError(f"marker_symlink_component:{candidate}")
             return directory
@@ -222,6 +223,7 @@ def resolve_repository_root(
 
     environ = env if env is not None else os.environ
     start = Path(cwd or os.getcwd())
+    root: Path | None
     if explicit_root is not None:
         root = _resolve_existing_dir(Path(explicit_root))
     elif environ.get("AIWORKHUB_REPO_ROOT"):
@@ -244,12 +246,54 @@ def resolve_repository_root(
 def _read_manifest(path: Path) -> RepositoryManifest:
     if _has_symlink_component(path):
         raise PathEscapeError(f"manifest_symlink_component:{path}")
-    if not path.is_file():
-        raise ManifestMissingError(f"manifest_missing:{path}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        before = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise ManifestMissingError(f"manifest_missing:{path}") from exc
+    except OSError as exc:
         raise ManifestInvalidError(f"manifest_unreadable:{path}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise ManifestInvalidError(f"manifest_unreadable:{path}")
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        # The manifest existed at prevalidation time, so a failed open (even
+        # ENOENT after a concurrent replacement) is unreadable, not missing.
+        raise ManifestInvalidError(f"manifest_unreadable:{path}") from exc
+
+    read_error: BaseException | None = None
+    raw = bytearray()
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+        ):
+            raise OSError("manifest_identity_changed")
+        while chunk := os.read(fd, 64 * 1024):
+            raw.extend(chunk)
+    except OSError as exc:
+        read_error = exc
+    try:
+        os.close(fd)
+    except OSError as exc:
+        read_error = read_error or exc
+    if read_error is not None:
+        raise ManifestInvalidError(f"manifest_unreadable:{path}") from read_error
+
+    try:
+        decoded = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ManifestInvalidError(f"manifest_invalid_utf8:{path}") from exc
+    try:
+        payload = json.loads(decoded)
+    except json.JSONDecodeError as exc:
+        raise ManifestInvalidError(f"manifest_invalid_json:{path}") from exc
     if not isinstance(payload, dict):
         raise ManifestInvalidError("manifest_must_be_object")
     return RepositoryManifest.from_json(payload)

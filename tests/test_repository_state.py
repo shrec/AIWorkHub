@@ -51,9 +51,99 @@ def test_missing_and_invalid_manifests_fail_closed(tmp_path: Path) -> None:
 
     hub = repo / rs.HUB_DIRNAME
     hub.mkdir()
-    (hub / "project.json").write_text('{"schema_id":"wrong"}\n', encoding="utf-8")
-    with pytest.raises(rs.ManifestInvalidError):
+    manifest_path = hub / "project.json"
+    manifest_path.write_text('{"schema_id":"wrong"}\n', encoding="utf-8")
+    with pytest.raises(rs.ManifestInvalidError, match="manifest_schema_id_invalid"):
         rs.inspect_repository(repo)
+
+    manifest_path.write_bytes(b"{not-json")
+    with pytest.raises(rs.ManifestInvalidError, match="manifest_invalid_json"):
+        rs.inspect_repository(repo)
+
+    manifest_path.write_bytes(b"\xff\xfe")
+    with pytest.raises(rs.ManifestInvalidError, match="manifest_invalid_utf8"):
+        rs.inspect_repository(repo)
+
+
+def test_manifest_bom_and_read_failures_preserve_fail_closed_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "C_drive" / "work" / "repo"
+    _git_init(repo)
+    state = rs.bootstrap_repository(repo, repo_id="repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    manifest_path = repo / rs.PROJECT_MANIFEST_REL
+    original = manifest_path.read_bytes()
+    manifest_path.write_bytes(b"\xef\xbb\xbf" + original)
+    with_bom = manifest_path.read_bytes()
+
+    assert rs.inspect_repository(repo).manifest.repo_id == state.manifest.repo_id
+    assert manifest_path.read_bytes() == with_bom
+
+    original_read = os.read
+    manifest_fd: int | None = None
+
+    def denied(fd: int, size: int) -> bytes:
+        if fd == manifest_fd:
+            raise PermissionError("access denied")
+        return original_read(fd, size)
+
+    original_open = os.open
+
+    def capture_open(path: os.PathLike[str] | str, flags: int, mode: int = 0o777) -> int:
+        nonlocal manifest_fd
+        fd = original_open(path, flags, mode)
+        if Path(path) == manifest_path:
+            manifest_fd = fd
+        return fd
+
+    monkeypatch.setattr(os, "open", capture_open)
+    monkeypatch.setattr(os, "read", denied)
+    with pytest.raises(rs.ManifestInvalidError, match="manifest_unreadable"):
+        rs.inspect_repository(repo)
+    assert manifest_path.read_bytes() == with_bom
+
+
+def test_manifest_replacement_between_lstat_and_open_is_rejected_without_fd_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "C_drive" / "work" / "repo"
+    _git_init(repo)
+    owner_id = "repo_cccccccccccccccccccccccccccccccc"
+    external_id = "repo_dddddddddddddddddddddddddddddddd"
+    rs.bootstrap_repository(repo, repo_id=owner_id)
+    manifest_path = repo / rs.PROJECT_MANIFEST_REL
+    original_bytes = manifest_path.read_bytes()
+    external_manifest = tmp_path / "D_drive" / "external-project.json"
+    external_manifest.parent.mkdir()
+    payload = json.loads(original_bytes.decode("utf-8"))
+    payload["repo_id"] = external_id
+    external_manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    original_open = os.open
+    barrier_ran = False
+    opened_fd: int | None = None
+
+    def replace_then_open(path: os.PathLike[str] | str, flags: int, mode: int = 0o777) -> int:
+        nonlocal barrier_ran, opened_fd
+        if Path(path) == manifest_path and not barrier_ran:
+            barrier_ran = True
+            manifest_path.unlink()
+            external_manifest.replace(manifest_path)
+        opened_fd = original_open(path, flags, mode)
+        return opened_fd
+
+    monkeypatch.setattr(os, "open", replace_then_open)
+    with pytest.raises(rs.ManifestInvalidError, match="manifest_unreadable"):
+        rs.inspect_repository(repo)
+
+    assert barrier_ran
+    assert opened_fd is not None
+    with pytest.raises(OSError):
+        os.fstat(opened_fd)
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["repo_id"] == external_id
+    assert owner_id != external_id
 
 
 def test_resolver_precedence_explicit_env_manifest_then_git(tmp_path: Path) -> None:
@@ -128,6 +218,20 @@ def test_path_traversal_and_symlink_escapes_are_rejected(tmp_path: Path) -> None
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises((rs.ManifestInvalidError, rs.PathEscapeError)):
         rs.inspect_repository(other)
+
+
+def test_broken_nearest_manifest_symlink_prevents_parent_fallback(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    _git_init(parent)
+    rs.bootstrap_repository(parent, repo_id="repo_parent_authority")
+
+    nested = parent / "nested"
+    marker_dir = nested / rs.HUB_DIRNAME
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "project.json").symlink_to(nested / "missing-project.json")
+
+    with pytest.raises(rs.PathEscapeError, match="marker_symlink_component"):
+        rs.resolve_repository_root(cwd=nested, env={})
 
 
 def test_bootstrap_does_not_discover_or_adopt_a_planted_legacy_path(tmp_path: Path) -> None:
