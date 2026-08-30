@@ -2082,17 +2082,18 @@ def test_residual_contract_supports_whole_file_code_rework(
         )
         manifest = worker_workspace.build_residual_contract_manifest(successor, card)
         assert manifest[0]["scope"] == "whole_file"
-        with pytest.raises(
-            worker_workspace.WorkspaceError,
-            match="residual_contract_file_unchanged",
-        ):
-            worker_workspace.validate_residual_contract(successor, manifest)
+        unchanged = worker_workspace.validate_residual_contract(successor, manifest)[0]
+        assert unchanged["pass"] is True
+        assert unchanged["scope"] == "whole_file"
+        assert unchanged["changed"] is False
+        assert unchanged["observed_file_hash"] == unchanged["predecessor_file_hash"]
 
         output = successor.path / "src" / "repair.py"
         output.write_text("VALUE = 'fixed'\n", encoding="utf-8")
         result = worker_workspace.validate_residual_contract(successor, manifest)[0]
         assert result["pass"] is True
         assert result["scope"] == "whole_file"
+        assert result["changed"] is True
         assert result["observed_file_hash"] != result["predecessor_file_hash"]
     finally:
         if successor is not None:

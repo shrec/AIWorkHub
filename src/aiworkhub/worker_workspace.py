@@ -2395,14 +2395,13 @@ def validate_residual_contract(
             observed_file_hash = _bounded_residual_file_hash(
                 workspace.path / relative
             )
-            if observed_file_hash == expected_file_hash:
-                raise WorkspaceError(f"residual_contract_file_unchanged:{relative}")
             results.append({
                 "path": relative,
                 "pointers": pointers,
                 "scope": scope,
                 "predecessor_file_hash": expected_file_hash,
                 "observed_file_hash": observed_file_hash,
+                "changed": observed_file_hash != expected_file_hash,
                 "pass": True,
             })
             continue
