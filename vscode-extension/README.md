@@ -139,7 +139,7 @@ port, expose a LAN service or require an AIWorkHub cloud account.
 - Send focused code fragments through staged semantic edits and let the local
   bridge assemble the hash-bound final envelope without model-side full-file
   regeneration.
-- Use 31 bounded source-intelligence modes for symbols, calls, tests, impact,
+- Use 37 bounded source-intelligence modes for symbols, calls, tests, impact,
   complexity, ownership, hotspots, gaps and task-shaped context bundles.
 - Preserve continuity through Session Manager, AI Memory and KB.
 - Review diffs, tests, logs, artifacts, approval history and deterministic
