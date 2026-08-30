@@ -12,6 +12,7 @@ Run: python3 -m pytest -q tests/test_source_graph_single_file_index.py
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -55,6 +56,13 @@ def _edge_count_for_file(conn, file_path: str) -> int:
     return conn.execute(
         "SELECT COUNT(*) FROM edges WHERE file_path=?", (file_path,)
     ).fetchone()[0]
+
+
+def _open_fd_count() -> int:
+    proc_fd = Path("/proc/self/fd")
+    if not proc_fd.exists():
+        pytest.skip("/proc/self/fd is unavailable")
+    return len(os.listdir(proc_fd))
 
 
 # ---------------------------------------------------------------------------
@@ -680,6 +688,540 @@ def test_index_file_failure_rolls_back_rows_and_mutation_marker(tmp_path, monkey
             "SELECT value FROM meta WHERE key='single_file_last_mutation'"
         ).fetchone()[0] == original_marker
         assert _entity_count_for_file(conn, "stable.py") >= 1
+    finally:
+        conn.close()
+
+
+def test_extract_file_from_bytes_matches_extract_file_for_same_bytes(tmp_path):
+    repo = _new_repo(tmp_path, "from_bytes_parity")
+    source = "def parity():\n    return 1\n"
+    target = repo / "parity.py"
+    _write(target, source)
+
+    from_path = sg.sgast.extract_file(repo, target, build_revision=sg.BUILD_REVISION)
+    from_bytes = sg.sgast.extract_file_from_bytes(
+        repo,
+        target,
+        source.encode("utf-8"),
+        build_revision=sg.BUILD_REVISION,
+    )
+
+    assert from_bytes == from_path
+
+
+def test_index_file_fails_closed_when_no_safe_nofollow_authority(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "no_nofollow")
+    source = "def blocked():\n    return 1\n"
+    _write(repo / "blocked.py", source)
+    monkeypatch.delattr(sg.os, "O_NOFOLLOW", raising=False)
+
+    with pytest.raises(sg.SourceGraphError, match="safe_open_unsupported"):
+        sg.index_file(repo, "blocked.py", _sha256(source))
+
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        assert _entity_count_for_file(conn, "blocked.py") == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM files WHERE file_path='blocked.py'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_index_file_fails_closed_when_nofollow_flag_is_zero(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "zero_nofollow")
+    source = "def blocked_zero():\n    return 1\n"
+    _write(repo / "blocked_zero.py", source)
+    monkeypatch.setattr(sg.os, "O_NOFOLLOW", 0, raising=False)
+
+    with pytest.raises(sg.SourceGraphError, match="safe_open_unsupported"):
+        sg.index_file(repo, "blocked_zero.py", _sha256(source))
+
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        assert _entity_count_for_file(conn, "blocked_zero.py") == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM files WHERE file_path='blocked_zero.py'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_index_file_descriptor_chain_does_not_leak_success_or_parent_failure(
+    tmp_path,
+):
+    repo = _new_repo(tmp_path, "descriptor_chain")
+    source = "def nested_descriptor_chain():\n    return 1\n"
+    _write(repo / "pkg" / "nested" / "target.py", source)
+
+    before = _open_fd_count()
+    result = sg.index_file(repo, "pkg/nested/target.py", _sha256(source))
+    after_success = _open_fd_count()
+
+    assert result["ok"] is True
+    assert after_success == before
+
+    outside = tmp_path / "outside_descriptor_chain"
+    _write(outside / "target.py", source)
+    real_validate = sg._validate_single_file_path
+    swapped = False
+
+    def swap_parent_after_validation(repo_root: Path, path: str) -> Path:
+        nonlocal swapped
+        resolved = real_validate(repo_root, path)
+        if not swapped:
+            swapped = True
+            (repo / "pkg" / "nested").rename(repo / "pkg" / "nested.original")
+            (repo / "pkg" / "nested").symlink_to(outside, target_is_directory=True)
+        return resolved
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            sg, "_validate_single_file_path", swap_parent_after_validation
+        )
+        with pytest.raises(sg.SourceGraphError, match="symlink|unreadable"):
+            sg.index_file(repo, "pkg/nested/target.py", _sha256(source))
+
+    assert swapped is True
+    assert _open_fd_count() == before
+
+
+def test_index_file_rejects_oversized_fstat_before_read(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "oversized_before_read")
+    source = "x = 1\n"
+    _write(repo / "too_big.py", source)
+    monkeypatch.setattr(sg, "SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT", 4)
+    read_calls = []
+    real_read = sg.os.read
+
+    def record_read(fd: int, size: int) -> bytes:
+        read_calls.append((fd, size))
+        return real_read(fd, size)
+
+    monkeypatch.setattr(sg.os, "read", record_read)
+    with pytest.raises(sg.SourceGraphError, match="too_large"):
+        sg.index_file(repo, "too_big.py", _sha256(source))
+
+    assert read_calls == []
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        assert _entity_count_for_file(conn, "too_big.py") == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM files WHERE file_path='too_big.py'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_index_file_rejects_cumulative_overrun_and_rolls_back(
+    tmp_path, monkeypatch,
+):
+    repo = _new_repo(tmp_path, "cumulative_overrun")
+    original = "def stable():\n    return 1\n"
+    _write(repo / "stable.py", original)
+    sg.index_file(repo, "stable.py", _sha256(original))
+    db_path = sg.resolve_db_path(repo)
+
+    conn = sg.connect(db_path)
+    try:
+        original_file_row = conn.execute(
+            "SELECT source_hash, file_size FROM files WHERE file_path='stable.py'"
+        ).fetchone()
+        original_entities = conn.execute(
+            """
+            SELECT kind, name, qualname, line_start, line_end, source_hash
+            FROM entities
+            WHERE file_path='stable.py'
+            ORDER BY kind, name, qualname, line_start, line_end
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    updated = "def stable():\n    return 222222\n"
+    _write(repo / "stable.py", updated)
+    monkeypatch.setattr(sg, "SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT", 24)
+    real_fstat = sg.os.fstat
+
+    class FakeRegularFileStat:
+        def __init__(self, original_stat):
+            self.st_mode = original_stat.st_mode
+            self.st_size = 24
+            self.st_mtime_ns = original_stat.st_mtime_ns
+
+    def lie_about_regular_file_size(fd: int):
+        file_stat = real_fstat(fd)
+        if sg.stat.S_ISREG(file_stat.st_mode):
+            return FakeRegularFileStat(file_stat)
+        return file_stat
+
+    monkeypatch.setattr(sg.os, "fstat", lie_about_regular_file_size)
+    with pytest.raises(sg.SourceGraphError, match="too_large"):
+        sg.index_file(repo, "stable.py", _sha256(updated))
+    monkeypatch.setattr(sg.os, "fstat", real_fstat)
+
+    conn = sg.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT source_hash, file_size FROM files WHERE file_path='stable.py'"
+        ).fetchone() == original_file_row
+        assert conn.execute(
+            """
+            SELECT kind, name, qualname, line_start, line_end, source_hash
+            FROM entities
+            WHERE file_path='stable.py'
+            ORDER BY kind, name, qualname, line_start, line_end
+            """
+        ).fetchall() == original_entities
+    finally:
+        conn.close()
+
+
+def test_index_file_accepts_exactly_at_authenticated_byte_limit(
+    tmp_path, monkeypatch,
+):
+    repo = _new_repo(tmp_path, "at_limit")
+    source = "def at_limit():\n    return 1\n"
+    _write(repo / "at_limit.py", source)
+    source_bytes = source.encode("utf-8")
+    monkeypatch.setattr(
+        sg, "SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT", len(source_bytes)
+    )
+
+    result = sg.index_file(repo, "at_limit.py", hashlib.sha256(source_bytes).hexdigest())
+
+    assert result["ok"] is True
+    assert result["source_hash"] == hashlib.sha256(source_bytes).hexdigest()
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        file_row = conn.execute(
+            "SELECT source_hash, file_size FROM files WHERE file_path='at_limit.py'"
+        ).fetchone()
+        assert file_row["source_hash"] == result["source_hash"]
+        assert file_row["file_size"] == len(source_bytes)
+        assert _entity_count_for_file(conn, "at_limit.py") >= 1
+    finally:
+        conn.close()
+
+
+def test_index_file_uses_authenticated_bytes_after_pathname_swap(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "same_bytes_barrier")
+    original = "def original_symbol():\n    return 'original'\n"
+    replacement = "def swapped_symbol():\n    return 'replacement'\n"
+    target = repo / "victim.py"
+    _write(target, original)
+    real_from_bytes = sg.sgast.extract_file_from_bytes
+    swapped = False
+
+    def swap_before_extract(repo_root, file_path, raw, *, build_revision):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            _write(file_path, replacement)
+        return real_from_bytes(
+            repo_root,
+            file_path,
+            raw,
+            build_revision=build_revision,
+        )
+
+    monkeypatch.setattr(sg.sgast, "extract_file_from_bytes", swap_before_extract)
+    result = sg.index_file(repo, "victim.py", _sha256(original))
+
+    assert swapped is True
+    assert result["source_hash"] == _sha256(original)
+    assert result["entities"] >= 1
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        file_row = conn.execute(
+            "SELECT source_hash, file_size FROM files WHERE file_path='victim.py'"
+        ).fetchone()
+        assert file_row["source_hash"] == _sha256(original)
+        assert file_row["file_size"] == len(original.encode("utf-8"))
+        names = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM entities WHERE file_path='victim.py'"
+            )
+        }
+        assert "original_symbol" in names
+        assert "swapped_symbol" not in names
+    finally:
+        conn.close()
+
+
+def test_index_file_rejects_intermediate_parent_swap_to_symlink(
+    tmp_path, monkeypatch,
+):
+    repo = _new_repo(tmp_path, "parent_swap")
+    original = "def authenticated_original():\n    return 'repo'\n"
+    outside = "def outside_parent_swap():\n    return 'outside'\n"
+    target_dir = repo / "nested"
+    target = target_dir / "victim.py"
+    _write(target, original)
+    outside_dir = tmp_path / "outside_parent"
+    _write(outside_dir / "victim.py", outside)
+
+    original_hash = _sha256(original)
+    baseline_result = sg.index_file(repo, "nested/victim.py", original_hash)
+    assert baseline_result["source_hash"] == original_hash
+
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        baseline_file_row = conn.execute(
+            """
+            SELECT file_path, language, status, source_hash, file_size
+            FROM files
+            WHERE file_path='nested/victim.py'
+            """
+        ).fetchone()
+        baseline_entities = conn.execute(
+            """
+            SELECT kind, name, qualname, line_start, line_end, source_hash
+            FROM entities
+            WHERE file_path='nested/victim.py'
+            ORDER BY kind, name, qualname, line_start, line_end
+            """
+        ).fetchall()
+        assert baseline_file_row is not None
+        assert baseline_file_row[3] == original_hash
+        assert baseline_entities
+        assert sg.find(conn, "authenticated_original")
+    finally:
+        conn.close()
+
+    real_validate = sg._validate_single_file_path
+    swapped = False
+
+    def swap_parent_after_validation(repo_root: Path, path: str) -> Path:
+        nonlocal swapped
+        resolved = real_validate(repo_root, path)
+        if not swapped:
+            swapped = True
+            target_dir.rename(repo / "nested.original")
+            target_dir.symlink_to(outside_dir, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(
+        sg, "_validate_single_file_path", swap_parent_after_validation
+    )
+    with pytest.raises(sg.SourceGraphError, match="symlink|unreadable"):
+        sg.index_file(repo, "nested/victim.py", _sha256(outside))
+
+    assert swapped is True
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        assert conn.execute(
+            """
+            SELECT file_path, language, status, source_hash, file_size
+            FROM files
+            WHERE file_path='nested/victim.py'
+            """
+        ).fetchone() == baseline_file_row
+        assert conn.execute(
+            """
+            SELECT kind, name, qualname, line_start, line_end, source_hash
+            FROM entities
+            WHERE file_path='nested/victim.py'
+            ORDER BY kind, name, qualname, line_start, line_end
+            """
+        ).fetchall() == baseline_entities
+        assert sg.find(conn, "authenticated_original")
+        assert not sg.find(conn, "outside_parent_swap")
+    finally:
+        conn.close()
+
+
+def test_index_file_rejects_repo_root_ancestor_swap_to_symlink(
+    tmp_path, monkeypatch,
+):
+    root_parent = tmp_path / "stable_parent"
+    repo = root_parent / "repo"
+    repo.mkdir(parents=True)
+    bootstrap_repository(repo, repo_name="repo")
+    original = "def authenticated_ancestor_original():\n    return 'repo'\n"
+    outside = "def outside_ancestor_swap():\n    return 'outside'\n"
+    _write(repo / "victim.py", original)
+
+    outside_parent = tmp_path / "outside_parent"
+    outside_repo = outside_parent / "repo"
+    _write(outside_repo / "victim.py", outside)
+
+    original_hash = _sha256(original)
+    baseline_result = sg.index_file(repo, "victim.py", original_hash)
+    assert baseline_result["source_hash"] == original_hash
+
+    db_path = sg.resolve_db_path(repo)
+    conn = sg.connect(db_path, read_only=True)
+    try:
+        baseline_file_row = conn.execute(
+            """
+            SELECT file_path, language, status, source_hash, file_size
+            FROM files
+            WHERE file_path='victim.py'
+            """
+        ).fetchone()
+        baseline_entities = conn.execute(
+            """
+            SELECT kind, name, qualname, line_start, line_end, source_hash
+            FROM entities
+            WHERE file_path='victim.py'
+            ORDER BY kind, name, qualname, line_start, line_end
+            """
+        ).fetchall()
+        assert baseline_file_row is not None
+        assert baseline_file_row[3] == original_hash
+        assert baseline_entities
+        assert sg.find(conn, "authenticated_ancestor_original")
+    finally:
+        conn.close()
+
+    moved_parent = tmp_path / "stable_parent.original"
+    original_db_path = moved_parent / db_path.relative_to(root_parent)
+    real_validate = sg._validate_single_file_path
+    swapped = False
+
+    def swap_ancestor_after_validation(repo_root: Path, path: str) -> Path:
+        nonlocal swapped
+        resolved = real_validate(repo_root, path)
+        if not swapped:
+            swapped = True
+            root_parent.rename(moved_parent)
+            root_parent.symlink_to(outside_parent, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(
+        sg, "_validate_single_file_path", swap_ancestor_after_validation
+    )
+    with pytest.raises(sg.SourceGraphError, match="symlink|unreadable"):
+        sg.index_file(repo, "victim.py", _sha256(outside))
+
+    assert swapped is True
+    conn = sg.connect(original_db_path, read_only=True)
+    try:
+        assert conn.execute(
+            """
+            SELECT file_path, language, status, source_hash, file_size
+            FROM files
+            WHERE file_path='victim.py'
+            """
+        ).fetchone() == baseline_file_row
+        assert conn.execute(
+            """
+            SELECT kind, name, qualname, line_start, line_end, source_hash
+            FROM entities
+            WHERE file_path='victim.py'
+            ORDER BY kind, name, qualname, line_start, line_end
+            """
+        ).fetchall() == baseline_entities
+        assert sg.find(conn, "authenticated_ancestor_original")
+        assert not sg.find(conn, "outside_ancestor_swap")
+    finally:
+        conn.close()
+
+
+def test_index_file_extraction_error_fails_closed_without_partial_mutation(tmp_path):
+    repo = _new_repo(tmp_path, "extract_fail_closed")
+    original = "def stable():\n    return 1\n"
+    target = repo / "stable.py"
+    _write(target, original)
+    sg.index_file(repo, "stable.py", _sha256(original))
+    db_path = sg.resolve_db_path(repo)
+
+    conn = sg.connect(db_path)
+    try:
+        before_hash = conn.execute(
+            "SELECT source_hash FROM files WHERE file_path='stable.py'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    broken = "def stable(:\n"
+    _write(target, broken)
+    with pytest.raises(sg.SourceGraphError, match="extraction_failed"):
+        sg.index_file(repo, "stable.py", _sha256(broken))
+
+    conn = sg.connect(db_path, read_only=True)
+    try:
+        assert conn.execute(
+            "SELECT source_hash FROM files WHERE file_path='stable.py'"
+        ).fetchone()[0] == before_hash
+        assert _entity_count_for_file(conn, "stable.py") >= 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("fail_on_read_call", [1, 2])
+def test_index_file_read_error_fails_closed_without_partial_mutation(
+    tmp_path,
+    monkeypatch,
+    fail_on_read_call,
+):
+    repo = _new_repo(tmp_path, f"read_fail_{fail_on_read_call}")
+    original = "def stable_read():\n    return 1\n"
+    target = repo / "stable.py"
+    _write(target, original)
+    sg.index_file(repo, "stable.py", _sha256(original))
+    db_path = sg.resolve_db_path(repo)
+
+    conn = sg.connect(db_path, read_only=True)
+    try:
+        before_file_row = conn.execute(
+            """
+            SELECT file_path, language, status, source_hash, file_size
+            FROM files
+            WHERE file_path='stable.py'
+            """
+        ).fetchone()
+        before_entities = conn.execute(
+            """
+            SELECT kind, name, qualname, line_start, line_end, source_hash
+            FROM entities
+            WHERE file_path='stable.py'
+            ORDER BY kind, name, qualname, line_start, line_end
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    updated = "def stable_read():\n    return 2\n"
+    _write(target, updated)
+    real_read = sg.os.read
+    read_calls = 0
+
+    def failing_read(fd: int, length: int) -> bytes:
+        nonlocal read_calls
+        read_calls += 1
+        if read_calls == fail_on_read_call:
+            raise OSError(errno.EIO, "synthetic read failure")
+        return real_read(fd, length)
+
+    monkeypatch.setattr(sg.os, "read", failing_read)
+    with pytest.raises(
+        sg.SourceGraphError,
+        match="source_graph_single_file_unreadable:stable.py",
+    ) as exc_info:
+        sg.index_file(repo, "stable.py", _sha256(updated))
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert read_calls == fail_on_read_call
+
+    conn = sg.connect(db_path, read_only=True)
+    try:
+        assert conn.execute(
+            """
+            SELECT file_path, language, status, source_hash, file_size
+            FROM files
+            WHERE file_path='stable.py'
+            """
+        ).fetchone() == before_file_row
+        assert conn.execute(
+            """
+            SELECT kind, name, qualname, line_start, line_end, source_hash
+            FROM entities
+            WHERE file_path='stable.py'
+            ORDER BY kind, name, qualname, line_start, line_end
+            """
+        ).fetchall() == before_entities
     finally:
         conn.close()
 

@@ -97,6 +97,7 @@ MAX_SOURCE_GRAPH_HASH_WORKERS = 16
 MIN_PARALLEL_HASH_FILES = 8
 MIN_PARALLEL_HASH_BYTES = 256 * 1024
 SOURCE_GRAPH_HASH_STABLE_READ_ATTEMPTS = 3
+SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT = 64 * 1024 * 1024
 _PYTHON_DOTTED_CALL_RE = re.compile(
     r"\b([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)+)\s*\("
 )
@@ -4212,6 +4213,189 @@ def _validate_single_file_path(repo_root: Path, path: str) -> Path:
     return candidate
 
 
+@dataclass(frozen=True, slots=True)
+class _AuthenticatedFileSnapshot:
+    raw: bytes
+    source_hash: str
+    file_size: int
+    mtime_ns: int
+
+
+def _open_nofollow_directory_component(
+    part: str,
+    *,
+    parent_fd: int,
+    dir_flags: int,
+    error_display: str | Path,
+) -> int:
+    """Open one directory component and transfer ownership to the caller."""
+
+    try:
+        next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
+    except OSError as exc:
+        reason = "symlink" if exc.errno == errno.ELOOP else "unreadable"
+        raise SourceGraphError(
+            f"source_graph_single_file_{reason}:{error_display}"
+        ) from exc
+    try:
+        dir_stat = os.fstat(next_fd)
+    except OSError as exc:
+        os.close(next_fd)
+        raise SourceGraphError(
+            f"source_graph_single_file_unreadable:{error_display}"
+        ) from exc
+    if not stat.S_ISDIR(dir_stat.st_mode):
+        os.close(next_fd)
+        raise SourceGraphError(
+            f"source_graph_single_file_non_directory:{error_display}"
+        )
+    return next_fd
+
+
+def _open_authenticated_regular_file_snapshot(
+    repo_root: Path,
+    rel_path: Path,
+) -> _AuthenticatedFileSnapshot:
+    """Read one full-component no-follow regular-file snapshot."""
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if (
+        isinstance(nofollow, bool)
+        or not isinstance(nofollow, int)
+        or nofollow <= 0
+    ):
+        raise SourceGraphError(
+            "source_graph_single_file_safe_open_unsupported:O_NOFOLLOW"
+        )
+    directory = getattr(os, "O_DIRECTORY", None)
+    if not isinstance(directory, int):
+        raise SourceGraphError(
+            "source_graph_single_file_safe_open_unsupported:O_DIRECTORY"
+        )
+    if os.open not in os.supports_dir_fd:
+        raise SourceGraphError(
+            "source_graph_single_file_safe_open_unsupported:dir_fd"
+        )
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    dir_flags = os.O_RDONLY | nofollow | directory
+    if isinstance(cloexec, int):
+        dir_flags |= cloexec
+
+    descriptors: list[int] = []
+    rel_display = rel_path.as_posix()
+    try:
+        try:
+            root_fd = os.open(os.sep, dir_flags)
+        except OSError as exc:
+            raise SourceGraphError(
+                f"source_graph_single_file_unreadable:{repo_root}"
+            ) from exc
+        descriptors.append(root_fd)
+
+        parent_fd = root_fd
+        for part in repo_root.parts[1:]:
+            next_fd = _open_nofollow_directory_component(
+                part,
+                parent_fd=parent_fd,
+                dir_flags=dir_flags,
+                error_display=repo_root,
+            )
+            descriptors.append(next_fd)
+            parent_fd = next_fd
+
+        parts = rel_path.parts
+        for part in parts[:-1]:
+            next_fd = _open_nofollow_directory_component(
+                part,
+                parent_fd=parent_fd,
+                dir_flags=dir_flags,
+                error_display=rel_display,
+            )
+            descriptors.append(next_fd)
+            parent_fd = next_fd
+
+        file_flags = os.O_RDONLY | nofollow
+        if isinstance(cloexec, int):
+            file_flags |= cloexec
+        try:
+            fd = os.open(parts[-1], file_flags, dir_fd=parent_fd)
+        except OSError as exc:
+            reason = "symlink" if exc.errno == errno.ELOOP else "unreadable"
+            raise SourceGraphError(
+                f"source_graph_single_file_{reason}:{rel_display}"
+            ) from exc
+        descriptors.append(fd)
+    except Exception:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+    try:
+        try:
+            file_stat = os.fstat(fd)
+        except OSError as exc:
+            raise SourceGraphError(
+                f"source_graph_single_file_unreadable:{rel_display}"
+            ) from exc
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise SourceGraphError(
+                f"source_graph_single_file_non_regular:{rel_display}"
+            )
+        file_size = int(file_stat.st_size)
+        limit = SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT
+        if file_size > limit:
+            raise SourceGraphError(
+                f"source_graph_single_file_too_large:{rel_display}:"
+                f"size={file_size} limit={limit}"
+            )
+        raw = bytearray()
+        try:
+            while True:
+                read_size = min(1024 * 1024, limit + 1 - len(raw))
+                if read_size <= 0:
+                    raise SourceGraphError(
+                        f"source_graph_single_file_too_large:{rel_display}:"
+                        f"size>{limit} limit={limit}"
+                    )
+                chunk = os.read(fd, read_size)
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                if len(raw) > limit:
+                    raise SourceGraphError(
+                        f"source_graph_single_file_too_large:{rel_display}:"
+                        f"size>{limit} limit={limit}"
+                    )
+                if len(raw) > file_size:
+                    raise SourceGraphError(
+                        f"source_graph_single_file_unstable_size:{rel_display}"
+                    )
+        except OSError as exc:
+            raise SourceGraphError(
+                f"source_graph_single_file_unreadable:{rel_display}"
+            ) from exc
+        if len(raw) != file_size:
+            raise SourceGraphError(
+                f"source_graph_single_file_unstable_size:{rel_display}"
+            )
+        authenticated = bytes(raw)
+        return _AuthenticatedFileSnapshot(
+            raw=authenticated,
+            source_hash=sgast.sha256_bytes(authenticated),
+            file_size=file_size,
+            mtime_ns=int(file_stat.st_mtime_ns),
+        )
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]:
     """Index exactly one file into the canonical Source Graph.
 
@@ -4235,32 +4419,38 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
             f"source_graph_single_file_unsupported_extension:{suffix}"
         )
 
-    # Compute the actual file hash.
-    try:
-        raw = resolved.read_bytes()
-    except OSError as exc:
-        raise SourceGraphError(
-            f"source_graph_single_file_unreadable:{path}"
-        ) from exc
-    source_hash = sgast.sha256_bytes(raw)
-
     # Fail closed on hash mismatch.
     if not isinstance(expected_hash, str) or not expected_hash:
         raise SourceGraphError(
             "source_graph_single_file_expected_hash_required"
         )
+    snapshot = _open_authenticated_regular_file_snapshot(repo_root, Path(path))
+    source_hash = snapshot.source_hash
     if source_hash != expected_hash:
         raise SourceGraphError(
             f"source_graph_single_file_hash_mismatch:"
             f"expected={expected_hash[:16]} actual={source_hash[:16]}"
         )
 
-    # Extraction.
-    extraction = sgast.extract_file(repo_root, resolved, build_revision=BUILD_REVISION)
+    # Extraction consumes exactly the authenticated bytes above.
+    extraction = sgast.extract_file_from_bytes(
+        repo_root,
+        resolved,
+        snapshot.raw,
+        build_revision=BUILD_REVISION,
+    )
     if extraction.file_path != rel:
         raise SourceGraphError(
             f"source_graph_single_file_path_mismatch:"
             f"expected={rel} returned={extraction.file_path}"
+        )
+    if extraction.source_hash != source_hash:
+        raise SourceGraphError(
+            f"source_graph_single_file_extraction_hash_mismatch:{rel}"
+        )
+    if extraction.status not in {"ok", "file_evidence_only"}:
+        raise SourceGraphError(
+            f"source_graph_single_file_extraction_failed:{rel}:{extraction.status}"
         )
 
     # Acquire writer lease, open connection, mutate exactly one file.
@@ -4287,15 +4477,11 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                     else set()
                 )
                 _invalidate_file(conn, rel)
-                try:
-                    path_stat = resolved.stat()
-                    file_size = int(path_stat.st_size)
-                    mtime_ns = int(path_stat.st_mtime_ns)
-                except OSError:
-                    file_size = -1
-                    mtime_ns = -1
                 inserted_entities, inserted_edges, _dropped = _write_extraction(
-                    conn, extraction, file_size=file_size, mtime_ns=mtime_ns,
+                    conn,
+                    extraction,
+                    file_size=snapshot.file_size,
+                    mtime_ns=snapshot.mtime_ns,
                 )
                 # Re-run cross-file edge resolution exactly as a full build's
                 # tail does. Re-extracting one file drops its own edges back to

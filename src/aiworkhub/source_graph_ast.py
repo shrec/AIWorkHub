@@ -166,6 +166,24 @@ def extract_file(repo_root: Path, file_path: Path, *, build_revision: str) -> Fi
             file_path=rel, language="unknown", status="unreadable_fail_closed",
             source_hash="", error=str(exc),
         )
+    return extract_file_from_bytes(
+        repo_root,
+        file_path,
+        raw,
+        build_revision=build_revision,
+    )
+
+
+def extract_file_from_bytes(
+    repo_root: Path,
+    file_path: Path,
+    raw: bytes,
+    *,
+    build_revision: str,
+) -> FileExtraction:
+    """Extract evidence from an authenticated byte snapshot."""
+
+    rel = file_path.relative_to(repo_root).as_posix()
     source_hash = sha256_bytes(raw)
 
     suffix = file_path.suffix.lower()
