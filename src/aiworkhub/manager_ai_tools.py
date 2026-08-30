@@ -120,6 +120,8 @@ def source_graph_query(
     query: str,
     budget: int = 64,
     target: str | None = None,
+    cursor: str | None = None,
+    continuation_cursor: str | None = None,
     bundle_type: worker_tools.SourceGraphBundleType = "explore",
     workflow_stage: worker_tools.WorkflowStage = "unspecified",
     compact_replay: bool = True,
@@ -127,7 +129,9 @@ def source_graph_query(
     return _invoke(
         lambda ctx: worker_tools.source_graph_query(
             ctx, mode=mode, query=query, budget=budget,
-            target=target, bundle_type=bundle_type, workflow_stage=workflow_stage,
+            target=target, cursor=cursor,
+            continuation_cursor=continuation_cursor,
+            bundle_type=bundle_type, workflow_stage=workflow_stage,
             compact_replay=compact_replay,
         ),
         target=target,

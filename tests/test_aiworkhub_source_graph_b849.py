@@ -4019,3 +4019,654 @@ def test_bodygrep_multi_file_matching_path_peak_releases_previous_text(tmp_path)
     assert result["files_scanned"] == 2
     assert size > 1_000_000, "fixture must be meaningfully large"
     assert peak < size * 2.5, f"peak traced memory {peak} exceeds {size * 2.5}"
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00510: signed, byte-preserving, bounded continuation pagination
+# ---------------------------------------------------------------------------
+
+
+def _continuation_ctx(
+    repo: Path, *, task_id: str = "t-cont", request_id: str = "req-cont",
+) -> w.WorkerToolContext:
+    return w.WorkerToolContext(
+        task_id=task_id, runner="r", topic="topic", request_id=request_id,
+        repo=repo, authority_repo=repo, source_graph_targets=(),
+        session_topic="topic", audit_ledger_path=None, audit_hmac_key_path=None,
+    )
+
+
+def _big_body_function(name: str, lines: int = 50) -> str:
+    return (
+        f"def {name}():\n"
+        + "".join(
+            f"    # padding line {i} to force an outer-sized response\n"
+            for i in range(lines)
+        )
+        + "    return 1\n"
+    )
+
+
+def _rework_continuation_ctx(
+    tmp_path: Path,
+    *,
+    predecessor_request: str = "predecessor-request",
+) -> tuple[w.WorkerToolContext, dict, Path]:
+    authority = _new_repo(tmp_path, "rework_continuation_authority")
+    workspace = _new_repo(tmp_path, "rework_continuation_workspace")
+    _write(authority / "src" / "mod.py", "def canonical_only():\n    return 1\n")
+    sg.build_index(authority, incremental=False)
+
+    updated = _big_body_function("overlay_target", lines=90).encode("utf-8")
+    target = workspace / "src" / "mod.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(updated)
+    packet = json.loads(
+        materialize_rework_overlay(
+            "successor-request",
+            "same-task",
+            predecessor_request,
+            "same-task",
+            authority,
+            [("src/mod.py", hashlib.sha256(updated).hexdigest(), updated)],
+        )
+    )
+    runtime = tmp_path / f"runtime-{predecessor_request}"
+    runtime.mkdir()
+    packet_path = runtime / "rework_overlay.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = w.WorkerToolContext(
+        task_id="same-task",
+        runner="runner",
+        topic="task_mcp",
+        request_id="successor-request",
+        repo=workspace,
+        authority_repo=authority,
+        source_graph_targets=("src/mod.py",),
+        allowed_writes=("src/mod.py",),
+        session_topic="task_mcp",
+        audit_ledger_path=None,
+        audit_hmac_key_path=None,
+        rework_overlay_packet=packet,
+        rework_overlay_packet_path=packet_path,
+    )
+    return ctx, packet, target
+
+
+def _compact_response_bytes(result: dict) -> int:
+    return len(
+        json.dumps(
+            result, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    )
+
+
+def test_source_graph_continuation_reassembles_exact_canonical_bytes(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "continuation_roundtrip")
+    _write(repo / "pkg" / "big.py", _big_body_function("big_target"))
+    sg.build_index(repo, incremental=True)
+    ctx = _continuation_ctx(repo)
+    monkeypatch.setattr(w, "_source_graph_output_cap", lambda mode: 2048)
+
+    first = w.source_graph_query(ctx, mode="body", query="big_target", budget=8)
+    assert first["ok"] is True
+    assert first["outer_truncated"] is True
+    assert first["internal_truncated"] is False
+    assert first["truncated"] is True
+    assert first["content_encoding"] == "base64"
+    assert first["page_index"] == 0
+    assert first["page_count"] > 1
+    assert first["continuation_cursor"]
+    assert _compact_response_bytes(first) <= first["output_cap_bytes"]
+
+    chunks = [base64.b64decode(first["content"])]
+    indexes = [first["page_index"]]
+    shas = [first["page_sha256"]]
+    cursor = first["continuation_cursor"]
+    last = first
+    while cursor:
+        page = w.source_graph_query(
+            ctx, mode="body", query="big_target", budget=8, continuation_cursor=cursor,
+        )
+        assert page["ok"] is True
+        assert page["content_encoding"] == "base64"
+        assert _compact_response_bytes(page) <= page["output_cap_bytes"]
+        chunks.append(base64.b64decode(page["content"]))
+        indexes.append(page["page_index"])
+        shas.append(page["page_sha256"])
+        cursor = page["continuation_cursor"]
+        last = page
+
+    assert indexes == list(range(first["page_count"]))
+    assert len(chunks) == first["page_count"]
+    assert [hashlib.sha256(c).hexdigest() for c in chunks] == shas
+    reassembled = b"".join(chunks)
+    assert len(reassembled) == first["full_bytes"]
+    assert hashlib.sha256(reassembled).hexdigest() == first["content_sha256"]
+    assert last["continuation_cursor"] is None
+    assert last["outer_truncated"] is False
+    assert last["truncated"] is False
+
+
+def test_source_graph_continuation_replay_uses_stored_chunk_metadata(
+    tmp_path, monkeypatch,
+):
+    repo = _new_repo(tmp_path, "continuation_stored_chunk")
+    _write(repo / "pkg" / "big.py", _big_body_function("stored_chunk_target"))
+    sg.build_index(repo, incremental=True)
+    ctx = _continuation_ctx(repo)
+    monkeypatch.setattr(w, "_source_graph_output_cap", lambda mode: 2048)
+
+    calls = 0
+    original_sizer = w._continuation_chunk_size_for_cap
+
+    def counted_sizer(**kwargs):
+        nonlocal calls
+        calls += 1
+        return original_sizer(**kwargs)
+
+    monkeypatch.setattr(w, "_continuation_chunk_size_for_cap", counted_sizer)
+    first = w.source_graph_query(
+        ctx, mode="body", query="stored_chunk_target", budget=8,
+    )
+    assert first["ok"] is True
+    assert first["continuation_cursor"]
+    assert calls == 1
+
+    def forbidden_sizer(**_kwargs):
+        raise AssertionError("continuation replay recomputed chunk size")
+
+    monkeypatch.setattr(w, "_continuation_chunk_size_for_cap", forbidden_sizer)
+    page = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="stored_chunk_target",
+        budget=8,
+        continuation_cursor=first["continuation_cursor"],
+    )
+
+    assert page["ok"] is True
+    assert page["page_index"] == 1
+    assert page["page_count"] == first["page_count"]
+    assert page["full_bytes"] == first["full_bytes"]
+
+
+@pytest.mark.parametrize("cap", [1536, 2048, 3072])
+def test_source_graph_continuation_pages_fit_supported_low_caps(
+    tmp_path, monkeypatch, cap,
+):
+    repo = _new_repo(tmp_path, f"continuation_low_cap_{cap}")
+    _write(repo / "pkg" / "big.py", _big_body_function("cap_target", lines=120))
+    sg.build_index(repo, incremental=True)
+    ctx = _continuation_ctx(repo)
+    monkeypatch.setattr(w, "_source_graph_output_cap", lambda mode: cap)
+
+    first = w.source_graph_query(ctx, mode="body", query="cap_target", budget=8)
+    assert first["ok"] is True
+    assert first["outer_truncated"] is True
+    assert _compact_response_bytes(first) <= cap
+
+    chunks = [base64.b64decode(first["content"])]
+    pages = [first]
+    cursor = first["continuation_cursor"]
+    while cursor:
+        page = w.source_graph_query(
+            ctx, mode="body", query="cap_target", budget=8,
+            continuation_cursor=cursor,
+        )
+        assert page["ok"] is True
+        assert _compact_response_bytes(page) <= cap
+        pages.append(page)
+        chunks.append(base64.b64decode(page["content"]))
+        cursor = page["continuation_cursor"]
+
+    assert pages[-1]["continuation_cursor"] is None
+    assert pages[-1]["outer_truncated"] is False
+    reassembled = b"".join(chunks)
+    assert len(reassembled) == first["full_bytes"]
+    assert hashlib.sha256(reassembled).hexdigest() == first["content_sha256"]
+
+
+@pytest.mark.parametrize("cap", [3072, 4096, 8192])
+def test_source_graph_continuation_chunk_size_measures_max_metadata(cap):
+    canonical_bytes = json.dumps(
+        {
+            "matches": ["x" * 128 for _ in range(40)],
+            "mode": "body",
+            "query": "q" * w.MAX_QUERY_BYTES,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    content_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+    meta = {
+        "ok": True,
+        "tool": "source_graph",
+        "mode": "body",
+        "workflow_stage": "implementation",
+        "query": "q" * w.MAX_QUERY_BYTES,
+        "target": "t" * 256,
+        "budget": w.MAX_BUDGET,
+        "bundle_type": "explore",
+        "hit_count": w.MAX_BUDGET,
+        "output_cap_bytes": cap,
+        "cache_hit": False,
+        "cache_receipt": False,
+        "authority_source": "rework_overlay",
+        "authority_state": "request_scoped_worktree",
+        "authority_repo": "/" + "r" * 240,
+        "target_request_id": "a" * 128,
+        "target_task_id": "b" * 256,
+        "packet_sha256": "c" * 64,
+        "index_revision": "d" * 128,
+        "index_finished_at": "2026-08-30T19:45:28.980220+00:00",
+        "evidence_counts": {
+            "entity_rows": 999999,
+            "edge_rows": 999999,
+            "file_rows": 999999,
+        },
+        "internal_truncated": False,
+    }
+
+    chunk_size = w._continuation_chunk_size_for_cap(
+        store_id="f" * 32,
+        meta=meta,
+        canonical_bytes=canonical_bytes,
+        content_sha256=content_sha256,
+        output_cap_bytes=cap,
+    )
+    page_count = (len(canonical_bytes) + chunk_size - 1) // chunk_size
+    chunks = []
+    for index in range(page_count):
+        page, byte_count = w._continuation_page_result(
+            store_id="f" * 32,
+            page_index=index,
+            meta=meta,
+            canonical_bytes=canonical_bytes,
+            chunk_size=chunk_size,
+            page_count=page_count,
+            content_sha256=content_sha256,
+        )
+        assert byte_count == len(base64.b64decode(page["content"]))
+        assert _compact_response_bytes(page) <= cap
+        chunks.append(base64.b64decode(page["content"]))
+
+    assert b"".join(chunks) == canonical_bytes
+
+
+def test_source_graph_continuation_max_metadata_fails_closed_below_minimum_cap():
+    canonical_bytes = b'{"matches":["x"],"mode":"body"}'
+    content_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+    meta = {
+        "ok": True,
+        "tool": "source_graph",
+        "mode": "body",
+        "workflow_stage": "implementation",
+        "query": "q" * w.MAX_QUERY_BYTES,
+        "target": "t" * 256,
+        "budget": w.MAX_BUDGET,
+        "bundle_type": "explore",
+        "hit_count": w.MAX_BUDGET,
+        "output_cap_bytes": 2048,
+        "cache_hit": False,
+        "cache_receipt": False,
+        "authority_source": "rework_overlay",
+        "authority_state": "request_scoped_worktree",
+        "authority_repo": "/" + "r" * 240,
+        "target_request_id": "a" * 128,
+        "target_task_id": "b" * 256,
+        "packet_sha256": "c" * 64,
+        "index_revision": "d" * 128,
+        "index_finished_at": "2026-08-30T19:45:28.980220+00:00",
+        "evidence_counts": {
+            "entity_rows": 999999,
+            "edge_rows": 999999,
+            "file_rows": 999999,
+        },
+        "internal_truncated": False,
+    }
+
+    with pytest.raises(w.WorkerToolError, match="continuation_output_cap_too_small"):
+        w._continuation_chunk_size_for_cap(
+            store_id="f" * 32,
+            meta=meta,
+            canonical_bytes=canonical_bytes,
+            content_sha256=content_sha256,
+            output_cap_bytes=2048,
+        )
+
+
+def test_source_graph_continuation_rework_overlay_round_trips_unchanged(
+    tmp_path, monkeypatch,
+):
+    ctx, _packet, _target = _rework_continuation_ctx(tmp_path)
+    monkeypatch.setattr(w, "_source_graph_output_cap", lambda mode: 2048)
+
+    first = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="overlay_target",
+        target="src/mod.py",
+        budget=8,
+        workflow_stage="rework",
+    )
+    assert first["ok"] is True
+    assert first["authority_source"] == "rework_overlay"
+    assert first["outer_truncated"] is True
+
+    page = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="overlay_target",
+        target="src/mod.py",
+        budget=8,
+        workflow_stage="rework",
+        continuation_cursor=first["continuation_cursor"],
+    )
+
+    assert page["ok"] is True
+    assert page["authority_source"] == "rework_overlay"
+    assert page["page_index"] == 1
+
+
+def test_source_graph_continuation_rejects_stale_rework_overlay_predecessor(
+    tmp_path, monkeypatch,
+):
+    ctx, packet, _target = _rework_continuation_ctx(tmp_path)
+    monkeypatch.setattr(w, "_source_graph_output_cap", lambda mode: 2048)
+    first = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="overlay_target",
+        target="src/mod.py",
+        budget=8,
+        workflow_stage="rework",
+    )
+    assert first["continuation_cursor"]
+
+    packet["predecessor_request_id"] = "different-predecessor-request"
+    stale = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="overlay_target",
+        target="src/mod.py",
+        budget=8,
+        workflow_stage="rework",
+        continuation_cursor=first["continuation_cursor"],
+    )
+
+    assert stale["ok"] is False
+    assert stale["reason"] == "continuation_authority_mismatch"
+
+
+def test_source_graph_continuation_rejects_stale_rework_overlay_snapshot(
+    tmp_path, monkeypatch,
+):
+    ctx, _packet, target = _rework_continuation_ctx(tmp_path)
+    monkeypatch.setattr(w, "_source_graph_output_cap", lambda mode: 2048)
+    first = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="overlay_target",
+        target="src/mod.py",
+        budget=8,
+        workflow_stage="rework",
+    )
+    assert first["continuation_cursor"]
+
+    target.write_bytes(
+        (_big_body_function("overlay_target", lines=90) + "# later edit\n").encode("utf-8")
+    )
+    stale = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="overlay_target",
+        target="src/mod.py",
+        budget=8,
+        workflow_stage="rework",
+        continuation_cursor=first["continuation_cursor"],
+    )
+
+    assert stale["ok"] is False
+    assert stale["reason"] == "continuation_authority_mismatch"
+
+
+def test_source_graph_internal_truncation_only_reflects_engine_loss():
+    assert w._payload_internal_truncation({"truncated": True}) is True
+    assert w._payload_internal_truncation({"scan_truncated": True}) is True
+    assert w._payload_internal_truncation({"next_cursor": "abc"}) is True
+    assert w._payload_internal_truncation({"matches": [1, 2, 3]}) is False
+    assert w._payload_internal_truncation({
+        "truncated": False, "scan_truncated": False, "next_cursor": None,
+    }) is False
+    assert w._payload_internal_truncation("not-a-dict") is False
+
+
+def test_source_graph_continuation_cursor_tamper_fails_closed():
+    token = {
+        "schema_id": w.CONTINUATION_SCHEMA_ID,
+        "store_id": "seed",
+        "page_index": 1,
+        "content_sha256": "a" * 64,
+    }
+    cursor = w._encode_continuation_cursor(token)
+    assert w._decode_continuation_cursor(cursor) == token
+
+    raw = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+    raw["hmac_sha256"] = "0" * 64
+    forged = base64.urlsafe_b64encode(
+        json.dumps(
+            raw, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).decode("ascii")
+    assert w._decode_continuation_cursor(forged) is None
+
+    flipped = cursor[:-1] + ("A" if cursor[-1] != "A" else "B")
+    assert w._decode_continuation_cursor(flipped) is None
+    assert w._decode_continuation_cursor("") is None
+    assert w._decode_continuation_cursor("!!!not-base64!!!") is None
+
+
+def test_source_graph_continuation_wrong_schema_fails_closed(tmp_path):
+    repo = _new_repo(tmp_path, "continuation_schema")
+    _write(repo / "pkg" / "a.py", "def present():\n    return 1\n")
+    sg.build_index(repo, incremental=True)
+    ctx = _continuation_ctx(repo)
+    forged = w._encode_continuation_cursor({
+        "schema_id": "not.the.continuation.schema",
+        "store_id": "seed",
+        "page_index": 1,
+        "content_sha256": "a" * 64,
+    })
+    result = w.source_graph_query(
+        ctx, mode="focus", query="present", continuation_cursor=forged,
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "invalid_continuation_cursor"
+
+
+def test_source_graph_continuation_store_count_eviction(monkeypatch):
+    w._continuation_clear()
+    try:
+        monkeypatch.setattr(w, "SOURCE_GRAPH_CONTINUATION_MAX_ENTRIES", 2)
+        monkeypatch.setattr(w, "SOURCE_GRAPH_CONTINUATION_MAX_BYTES", 1024 * 1024)
+        ids = [
+            w._continuation_put(
+                canonical_bytes=b"x" * 100, content_sha256="a" * 64, bind=(), meta={},
+            )
+            for _ in range(3)
+        ]
+        assert len(w._CONTINUATION_STORE) == 2
+        assert w._CONTINUATION_RETAINED_BYTES == 200
+        assert ids[0] not in w._CONTINUATION_STORE
+        assert ids[1] in w._CONTINUATION_STORE
+        assert ids[2] in w._CONTINUATION_STORE
+    finally:
+        w._continuation_clear()
+
+
+def test_source_graph_continuation_store_byte_eviction_exact_accounting(monkeypatch):
+    w._continuation_clear()
+    try:
+        monkeypatch.setattr(w, "SOURCE_GRAPH_CONTINUATION_MAX_ENTRIES", 1024)
+        monkeypatch.setattr(w, "SOURCE_GRAPH_CONTINUATION_MAX_BYTES", 150)
+        for _ in range(3):
+            w._continuation_put(
+                canonical_bytes=b"y" * 100, content_sha256="b" * 64, bind=(), meta={},
+            )
+        assert len(w._CONTINUATION_STORE) == 1
+        assert w._CONTINUATION_RETAINED_BYTES == 100
+
+        sid = w._continuation_put(
+            canonical_bytes=b"z" * 100, content_sha256="c" * 64, bind=(), meta={},
+        )
+        assert w._CONTINUATION_RETAINED_BYTES == 100
+        w._continuation_remove(sid)
+        assert w._CONTINUATION_RETAINED_BYTES == 0
+        assert len(w._CONTINUATION_STORE) == 0
+    finally:
+        w._continuation_clear()
+
+
+def test_source_graph_continuation_oversized_entry_is_not_retained(tmp_path, monkeypatch):
+    w._continuation_clear()
+    try:
+        monkeypatch.setattr(w, "SOURCE_GRAPH_CONTINUATION_MAX_ENTRIES", 1024)
+        monkeypatch.setattr(w, "SOURCE_GRAPH_CONTINUATION_MAX_BYTES", 100)
+        before_bytes = w._CONTINUATION_RETAINED_BYTES
+
+        sid = w._continuation_put(
+            canonical_bytes=b"oversized" * 20,
+            content_sha256="f" * 64,
+            bind=(),
+            meta={},
+        )
+
+        assert sid is None
+        assert w._CONTINUATION_STORE == {}
+        assert w._CONTINUATION_RETAINED_BYTES == before_bytes == 0
+
+        repo = _new_repo(tmp_path, "continuation_oversized")
+        _write(repo / "pkg" / "big.py", _big_body_function("oversized_target"))
+        sg.build_index(repo, incremental=True)
+        monkeypatch.setattr(w, "_source_graph_output_cap", lambda mode: 80)
+        result = w.source_graph_query(
+            _continuation_ctx(repo), mode="body", query="oversized_target", budget=8,
+        )
+
+        assert result["ok"] is False
+        assert result["reason"] == "continuation_payload_too_large"
+        assert w._CONTINUATION_STORE == {}
+        assert w._CONTINUATION_RETAINED_BYTES == 0
+    finally:
+        w._continuation_clear()
+
+
+def test_source_graph_continuation_entry_expires(monkeypatch):
+    w._continuation_clear()
+    try:
+        sid = w._continuation_put(
+            canonical_bytes=b"z" * 50, content_sha256="d" * 64, bind=(), meta={},
+        )
+        assert w._continuation_fetch(sid) is not None
+        w._CONTINUATION_STORE[sid].created_at = (
+            time.time() - w.SOURCE_GRAPH_CONTINUATION_TTL_SECONDS - 1.0
+        )
+        assert w._continuation_fetch(sid) is None
+        assert sid not in w._CONTINUATION_STORE
+        assert w._CONTINUATION_RETAINED_BYTES == 0
+    finally:
+        w._continuation_clear()
+
+
+def test_source_graph_continuation_cursor_binds_to_authority(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "continuation_authority")
+    _write(repo / "pkg" / "auth.py", _big_body_function("auth_target"))
+    sg.build_index(repo, incremental=True)
+    monkeypatch.setattr(w, "_source_graph_output_cap", lambda mode: 2048)
+
+    first = w.source_graph_query(
+        _continuation_ctx(repo), mode="body", query="auth_target", budget=8,
+    )
+    cursor = first["continuation_cursor"]
+    assert cursor
+
+    cross = w.source_graph_query(
+        _continuation_ctx(repo, task_id="t-other"), mode="body", query="auth_target",
+        continuation_cursor=cursor,
+    )
+    assert cross["ok"] is False
+    assert cross["reason"] == "continuation_authority_mismatch"
+
+    real_identity = w._source_graph_index_identity
+
+    def _stale_identity(db_path, *, default_revision):
+        ident = real_identity(db_path, default_revision=default_revision)
+        return {**ident, "build_revision": "stale-revision"}
+
+    monkeypatch.setattr(w, "_source_graph_index_identity", _stale_identity)
+    stale = w.source_graph_query(
+        _continuation_ctx(repo), mode="body", query="auth_target",
+        continuation_cursor=cursor,
+    )
+    assert stale["ok"] is False
+    # A stale generation fails closed at the earliest deterministic authority
+    # boundary: the canonical binding rejects the wrong-revision generation
+    # before the continuation bind comparison can even run.
+    assert stale["reason"] == "authority_source_graph_db_wrong_revision:stale-revision"
+
+
+def test_source_graph_continuation_binds_every_current_request_field(
+    tmp_path, monkeypatch,
+):
+    repo = _new_repo(tmp_path, "continuation_request_fields")
+    _write(repo / "pkg" / "field.py", _big_body_function("field_target"))
+    sg.build_index(repo, incremental=True)
+    monkeypatch.setattr(w, "_source_graph_output_cap", lambda mode: 2048)
+
+    ctx = _continuation_ctx(repo)
+    first = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="field_target",
+        target="pkg/field.py",
+        budget=8,
+        bundle_type="explore",
+        workflow_stage="rework",
+    )
+    cursor = first["continuation_cursor"]
+    assert cursor
+
+    mismatches = [
+        {"mode": "focus"},
+        {"query": "field_target_changed"},
+        {"target": None},
+        {"budget": 9},
+        {"bundle_type": "bugfix"},
+        {"workflow_stage": "implementation"},
+    ]
+    for changed in mismatches:
+        result = w.source_graph_query(
+            ctx,
+            mode=changed.get("mode", "body"),
+            query=changed.get("query", "field_target"),
+            target=changed.get("target", "pkg/field.py"),
+            budget=changed.get("budget", 8),
+            bundle_type=changed.get("bundle_type", "explore"),
+            workflow_stage=changed.get("workflow_stage", "rework"),
+            continuation_cursor=cursor,
+        )
+        assert result["ok"] is False, changed
+        assert result["reason"] == "continuation_authority_mismatch"
+
+
+def test_source_graph_continuation_zero_hit_remains_ok(tmp_path):
+    repo = _new_repo(tmp_path, "continuation_zerohit")
+    _write(repo / "pkg" / "a.py", "def present():\n    return 1\n")
+    sg.build_index(repo, incremental=True)
+    result = w.source_graph_query(
+        _continuation_ctx(repo), mode="focus", query="definitely_absent_symbol", budget=8,
+    )
+    assert result["ok"] is True
+    assert result["hit_count"] == 0
+    assert result["truncated"] is False

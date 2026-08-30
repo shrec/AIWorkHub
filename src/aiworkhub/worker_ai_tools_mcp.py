@@ -74,6 +74,7 @@ just a bare ok/fail bit.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -145,7 +146,9 @@ BOUND_ENV_VARS: tuple[str, ...] = (
 # string with no control/space characters. This mirrors route_identity.py's
 # ``_MAX_PROVIDER_LEN = 32`` so native and text paths share one bound.
 MAX_PROVIDER_CALL_ID_LEN = 32
-PROVENANCE_VALUES: frozenset[str] = frozenset({"prefetch", "live", "cache"})
+PROVENANCE_VALUES: frozenset[str] = frozenset({
+    "prefetch", "live", "cache", "continuation",
+})
 
 # ``\Z`` (not ``$``) and ``fullmatch`` together reject any trailing newline or
 # whitespace so a spoofed identity like ``pci_ok\n`` can never reach the ledger.
@@ -266,6 +269,16 @@ MAX_TOOL_OUTPUT_BYTES = 16 * 1024
 SOURCE_GRAPH_ORIENTATION_OUTPUT_BYTES = 8 * 1024
 SOURCE_GRAPH_ANALYSIS_OUTPUT_BYTES = 12 * 1024
 MAX_RAW_TOOL_OUTPUT_BYTES = 512 * 1024
+# Signed outer-pagination continuation (NF-2026-00510).  When the exact
+# canonical JSON bytes of a Source Graph response exceed a mode's outer output
+# cap, the worker pages those bytes across a signed cursor instead of
+# discarding the tail into a lossy preview.  Continuation state is process-local
+# and bounded by TTL, entry count and retained bytes; every page (initial and
+# continuation) appends an authenticated audit entry.
+CONTINUATION_SCHEMA_ID = "aiworkhub.task_mcp.source_graph_continuation.v1"
+SOURCE_GRAPH_CONTINUATION_TTL_SECONDS = 600.0
+SOURCE_GRAPH_CONTINUATION_MAX_ENTRIES = 256
+SOURCE_GRAPH_CONTINUATION_MAX_BYTES = 8 * 1024 * 1024
 MAX_DECLARED_INPUT_PREVIEW_BYTES = 12 * 1024
 MAX_DECLARED_INPUT_HASH_BYTES = 8 * 1024 * 1024
 MAX_QUALITY_REVIEW_PACKET_BYTES = 256 * 1024
@@ -3297,6 +3310,462 @@ def _apply_rework_overlay_query(
     }
 
 
+# ---------------------------------------------------------------------------
+# Signed outer-pagination continuation (NF-2026-00510)
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class _ContinuationEntry:
+    canonical_bytes: bytes
+    created_at: float
+    content_sha256: str
+    bind: tuple[tuple[str, str], ...]
+    meta: dict[str, Any]
+    chunk_size: int
+    page_count: int
+
+
+_CONTINUATION_STORE: dict[str, _ContinuationEntry] = {}
+_CONTINUATION_RETAINED_BYTES = 0
+_CONTINUATION_LOCK = threading.Lock()
+# Process-local signing secret.  HMAC-authenticates cursors without depending
+# on the per-request audit key (which manager contexts do not carry).  It never
+# leaves the process, so a cursor is unforgeable but not portable across
+# processes -- exactly the bounded, process-local lifetime this feature needs.
+_CONTINUATION_HMAC_KEY: bytes = secrets.token_bytes(32)
+
+
+def _continuation_bind(
+    ctx: WorkerToolContext,
+    *,
+    mode: str,
+    query: str,
+    target: str | None,
+    budget: int,
+    bundle_type: str,
+    workflow_stage: str,
+    content_sha256: str,
+    index_identity: Mapping[str, str],
+    authority_source: str,
+    authority_state: str,
+    authority_repo: str,
+    packet_sha256: str,
+    target_request_id: str,
+    target_task_id: str,
+) -> tuple[tuple[str, str], ...]:
+    """The exact immutable authority a continuation cursor is bound to."""
+    return (
+        ("task_id", str(ctx.task_id)),
+        ("request_id", str(ctx.request_id)),
+        ("repo", str(authority_repo)),
+        ("mode", mode),
+        ("query", query),
+        ("target", target or ""),
+        ("budget", str(budget)),
+        ("bundle_type", bundle_type),
+        ("workflow_stage", workflow_stage),
+        ("authority_source", authority_source),
+        ("authority_state", authority_state),
+        ("index_revision", str(index_identity["build_revision"])),
+        ("index_finished_at", str(index_identity["finished_at"])),
+        ("packet_sha256", packet_sha256),
+        ("target_request_id", target_request_id),
+        ("target_task_id", target_task_id),
+        ("content_sha256", content_sha256),
+    )
+
+
+def _continuation_sign(body: str) -> str:
+    return hmac.new(
+        _CONTINUATION_HMAC_KEY, body.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+def _encode_continuation_cursor(fields: dict[str, Any]) -> str:
+    body = json.dumps(
+        fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    token = {**fields, "hmac_sha256": _continuation_sign(body)}
+    return base64.urlsafe_b64encode(
+        json.dumps(
+            token, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).decode("ascii")
+
+
+def _decode_continuation_cursor(cursor: str) -> dict[str, Any] | None:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
+        decoded = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    presented = decoded.get("hmac_sha256")
+    if not isinstance(presented, str) or len(presented) != 64:
+        return None
+    fields = {key: value for key, value in decoded.items() if key != "hmac_sha256"}
+    body = json.dumps(
+        fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    if not hmac.compare_digest(_continuation_sign(body), presented):
+        return None
+    return fields
+
+
+def _continuation_evict_for(needed: int) -> None:
+    """Evict oldest entries until count and retained-byte bounds both hold."""
+    global _CONTINUATION_RETAINED_BYTES
+    while _CONTINUATION_STORE and (
+        len(_CONTINUATION_STORE) >= SOURCE_GRAPH_CONTINUATION_MAX_ENTRIES
+        or _CONTINUATION_RETAINED_BYTES + needed > SOURCE_GRAPH_CONTINUATION_MAX_BYTES
+    ):
+        oldest_id = min(
+            _CONTINUATION_STORE,
+            key=lambda store_id: _CONTINUATION_STORE[store_id].created_at,
+        )
+        entry = _CONTINUATION_STORE.pop(oldest_id)
+        _CONTINUATION_RETAINED_BYTES -= len(entry.canonical_bytes)
+
+
+def _continuation_put(
+    *,
+    canonical_bytes: bytes,
+    content_sha256: str,
+    bind: tuple[tuple[str, str], ...],
+    meta: dict[str, Any],
+    store_id: str | None = None,
+    chunk_size: int | None = None,
+    page_count: int | None = None,
+) -> str | None:
+    """Store one pageable response and return its bounded store identifier."""
+    global _CONTINUATION_RETAINED_BYTES
+    if len(canonical_bytes) > SOURCE_GRAPH_CONTINUATION_MAX_BYTES:
+        return None
+    if chunk_size is None:
+        chunk_size = max(1, len(canonical_bytes))
+    if page_count is None:
+        page_count = (len(canonical_bytes) + chunk_size - 1) // chunk_size
+    if chunk_size <= 0 or page_count <= 0:
+        return None
+    with _CONTINUATION_LOCK:
+        _continuation_evict_for(len(canonical_bytes))
+        if store_id is None:
+            while True:
+                store_id = secrets.token_hex(16)
+                if store_id not in _CONTINUATION_STORE:
+                    break
+        elif store_id in _CONTINUATION_STORE:
+            return None
+        _CONTINUATION_STORE[store_id] = _ContinuationEntry(
+            canonical_bytes=canonical_bytes,
+            created_at=time.time(),
+            content_sha256=content_sha256,
+            bind=bind,
+            meta=meta,
+            chunk_size=chunk_size,
+            page_count=page_count,
+        )
+        _CONTINUATION_RETAINED_BYTES += len(canonical_bytes)
+    return store_id
+
+
+def _continuation_fetch(store_id: str) -> _ContinuationEntry | None:
+    """Return a live, unexpired entry or evict it and fail closed."""
+    global _CONTINUATION_RETAINED_BYTES
+    with _CONTINUATION_LOCK:
+        entry = _CONTINUATION_STORE.get(store_id)
+        if entry is None:
+            return None
+        if time.time() - entry.created_at > SOURCE_GRAPH_CONTINUATION_TTL_SECONDS:
+            _CONTINUATION_STORE.pop(store_id, None)
+            _CONTINUATION_RETAINED_BYTES -= len(entry.canonical_bytes)
+            return None
+    return entry
+
+
+def _continuation_remove(store_id: str) -> None:
+    """Drop a fully-consumed entry and reclaim its exact retained bytes."""
+    global _CONTINUATION_RETAINED_BYTES
+    with _CONTINUATION_LOCK:
+        entry = _CONTINUATION_STORE.pop(store_id, None)
+        if entry is not None:
+            _CONTINUATION_RETAINED_BYTES -= len(entry.canonical_bytes)
+
+
+def _continuation_clear() -> None:
+    """Test seam: drop every entry and reset retained-byte accounting."""
+    global _CONTINUATION_RETAINED_BYTES
+    with _CONTINUATION_LOCK:
+        _CONTINUATION_STORE.clear()
+        _CONTINUATION_RETAINED_BYTES = 0
+
+
+def _payload_internal_truncation(payload: Any) -> bool:
+    """Report only engine/payload loss, never wrapper response size."""
+    if not isinstance(payload, dict):
+        return False
+    if bool(payload.get("truncated")) or bool(payload.get("scan_truncated")):
+        return True
+    return payload.get("next_cursor") not in (None, "")
+
+
+def _canonical_json_bytes(name: str, text: str) -> bytes:
+    """Return the exact ordered canonical JSON bytes for one tool payload."""
+    start = text.find("{")
+    if start < 0:
+        raise WorkerToolError(f"tool_malformed_json:{name}:missing_object")
+    prefix = text[:start].strip()
+    if prefix and not prefix.startswith("[*] Language:"):
+        raise WorkerToolError(f"tool_malformed_json:{name}:unexpected_prefix")
+    try:
+        payload = json.loads(text[start:])
+    except json.JSONDecodeError as exc:
+        raise WorkerToolError(f"tool_malformed_json:{name}:{exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise WorkerToolError(f"tool_malformed_json:{name}:object_required")
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _continuation_page_result(
+    *,
+    store_id: str,
+    page_index: int,
+    meta: dict[str, Any],
+    canonical_bytes: bytes,
+    chunk_size: int,
+    page_count: int,
+    content_sha256: str,
+) -> tuple[dict[str, Any], int]:
+    """Render one page (base64 chunk) and mint the next cursor when bytes remain."""
+    start = page_index * chunk_size
+    chunk = canonical_bytes[start:start + chunk_size]
+    has_more = start + chunk_size < len(canonical_bytes)
+    if has_more:
+        next_cursor = _encode_continuation_cursor({
+            "schema_id": CONTINUATION_SCHEMA_ID,
+            "store_id": store_id,
+            "page_index": page_index + 1,
+            "content_sha256": content_sha256,
+        })
+    else:
+        next_cursor = None
+    result = {
+        **meta,
+        "truncated": bool(meta.get("internal_truncated")) or has_more,
+        "outer_truncated": has_more,
+        "bytes": len(chunk),
+        "content": base64.b64encode(chunk).decode("ascii"),
+        "content_encoding": "base64",
+        "content_sha256": content_sha256,
+        "page_sha256": hashlib.sha256(chunk).hexdigest(),
+        "page_index": page_index,
+        "page_count": page_count,
+        "full_bytes": len(canonical_bytes),
+        "continuation_cursor": next_cursor,
+    }
+    return result, len(chunk)
+
+
+def _serialized_response_bytes(result: Mapping[str, Any]) -> int:
+    return len(
+        json.dumps(
+            result, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    )
+
+
+def _continuation_chunk_size_for_cap(
+    *,
+    store_id: str,
+    meta: dict[str, Any],
+    canonical_bytes: bytes,
+    content_sha256: str,
+    output_cap_bytes: int,
+) -> int:
+    """Return one fixed raw chunk size whose every page serializes under cap."""
+
+    cap = int(output_cap_bytes)
+    if cap <= 0 or not canonical_bytes:
+        raise WorkerToolError("continuation_output_cap_too_small")
+
+    def fits(chunk_size: int) -> bool:
+        page_count = (len(canonical_bytes) + chunk_size - 1) // chunk_size
+        for index in range(page_count):
+            page, _bytes_returned = _continuation_page_result(
+                store_id=store_id,
+                page_index=index,
+                meta=meta,
+                canonical_bytes=canonical_bytes,
+                chunk_size=chunk_size,
+                page_count=page_count,
+                content_sha256=content_sha256,
+            )
+            if _serialized_response_bytes(page) > cap:
+                return False
+        return True
+
+    low, high = 1, len(canonical_bytes)
+    best = 0
+    while low <= high:
+        mid = (low + high) // 2
+        if fits(mid):
+            best = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    if best <= 0:
+        raise WorkerToolError("continuation_output_cap_too_small")
+    return best
+
+
+def _serve_continuation(
+    ctx: WorkerToolContext,
+    *,
+    tool: str,
+    cursor: str,
+    started: float,
+    query_sha256: str,
+    mode: str,
+    query: str,
+    target: str | None,
+    budget: int,
+    bundle_type: str,
+    workflow_stage: str,
+) -> dict[str, Any]:
+    """Serve one continuation page from the bounded process-local store."""
+    fields = _decode_continuation_cursor(cursor)
+    if fields is None or fields.get("schema_id") != CONTINUATION_SCHEMA_ID:
+        return _violation(ctx, tool, "invalid_continuation_cursor")
+    store_id = fields.get("store_id")
+    page_index = fields.get("page_index")
+    content_sha256 = fields.get("content_sha256")
+    if not isinstance(store_id, str) or not store_id:
+        return _violation(ctx, tool, "invalid_continuation_cursor")
+    if (
+        not isinstance(page_index, int)
+        or isinstance(page_index, bool)
+        or page_index < 1
+    ):
+        return _violation(ctx, tool, "invalid_continuation_cursor")
+    if not isinstance(content_sha256, str) or len(content_sha256) != 64:
+        return _violation(ctx, tool, "invalid_continuation_cursor")
+
+    from . import source_graph as _source_graph_mod
+    try:
+        overlay_view = None
+        overlay_target_request_id = ""
+        overlay_target_task_id = ""
+        overlay_packet = ctx.rework_overlay_packet
+        if overlay_packet is None:
+            binding = _resolve_source_graph_db(ctx)
+        else:
+            overlay_target_request_id = str(
+                overlay_packet.get("predecessor_request_id") or ""
+            )
+            overlay_target_task_id = str(
+                overlay_packet.get("predecessor_task_id") or ""
+            )
+            candidate_binding = _candidate_source_graph_binding(ctx)
+            binding = candidate_binding or _canonical_source_graph_binding(ctx)
+            if candidate_binding is None:
+                overlay_view = _prepare_rework_overlay_view(
+                    ctx,
+                    binding.db_path,
+                    build_revision=_source_graph_mod.BUILD_REVISION,
+                )
+    except (WorkerToolError, OSError, sqlite3.Error) as exc:
+        return _violation(ctx, tool, str(exc)[:160])
+    query_repo = binding.authority_repo or ctx.authority_repo
+    index_identity = _source_graph_index_identity(
+        binding.db_path, default_revision=_source_graph_mod.BUILD_REVISION,
+    )
+    if overlay_view is not None and (
+        overlay_view.changed or overlay_view.deleted or overlay_view.digest_refs
+        or overlay_view.authorized_digests
+    ):
+        authority_source = "rework_overlay"
+        authority_state = "request_scoped_worktree"
+        packet_sha256 = overlay_view.snapshot_sha256
+        target_request_id = overlay_target_request_id
+        target_task_id = overlay_target_task_id
+    else:
+        authority_source = binding.authority_source
+        authority_state = binding.authority_state
+        packet_sha256 = binding.packet_sha256
+        target_request_id = binding.target_request_id
+        target_task_id = binding.target_task_id
+
+    entry = _continuation_fetch(store_id)
+    if entry is None:
+        return _violation(ctx, tool, "continuation_unavailable")
+    if not hmac.compare_digest(entry.content_sha256, content_sha256):
+        return _violation(ctx, tool, "invalid_continuation_cursor")
+
+    meta = entry.meta
+    expected_bind = _continuation_bind(
+        ctx,
+        mode=mode,
+        query=query,
+        target=target,
+        budget=budget,
+        bundle_type=bundle_type,
+        workflow_stage=workflow_stage,
+        content_sha256=entry.content_sha256,
+        index_identity=index_identity,
+        authority_source=authority_source,
+        authority_state=authority_state,
+        authority_repo=str(query_repo),
+        packet_sha256=packet_sha256,
+        target_request_id=target_request_id,
+        target_task_id=target_task_id,
+    )
+    if expected_bind != entry.bind:
+        return _violation(ctx, tool, "continuation_authority_mismatch")
+
+    if page_index >= entry.page_count:
+        return _violation(ctx, tool, "continuation_page_out_of_range")
+    result, bytes_returned = _continuation_page_result(
+        store_id=store_id,
+        page_index=page_index,
+        meta=meta,
+        canonical_bytes=entry.canonical_bytes,
+        chunk_size=entry.chunk_size,
+        page_count=entry.page_count,
+        content_sha256=entry.content_sha256,
+    )
+    if result["continuation_cursor"] is None:
+        _continuation_remove(store_id)
+    _append_audit(
+        ctx, tool=tool, ok=True, cache_hit=False,
+        hit_count=int(meta.get("hit_count") or 0),
+        bytes_returned=bytes_returned,
+        authority_source=str(meta.get("authority_source") or ""),
+        authority_state=str(meta.get("authority_state") or ""),
+        authority_repo=query_repo,
+        provenance="continuation",
+        payload={
+            "mode": meta.get("mode"),
+            "query_sha256": query_sha256,
+            "workflow_stage": meta.get("workflow_stage"),
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "index_revision": index_identity["build_revision"],
+            "index_finished_at": index_identity["finished_at"],
+            "evidence_counts": meta.get("evidence_counts"),
+            "output_cap_bytes": meta.get("output_cap_bytes"),
+            "target_request_id": meta.get("target_request_id"),
+            "target_task_id": meta.get("target_task_id"),
+            "packet_sha256": meta.get("packet_sha256"),
+            "internal_truncated": bool(meta.get("internal_truncated")),
+            "outer_truncated": result["outer_truncated"],
+            "page_index": page_index,
+        },
+    )
+    return result
+
+
 def source_graph_query(
     ctx: WorkerToolContext,
     *,
@@ -3305,6 +3774,7 @@ def source_graph_query(
     budget: int = 64,
     target: str | None = None,
     cursor: str | None = None,
+    continuation_cursor: str | None = None,
     bundle_type: SourceGraphBundleType = "explore",
     workflow_stage: WorkflowStage = "unspecified",
     compact_replay: bool = True,
@@ -3334,6 +3804,11 @@ def source_graph_query(
     page is returned, so this wrapper never re-filters or re-paginates an
     analytic payload on top of what the engine already decided. ``cursor``
     is rejected for every non-analytic mode rather than silently ignored.
+
+    ``continuation_cursor`` is the signed outer-pagination cursor minted by a
+    previous page of THIS call: it reassembles the exact canonical response
+    bytes when the response exceeded the mode's outer output cap, and is
+    orthogonal to the engine-level analytic ``cursor`` above.
     """
 
     tool = "source_graph"
@@ -3384,6 +3859,17 @@ def source_graph_query(
         if ctx.source_graph_targets and bounded_target not in ctx.source_graph_targets:
             return _violation(ctx, tool, "target_not_allowed")
         scope = bounded_target
+
+    if continuation_cursor is not None:
+        bounded_continuation = _bounded_query(continuation_cursor, max_bytes=1024)
+        if bounded_continuation is None:
+            return _violation(ctx, tool, "invalid_continuation_cursor")
+        return _serve_continuation(
+            ctx, tool=tool, cursor=bounded_continuation,
+            started=started, query_sha256=query_sha256,
+            mode=mode, query=bounded_query, target=scope, budget=budget,
+            bundle_type=bundle_type, workflow_stage=workflow_stage,
+        )
 
     from . import source_graph as _source_graph_mod
     try:
@@ -3666,20 +4152,19 @@ def source_graph_query(
         hit_count = _json_hit_count(hit_payload)
     evidence_counts = _source_graph_evidence_counts(payload)
     raw_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    truncated = len(raw_text.encode("utf-8")) > MAX_RAW_TOOL_OUTPUT_BYTES
     output_cap_bytes = _source_graph_output_cap(mode)
     try:
-        text, json_truncated = _canonical_json_output(
-            tool, raw_text, max_bytes=output_cap_bytes,
-        )
+        canonical_bytes = _canonical_json_bytes(tool, raw_text)
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
-    truncated = truncated or json_truncated
+    # Engine/payload loss is the ONLY internal truncation: the engine itself
+    # truncated, or signalled a continuation cursor.  Response size alone is
+    # never classified as internal -- that is outer pagination (below).
+    internal_truncated = _payload_internal_truncation(payload)
+    full_content_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
 
-    payload = json.loads(text)
-    bytes_returned = len(text.encode("utf-8"))
-    content_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    result = {
+    # Static response metadata shared by every page (initial or continuation).
+    meta = {
         "ok": True,
         "tool": tool,
         "mode": mode,
@@ -3687,12 +4172,9 @@ def source_graph_query(
         "query": bounded_query,
         "target": scope,
         "budget": budget,
-        "truncated": truncated,
+        "bundle_type": bundle_type,
         "hit_count": hit_count,
-        "bytes": bytes_returned,
         "output_cap_bytes": output_cap_bytes,
-        "content": text,
-        "content_sha256": content_sha256,
         "cache_hit": False,
         "cache_receipt": False,
         "authority_source": "rework_overlay" if overlay_applied else binding.authority_source,
@@ -3718,11 +4200,79 @@ def source_graph_query(
         "index_revision": index_identity["build_revision"],
         "index_finished_at": index_identity["finished_at"],
         "evidence_counts": evidence_counts,
+        "internal_truncated": internal_truncated,
     }
-    if generation_is_definite:
+
+    cacheable = generation_is_definite
+    text = canonical_bytes.decode("utf-8")
+    bytes_returned = len(canonical_bytes)
+    result = {
+        **meta,
+        "truncated": internal_truncated,
+        "outer_truncated": False,
+        "bytes": bytes_returned,
+        "content": text,
+        "content_sha256": full_content_sha256,
+    }
+    if _serialized_response_bytes(result) > output_cap_bytes:
+        bind = _continuation_bind(
+            ctx,
+            mode=mode,
+            query=bounded_query,
+            target=scope,
+            budget=budget,
+            bundle_type=bundle_type,
+            workflow_stage=workflow_stage,
+            content_sha256=full_content_sha256,
+            index_identity=index_identity,
+            authority_source=str(meta["authority_source"]),
+            authority_state=str(meta["authority_state"]),
+            authority_repo=str(query_repo),
+            packet_sha256=str(meta["packet_sha256"]),
+            target_request_id=str(meta["target_request_id"]),
+            target_task_id=str(meta["target_task_id"]),
+        )
+        if len(canonical_bytes) > SOURCE_GRAPH_CONTINUATION_MAX_BYTES:
+            return _violation(ctx, tool, "continuation_payload_too_large")
+        store_id = secrets.token_hex(16)
+        try:
+            chunk_size = _continuation_chunk_size_for_cap(
+                store_id=store_id,
+                meta=meta,
+                canonical_bytes=canonical_bytes,
+                content_sha256=full_content_sha256,
+                output_cap_bytes=output_cap_bytes,
+            )
+        except WorkerToolError as exc:
+            return _violation(ctx, tool, str(exc)[:160])
+        page_count = (len(canonical_bytes) + chunk_size - 1) // chunk_size
+        stored_id = _continuation_put(
+            canonical_bytes=canonical_bytes,
+            content_sha256=full_content_sha256,
+            bind=bind,
+            meta=meta,
+            store_id=store_id,
+            chunk_size=chunk_size,
+            page_count=page_count,
+        )
+        if stored_id is None:
+            return _violation(ctx, tool, "continuation_payload_too_large")
+        result, bytes_returned = _continuation_page_result(
+            store_id=store_id,
+            page_index=0,
+            meta=meta,
+            canonical_bytes=canonical_bytes,
+            chunk_size=chunk_size,
+            page_count=page_count,
+            content_sha256=full_content_sha256,
+        )
+        # A paginated page is a partial view of the response; never cache it.
+        cacheable = False
+
+    if cacheable:
         _source_graph_cache_store(cache_key, {
             "result": result, "hit_count": hit_count, "bytes": bytes_returned,
-            "content_sha256": content_sha256,
+            "content_sha256": full_content_sha256,
             "authority_source": result["authority_source"],
             "authority_state": result["authority_state"],
             "evidence_counts": evidence_counts,
@@ -3748,6 +4298,9 @@ def source_graph_query(
             "target_request_id": result["target_request_id"],
             "target_task_id": result["target_task_id"],
             "packet_sha256": result["packet_sha256"],
+            "internal_truncated": internal_truncated,
+            "outer_truncated": result["outer_truncated"],
+            "page_index": result.get("page_index", 0),
         },
     )
     return result
@@ -5264,6 +5817,7 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
     def _source_graph_query(
         mode: SourceGraphMode, query: str, budget: int = 64,
         target: str | None = None, cursor: str | None = None,
+        continuation_cursor: str | None = None,
         bundle_type: SourceGraphBundleType = "explore",
         workflow_stage: WorkflowStage = "unspecified",
     ) -> dict[str, Any]:
@@ -5271,6 +5825,7 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         return source_graph_query(
             ctx, mode=mode, query=query, budget=budget,
             target=target, cursor=cursor,
+            continuation_cursor=continuation_cursor,
             bundle_type=bundle_type, workflow_stage=workflow_stage,
         )
 

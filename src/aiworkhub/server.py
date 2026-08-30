@@ -585,6 +585,8 @@ def aiworkhub_manager_source_graph_query(
     query: str,
     budget: int = 64,
     target: str | None = None,
+    cursor: str | None = None,
+    continuation_cursor: str | None = None,
     bundle_type: worker_ai_tools_mcp.SourceGraphBundleType = "explore",
     workflow_stage: worker_ai_tools_mcp.WorkflowStage = "unspecified",
 ) -> dict[str, Any]:
@@ -592,6 +594,7 @@ def aiworkhub_manager_source_graph_query(
 
     return manager_ai_tools.source_graph_query(
         mode=mode, query=query, budget=budget, target=target,
+        cursor=cursor, continuation_cursor=continuation_cursor,
         bundle_type=bundle_type, workflow_stage=workflow_stage,
     )
 

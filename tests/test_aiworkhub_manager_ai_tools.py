@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import sys
 from types import SimpleNamespace
@@ -18,7 +20,9 @@ from aiworkhub import (  # noqa: E402
     shared_router,
     source_graph,
     task_store,
+    worker_ai_tools_mcp as worker_tools,
 )
+from aiworkhub.worker_workspace import materialize_rework_overlay  # noqa: E402
 
 
 def test_windows_ancestor_chain_accepts_only_same_owner_bounded_path(monkeypatch):
@@ -85,6 +89,63 @@ def _manager_route(root: Path) -> dict:
     }
 
 
+def _manager_rework_context(tmp_path: Path) -> tuple[worker_tools.WorkerToolContext, dict, dict]:
+    authority = tmp_path / "manager_rework_authority"
+    workspace = tmp_path / "manager_rework_workspace"
+    authority.mkdir()
+    workspace.mkdir()
+    assert task_store.initialize_repository(authority)["ok"]
+    assert task_store.initialize_repository(workspace)["ok"]
+    (authority / "src").mkdir()
+    (authority / "src" / "mod.py").write_text(
+        "def canonical_only():\n    return 1\n", encoding="utf-8",
+    )
+    source_graph.build_index(authority, incremental=False)
+    body = (
+        "def manager_overlay_target():\n"
+        + "".join(f"    # manager padding {i}\n" for i in range(90))
+        + "    return 1\n"
+    ).encode("utf-8")
+    target = workspace / "src" / "mod.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(body)
+    packet = json.loads(
+        materialize_rework_overlay(
+            "manager-successor",
+            "manager-task",
+            "manager-predecessor",
+            "manager-task",
+            authority,
+            [("src/mod.py", hashlib.sha256(body).hexdigest(), body)],
+        )
+    )
+    runtime = tmp_path / "manager_runtime"
+    runtime.mkdir()
+    packet_path = runtime / "rework_overlay.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = worker_tools.WorkerToolContext(
+        task_id="manager-task",
+        runner="codex_manager",
+        topic="management",
+        request_id="manager-successor",
+        repo=workspace,
+        authority_repo=authority,
+        source_graph_targets=("src/mod.py",),
+        allowed_writes=("src/mod.py",),
+        session_topic="management",
+        audit_ledger_path=None,
+        audit_hmac_key_path=None,
+        rework_overlay_packet=packet,
+        rework_overlay_packet_path=packet_path,
+    )
+    manager = {
+        "provider": "codex",
+        "session_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+        "repo": str(authority),
+    }
+    return ctx, packet, manager
+
+
 def test_manager_uses_same_canonical_ai_tools_as_workers(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
@@ -103,6 +164,55 @@ def test_manager_uses_same_canonical_ai_tools_as_workers(tmp_path, monkeypatch):
     assert all(result["surface"] == "manager_mcp" for result in results)
     assert all(result["authority_source"] == "canonical" for result in results)
     assert all(result["manager"]["repo"] == str(root) for result in results)
+
+
+def test_manager_source_graph_continuation_rejects_stale_rework_overlay_authority(
+    tmp_path, monkeypatch,
+):
+    ctx, packet, manager = _manager_rework_context(tmp_path)
+    monkeypatch.setattr(manager_ai_tools, "_manager_context", lambda **_kwargs: (ctx, manager))
+    monkeypatch.setattr(worker_tools, "_source_graph_output_cap", lambda mode: 2048)
+
+    first = manager_ai_tools.source_graph_query(
+        mode="body",
+        query="manager_overlay_target",
+        target="src/mod.py",
+        budget=8,
+        workflow_stage="rework",
+    )
+    assert first["ok"] is True
+    assert first["authority_source"] == "rework_overlay"
+    assert first["continuation_cursor"]
+
+    unchanged = manager_ai_tools.source_graph_query(
+        mode="body",
+        query="manager_overlay_target",
+        target="src/mod.py",
+        budget=8,
+        workflow_stage="rework",
+        continuation_cursor=first["continuation_cursor"],
+    )
+    assert unchanged["ok"] is True
+    assert unchanged["page_index"] == 1
+
+    second = manager_ai_tools.source_graph_query(
+        mode="body",
+        query="manager_overlay_target",
+        target="src/mod.py",
+        budget=8,
+        workflow_stage="rework",
+    )
+    packet["predecessor_request_id"] = "manager-predecessor-stale"
+    stale = manager_ai_tools.source_graph_query(
+        mode="body",
+        query="manager_overlay_target",
+        target="src/mod.py",
+        budget=8,
+        workflow_stage="rework",
+        continuation_cursor=second["continuation_cursor"],
+    )
+    assert stale["ok"] is False
+    assert stale["reason"] == "continuation_authority_mismatch"
 
 
 def test_unverified_client_cannot_use_manager_ai_tools(monkeypatch):
@@ -1108,3 +1218,46 @@ def test_stale_synthetic_codex_route_is_downgraded_on_read(tmp_path, monkeypatch
     assert codex["route"]["thread_id"] == ""
     assert codex["wake"]["supported"] is False
     assert codex["wake"]["reason"] == "codex_thread_id_not_observed"
+
+
+def test_manager_source_graph_continuation_passthrough(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    (root / "pkg").mkdir()
+    (root / "pkg" / "big.py").write_text(
+        "def big_manager_target():\n"
+        + "".join(f"    # padding line {i} for outer pagination\n" for i in range(50))
+        + "    return 1\n",
+        encoding="utf-8",
+    )
+    source_graph.build_index(root)
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
+    monkeypatch.setattr(
+        manager_ai_tools.worker_tools, "_source_graph_output_cap", lambda mode: 2048,
+    )
+
+    first = manager_ai_tools.source_graph_query(
+        mode="body", query="big_manager_target", budget=8,
+    )
+    assert first["ok"] is True
+    assert first["surface"] == "manager_mcp"
+    assert first["outer_truncated"] is True
+    assert first["internal_truncated"] is False
+    cursor = first["continuation_cursor"]
+    assert cursor
+
+    chunks = [base64.b64decode(first["content"])]
+    while cursor:
+        page = manager_ai_tools.source_graph_query(
+            mode="body", query="big_manager_target", budget=8, continuation_cursor=cursor,
+        )
+        assert page["ok"] is True
+        assert page["surface"] == "manager_mcp"
+        assert page["content_encoding"] == "base64"
+        chunks.append(base64.b64decode(page["content"]))
+        cursor = page["continuation_cursor"]
+
+    reassembled = b"".join(chunks)
+    assert len(reassembled) == first["full_bytes"]
+    assert hashlib.sha256(reassembled).hexdigest() == first["content_sha256"]
