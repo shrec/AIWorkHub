@@ -188,8 +188,21 @@ assert.ok(ext.includes("PYTHONPATH: runtimeDir"));
 // action, which invokes the one bounded aiworkhub_dashboard_initialize MCP
 // tool (Python side owns manifest/registry/DB creation).
 assert.ok(!ext.includes("function bootstrapRepository"), "activation-time bootstrap must be removed");
-assert.ok(!ext.includes(".isDirectory()"), "storage readiness must never be derived from directory existence");
-assert.ok(ext.includes('path.join(root, ".aiworkhub", "project.json")'));
+const readRepositoryManifestInfoMatch = ext.match(
+  /function readRepositoryManifestInfo\(root, label\) \{[\s\S]*?\r?\n\}\r?\n/,
+);
+assert.ok(readRepositoryManifestInfoMatch, "readRepositoryManifestInfo must exist");
+assert.ok(
+  readRepositoryManifestInfoMatch[0].includes(".isDirectory()"),
+  "manifest inspection may verify that the repository metadata root is a directory",
+);
+const extWithoutReadRepositoryManifestInfo = ext.replace(readRepositoryManifestInfoMatch[0], "");
+assert.ok(
+  !extWithoutReadRepositoryManifestInfo.includes(".isDirectory()"),
+  "storage readiness outside manifest inspection must never be derived from directory existence",
+);
+assert.ok(ext.includes('const hubPath = path.join(root, ".aiworkhub")'));
+assert.ok(ext.includes('const manifestPath = path.join(hubPath, "project.json")'));
 assert.ok(ext.includes('INITIALIZE_TOOL = "aiworkhub_dashboard_initialize"'));
 assert.ok(ext.includes('"initializeStorage"'));
 assert.ok(ext.includes("pushInitializeStorage"));

@@ -13,7 +13,24 @@ function writeRepo(root, repoId, repoName) {
   fs.mkdirSync(path.join(root, ".aiworkhub"), { recursive: true });
   fs.writeFileSync(
     path.join(root, ".aiworkhub", "project.json"),
-    JSON.stringify({ repo_id: repoId, repo_name: repoName }) + "\n",
+    JSON.stringify({
+      schema_id: "aiworkhub.project_manifest.v1",
+      manifest_version: 1,
+      layout_version: 1,
+      repo_id: repoId,
+      repo_name: repoName,
+      layout: {
+        durable: {
+          tasking: "tasking",
+          source_graph: "source_graph",
+          sessions: "sessions",
+          memory: "memory",
+          kb: "kb",
+          config: "config",
+        },
+        runtime: { path: "runtime", durable: false, ignored: true },
+      },
+    }) + "\n",
     "utf8",
   );
 }

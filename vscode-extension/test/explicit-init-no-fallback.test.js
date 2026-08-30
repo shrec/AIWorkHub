@@ -39,10 +39,19 @@ assertAbsent(
   ["function bootstrapRepository", "bootstrapRepository(folder", "bootstrapRepository(match"],
   "activation_time_bootstrap forbidden pattern present",
 );
+const readRepositoryManifestInfoMatch = ext.match(
+  /function readRepositoryManifestInfo\(root, label\) \{[\s\S]*?\r?\n\}\r?\n/,
+);
+assert.ok(readRepositoryManifestInfoMatch, "readRepositoryManifestInfo function body not found");
+assert.ok(
+  readRepositoryManifestInfoMatch[0].includes(".isDirectory()"),
+  "readRepositoryManifestInfo must validate the repository manifest path as a directory",
+);
+const extWithoutReadRepositoryManifestInfo = ext.replace(readRepositoryManifestInfoMatch[0], "");
 assertAbsent(
-  ext,
+  extWithoutReadRepositoryManifestInfo,
   [".isDirectory()"],
-  "directory_only_storage_ready forbidden pattern present",
+  "directory_only_storage_ready forbidden pattern present outside readRepositoryManifestInfo",
 );
 
 // getActiveRepositoryRoot must remain the single resolution path used by
