@@ -6,7 +6,8 @@ though the launcher had injected those sections with a verified hash receipt
 (executed=true), because the gate only ever credited LIVE worker calls. This
 locks the acceptance criteria: an executed, non-degraded section whose bundle
 receipt is acknowledged satisfies optional context tools (zero hit_count is
-still valid), while Source Graph additionally requires a fresh live call;
+still valid), and canonical supervisor Source Graph satisfies initial
+orientation;
 tampered / repo-mismatched / unacknowledged receipts and degraded sections stay
 fail-closed; the terminal evidence names the satisfaction source per tool.
 """
@@ -18,6 +19,8 @@ import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
@@ -32,17 +35,46 @@ def _sha(text: str = "bundle-b954") -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _write_receipt(tmp_path: Path, bundle_sha: str, *, section_count: int = 2, acknowledged: bool = True) -> Path:
-    stdout = tmp_path / "worker.stdout.log"
-    receipt = {
+def _receipt_payload(
+    bundle_sha: str,
+    *,
+    section_count: int = 2,
+    acknowledged: bool = True,
+    request_id: str = "req",
+) -> dict:
+    return {
         "schema_id": project_context.RECEIPT_SCHEMA_ID,
         "acknowledged": acknowledged,
         "bundle_sha256": bundle_sha,
         "prompt_sha256": "",
         "section_count": section_count,
+        "request_id": request_id,
     }
+
+
+def _write_receipt(
+    tmp_path: Path,
+    bundle_sha: str,
+    *,
+    section_count: int = 2,
+    acknowledged: bool = True,
+    request_id: str = "req",
+) -> Path:
+    stdout = tmp_path / "worker.stdout.log"
+    receipt = _receipt_payload(
+        bundle_sha,
+        section_count=section_count,
+        acknowledged=acknowledged,
+        request_id=request_id,
+    )
     stdout.write_text(
-        "worker preamble\nPROJECT_CONTEXT_RECEIPT: " + json.dumps(receipt) + "\ntool output line\n",
+        json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "PROJECT_CONTEXT_RECEIPT: " + json.dumps(receipt),
+            },
+        }) + "\n",
         encoding="utf-8",
     )
     return stdout
@@ -97,9 +129,91 @@ def _sections(*specs) -> list[dict]:
     return out
 
 
+def test_verbatim_worker_prompt_echo_cannot_acknowledge_injected_orientation(
+    tmp_path,
+    monkeypatch,
+):
+    _patch_verify(monkeypatch)
+    request_id = "canonical-request-b954"
+    bundle = "PROJECT_CONTEXT_BUNDLE:\n" + json.dumps({
+        "evidence": {"source_graph": {"matches": [], "truncated": False}},
+        "repo_identity": {"repo_id": "repo-b954", "scope_root": "."},
+    })
+    bundle_sha = _sha(bundle)
+    prompt = pl.build_worker_prompt(
+        task_id="TASK_B954",
+        runner="codex",
+        topic="representation",
+        request_id=request_id,
+        project_context_bundle=bundle,
+    )
+    stdout = tmp_path / "prompt-echo.stdout.log"
+    stdout.write_text(prompt + "\n", encoding="utf-8")
+
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path,
+            bundle_sha=bundle_sha,
+            sections=_sections(("source_graph", True, 0, "")),
+            stdout=stdout,
+        ),
+        request_id,
+    )
+
+    assert f'\"request_id\":\"{request_id}\"' in prompt
+    assert gate["satisfied"] is False
+    assert gate["missing_tools"] == ["source_graph"]
+
+
+def test_authenticated_assistant_receipt_binds_exact_request_and_satisfies_orientation(
+    tmp_path,
+    monkeypatch,
+):
+    _patch_verify(monkeypatch)
+    request_id = "canonical-request-b954"
+    bundle = "PROJECT_CONTEXT_BUNDLE:\n" + json.dumps({
+        "evidence": {"source_graph": {"matches": [], "truncated": False}},
+        "repo_identity": {"repo_id": "repo-b954", "scope_root": "."},
+    })
+    bundle_sha = _sha(bundle)
+    prompt = pl.build_worker_prompt(
+        task_id="TASK_B954",
+        runner="codex",
+        topic="representation",
+        request_id=request_id,
+        project_context_bundle=bundle,
+    )
+    receipt = _receipt_payload(bundle_sha, section_count=1, request_id=request_id)
+    stdout = tmp_path / "authenticated-worker.stdout.log"
+    stdout.write_text(json.dumps({
+        "type": "item.completed",
+        "item": {
+            "type": "agent_message",
+            "text": "PROJECT_CONTEXT_RECEIPT: " + json.dumps(receipt),
+        },
+    }) + "\n", encoding="utf-8")
+
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path,
+            bundle_sha=bundle_sha,
+            sections=_sections(("source_graph", True, 0, "")),
+            stdout=stdout,
+        ),
+        request_id,
+    )
+
+    assert f'\"request_id\":\"{request_id}\"' in prompt
+    assert gate["satisfied"] is True
+    assert gate["verification"]["live_source_graph_calls"] == 0
+    assert gate["satisfaction_by_tool"]["source_graph"] == (
+        "supervisor_injected_orientation"
+    )
+
+
 # --- PASS: injected+verified sections, no live call ------------------------
 
-def test_injected_session_and_source_graph_no_live_call_fails_continuous_use_gate(tmp_path, monkeypatch):
+def test_injected_session_and_source_graph_satisfy_initial_orientation(tmp_path, monkeypatch):
     _patch_verify(monkeypatch)  # empty ledger, zero live calls
     bundle = _sha()
     stdout = _write_receipt(tmp_path, bundle, section_count=2)
@@ -108,10 +222,10 @@ def test_injected_session_and_source_graph_no_live_call_fails_continuous_use_gat
         ("session_current_state", True, 8, ""),
     )
     gate = pl._worker_mcp_live_call_gate(_metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req")
-    assert gate["satisfied"] is False
-    assert gate["missing_tools"] == ["source_graph_live_call"]
+    assert gate["satisfied"] is True
+    assert gate["missing_tools"] == []
     assert gate["injected_context_acknowledged"] is True
-    assert gate["satisfaction_by_tool"]["source_graph"] == "injected_only_not_sufficient"
+    assert gate["satisfaction_by_tool"]["source_graph"] == "supervisor_injected_orientation"
     assert gate["satisfaction_by_tool"]["session_current_state"] == "injected_receipt"
 
 
@@ -124,8 +238,9 @@ def test_injected_ai_memory_zero_hit_is_valid(tmp_path, monkeypatch):
         ("ai_memory", True, 0, ""),   # zero hits, but executed + acknowledged
     )
     gate = pl._worker_mcp_live_call_gate(_metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req")
-    assert gate["satisfied"] is False
-    assert gate["missing_tools"] == ["source_graph_live_call"]
+    assert gate["satisfied"] is True
+    assert gate["missing_tools"] == []
+    assert gate["satisfaction_by_tool"]["source_graph"] == "supervisor_injected_orientation"
     assert gate["satisfaction_by_tool"]["ai_memory"] == "injected_receipt"
 
 
@@ -173,8 +288,8 @@ def test_section_not_executed_and_no_live_call_fails(tmp_path, monkeypatch):
     )
     gate = pl._worker_mcp_live_call_gate(_metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req")
     assert gate["satisfied"] is False
-    assert gate["missing_tools"] == ["source_graph_live_call", "ai_memory"]
-    assert gate["reason"] == "required_aiworkhub_mcp_calls_missing:source_graph_live_call,ai_memory"
+    assert gate["missing_tools"] == ["ai_memory"]
+    assert gate["reason"] == "required_aiworkhub_mcp_calls_missing:ai_memory"
 
 
 def test_degraded_injected_section_requires_live_recovery(tmp_path, monkeypatch):
@@ -187,7 +302,49 @@ def test_degraded_injected_section_requires_live_recovery(tmp_path, monkeypatch)
     )
     gate = pl._worker_mcp_live_call_gate(_metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req")
     assert gate["satisfied"] is False
-    assert gate["missing_tools"] == ["source_graph_live_call", "session_current_state"]
+    assert gate["missing_tools"] == ["session_current_state"]
+
+
+def test_degraded_supervisor_source_graph_stays_fail_closed(tmp_path, monkeypatch):
+    _patch_verify(monkeypatch)
+    bundle = _sha()
+    stdout = _write_receipt(tmp_path, bundle, section_count=1)
+    sections = _sections(("source_graph", True, 0, "cached_or_stale"))
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req"
+    )
+    assert gate["satisfied"] is False
+    assert gate["missing_tools"] == ["source_graph"]
+
+
+def test_supervisor_source_graph_requires_authenticated_audit_authority(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        pl.worker_ai_tools_mcp,
+        "verify_audit_ledger",
+        lambda *_a, **_k: {
+            "ok": False,
+            "reason": "audit_unavailable",
+            "live_source_graph_calls": 0,
+            "successful_call_count_by_tool": {},
+            "policy_violations": 0,
+        },
+    )
+    bundle = _sha()
+    stdout = _write_receipt(tmp_path, bundle, section_count=1)
+    sections = _sections(("source_graph", True, 0, ""))
+
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req"
+    )
+
+    assert gate["injected_context_acknowledged"] is True
+    assert gate["satisfied"] is False
+    assert gate["missing_tools"] == ["source_graph"]
+    assert "source_graph" not in gate["satisfaction_by_tool"]
+    assert gate["reason"] == "audit_unavailable"
 
 
 # --- FAIL: tampered / repo-mismatched receipt stays fail-closed ------------
@@ -217,6 +374,58 @@ def test_unacknowledged_receipt_fails_closed(tmp_path, monkeypatch):
     assert gate["satisfied"] is False
 
 
+@pytest.mark.parametrize(
+    "acknowledged",
+    ["false", 1, 0, [], [True], {}, {"value": True}, None],
+    ids=[
+        "string",
+        "nonzero-number",
+        "zero-number",
+        "empty-list",
+        "nonempty-list",
+        "empty-object",
+        "nonempty-object",
+        "null",
+    ],
+)
+def test_non_boolean_acknowledgement_never_acknowledges_authenticated_receipt(
+    tmp_path,
+    monkeypatch,
+    acknowledged,
+):
+    _patch_verify(monkeypatch)
+    bundle = _sha()
+    receipt = _receipt_payload(bundle, section_count=1, request_id="req")
+    receipt["acknowledged"] = acknowledged
+    stdout = tmp_path / "invalid-acknowledgement.stdout.log"
+    stdout.write_text(
+        json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "PROJECT_CONTEXT_RECEIPT: " + json.dumps(receipt),
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    sections = _sections(("source_graph", True, 0, ""))
+
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path,
+            bundle_sha=bundle,
+            sections=sections,
+            stdout=stdout,
+        ),
+        "req",
+    )
+
+    assert gate["injected_context_acknowledged"] is False
+    assert gate["satisfied"] is False
+    assert gate["missing_tools"] == ["source_graph"]
+    assert "source_graph" not in gate["satisfaction_by_tool"]
+
+
 # --- PASS: no injection, verified live calls -------------------------------
 
 def test_no_injection_but_live_calls_pass(tmp_path, monkeypatch):
@@ -232,6 +441,44 @@ def test_no_injection_but_live_calls_pass(tmp_path, monkeypatch):
     assert gate["satisfied"] is True
     assert gate["satisfaction_by_tool"]["source_graph"] == "live_worker_call"
     assert gate["satisfaction_by_tool"]["session_current_state"] == "live_worker_call"
+
+
+def test_live_source_graph_call_takes_precedence_over_supervisor_orientation(
+    tmp_path,
+    monkeypatch,
+):
+    _patch_verify(monkeypatch, live_source_graph=1, successful={"source_graph": 1})
+    bundle = _sha()
+    stdout = _write_receipt(tmp_path, bundle, section_count=1)
+    sections = _sections(("source_graph", True, 0, ""))
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req"
+    )
+    assert gate["satisfied"] is True
+    assert gate["satisfaction_by_tool"]["source_graph"] == "live_worker_call"
+
+
+def test_supervisor_receipt_from_another_request_cannot_be_replayed(
+    tmp_path,
+    monkeypatch,
+):
+    _patch_verify(monkeypatch)
+    bundle = _sha()
+    stdout = _write_receipt(
+        tmp_path,
+        bundle,
+        section_count=1,
+        request_id="first-request",
+    )
+    sections = _sections(("source_graph", True, 0, ""))
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout),
+        "second-request",
+    )
+    assert gate["satisfied"] is False
+    assert gate["injected_context_acknowledged"] is True
+    assert gate["missing_tools"] == ["source_graph"]
+    assert "source_graph" not in gate["satisfaction_by_tool"]
 
 
 def test_fresh_zero_hit_source_graph_call_satisfies_invocation_gate(
@@ -340,7 +587,7 @@ def test_gate_result_never_leaks_paths(tmp_path, monkeypatch):
     assert str(tmp_path) not in blob
 
 
-def test_prefetch_and_cache_provenance_never_satisfy_live_gate(tmp_path, monkeypatch):
+def test_cached_only_supervisor_section_never_satisfies_orientation(tmp_path, monkeypatch):
     # A ledger full of auditable prefetch/cache observations (zero genuine live
     # calls) must still fail the gate: provenance is auditable, never
     # authoritative. One genuine provider call counts exactly once.
@@ -358,13 +605,14 @@ def test_prefetch_and_cache_provenance_never_satisfy_live_gate(tmp_path, monkeyp
     monkeypatch.setattr(pl.worker_ai_tools_mcp, "verify_audit_ledger", fake_verify)
     bundle = _sha()
     stdout = _write_receipt(tmp_path, bundle, section_count=1)
-    sections = _sections(("source_graph", True, 3, ""))
+    sections = _sections(("source_graph", True, 3, "cache_receipt_only"))
     gate = pl._worker_mcp_live_call_gate(
         _metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req",
     )
     assert gate["satisfied"] is False
-    assert gate["missing_tools"] == ["source_graph_live_call"]
-    assert gate["satisfaction_by_tool"]["source_graph"] == "injected_only_not_sufficient"
+    assert gate["missing_tools"] == []
+    assert gate["stale_tools"] == ["source_graph"]
+    assert gate["satisfaction_by_tool"]["source_graph"] == "stale_or_cached"
 
 
 # --- Source Graph cache: generation bound, capacity bound, race safety -----

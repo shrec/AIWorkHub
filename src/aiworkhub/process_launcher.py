@@ -2188,27 +2188,46 @@ def _launch_source_graph_request(
 
 
 def _receipt_text_candidates(raw_line: str) -> list[str]:
-    """Return bounded text payloads used by the supported JSONL adapters."""
-    candidates = [raw_line.strip()]
+    """Return only provider-authenticated assistant-output payloads.
+
+    The worker prompt contains the complete acknowledgement template.  Raw
+    stdout therefore has no acknowledgement authority: a provider that echoes
+    its input would otherwise replay that template verbatim.  Supported JSONL
+    adapters bind assistant text to a typed output envelope at the
+    process/adapter boundary.
+    """
     try:
         event = json.loads(raw_line)
     except json.JSONDecodeError:
-        return candidates
+        return []
     if not isinstance(event, dict):
-        return candidates
+        return []
+
+    candidates: list[str] = []
 
     def add(value: Any) -> None:
         if isinstance(value, str) and value.strip():
             candidates.append(value.strip())
 
     item = event.get("item")
-    if isinstance(item, dict):
-        add(item.get("text"))  # Codex JSONL agent_message
+    if (
+        isinstance(item, dict)
+        and str(item.get("type") or "") == "agent_message"
+    ):
+        add(item.get("text"))  # Codex JSONL assistant output
+
     data = event.get("data")
-    if isinstance(data, dict):
-        add(data.get("content"))  # DeepSeek/Copilot assistant.message
+    if (
+        isinstance(data, dict)
+        and str(event.get("type") or "") == "assistant.message"
+    ):
+        add(data.get("content"))  # DeepSeek/Copilot assistant output
+
     message = event.get("message")
-    if isinstance(message, dict):
+    if (
+        isinstance(message, dict)
+        and str(message.get("role") or "") == "assistant"
+    ):
         content = message.get("content")
         if isinstance(content, list):
             for block in content[:32]:
@@ -2223,12 +2242,14 @@ def _project_context_receipt_from_output(
     path: Path,
     *,
     expected_bundle_sha256: str = "",
+    expected_request_id: str = "",
 ) -> dict[str, Any]:
     result = {
         "schema_id": project_context.RECEIPT_SCHEMA_ID,
         "acknowledged": False,
         "bundle_sha256": "",
         "prompt_sha256": "",
+        "request_id": "",
         "section_count": 0,
         "reason": "receipt_not_found",
     }
@@ -2248,6 +2269,7 @@ def _project_context_receipt_from_output(
         text = _read_byte_range(path, 0, half) + "\n" + _read_byte_range(path, size - half, half)
     prefix = "PROJECT_CONTEXT_RECEIPT:"
     expected = expected_bundle_sha256.strip().lower()
+    expected_request = expected_request_id.strip()
     for line in reversed(text.splitlines()):
         for candidate in _receipt_text_candidates(line):
             marker = candidate.rfind(prefix)
@@ -2260,16 +2282,26 @@ def _project_context_receipt_from_output(
             if not isinstance(value, dict) or value.get("schema_id") != project_context.RECEIPT_SCHEMA_ID:
                 continue
             bundle_sha = str(value.get("bundle_sha256") or "").strip().lower()
+            receipt_request = str(value.get("request_id") or "").strip()
             section_raw = value.get("section_count") or 0
             section_count = int(section_raw) if str(section_raw).isdigit() else 0
             valid_sha = len(bundle_sha) == 64 and all(ch in "0123456789abcdef" for ch in bundle_sha)
             matches = not expected or bundle_sha == expected
-            acknowledged = bool(value.get("acknowledged")) and valid_sha and matches and section_count > 0
+            request_matches = not expected_request or receipt_request == expected_request
+            acknowledged = (
+                value.get("acknowledged") is True
+                and valid_sha
+                and matches
+                and request_matches
+                and section_count > 0
+            )
             reason = str(value.get("reason") or "")[:160]
             if not valid_sha:
                 reason = "receipt_bundle_sha256_invalid"
             elif not matches:
                 reason = "receipt_bundle_sha256_mismatch"
+            elif not request_matches:
+                reason = "receipt_request_id_mismatch"
             elif section_count <= 0:
                 reason = "receipt_section_count_invalid"
             return {
@@ -2277,6 +2309,7 @@ def _project_context_receipt_from_output(
                 "acknowledged": acknowledged,
                 "bundle_sha256": bundle_sha[:80],
                 "prompt_sha256": str(value.get("prompt_sha256") or "")[:80],
+                "request_id": receipt_request[:160],
                 "section_count": section_count,
                 "reason": reason,
             }
@@ -2705,7 +2738,10 @@ _GATEABLE_CONTEXT_SECTIONS = frozenset(
 )
 
 
-def _injected_context_satisfaction(metadata: dict[str, Any]) -> tuple[bool, set[str]]:
+def _injected_context_satisfaction(
+    metadata: dict[str, Any],
+    request_id: str = "",
+) -> tuple[bool, set[str]]:
     """Which required tools a VERIFIED injected project-context section already
     satisfies, and whether the worker acknowledged the injected bundle.
 
@@ -2734,8 +2770,12 @@ def _injected_context_satisfaction(metadata: dict[str, Any]) -> tuple[bool, set[
     stdout_path = str(metadata.get("stdout_path") or "").strip()
     if not bundle_sha256 or not stdout_path:
         return False, set()
+    # Preserve the pre-existing bundle-bound acknowledgement contract for
+    # Session Manager, AI Memory, and KB. Request binding is evaluated
+    # separately at the Source Graph substitution boundary below.
     receipt = _project_context_receipt_from_output(
-        Path(stdout_path), expected_bundle_sha256=bundle_sha256
+        Path(stdout_path),
+        expected_bundle_sha256=bundle_sha256,
     )
     if not receipt.get("acknowledged"):
         return False, set()
@@ -4106,8 +4146,21 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     # implementation detail.  Keep it observable for exempt research and
     # data-classification tasks as well, while preserving their non-gated
     # completion semantics.
-    injected_acknowledged, injected_tools = _injected_context_satisfaction(metadata)
+    injected_acknowledged, injected_tools = _injected_context_satisfaction(
+        metadata, request_id
+    )
     gate_result["injected_context_acknowledged"] = injected_acknowledged
+    source_graph_injected_acknowledged = False
+    context = metadata.get("project_context") or {}
+    if injected_acknowledged and isinstance(context, dict):
+        source_graph_receipt = _project_context_receipt_from_output(
+            Path(str(metadata.get("stdout_path") or "")),
+            expected_bundle_sha256=str(context.get("bundle_sha256") or ""),
+            expected_request_id=request_id,
+        )
+        source_graph_injected_acknowledged = bool(
+            source_graph_receipt.get("acknowledged")
+        )
     if policy_error:
         gate_result["gated"] = True
         gate_result["satisfied"] = False
@@ -4199,24 +4252,26 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     if not gated:
         return gate_result
     # ``successful`` was decoded above with fail-closed numeric handling.
-    # Injected context accelerates startup but does not prove continuous tool
-    # use.  In particular, Source Graph must have a fresh authenticated worker
-    # call during execution; an initial hash-receipted bundle alone can never
-    # satisfy a code task's discovery gate.
+    # The canonical supervisor-owned Source Graph query is initial-orientation
+    # evidence once its exact bundle receipt is acknowledged. A later live,
+    # authoritative worker call remains stronger evidence and takes precedence.
     satisfaction_by_tool: dict[str, str] = {}
     missing: list[str] = []
     stale: list[str] = []
     # Source Graph freshness is invocation truth: an authenticated, successful,
-    # non-cached authoritative call satisfies continuous use even when the
-    # bounded query returns zero rows.  Result adequacy stays observable through
-    # hit_count/zero_hit_calls and may guide re-query/review, but it must not be
-    # rewritten into "the tool was never called".  Cached-only, failed,
-    # non-authoritative and unverified activity remains fail-closed.
+    # non-cached authoritative worker call satisfies continuous use even when
+    # the bounded query returns zero rows. An acknowledged supervisor section
+    # proves the same initial call was already executed before launch. Cached,
+    # failed, degraded, non-authoritative, or unverified evidence is excluded
+    # from injected_tools and remains fail-closed.
     if live_source_graph_calls > 0:
         satisfaction_by_tool["source_graph"] = "live_worker_call"
-    elif injected_acknowledged and "source_graph" in injected_tools:
-        satisfaction_by_tool["source_graph"] = "injected_only_not_sufficient"
-        missing.append("source_graph_live_call")
+    elif (
+        verification.get("ok") is True
+        and source_graph_injected_acknowledged
+        and "source_graph" in injected_tools
+    ):
+        satisfaction_by_tool["source_graph"] = "supervisor_injected_orientation"
     elif int(successful.get("source_graph") or 0) > 0:
         satisfaction_by_tool["source_graph"] = "stale_or_cached"
         stale.append("source_graph")
@@ -4618,6 +4673,7 @@ def build_worker_prompt(
     task_id: str,
     runner: str,
     topic: str,
+    request_id: str = "",
     card: dict[str, Any] | None = None,
     owner_prompt: str = "",
     project_context_bundle: str = "",
@@ -4694,6 +4750,7 @@ def build_worker_prompt(
             "bundle_sha256": bundle_sha256,
             "prompt_sha256": "",
             "section_count": section_count,
+            "request_id": request_id,
         }, sort_keys=True, separators=(",", ":"))
         if project_context_bundle.strip()
         else ""
@@ -8648,6 +8705,7 @@ class ProcessManager:
                         task_id=task_id,
                         runner=runner,
                         topic=topic,
+                        request_id=request_id,
                         card=card,
                         owner_prompt=owner_prompt,
                         project_context_bundle=(
@@ -9268,11 +9326,13 @@ class ProcessManager:
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             context_result = project_context.collect_project_context(self.repo, card)
             provider_env, model = self._resolve_provider_env(adapter_id, model)
+            request_id = uuid.uuid4().hex
             prompt_budget: dict[str, Any] = {}
             prompt = build_worker_prompt(
                 task_id=task_id,
                 runner=runner,
                 topic=topic,
+                request_id=request_id,
                 card=card,
                 owner_prompt=owner_prompt,
                 project_context_bundle=(
@@ -9317,7 +9377,6 @@ class ProcessManager:
                         ):
                             raise LaunchRejected(f"duplicate_persisted_task:{event.get('request_id')}")
 
-                request_id = uuid.uuid4().hex
                 self.process_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 chmod_path(self.process_dir, 0o700)
                 stdout_path = self.process_dir / f"{request_id}.stdout.log"
