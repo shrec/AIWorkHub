@@ -10,6 +10,7 @@ telemetry accounting, and a fake-worker end-to-end dynamic tool call.
 
 from __future__ import annotations
 
+import base64
 import inspect
 import json
 import os
@@ -806,17 +807,54 @@ def test_source_graph_orientation_truncation_preserves_full_evidence_counts(
     )
     ctx = _ctx(repo, home=tmp_path / "home")
 
-    result = w.source_graph_query(ctx, mode="focus", query="large", budget=32)
+    page = w.source_graph_query(ctx, mode="focus", query="large", budget=32)
+    assert page["ok"] is True
+    assert page["internal_truncated"] is False
+    assert page["outer_truncated"] is True
+    assert page["truncated"] is True
+    assert page["output_cap_bytes"] == 8 * 1024
+    assert page["hit_count"] == w._json_hit_count(large_payload)
+    assert page["evidence_counts"] == w._source_graph_evidence_counts(large_payload)
 
-    assert result["ok"] is True
-    assert result["truncated"] is True
-    assert result["output_cap_bytes"] == 8 * 1024
-    assert result["bytes"] <= result["output_cap_bytes"]
-    assert result["hit_count"] == w._json_hit_count(large_payload)
-    assert result["evidence_counts"] == w._source_graph_evidence_counts(large_payload)
-    bounded = json.loads(result["content"])
-    assert bounded["original_hit_count"] == result["hit_count"]
-    assert "ranked_symbols" in bounded["priority_keys_present"]
+    cursor_payload = json.loads(
+        base64.urlsafe_b64decode(page["continuation_cursor"]).decode("utf-8")
+    )
+    cursor_payload["page_index"] += 1
+    tampered_cursor = base64.urlsafe_b64encode(
+        json.dumps(
+            cursor_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).decode("ascii")
+    tampered = w.source_graph_query(
+        ctx,
+        mode="focus",
+        query="large",
+        budget=32,
+        continuation_cursor=tampered_cursor,
+    )
+    assert tampered["ok"] is False
+    assert tampered["reason"] == "invalid_continuation_cursor"
+
+    pages = [page]
+    while page["continuation_cursor"] is not None:
+        page = w.source_graph_query(
+            ctx,
+            mode="focus",
+            query="large",
+            budget=32,
+            continuation_cursor=page["continuation_cursor"],
+        )
+        assert page["ok"] is True
+        pages.append(page)
+
+    assert all(page["bytes"] <= page["output_cap_bytes"] for page in pages)
+    assert pages[-1]["continuation_cursor"] is None
+    assert all(page["content_encoding"] == "base64" for page in pages)
+    content = b"".join(base64.b64decode(page["content"]) for page in pages)
+    assert json.loads(content.decode("utf-8")) == large_payload
 
 
 def test_source_graph_cache_is_invalidated_by_index_generation(
