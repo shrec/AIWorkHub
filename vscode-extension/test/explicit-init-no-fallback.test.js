@@ -119,6 +119,87 @@ assertPresent(
   "app.js storage-gate wiring",
 );
 
+const storageStateMatch = app.match(
+  /function renderStorageState\(snapshot\) \{[\s\S]*?\r?\n\}\r?\n\s*function renderSnapshot/,
+);
+assert.ok(storageStateMatch, "renderStorageState function body not found");
+const storageStateSource = storageStateMatch[0].replace(/\r?\n\s*function renderSnapshot$/, "");
+
+function createStorageHarness() {
+  const elements = {
+    uninitializedAlert: { hidden: null },
+    uninitializedAlertHeading: { textContent: "" },
+    uninitializedAlertMessage: { textContent: "" },
+    initializeButton: { hidden: null, disabled: null },
+  };
+  const connections = [];
+  const render = new Function(
+    "elements",
+    "setConnection",
+    `${storageStateSource}; return renderStorageState;`,
+  )(elements, (...args) => connections.push(args));
+  return { elements, connections, render: (storage) => render({ storage }) };
+}
+
+function exerciseStorageState(storage) {
+  const harness = createStorageHarness();
+  const ready = harness.render(storage);
+  return { ready, elements: harness.elements, connections: harness.connections };
+}
+
+const readyStorage = exerciseStorageState({ ready: true, reason: "ready", not_initialized: false });
+assert.strictEqual(readyStorage.ready, true);
+assert.strictEqual(readyStorage.elements.uninitializedAlert.hidden, true);
+assert.strictEqual(readyStorage.elements.initializeButton.hidden, true);
+assert.strictEqual(readyStorage.elements.initializeButton.disabled, true);
+assert.strictEqual(readyStorage.elements.uninitializedAlertMessage.textContent, "");
+
+const manifestMissing = exerciseStorageState({
+  ready: false,
+  reason: "repository_manifest_missing",
+  not_initialized: true,
+});
+assert.strictEqual(manifestMissing.ready, false);
+assert.strictEqual(manifestMissing.elements.uninitializedAlertHeading.textContent, "AIWorkHub is not initialized for this repository");
+assert.strictEqual(manifestMissing.elements.initializeButton.hidden, false);
+assert.strictEqual(manifestMissing.elements.initializeButton.disabled, false);
+assert.match(manifestMissing.elements.uninitializedAlertMessage.textContent, /Initialize/);
+assert.deepStrictEqual(manifestMissing.connections.at(-1), ["degraded", "Uninitialized"]);
+
+for (const storage of [
+  { ready: false, reason: "canonical_schema_incomplete", not_initialized: false },
+  { ready: false, reason: "storage_permission_denied", not_initialized: false },
+  { ready: false, reason: "malformed_flag", not_initialized: "true" },
+  { ready: false, reason: "missing_flag" },
+]) {
+  const degraded = exerciseStorageState(storage);
+  assert.strictEqual(degraded.ready, false);
+  assert.strictEqual(degraded.elements.uninitializedAlert.hidden, false);
+  assert.strictEqual(degraded.elements.uninitializedAlertHeading.textContent, "AIWorkHub storage is degraded");
+  assert.strictEqual(degraded.elements.initializeButton.hidden, true);
+  assert.strictEqual(degraded.elements.initializeButton.disabled, true);
+  assert.ok(degraded.elements.uninitializedAlertMessage.textContent.includes(storage.reason));
+  assert.ok(!degraded.elements.uninitializedAlertMessage.textContent.includes("Initialize"));
+  assert.deepStrictEqual(degraded.connections.at(-1), ["degraded", `Storage degraded: ${storage.reason}`]);
+}
+
+const transition = createStorageHarness();
+assert.strictEqual(transition.render({ ready: true, reason: "ready", not_initialized: false }), true);
+assert.strictEqual(transition.render({ ready: false, reason: "canonical_schema_incomplete", not_initialized: false }), false);
+assert.strictEqual(transition.elements.uninitializedAlertHeading.textContent, "AIWorkHub storage is degraded");
+assert.strictEqual(transition.elements.initializeButton.hidden, true);
+assert.strictEqual(transition.elements.initializeButton.disabled, true);
+assert.strictEqual(transition.render({ ready: false, reason: "repository_manifest_missing", not_initialized: true }), false);
+assert.strictEqual(transition.elements.uninitializedAlertHeading.textContent, "AIWorkHub is not initialized for this repository");
+assert.strictEqual(transition.elements.initializeButton.hidden, false);
+assert.strictEqual(transition.elements.initializeButton.disabled, false);
+assert.strictEqual(transition.render({ ready: true, reason: "ready", not_initialized: false }), true);
+assert.strictEqual(transition.elements.uninitializedAlert.hidden, true);
+assert.strictEqual(transition.elements.uninitializedAlertHeading.textContent, "AIWorkHub storage is degraded");
+assert.strictEqual(transition.elements.uninitializedAlertMessage.textContent, "");
+assert.strictEqual(transition.elements.initializeButton.hidden, true);
+assert.strictEqual(transition.elements.initializeButton.disabled, true);
+
 // ── 5. Python: dashboard.py's task list/detail/exact-counts/callback-health
 //      surface (DashboardProvider + exact_status_counts + build_snapshot/
 //      build_task_detail) must never import/execute AITools/taskdb.py or

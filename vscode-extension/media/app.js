@@ -135,6 +135,7 @@ const elements = {
   offlineAlertMessage: document.querySelector("#offline-alert-message"),
   offlineRetryButton: document.querySelector("#offline-retry-button"),
   uninitializedAlert: document.querySelector("#uninitialized-alert"),
+  uninitializedAlertHeading: document.querySelector("#uninitialized-alert strong"),
   uninitializedAlertMessage: document.querySelector("#uninitialized-alert-message"),
   initializeButton: document.querySelector("#initialize-button"),
   identityAlert: document.querySelector("#identity-alert"),
@@ -2842,19 +2843,27 @@ function renderWarnings(snapshot) {
   elements.warningList.replaceChildren(fragment);
 }
 
-// The storage gate: an uninitialized/degraded repository always arrives
-// with a zero-count, zero-row snapshot (see dashboard.build_snapshot), but
-// this still renders the one explicit "Initialize AIWorkHub" action instead
-// of a silent empty queue, so the user is never left guessing why nothing
-// shows up.
+// The storage gate trusts the backend's explicit not_initialized flag.
+// Other storage failures remain visible as degraded and never offer initialization.
 function renderStorageState(snapshot) {
   const storage = snapshot && typeof snapshot.storage === "object" ? snapshot.storage : null;
   const ready = !storage || storage.ready !== false;
+  const notInitialized = !ready && storage.not_initialized === true;
   elements.uninitializedAlert.hidden = ready;
-  if (!ready) {
-    const reason = String((storage && storage.reason) || "uninitialized");
+  elements.uninitializedAlertHeading.textContent = notInitialized
+    ? "AIWorkHub is not initialized for this repository"
+    : "AIWorkHub storage is degraded";
+  elements.uninitializedAlertMessage.textContent = "";
+  elements.initializeButton.hidden = !notInitialized;
+  elements.initializeButton.disabled = !notInitialized;
+  if (notInitialized) {
+    const reason = String(storage.reason || "uninitialized");
     elements.uninitializedAlertMessage.textContent = `Storage is not ready (${reason}). Initialize to create the canonical task store for this repository.`;
     setConnection("degraded", "Uninitialized");
+  } else if (!ready) {
+    const reason = String(storage.reason || "unknown_storage_failure");
+    elements.uninitializedAlertMessage.textContent = `Storage is degraded (${reason}).`;
+    setConnection("degraded", `Storage degraded: ${reason}`);
   }
   return ready;
 }
