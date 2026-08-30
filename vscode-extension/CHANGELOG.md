@@ -1,5 +1,31 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.69 — 2026-08-30
+
+### Added
+
+- Supervisor-owned context receipts now carry authenticated provider envelopes,
+  and the worker completion path enforces its live Source Graph gate.
+- Mechanical workspace and input preflight rejects invalid launch inputs before
+  execution, while mypy runs through the repository's canonical trusted Python
+  interpreter.
+
+### Fixed
+
+- Diagnostic validation compares results with the accepted baseline to identify
+  regressions without relabeling existing diagnostics.
+- Normalized review findings enter the lifecycle idempotently, and acceptance
+  closes exactly linked NeedFix findings without repeated side effects.
+- Reserved reviewer launch failures reconcile to a terminal result, and
+  process-launcher validation lives in a focused module protected by a size
+  ratchet.
+
+### Tests
+
+- Regression coverage binds receipt authentication and Source Graph enforcement
+  to baseline comparison, preflight, interpreter trust, finding replay, linked
+  closure, launcher extraction and reviewer launch-failure reconciliation.
+
 ## 0.10.68 — 2026-08-29
 
 ### Added

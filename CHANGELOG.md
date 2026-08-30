@@ -6,6 +6,36 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.69] - 2026-08-30
+
+### Added
+
+- Supervisors now own authenticated context receipts and enforce the live Source
+  Graph gate before worker completion, with provider receipt envelopes binding
+  authority, request identity and evidence to their authenticated payloads.
+- Workspace and task input preflight is a mechanical, deterministic step, and
+  mypy validation uses only the canonical trusted interpreter selected for the
+  repository.
+
+### Fixed
+
+- Validation compares diagnostics with the accepted baseline so unchanged
+  findings remain distinguishable from regressions.
+- Review-finding ingress normalizes identities before an idempotent write, and
+  accepted targets close exactly linked NeedFix findings without duplicating
+  lifecycle effects.
+- Reserved reviewer launch failures now reconcile to a terminal lifecycle result
+  instead of leaving leased review work stranded.
+- Process-launcher validation was extracted into a focused module with a size
+  ratchet that keeps the launcher boundary from growing back.
+
+### Tests
+
+- Coverage exercises context and Source Graph enforcement, baseline diagnostics,
+  deterministic preflight, trusted mypy selection, normalized finding replay,
+  linked NeedFix closure, launcher extraction, reviewer launch reconciliation
+  and authenticated provider receipt envelopes.
+
 ## [0.10.68] - 2026-08-29
 
 ### Added

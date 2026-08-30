@@ -12,6 +12,22 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.69 — 2026-08-30
+
+- Worker completion now requires the supervisor-owned context receipt and live
+  Source Graph gate; authenticated provider envelopes bind receipts to their
+  authority, request and evidence.
+- Launch preparation mechanically validates workspace and task inputs, and
+  mypy uses the repository's canonical trusted interpreter.
+- Diagnostics are compared with the accepted baseline so new regressions are
+  separated from existing results.
+- Normalized review findings are ingested idempotently, and accepted targets
+  close exactly linked NeedFix findings without replaying lifecycle effects.
+- Reserved reviewer launch failures reconcile to terminal state instead of
+  leaving work pending.
+- Process-launcher validation is isolated in a focused, parity-tested module
+  whose size ratchet protects the extracted boundary.
+
 ## What's new in 0.10.68 — 2026-08-29
 
 - Mandatory review mechanics now belong to the supervisor and durable task
