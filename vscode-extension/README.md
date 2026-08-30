@@ -12,6 +12,19 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.71 — 2026-08-30
+
+- Source Graph recovery can remove a locked prior-build probe without destroying
+  the readable generation, keeping usable graph evidence available.
+- Task lifecycle updates support an unchanged residual scope when the remaining
+  work itself has not changed.
+- Public documentation now reports all 48 Source Graph query modes.
+- Expected file bytes come from authenticated evidence, and signed outer
+  continuation cursors bound pagination with exact counts and deterministic
+  reassembly.
+- CI matches production behavior for exact page counts, complete reassembly and
+  rejection of cursor tampering before continuation.
+
 ## What's new in 0.10.70 — 2026-08-30
 
 - Reviewer launches materialize immutable, evidence-bound input packets before

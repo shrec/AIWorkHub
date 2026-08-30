@@ -6,6 +6,31 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.71] - 2026-08-30
+
+### Added
+
+- Task updates may preserve an unchanged residual scope, allowing lifecycle
+  progress without manufacturing a scope change.
+- Expected file bytes are extracted only from authenticated evidence, and outer
+  continuation pagination is bounded by signed cursors with exact item counts
+  and deterministic page reassembly.
+
+### Fixed
+
+- Source Graph recovery can discard a locked prior-build probe while preserving
+  the readable generation, rather than destroying usable graph evidence.
+- Continuation cursors reject tampering before pagination resumes.
+
+### Documentation
+
+- Public Source Graph documentation now reports the correct 48 query modes.
+
+### Tests
+
+- CI exercises the same pagination contract as production, including exact
+  counts, multi-page reassembly and cursor-tamper authentication.
+
 ## [0.10.70] - 2026-08-30
 
 ### Fixed

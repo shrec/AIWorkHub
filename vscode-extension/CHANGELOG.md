@@ -1,5 +1,29 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.71 — 2026-08-30
+
+### Added
+
+- Unchanged residual task scopes are accepted when an update advances lifecycle
+  state without changing the remaining work.
+- Authenticated evidence supplies expected file bytes, while signed, bounded
+  outer continuation cursors provide exact counts and deterministic reassembly.
+
+### Fixed
+
+- Source Graph recovery removes a locked prior-build probe without destroying
+  the readable generation it was probing.
+- Tampered pagination cursors are rejected before continuation.
+
+### Documentation
+
+- Public Source Graph material now states the correct total of 48 query modes.
+
+### Tests
+
+- CI mirrors production pagination checks for exact counts, complete multi-page
+  reassembly and cursor-tamper authentication.
+
 ## 0.10.70 — 2026-08-30
 
 ### Fixed

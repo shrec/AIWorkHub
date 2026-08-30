@@ -1,8 +1,8 @@
 {
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
-  "description": "Repository-native multi-model orchestration with dependency-aware tasks, 37-mode source intelligence, durable context and evidence-first review.",
-  "version": "0.10.70",
+  "description": "Repository-native multi-model orchestration with dependency-aware tasks, 48-mode source intelligence, durable context and evidence-first review.",
+  "version": "0.10.71",
   "publisher": "IvaneChkheidze",
   "license": "MIT",
   "icon": "media/aiworkhub-marketplace-icon.png",
