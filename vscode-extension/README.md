@@ -12,6 +12,19 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.70 — 2026-08-30
+
+- Reviewer launches materialize immutable, evidence-bound input packets before
+  execution.
+- Existing valid `.aiworkhub/project.json` files remain the canonical repository
+  authority; Windows, Linux and remote workspace hosts no longer misclassify
+  those repositories as uninitialized.
+- The dashboard distinguishes degraded or unavailable storage from a canonical
+  schema upgrade. Only the compatible older-schema state offers the explicit
+  project-schema upgrade action.
+- Exhaustive extension fixtures now keep manifest discovery aligned with
+  production for valid, missing, malformed and host-specific cases.
+
 ## What's new in 0.10.69 — 2026-08-30
 
 - Worker completion now requires the supervisor-owned context receipt and live

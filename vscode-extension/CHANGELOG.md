@@ -1,5 +1,23 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.70 — 2026-08-30
+
+### Fixed
+
+- Reviewer inputs are materialized as immutable evidence-bound packets before a
+  reviewer starts.
+- Existing valid `.aiworkhub/project.json` files retain canonical repository
+  authority, repairing false uninitialized detection on Windows, Linux and
+  remote workspace hosts.
+- Degraded or unavailable storage is shown as an operational failure, distinct
+  from a canonical schema that needs upgrading; the latter exposes an explicit
+  project-schema upgrade action.
+
+### Tests
+
+- Manifest-discovery fixtures exhaustively match production behavior across
+  valid, missing, malformed and host-specific cases.
+
 ## 0.10.69 — 2026-08-30
 
 ### Added

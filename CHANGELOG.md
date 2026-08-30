@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.70] - 2026-08-30
+
+### Fixed
+
+- Reviewer launches now materialize immutable input packets before execution, so
+  every reviewer receives the exact evidence-bound inputs selected by the
+  supervisor.
+- Repository discovery preserves the authority of an existing valid
+  `.aiworkhub/project.json` and no longer falsely reports initialized
+  repositories as uninitialized on Windows, Linux or remote workspace hosts.
+- The dashboard reports degraded or unavailable storage as an operational
+  failure rather than a missing repository. A canonical but older schema is
+  identified separately and offers an explicit project-schema upgrade action.
+
+### Tests
+
+- Extension manifest-discovery fixtures now exhaustively mirror production
+  behavior for valid, missing, malformed and host-specific repository manifests.
+
 ## [0.10.69] - 2026-08-30
 
 ### Added
