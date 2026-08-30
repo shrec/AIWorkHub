@@ -449,6 +449,54 @@ def test_ensure_started_and_health_share_canonical_generation(
     assert started["files_seen"] > 0
 
 
+def test_locked_prior_build_probe_fails_safe_into_committed_build(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    root = _init_repo(tmp_path, "locked_prior_probe")
+    (root / "locked_probe.py").write_text(
+        "def survives_locked_probe():\n    return True\n", encoding="utf-8",
+    )
+    cleanup_daemons.append(root)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+
+    real_connect = source_graph.connect
+    connect_calls = {"count": 0}
+
+    def locked_first_read(db_path, *, read_only=False):
+        connect_calls["count"] += 1
+        if connect_calls["count"] == 1:
+            assert read_only is True
+            raise sqlite3.OperationalError("database is locked")
+        return real_connect(db_path, read_only=read_only)
+
+    real_build_index = source_graph.build_index
+    build_modes = []
+
+    def observed_build(repo_root, *, incremental=True, db_path=None):
+        build_modes.append(incremental)
+        return real_build_index(repo_root, incremental=incremental, db_path=db_path)
+
+    monkeypatch.setattr(source_graph, "connect", locked_first_read)
+    monkeypatch.setattr(source_graph, "build_index", observed_build)
+
+    assert daemon._run_one_build() is True
+    assert connect_calls["count"] >= 1
+    assert build_modes == [False]
+    assert daemon.health()["status"] == source_graph_daemon.STATUS_READY
+
+    db_path = source_graph.resolve_db_path(root)
+    conn = real_connect(db_path, read_only=True)
+    try:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='last_build'"
+        ).fetchone() is not None
+        assert conn.execute(
+            "SELECT 1 FROM entities WHERE name='survives_locked_probe'"
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+
 def test_cross_process_writer_contention_is_healthy_standby(tmp_path, cleanup_daemons):
     root = _init_repo(tmp_path)
     cleanup_daemons.append(root)

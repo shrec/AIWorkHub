@@ -1001,9 +1001,10 @@ class SourceGraphDaemon:
 
         A fresh repository (no database file yet, or a database with an
         empty ``meta`` table) triggers exactly one full build; every build
-        after that is incremental. Any resolution failure is treated as
-        "no prior build" -- it fails toward a (safe, if redundant) full
-        build rather than silently skipping indexing.
+        after that is incremental. Resolution and SQLite read/open failures
+        are treated as "no prior build" -- the probe fails toward a safe,
+        potentially redundant full build. The build's writer lease remains
+        authoritative and can still truthfully yield standby.
         """
         try:
             db_path = source_graph.resolve_db_path(self.repo_root)
@@ -1017,7 +1018,7 @@ class SourceGraphDaemon:
                 return row is not None
             finally:
                 conn.close()
-        except source_graph.SourceGraphError:
+        except (source_graph.SourceGraphError, sqlite3.Error):
             return False
 
     def _run_one_build(self) -> bool:
