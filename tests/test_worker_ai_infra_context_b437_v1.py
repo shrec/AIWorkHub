@@ -289,8 +289,8 @@ def test_common_prompt_delivery_and_receipt_are_distinct(
         output,
         expected_bundle_sha256=context_result.metadata["bundle_sha256"],
     )
-    assert receipt["acknowledged"] is True
-    assert receipt["bundle_sha256"] == context_result.metadata["bundle_sha256"]
+    assert receipt["acknowledged"] is False
+    assert receipt["reason"] == "receipt_not_found"
 
     codex_event = tmp_path / "codex.stdout.log"
     codex_event.write_text(json.dumps({
@@ -331,7 +331,15 @@ def test_receipt_survives_long_stream_suffix(tmp_path: Path) -> None:
         "section_count": 4,
     }
     output.write_text(
-        "PROJECT_CONTEXT_RECEIPT: " + json.dumps(receipt) + "\n" + ("x" * (128 * 1024)),
+        json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "PROJECT_CONTEXT_RECEIPT: " + json.dumps(receipt),
+            },
+        })
+        + "\n"
+        + ("x" * (128 * 1024)),
         encoding="utf-8",
     )
     parsed = process_launcher._project_context_receipt_from_output(
