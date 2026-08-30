@@ -8871,7 +8871,7 @@ class ProcessManager:
                     task_id,
                     runner,
                     reason=reason[:500],
-                    request_id=request_id or "",
+                    request_id=request_id or reserved_request_id or "",
                 )
                 if not blocked_result.get("ok"):
                     reason += ":launch_failure_transition_failed:" + str(

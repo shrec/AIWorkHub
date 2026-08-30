@@ -2990,3 +2990,113 @@ def test_an_abandoned_claim_names_a_refused_terminal_transition(
     assert receipt["claimed_task_transition"] == (
         "launch_failure_transition_failed:claim_owner_mismatch"
     )
+
+
+def test_claimed_pre_provider_exception_uses_exact_reserved_request(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    request_id = "review-stale-editor-host"
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    process_launcher.task_store.initialize_repository(manager.repo)
+    _readiness, db_path = process_launcher.task_store._require_ready(manager.repo)
+    now = "2026-08-30T00:00:00+00:00"
+    card = {
+        "task_id": "TARGET_TASK",
+        "runner": RUNNER,
+        "topic": TOPIC,
+        "status": "processing",
+        "worker_status": "claimed",
+        "claimed_by": RUNNER,
+        "launch_request_id": request_id,
+        "allowed_writes": ["candidate.py"],
+    }
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "priority, objective, card_json, created_at, updated_at, claimed_by, "
+            "claimed_at, started_at) VALUES (?, ?, ?, 'processing', 'claimed', "
+            "'', '', ?, ?, ?, ?, ?, '')",
+            (
+                "TARGET_TASK",
+                RUNNER,
+                TOPIC,
+                json.dumps(card),
+                now,
+                now,
+                RUNNER,
+                now,
+            ),
+        )
+
+    monkeypatch.setattr(process_launcher, "launch_gates_open", lambda: True)
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_preflight_card",
+        lambda _self, *_args, **_kwargs: card,
+    )
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_reviewer_reservation_still_held",
+        lambda _self, candidate: candidate == request_id,
+    )
+
+    def stale_editor_host(_self, _card):
+        raise RuntimeError("stale_editor_host_before_provider")
+
+    monkeypatch.setattr(
+        process_launcher.ProcessManager, "_with_dependency_inputs", stale_editor_host
+    )
+
+    receipt = _abandoned_receipt(manager, request_id)
+    assert receipt["ok"] is False
+    assert "launch_request_id_required" not in receipt["blocked_reason"]
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT status, worker_status, completed_at, card_json "
+            "FROM tasks WHERE task_id='TARGET_TASK'"
+        ).fetchone()
+    assert row is not None
+    assert row["status"] == "blocked"
+    assert row["worker_status"] == "launch_failed"
+    assert row["completed_at"]
+    failed_card = json.loads(row["card_json"])
+    assert failed_card["launch_request_id"] == request_id
+    terminal_snapshot = tuple(row)
+
+    # Retry is idempotent, while exact request/owner CAS guards later claims.
+    retry = process_launcher.task_engine.mark_launch_failed(
+        manager.repo,
+        "TARGET_TASK",
+        RUNNER,
+        reason="retry",
+        request_id=request_id,
+    )
+    assert retry["ok"] is False
+    request_mismatch = process_launcher.task_engine.mark_launch_failed(
+        manager.repo,
+        "TARGET_TASK",
+        RUNNER,
+        reason="must not steal",
+        request_id="different-request",
+    )
+    assert request_mismatch["ok"] is False
+    owner_mismatch = process_launcher.task_engine.mark_launch_failed(
+        manager.repo,
+        "TARGET_TASK",
+        "different-owner",
+        reason="must not steal",
+        request_id=request_id,
+    )
+    assert owner_mismatch["ok"] is False
+    with sqlite3.connect(db_path) as conn:
+        terminal_retry = conn.execute(
+            "SELECT status, worker_status, completed_at, card_json "
+            "FROM tasks WHERE task_id='TARGET_TASK'"
+        ).fetchone()
+    assert terminal_retry == terminal_snapshot
+
+    archived, archive_reason = process_launcher.task_store.archive_task(
+        manager.repo, "TARGET_TASK", reason="terminal launch failure"
+    )
+    assert archived is True, archive_reason
