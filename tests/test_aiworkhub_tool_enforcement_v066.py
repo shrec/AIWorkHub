@@ -93,15 +93,22 @@ def test_required_context_accepts_acknowledged_supervisor_receipt(
     metadata = _metadata()
     bundle_sha256 = "a" * 64
     stdout_path = tmp_path / "worker.jsonl"
+    receipt = {
+        "acknowledged": True,
+        "bundle_sha256": bundle_sha256,
+        "prompt_sha256": "",
+        "request_id": "request-1",
+        "schema_id": process_launcher.project_context.RECEIPT_SCHEMA_ID,
+        "section_count": 4,
+    }
     stdout_path.write_text(
-        "PROJECT_CONTEXT_RECEIPT: "
-        + json.dumps(
+        json.dumps(
             {
-                "acknowledged": True,
-                "bundle_sha256": bundle_sha256,
-                "prompt_sha256": "",
-                "schema_id": process_launcher.project_context.RECEIPT_SCHEMA_ID,
-                "section_count": 4,
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": "PROJECT_CONTEXT_RECEIPT: " + json.dumps(receipt),
+                },
             }
         )
         + "\n",
