@@ -1169,6 +1169,96 @@ def resolve_needfix(
         conn.close()
 
 
+def close_for_accepted_task(
+    repo_root: str | Path,
+    task_id: str,
+    *,
+    accepted_request_id: str,
+) -> dict[str, Any]:
+    """Durably resolve the one NeedFix linked to an accepted canonical task.
+
+    The task id is the fail-closed join key.  The durable closure identity is
+    bound to the task and its canonical accepting request, so retries and lost
+    acknowledgements return the same result without another audit event.
+    """
+    linked_task_id = str(task_id or "").strip()
+    request_id = str(accepted_request_id or "").strip()
+    if not linked_task_id or not request_id:
+        raise NeedFixValidationError("task_id and accepted_request_id are required")
+    closure_id = hashlib.sha256(
+        (
+            f"needfix-accepted-task-closure\0{linked_task_id}"
+            f"\0{request_id}"
+        ).encode("utf-8")
+    ).hexdigest()
+
+    conn = _connect(repo_root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT * FROM needfix WHERE converted_task_id = ? ORDER BY id",
+            (linked_task_id,),
+        ).fetchall()
+        if not rows:
+            conn.commit()
+            return {
+                "state": "not_linked",
+                "task_id": linked_task_id,
+                "closure_id": closure_id,
+                "needfix_id": None,
+            }
+        if len(rows) != 1:
+            conn.rollback()
+            raise NeedFixConflictError(
+                f"task {linked_task_id!r} is linked to multiple NeedFix records"
+            )
+        row = rows[0]
+        needfix_id = str(row["id"])
+        if row["status"] == "resolved":
+            conn.commit()
+            return {
+                "state": "already_closed",
+                "task_id": linked_task_id,
+                "closure_id": closure_id,
+                "needfix_id": needfix_id,
+            }
+        if row["status"] != "task_created":
+            conn.rollback()
+            raise NeedFixConflictError(
+                f"linked NeedFix {needfix_id} is not task_created "
+                f"(current status is {row['status']!r})"
+            )
+        now = _utcnow_iso()
+        conn.execute(
+            "UPDATE needfix SET status = 'resolved', resolved_at = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'task_created' AND converted_task_id = ?",
+            (now, now, needfix_id, linked_task_id),
+        )
+        _record_event(
+            conn,
+            needfix_id,
+            "accepted_task_closed",
+            {
+                "closure_id": closure_id,
+                "converted_task_id": linked_task_id,
+                "accepted_request_id": request_id,
+            },
+        )
+        conn.commit()
+        return {
+            "state": "closed",
+            "task_id": linked_task_id,
+            "closure_id": closure_id,
+            "needfix_id": needfix_id,
+        }
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def resolve_verified_needfix(
     repo_root: str | Path,
     needfix_id: str,

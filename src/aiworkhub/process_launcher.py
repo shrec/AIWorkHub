@@ -45,6 +45,7 @@ from . import context_write_intents
 from . import context_writes
 from . import evidence_levels
 from . import kilo_auth
+from . import needfix_store
 from .platform_io import (
     AdvisoryLockTimeout,
     chmod_fd,
@@ -4938,8 +4939,9 @@ class ProcessManager:
         self._cancelled: set[str] = set()
         self._watching: set[str] = set()
         self._authority_key: bytes | None = None
-        if self.isolation_enabled and self.process_log_path.is_file():
+        if self.process_log_path.is_file() and self.isolation_enabled:
             self._reconcile_persisted_requests()
+        self._reconcile_pending_needfix_closures()
 
     def _default_show_task(self, task_id: str) -> dict[str, Any]:
         """The sole claim/finalization authority: ``self.repo`` -- the exact
@@ -13359,6 +13361,77 @@ class ProcessManager:
         self._refuse_backwards_version_promotion(workspace, changed)
         return promote(workspace, changed)
 
+    def _close_accepted_task_needfix(
+        self, task_id: str, request_id: str
+    ) -> dict[str, Any]:
+        """Return explicit recoverable state without revising acceptance truth."""
+        try:
+            return needfix_store.close_for_accepted_task(
+                self.repo, task_id, accepted_request_id=request_id
+            )
+        except Exception as exc:
+            closure_id = hashlib.sha256(
+                (
+                    f"needfix-accepted-task-closure\0{task_id}"
+                    f"\0{request_id}"
+                ).encode("utf-8")
+            ).hexdigest()
+            pending = {
+                "state": "pending_recovery",
+                "task_id": task_id,
+                "accepted_request_id": request_id,
+                "closure_id": closure_id,
+                "recoverable": True,
+                "error": str(exc)[:500],
+            }
+            self._append_event({
+                "request_id": request_id,
+                "task_id": task_id,
+                "state": "needfix_closure_pending",
+                "needfix_closure": pending,
+                "recorded_at": _utcnow(),
+            })
+            return pending
+
+    def _reconcile_pending_needfix_closures(self) -> None:
+        """Retry durable accepted-task closures without model/operator action."""
+        events = self._events()
+        completed = {
+            (str(event.get("task_id") or ""), str(event.get("request_id") or ""))
+            for event in events
+            if event.get("state") == "needfix_closure_reconciled"
+        }
+        pending: dict[tuple[str, str], dict[str, Any]] = {}
+        for event in events:
+            if event.get("state") != "needfix_closure_pending":
+                continue
+            identity = (
+                str(event.get("task_id") or ""),
+                str(event.get("request_id") or ""),
+            )
+            if all(identity) and identity not in completed:
+                pending[identity] = event
+        for (task_id, request_id), _event in pending.items():
+            try:
+                card = _parse_card(self._show_task(task_id), task_id)
+                if (
+                    _canonical_task_status(card) != "finished"
+                    or str(card.get("accepted_request_id") or "") != request_id
+                ):
+                    continue
+                closure = needfix_store.close_for_accepted_task(
+                    self.repo, task_id, accepted_request_id=request_id
+                )
+            except Exception:
+                continue
+            self._append_event({
+                "request_id": request_id,
+                "task_id": task_id,
+                "state": "needfix_closure_reconciled",
+                "needfix_closure": closure,
+                "recorded_at": _utcnow(),
+            })
+
     def accept_review(
         self,
         request_id: str,
@@ -13458,12 +13531,18 @@ class ProcessManager:
             canonical = _canonical_task_status(card)
             if canonical == "finished":
                 already = str(card.get("accepted_request_id") or "") == request_id
+                closure = (
+                    self._close_accepted_task_needfix(task_id, request_id)
+                    if already
+                    else {"state": "not_attempted"}
+                )
                 return {
                     "ok": already,
                     "already_accepted": already,
                     "request_id": request_id,
                     "task_id": task_id,
                     "error": "" if already else "task_already_finished_by_other_request",
+                    "needfix_closure": closure,
                 }
             if canonical != "review":
                 return {
@@ -13890,6 +13969,7 @@ class ProcessManager:
                         "task_id": task_id,
                         "promoted_paths": [],
                     }
+                needfix_closure = self._close_accepted_task_needfix(task_id, request_id)
                 cleanup_error = ""
                 try:
                     cleanup_workspace(workspace.repo, workspace.path, workspace.home)
@@ -13910,6 +13990,7 @@ class ProcessManager:
                     "acceptance_evidence_record": acceptance_evidence_record,
                     "reviewer_finalization": [],
                     "acceptance_lock_scope": "request",
+                    "needfix_closure": needfix_closure,
                     "finished_at": _utcnow(),
                 })
                 return {
@@ -13922,6 +14003,7 @@ class ProcessManager:
                     "acceptance_evidence_record": acceptance_evidence_record,
                     "reviewer_finalization": [],
                     "acceptance_lock_scope": "request",
+                    "needfix_closure": needfix_closure,
                 }
 
             if readonly_research:
@@ -14056,6 +14138,7 @@ class ProcessManager:
                         "task_id": task_id,
                         "promoted_paths": [],
                     }
+                needfix_closure = self._close_accepted_task_needfix(task_id, request_id)
                 cleanup_error = ""
                 try:
                     cleanup_workspace(workspace.repo, workspace.path, workspace.home)
@@ -14075,6 +14158,7 @@ class ProcessManager:
                     "research_result": current_result,
                     "acceptance_evidence_record": acceptance_evidence_record,
                     "reviewer_finalization": [],
+                    "needfix_closure": needfix_closure,
                     "finished_at": _utcnow(),
                 })
                 return {
@@ -14087,6 +14171,7 @@ class ProcessManager:
                     "acceptance_evidence_record": acceptance_evidence_record,
                     "reviewer_finalization": [],
                     "acceptance_lock_scope": "request",
+                    "needfix_closure": needfix_closure,
                 }
 
             try:
@@ -14406,6 +14491,8 @@ class ProcessManager:
                     "promoted_paths": promoted,
                 }
 
+            needfix_closure = self._close_accepted_task_needfix(task_id, request_id)
+
             verified_reviewer_ids = [
                 tid for tid, _ws, _accepted in verified_reviewer_tasks
             ]
@@ -14459,6 +14546,7 @@ class ProcessManager:
                     "cleanup_error": str(exc)[:500],
                     "reviewer_finalization": reviewer_finalization,
                     "acceptance_evidence_record": acceptance_evidence_record,
+                    "needfix_closure": needfix_closure,
                     "finished_at": _utcnow(),
                 })
                 return {
@@ -14469,6 +14557,7 @@ class ProcessManager:
                     "cleanup_error": str(exc)[:500],
                     "reviewer_finalization": reviewer_finalization,
                     "acceptance_evidence_record": acceptance_evidence_record,
+                    "needfix_closure": needfix_closure,
                 }
 
             self._append_event({
@@ -14483,6 +14572,7 @@ class ProcessManager:
                 "workspace_retained": False,
                 "reviewer_finalization": reviewer_finalization,
                 "acceptance_evidence_record": acceptance_evidence_record,
+                "needfix_closure": needfix_closure,
                 "finished_at": _utcnow(),
             })
             return {
@@ -14492,6 +14582,7 @@ class ProcessManager:
                 "promoted_paths": promoted,
                 "reviewer_finalization": reviewer_finalization,
                 "acceptance_evidence_record": acceptance_evidence_record,
+                "needfix_closure": needfix_closure,
             }
 
     def list_processes(self, limit: int = 100) -> dict[str, Any]:

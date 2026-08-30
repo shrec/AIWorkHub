@@ -393,6 +393,68 @@ def test_convert_needfix_still_mints_deterministic_id_and_links_atomically(init:
     assert needfix_store.get_needfix(init, nfid)["status"] == "task_created"
 
 
+def test_accepted_task_closure_is_exact_durable_and_idempotent(init: Path):
+    linked = needfix_store.add_needfix(
+        init, title="linked", description="d", status="accepted"
+    )
+    other = needfix_store.add_needfix(
+        init, title="other", description="d", status="accepted"
+    )
+    task_id = f"needfix-{linked['id']}"
+    needfix_store.convert_needfix(
+        init, linked["id"], lambda card: {"ok": True, "task_id": card["task_id"]}
+    )
+
+    first = needfix_store.close_for_accepted_task(
+        init, task_id, accepted_request_id="req-one"
+    )
+    second = needfix_store.close_for_accepted_task(
+        init, task_id, accepted_request_id="req-one"
+    )
+
+    assert first["state"] == "closed"
+    assert second == {**first, "state": "already_closed"}
+    assert needfix_store.get_needfix(init, linked["id"])["status"] == "resolved"
+    assert needfix_store.get_needfix(init, other["id"])["status"] == "accepted"
+    active = needfix_store.list_needfix(
+        init,
+        active_only=True,
+        get_task_fn=lambda _task_id: None,
+        canonical_status_fn=lambda _card: "",
+    )
+    assert [record["id"] for record in active] == [other["id"]]
+    assert (
+        needfix_store.count_needfix(
+            init,
+            active_only=True,
+            get_task_fn=lambda _task_id: None,
+            canonical_status_fn=lambda _card: "",
+        )
+        == 1
+    )
+    conn = needfix_store._connect(init)
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM needfix_events "
+            "WHERE needfix_id = ? AND event = 'accepted_task_closed'",
+            (linked["id"],),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1
+
+
+def test_accepted_task_closure_does_not_touch_unlinked_record(init: Path):
+    rec = needfix_store.add_needfix(
+        init, title="unlinked", description="d", status="accepted"
+    )
+    result = needfix_store.close_for_accepted_task(
+        init, "different-task", accepted_request_id="req-one"
+    )
+    assert result["state"] == "not_linked"
+    assert needfix_store.get_needfix(init, rec["id"])["status"] == "accepted"
+
+
 def test_reconcile_binds_to_the_same_id_convert_mints(init: Path):
     # The reconcile candidate and the convert-minted id are one and the same,
     # so after-the-fact linking can never disagree with conversion.

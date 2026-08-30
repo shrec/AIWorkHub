@@ -19,11 +19,139 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import (  # noqa: E402
+    needfix_store,
     platform_io,
     process_launcher,
     task_templates,
     worker_ai_tools_mcp,
 )
+
+
+def _linked_needfix(repo: Path, task_id: str) -> str:
+    record = needfix_store.add_needfix(
+        repo, title="accepted closure", description="d", status="accepted"
+    )
+    needfix_store.convert_needfix(
+        repo,
+        record["id"],
+        lambda _card: {"ok": True, "task_id": task_id},
+    )
+    return str(record["id"])
+
+
+def _accepted_needfix_card(
+    task_id: str, request_id: str, status: str = "finished"
+) -> dict:
+    card = _card(task_id, status)
+    card["accepted_request_id"] = request_id
+    return card
+
+
+def test_accept_review_needfix_restart_reconciles_pending_closure_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task_id = "needfix-task"
+    request_id = "accepted-request"
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _accepted_needfix_card(task_id, request_id)),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    needfix_id = _linked_needfix(manager.repo, task_id)
+    real_close = needfix_store.close_for_accepted_task
+    calls = 0
+
+    def fail_first(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("injected closure persistence failure")
+        return real_close(*args, **kwargs)
+
+    monkeypatch.setattr(needfix_store, "close_for_accepted_task", fail_first)
+    pending = manager._close_accepted_task_needfix(task_id, request_id)
+
+    assert pending["state"] == "pending_recovery"
+    assert pending["accepted_request_id"] == request_id
+    assert needfix_store.get_needfix(manager.repo, needfix_id)["status"] == "task_created"
+
+    restarted = process_launcher.ProcessManager(
+        repo=manager.repo,
+        process_log_path=manager.process_log_path,
+        process_dir=manager.process_dir,
+        show_task=_show(lambda: _accepted_needfix_card(task_id, request_id)),
+        collision_guard=_collision,
+        adapter_builder=_plan([sys.executable, "-c", "pass"], manager.repo),
+        isolation_enabled=False,
+    )
+    assert needfix_store.get_needfix(manager.repo, needfix_id)["status"] == "resolved"
+    assert (
+        needfix_store.list_needfix(
+            manager.repo,
+            active_only=True,
+            get_task_fn=lambda _task_id: None,
+            canonical_status_fn=lambda _card: "",
+        )
+        == []
+    )
+
+    process_launcher.ProcessManager(
+        repo=manager.repo,
+        process_log_path=manager.process_log_path,
+        process_dir=manager.process_dir,
+        show_task=_show(lambda: _accepted_needfix_card(task_id, request_id)),
+        collision_guard=_collision,
+        adapter_builder=_plan([sys.executable, "-c", "pass"], manager.repo),
+        isolation_enabled=False,
+    )
+    conn = needfix_store._connect(manager.repo)
+    try:
+        closure_events = conn.execute(
+            "SELECT COUNT(*) FROM needfix_events "
+            "WHERE needfix_id = ? AND event = 'accepted_task_closed'",
+            (needfix_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert closure_events == 1
+    reconciled = [
+        event
+        for event in restarted._events()
+        if event.get("state") == "needfix_closure_reconciled"
+    ]
+    assert len(reconciled) == 1
+    assert reconciled[0]["needfix_closure"]["closure_id"] == pending["closure_id"]
+
+
+@pytest.mark.parametrize("status", ["pending", "blocked", "review", "rejected"])
+def test_accept_review_needfix_reconciliation_ignores_nonaccepted_tasks(
+    tmp_path: Path, status: str
+) -> None:
+    task_id = f"task-{status}"
+    request_id = "request-nonaccepted"
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _accepted_needfix_card(task_id, request_id, status)),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    needfix_id = _linked_needfix(manager.repo, task_id)
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": task_id,
+        "state": "needfix_closure_pending",
+    })
+
+    process_launcher.ProcessManager(
+        repo=manager.repo,
+        process_log_path=manager.process_log_path,
+        process_dir=manager.process_dir,
+        show_task=_show(lambda: _accepted_needfix_card(task_id, request_id, status)),
+        collision_guard=_collision,
+        adapter_builder=_plan([sys.executable, "-c", "pass"], manager.repo),
+        isolation_enabled=False,
+    )
+
+    assert needfix_store.get_needfix(manager.repo, needfix_id)["status"] == "task_created"
 
 
 def _card(task_id: str = "TASK_B1", state: str = "pending") -> dict:
