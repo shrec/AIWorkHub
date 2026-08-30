@@ -8947,10 +8947,7 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
             "claim_epoch": 1,
             "allowed_writes": ["src/changed.py"],
             "read_first": ["README.md", "src/changed.py"],
-            "immutable_inputs": [
-                "The archived predecessor passed its tests before this review."
-            ],
-            "immutable_input_paths": ["docs/SOURCE_GRAPH.md"],
+            "immutable_inputs": ["docs/SOURCE_GRAPH.md"],
             "terminal_review": {
                 "evidence": {
                     "workspace": workspace.as_metadata(),
@@ -9013,7 +9010,7 @@ def test_quality_review_packet_binding_carries_explicit_target_inputs(
     assert set(scoped_kwargs["source_evidence"]) == {"src/changed.py"}
     assert set(packet_kwargs["source_evidence"]) == {"src/changed.py"}
     assert prepared["packet"]["contract"]["immutable_inputs"] == [
-        "The archived predecessor passed its tests before this review."
+        "docs/SOURCE_GRAPH.md"
     ]
     packet_body = {
         key: value

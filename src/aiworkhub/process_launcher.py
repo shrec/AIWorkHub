@@ -6910,7 +6910,7 @@ class ProcessManager:
             read_only_input_paths = _worker_workspace.quality_review_read_only_input_paths(
                 self.repo,
                 read_first=card.get("read_first") or [],
-                immutable_input_paths=card.get("immutable_input_paths") or [],
+                immutable_input_paths=card.get("immutable_inputs") or [],
                 candidate_changed_paths=current_hashes,
             )
             packet = quality_reviewer.build_review_packet(
@@ -6928,10 +6928,10 @@ class ProcessManager:
                 source_evidence=source_evidence,
                 scoped_audits=scoped_audits,
             )
-            # Immutable prose is authenticated reviewer contract context, not
-            # candidate path evidence. Keep both exact-path gates pure, then
-            # bind the prose into the sealed packet contract and refresh the
-            # canonical digest before the packet is persisted.
+            # Immutable inputs are authenticated reviewer contract context and
+            # read-only workspace materialization authority. Keep candidate
+            # path gates pure, then bind the same declared paths into the
+            # sealed packet contract and refresh its canonical digest.
             contract = packet.get("contract")
             if not isinstance(contract, dict):
                 raise quality_reviewer.ReviewerEvidenceError(
