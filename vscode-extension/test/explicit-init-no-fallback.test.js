@@ -118,6 +118,8 @@ assertPresent(
   ],
   "app.js storage-gate wiring",
 );
+const initializeMessageMatches = app.match(/vscode\.postMessage\(\{ type: "initializeStorage" \}\);/g) || [];
+assert.strictEqual(initializeMessageMatches.length, 1, "the UI must contain exactly one initializeStorage post");
 
 const storageStateMatch = app.match(
   /function renderStorageState\(snapshot\) \{[\s\S]*?\r?\n\}\r?\n\s*function renderSnapshot/,
@@ -125,12 +127,18 @@ const storageStateMatch = app.match(
 assert.ok(storageStateMatch, "renderStorageState function body not found");
 const storageStateSource = storageStateMatch[0].replace(/\r?\n\s*function renderSnapshot$/, "");
 
+const initializeListenerMatch = app.match(
+  /elements\.initializeButton\.addEventListener\("click", \(\) => \{[\s\S]*?\r?\n\}\);/,
+);
+assert.ok(initializeListenerMatch, "initializeStorage click handler not found");
+const initializeListenerSource = initializeListenerMatch[0];
+
 function createStorageHarness() {
   const elements = {
     uninitializedAlert: { hidden: null },
     uninitializedAlertHeading: { textContent: "" },
     uninitializedAlertMessage: { textContent: "" },
-    initializeButton: { hidden: null, disabled: null },
+    initializeButton: { hidden: null, disabled: null, textContent: "" },
   };
   const connections = [];
   const render = new Function(
@@ -139,6 +147,26 @@ function createStorageHarness() {
     `${storageStateSource}; return renderStorageState;`,
   )(elements, (...args) => connections.push(args));
   return { elements, connections, render: (storage) => render({ storage }) };
+}
+
+function createActionHarness(label) {
+  let click = null;
+  let scheduled = null;
+  const messages = [];
+  const button = {
+    disabled: false,
+    textContent: label,
+    addEventListener(type, handler) {
+      assert.strictEqual(type, "click");
+      click = handler;
+    },
+  };
+  new Function("elements", "vscode", "window", initializeListenerSource)(
+    { initializeButton: button },
+    { postMessage: (message) => messages.push(message) },
+    { setTimeout: (handler, ms) => { scheduled = { handler, ms }; } },
+  );
+  return { button, click: () => click(), messages, scheduled: () => scheduled };
 }
 
 function exerciseStorageState(storage) {
@@ -163,11 +191,39 @@ assert.strictEqual(manifestMissing.ready, false);
 assert.strictEqual(manifestMissing.elements.uninitializedAlertHeading.textContent, "AIWorkHub is not initialized for this repository");
 assert.strictEqual(manifestMissing.elements.initializeButton.hidden, false);
 assert.strictEqual(manifestMissing.elements.initializeButton.disabled, false);
+assert.strictEqual(manifestMissing.elements.initializeButton.textContent, "Initialize AIWorkHub");
 assert.match(manifestMissing.elements.uninitializedAlertMessage.textContent, /Initialize/);
 assert.deepStrictEqual(manifestMissing.connections.at(-1), ["degraded", "Uninitialized"]);
 
+const initializeAction = createActionHarness(manifestMissing.elements.initializeButton.textContent);
+initializeAction.click();
+assert.deepStrictEqual(initializeAction.messages, [{ type: "initializeStorage" }]);
+assert.strictEqual(initializeAction.scheduled().ms, 4000);
+initializeAction.scheduled().handler();
+assert.strictEqual(initializeAction.button.textContent, "Initialize AIWorkHub");
+
+const schemaIncomplete = exerciseStorageState({
+  ready: false,
+  reason: "canonical_schema_incomplete",
+  not_initialized: false,
+});
+assert.strictEqual(schemaIncomplete.ready, false);
+assert.strictEqual(schemaIncomplete.elements.uninitializedAlert.hidden, false);
+assert.strictEqual(schemaIncomplete.elements.uninitializedAlertHeading.textContent, "AIWorkHub storage upgrade required");
+assert.strictEqual(schemaIncomplete.elements.initializeButton.hidden, false);
+assert.strictEqual(schemaIncomplete.elements.initializeButton.disabled, false);
+assert.strictEqual(schemaIncomplete.elements.initializeButton.textContent, "Upgrade AIWorkHub storage");
+assert.deepStrictEqual(schemaIncomplete.connections.at(-1), ["degraded", "Storage upgrade required"]);
+
+const upgradeAction = createActionHarness(schemaIncomplete.elements.initializeButton.textContent);
+upgradeAction.click();
+assert.deepStrictEqual(upgradeAction.messages, [{ type: "initializeStorage" }]);
+assert.strictEqual(upgradeAction.button.textContent, "Upgrading AIWorkHub storage");
+upgradeAction.scheduled().handler();
+assert.strictEqual(upgradeAction.button.textContent, "Upgrade AIWorkHub storage");
+assert.strictEqual(upgradeAction.messages.length, 1);
+
 for (const storage of [
-  { ready: false, reason: "canonical_schema_incomplete", not_initialized: false },
   { ready: false, reason: "storage_permission_denied", not_initialized: false },
   { ready: false, reason: "malformed_flag", not_initialized: "true" },
   { ready: false, reason: "missing_flag" },
@@ -186,13 +242,15 @@ for (const storage of [
 const transition = createStorageHarness();
 assert.strictEqual(transition.render({ ready: true, reason: "ready", not_initialized: false }), true);
 assert.strictEqual(transition.render({ ready: false, reason: "canonical_schema_incomplete", not_initialized: false }), false);
-assert.strictEqual(transition.elements.uninitializedAlertHeading.textContent, "AIWorkHub storage is degraded");
-assert.strictEqual(transition.elements.initializeButton.hidden, true);
-assert.strictEqual(transition.elements.initializeButton.disabled, true);
+assert.strictEqual(transition.elements.uninitializedAlertHeading.textContent, "AIWorkHub storage upgrade required");
+assert.strictEqual(transition.elements.initializeButton.hidden, false);
+assert.strictEqual(transition.elements.initializeButton.disabled, false);
+assert.strictEqual(transition.elements.initializeButton.textContent, "Upgrade AIWorkHub storage");
 assert.strictEqual(transition.render({ ready: false, reason: "repository_manifest_missing", not_initialized: true }), false);
 assert.strictEqual(transition.elements.uninitializedAlertHeading.textContent, "AIWorkHub is not initialized for this repository");
 assert.strictEqual(transition.elements.initializeButton.hidden, false);
 assert.strictEqual(transition.elements.initializeButton.disabled, false);
+assert.strictEqual(transition.elements.initializeButton.textContent, "Initialize AIWorkHub");
 assert.strictEqual(transition.render({ ready: true, reason: "ready", not_initialized: false }), true);
 assert.strictEqual(transition.elements.uninitializedAlert.hidden, true);
 assert.strictEqual(transition.elements.uninitializedAlertHeading.textContent, "AIWorkHub storage is degraded");

@@ -2844,22 +2844,35 @@ function renderWarnings(snapshot) {
 }
 
 // The storage gate trusts the backend's explicit not_initialized flag.
-// Other storage failures remain visible as degraded and never offer initialization.
+// Only the exact canonical schema-incomplete state also offers the existing
+// bounded initialization action as an explicit storage upgrade.
 function renderStorageState(snapshot) {
   const storage = snapshot && typeof snapshot.storage === "object" ? snapshot.storage : null;
   const ready = !storage || storage.ready !== false;
   const notInitialized = !ready && storage.not_initialized === true;
+  const upgradeRequired = !ready
+    && !notInitialized
+    && storage.reason === "canonical_schema_incomplete";
+  const actionable = notInitialized || upgradeRequired;
   elements.uninitializedAlert.hidden = ready;
   elements.uninitializedAlertHeading.textContent = notInitialized
     ? "AIWorkHub is not initialized for this repository"
-    : "AIWorkHub storage is degraded";
+    : upgradeRequired
+      ? "AIWorkHub storage upgrade required"
+      : "AIWorkHub storage is degraded";
   elements.uninitializedAlertMessage.textContent = "";
-  elements.initializeButton.hidden = !notInitialized;
-  elements.initializeButton.disabled = !notInitialized;
+  elements.initializeButton.hidden = !actionable;
+  elements.initializeButton.disabled = !actionable;
+  elements.initializeButton.textContent = upgradeRequired
+    ? "Upgrade AIWorkHub storage"
+    : "Initialize AIWorkHub";
   if (notInitialized) {
     const reason = String(storage.reason || "uninitialized");
     elements.uninitializedAlertMessage.textContent = `Storage is not ready (${reason}). Initialize to create the canonical task store for this repository.`;
     setConnection("degraded", "Uninitialized");
+  } else if (upgradeRequired) {
+    elements.uninitializedAlertMessage.textContent = "The canonical task store schema is incomplete. Upgrade storage to restore this repository.";
+    setConnection("degraded", "Storage upgrade required");
   } else if (!ready) {
     const reason = String(storage.reason || "unknown_storage_failure");
     elements.uninitializedAlertMessage.textContent = `Storage is degraded (${reason}).`;
@@ -4625,12 +4638,15 @@ elements.offlineRetryButton.addEventListener("click", () => {
 // ever turns this into the one bounded aiworkhub_dashboard_initialize MCP
 // tool call.
 elements.initializeButton.addEventListener("click", () => {
+  const actionLabel = elements.initializeButton.textContent;
   elements.initializeButton.disabled = true;
-  elements.initializeButton.textContent = "Initializing";
+  elements.initializeButton.textContent = actionLabel === "Upgrade AIWorkHub storage"
+    ? "Upgrading AIWorkHub storage"
+    : "Initializing";
   vscode.postMessage({ type: "initializeStorage" });
   window.setTimeout(() => {
     elements.initializeButton.disabled = false;
-    elements.initializeButton.textContent = "Initialize AIWorkHub";
+    elements.initializeButton.textContent = actionLabel;
   }, 4000);
 });
 
