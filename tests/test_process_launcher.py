@@ -1469,6 +1469,14 @@ def _run_baseline_diagnostic_validation_compare(
     monkeypatch.setattr(
         process_launcher, "run_validations", lambda *_args, **_kwargs: [baseline]
     )
+    monkeypatch.setattr(
+        process_launcher,
+        "_validation_route_kwargs",
+        lambda metadata: {
+            "adapter_id": metadata["adapter_id"],
+            "backend": metadata["sandbox_backend"],
+        },
+    )
     return process_launcher._compare_schema_mypy_baseline(
         workspace,
         {"allowed_writes": [], "read_first": []},
@@ -1703,6 +1711,14 @@ def test_run_declared_validations_accepts_only_baselined_mypy_failure(
     monkeypatch.setattr(
         process_launcher, "cleanup_workspace", lambda *_args, **_kwargs: None
     )
+    monkeypatch.setattr(
+        process_launcher,
+        "_validation_route_kwargs",
+        lambda metadata: {
+            "adapter_id": metadata["adapter_id"],
+            "backend": metadata["sandbox_backend"],
+        },
+    )
     rows = process_launcher._run_declared_validations(
         workspace,
         {
@@ -1742,6 +1758,14 @@ def test_run_declared_validations_keeps_mixed_mypy_and_pytest_failures_red(
         )
 
     monkeypatch.setattr(process_launcher, "run_validations", run)
+    monkeypatch.setattr(
+        process_launcher,
+        "_validation_route_kwargs",
+        lambda metadata: {
+            "adapter_id": metadata["adapter_id"],
+            "backend": metadata["sandbox_backend"],
+        },
+    )
     with pytest.raises(
         process_launcher.ValidationRunError,
         match="baseline_comparison_failed:baseline_comparison_ineligible",

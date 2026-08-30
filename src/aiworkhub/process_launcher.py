@@ -9,7 +9,6 @@ never selects a task by keywords and it never invokes a shell.
 from __future__ import annotations
 
 import ast
-from collections import Counter
 import fnmatch
 import ctypes
 import difflib
@@ -34,7 +33,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from . import core
@@ -58,6 +57,7 @@ from . import quality_evidence
 from . import quality_review_ingest
 from . import quality_review_scope
 from . import process_event_ledger
+from . import process_launcher_validation as _launcher_validation
 from .process_launcher_read_efficiency import (
     _provider_read_efficiency_from_output,
     _strict_read_command_event,
@@ -501,177 +501,18 @@ def _sandbox_backend_for_adapter(adapter_id: str) -> str:
 
 
 def _validation_route_kwargs(metadata: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the exact launch-bound validation route, failing on drift.
-
-    Finalization must not rediscover a host-native sandbox for an editor-hosted
-    worker.  Conversely, a forged/stale metadata backend must never let a
-    native CLI route borrow the in-process boundary.  A coordinator-authorized
-    validation-only replay records ``deterministic_validation`` as its
-    execution lane because no provider was launched.  That value is not a
-    provider sandbox and must not be compared to the original adapter backend;
-    the adapter identity still selects the validation safety boundary.
-    """
-    adapter_id = str(metadata.get("adapter_id") or "").strip()
-    if not adapter_id:
-        raise WorkspaceError("validation_route_adapter_missing")
-    expected_backend = _sandbox_backend_for_adapter(adapter_id)
-    recorded_backend = str(metadata.get("sandbox_backend") or "").strip()
-    execution_mode = str(metadata.get("execution_mode") or "").strip()
-    route: dict[str, Any] = {
-        "backend": expected_backend,
-        "adapter_id": adapter_id,
-    }
-    if execution_mode == "validation_only_replay":
-        if recorded_backend and recorded_backend not in {
-            expected_backend,
-            "deterministic_validation",
-        }:
-            raise WorkspaceError(
-                "validation_route_backend_mismatch:"
-                f"expected={expected_backend}:recorded={recorded_backend}"
-            )
-        route["outer_validation_authority"] = True
-        return route
-    if recorded_backend and recorded_backend != expected_backend:
-        raise WorkspaceError(
-            "validation_route_backend_mismatch:"
-            f"expected={expected_backend}:recorded={recorded_backend}"
-        )
-    return route
-
-
-def _declared_validation_commands(authority: Mapping[str, Any]) -> list[str]:
-    """Return the exact non-empty validation contract from card/metadata.
-
-    An empty contract is authoritative: it must not resolve a route, provision
-    executable scratch, or run a child process.  Keeping this decision above
-    keyword-argument evaluation prevents downstream route setup from turning
-    ``validation=[]`` into an operational failure before ``run_validations``
-    can apply its own empty fast path.
-    """
-    raw = authority.get("validation")
-    if raw is None:
-        return []
-    if not isinstance(raw, (list, tuple)):
-        raise WorkspaceError("validation_commands_invalid")
-    commands: list[str] = []
-    for value in raw:
-        if not isinstance(value, str) or not value.strip():
-            raise WorkspaceError("validation_command_invalid")
-        commands.append(value)
-    return commands
-
-
-def _requires_bridge_cancellation(metadata: Mapping[str, Any]) -> bool:
-    """Return whether finalization must publish a provider bridge decision.
-
-    Coordinator-authorized validation-only replay never launches a provider
-    or creates a fresh VS Code LM bridge receipt.  Skip bridge cancellation
-    only when both durable facts agree; every other editor-hosted lifecycle
-    remains fail-closed.
-    """
-    return not (
-        str(metadata.get("execution_mode") or "").strip()
-        == "validation_only_replay"
-        and metadata.get("provider_launched") is False
+    return _launcher_validation.validation_route_kwargs(
+        metadata, _sandbox_backend_for_adapter
     )
 
 
-_MYPY_DIAGNOSTIC_RE = re.compile(
-    r"^(?P<path>[^:\n]+):\d+(?::\d+)?\s*: error: (?P<message>.+?)(?:\s+\[(?P<code>[^\]]+)\])?$"
-)
-
-
-def _exact_schema_mypy_invocation(row: Mapping[str, Any]) -> bool:
-    """Accept only the trusted mypy executable or ``python -m mypy``."""
-    argv = tuple(
-        str(value)
-        for value in (row.get("executed_argv") or row.get("argv") or ())
-    )
-    if not argv:
-        return False
-    executable = Path(argv[0]).name.lower()
-    if executable in {"mypy", "mypy.exe"}:
-        return True
-    return bool(
-        len(argv) >= 3
-        and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable)
-        and argv[1:3] == ("-m", "mypy")
-    )
-
-
-def _schema_mypy_diagnostics(row: Mapping[str, Any]) -> Counter[tuple[str, str, str]]:
-    """Parse exactly the comparable portion of a real mypy failure."""
-    if row.get("timed_out") or row.get("returncode") != 1:
-        raise WorkspaceError("baseline_mypy_candidate_not_comparable")
-    if _worker_workspace._validation_failure_class(row) != "type_check_failure":
-        raise WorkspaceError("baseline_mypy_candidate_not_comparable")
-    if row.get("stdout_truncated") or row.get("stderr_truncated"):
-        raise WorkspaceError("baseline_mypy_output_truncated")
-    output = "\n".join(
-        (str(row.get("stdout_tail") or ""), str(row.get("stderr_tail") or ""))
-    )
-    diagnostics: Counter[tuple[str, str, str]] = Counter()
-    saw_error = False
-    for raw in output.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("Found ") or line.startswith("Success:"):
-            continue
-        if " error: " not in line:
-            if "Traceback" in line or "INTERNAL ERROR" in line:
-                raise WorkspaceError("baseline_mypy_output_malformed")
-            continue
-        saw_error = True
-        match = _MYPY_DIAGNOSTIC_RE.fullmatch(line)
-        if match is None:
-            raise WorkspaceError("baseline_mypy_output_malformed")
-        raw_path = match.group("path").replace("\\", "/")
-        path_parts = PurePosixPath(raw_path).parts
-        if (
-            not path_parts
-            or raw_path.startswith("/")
-            or ".." in path_parts
-            or path_parts == (".",)
-        ):
-            raise WorkspaceError("baseline_mypy_path_invalid")
-        path = PurePosixPath(*path_parts).as_posix()
-        code = str(match.group("code") or "").strip()
-        message = " ".join(match.group("message").split())
-        if not code or not message:
-            raise WorkspaceError("baseline_mypy_output_malformed")
-        diagnostics[(path, code, message)] += 1
-    if not saw_error:
-        raise WorkspaceError("baseline_mypy_diagnostics_absent")
-    return diagnostics
-
-
-def _baseline_validation_identity(row: Mapping[str, Any]) -> dict[str, Any]:
-    """Return execution facts that must match before diagnostics compare."""
-    return {
-        "declared_command": str(row.get("declared_command") or row.get("command") or ""),
-        "declared_argv": list(row.get("declared_argv") or row.get("argv") or ()),
-        "executed_argv": list(row.get("executed_argv") or row.get("argv") or ()),
-        "interpreter_authority": row.get("interpreter_authority"),
-        "sandbox_backend": row.get("sandbox_backend"),
-        "execution_boundary": row.get("execution_boundary"),
-        "cwd": row.get("cwd"),
-        "env_override": row.get("env_override"),
-        "timeout_seconds": row.get("timeout_seconds"),
-    }
-
-
-def _diagnostic_multiset_digest(
-    diagnostics: Counter[tuple[str, str, str]],
-) -> str:
-    payload = [
-        {"path": key[0], "code": key[1], "message": key[2], "count": count}
-        for key, count in sorted(diagnostics.items())
-    ]
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
-            "utf-8"
-        )
-    ).hexdigest()
+_declared_validation_commands = _launcher_validation.declared_validation_commands
+_requires_bridge_cancellation = _launcher_validation.requires_bridge_cancellation
+_MYPY_DIAGNOSTIC_RE = _launcher_validation.MYPY_DIAGNOSTIC_RE
+_exact_schema_mypy_invocation = _launcher_validation.exact_schema_mypy_invocation
+_schema_mypy_diagnostics = _launcher_validation.schema_mypy_diagnostics
+_baseline_validation_identity = _launcher_validation.baseline_validation_identity
+_diagnostic_multiset_digest = _launcher_validation.diagnostic_multiset_digest
 
 
 def _compare_schema_mypy_baseline(
@@ -680,84 +521,16 @@ def _compare_schema_mypy_baseline(
     route_metadata: Mapping[str, Any],
     candidate: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    failed = [
-        row
-        for row in candidate
-        if row.get("timed_out") or row.get("returncode") != 0
-    ]
-    if not failed or any(
-        str(row.get("behavioral_role") or "").lower() != "schema"
-        or not _exact_schema_mypy_invocation(row)
-        for row in failed
-    ):
-        raise WorkspaceError("baseline_comparison_ineligible")
-    if not workspace.base_oid:
-        raise WorkspaceError("baseline_base_oid_missing")
-    adapter_id = str(route_metadata.get("adapter_id") or "").strip()
-    if not adapter_id:
-        raise WorkspaceError("baseline_validation_adapter_missing")
-    baseline_card = dict(authority)
-    baseline_card.pop("rework_predecessor", None)
-    baseline_workspace: WorkerWorkspace | None = None
-    try:
-        baseline_workspace = create_workspace(
-            workspace.repo,
-            f"baseline_{uuid.uuid4().hex}",
-            baseline_card,
-            adapter_id,
-            pinned_base_oid=workspace.base_oid,
-        )
-        for row in failed:
-            command = str(row.get("declared_command") or row.get("command") or "")
-            if not command:
-                raise WorkspaceError("baseline_mypy_command_missing")
-            try:
-                baseline_rows = run_validations(
-                    baseline_workspace,
-                    [command],
-                    **_validation_route_kwargs(route_metadata),
-                )
-            except ValidationRunError as exc:
-                baseline_rows = exc.results
-            if len(baseline_rows) != 1:
-                raise WorkspaceError("baseline_validation_receipt_count_mismatch")
-            baseline_row = dict(baseline_rows[0])
-            if _baseline_validation_identity(row) != _baseline_validation_identity(
-                baseline_row
-            ):
-                raise WorkspaceError("baseline_validation_authority_mismatch")
-            candidate_diagnostics = _schema_mypy_diagnostics(row)
-            baseline_diagnostics = _schema_mypy_diagnostics(baseline_row)
-            new_diagnostics = sorted(
-                (candidate_diagnostics - baseline_diagnostics).elements()
-            )
-            outcome = (
-                "baseline_no_new_diagnostics"
-                if not new_diagnostics
-                else "baseline_new_diagnostics"
-            )
-            row["baseline_comparison"] = {
-                "schema_id": "aiworkhub.baseline_comparison.v1",
-                "outcome": outcome,
-                "base_oid": workspace.base_oid,
-                "candidate_count": sum(candidate_diagnostics.values()),
-                "baseline_count": sum(baseline_diagnostics.values()),
-                "candidate_digest": _diagnostic_multiset_digest(candidate_diagnostics),
-                "baseline_digest": _diagnostic_multiset_digest(baseline_diagnostics),
-                "candidate_authority": _baseline_validation_identity(row),
-                "baseline_authority": _baseline_validation_identity(baseline_row),
-                "new_diagnostics": [list(value) for value in new_diagnostics],
-            }
-            if new_diagnostics:
-                raise WorkspaceError("baseline_mypy_new_diagnostics")
-        return candidate
-    finally:
-        if baseline_workspace is not None:
-            cleanup_workspace(
-                baseline_workspace.repo,
-                baseline_workspace.path,
-                baseline_workspace.home,
-            )
+    return _launcher_validation.compare_schema_mypy_baseline(
+        workspace,
+        authority,
+        route_metadata,
+        candidate,
+        create_workspace=create_workspace,
+        cleanup_workspace=cleanup_workspace,
+        run_validations=run_validations,
+        route_resolver=_validation_route_kwargs,
+    )
 
 
 def _run_declared_validations(
@@ -765,147 +538,26 @@ def _run_declared_validations(
     authority: Mapping[str, Any],
     route_metadata: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    commands = _declared_validation_commands(authority)
-    if not commands:
-        return []
-    try:
-        _work_kind, roles = quality_evidence.normalize_behavioral_contract(
-            authority.get("work_kind"),
-            commands,
-            authority.get("validation_roles"),
-        )
-    except ValueError as exc:
-        raise WorkspaceError(str(exc)) from exc
-
-    def with_roles(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-        materialized = [dict(row) for row in rows]
-        if len(materialized) != len(roles):
-            raise WorkspaceError("validation_receipt_count_mismatch")
-        for row, role in zip(materialized, roles, strict=True):
-            row["behavioral_role"] = role
-        return materialized
-
-    try:
-        results = run_validations(
-            workspace,
-            commands,
-            **_validation_route_kwargs(route_metadata),
-        )
-    except ValidationRunError as exc:
-        rows = with_roles(exc.results)
-        if isinstance(exc, ValidationEnvironmentBlocked):
-            # Preserve the recoverable environment-blocked subtype so the
-            # finalizer can route it away from acceptance-blocking
-            # ``validation_failed`` (NF-2026-00271). Re-attaching the roles
-            # must not strip ``terminal_state``/``restriction``/``recoverable``.
-            exc.results = rows
-            raise
-        try:
-            return _compare_schema_mypy_baseline(
-                workspace, authority, route_metadata, rows
-            )
-        except WorkspaceError as baseline_exc:
-            raise ValidationRunError(
-                f"{exc}:baseline_comparison_failed:{baseline_exc}", rows
-            ) from baseline_exc
-    return with_roles(results)
-
-
-def _enforce_behavioral_gate(
-    authority: Mapping[str, Any],
-    validations: Iterable[Mapping[str, Any]],
-    quality_gate: dict[str, Any],
-) -> dict[str, Any]:
-    gate = quality_evidence.evaluate_behavioral_gate(authority, validations)
-    quality_gate["behavioral_gate"] = gate
-    if gate.get("applicable") and not gate.get("passed"):
-        raise WorkspaceError(
-            "behavioral_gate_failed:" + str(gate.get("reason") or "unknown")[:300]
-        )
-    return gate
-
-
-def _is_operational_validation_failure(terminal_state: str, error: str) -> bool:
-    """Classify retryable infrastructure validation failures consistently."""
-    return terminal_state == "validation_failed" and (
-        error.startswith("validation_exec_scratch_unavailable:")
-        or error.startswith(
-            "validation_failed:validation_exec_scratch_unavailable:"
-        )
+    return _launcher_validation.run_declared_validations(
+        workspace,
+        authority,
+        route_metadata,
+        run_validations=run_validations,
+        route_resolver=_validation_route_kwargs,
+        baseline_comparer=_compare_schema_mypy_baseline,
     )
 
 
-# Narrow, explicit allowlist of the exact recoverable ``WorkspaceError`` tokens
-# that are genuine environment/sandbox restrictions: the declared
-# validator/interpreter (or its trusted runtime root) could not be resolved, the
-# exec scratch could not be provisioned, or the sandbox backend itself could not
-# be selected. These are recoverable by re-running in a corrected environment,
-# so they route to the retryable ``finalize_failed`` bucket. Every other
-# ``validation_*`` token -- including every security refusal (a world-writable
-# or untrusted-owner executable/runtime-root, a symlink-forbidden pytest
-# runtime, an unapproved or non-executable validator) -- is a deterministic
-# candidate/card defect and must stay acceptance-blocking ``validation_failed``.
-# Tokens are exact and colon-terminated so a broad family prefix can never
-# fail-open and reclassify a security refusal as recoverable.
-_VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES = (
-    "validation_executable_unavailable:",
-    "validation_pytest_runtime_unavailable:",
-    "validation_pytest_runtime_missing_pytest:",
-    "validation_exec_scratch_unavailable:",
-    "unsupported_sandbox_backend:",
-    "validation_unsupported_in_sandbox:",
+_enforce_behavioral_gate = _launcher_validation.enforce_behavioral_gate
+_is_operational_validation_failure = (
+    _launcher_validation.is_operational_validation_failure
 )
-
-
-def _terminal_state_for_workspace_error(exc: WorkspaceError) -> str:
-    """Map a caught ``WorkspaceError`` to its truthful terminal process state.
-
-    ``ValidationEnvironmentBlocked`` is a recoverable, supersede-free
-    environment/sandbox restriction (NF-2026-00271): the candidate did not fail
-    its gate, the declared validator could not run here. It must never surface
-    as the acceptance-blocking ``validation_failed``; route it to the retryable
-    ``finalize_failed`` bucket so ``retry_finalization`` can re-run deterministic
-    validation without relaunching the provider, while ``error`` keeps the exact
-    restriction.
-
-    Genuine gate failures are class-based: a plain ``ValidationRunError`` (or a
-    ``required_output``/``quality_gate``/``behavioral_gate``/``residual_contract``
-    /``research_result`` ``WorkspaceError``) stays ``validation_failed``. The
-    only plain ``WorkspaceError`` tokens that become ``finalize_failed`` are the
-    exact recoverable environment/sandbox restrictions enumerated in
-    ``_VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES`` (executable/pytest-runtime
-    resolution, exec-scratch provisioning, and sandbox-backend selection). The
-    allowlist is colon-terminated and exact: a security refusal (a world-writable
-    or untrusted-owner executable/runtime-root, a symlink-forbidden pytest
-    runtime, an unapproved or non-executable validator) and every remaining
-    ``validation_``-prefixed token -- plus the legacy ``invalid_validation_command``
-    spelling -- are deterministic candidate/card defects (a malformed declared
-    command, a contract-shape violation, a receipt count mismatch, an over-limit
-    command list, or an unresolvable ``cwd``/``PYTHONPATH``) and must stay
-    acceptance-blocking so a provider-free retry loop can never re-run a defect
-    the candidate itself authored.
-    """
-    if isinstance(exc, ValidationEnvironmentBlocked):
-        return "finalize_failed"
-    if isinstance(exc, ValidationRunError):
-        return "validation_failed"
-    error = str(exc)
-    if error.startswith("scope_violation") or error.startswith("symlink_output"):
-        return "scope_rejected"
-    if error.startswith((
-        "required_output", "quality_gate", "behavioral_gate",
-        "residual_contract", "research_result",
-    )):
-        return "validation_failed"
-    if error.startswith(("parent_changed", "promotion_scope")):
-        return "promotion_conflict"
-    if error.startswith(_VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES):
-        return "finalize_failed"
-    if error.startswith("validation_") or error.startswith(
-        "invalid_validation_command"
-    ):
-        return "validation_failed"
-    return "finalize_failed"
+_VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES = (
+    _launcher_validation.VALIDATION_ENVIRONMENT_RESTRICTION_PREFIXES
+)
+_terminal_state_for_workspace_error = (
+    _launcher_validation.terminal_state_for_workspace_error
+)
 
 # Failure workspaces remain available through coordinator review.  Once a
 # coordinator has disposed that exact attempt (finished/archived, returned it
