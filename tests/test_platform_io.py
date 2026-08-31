@@ -11,6 +11,256 @@ import pytest
 from aiworkhub import platform_io
 
 
+class _FakeWindowsFunction:
+    def __init__(self, function):
+        self.function = function
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *args):
+        return self.function(*args)
+
+
+class _FakeWindowsLibraries:
+    def __init__(
+        self,
+        *,
+        status=0,
+        attributes=0x10,
+        reparse_tag=0,
+        volume=7,
+        file_id=bytes(range(1, 17)),
+    ):
+        self.calls = []
+        self.closes = []
+        self.close_results = [1]
+        self.last_error = 5
+
+        def nt_create(*args):
+            self.calls.append(args)
+            args[0]._obj.value = 0x1_0000_1234
+            return status
+
+        def information(handle, info_class, output, size):
+            assert handle == 0x1_0000_1234
+            if info_class == 9:
+                value = output._obj
+                value.FileAttributes = attributes
+                value.ReparseTag = reparse_tag
+            else:
+                assert info_class == 18
+                value = output._obj
+                value.VolumeSerialNumber = volume
+                value.FileId[:] = file_id
+            return 1
+
+        def close(handle):
+            self.closes.append(handle.value)
+            return self.close_results.pop(0)
+
+        self.ntdll = SimpleNamespace(
+            NtCreateFile=_FakeWindowsFunction(nt_create),
+            RtlNtStatusToDosError=_FakeWindowsFunction(lambda _status: 5),
+        )
+        self.kernel32 = SimpleNamespace(
+            GetFileInformationByHandleEx=_FakeWindowsFunction(information),
+            CloseHandle=_FakeWindowsFunction(close),
+        )
+
+    def windll(self, name, **_kwargs):
+        return self.ntdll if name == "ntdll" else self.kernel32
+
+    def get_last_error(self):
+        return self.last_error
+
+
+def test_canonical_segment_rejects_ambiguous_windows_names():
+    rejected = [
+        "",
+        ".",
+        "..",
+        "a/b",
+        "a\\b",
+        "a\x00b",
+        "tail.",
+        "tail ",
+        "CON",
+        "nul.txt",
+        "e\u0301",
+        "bad:name",
+        "bad*name",
+        "bad?name",
+        "bad<name",
+        "bad>name",
+        'bad"name',
+        "bad|name",
+        "bad\x01name",
+        "bad\x1fname",
+    ]
+    for child_name in rejected:
+        with pytest.raises(ValueError):
+            platform_io._canonical_windows_child_segment(child_name)
+    with pytest.raises(ValueError):
+        platform_io._canonical_windows_child_segment("x" * 32767)
+    assert platform_io._canonical_windows_child_segment("é") == ("é", 2)
+
+
+@pytest.mark.parametrize("parent", [0, platform_io._INVALID_HANDLE_VALUE])
+def test_relative_child_rejects_invalid_parent_before_native_call(monkeypatch, parent):
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: pytest.fail("native call"),
+        raising=False,
+    )
+    with pytest.raises(ValueError):
+        platform_io.open_windows_relative_child_directory(parent, "child")
+
+
+def test_ntcreatefile_relative_child_preserves_exact_abi_and_authority(monkeypatch):
+    fake = _FakeWindowsLibraries()
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    owned = platform_io.open_windows_relative_child_directory(0x1_0000_0009, "child")
+    assert owned.value == 0x1_0000_1234
+    assert len(fake.ntdll.NtCreateFile.argtypes) == 11
+    args = fake.calls[0]
+    object_attributes = args[2]._obj
+    assert object_attributes.RootDirectory == 0x1_0000_0009
+    assert object_attributes.ObjectName.contents.Length == 10
+    assert object_attributes.ObjectName.contents.MaximumLength == 12
+    assert args[1:2] == (0x00100081,)
+    assert args[5:9] == (0, 0x7, 0x1, 0x200021)
+    owned.close()
+    owned.close()
+    assert fake.closes == [0x1_0000_1234]
+
+
+@pytest.mark.parametrize(
+    ("attributes", "tag", "volume", "file_id"),
+    [
+        (0, 0, 7, b"1" * 16),
+        (0x10, 1, 7, b"1" * 16),
+        (0x10, 0, 0, b"1" * 16),
+        (0x10, 0, 7, b"\0" * 16),
+    ],
+)
+def test_handle_validation_closes_every_rejected_child(
+    monkeypatch,
+    attributes,
+    tag,
+    volume,
+    file_id,
+):
+    fake = _FakeWindowsLibraries(
+        attributes=attributes,
+        reparse_tag=tag,
+        volume=volume,
+        file_id=file_id,
+    )
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    with pytest.raises(OSError):
+        platform_io.open_windows_relative_child_directory(99, "child")
+    assert fake.closes == [0x1_0000_1234]
+
+
+def test_owned_handle_failed_close_remains_retryable(monkeypatch):
+    fake = _FakeWindowsLibraries()
+    fake.close_results = [0, 1]
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "WinError",
+        lambda code: OSError(code, "close failed"),
+        raising=False,
+    )
+    handle = platform_io.OwnedWindowsHandle(
+        0x1_0000_1234, fake.kernel32.CloseHandle, fake.get_last_error
+    )
+    with pytest.raises(OSError):
+        handle.close()
+    assert handle.value == 0x1_0000_1234
+    handle.close()
+    handle.close()
+    assert handle.closed
+    assert fake.closes == [0x1_0000_1234, 0x1_0000_1234]
+
+
+def test_owned_handle_close_failure_uses_default_last_error_on_posix_ctypes(monkeypatch):
+    fake = _FakeWindowsLibraries()
+    fake.close_results = [0, 1]
+    monkeypatch.delattr(platform_io.ctypes, "get_last_error", raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "WinError",
+        lambda code: OSError(code, "close failed"),
+        raising=False,
+    )
+    handle = platform_io.OwnedWindowsHandle(
+        0x1_0000_1234,
+        fake.kernel32.CloseHandle,
+        platform_io._windows_last_error_getter(),
+    )
+    with pytest.raises(OSError) as raised:
+        handle.close()
+    assert raised.value.errno == 0
+    assert handle.value == 0x1_0000_1234
+    handle.close()
+    assert fake.closes == [0x1_0000_1234, 0x1_0000_1234]
+
+
+def test_native_canary_relative_child_directory(tmp_path):
+    if os.name != "nt":
+        pytest.skip("native Windows canary")
+    child = tmp_path / "child"
+    child.mkdir()
+    kernel32 = getattr(platform_io.ctypes, "WinDLL")(
+        "kernel32", use_last_error=True
+    )
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        platform_io.ctypes.c_wchar_p,
+        platform_io.ctypes.c_uint32,
+        platform_io.ctypes.c_uint32,
+        platform_io.ctypes.c_void_p,
+        platform_io.ctypes.c_uint32,
+        platform_io.ctypes.c_uint32,
+        platform_io.ctypes.c_void_p,
+    )
+    create_file.restype = platform_io.ctypes.c_void_p
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (platform_io.ctypes.c_void_p,)
+    close_handle.restype = platform_io.ctypes.c_int
+    parent_handle = platform_io._handle_value(
+        create_file(str(tmp_path), 0x80, 0x7, None, 3, 0x02200000, None)
+    )
+    assert parent_handle not in (0, platform_io._INVALID_HANDLE_VALUE)
+    try:
+        owned = platform_io.open_windows_relative_child_directory(
+            parent_handle,
+            "child",
+        )
+        assert owned.value not in (0, platform_io._INVALID_HANDLE_VALUE)
+        owned.close()
+        owned.close()
+        marker = child / "usable.txt"
+        marker.write_text("ok", encoding="utf-8")
+        assert marker.read_text(encoding="utf-8") == "ok"
+        assert [path.name for path in child.iterdir()] == ["usable.txt"]
+    finally:
+        assert close_handle(parent_handle)
+
+
 def test_background_process_launch_kwargs_dispatches_exactly_by_platform(monkeypatch):
     startup = SimpleNamespace(dwFlags=0, wShowWindow=None)
     monkeypatch.setattr(

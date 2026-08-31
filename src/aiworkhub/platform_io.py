@@ -8,10 +8,13 @@ repository-local locking contract on Linux, macOS, and Windows.
 from __future__ import annotations
 
 import errno
+import ctypes
 import os
 import subprocess
 import time
-from typing import Any, TypedDict
+import unicodedata
+from collections.abc import Callable
+from typing import Any, Protocol, TypedDict, cast
 
 
 class BackgroundProcessLaunchKwargs(TypedDict, total=False):
@@ -37,6 +40,264 @@ def background_process_launch_kwargs(
             "startupinfo": startupinfo,
         }
     return {"start_new_session": True}
+
+
+_INVALID_HANDLE_VALUE = cast(int, ctypes.c_void_p(-1).value)
+_DOS_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{number}" for number in range(1, 10)}
+    | {f"LPT{number}" for number in range(1, 10)}
+)
+_WINDOWS_RESERVED_SEGMENT_CHARACTERS = frozenset('<>:"|?*')
+
+
+class _WindowsLibraryLoader(Protocol):
+    def __call__(self, name: str, **kwargs: object) -> Any: ...
+
+
+class _UnicodeString(ctypes.Structure):
+    _fields_ = [
+        ("Length", ctypes.c_ushort),
+        ("MaximumLength", ctypes.c_ushort),
+        ("Buffer", ctypes.c_void_p),
+    ]
+
+
+class _ObjectAttributes(ctypes.Structure):
+    _fields_ = [
+        ("Length", ctypes.c_uint32),
+        ("RootDirectory", ctypes.c_void_p),
+        ("ObjectName", ctypes.POINTER(_UnicodeString)),
+        ("Attributes", ctypes.c_uint32),
+        ("SecurityDescriptor", ctypes.c_void_p),
+        ("SecurityQualityOfService", ctypes.c_void_p),
+    ]
+
+
+class _IoStatusBlockUnion(ctypes.Union):
+    _fields_ = [("Status", ctypes.c_int32), ("Pointer", ctypes.c_void_p)]
+
+
+class _IoStatusBlock(ctypes.Structure):
+    _anonymous_ = ("result",)
+    _fields_ = [("result", _IoStatusBlockUnion), ("Information", ctypes.c_size_t)]
+
+
+class _FileAttributeTagInfo(ctypes.Structure):
+    _fields_ = [("FileAttributes", ctypes.c_uint32), ("ReparseTag", ctypes.c_uint32)]
+
+
+class _FileIdInfo(ctypes.Structure):
+    _fields_ = [
+        ("VolumeSerialNumber", ctypes.c_ulonglong),
+        ("FileId", ctypes.c_ubyte * 16),
+    ]
+
+
+class OwnedWindowsHandle:
+    """Pointer-width-safe Windows handle with checked, retryable ownership release."""
+
+    def __init__(
+        self,
+        value: int,
+        close_handle: Callable[[ctypes.c_void_p], int],
+        get_last_error: Callable[[], int],
+    ) -> None:
+        self._value: int | None = value
+        self._close_handle = close_handle
+        self._get_last_error = get_last_error
+
+    @property
+    def value(self) -> int:
+        if self._value is None:
+            raise ValueError("Windows handle is closed")
+        return self._value
+
+    @property
+    def closed(self) -> bool:
+        return self._value is None
+
+    def close(self) -> None:
+        value = self._value
+        if value is None:
+            return
+        if not self._close_handle(ctypes.c_void_p(value)):
+            raise _windows_error(self._get_last_error())
+        self._value = None
+
+    def __enter__(self) -> OwnedWindowsHandle:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+def _canonical_windows_child_segment(child_name: str) -> tuple[str, int]:
+    if not isinstance(child_name, str):
+        raise TypeError("child_name must be str")
+    if (
+        not child_name
+        or child_name in {".", ".."}
+        or "/" in child_name
+        or "\\" in child_name
+        or "\x00" in child_name
+        or any(
+            character in _WINDOWS_RESERVED_SEGMENT_CHARACTERS
+            or ord(character) < 32
+            for character in child_name
+        )
+        or child_name.endswith((".", " "))
+        or unicodedata.normalize("NFC", child_name) != child_name
+    ):
+        raise ValueError("child_name must be one canonical Windows segment")
+    if child_name.split(".", 1)[0].upper() in _DOS_DEVICE_NAMES:
+        raise ValueError("child_name is a reserved DOS device name")
+    try:
+        encoded = child_name.encode("utf-16-le", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("child_name is not valid UTF-16") from exc
+    if len(encoded) > 0xFFFC:
+        raise ValueError("child_name exceeds UNICODE_STRING capacity")
+    return child_name, len(encoded)
+
+
+def _windows_error(code: int) -> OSError:
+    win_error = getattr(ctypes, "WinError", None)
+    if win_error is not None:
+        return cast(OSError, win_error(code))
+    return OSError(code, f"Windows error {code}")
+
+
+def _windows_dll_loader() -> _WindowsLibraryLoader:
+    return cast(_WindowsLibraryLoader, getattr(ctypes, "WinDLL"))
+
+
+def _windows_last_error_getter() -> Callable[[], int]:
+    get_last_error = getattr(ctypes, "get_last_error", None)
+    if get_last_error is None:
+        return lambda: 0
+    return cast(Callable[[], int], get_last_error)
+
+
+def _handle_value(handle: object) -> int:
+    value = handle.value if isinstance(handle, ctypes.c_void_p) else handle
+    if not isinstance(value, int):
+        raise OSError("native Windows handle was not an integer")
+    return value
+
+
+def open_windows_relative_child_directory(
+    parent_handle: int,
+    child_name: str,
+) -> OwnedWindowsHandle:
+    """Open and validate one directory directly beneath a borrowed parent HANDLE."""
+
+    if isinstance(parent_handle, bool) or not isinstance(parent_handle, int):
+        raise TypeError("parent_handle must be int")
+    if parent_handle == 0 or parent_handle == _INVALID_HANDLE_VALUE:
+        raise ValueError("parent_handle is invalid")
+    child_name, byte_length = _canonical_windows_child_segment(child_name)
+
+    win_dll = _windows_dll_loader()
+    ntdll = win_dll("ntdll", use_last_error=True)
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    get_last_error = _windows_last_error_getter()
+    nt_create_file = ntdll.NtCreateFile
+    nt_create_file.argtypes = (
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_uint32,
+        ctypes.POINTER(_ObjectAttributes),
+        ctypes.POINTER(_IoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+    nt_create_file.restype = ctypes.c_int32
+    rtl_status_to_dos_error = ntdll.RtlNtStatusToDosError
+    rtl_status_to_dos_error.argtypes = (ctypes.c_int32,)
+    rtl_status_to_dos_error.restype = ctypes.c_uint32
+    get_file_information = kernel32.GetFileInformationByHandleEx
+    get_file_information.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+    get_file_information.restype = ctypes.c_int
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+
+    name_buffer = ctypes.create_unicode_buffer(child_name)
+    unicode_name = _UnicodeString(
+        byte_length,
+        byte_length + 2,
+        ctypes.cast(name_buffer, ctypes.c_void_p),
+    )
+    attributes = _ObjectAttributes(
+        ctypes.sizeof(_ObjectAttributes),
+        ctypes.c_void_p(parent_handle),
+        ctypes.pointer(unicode_name),
+        0x40,
+        None,
+        None,
+    )
+    result_handle = ctypes.c_void_p()
+    io_status = _IoStatusBlock()
+    status = int(
+        nt_create_file(
+            ctypes.byref(result_handle),
+            0x00100081,
+            ctypes.byref(attributes),
+            ctypes.byref(io_status),
+            None,
+            0,
+            0x7,
+            0x1,
+            0x200021,
+            None,
+            0,
+        )
+    )
+    if status < 0:
+        winerror = int(rtl_status_to_dos_error(status))
+        raise OSError(
+            winerror,
+            f"NtCreateFile failed for relative child {child_name!r}",
+        )
+    value = result_handle.value
+    if not value:
+        raise OSError("NtCreateFile succeeded without a handle")
+    owned = OwnedWindowsHandle(value, close_handle, get_last_error)
+    try:
+        tag_info = _FileAttributeTagInfo()
+        if not get_file_information(
+            owned.value,
+            9,
+            ctypes.byref(tag_info),
+            ctypes.sizeof(tag_info),
+        ):
+            raise _windows_error(get_last_error())
+        if not tag_info.FileAttributes & 0x10 or tag_info.ReparseTag != 0:
+            raise OSError("opened child is not a non-reparse directory")
+        file_id = _FileIdInfo()
+        if not get_file_information(
+            owned.value,
+            18,
+            ctypes.byref(file_id),
+            ctypes.sizeof(file_id),
+        ):
+            raise _windows_error(get_last_error())
+        if file_id.VolumeSerialNumber == 0 or not any(file_id.FileId):
+            raise OSError("opened child has no stable volume/file identity")
+    except BaseException:
+        owned.close()
+        raise
+    return owned
 
 
 WINDOWS_REPLACE_RETRY_SECONDS = 1.0
