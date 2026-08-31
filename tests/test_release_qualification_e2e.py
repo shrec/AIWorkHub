@@ -22,6 +22,7 @@ from aiworkhub import (
     callback_store,
     context_writes,
     core,
+    process_launcher,
     repository_bootstrap,
     source_graph,
     source_graph_daemon,
@@ -163,6 +164,7 @@ def test_fresh_install_task_context_callback_reload_and_repo_isolation(tmp_path,
     # daemon refresh suites.
     (repo_a / "app.py").write_text("def python_probe():\n    return 1\n", encoding="utf-8")
     (repo_a / "app.php").write_text("<?php function php_probe() { return 1; }\n", encoding="utf-8")
+    base_oid = "qualification-base-oid"
     init_a = repository_bootstrap.initialize_repository_full(repo_a)
     init_b = repository_bootstrap.initialize_repository_full(repo_b)
     assert init_a["ok"] is True and init_b["ok"] is True
@@ -221,6 +223,20 @@ def test_fresh_install_task_context_callback_reload_and_repo_isolation(tmp_path,
         repo_a, TASK_ID, RUNNER, TOPIC, request_id="qualification-request"
     )
     assert claimed["ok"] is True, claimed
+    task_card = task_store.get_task(repo_a, TASK_ID)
+    assert task_card is not None
+    claim_epoch = int(task_card["claim_epoch"])
+    attempt_artifact_manifest = process_launcher.attempt_artifacts.persist_json_bundle(
+        repo_a / ".aiworkhub" / "attempt-artifacts" / "qualification-request",
+        attempt_id="qualification-request",
+        payloads={
+            "metadata": {"task_id": TASK_ID, "request_id": "qualification-request"},
+            "diff": {"changed_paths": [], "changed_path_hashes": {}},
+            "validation": {"checks": [{"ok": True}]},
+            "review": {"status": "review_ready"},
+            "usage": {"events": []},
+        },
+    )
     reviewed = task_engine.mark_terminal_review(
         repo_a,
         TASK_ID,
@@ -229,6 +245,10 @@ def test_fresh_install_task_context_callback_reload_and_repo_isolation(tmp_path,
         evidence={
             "request_id": "qualification-request",
             "request_identity": {"request_id": "qualification-request"},
+            "workspace": {"base_oid": base_oid},
+            "changed_paths": [],
+            "changed_path_hashes": {},
+            "attempt_artifact_manifest": attempt_artifact_manifest,
             "validation": [{"ok": True}],
             "required_outputs": [{"ok": True}],
         },
@@ -248,15 +268,50 @@ def test_fresh_install_task_context_callback_reload_and_repo_isolation(tmp_path,
     finally:
         callback_db.close()
 
+    # Use the production post-promotion receipt builder for this no-write
+    # qualification, then let task_engine perform the durable acceptance.
+    receipt = process_launcher._accepted_outcome_receipt(
+        repo_a,
+        task_id=TASK_ID,
+        request_id="qualification-request",
+        claim_epoch=claim_epoch,
+        base_oid=base_oid,
+        promoted_paths=[],
+        changed_path_hashes={},
+        attempt_artifact_manifest=attempt_artifact_manifest,
+    )
+    assert receipt["task_id"] == TASK_ID
     accepted = task_engine.accept_review(
         repo_a,
         TASK_ID,
         runner=RUNNER,
         topic=TOPIC,
         request_id="qualification-request",
-        evidence={"qualification": True},
+        evidence={
+            "promoted_paths": [],
+            "validation": [{"ok": True}],
+            "required_outputs": [{"ok": True}],
+            "attempt_artifact_manifest": attempt_artifact_manifest,
+        },
+        accepted_outcome_receipt=receipt,
     )
     assert accepted["ok"] is True, accepted
+
+    replayed = task_engine.accept_review(
+        repo_a,
+        TASK_ID,
+        runner=RUNNER,
+        topic=TOPIC,
+        request_id="qualification-request",
+        evidence={"promoted_paths": []},
+        accepted_outcome_receipt=receipt,
+    )
+    assert replayed["ok"] is True, replayed
+    replayed_card = json.loads(replayed["stdout"])
+    assert replayed_card["already_accepted"] is True
+    assert replayed_card["accepted_outcome_receipt"] == receipt
+    events = task_store.get_task_events(repo_a, TASK_ID)
+    assert [event["event"] for event in events].count("accept_review") == 1
 
     # Reload/restart recovery is an idempotent InitRepo plus a fresh stdio MCP
     # child.  The accepted row and the other repository's pending same-id row
@@ -265,6 +320,7 @@ def test_fresh_install_task_context_callback_reload_and_repo_isolation(tmp_path,
     assert restarted["ok"] is True
     assert task_store.get_task(repo_a, TASK_ID)["status"] == "finished"
     assert task_store.get_task(repo_b, TASK_ID)["status"] == "pending"
+    assert source_graph_daemon.stop_daemon(repo_a) is True
     names = _stdio_tool_names(repo_a)
     for required in {
         "aiworkhub_repo_current",
