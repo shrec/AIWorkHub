@@ -12,6 +12,15 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.73 — 2026-08-31
+
+- Baseline diagnostics now receive parity comparison across validation paths,
+  keeping unchanged accepted findings distinct from new regressions.
+- Bugfix templates now enforce all declared required outputs before completion,
+  preventing partial fixes from satisfying the template contract.
+- Remaining Source Graph retrieval/evaluation work and Windows ACL/AppContainer
+  integration are not represented as complete by this release.
+
 ## What's new in 0.10.72 — 2026-08-31
 
 - Dead processing claims now reconcile only within their bound task scope through

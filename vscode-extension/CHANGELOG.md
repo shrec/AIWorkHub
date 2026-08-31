@@ -1,5 +1,19 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.73 — 2026-08-31
+
+### Fixed
+
+- Baseline diagnostics are compared consistently across validation paths, keeping
+  unchanged accepted findings distinct from newly introduced regressions.
+- Bugfix templates require every declared output before completion, so a partial
+  fix cannot satisfy the template contract.
+
+### Notes
+
+- Remaining Source Graph retrieval/evaluation work and Windows ACL/AppContainer
+  integration are not represented as complete in this release.
+
 ## 0.10.72 — 2026-08-31
 
 ### Added

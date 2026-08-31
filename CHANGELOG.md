@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.73] - 2026-08-31
+
+### Fixed
+
+- Baseline diagnostics are compared with parity across validation paths, so
+  unchanged accepted findings remain distinct from newly introduced regressions.
+- Bugfix templates enforce every required output before completion, preventing
+  partially materialized fixes from satisfying the template contract.
+
+### Notes
+
+- This release does not claim completion of remaining Source Graph
+  retrieval/evaluation work or Windows ACL/AppContainer integration.
+
 ## [0.10.72] - 2026-08-31
 
 ### Added
