@@ -9172,3 +9172,180 @@ def test_acceptance_helper_hides_receipt_from_different_request(tmp_path: Path) 
     assert result["ok"] is False
     assert result["accepted_outcome_receipt"] is None
     assert result["error"] == "task_already_finished_by_other_request"
+
+
+def _nf523_parity_mypy_row(**overrides):
+    row = {
+        "command": ".venv/bin/python -m mypy src/aiworkhub/example.py",
+        "declared_command": ".venv/bin/python -m mypy src/aiworkhub/example.py",
+        "argv": [".venv/bin/python", "-m", "mypy", "src/aiworkhub/example.py"],
+        "executed_argv": [
+            ".venv/bin/python",
+            "-m",
+            "mypy",
+            "src/aiworkhub/example.py",
+        ],
+        "returncode": 1,
+        "timed_out": False,
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        "behavioral_role": "parity",
+        "stdout_tail": (
+            "src/aiworkhub/example.py:12:8: "
+            "error: incompatible argument [call-arg]\n"
+        ),
+        "stderr_tail": "",
+    }
+    row.update(overrides)
+    return row
+
+
+_NF523_EXTRA_LINE = (
+    "src/aiworkhub/example.py:40:9: "
+    "error: unsupported operand [operator]\n"
+)
+
+
+def _nf523_baseline_compare(baseline_row):
+    from types import SimpleNamespace
+
+    from aiworkhub.process_launcher_validation import compare_schema_mypy_baseline
+
+    workspace = SimpleNamespace(
+        repo="/repos/example",
+        path="/worktrees/candidate",
+        home="/homes/candidate",
+        base_oid="f" * 40,
+    )
+
+    def create_workspace(repo, name, card, adapter_id, **kwargs):
+        return SimpleNamespace(
+            repo=repo,
+            path=f"/worktrees/{name}",
+            home=f"/homes/{name}",
+            base_oid=kwargs.get("pinned_base_oid"),
+        )
+
+    def cleanup_workspace(repo, path, home):
+        return None
+
+    def run_validations(target, commands, **route):
+        assert commands == [baseline_row["declared_command"]]
+        return [dict(baseline_row)]
+
+    def compare(candidate):
+        return compare_schema_mypy_baseline(
+            workspace,
+            {"task_id": "AIWORKHUB_NF525"},
+            {"adapter_id": "adapter-x"},
+            candidate,
+            create_workspace=create_workspace,
+            cleanup_workspace=cleanup_workspace,
+            run_validations=run_validations,
+            route_resolver=lambda metadata: {"backend": "deterministic_validation"},
+        )
+
+    return compare
+
+
+def test_parity_schema_mypy_baseline_equal_diagnostics_passes():
+    compare = _nf523_baseline_compare(_nf523_parity_mypy_row())
+    row = _nf523_parity_mypy_row(behavioral_role="PARITY")
+    assert compare([row]) == [row]
+    evidence = row["baseline_comparison"]
+    assert evidence["schema_id"] == "aiworkhub.baseline_comparison.v1"
+    assert evidence["outcome"] == "baseline_no_new_diagnostics"
+    assert evidence["new_diagnostics"] == []
+    assert evidence["candidate_count"] == evidence["baseline_count"] == 1
+
+
+def test_parity_schema_mypy_baseline_subset_diagnostics_passes():
+    subset = _nf523_parity_mypy_row()
+    superset = _nf523_parity_mypy_row(
+        stdout_tail=subset["stdout_tail"] + _NF523_EXTRA_LINE
+    )
+    compare = _nf523_baseline_compare(superset)
+    row = _nf523_parity_mypy_row()
+    assert compare([row]) == [row]
+    evidence = row["baseline_comparison"]
+    assert evidence["schema_id"] == "aiworkhub.baseline_comparison.v1"
+    assert evidence["outcome"] == "baseline_no_new_diagnostics"
+    assert evidence["candidate_count"] == 1
+    assert evidence["baseline_count"] == 2
+
+
+def test_parity_schema_mypy_baseline_new_diagnostics_fails_closed():
+    from aiworkhub.worker_workspace import WorkspaceError
+
+    baseline = _nf523_parity_mypy_row()
+    candidate = _nf523_parity_mypy_row(
+        stdout_tail=baseline["stdout_tail"] + _NF523_EXTRA_LINE
+    )
+    compare = _nf523_baseline_compare(baseline)
+    with pytest.raises(WorkspaceError, match="baseline_mypy_new_diagnostics"):
+        compare([candidate])
+    evidence = candidate["baseline_comparison"]
+    assert evidence["outcome"] == "baseline_new_diagnostics"
+    assert evidence["new_diagnostics"] == [
+        ["src/aiworkhub/example.py", "operator", "unsupported operand"]
+    ]
+
+
+@pytest.mark.parametrize("role", ["regression", "reproduction", "delta"])
+def test_validation_role_parity_gate_rejects_non_parity_roles(role):
+    from aiworkhub.worker_workspace import WorkspaceError
+
+    compare = _nf523_baseline_compare(_nf523_parity_mypy_row())
+    row = _nf523_parity_mypy_row(behavioral_role=role)
+    with pytest.raises(WorkspaceError, match="baseline_comparison_ineligible"):
+        compare([row])
+    assert "baseline_comparison" not in row
+
+
+def test_validation_role_parity_gate_rejects_non_mypy_command():
+    from aiworkhub.worker_workspace import WorkspaceError
+
+    compare = _nf523_baseline_compare(_nf523_parity_mypy_row())
+    row = _nf523_parity_mypy_row(
+        command=".venv/bin/python -m pytest -q tests",
+        declared_command=".venv/bin/python -m pytest -q tests",
+        argv=[".venv/bin/python", "-m", "pytest", "-q", "tests"],
+        executed_argv=[".venv/bin/python", "-m", "pytest", "-q", "tests"],
+    )
+    with pytest.raises(WorkspaceError, match="baseline_comparison_ineligible"):
+        compare([row])
+    assert "baseline_comparison" not in row
+
+
+def test_baseline_comparison_parity_identity_mismatch_fails_closed():
+    from aiworkhub.worker_workspace import WorkspaceError
+
+    drifted = _nf523_parity_mypy_row(
+        executed_argv=[
+            "/usr/bin/python3.11",
+            "-m",
+            "mypy",
+            "src/aiworkhub/example.py",
+        ]
+    )
+    compare = _nf523_baseline_compare(drifted)
+    row = _nf523_parity_mypy_row()
+    with pytest.raises(WorkspaceError, match="baseline_validation_authority_mismatch"):
+        compare([row])
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"timed_out": True}, "baseline_mypy_candidate_not_comparable"),
+        ({"stdout_truncated": True}, "baseline_mypy_output_truncated"),
+    ],
+    ids=["timeout", "stdout_truncated"],
+)
+def test_parity_schema_mypy_baseline_non_comparable_fails_closed(overrides, error):
+    from aiworkhub.worker_workspace import WorkspaceError
+
+    compare = _nf523_baseline_compare(_nf523_parity_mypy_row())
+    row = _nf523_parity_mypy_row(**overrides)
+    with pytest.raises(WorkspaceError, match=error):
+        compare([row])

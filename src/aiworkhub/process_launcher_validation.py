@@ -200,7 +200,7 @@ def compare_schema_mypy_baseline(
         if row.get("timed_out") or row.get("returncode") != 0
     ]
     if not failed or any(
-        str(row.get("behavioral_role") or "").lower() != "schema"
+        str(row.get("behavioral_role") or "").lower() not in {"schema", "parity"}
         or not exact_schema_mypy_invocation(row)
         for row in failed
     ):
