@@ -5525,7 +5525,7 @@ def reconcile_dead_processing_task(
     live_topic = str(card.get("topic") or "")
     gate = _canonical_write_gate(
         "recover-stale", runner=CODEX_RUNNER, topic=live_topic,
-        coordinator_capability=True,
+        coordinator_capability=True, task_id=task_id,
     )
     if gate is not None:
         return gate

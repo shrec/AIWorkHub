@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from aiworkhub import stale_recovery, task_store
+from aiworkhub import core, stale_recovery, task_store
 
 
 def _store(tmp_path, monkeypatch, *, alive=False, request_id="req-1", epoch=3):
@@ -67,6 +67,21 @@ def test_reconcile_fails_closed_and_live_archive_stays_forbidden(tmp_path, monke
     assert task_store.archive_task(tmp_path, "T1", actor="manager") == (
         False, "archive_processing_forbidden"
     )
+
+
+def test_core_reconcile_binds_task_id_to_card_scoped_write_gate(monkeypatch):
+    observed = {}
+    blocked = {"ok": False, "returncode": 126, "stderr": "sentinel"}
+    monkeypatch.setattr(core, "_live_card", lambda task_id: ({"topic": "quality_review"}, None))
+
+    def fake_gate(action, **kwargs):
+        observed.update(action=action, **kwargs)
+        return blocked
+
+    monkeypatch.setattr(core, "_canonical_write_gate", fake_gate)
+    assert core.reconcile_dead_processing_task("T1", "req-1", 1) is blocked
+    assert observed["action"] == "recover-stale"
+    assert observed["task_id"] == "T1"
 
 
 def test_reconcile_rejects_identity_mismatches_without_mutation(tmp_path, monkeypatch):
