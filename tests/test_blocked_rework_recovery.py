@@ -944,6 +944,90 @@ def test_recovery_bumps_claim_epoch_for_fresh_lineage(
     assert task["recovery_epoch"] == 3
 
 
+def test_validation_replay_binds_exact_reviewer_transport_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    task_id = "REVIEWER_TRANSPORT_EXACT"
+    request_id = "1" * 32
+    workspace = repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+    candidate = workspace / "src" / "result.py"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"retained\n")
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    predecessor = {
+        "request_id": request_id,
+        "task_id": task_id,
+        "changed_path_hashes": {"src/result.py": digest},
+        "workspace": {
+            "request_id": request_id,
+            "repo": str(repo),
+            "path": str(workspace),
+        },
+    }
+    _insert_blocked_task(
+        repo,
+        task_id,
+        reject_review_reason="rerun retained validation",
+        extra_card={"rework_predecessor": predecessor},
+    )
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        for event_request_id in (request_id, "2" * 32):
+            payload = {
+                "substatus": "validation_failed",
+                "evidence": {
+                    "changed_path_hashes": {"src/result.py": digest},
+                    "request_identity": {
+                        "request_id": event_request_id,
+                        "task_id": task_id,
+                        "repo": str(repo),
+                    },
+                },
+            }
+            conn.execute(
+                "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+                "VALUES (?, 'terminal_review', 'codex_worker_test', ?, ?)",
+                (task_id, json.dumps(payload), "2026-08-06T00:00:01+00:00"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    original_read_bytes = Path.read_bytes
+
+    def fail_candidate_read(path: Path) -> bytes:
+        if path == candidate:
+            raise OSError("candidate became unreadable")
+        return original_read_bytes(path)
+
+    with monkeypatch.context() as context:
+        context.setattr(Path, "read_bytes", fail_candidate_read)
+        assert task_store.recover_blocked_rework(
+            repo,
+            task_id,
+            feedback_reason="rerun retained validation",
+            validation_only_replay=True,
+        ) == (False, "validation_only_replay_candidate_invalid")
+        blocked_card = _get_card(repo, task_id)
+        assert blocked_card["status"] == "blocked"
+        assert "validation_only_replay_authorization" not in blocked_card
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        feedback_reason="rerun retained validation",
+        validation_only_replay=True,
+    ) == (True, "recovered")
+    card = _get_card(repo, task_id)
+    assert card["status"] == "pending"
+    assert card["validation_only_replay_authorization"][
+        "predecessor_request_id"
+    ] == request_id
+
+
 def test_recovery_accepts_launch_failed_and_timed_out_substatuses(
     tmp_path: Path,
 ) -> None:

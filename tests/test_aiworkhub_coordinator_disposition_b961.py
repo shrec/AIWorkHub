@@ -1886,6 +1886,46 @@ def test_recover_blocked_rework_validation_only_replay_default_false_unchanged(t
     assert "validation_only_replay_authorization" not in card
 
 
+def test_reviewer_transport_recovery_rejects_workspace_repository_mismatch(tmp_path):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    task_id = _make_blocked_rework_task_with_terminal_review(root)
+    card = task_store.get_task(root, task_id)
+    assert card is not None
+    card["rework_predecessor"] = {
+        "request_id": "a" * 32,
+        "task_id": task_id,
+        "changed_path_hashes": {"result.py": "b" * 64},
+        "workspace": {
+            "request_id": "a" * 32,
+            "repo": str(tmp_path / "different-repository"),
+            "path": str(tmp_path / "workspace"),
+        },
+    }
+    _readiness, db_path = task_store._require_ready(root)
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (
+                json.dumps(task_store.persistable_card_payload(card), sort_keys=True),
+                task_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        feedback_reason="rerun validation",
+        validation_only_replay=True,
+    )
+    assert (ok, state) == (False, "validation_only_replay_workspace_invalid")
+    assert task_store.get_task(root, task_id)["status"] == "blocked"
+
+
 def test_recover_blocked_rework_validation_only_replay_no_terminal_failure_rejected(tmp_path):
     root = tmp_path
     task_store.initialize_repository(root)

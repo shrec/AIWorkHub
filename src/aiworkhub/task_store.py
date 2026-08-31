@@ -1273,6 +1273,10 @@ def reconcile_dead_processing_claim(
     _readiness, db_path = _require_ready(root)
     conn = _connect(db_path)
     try:
+        # Serialize the status check, authorization mint, transition and event.
+        # A retry therefore observes the committed pending episode instead of
+        # racing a second blocked->pending transition.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT status, worker_status, card_json FROM tasks WHERE task_id=?",
             (task_id,),
@@ -3406,13 +3410,169 @@ def recover_blocked_rework(
         ):
             return False, "live_claim_detected"
 
-        terminal_event = "terminal_failure" if validation_only_replay else "terminal_review"
-        terminal_row = conn.execute(
+        retained_predecessor = card.get("rework_predecessor")
+        if not isinstance(retained_predecessor, dict):
+            retained_predecessor = {}
+        has_reviewer_transport = isinstance(
+            retained_predecessor.get("workspace"), dict
+        )
+
+        # Retained reviewer transport is authoritative when present.  The
+        # older terminal_failure synthesis branch remains available only when
+        # no reviewer-pinned predecessor exists.
+        terminal_event = (
+            "terminal_failure"
+            if validation_only_replay and not has_reviewer_transport
+            else "terminal_review"
+        )
+        terminal_rows = conn.execute(
             "SELECT runner, payload_json, created_at FROM task_events "
-            "WHERE task_id=? AND event=? "
-            "ORDER BY rowid DESC LIMIT 1",
+            "WHERE task_id=? AND event=? ORDER BY rowid DESC",
             (task_id, terminal_event),
-        ).fetchone()
+        ).fetchall()
+        terminal_row = terminal_rows[0] if terminal_rows else None
+
+        if validation_only_replay and has_reviewer_transport:
+            predecessor_request_id = str(
+                retained_predecessor.get("request_id") or ""
+            ).strip()
+            predecessor_task_id = str(
+                retained_predecessor.get("task_id") or task_id
+            ).strip()
+            predecessor_hashes = retained_predecessor.get("changed_path_hashes")
+            predecessor_workspace = retained_predecessor.get("workspace")
+            if (
+                not predecessor_request_id
+                or predecessor_task_id != task_id
+                or not isinstance(predecessor_hashes, dict)
+                or not predecessor_hashes
+                or not isinstance(predecessor_workspace, dict)
+            ):
+                return False, "validation_only_replay_predecessor_invalid"
+            if str(predecessor_workspace.get("request_id") or "").strip() != predecessor_request_id:
+                return False, "validation_only_replay_predecessor_identity_mismatch"
+            try:
+                expected_repo = Path(root).resolve(strict=True)
+                authority_repo = Path(
+                    str(predecessor_workspace.get("repo") or "")
+                ).resolve(strict=True)
+                workspace_path = Path(str(predecessor_workspace.get("path") or ""))
+                resolved_workspace = workspace_path.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                return False, "validation_only_replay_workspace_invalid"
+            if (
+                authority_repo != expected_repo
+                or not workspace_path.is_absolute()
+                or workspace_path.is_symlink()
+                or not resolved_workspace.is_dir()
+                or resolved_workspace
+                != expected_repo
+                / ".aiworkhub"
+                / "runtime"
+                / "worktrees"
+                / predecessor_request_id
+                / "worktree"
+                or any(
+                    (expected_repo.joinpath(*parts)).is_symlink()
+                    for parts in (
+                        (".aiworkhub",),
+                        (".aiworkhub", "runtime"),
+                        (".aiworkhub", "runtime", "worktrees"),
+                        (".aiworkhub", "runtime", "worktrees", predecessor_request_id),
+                        (
+                            ".aiworkhub",
+                            "runtime",
+                            "worktrees",
+                            predecessor_request_id,
+                            "worktree",
+                        ),
+                    )
+                )
+            ):
+                return False, "validation_only_replay_workspace_invalid"
+            for raw_path, expected_hash in predecessor_hashes.items():
+                if (
+                    not isinstance(raw_path, str)
+                    or not raw_path
+                    or raw_path.startswith("/")
+                    or "\\" in raw_path
+                    or any(part in {"", ".", ".."} for part in raw_path.split("/"))
+                    or not isinstance(expected_hash, str)
+                    or len(expected_hash) != 64
+                    or any(ch not in "0123456789abcdef" for ch in expected_hash)
+                ):
+                    return False, "validation_only_replay_manifest_invalid"
+                candidate = resolved_workspace.joinpath(*raw_path.split("/"))
+                try:
+                    candidate_stat = candidate.lstat()
+                    resolved_candidate = candidate.resolve(strict=True)
+                except OSError:
+                    return False, "validation_only_replay_candidate_invalid"
+                if (
+                    candidate.is_symlink()
+                    or not candidate.is_file()
+                    or candidate_stat.st_nlink != 1
+                    or not resolved_candidate.is_relative_to(resolved_workspace)
+                    or any(
+                        resolved_workspace.joinpath(*raw_path.split("/")[:index]).is_symlink()
+                        for index in range(1, len(raw_path.split("/")))
+                    )
+                ):
+                    return False, "validation_only_replay_candidate_invalid"
+                try:
+                    candidate_bytes = candidate.read_bytes()
+                except OSError:
+                    return False, "validation_only_replay_candidate_invalid"
+                if hashlib.sha256(candidate_bytes).hexdigest() != expected_hash:
+                    return False, "validation_only_replay_hash_mismatch"
+
+            terminal_row = None
+            for candidate_row in terminal_rows:
+                try:
+                    candidate_event = json.loads(
+                        str(candidate_row["payload_json"] or "{}")
+                    )
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(candidate_event, dict):
+                    continue
+                candidate_evidence = candidate_event.get("evidence")
+                if not isinstance(candidate_evidence, dict):
+                    continue
+                candidate_identity = candidate_evidence.get("request_identity")
+                candidate_workspace = candidate_evidence.get("workspace")
+                if not isinstance(candidate_identity, dict):
+                    candidate_identity = {}
+                if not isinstance(candidate_workspace, dict):
+                    candidate_workspace = {}
+                event_request_id = str(
+                    candidate_event.get("request_id")
+                    or candidate_evidence.get("request_id")
+                    or candidate_identity.get("request_id")
+                    or candidate_workspace.get("request_id")
+                    or ""
+                ).strip()
+                event_task_id = str(
+                    candidate_event.get("task_id")
+                    or candidate_identity.get("task_id")
+                    or ""
+                ).strip()
+                event_repo = str(
+                    candidate_identity.get("repo")
+                    or candidate_workspace.get("repo")
+                    or ""
+                ).strip()
+                if (
+                    event_request_id == predecessor_request_id
+                    and event_task_id == task_id
+                    and event_repo == str(expected_repo)
+                    and candidate_evidence.get("changed_path_hashes")
+                    == predecessor_hashes
+                ):
+                    terminal_row = candidate_row
+                    break
+            if terminal_row is None:
+                return False, "validation_only_replay_terminal_review_mismatch"
         if terminal_row is None:
             return False, "no_retained_predecessor_evidence"
 
@@ -3422,10 +3582,6 @@ def recover_blocked_rework(
             return False, "retained_predecessor_evidence_invalid"
         if not isinstance(terminal_review, dict) or not terminal_review:
             return False, "retained_predecessor_evidence_invalid"
-
-        retained_predecessor = card.get("rework_predecessor")
-        if not isinstance(retained_predecessor, dict):
-            retained_predecessor = {}
 
         # A terminal failure can leave a perfectly usable candidate without
         # ever reaching reject_review (notably worker quota refusals and

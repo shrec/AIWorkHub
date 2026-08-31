@@ -3553,6 +3553,14 @@ def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
     assert result["execution_mode"] == "validation_only_replay"
     assert result["provider_launched"] is False
     assert result["pid"] is None
+    launch_event = next(
+        event
+        for event in manager._events()
+        if event.get("request_id") == result["request_id"]
+        and event.get("state") == "running"
+    )
+    assert launch_event["execution_mode"] == "validation_only_replay"
+    assert launch_event["provider_launched"] is False
     assert not list((tmp_path / "processes").glob("*.supervisor-spec.json"))
     deadline = time.monotonic() + 2
     while not finalized and time.monotonic() < deadline:
