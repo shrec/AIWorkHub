@@ -1,5 +1,27 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.72 — 2026-08-31
+
+### Added
+
+- Authenticated Source Graph accepted-outcome receipts are persisted, with
+  release-qualification coverage enforcing the same receipt contract.
+
+### Fixed
+
+- Dead processing claims reconcile within their bound task scope through an
+  explicitly authorized reconciliation path.
+- Windows child authority is parent-relative, directory authority remains native
+  to its handle, and child disposition is bound to that authorized handle.
+- Native Windows disposition failures retain platform error parity.
+- Process-launcher acceptance helpers were extracted and the launcher size
+  ratchet was restored.
+
+### Notes
+
+- Remaining Source Graph retrieval/evaluation work and Windows ACL/AppContainer
+  integration are not represented as complete in this release.
+
 ## 0.10.71 — 2026-08-30
 
 ### Added

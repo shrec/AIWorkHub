@@ -6,6 +6,29 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.72] - 2026-08-31
+
+### Added
+
+- Source Graph persists authenticated accepted-outcome receipts, and release
+  qualification exercises the same receipt contract used by accepted outcomes.
+
+### Fixed
+
+- Dead processing claims are reconciled only within their bound task scope, with
+  explicit authority for the reconciliation path.
+- Windows child operations derive authority relative to the parent, keep
+  directory authority on native handles, and bind child disposition to the
+  authorized handle.
+- Native Windows disposition failures preserve their platform error behavior.
+- Process-launcher acceptance helpers now live behind an extracted boundary, and
+  the launcher size ratchet is restored.
+
+### Notes
+
+- This release does not claim completion of remaining Source Graph
+  retrieval/evaluation work or Windows ACL/AppContainer integration.
+
 ## [0.10.71] - 2026-08-30
 
 ### Added
