@@ -12,6 +12,17 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.74 — 2026-08-31
+
+- Reviewers can read authenticated, evidence-bound input packets through a
+  dedicated packet-read authority.
+- The generated Source Graph mode catalog is freshness-checked and documents the
+  canonical query-mode surface.
+- Windows read-only authorization uses ACL snapshots with bounded ACE and SID
+  parsing.
+- Remaining Source Graph work, Windows platform work, platform consolidation and
+  mechanical standards work are not represented as complete by this release.
+
 ## What's new in 0.10.73 — 2026-08-31
 
 - Baseline diagnostics now receive parity comparison across validation paths,

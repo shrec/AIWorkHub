@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.74] - 2026-08-31
+
+### Added
+
+- Reviewers can read their authenticated, evidence-bound input packets through a
+  dedicated packet-read authority.
+- Windows read-only authorization uses ACL snapshots with bounded ACE and SID
+  parsing.
+
+### Documentation
+
+- The generated Source Graph mode catalog is freshness-checked and documents the
+  canonical query-mode surface.
+
+### Notes
+
+- This release does not claim completion of remaining Source Graph work, Windows
+  platform work or broader platform consolidation and mechanical standards work.
+
 ## [0.10.73] - 2026-08-31
 
 ### Fixed

@@ -1,5 +1,24 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.74 — 2026-08-31
+
+### Added
+
+- Reviewers can read authenticated, evidence-bound input packets through a
+  dedicated packet-read authority.
+- Windows read-only authorization uses ACL snapshots with bounded ACE and SID
+  parsing.
+
+### Documentation
+
+- The generated Source Graph mode catalog is freshness-checked and documents the
+  canonical query-mode surface.
+
+### Notes
+
+- Remaining Source Graph work, Windows platform work, platform consolidation and
+  mechanical standards work are not represented as complete in this release.
+
 ## 0.10.73 — 2026-08-31
 
 ### Fixed
