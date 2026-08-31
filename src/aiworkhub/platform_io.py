@@ -10,11 +10,12 @@ from __future__ import annotations
 import errno
 import ctypes
 import os
-import subprocess
 import time
 import unicodedata
 from collections.abc import Callable
 from typing import Any, Protocol, TypedDict, cast
+
+from . import _platform_process
 
 
 class BackgroundProcessLaunchKwargs(TypedDict, total=False):
@@ -30,16 +31,7 @@ def background_process_launch_kwargs(
 ) -> BackgroundProcessLaunchKwargs:
     """Return only the headless process flags supported by this platform."""
 
-    platform_name = os.name if platform_name is None else platform_name
-    if platform_name == "nt":
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = subprocess.SW_HIDE
-        return {
-            "creationflags": subprocess.CREATE_NO_WINDOW,
-            "startupinfo": startupinfo,
-        }
-    return {"start_new_session": True}
+    return _platform_process.background_process_launch_kwargs(platform_name)
 
 
 _INVALID_HANDLE_VALUE = cast(int, ctypes.c_void_p(-1).value)
@@ -576,32 +568,7 @@ def windows_pid_is_alive(pid: int) -> bool:
     killed the VS Code extension host while the dashboard enumerated routes.
     """
 
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    import ctypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    open_process = kernel32.OpenProcess
-    open_process.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
-    open_process.restype = ctypes.c_void_p
-    get_exit_code = kernel32.GetExitCodeProcess
-    get_exit_code.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
-    get_exit_code.restype = ctypes.c_int
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = (ctypes.c_void_p,)
-    close_handle.restype = ctypes.c_int
-
-    handle = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not handle:
-        # Access denied still establishes that a protected process exists.
-        return ctypes.get_last_error() == 5
-    exit_code = ctypes.c_uint32()
-    try:
-        if not get_exit_code(handle, ctypes.byref(exit_code)):
-            return False
-        return exit_code.value == 259  # STILL_ACTIVE
-    finally:
-        close_handle(handle)
+    return _platform_process.windows_process_is_alive(pid)
 
 
 def process_is_alive(pid: int) -> bool:
@@ -617,19 +584,7 @@ def process_is_alive(pid: int) -> bool:
     which never signals the target.
     """
 
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    if os.name == "nt":
-        return windows_pid_is_alive(pid)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # EPERM: the process exists, we just may not signal it
-    except OSError:
-        return True  # undeterminable -> fail closed to alive
-    return True
+    return _platform_process.process_is_alive(pid)
 
 
 def chmod_fd(fd: int, mode: int) -> None:
@@ -691,6 +646,13 @@ def atomic_replace(source: str | os.PathLike[str], destination: str | os.PathLik
             time.sleep(0.01)
 
 
+class _MsvcrtLocking(Protocol):
+    LK_NBLCK: int
+    LK_UNLCK: int
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None: ...
+
+
 def _prepare_windows_lock_byte(fd: int) -> None:
     """Ensure byte zero exists and select it for ``msvcrt.locking``."""
 
@@ -706,9 +668,10 @@ def lock_fd(fd: int, *, blocking: bool) -> None:
     if os.name == "nt":
         import msvcrt
 
+        windows_locking = cast(_MsvcrtLocking, msvcrt)
         _prepare_windows_lock_byte(fd)
         if not blocking:
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            windows_locking.locking(fd, windows_locking.LK_NBLCK, 1)
             return
         # ``msvcrt.LK_LOCK`` is NOT the Windows equivalent of
         # ``flock(LOCK_EX)``.  It retries ten times at one-second intervals
@@ -721,7 +684,7 @@ def lock_fd(fd: int, *, blocking: bool) -> None:
         deadline = time.monotonic() + ADVISORY_LOCK_MAX_WAIT_SECONDS
         while True:
             try:
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                windows_locking.locking(fd, windows_locking.LK_NBLCK, 1)
                 return
             except OSError as exc:
                 if exc.errno not in _WINDOWS_LOCK_CONTENDED_ERRNOS:
@@ -770,8 +733,9 @@ def unlock_fd(fd: int) -> None:
     if os.name == "nt":
         import msvcrt
 
+        windows_locking = cast(_MsvcrtLocking, msvcrt)
         os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        windows_locking.locking(fd, windows_locking.LK_UNLCK, 1)
         return
 
     import fcntl

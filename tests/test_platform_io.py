@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiworkhub import platform_io
+from aiworkhub import _platform_process, platform_io
 
 
 class _FakeWindowsFunction:
@@ -593,13 +593,15 @@ def test_native_canary_relative_child_disposition(tmp_path, child_kind):
 def test_background_process_launch_kwargs_dispatches_exactly_by_platform(monkeypatch):
     startup = SimpleNamespace(dwFlags=0, wShowWindow=None)
     monkeypatch.setattr(
-        platform_io.subprocess, "STARTUPINFO", lambda: startup, raising=False
+        _platform_process.subprocess, "STARTUPINFO", lambda: startup, raising=False
     )
     monkeypatch.setattr(
-        platform_io.subprocess, "STARTF_USESHOWWINDOW", 4, raising=False
+        _platform_process.subprocess, "STARTF_USESHOWWINDOW", 4, raising=False
     )
-    monkeypatch.setattr(platform_io.subprocess, "SW_HIDE", 0, raising=False)
-    monkeypatch.setattr(platform_io.subprocess, "CREATE_NO_WINDOW", 8, raising=False)
+    monkeypatch.setattr(_platform_process.subprocess, "SW_HIDE", 0, raising=False)
+    monkeypatch.setattr(
+        _platform_process.subprocess, "CREATE_NO_WINDOW", 8, raising=False
+    )
 
     assert platform_io.background_process_launch_kwargs("nt") == {
         "creationflags": 8,
@@ -610,6 +612,98 @@ def test_background_process_launch_kwargs_dispatches_exactly_by_platform(monkeyp
     assert platform_io.background_process_launch_kwargs("posix") == {
         "start_new_session": True,
     }
+
+
+def test_process_backend_selection_tracks_current_platform(monkeypatch):
+    monkeypatch.setattr(_platform_process.os, "name", "posix")
+    assert platform_io.background_process_launch_kwargs() == {
+        "start_new_session": True,
+    }
+    startup = SimpleNamespace(dwFlags=0, wShowWindow=None)
+    monkeypatch.setattr(
+        _platform_process.subprocess, "STARTUPINFO", lambda: startup, raising=False
+    )
+    monkeypatch.setattr(
+        _platform_process.subprocess, "STARTF_USESHOWWINDOW", 4, raising=False
+    )
+    monkeypatch.setattr(_platform_process.subprocess, "SW_HIDE", 0, raising=False)
+    monkeypatch.setattr(
+        _platform_process.subprocess, "CREATE_NO_WINDOW", 8, raising=False
+    )
+    monkeypatch.setattr(_platform_process.os, "name", "nt")
+    assert platform_io.background_process_launch_kwargs()["creationflags"] == 8
+
+
+@pytest.mark.parametrize(("pid", "expected"), [(0, False), (-1, False), (True, False)])
+def test_process_is_alive_rejects_invalid_pid(monkeypatch, pid, expected):
+    monkeypatch.setattr(_platform_process.os, "name", "posix")
+    monkeypatch.setattr(
+        _platform_process.os, "kill", lambda *_args: pytest.fail("kill")
+    )
+    assert platform_io.process_is_alive(pid) is expected
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [(ProcessLookupError(), False), (PermissionError(), True), (OSError(), True)],
+)
+def test_posix_process_liveness_preserves_probe_semantics(monkeypatch, error, expected):
+    monkeypatch.setattr(_platform_process.os, "name", "posix")
+
+    def raise_probe_error(*_args):
+        raise error
+
+    monkeypatch.setattr(_platform_process.os, "kill", raise_probe_error)
+    assert platform_io.process_is_alive(42) is expected
+
+
+def test_windows_process_liveness_closes_handle_and_reads_exit_code(monkeypatch):
+    calls: list[object] = []
+    exit_code = 259
+
+    def get_exit_code(handle, output):
+        assert handle == 123
+        output._obj.value = exit_code
+        return 1
+
+    kernel32 = SimpleNamespace(
+        OpenProcess=_FakeWindowsFunction(lambda access, inherit, pid: 123),
+        GetExitCodeProcess=_FakeWindowsFunction(get_exit_code),
+        CloseHandle=_FakeWindowsFunction(lambda handle: calls.append(handle) or 1),
+    )
+    monkeypatch.setattr(
+        _platform_process.ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: kernel32,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _platform_process.ctypes, "get_last_error", lambda: 5, raising=False
+    )
+    monkeypatch.setattr(_platform_process.os, "name", "nt")
+
+    assert platform_io.process_is_alive(42)
+    assert calls == [123]
+
+
+def test_windows_process_liveness_treats_access_denied_as_alive(monkeypatch):
+    kernel32 = SimpleNamespace(
+        OpenProcess=_FakeWindowsFunction(lambda *_args: 0),
+        GetExitCodeProcess=_FakeWindowsFunction(
+            lambda *_args: pytest.fail("exit code")
+        ),
+        CloseHandle=_FakeWindowsFunction(lambda *_args: pytest.fail("close")),
+    )
+    monkeypatch.setattr(
+        _platform_process.ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: kernel32,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _platform_process.ctypes, "get_last_error", lambda: 5, raising=False
+    )
+    assert _platform_process.windows_process_is_alive(42)
 
 
 def test_windows_pid_probe_is_non_signalling():
