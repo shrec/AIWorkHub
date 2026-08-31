@@ -1439,6 +1439,10 @@ class FakeAclSnapshotApi:
         self.freed = []
         self.live = False
         self.aces = []
+        self.revision = 2
+        self.sbz1 = 0
+        self.sbz2 = 0
+        self.raw_override = None
 
     def get_named_security_info(self, path):
         if self.fail == "get_named_security_info":
@@ -1456,11 +1460,20 @@ class FakeAclSnapshotApi:
         assert dacl == self.dacl and self.live
         if self.fail == "acl_information":
             raise wac.AclSnapshotError("acl_information", 87)
-        return 256, len(self.aces)
+        return 8 + sum(len(data) for _, data in self.aces), len(self.aces)
+
+    def acl_bytes(self, dacl, size):
+        assert dacl == self.dacl and self.live
+        raw = self.raw_override
+        if raw is None:
+            body = b"".join(data for _, data in self.aces)
+            total = 8 + len(body)
+            raw = bytes((self.revision, self.sbz1)) + total.to_bytes(2, "little") + len(self.aces).to_bytes(2, "little") + self.sbz2.to_bytes(2, "little") + body
+        return raw[:size]
 
     def get_ace(self, dacl, index, acl_end):
         assert dacl == self.dacl and self.live
-        assert acl_end == dacl + 256
+        assert acl_end == dacl + 8 + sum(len(data) for _, data in self.aces)
         if self.fail == "get_ace":
             raise wac.AclSnapshotError("get_ace", 87)
         address, data = self.aces[index]
@@ -1499,16 +1512,19 @@ def test_acl_snapshot_distinguishes_absent_null_and_empty_dacl():
         wac.DaclState.ABSENT, wac.DaclState.NULL, wac.DaclState.PRESENT
     )
     assert absent.aces == null.aces == empty.aces == ()
+    assert absent.raw_acl is null.raw_acl is None
+    assert empty.raw_acl == b"\x02\0\x08\0\0\0\0\0"
 
 
 def test_acl_snapshot_copies_exact_simple_ace_sid_and_large_pointers():
     api = FakeAclSnapshotApi()
     raw = _simple_ace()
-    api.aces = [(0x1_0000_3000, raw)]
+    api.aces = [(api.dacl + 8, raw)]
     result = wac.snapshot_filesystem_acl("C:\\safe", api=api)
     assert result.aces[0].raw == raw
     assert result.aces[0].sid == raw[8:]
     assert result.aces[0].mask == 0x120089
+    assert result.raw_acl == b"\x02\0" + (8 + len(raw)).to_bytes(2, "little") + b"\x01\0\0\0" + raw
     assert api.freed == [0x1_0000_1000]
     assert not api.live
 
@@ -1519,16 +1535,20 @@ def test_acl_snapshot_object_ace_preserves_guid_metadata():
     size = 12 + len(guid) + len(sid)
     raw = bytes((5, 1)) + size.to_bytes(2, "little") + (1).to_bytes(4, "little") + (1).to_bytes(4, "little") + guid + sid
     api = FakeAclSnapshotApi()
-    api.aces = [(0x1_0000_4000, raw)]
-    ace = wac.snapshot_filesystem_acl("C:\\safe", api=api).aces[0]
+    api.revision, api.sbz1, api.sbz2 = 4, 0xA5, 0xBEEF
+    api.aces = [(api.dacl + 8, raw)]
+    snapshot = wac.snapshot_filesystem_acl("C:\\safe", api=api)
+    ace = snapshot.aces[0]
     assert ace.object_flags == 1 and ace.object_type == guid and ace.inherited_object_type is None
     assert ace.sid == sid and ace.raw == raw
+    assert snapshot.raw_acl is not None
+    assert snapshot.raw_acl[:2] == b"\x04\xa5"
 
 
 @pytest.mark.parametrize("raw", [b"", b"\x00\0\x03\0", b"\x00\0\xff\xff" + b"x" * 4, bytes((99, 0, 8, 0)) + b"x" * 4])
 def test_acl_snapshot_malformed_or_unsupported_ace_fails_closed(raw):
     api = FakeAclSnapshotApi()
-    api.aces = [(0x1_0000_5000, raw)]
+    api.aces = [(api.dacl + 8, raw)]
     with pytest.raises(wac.AclSnapshotError):
         wac.snapshot_filesystem_acl("C:\\safe", api=api)
     assert api.freed == [api.descriptor]
@@ -1537,7 +1557,7 @@ def test_acl_snapshot_malformed_or_unsupported_ace_fails_closed(raw):
 @pytest.mark.parametrize("failure", ["get_security_descriptor_dacl", "acl_information", "get_ace", "sid"])
 def test_acl_snapshot_every_borrowed_stage_failure_frees_descriptor_once(failure):
     api = FakeAclSnapshotApi(fail=failure)
-    api.aces = [(0x1_0000_6000, _simple_ace())]
+    api.aces = [(api.dacl + 8, _simple_ace())]
     with pytest.raises(wac.AclSnapshotError):
         wac.snapshot_filesystem_acl("C:\\safe", api=api)
     assert api.freed == [api.descriptor] and not api.live
@@ -1545,12 +1565,69 @@ def test_acl_snapshot_every_borrowed_stage_failure_frees_descriptor_once(failure
 
 def test_acl_snapshot_cleanup_failure_is_observable_with_primary_failure():
     api = FakeAclSnapshotApi(fail="local_free")
-    api.aces = [(0x1_0000_7000, bytes((99, 0, 8, 0)) + b"xxxx")]
+    api.aces = [(api.dacl + 8, bytes((99, 0, 8, 0)) + b"xxxx")]
     with pytest.raises(wac.AclSnapshotError) as exc:
         wac.snapshot_filesystem_acl("C:\\safe", api=api)
     assert exc.value.operation == "unsupported_ace_type"
     assert exc.value.cleanup_error is not None
     assert api.freed == [api.descriptor]
+
+
+@pytest.mark.parametrize("revision", [0, 1, 3, 5, 255])
+def test_acl_snapshot_rejects_unsupported_acl_revision_and_frees(revision):
+    api = FakeAclSnapshotApi()
+    api.revision = revision
+    with pytest.raises(wac.AclSnapshotError, match="unsupported_acl_revision"):
+        wac.snapshot_filesystem_acl("C:\\safe", api=api)
+    assert api.freed == [api.descriptor]
+
+
+def test_acl_snapshot_preserves_revision_header_and_exact_partition():
+    api = FakeAclSnapshotApi()
+    first, second = _simple_ace(0), _simple_ace(1, flags=0x80)
+    api.revision, api.sbz1, api.sbz2 = 4, 0x7A, 0xCAFE
+    api.aces = [(api.dacl + 8, first), (api.dacl + 8 + len(first), second)]
+    snapshot = wac.snapshot_filesystem_acl("C:\\safe", api=api)
+    assert snapshot.raw_acl is not None
+    assert snapshot.raw_acl[:2] == b"\x04\x7a"
+    assert snapshot.raw_acl[6:8] == b"\xfe\xca"
+    assert b"".join(ace.raw for ace in snapshot.aces) == snapshot.raw_acl[8:]
+    snapshot.verify_integrity()
+
+
+@pytest.mark.parametrize("kind", ["size", "count", "truncated", "gap"])
+def test_acl_snapshot_rejects_malformed_raw_acl_and_always_frees(kind):
+    api = FakeAclSnapshotApi()
+    raw = _simple_ace()
+    api.aces = [(api.dacl + 8, raw)]
+    total = 8 + len(raw)
+    valid = b"\x02\0" + total.to_bytes(2, "little") + b"\x01\0\0\0" + raw
+    if kind == "size":
+        api.raw_override = valid[:2] + (len(valid) + 1).to_bytes(2, "little") + valid[4:]
+    elif kind == "count":
+        api.raw_override = valid[:4] + b"\x02\0" + valid[6:]
+    elif kind == "truncated":
+        api.raw_override = valid[:-1]
+    else:
+        api.aces = [(api.dacl + 9, raw)]
+    with pytest.raises(wac.AclSnapshotError):
+        wac.snapshot_filesystem_acl("C:\\safe", api=api)
+    assert api.freed == [api.descriptor]
+
+
+def test_acl_snapshot_authentication_detects_field_and_raw_drift():
+    api = FakeAclSnapshotApi()
+    raw = _simple_ace()
+    api.aces = [(api.dacl + 8, raw)]
+    snapshot = wac.snapshot_filesystem_acl("C:\\safe", api=api)
+    object.__setattr__(snapshot, "defaulted", not snapshot.defaulted)
+    with pytest.raises(wac.AclSnapshotError, match="snapshot_authentication"):
+        snapshot.verify_integrity()
+
+
+def test_nonpresent_snapshot_cannot_fabricate_raw_acl():
+    with pytest.raises(ValueError, match="cannot have raw"):
+        wac.AclSnapshot("C:\\safe", wac.DaclState.NULL, False, (), b"acl")
 
 
 @pytest.mark.parametrize("path", ["", "\x00", "C:\\x\x00y", 1, None])
@@ -1702,7 +1779,23 @@ def test_acl_snapshot_native_sid_checks_bounded_header_before_native_calls(monke
 
 @pytest.mark.skipif(wac.os.name != "nt", reason="Windows native canary")
 def test_acl_snapshot_windows_native_canary_is_structurally_valid():
-    snapshot = wac.snapshot_filesystem_acl(wac.os.getcwd())
+    path = wac.os.getcwd()
+    snapshot = wac.snapshot_filesystem_acl(path)
+    reacquired = wac.snapshot_filesystem_acl(path)
     assert isinstance(snapshot, wac.AclSnapshot)
     assert isinstance(snapshot.aces, tuple)
-    assert all(ace.raw and ace.sid for ace in snapshot.aces)
+    assert (reacquired.dacl_state, reacquired.defaulted) == (
+        snapshot.dacl_state,
+        snapshot.defaulted,
+    )
+    assert reacquired.raw_acl == snapshot.raw_acl
+    if snapshot.dacl_state is wac.DaclState.PRESENT:
+        assert snapshot.raw_acl is not None
+        assert reacquired.raw_acl is not None
+        assert reacquired.raw_acl[:8] == snapshot.raw_acl[:8]
+        assert b"".join(ace.raw for ace in snapshot.aces) == snapshot.raw_acl[8:]
+        assert b"".join(ace.raw for ace in reacquired.aces) == reacquired.raw_acl[8:]
+        assert reacquired.aces == snapshot.aces
+    else:
+        assert snapshot.raw_acl is reacquired.raw_acl is None
+        assert snapshot.aces == reacquired.aces == ()

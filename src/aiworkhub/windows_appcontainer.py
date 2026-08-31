@@ -1658,6 +1658,42 @@ class AclSnapshot:
     dacl_state: DaclState
     defaulted: bool
     aces: tuple[AclAce, ...]
+    raw_acl: bytes | None = None
+    authentication: bytes = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.dacl_state is DaclState.PRESENT:
+            if self.raw_acl is None:
+                raise ValueError("a present DACL requires raw ACL bytes")
+        elif self.raw_acl is not None:
+            raise ValueError("an absent or NULL DACL cannot have raw ACL bytes")
+        object.__setattr__(self, "authentication", self._authentication())
+
+    def _authentication(self) -> bytes:
+        digest = hashlib.sha256()
+        encoded_path = self.path.encode("utf-8", "surrogatepass")
+        digest.update(len(encoded_path).to_bytes(8, "little"))
+        digest.update(encoded_path)
+        digest.update(self.dacl_state.value.encode("ascii"))
+        digest.update(bytes((self.defaulted,)))
+        raw = self.raw_acl or b""
+        digest.update(len(raw).to_bytes(8, "little"))
+        digest.update(raw)
+        return digest.digest()
+
+    def verify_integrity(self) -> None:
+        """Fail closed if authenticated fields or decoded ACE bytes drift."""
+        if self.authentication != self._authentication():
+            raise AclSnapshotError("snapshot_authentication")
+        if self.dacl_state is not DaclState.PRESENT:
+            if self.raw_acl is not None or self.aces:
+                raise AclSnapshotError("snapshot_state")
+            return
+        raw = self.raw_acl
+        if raw is None or len(raw) < 8:
+            raise AclSnapshotError("snapshot_state")
+        if b"".join(ace.raw for ace in self.aces) != raw[8:]:
+            raise AclSnapshotError("snapshot_ace_partition")
 
 
 class AclSnapshotError(RuntimeError):
@@ -1683,6 +1719,7 @@ class _AclSnapshotApi(Protocol):
     def get_named_security_info(self, path: str) -> int: ...
     def get_security_descriptor_dacl(self, descriptor: int) -> tuple[bool, int, bool]: ...
     def acl_information(self, dacl: int) -> tuple[int, int]: ...
+    def acl_bytes(self, dacl: int, size: int) -> bytes: ...
     def get_ace(self, dacl: int, index: int, acl_end: int) -> tuple[int, bytes]: ...
     def sid_bytes(self, address: int, ace_end: int) -> bytes: ...
     def local_free(self, descriptor: int) -> None: ...
@@ -1695,6 +1732,7 @@ _SIMPLE_ACE_TYPES = frozenset((0, 1, 2, 3))
 _OBJECT_ACE_TYPES = frozenset((5, 6, 7, 8))
 _ACE_OBJECT_TYPE_PRESENT = 0x1
 _ACE_INHERITED_OBJECT_TYPE_PRESENT = 0x2
+_SUPPORTED_ACL_REVISIONS = frozenset((2, 4))
 
 
 class _ACL_SIZE_INFORMATION(ctypes.Structure):
@@ -1771,6 +1809,9 @@ class _NativeAclSnapshotApi:
         ):
             raise AclSnapshotError("acl_information", _last_win_error())
         return int(info.AclBytesInUse), int(info.AceCount)
+
+    def acl_bytes(self, dacl: int, size: int) -> bytes:
+        return bytes(ctypes.string_at(dacl, size))
 
     def get_ace(self, dacl: int, index: int, acl_end: int) -> tuple[int, bytes]:
         ace = wintypes.LPVOID()
@@ -1865,9 +1906,9 @@ def snapshot_filesystem_acl(path: str, *, api: _AclSnapshotApi | None = None) ->
         if not present:
             if dacl:
                 raise AclSnapshotError("contradictory_dacl_state")
-            return AclSnapshot(path, DaclState.ABSENT, defaulted, ())
+            return AclSnapshot(path, DaclState.ABSENT, defaulted, (), None)
         if not dacl:
-            return AclSnapshot(path, DaclState.NULL, defaulted, ())
+            return AclSnapshot(path, DaclState.NULL, defaulted, (), None)
         acl_bytes, ace_count = boundary.acl_information(dacl)
         if acl_bytes < 8 or ace_count < 0 or ace_count > (acl_bytes - 8) // 4:
             raise AclSnapshotError("invalid_acl_bounds")
@@ -1875,11 +1916,37 @@ def snapshot_filesystem_acl(path: str, *, api: _AclSnapshotApi | None = None) ->
         if dacl > uintptr_max or acl_bytes > uintptr_max - dacl:
             raise AclSnapshotError("invalid_acl_bounds")
         acl_end = dacl + acl_bytes
+        header = bytes(boundary.acl_bytes(dacl, 8))
+        if len(header) != 8:
+            raise AclSnapshotError("truncated_acl_header")
+        revision = header[0]
+        declared_size = int.from_bytes(header[2:4], "little")
+        declared_count = int.from_bytes(header[4:6], "little")
+        if revision not in _SUPPORTED_ACL_REVISIONS:
+            raise AclSnapshotError("unsupported_acl_revision")
+        if declared_size != acl_bytes or declared_count != ace_count:
+            raise AclSnapshotError("invalid_acl_header")
         copied: list[AclAce] = []
+        cursor = dacl + 8
         for index in range(ace_count):
             address, raw = boundary.get_ace(dacl, index, acl_end)
+            if address != cursor or len(raw) < 4:
+                raise AclSnapshotError("ace_traversal")
+            ace_end = address + len(raw)
+            if ace_end < address or ace_end > acl_end:
+                raise AclSnapshotError("ace_out_of_range")
             copied.append(_copy_acl_ace(boundary, address, raw))
-        return AclSnapshot(path, DaclState.PRESENT, defaulted, tuple(copied))
+            cursor = ace_end
+        if cursor != acl_end:
+            raise AclSnapshotError("ace_count_traversal")
+        raw_acl = bytes(boundary.acl_bytes(dacl, acl_bytes))
+        if len(raw_acl) != acl_bytes or raw_acl[:8] != header:
+            raise AclSnapshotError("truncated_acl_copy")
+        if b"".join(ace.raw for ace in copied) != raw_acl[8:]:
+            raise AclSnapshotError("ace_raw_mismatch")
+        result = AclSnapshot(path, DaclState.PRESENT, defaulted, tuple(copied), raw_acl)
+        result.verify_integrity()
+        return result
     except BaseException as exc:
         primary = exc
         raise
