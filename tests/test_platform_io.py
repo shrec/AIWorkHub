@@ -26,20 +26,29 @@ class _FakeWindowsLibraries:
         self,
         *,
         status=0,
+        dos_error=5,
         attributes=0x10,
         reparse_tag=0,
         volume=7,
         file_id=bytes(range(1, 17)),
+        disposition_results=(1,),
     ):
         self.calls = []
         self.closes = []
         self.close_results = [1]
         self.last_error = 5
+        self.disposition_calls = []
+        self.disposition_results = list(disposition_results)
+        self.nt_statuses = []
 
         def nt_create(*args):
             self.calls.append(args)
             args[0]._obj.value = 0x1_0000_1234
             return status
+
+        def rtl_status_to_dos_error(status_arg):
+            self.nt_statuses.append(status_arg)
+            return dos_error
 
         def information(handle, info_class, output, size):
             assert handle == 0x1_0000_1234
@@ -54,16 +63,28 @@ class _FakeWindowsLibraries:
                 value.FileId[:] = file_id
             return 1
 
+        def set_file_information(handle, info_class, output, size):
+            value = output._obj
+            self.disposition_calls.append(
+                (
+                    getattr(handle, "value", handle),
+                    info_class,
+                    value.Flags if info_class == 21 else value.DeleteFile,
+                )
+            )
+            return self.disposition_results.pop(0)
+
         def close(handle):
             self.closes.append(handle.value)
             return self.close_results.pop(0)
 
         self.ntdll = SimpleNamespace(
             NtCreateFile=_FakeWindowsFunction(nt_create),
-            RtlNtStatusToDosError=_FakeWindowsFunction(lambda _status: 5),
+            RtlNtStatusToDosError=_FakeWindowsFunction(rtl_status_to_dos_error),
         )
         self.kernel32 = SimpleNamespace(
             GetFileInformationByHandleEx=_FakeWindowsFunction(information),
+            SetFileInformationByHandle=_FakeWindowsFunction(set_file_information),
             CloseHandle=_FakeWindowsFunction(close),
         )
 
@@ -86,6 +107,14 @@ def test_canonical_segment_rejects_ambiguous_windows_names():
         "tail ",
         "CON",
         "nul.txt",
+        "COM¹",
+        "COM²",
+        "COM³",
+        "LPT¹",
+        "LPT²",
+        "LPT³",
+        "com¹.txt",
+        "LPT².log",
         "e\u0301",
         "bad:name",
         "bad*name",
@@ -106,7 +135,14 @@ def test_canonical_segment_rejects_ambiguous_windows_names():
 
 
 @pytest.mark.parametrize("parent", [0, platform_io._INVALID_HANDLE_VALUE])
-def test_relative_child_rejects_invalid_parent_before_native_call(monkeypatch, parent):
+@pytest.mark.parametrize(
+    "opener",
+    [
+        platform_io.open_windows_relative_child_directory,
+        platform_io.open_windows_relative_child_disposition,
+    ],
+)
+def test_relative_child_rejects_invalid_parent_before_native_call(monkeypatch, parent, opener):
     monkeypatch.setattr(
         platform_io.ctypes,
         "WinDLL",
@@ -114,10 +150,42 @@ def test_relative_child_rejects_invalid_parent_before_native_call(monkeypatch, p
         raising=False,
     )
     with pytest.raises(ValueError):
-        platform_io.open_windows_relative_child_directory(parent, "child")
+        opener(parent, "child")
 
 
-def test_ntcreatefile_relative_child_preserves_exact_abi_and_authority(monkeypatch):
+@pytest.mark.parametrize(
+    "child_name",
+    [
+        "COM¹",
+        "COM²",
+        "COM³",
+        "LPT¹",
+        "LPT²",
+        "LPT³",
+        "com¹.txt",
+        "COM².log",
+        "lpt³.bak",
+    ],
+)
+@pytest.mark.parametrize(
+    "opener",
+    [
+        platform_io.open_windows_relative_child_directory,
+        platform_io.open_windows_relative_child_disposition,
+    ],
+)
+def test_reserved_superscript_names_no_native_call(monkeypatch, child_name, opener):
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: pytest.fail("native call"),
+        raising=False,
+    )
+    with pytest.raises(ValueError):
+        opener(0x1_0000_0009, child_name)
+
+
+def test_ntcreatefile_directory_child_preserves_exact_abi_and_authority(monkeypatch):
     fake = _FakeWindowsLibraries()
     monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
     monkeypatch.setattr(
@@ -138,6 +206,32 @@ def test_ntcreatefile_relative_child_preserves_exact_abi_and_authority(monkeypat
     assert args[5:9] == (0, 0x7, 0x1, 0x200021)
     owned.close()
     owned.close()
+    assert fake.closes == [0x1_0000_1234]
+
+
+def test_ntcreatefile_disposition_child_preserves_exact_abi_and_authority(monkeypatch):
+    fake = _FakeWindowsLibraries()
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    authority = platform_io.open_windows_relative_child_disposition(
+        0x1_0000_0009, "child"
+    )
+    assert authority.handle.value == 0x1_0000_1234
+    assert len(fake.ntdll.NtCreateFile.argtypes) == 11
+    args = fake.calls[0]
+    object_attributes = args[2]._obj
+    assert object_attributes.RootDirectory == 0x1_0000_0009
+    assert object_attributes.ObjectName.contents.Length == 10
+    assert object_attributes.ObjectName.contents.MaximumLength == 12
+    assert args[1:2] == (0x00110080,)
+    assert args[5:9] == (0, 0x3, 0x1, 0x200020)
+    authority.close()
+    authority.close()
     assert fake.closes == [0x1_0000_1234]
 
 
@@ -172,6 +266,92 @@ def test_handle_validation_closes_every_rejected_child(
     )
     with pytest.raises(OSError):
         platform_io.open_windows_relative_child_directory(99, "child")
+    assert fake.closes == [0x1_0000_1234]
+
+
+@pytest.mark.parametrize(
+    ("attributes", "tag", "volume", "file_id"),
+    [
+        (0, 1, 7, b"1" * 16),
+        (0x10, 1, 7, b"1" * 16),
+        (0x40, 0, 7, b"1" * 16),
+        (0, 0, 0, b"1" * 16),
+        (0x10, 0, 0, b"1" * 16),
+        (0, 0, 7, b"\0" * 16),
+        (0x10, 0, 7, b"\0" * 16),
+    ],
+)
+def test_disposition_handle_validation_closes_every_rejected_child(
+    monkeypatch,
+    attributes,
+    tag,
+    volume,
+    file_id,
+):
+    fake = _FakeWindowsLibraries(
+        attributes=attributes,
+        reparse_tag=tag,
+        volume=volume,
+        file_id=file_id,
+    )
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    with pytest.raises(OSError):
+        platform_io.open_windows_relative_child_disposition(99, "child")
+    assert fake.closes == [0x1_0000_1234]
+
+
+@pytest.mark.parametrize(
+    ("attributes", "expected_is_directory"),
+    [(0, False), (0x10, True)],
+)
+def test_disposition_opener_authenticates_file_and_directory_type(
+    monkeypatch,
+    attributes,
+    expected_is_directory,
+):
+    fake = _FakeWindowsLibraries(
+        attributes=attributes,
+        reparse_tag=0,
+        volume=7,
+        file_id=b"1" * 16,
+    )
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    authority = platform_io.open_windows_relative_child_disposition(
+        0x1_0000_0009, "child"
+    )
+    assert authority.is_directory is expected_is_directory
+    assert authority.volume_serial_number == 7
+    assert authority.file_id == b"1" * 16
+
+
+def test_disposition_metadata_failure_closes_exactly_once(monkeypatch):
+    fake = _FakeWindowsLibraries()
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    fake.kernel32.GetFileInformationByHandleEx = _FakeWindowsFunction(
+        lambda *_args: 0
+    )
+    fake.last_error = 5
+    with pytest.raises(OSError) as raised:
+        platform_io.open_windows_relative_child_disposition(0x1_0000_0009, "child")
+    assert raised.value.errno == 5
     assert fake.closes == [0x1_0000_1234]
 
 
@@ -219,11 +399,143 @@ def test_owned_handle_close_failure_uses_default_last_error_on_posix_ctypes(monk
     assert fake.closes == [0x1_0000_1234, 0x1_0000_1234]
 
 
-def test_native_canary_relative_child_directory(tmp_path):
-    if os.name != "nt":
-        pytest.skip("native Windows canary")
+def test_ntcreatefile_negative_status_converts_to_dos_error(monkeypatch):
+    fake = _FakeWindowsLibraries(status=-0xC0000034, dos_error=3)
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    with pytest.raises(OSError) as raised:
+        platform_io.open_windows_relative_child_directory(0x1_0000_0009, "child")
+    assert fake.nt_statuses == [-0xC0000034]
+    assert raised.value.errno == 3
+
+
+def test_disposition_marks_exact_handle_with_posix_delete_flags(monkeypatch):
+    fake = _FakeWindowsLibraries(attributes=0)
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    authority = platform_io.open_windows_relative_child_disposition(
+        0x1_0000_0009, "child"
+    )
+    platform_io.mark_windows_relative_child_disposition(authority)
+    assert len(fake.kernel32.SetFileInformationByHandle.argtypes) == 4
+    assert fake.disposition_calls == [(0x1_0000_1234, 21, 0x3)]
+
+
+def test_disposition_marks_directory_with_delete_only_flag(monkeypatch):
+    fake = _FakeWindowsLibraries(attributes=0x10)
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    authority = platform_io.open_windows_relative_child_disposition(
+        0x1_0000_0009, "child"
+    )
+    platform_io.mark_windows_relative_child_disposition(authority)
+    assert fake.disposition_calls == [(0x1_0000_1234, 21, 0x1)]
+
+
+def test_disposition_falls_back_exactly_on_unsupported_error(monkeypatch):
+    fake = _FakeWindowsLibraries(attributes=0, disposition_results=(0, 1))
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    authority = platform_io.open_windows_relative_child_disposition(
+        0x1_0000_0009, "child"
+    )
+    fake.last_error = 87
+    platform_io.mark_windows_relative_child_disposition(authority)
+    assert fake.disposition_calls == [
+        (0x1_0000_1234, 21, 0x3),
+        (0x1_0000_1234, 4, 1),
+    ]
+
+
+def test_disposition_hard_failure_never_falls_back(monkeypatch):
+    fake = _FakeWindowsLibraries(attributes=0, disposition_results=(0,))
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    authority = platform_io.open_windows_relative_child_disposition(
+        0x1_0000_0009, "child"
+    )
+    fake.last_error = 5
+    with pytest.raises(OSError) as raised:
+        platform_io.mark_windows_relative_child_disposition(authority)
+    assert raised.value.errno == 5
+    assert fake.disposition_calls == [(0x1_0000_1234, 21, 0x3)]
+
+
+def test_disposition_on_closed_handle_raises_without_native_call(monkeypatch):
+    fake = _FakeWindowsLibraries()
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    authority = platform_io.open_windows_relative_child_disposition(
+        0x1_0000_0009, "child"
+    )
+    authority.close()
+    with pytest.raises(ValueError):
+        platform_io.mark_windows_relative_child_disposition(authority)
+    assert fake.disposition_calls == []
+
+
+def test_disposition_fallback_refuses_after_identity_drift(monkeypatch):
+    fake = _FakeWindowsLibraries(disposition_results=(0,))
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "get_last_error",
+        fake.get_last_error,
+        raising=False,
+    )
+    authority = platform_io.open_windows_relative_child_disposition(
+        0x1_0000_0009, "child"
+    )
+    fake.last_error = 87
+    original = fake.kernel32.SetFileInformationByHandle
+
+    def close_then_fail(handle, info_class, output, size):
+        authority.close()
+        return original(handle, info_class, output, size)
+
+    fake.kernel32.SetFileInformationByHandle = _FakeWindowsFunction(close_then_fail)
+    with pytest.raises(OSError, match="closed before disposition fallback"):
+        platform_io.mark_windows_relative_child_disposition(authority)
+
+
+def _native_disposition_canary(tmp_path, child_kind):
     child = tmp_path / "child"
-    child.mkdir()
+    if child_kind == "directory":
+        child.mkdir()
+    else:
+        child.write_text("child", encoding="utf-8")
+    sibling = tmp_path / "sibling"
+    sibling.write_text("sibling", encoding="utf-8")
     kernel32 = getattr(platform_io.ctypes, "WinDLL")(
         "kernel32", use_last_error=True
     )
@@ -242,23 +554,32 @@ def test_native_canary_relative_child_directory(tmp_path):
     close_handle.argtypes = (platform_io.ctypes.c_void_p,)
     close_handle.restype = platform_io.ctypes.c_int
     parent_handle = platform_io._handle_value(
-        create_file(str(tmp_path), 0x80, 0x7, None, 3, 0x02200000, None)
+        create_file(str(tmp_path), 0x81, 0x3, None, 3, 0x02200000, None)
     )
     assert parent_handle not in (0, platform_io._INVALID_HANDLE_VALUE)
     try:
-        owned = platform_io.open_windows_relative_child_directory(
+        authority = platform_io.open_windows_relative_child_disposition(
             parent_handle,
             "child",
         )
-        assert owned.value not in (0, platform_io._INVALID_HANDLE_VALUE)
-        owned.close()
-        owned.close()
-        marker = child / "usable.txt"
-        marker.write_text("ok", encoding="utf-8")
-        assert marker.read_text(encoding="utf-8") == "ok"
-        assert [path.name for path in child.iterdir()] == ["usable.txt"]
+        assert authority.handle.value not in (0, platform_io._INVALID_HANDLE_VALUE)
+        assert authority.is_directory is (child_kind == "directory")
+        assert authority.volume_serial_number != 0
+        assert any(authority.file_id)
+        platform_io.mark_windows_relative_child_disposition(authority)
+        authority.close()
+        authority.close()
+        assert not child.exists()
+        assert sibling.exists()
     finally:
         assert close_handle(parent_handle)
+
+
+@pytest.mark.parametrize("child_kind", ["file", "directory"])
+def test_native_canary_relative_child_disposition(tmp_path, child_kind):
+    if os.name != "nt":
+        pytest.skip("native Windows canary")
+    _native_disposition_canary(tmp_path, child_kind)
 
 
 def test_background_process_launch_kwargs_dispatches_exactly_by_platform(monkeypatch):

@@ -43,12 +43,46 @@ def background_process_launch_kwargs(
 
 
 _INVALID_HANDLE_VALUE = cast(int, ctypes.c_void_p(-1).value)
+# Windows reserves CON/PRN/AUX/NUL, COM1-COM9 and LPT1-LPT9 as device names;
+# the superscript-digit spellings COM¹-COM³ and LPT¹-LPT³ are reserved as well.
+# The split-below check rejects the bare name and every dotted extension form
+# before any native call.
 _DOS_DEVICE_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
     | {f"COM{number}" for number in range(1, 10)}
     | {f"LPT{number}" for number in range(1, 10)}
+    | {f"{prefix}{superscript}" for prefix in ("COM", "LPT") for superscript in "¹²³"}
 )
 _WINDOWS_RESERVED_SEGMENT_CHARACTERS = frozenset('<>:"|?*')
+
+# FILE_ATTRIBUTE_* bits used to classify an authenticated child identity.
+_FILE_ATTRIBUTE_DIRECTORY = 0x10
+_FILE_ATTRIBUTE_DEVICE = 0x40
+
+# Enumeration authority (unchanged legacy contract): the directory must be
+# listable and its attributes readable, and sharing includes FILE_SHARE_DELETE
+# so a concurrent cleaner never blocks enumeration of the same directory.
+_WINDOWS_DIRECTORY_DESIRED_ACCESS = 0x00100081  # LIST | READ_ATTRIBUTES | SYNCHRONIZE
+_WINDOWS_DIRECTORY_SHARE_ACCESS = 0x7  # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+# Disposition authority: the open requests DELETE | FILE_READ_ATTRIBUTES |
+# SYNCHRONIZE so the very same HANDLE can later be marked for deletion, and
+# shares only READ | WRITE -- never FILE_SHARE_DELETE -- so a pending delete mark
+# is never silently absorbed by a concurrent opener.
+_WINDOWS_CHILD_DESIRED_ACCESS = 0x00110080  # DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+_WINDOWS_CHILD_SHARE_ACCESS = 0x3  # FILE_SHARE_READ | FILE_SHARE_WRITE
+
+_FILE_OPEN = 0x1
+_FILE_DIRECTORY_FILE = 0x1
+_FILE_SYNCHRONOUS_IO_NONALERT = 0x20
+_FILE_OPEN_REPARSE_POINT = 0x00200000
+# The enumeration opener constrains the open to directories; the disposition
+# opener leaves the type unconstrained so it can target a file or a directory.
+_WINDOWS_DIRECTORY_CREATE_OPTIONS = (
+    _FILE_DIRECTORY_FILE | _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_REPARSE_POINT
+)
+_WINDOWS_CHILD_CREATE_OPTIONS = (
+    _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_REPARSE_POINT
+)
 
 
 class _WindowsLibraryLoader(Protocol):
@@ -94,6 +128,26 @@ class _FileIdInfo(ctypes.Structure):
     ]
 
 
+class _FileDispositionInfo(ctypes.Structure):
+    _fields_ = [("DeleteFile", ctypes.c_ubyte)]
+
+
+class _FileDispositionInfoEx(ctypes.Structure):
+    _fields_ = [("Flags", ctypes.c_uint32)]
+
+
+_FILE_ATTRIBUTE_TAG_INFO = 9
+_FILE_ID_INFO = 18
+_FILE_DISPOSITION_INFO = 4
+_FILE_DISPOSITION_INFO_EX = 21
+_FILE_DISPOSITION_FLAG_DELETE = 0x00000001
+_FILE_DISPOSITION_FLAG_POSIX_SEMANTICS = 0x00000002
+# The one documented "unsupported" result: pre-Windows 10 1709 filesystems
+# reject FileDispositionInfoEx with ERROR_INVALID_PARAMETER (87) -- the exact
+# signal that plain FileDispositionInfo delete semantics is the only fallback.
+_WINDOWS_DISPOSITION_UNSUPPORTED_ERRNOS = frozenset({87})
+
+
 class OwnedWindowsHandle:
     """Pointer-width-safe Windows handle with checked, retryable ownership release."""
 
@@ -130,6 +184,46 @@ class OwnedWindowsHandle:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+
+class WindowsRelativeChildAuthority:
+    """Typed, authenticated relative-child authority for exact-handle disposition.
+
+    Carries the borrowed, identity-authenticated HANDLE together with the type,
+    volume serial and FileId proven at open time, so disposition can target the
+    very same object without ever reopening a pathname (which could drift to a
+    different filesystem object between open and delete).
+    """
+
+    def __init__(
+        self,
+        handle: OwnedWindowsHandle,
+        *,
+        is_directory: bool,
+        volume_serial_number: int,
+        file_id: bytes,
+    ) -> None:
+        self._handle = handle
+        self.is_directory = is_directory
+        self.volume_serial_number = volume_serial_number
+        self.file_id = bytes(file_id)
+
+    @property
+    def handle(self) -> OwnedWindowsHandle:
+        return self._handle
+
+    @property
+    def closed(self) -> bool:
+        return self._handle.closed
+
+    def close(self) -> None:
+        self._handle.close()
+
+    def __enter__(self) -> WindowsRelativeChildAuthority:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._handle.close()
 
 
 def _canonical_windows_child_segment(child_name: str) -> tuple[str, int]:
@@ -186,11 +280,19 @@ def _handle_value(handle: object) -> int:
     return value
 
 
-def open_windows_relative_child_directory(
+def _open_windows_relative_child_handle(
     parent_handle: int,
     child_name: str,
-) -> OwnedWindowsHandle:
-    """Open and validate one directory directly beneath a borrowed parent HANDLE."""
+    desired_access: int,
+    share_access: int,
+    create_options: int,
+) -> tuple[OwnedWindowsHandle, Any, Callable[[], int]]:
+    """Open one exact child segment beneath a borrowed parent HANDLE.
+
+    Returns the owned HANDLE together with the bound
+    ``GetFileInformationByHandleEx`` and last-error getters so the caller can
+    authenticate the child identity on this exact HANDLE before it leaves scope.
+    """
 
     if isinstance(parent_handle, bool) or not isinstance(parent_handle, int):
         raise TypeError("parent_handle must be int")
@@ -251,14 +353,14 @@ def open_windows_relative_child_directory(
     status = int(
         nt_create_file(
             ctypes.byref(result_handle),
-            0x00100081,
+            desired_access,
             ctypes.byref(attributes),
             ctypes.byref(io_status),
             None,
             0,
-            0x7,
-            0x1,
-            0x200021,
+            share_access,
+            _FILE_OPEN,
+            create_options,
             None,
             0,
         )
@@ -272,22 +374,49 @@ def open_windows_relative_child_directory(
     value = result_handle.value
     if not value:
         raise OSError("NtCreateFile succeeded without a handle")
-    owned = OwnedWindowsHandle(value, close_handle, get_last_error)
+    return (
+        OwnedWindowsHandle(value, close_handle, get_last_error),
+        get_file_information,
+        get_last_error,
+    )
+
+
+def open_windows_relative_child_directory(
+    parent_handle: int,
+    child_name: str,
+) -> OwnedWindowsHandle:
+    """Open and validate one directory directly beneath a borrowed parent HANDLE.
+
+    The enumeration contract is preserved: ``FILE_LIST_DIRECTORY |
+    FILE_READ_ATTRIBUTES | SYNCHRONIZE`` with ``FILE_SHARE_DELETE``, so directory
+    enumeration is never blocked by a concurrent cleaner and vice versa.
+    """
+
+    owned, get_file_information, get_last_error = _open_windows_relative_child_handle(
+        parent_handle,
+        child_name,
+        _WINDOWS_DIRECTORY_DESIRED_ACCESS,
+        _WINDOWS_DIRECTORY_SHARE_ACCESS,
+        _WINDOWS_DIRECTORY_CREATE_OPTIONS,
+    )
     try:
         tag_info = _FileAttributeTagInfo()
         if not get_file_information(
             owned.value,
-            9,
+            _FILE_ATTRIBUTE_TAG_INFO,
             ctypes.byref(tag_info),
             ctypes.sizeof(tag_info),
         ):
             raise _windows_error(get_last_error())
-        if not tag_info.FileAttributes & 0x10 or tag_info.ReparseTag != 0:
+        if (
+            not tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY
+            or tag_info.ReparseTag != 0
+        ):
             raise OSError("opened child is not a non-reparse directory")
         file_id = _FileIdInfo()
         if not get_file_information(
             owned.value,
-            18,
+            _FILE_ID_INFO,
             ctypes.byref(file_id),
             ctypes.sizeof(file_id),
         ):
@@ -298,6 +427,111 @@ def open_windows_relative_child_directory(
         owned.close()
         raise
     return owned
+
+
+def open_windows_relative_child_disposition(
+    parent_handle: int,
+    child_name: str,
+) -> WindowsRelativeChildAuthority:
+    """Open and authenticate one exact child (file or directory) for disposition.
+
+    The open requests ``DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`` and shares
+    only ``READ | WRITE``, so the very same HANDLE can later be marked for
+    deletion. The object's type (regular file or directory), volume serial and
+    FileId are proven here and retained on the returned authority.
+    """
+
+    owned, get_file_information, get_last_error = _open_windows_relative_child_handle(
+        parent_handle,
+        child_name,
+        _WINDOWS_CHILD_DESIRED_ACCESS,
+        _WINDOWS_CHILD_SHARE_ACCESS,
+        _WINDOWS_CHILD_CREATE_OPTIONS,
+    )
+    try:
+        tag_info = _FileAttributeTagInfo()
+        if not get_file_information(
+            owned.value,
+            _FILE_ATTRIBUTE_TAG_INFO,
+            ctypes.byref(tag_info),
+            ctypes.sizeof(tag_info),
+        ):
+            raise _windows_error(get_last_error())
+        if tag_info.ReparseTag != 0:
+            raise OSError("opened child is a reparse point")
+        if tag_info.FileAttributes & _FILE_ATTRIBUTE_DEVICE:
+            raise OSError("opened child has an unexpected device type")
+        is_directory = bool(tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY)
+        file_id = _FileIdInfo()
+        if not get_file_information(
+            owned.value,
+            _FILE_ID_INFO,
+            ctypes.byref(file_id),
+            ctypes.sizeof(file_id),
+        ):
+            raise _windows_error(get_last_error())
+        if file_id.VolumeSerialNumber == 0 or not any(file_id.FileId):
+            raise OSError("opened child has no stable volume/file identity")
+    except BaseException:
+        owned.close()
+        raise
+    return WindowsRelativeChildAuthority(
+        owned,
+        is_directory=is_directory,
+        volume_serial_number=int(file_id.VolumeSerialNumber),
+        file_id=bytes(file_id.FileId),
+    )
+
+
+def mark_windows_relative_child_disposition(
+    authority: WindowsRelativeChildAuthority,
+) -> None:
+    """Mark the exact authenticated child HANDLE for deletion.
+
+    The child HANDLE was opened and authenticated by
+    :func:`open_windows_relative_child_disposition`; this call requests deletion
+    of that very HANDLE through ``SetFileInformationByHandle`` and never reopens
+    a pathname, so the identity already proven cannot drift to a different
+    filesystem object.
+    """
+
+    value = authority.handle.value  # raises ValueError once the handle is closed
+    win_dll = _windows_dll_loader()
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    set_file_information = kernel32.SetFileInformationByHandle
+    set_file_information.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+    set_file_information.restype = ctypes.c_int
+    get_last_error = _windows_last_error_getter()
+
+    flags = _FILE_DISPOSITION_FLAG_DELETE
+    if not authority.is_directory:
+        # POSIX delete semantics are only defined for regular files.
+        flags |= _FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+    disposition_ex = _FileDispositionInfoEx(flags)
+    if not set_file_information(
+        ctypes.c_void_p(value),
+        _FILE_DISPOSITION_INFO_EX,
+        ctypes.byref(disposition_ex),
+        ctypes.sizeof(disposition_ex),
+    ):
+        error = get_last_error()
+        if error not in _WINDOWS_DISPOSITION_UNSUPPORTED_ERRNOS:
+            raise _windows_error(error)
+        if authority.closed:
+            raise OSError("child HANDLE was closed before disposition fallback")
+        disposition = _FileDispositionInfo(1)
+        if not set_file_information(
+            ctypes.c_void_p(value),
+            _FILE_DISPOSITION_INFO,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            raise _windows_error(get_last_error())
 
 
 WINDOWS_REPLACE_RETRY_SECONDS = 1.0
