@@ -463,8 +463,9 @@ def build_review_prompt(
     packet_evidence = (
         f"QUALITY_REVIEW_PACKET_FILE: {packet_file}\n"
         f"PACKET_SHA256: {packet_digest}\n"
-        "Read the packet file first with a worker file-read tool; its "
-        f"contents are the authoritative evidence for this review.\n"
+        "Call aiworkhub_worker_quality_review_packet_read with no arguments "
+        "before reviewing; the returned packet is the authoritative evidence "
+        "for this review. Do not supply a path or identity to that tool.\n"
         if use_file_transport
         else f"QUALITY_REVIEW_PACKET: {encoded}\n"
     )

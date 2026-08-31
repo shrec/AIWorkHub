@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +11,7 @@ from aiworkhub import quality_evidence as qe
 from aiworkhub import quality_review as qr
 from aiworkhub import quality_review_ingest
 from aiworkhub import quality_reviewer, runtime_adapters
+from aiworkhub import worker_ai_tools_mcp as worker_mcp
 
 CANDIDATE_PATH = "src/aiworkhub/quality_review.py"
 TASK_ID = "NF-2026-00259-PACKET-DELIVERY"
@@ -21,6 +24,9 @@ BLIND_TOOLSET = frozenset(
         "aiworkhub_worker_quality_review_submit",
     }
 )
+PACKET_READ_TOOLSET = BLIND_TOOLSET | {
+    "aiworkhub_worker_quality_review_packet_read"
+}
 
 
 def _scoped_audit(lens: str, paths: list[str]) -> dict[str, object]:
@@ -55,6 +61,132 @@ def _packet(lens: str = "correctness") -> dict[str, object]:
         validation=["python3 -m pytest -q"],
         scoped_audits={lens: _scoped_audit(lens, [CANDIDATE_PATH])},
     )
+
+
+def _review_ctx(repo: Path, packet_path: Path | None) -> worker_mcp.WorkerToolContext:
+    audit_ledger_path = repo / "review-audit.jsonl"
+    audit_hmac_key_path = repo / "review-audit.key"
+    audit_hmac_key_path.write_bytes(b"packet-read-test-key")
+    return worker_mcp.WorkerToolContext(
+        task_id="review-task",
+        runner="codex",
+        topic="quality-review",
+        request_id="review-request",
+        repo=repo,
+        authority_repo=repo,
+        source_graph_targets=(),
+        session_topic="quality-review",
+        audit_ledger_path=audit_ledger_path,
+        audit_hmac_key_path=audit_hmac_key_path,
+        quality_review_packet_path=packet_path,
+    )
+
+
+def _sealed_packet(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
+    candidate = tmp_path / CANDIDATE_PATH
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"candidate-bytes")
+    packet = _packet()
+    packet_path = tmp_path / "sealed-review-packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    return packet_path, packet, candidate
+
+
+def test_reviewer_packet_read_returns_exact_bound_packet(tmp_path: Path) -> None:
+    packet_path, packet, _candidate = _sealed_packet(tmp_path)
+    ctx = _review_ctx(tmp_path, packet_path)
+    result = worker_mcp.quality_review_packet_read(ctx)
+    assert result == {
+        "ok": True,
+        "tool": "quality_review_packet_read",
+        "packet_sha256": packet["packet_sha256"],
+        "packet": packet,
+    }
+    assert ctx.audit_ledger_path is not None
+    assert ctx.audit_hmac_key_path is not None
+    verification = worker_mcp.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    assert verification["ok"] is True
+    assert verification["entries_tampered"] == 0
+    assert verification["call_count_by_tool"]["quality_review_packet_read"] == 1
+    assert (
+        verification["successful_call_count_by_tool"]["quality_review_packet_read"]
+        == 1
+    )
+    entry = json.loads(ctx.audit_ledger_path.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["authority_source"] == "candidate_packet"
+    assert entry["authority_state"] == "quality_review_readonly"
+    target = packet["target"]
+    assert isinstance(target, dict)
+    assert entry["payload"] == {
+        "packet_sha256": packet["packet_sha256"],
+        "target_request_id": target["request_id"],
+        "target_task_id": target["task_id"],
+    }
+
+
+def test_reviewer_packet_read_is_inert_without_bound_packet(tmp_path: Path) -> None:
+    result = worker_mcp.quality_review_packet_read(_review_ctx(tmp_path, None))
+    assert result["ok"] is False
+    assert result["reason"] == "quality_review_packet_not_bound"
+
+
+@pytest.mark.parametrize("failure", ["malformed", "oversized", "digest", "changed_path"])
+def test_reviewer_packet_read_fails_closed(
+    tmp_path: Path, failure: str
+) -> None:
+    packet_path, packet, candidate = _sealed_packet(tmp_path)
+    if failure == "malformed":
+        packet_path.write_text("{", encoding="utf-8")
+    elif failure == "oversized":
+        packet_path.write_bytes(b"x" * (worker_mcp.MAX_QUALITY_REVIEW_PACKET_BYTES + 1))
+    elif failure == "digest":
+        packet["packet_sha256"] = "0" * 64
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    else:
+        candidate.write_bytes(b"changed")
+    result = worker_mcp.quality_review_packet_read(
+        _review_ctx(tmp_path, packet_path)
+    )
+    assert result["ok"] is False
+
+
+def test_reviewer_packet_read_rejects_symlink(tmp_path: Path) -> None:
+    packet_path, _packet_body, _candidate = _sealed_packet(tmp_path)
+    link = tmp_path / "packet-link.json"
+    try:
+        os.symlink(packet_path, link)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    result = worker_mcp.quality_review_packet_read(_review_ctx(tmp_path, link))
+    assert result["ok"] is False
+    assert result["reason"] == "quality_review_packet_invalid"
+
+
+def test_file_transport_prompt_names_no_argument_packet_tool(tmp_path: Path) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    prompt = quality_reviewer.build_review_prompt(
+        packet,
+        lens="correctness",
+        packet_file=str(packet_path),
+        max_inline_bytes=0,
+    )
+    assert "aiworkhub_worker_quality_review_packet_read" in prompt
+    assert "with no arguments" in prompt
+    assert "Do not supply a path or identity" in prompt
+
+
+def test_legacy_blind_toolset_remains_unchanged() -> None:
+    assert "aiworkhub_worker_quality_review_packet_read" not in BLIND_TOOLSET
+    assert "aiworkhub_worker_quality_review_packet_read" in PACKET_READ_TOOLSET
 
 
 # --- Acceptance 1: content delivered, packet_sha256 unchanged ----------------

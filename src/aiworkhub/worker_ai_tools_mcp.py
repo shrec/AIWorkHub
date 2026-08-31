@@ -2058,6 +2058,11 @@ def verify_audit_ledger(
             and authority_source == "worker_workspace"
             and authority_state == "deterministic_apply"
         )
+        review_packet_authority = (
+            tool == "quality_review_packet_read"
+            and authority_source == "candidate_packet"
+            and authority_state == "quality_review_readonly"
+        )
         if (
             entry.get("ok")
             and not entry.get("violation")
@@ -2067,6 +2072,7 @@ def verify_audit_ledger(
                     and authority_state in {"canonical_active", "sole_authority"}
                 )
                 or semantic_edit_authority
+                or review_packet_authority
             )
         ):
             successful_call_count[tool] = successful_call_count.get(tool, 0) + 1
@@ -5363,6 +5369,69 @@ def quality_review_submit(
     )
 
 
+def quality_review_packet_read(ctx: WorkerToolContext) -> dict[str, Any]:
+    """Return only the exact coordinator-bound, canonically verified packet."""
+
+    tool = "quality_review_packet_read"
+    path = ctx.quality_review_packet_path
+    if path is None:
+        return _violation(ctx, tool, "quality_review_packet_not_bound")
+    try:
+        if path.is_symlink() or not path.is_file():
+            return _violation(ctx, tool, "quality_review_packet_invalid")
+        if path.stat().st_size > MAX_QUALITY_REVIEW_PACKET_BYTES:
+            return _violation(ctx, tool, "quality_review_packet_too_large")
+        before = path.read_bytes()
+        verified = quality_reviewer.verify_review_packet_candidate(
+            path,
+            ctx.repo,
+            max_packet_bytes=MAX_QUALITY_REVIEW_PACKET_BYTES,
+        )
+        after = path.read_bytes()
+        if before != after:
+            return _violation(ctx, tool, "quality_review_packet_changed_during_read")
+        packet = json.loads(after.decode("utf-8"))
+    except quality_reviewer.ReviewerEvidenceError as exc:
+        return _violation(ctx, tool, str(exc))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _violation(ctx, tool, "quality_review_packet_unreadable")
+    if not isinstance(packet, dict):
+        return _violation(ctx, tool, "quality_review_packet_schema_mismatch")
+    result = {
+        "ok": True,
+        "tool": tool,
+        "packet_sha256": verified["packet_sha256"],
+        "packet": packet,
+    }
+    audit_configured = (
+        ctx.audit_ledger_path is not None and ctx.audit_hmac_key_path is not None
+    )
+    appended = _append_audit(
+        ctx,
+        tool=tool,
+        ok=True,
+        cache_hit=False,
+        hit_count=1,
+        bytes_returned=len(
+            json.dumps(result, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ),
+        authority_source="candidate_packet",
+        authority_state="quality_review_readonly",
+        payload={
+            "packet_sha256": verified["packet_sha256"],
+            "target_request_id": verified["target_request_id"],
+            "target_task_id": verified["target_task_id"],
+        },
+    )
+    if audit_configured and not appended:
+        return {
+            "ok": False,
+            "tool": tool,
+            "reason": "quality_review_packet_read_not_durable",
+        }
+    return result
+
+
 class WorkerSemanticEditSession:
     """Request-local handles for Source-Graph-sized deterministic edits."""
 
@@ -5799,6 +5868,7 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_session_write_intent",
     "aiworkhub_worker_ai_memory_write_intent",
     "aiworkhub_worker_kb_write_intent",
+    "aiworkhub_worker_quality_review_packet_read",
     "aiworkhub_worker_quality_review_submit",
 )
 
@@ -5918,6 +5988,17 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         )
 
     @mcp.tool(
+        name="aiworkhub_worker_quality_review_packet_read",
+        description=(
+            "Read the exact coordinator-bound sealed quality-review packet. "
+            "Reviewer-only and accepts no arguments."
+        ),
+    )
+    def _quality_review_packet_read() -> dict[str, Any]:
+        """Read the exact bound packet after canonical candidate verification."""
+        return quality_review_packet_read(ctx)
+
+    @mcp.tool(
         name="aiworkhub_worker_quality_review_submit",
         description=quality_reviewer.QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION,
     )
@@ -5995,6 +6076,7 @@ __all__ = [
     "ai_memory_write_intent",
     "kb_write_intent",
     "quality_review_submit",
+    "quality_review_packet_read",
     "resolve_host_package_import_root",
     "session_current_state",
     "source_graph_query",
