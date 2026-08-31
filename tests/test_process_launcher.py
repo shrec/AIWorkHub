@@ -5174,7 +5174,7 @@ def test_native_cli_large_packet_uses_file_transport_avoiding_argv_e2big(
     )
     assert "QUALITY_REVIEW_PACKET_FILE:" in prompt
     assert "QUALITY_REVIEW_PACKET:" not in prompt
-    assert "Read the packet file first" in prompt
+    assert "aiworkhub_worker_quality_review_packet_read" in prompt
 
 
 def test_bounded_review_submit_fails_closed_without_receipt_schema() -> None:

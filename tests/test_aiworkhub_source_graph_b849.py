@@ -3905,6 +3905,13 @@ import aiworkhub.source_graph as sg
 root = Path(sys.argv[1])
 size = (root / "big.md").stat().st_size
 peak = -1
+rss_before = -1
+if sys.platform.startswith("linux"):
+    try:
+        import resource
+        rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        rss_before = -1
 try:
     import tracemalloc
 except ImportError:
@@ -3924,14 +3931,14 @@ finally:
     if tracemalloc is not None:
         _current, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
-rss = -1
-if sys.platform.startswith("linux"):
+rss_growth = -1
+if rss_before >= 0:
     try:
-        import resource
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_growth = max(0, rss_after - rss_before)
     except Exception:
-        rss = -1
-print(f"{size} {peak} {rss}")
+        rss_growth = -1
+print(f"{size} {peak} {rss_growth}")
 """
     src_dir = str(Path(sg.__file__).resolve().parents[1])
     env = dict(os.environ)
@@ -3943,16 +3950,18 @@ print(f"{size} {peak} {rss}")
         env=env,
     )
     assert proc.returncode == 0, proc.stderr
-    size, peak, rss = (int(part) for part in proc.stdout.split())
+    size, peak, rss_growth = (int(part) for part in proc.stdout.split())
     assert size > 1_000_000, "fixture must be meaningfully large"
     if peak >= 0:
         # Tolerant: one copy of the candidate bytes is allowed; adding a full
         # decoded string + splitlines list would exceed this by a wide margin.
         assert peak < size * 3, f"peak traced memory {peak} exceeds {size * 3}"
-    if rss > 0:
-        # ru_maxrss is KiB on Linux; a loose ceiling only catches catastrophic
-        # regressions and is skipped on platforms without a KiB RSS figure.
-        assert rss < 256 * 1024, f"peak RSS {rss} KiB unexpectedly large"
+    if rss_growth > 0:
+        # ru_maxrss is KiB on Linux. Measure only growth caused by the repeated
+        # scans: the interpreter/import baseline varies substantially by host.
+        assert rss_growth < 256 * 1024, (
+            f"scan RSS growth {rss_growth} KiB unexpectedly large"
+        )
 
 
 def test_bodygrep_multi_file_no_match_peak_keeps_single_raw_buffer(tmp_path):
