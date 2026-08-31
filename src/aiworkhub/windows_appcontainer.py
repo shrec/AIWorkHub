@@ -38,12 +38,17 @@ __all__ = [
     "AppContainerProbe",
     "AppContainerReason",
     "AppContainerRequest",
+    "AclAce",
+    "AclSnapshot",
+    "AclSnapshotError",
+    "DaclState",
     "Win32Api",
     "build_command_line",
     "derive_container_identity",
     "launch_appcontainer",
     "platform_supported",
     "probe",
+    "snapshot_filesystem_acl",
 ]
 
 
@@ -1616,3 +1621,276 @@ def _environment_block(environment: Mapping[str, str] | None) -> Any:
         parts.append(f"{key}={value}")
     block = "\x00".join(parts) + "\x00\x00"
     return ctypes.create_unicode_buffer(block)
+
+
+# ---------------------------------------------------------------------------
+# Read-only filesystem ACL snapshots
+# ---------------------------------------------------------------------------
+
+
+class DaclState(str, enum.Enum):
+    """The three semantically distinct DACL states in a security descriptor."""
+
+    ABSENT = "absent"
+    NULL = "null"
+    PRESENT = "present"
+
+
+@dataclass(frozen=True)
+class AclAce:
+    """An immutable, ownership-free copy of one supported native ACE."""
+
+    ace_type: int
+    flags: int
+    mask: int
+    sid: bytes
+    raw: bytes
+    object_flags: int | None = None
+    object_type: bytes | None = None
+    inherited_object_type: bytes | None = None
+
+
+@dataclass(frozen=True)
+class AclSnapshot:
+    """Immutable read-only copy; it contains no borrowed native pointers."""
+
+    path: str
+    dacl_state: DaclState
+    defaulted: bool
+    aces: tuple[AclAce, ...]
+
+
+class AclSnapshotError(RuntimeError):
+    """A fail-closed native snapshot error, optionally with cleanup evidence."""
+
+    def __init__(
+        self,
+        operation: str,
+        win_error: int | None = None,
+        *,
+        cleanup_error: BaseException | None = None,
+    ) -> None:
+        self.operation = operation
+        self.win_error = win_error
+        self.cleanup_error = cleanup_error
+        detail = operation if win_error is None else f"{operation} (win_error={win_error})"
+        if cleanup_error is not None:
+            detail += f"; cleanup failed: {cleanup_error}"
+        super().__init__(detail)
+
+
+class _AclSnapshotApi(Protocol):
+    def get_named_security_info(self, path: str) -> int: ...
+    def get_security_descriptor_dacl(self, descriptor: int) -> tuple[bool, int, bool]: ...
+    def acl_information(self, dacl: int) -> tuple[int, int]: ...
+    def get_ace(self, dacl: int, index: int, acl_end: int) -> tuple[int, bytes]: ...
+    def sid_bytes(self, address: int, ace_end: int) -> bytes: ...
+    def local_free(self, descriptor: int) -> None: ...
+
+
+_SE_FILE_OBJECT = 1
+_DACL_SECURITY_INFORMATION = 0x00000004
+_ACL_SIZE_INFORMATION_CLASS = 2
+_SIMPLE_ACE_TYPES = frozenset((0, 1, 2, 3))
+_OBJECT_ACE_TYPES = frozenset((5, 6, 7, 8))
+_ACE_OBJECT_TYPE_PRESENT = 0x1
+_ACE_INHERITED_OBJECT_TYPE_PRESENT = 0x2
+
+
+class _ACL_SIZE_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("AceCount", wintypes.DWORD),
+        ("AclBytesInUse", wintypes.DWORD),
+        ("AclBytesFree", wintypes.DWORD),
+    ]
+
+
+class _NativeAclSnapshotApi:
+    """Small read-only Advapi32 boundary; no write-side export is resolved."""
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise AclSnapshotError("platform_unsupported")
+        self._advapi32 = _load_windows_dll("advapi32")
+        self._kernel32 = _load_windows_dll("kernel32")
+        self._configure_signatures(self._advapi32, self._kernel32)
+
+    @staticmethod
+    def _configure_signatures(advapi32: Any, kernel32: Any) -> None:
+        advapi32.GetNamedSecurityInfoW.argtypes = [
+            wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.LPVOID),
+        ]
+        advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+        advapi32.GetSecurityDescriptorDacl.argtypes = [
+            wintypes.LPVOID, ctypes.POINTER(wintypes.BOOL),
+            ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.BOOL),
+        ]
+        advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+        advapi32.GetAclInformation.argtypes = [
+            wintypes.LPVOID, wintypes.LPVOID, wintypes.DWORD, ctypes.c_int,
+        ]
+        advapi32.GetAclInformation.restype = wintypes.BOOL
+        advapi32.GetAce.argtypes = [
+            wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID),
+        ]
+        advapi32.GetAce.restype = wintypes.BOOL
+        advapi32.IsValidSid.argtypes = [wintypes.LPVOID]
+        advapi32.IsValidSid.restype = wintypes.BOOL
+        advapi32.GetLengthSid.argtypes = [wintypes.LPVOID]
+        advapi32.GetLengthSid.restype = wintypes.DWORD
+        kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+        kernel32.LocalFree.restype = wintypes.HLOCAL
+
+    def get_named_security_info(self, path: str) -> int:
+        descriptor = wintypes.LPVOID()
+        status = self._advapi32.GetNamedSecurityInfoW(
+            path, _SE_FILE_OBJECT, _DACL_SECURITY_INFORMATION,
+            None, None, None, None, ctypes.byref(descriptor),
+        )
+        if status or not descriptor.value:
+            raise AclSnapshotError("get_named_security_info", int(status))
+        return int(descriptor.value)
+
+    def get_security_descriptor_dacl(self, descriptor: int) -> tuple[bool, int, bool]:
+        present, defaulted, dacl = wintypes.BOOL(), wintypes.BOOL(), wintypes.LPVOID()
+        if not self._advapi32.GetSecurityDescriptorDacl(
+            ctypes.c_void_p(descriptor), ctypes.byref(present),
+            ctypes.byref(dacl), ctypes.byref(defaulted),
+        ):
+            raise AclSnapshotError("get_security_descriptor_dacl", _last_win_error())
+        return bool(present.value), int(dacl.value or 0), bool(defaulted.value)
+
+    def acl_information(self, dacl: int) -> tuple[int, int]:
+        info = _ACL_SIZE_INFORMATION()
+        if not self._advapi32.GetAclInformation(
+            ctypes.c_void_p(dacl), ctypes.byref(info), ctypes.sizeof(info),
+            _ACL_SIZE_INFORMATION_CLASS,
+        ):
+            raise AclSnapshotError("acl_information", _last_win_error())
+        return int(info.AclBytesInUse), int(info.AceCount)
+
+    def get_ace(self, dacl: int, index: int, acl_end: int) -> tuple[int, bytes]:
+        ace = wintypes.LPVOID()
+        if not self._advapi32.GetAce(ctypes.c_void_p(dacl), index, ctypes.byref(ace)):
+            raise AclSnapshotError("get_ace", _last_win_error())
+        address = int(ace.value or 0)
+        if not address:
+            raise AclSnapshotError("null_ace")
+        if address < dacl or address > acl_end or acl_end - address < 4:
+            raise AclSnapshotError("ace_out_of_range")
+        header = ctypes.string_at(address, 4)
+        size = int.from_bytes(header[2:4], "little")
+        if size < 4:
+            raise AclSnapshotError("invalid_ace_size")
+        if size > acl_end - address:
+            raise AclSnapshotError("ace_out_of_range")
+        return address, bytes(ctypes.string_at(address, size))
+
+    def sid_bytes(self, address: int, ace_end: int) -> bytes:
+        if not address or address >= ace_end or ace_end - address < 8:
+            raise AclSnapshotError("sid_out_of_range")
+        header = bytes(ctypes.string_at(address, 8))
+        if len(header) != 8:
+            raise AclSnapshotError("sid_out_of_range")
+        expected_length = 8 + 4 * header[1]
+        if expected_length > ace_end - address:
+            raise AclSnapshotError("sid_out_of_range")
+        pointer = ctypes.c_void_p(address)
+        if not self._advapi32.IsValidSid(pointer):
+            raise AclSnapshotError("invalid_sid")
+        length = int(self._advapi32.GetLengthSid(pointer))
+        if length != expected_length:
+            raise AclSnapshotError("sid_out_of_range")
+        return bytes(ctypes.string_at(address, length))
+
+    def local_free(self, descriptor: int) -> None:
+        result = self._kernel32.LocalFree(ctypes.c_void_p(descriptor))
+        if result:
+            raise AclSnapshotError("local_free", _last_win_error())
+
+
+def _copy_acl_ace(api: _AclSnapshotApi, address: int, raw: bytes) -> AclAce:
+    if not address or len(raw) < 8:
+        raise AclSnapshotError("invalid_ace_size")
+    size = int.from_bytes(raw[2:4], "little")
+    if size != len(raw) or size < 8:
+        raise AclSnapshotError("invalid_ace_size")
+    ace_type, flags = raw[0], raw[1]
+    mask = int.from_bytes(raw[4:8], "little")
+    object_flags = None
+    object_type = inherited_type = None
+    if ace_type in _SIMPLE_ACE_TYPES:
+        sid_offset = 8
+    elif ace_type in _OBJECT_ACE_TYPES:
+        if size < 12:
+            raise AclSnapshotError("invalid_object_ace")
+        object_flags = int.from_bytes(raw[8:12], "little")
+        if object_flags & ~3:
+            raise AclSnapshotError("invalid_object_flags")
+        sid_offset = 12
+        if object_flags & _ACE_OBJECT_TYPE_PRESENT:
+            if sid_offset + 16 > size:
+                raise AclSnapshotError("invalid_object_guid")
+            object_type = raw[sid_offset : sid_offset + 16]
+            sid_offset += 16
+        if object_flags & _ACE_INHERITED_OBJECT_TYPE_PRESENT:
+            if sid_offset + 16 > size:
+                raise AclSnapshotError("invalid_object_guid")
+            inherited_type = raw[sid_offset : sid_offset + 16]
+            sid_offset += 16
+    else:
+        raise AclSnapshotError("unsupported_ace_type")
+    sid = api.sid_bytes(address + sid_offset, address + size)
+    if not sid or sid_offset + len(sid) > size:
+        raise AclSnapshotError("sid_out_of_range")
+    return AclAce(ace_type, flags, mask, bytes(sid), bytes(raw), object_flags, object_type, inherited_type)
+
+
+def snapshot_filesystem_acl(path: str, *, api: _AclSnapshotApi | None = None) -> AclSnapshot:
+    """Read and copy a filesystem DACL without retaining native authority."""
+    if not isinstance(path, str):
+        raise TypeError("path must be a string")
+    if not path or "\x00" in path:
+        raise ValueError("path must be non-empty and contain no NUL")
+    boundary: _AclSnapshotApi = api if api is not None else _NativeAclSnapshotApi()
+    descriptor = boundary.get_named_security_info(path)
+    if not descriptor:
+        raise AclSnapshotError("null_security_descriptor")
+    primary: BaseException | None = None
+    try:
+        present, dacl, defaulted = boundary.get_security_descriptor_dacl(descriptor)
+        if not present:
+            if dacl:
+                raise AclSnapshotError("contradictory_dacl_state")
+            return AclSnapshot(path, DaclState.ABSENT, defaulted, ())
+        if not dacl:
+            return AclSnapshot(path, DaclState.NULL, defaulted, ())
+        acl_bytes, ace_count = boundary.acl_information(dacl)
+        if acl_bytes < 8 or ace_count < 0 or ace_count > (acl_bytes - 8) // 4:
+            raise AclSnapshotError("invalid_acl_bounds")
+        uintptr_max = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
+        if dacl > uintptr_max or acl_bytes > uintptr_max - dacl:
+            raise AclSnapshotError("invalid_acl_bounds")
+        acl_end = dacl + acl_bytes
+        copied: list[AclAce] = []
+        for index in range(ace_count):
+            address, raw = boundary.get_ace(dacl, index, acl_end)
+            copied.append(_copy_acl_ace(boundary, address, raw))
+        return AclSnapshot(path, DaclState.PRESENT, defaulted, tuple(copied))
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        try:
+            boundary.local_free(descriptor)
+        except BaseException as cleanup:
+            if primary is None:
+                raise
+            if isinstance(primary, AclSnapshotError):
+                primary.cleanup_error = cleanup
+                primary.args = (f"{primary}; cleanup failed: {cleanup}",)
+            else:
+                primary.add_note(f"LocalFree failed: {cleanup}")

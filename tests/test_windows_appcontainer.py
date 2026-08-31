@@ -1423,3 +1423,286 @@ def test_zero_timeout_native_termination_failure_propagates_after_cleanup(
     assert launch._termination_completed is False
     launch.close()
     assert len(kernel.calls) == 4
+
+
+# ---------------------------------------------------------------------------
+# Read-only native filesystem ACL snapshots
+# ---------------------------------------------------------------------------
+
+
+class FakeAclSnapshotApi:
+    def __init__(self, *, present=True, dacl=0x1_0000_2000, fail=None):
+        self.descriptor = 0x1_0000_1000
+        self.present = present
+        self.dacl = dacl
+        self.fail = fail
+        self.freed = []
+        self.live = False
+        self.aces = []
+
+    def get_named_security_info(self, path):
+        if self.fail == "get_named_security_info":
+            raise wac.AclSnapshotError("get_named_security_info", 5)
+        self.live = True
+        return self.descriptor
+
+    def get_security_descriptor_dacl(self, descriptor):
+        assert descriptor == self.descriptor and self.live
+        if self.fail == "get_security_descriptor_dacl":
+            raise wac.AclSnapshotError("get_security_descriptor_dacl", 87)
+        return self.present, self.dacl, False
+
+    def acl_information(self, dacl):
+        assert dacl == self.dacl and self.live
+        if self.fail == "acl_information":
+            raise wac.AclSnapshotError("acl_information", 87)
+        return 256, len(self.aces)
+
+    def get_ace(self, dacl, index, acl_end):
+        assert dacl == self.dacl and self.live
+        assert acl_end == dacl + 256
+        if self.fail == "get_ace":
+            raise wac.AclSnapshotError("get_ace", 87)
+        address, data = self.aces[index]
+        return address, data
+
+    def sid_bytes(self, address, ace_end):
+        assert self.live
+        if self.fail == "sid":
+            raise wac.AclSnapshotError("invalid_sid")
+        for ace_address, data in self.aces:
+            if ace_address <= address < ace_address + len(data):
+                sid = data[address - ace_address :]
+                if address + len(sid) > ace_end:
+                    raise wac.AclSnapshotError("sid_out_of_range")
+                return sid
+        raise wac.AclSnapshotError("invalid_sid")
+
+    def local_free(self, descriptor):
+        assert descriptor == self.descriptor
+        self.freed.append(descriptor)
+        self.live = False
+        if self.fail == "local_free":
+            raise wac.AclSnapshotError("local_free", 6)
+
+
+def _simple_ace(ace_type=0, flags=3, mask=0x120089, sid=b"\x01\x01\0\0\0\0\0\x05\x20\0\0\0"):
+    size = 8 + len(sid)
+    return bytes((ace_type, flags)) + size.to_bytes(2, "little") + mask.to_bytes(4, "little") + sid
+
+
+def test_acl_snapshot_distinguishes_absent_null_and_empty_dacl():
+    absent = wac.snapshot_filesystem_acl("C:\\safe", api=FakeAclSnapshotApi(present=False, dacl=0))
+    null = wac.snapshot_filesystem_acl("C:\\safe", api=FakeAclSnapshotApi(present=True, dacl=0))
+    empty = wac.snapshot_filesystem_acl("C:\\safe", api=FakeAclSnapshotApi())
+    assert (absent.dacl_state, null.dacl_state, empty.dacl_state) == (
+        wac.DaclState.ABSENT, wac.DaclState.NULL, wac.DaclState.PRESENT
+    )
+    assert absent.aces == null.aces == empty.aces == ()
+
+
+def test_acl_snapshot_copies_exact_simple_ace_sid_and_large_pointers():
+    api = FakeAclSnapshotApi()
+    raw = _simple_ace()
+    api.aces = [(0x1_0000_3000, raw)]
+    result = wac.snapshot_filesystem_acl("C:\\safe", api=api)
+    assert result.aces[0].raw == raw
+    assert result.aces[0].sid == raw[8:]
+    assert result.aces[0].mask == 0x120089
+    assert api.freed == [0x1_0000_1000]
+    assert not api.live
+
+
+def test_acl_snapshot_object_ace_preserves_guid_metadata():
+    sid = _simple_ace()[8:]
+    guid = bytes(range(16))
+    size = 12 + len(guid) + len(sid)
+    raw = bytes((5, 1)) + size.to_bytes(2, "little") + (1).to_bytes(4, "little") + (1).to_bytes(4, "little") + guid + sid
+    api = FakeAclSnapshotApi()
+    api.aces = [(0x1_0000_4000, raw)]
+    ace = wac.snapshot_filesystem_acl("C:\\safe", api=api).aces[0]
+    assert ace.object_flags == 1 and ace.object_type == guid and ace.inherited_object_type is None
+    assert ace.sid == sid and ace.raw == raw
+
+
+@pytest.mark.parametrize("raw", [b"", b"\x00\0\x03\0", b"\x00\0\xff\xff" + b"x" * 4, bytes((99, 0, 8, 0)) + b"x" * 4])
+def test_acl_snapshot_malformed_or_unsupported_ace_fails_closed(raw):
+    api = FakeAclSnapshotApi()
+    api.aces = [(0x1_0000_5000, raw)]
+    with pytest.raises(wac.AclSnapshotError):
+        wac.snapshot_filesystem_acl("C:\\safe", api=api)
+    assert api.freed == [api.descriptor]
+
+
+@pytest.mark.parametrize("failure", ["get_security_descriptor_dacl", "acl_information", "get_ace", "sid"])
+def test_acl_snapshot_every_borrowed_stage_failure_frees_descriptor_once(failure):
+    api = FakeAclSnapshotApi(fail=failure)
+    api.aces = [(0x1_0000_6000, _simple_ace())]
+    with pytest.raises(wac.AclSnapshotError):
+        wac.snapshot_filesystem_acl("C:\\safe", api=api)
+    assert api.freed == [api.descriptor] and not api.live
+
+
+def test_acl_snapshot_cleanup_failure_is_observable_with_primary_failure():
+    api = FakeAclSnapshotApi(fail="local_free")
+    api.aces = [(0x1_0000_7000, bytes((99, 0, 8, 0)) + b"xxxx")]
+    with pytest.raises(wac.AclSnapshotError) as exc:
+        wac.snapshot_filesystem_acl("C:\\safe", api=api)
+    assert exc.value.operation == "unsupported_ace_type"
+    assert exc.value.cleanup_error is not None
+    assert api.freed == [api.descriptor]
+
+
+@pytest.mark.parametrize("path", ["", "\x00", "C:\\x\x00y", 1, None])
+def test_acl_snapshot_path_validation_is_deterministic(path):
+    with pytest.raises((TypeError, ValueError)):
+        wac.snapshot_filesystem_acl(path, api=FakeAclSnapshotApi())
+
+
+def test_acl_snapshot_native_abi_is_pointer_width_safe():
+    class Fn:
+        def __call__(self, *args): return 0
+    class Dll:
+        GetNamedSecurityInfoW = Fn(); GetSecurityDescriptorDacl = Fn()
+        GetAclInformation = Fn(); GetAce = Fn(); IsValidSid = Fn(); GetLengthSid = Fn()
+        LocalFree = Fn()
+    adv, kernel = Dll(), Dll()
+    wac._NativeAclSnapshotApi._configure_signatures(adv, kernel)
+    assert adv.GetNamedSecurityInfoW.argtypes[-1]._type_ is wac.wintypes.LPVOID
+    assert adv.GetAce.argtypes[-1]._type_ is wac.wintypes.LPVOID
+    assert kernel.LocalFree.argtypes == [wac.wintypes.HLOCAL]
+    assert kernel.LocalFree.restype is wac.wintypes.HLOCAL
+
+
+@pytest.mark.parametrize(
+    ("address", "header", "operation"),
+    [
+        (0x1_0000_1FFF, b"", "ace_out_of_range"),
+        (0x1_0000_20FE, b"", "ace_out_of_range"),
+        (0x1_0000_20F0, b"\x00\x00\x20\x00", "ace_out_of_range"),
+    ],
+)
+def test_acl_snapshot_native_rejects_ace_ranges_before_unsafe_read(
+    monkeypatch, address, header, operation
+):
+    class GetAce:
+        def __call__(self, _dacl, _index, output):
+            wac.ctypes.cast(output, wac.ctypes.POINTER(wac.wintypes.LPVOID))[0] = address
+            return 1
+
+    api = wac._NativeAclSnapshotApi.__new__(wac._NativeAclSnapshotApi)
+    api._advapi32 = type("Advapi", (), {"GetAce": GetAce()})()
+    reads = []
+
+    def guarded_read(pointer, size):
+        reads.append((pointer, size))
+        return header
+
+    monkeypatch.setattr(wac.ctypes, "string_at", guarded_read)
+    with pytest.raises(wac.AclSnapshotError) as exc:
+        api.get_ace(0x1_0000_2000, 0, 0x1_0000_2100)
+    assert exc.value.operation == operation
+    if address == 0x1_0000_20F0:
+        assert reads == [(address, 4)]
+    else:
+        assert reads == []
+
+
+def test_acl_snapshot_native_accepts_valid_ace_above_32_bits(monkeypatch):
+    address = 0x1_0000_2020
+    raw = _simple_ace()
+
+    class GetAce:
+        def __call__(self, dacl, _index, output):
+            assert dacl.value == 0x1_0000_2000
+            wac.ctypes.cast(output, wac.ctypes.POINTER(wac.wintypes.LPVOID))[0] = address
+            return 1
+
+    api = wac._NativeAclSnapshotApi.__new__(wac._NativeAclSnapshotApi)
+    api._advapi32 = type("Advapi", (), {"GetAce": GetAce()})()
+    reads = []
+
+    def bounded_read(pointer, size):
+        reads.append((pointer, size))
+        return raw[:size]
+
+    monkeypatch.setattr(wac.ctypes, "string_at", bounded_read)
+    assert api.get_ace(0x1_0000_2000, 0, 0x1_0000_2100) == (address, raw)
+    assert reads == [(address, 4), (address, len(raw))]
+
+
+@pytest.mark.parametrize(
+    ("address", "ace_end", "header"),
+    [
+        (0x1_0000_20FF, 0x1_0000_2100, b""),
+        (0x1_0000_20F9, 0x1_0000_2100, b""),
+        (0x1_0000_20F0, 0x1_0000_2100, b"\x01\xff" + b"\0" * 6),
+    ],
+)
+def test_acl_snapshot_native_rejects_sid_range_before_native_validation(
+    monkeypatch, address, ace_end, header
+):
+    calls = []
+
+    class Advapi:
+        def IsValidSid(self, _pointer):
+            calls.append("valid")
+            return 1
+
+        def GetLengthSid(self, _pointer):
+            calls.append("length")
+            return 8
+
+    api = wac._NativeAclSnapshotApi.__new__(wac._NativeAclSnapshotApi)
+    api._advapi32 = Advapi()
+    reads = []
+
+    def bounded_read(pointer, size):
+        reads.append((pointer, size))
+        return header
+
+    monkeypatch.setattr(wac.ctypes, "string_at", bounded_read)
+    with pytest.raises(wac.AclSnapshotError) as exc:
+        api.sid_bytes(address, ace_end)
+    assert exc.value.operation == "sid_out_of_range"
+    assert calls == []
+    assert reads == ([] if ace_end - address < 8 else [(address, 8)])
+
+
+def test_acl_snapshot_native_sid_checks_bounded_header_before_native_calls(monkeypatch):
+    address = 0x1_0000_20E0
+    sid = b"\x01\x02" + b"\0" * 6 + b"\x20\0\0\0\x21\0\0\0"
+    calls = []
+
+    class Advapi:
+        def IsValidSid(self, pointer):
+            calls.append(("valid", pointer.value))
+            return 1
+
+        def GetLengthSid(self, pointer):
+            calls.append(("length", pointer.value))
+            return len(sid)
+
+    api = wac._NativeAclSnapshotApi.__new__(wac._NativeAclSnapshotApi)
+    api._advapi32 = Advapi()
+
+    def bounded_read(pointer, size):
+        calls.append(("read", pointer, size))
+        return sid[:size]
+
+    monkeypatch.setattr(wac.ctypes, "string_at", bounded_read)
+    assert api.sid_bytes(address, address + len(sid)) == sid
+    assert calls == [
+        ("read", address, 8),
+        ("valid", address),
+        ("length", address),
+        ("read", address, len(sid)),
+    ]
+
+
+@pytest.mark.skipif(wac.os.name != "nt", reason="Windows native canary")
+def test_acl_snapshot_windows_native_canary_is_structurally_valid():
+    snapshot = wac.snapshot_filesystem_acl(wac.os.getcwd())
+    assert isinstance(snapshot, wac.AclSnapshot)
+    assert isinstance(snapshot.aces, tuple)
+    assert all(ace.raw and ace.sid for ace in snapshot.aces)
