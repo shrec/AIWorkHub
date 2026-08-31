@@ -351,7 +351,11 @@ def test_disposition_metadata_failure_closes_exactly_once(monkeypatch):
     fake.last_error = 5
     with pytest.raises(OSError) as raised:
         platform_io.open_windows_relative_child_disposition(0x1_0000_0009, "child")
-    assert raised.value.errno == 5
+    assert (
+        raised.value.winerror == 5
+        if sys.platform == "win32"
+        else raised.value.errno == 5
+    )
     assert fake.closes == [0x1_0000_1234]
 
 
@@ -482,7 +486,11 @@ def test_disposition_hard_failure_never_falls_back(monkeypatch):
     fake.last_error = 5
     with pytest.raises(OSError) as raised:
         platform_io.mark_windows_relative_child_disposition(authority)
-    assert raised.value.errno == 5
+    assert (
+        raised.value.winerror == 5
+        if sys.platform == "win32"
+        else raised.value.errno == 5
+    )
     assert fake.disposition_calls == [(0x1_0000_1234, 21, 0x3)]
 
 
