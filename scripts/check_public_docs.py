@@ -11,6 +11,11 @@ from urllib.parse import unquote
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts import generate_architecture_catalogs
+
 PUBLIC_DOCS = tuple(
     ROOT / path
     for path in (
@@ -27,6 +32,7 @@ PUBLIC_DOCS = tuple(
         "docs/GETTING_STARTED.md",
         "docs/PUBLISHING.md",
         "docs/PRODUCT_ROADMAP.md",
+        "docs/generated/source-graph-modes.md",
     )
 )
 SITE_BASE = "https://shrec.github.io/AIWorkHub/"
@@ -70,6 +76,9 @@ def _local_target(document: Path, raw: str) -> Path | None:
 
 def check(root: Path = ROOT) -> list[str]:
     errors: list[str] = []
+    for error in generate_architecture_catalogs.check_catalogs(root):
+        errors.append(generate_architecture_catalogs.format_check_error(error, root))
+
     documents = tuple(root / path.relative_to(ROOT) for path in PUBLIC_DOCS)
     for document in documents:
         if not document.is_file():

@@ -11,6 +11,7 @@ def _fixture(tmp_path: Path, readme: str) -> None:
         target = tmp_path / document.relative_to(check_public_docs.ROOT)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("# Document\n")
+    check_public_docs.generate_architecture_catalogs.write_catalogs(tmp_path)
     (tmp_path / "README.md").write_text(readme)
     for relative, canonical in check_public_docs.PUBLIC_SITE_PAGES.items():
         target = tmp_path / relative
