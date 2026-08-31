@@ -5513,6 +5513,46 @@ def archive_task(task_id: str, reason: str = "", topic: str | None = None) -> di
     )
 
 
+def reconcile_dead_processing_task(
+    task_id: str, request_id: str, claim_epoch: int,
+) -> dict[str, Any]:
+    """Manager-only repair for one authenticated dead blocked worker episode."""
+    command = ["reconcile-dead-processing", task_id, request_id, str(claim_epoch)]
+    card, error = _live_card(task_id)
+    if error:
+        return error
+    assert card is not None
+    live_topic = str(card.get("topic") or "")
+    gate = _canonical_write_gate(
+        "recover-stale", runner=CODEX_RUNNER, topic=live_topic,
+        coordinator_capability=True,
+    )
+    if gate is not None:
+        return gate
+    if type(claim_epoch) is not int or claim_epoch < 1 or not str(request_id).strip():
+        return _canonical_result(ok=False, returncode=2, stderr="reconcile_identity_invalid", command=command)
+    from . import process_launcher, stale_recovery
+
+    status = process_launcher.ProcessManager(
+        repo=repo_root(), isolation_enabled=False
+    ).status(request_id)
+    ok, state = stale_recovery.reconcile_dead_processing_claim(
+        root=str(repo_root()), task_id=task_id, request_id=request_id,
+        claim_epoch=claim_epoch, process_status=status,
+        actor=_verified_manager_actor(),
+    )
+    if not ok:
+        return _canonical_result(ok=False, returncode=1, stderr=f"reconcile_failed:{state}", command=command)
+    card2 = task_store.get_task(repo_root(), task_id)
+    result = _canonical_result(
+        ok=True, returncode=0,
+        stdout=json.dumps(card2, ensure_ascii=False, default=str) if card2 else "",
+        command=command,
+    )
+    result["reconciliation"] = state
+    return result
+
+
 def supersede_task(
     task_id: str, reason: str = "", by: str = "", topic: str | None = None
 ) -> dict[str, Any]:

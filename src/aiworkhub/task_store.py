@@ -1258,6 +1258,91 @@ def archive_task(
         conn.close()
 
 
+def reconcile_dead_processing_claim(
+    root: str | Path,
+    task_id: str,
+    *,
+    request_id: str,
+    claim_epoch: int,
+    terminal_evidence: Mapping[str, Any],
+    actor: str,
+) -> tuple[bool, str]:
+    """Atomically terminalize one exact dead processing claim."""
+    if not request_id or not _is_bool_safe_int(claim_epoch):
+        return False, "reconcile_identity_invalid"
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT status, worker_status, card_json FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_not_found"
+        raw_card_json = row["card_json"]
+        try:
+            card = json.loads(str(raw_card_json or "{}"))
+        except json.JSONDecodeError:
+            return False, "card_json_invalid"
+        if not isinstance(card, dict):
+            return False, "card_json_invalid"
+        prior = card.get("dead_process_reconciliation")
+        if isinstance(prior, Mapping):
+            if (str(prior.get("request_id") or "") == request_id
+                    and prior.get("claim_epoch") == claim_epoch):
+                return True, "already_reconciled"
+            return False, "reconcile_identity_mismatch"
+        if canonical_status(dict(row)) != "processing" or str(row["worker_status"] or "") != "claimed":
+            return False, "task_not_processing_claimed"
+        if str(card.get("launch_request_id") or "") != request_id:
+            return False, "request_id_mismatch"
+        if card.get("claim_epoch") != claim_epoch:
+            return False, "claim_epoch_mismatch"
+        now = datetime.now(timezone.utc).isoformat()
+        evidence = dict(terminal_evidence)
+        terminal_error = evidence.get("error")
+        reason = (
+            terminal_error[:500]
+            if isinstance(terminal_error, str) and terminal_error
+            else str(evidence.get("state") or "terminal_blocked")[:500]
+        )
+        card["dead_process_reconciliation"] = {
+            "request_id": request_id, "claim_epoch": claim_epoch,
+            "reason": reason,
+            "evidence": evidence, "reconciled_at": now,
+        }
+        card["terminal_substatus"] = "dead_process_reconciled"
+        card["blocker_reason"] = card["dead_process_reconciliation"]["reason"]
+        card["status"] = "blocked"
+        card["worker_status"] = "blocked"
+        card["claimed_by"] = ""
+        card.pop("launch_request_id", None)
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', worker_status='blocked', claimed_by=NULL, "
+            "claimed_at=NULL, completed_at=?, updated_at=?, card_json=? "
+            "WHERE task_id=? AND status=? AND worker_status='claimed' AND card_json=?",
+            (
+                now, now, json.dumps(card, ensure_ascii=False, sort_keys=True),
+                task_id, str(row["status"]), raw_card_json,
+            ),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "reconcile_write_conflict"
+        conn.execute(
+            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) VALUES(?,?,?,?,?)",
+            (task_id, "dead_process_reconciled", actor,
+             json.dumps(card["dead_process_reconciliation"], sort_keys=True), now),
+        )
+        conn.commit()
+        return True, "reconciled"
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        return False, f"reconcile_write_failed:{type(exc).__name__}"
+    finally:
+        conn.close()
+
+
 _ARCHIVE_AUDIT_EVENTS: frozenset[str] = frozenset({"archived", "superseded"})
 
 # Buckets a *naive* reader assigns from the raw ``status``/``worker_status``

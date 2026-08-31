@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from aiworkhub import completion_inbox, launch_queue_persist
+from aiworkhub import completion_inbox, launch_queue_persist, task_store
 
 
 ACTION_RANK = {
@@ -11,6 +11,44 @@ ACTION_RANK = {
     "mark_done": 2,
     "escalate": 3,
 }
+
+
+def reconcile_dead_processing_claim(
+    *, root: str, task_id: str, request_id: str, claim_epoch: int,
+    process_status: dict[str, Any], actor: str,
+) -> tuple[bool, str]:
+    """Validate exact authenticated launcher evidence and reconcile its claim."""
+    if not process_status.get("ok"):
+        return False, "process_evidence_missing_or_unauthenticated"
+    if str(process_status.get("request_id") or "") != request_id:
+        return False, "process_request_id_mismatch"
+    if str(process_status.get("task_id") or "") != task_id:
+        return False, "process_task_id_mismatch"
+    if process_status.get("process_alive") is not False:
+        return False, "process_not_proven_dead"
+    if str(process_status.get("state") or "") != "blocked":
+        return False, "process_not_terminal_blocked"
+    latest = process_status.get("latest_event")
+    if not isinstance(latest, dict):
+        return False, "process_latest_event_invalid"
+    if str(latest.get("request_id") or "") != request_id:
+        return False, "process_latest_event_request_id_mismatch"
+    if str(latest.get("task_id") or "") != task_id:
+        return False, "process_latest_event_task_id_mismatch"
+    if str(latest.get("state") or "") != "blocked":
+        return False, "process_latest_event_not_terminal_blocked"
+    evidence = {
+        key: process_status.get(key)
+        for key in (
+            "request_id", "task_id", "state", "process_alive", "exit_code",
+            "runner", "topic", "error",
+        )
+    }
+    evidence["latest_event"] = latest
+    return task_store.reconcile_dead_processing_claim(
+        root, task_id, request_id=request_id, claim_epoch=claim_epoch,
+        terminal_evidence=evidence, actor=actor,
+    )
 
 
 def _open_entries_by_task(launch_log: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:

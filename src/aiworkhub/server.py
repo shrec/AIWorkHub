@@ -1594,6 +1594,20 @@ def aiworkhub_task_archive(
 
 @mcp.tool()
 @_serialize_task_lifecycle_write
+def aiworkhub_manager_reconcile_dead_processing(
+    task_id: str,
+    request_id: str,
+    claim_epoch: int,
+) -> dict[str, Any]:
+    """MANAGER WRITE: reconcile one exact authenticated dead blocked claim."""
+
+    return core.reconcile_dead_processing_task(
+        task_id=task_id, request_id=request_id, claim_epoch=claim_epoch
+    )
+
+
+@mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_task_supersede(
     task_id: str,
     reason: str = "",
