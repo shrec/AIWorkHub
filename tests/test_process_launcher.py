@@ -22,6 +22,7 @@ from aiworkhub import (  # noqa: E402
     needfix_store,
     platform_io,
     process_launcher,
+    process_launcher_acceptance,
     task_templates,
     worker_ai_tools_mcp,
 )
@@ -9119,3 +9120,55 @@ def test_accepted_outcome_receipt_rejects_post_promotion_byte_mismatch(
             changed_path_hashes={"result.txt": "0" * 64},
             attempt_artifact_manifest={"entries": []},
         )
+
+
+def test_acceptance_helpers_preserve_alias_and_identical_retry_receipt(
+    tmp_path: Path,
+) -> None:
+    assert (
+        process_launcher._accepted_outcome_receipt
+        is process_launcher_acceptance.accepted_outcome_receipt
+    )
+    receipt = {"receipt_id": "sha256:persisted"}
+    card = {
+        "status": "finished",
+        "accepted_request_id": "request-1",
+        "accept_evidence": {"accepted_outcome_receipt": receipt},
+    }
+    closed: list[tuple[str, str]] = []
+
+    result = process_launcher_acceptance.finished_acceptance_result(
+        tmp_path,
+        card,
+        task_id="TASK_ACCEPTED",
+        request_id="request-1",
+        canonical_status=lambda value: str(value["status"]),
+        close_needfix=lambda task_id, request_id: (
+            closed.append((task_id, request_id)) or {"state": "closed"}
+        ),
+    )
+
+    assert result is not None
+    assert result["accepted_outcome_receipt"] is receipt
+    assert result["already_accepted"] is True
+    assert closed == [("TASK_ACCEPTED", "request-1")]
+
+
+def test_acceptance_helper_hides_receipt_from_different_request(tmp_path: Path) -> None:
+    result = process_launcher_acceptance.finished_acceptance_result(
+        tmp_path,
+        {
+            "status": "finished",
+            "accepted_request_id": "request-1",
+            "accept_evidence": {"accepted_outcome_receipt": {"receipt_id": "secret"}},
+        },
+        task_id="TASK_ACCEPTED",
+        request_id="request-2",
+        canonical_status=lambda value: str(value["status"]),
+        close_needfix=lambda _task_id, _request_id: pytest.fail("must not close"),
+    )
+
+    assert result is not None
+    assert result["ok"] is False
+    assert result["accepted_outcome_receipt"] is None
+    assert result["error"] == "task_already_finished_by_other_request"
