@@ -1115,6 +1115,7 @@ def aiworkhub_task_create_from_template(
     template_id: str,
     production_paths: list[str] | None = None,
     test_paths: list[str] | None = None,
+    mandatory_changed_outputs: list[str] | None = None,
     forbidden: list[str] | None = None,
     allow_empty_required_outputs: list[str] | None = None,
     allow_unchanged_required_outputs: list[str] | None = None,
@@ -1142,6 +1143,7 @@ def aiworkhub_task_create_from_template(
             template_id,
             production_paths=production_paths,
             test_paths=test_paths,
+            mandatory_changed_outputs=mandatory_changed_outputs,
             title=title,
             objective=objective,
         )

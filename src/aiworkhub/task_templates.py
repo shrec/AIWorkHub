@@ -32,10 +32,10 @@ Scope vs. mandatory-change contract:
   authorized to touch. They are never an implicit assertion that every one
   of them must change.
 * ``required_outputs`` -- the set a downstream finalizer treats as
-  ``required_output_unchanged``-eligible -- defaults to empty. A path only
-  becomes mandatory-to-change when explicitly listed in
-  ``mandatory_changed_outputs``, and any such path must already be part of
-  the write scope; a mandatory path outside scope fails closed.
+  ``required_output_unchanged``-eligible -- defaults to the complete write
+  scope for ``bugfix_with_regression`` and to empty for every other template.
+  An explicit ``mandatory_changed_outputs`` list overrides either default;
+  every listed path must already be in scope or expansion fails closed.
 """
 
 from __future__ import annotations
@@ -573,13 +573,11 @@ def expand_template(
 
     Returns plain data for the existing authoritative ``create_task`` card:
     read-first targets, an allowed-write scope, and deterministic validation
-    commands. ``allowed_writes``/``write_set`` is the full authorized scope;
-    ``required_outputs`` is the (by default empty) subset a downstream
-    finalizer must observe as changed. A path only lands in
-    ``required_outputs`` when it is explicitly passed via
-    ``mandatory_changed_outputs``, and only if it is already in scope --
-    an out-of-scope mandatory path fails closed rather than silently
-    expanding the write set.
+    commands. ``allowed_writes``/``write_set`` is the full authorized scope.
+    For ``bugfix_with_regression``, omitted ``mandatory_changed_outputs``
+    makes that exact scope mandatory; every other template keeps an empty
+    default. An explicitly supplied mandatory list is authoritative for every
+    template and must be a subset of the write scope.
     """
     spec = resolve_template(template_id)
     production = _bounded_paths(
@@ -590,8 +588,13 @@ def expand_template(
     if set(production) & set(tests):
         raise TaskTemplateError("duplicate_path_across_fields")
     write_set: list[str] = [] if spec.read_only else [*production, *tests]
+    mandatory_default: Sequence[Any] = (
+        write_set if spec.name == "bugfix_with_regression" else ()
+    )
     mandatory = _bounded_paths(
-        () if mandatory_changed_outputs is None else mandatory_changed_outputs,
+        mandatory_default
+        if mandatory_changed_outputs is None
+        else mandatory_changed_outputs,
         "mandatory_changed_output",
     )
     write_scope = set(write_set)

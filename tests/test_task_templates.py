@@ -110,7 +110,7 @@ def test_bugfix_outputs_exactly_cover_atomic_write_set():
     )
     expected = ["src/a.py", "src/b.py", "tests/test_a.py"]
     assert card["allowed_writes"] == expected
-    assert card["required_outputs"] == []
+    assert card["required_outputs"] == expected
     assert card["write_set"] == expected
     assert card["write_set"] == expected
     assert card["read_only"] is False
@@ -1107,9 +1107,10 @@ def test_unchanged_required_traversal_to_non_test_output_is_allowed():
 
 # --- NF-2026-00456: allowed_writes/write_set is authenticated read/write
 # *scope*, never an implicit assertion that every path in it must change.
-# required_outputs is the (by default empty) narrow subset a downstream
-# finalizer must observe as changed, and a path only lands there when it is
-# explicitly passed via mandatory_changed_outputs. ------------------------
+# required_outputs is normally the narrow subset a downstream finalizer must
+# observe as changed. Bugfix templates default it to their complete write
+# scope; other templates retain the empty default. An explicit mandatory list
+# remains authoritative. ---------------------------------------------------
 
 
 def test_mandatory_changed_outputs_default_to_empty_required_outputs():
@@ -1184,6 +1185,42 @@ def test_mandatory_changed_outputs_can_select_a_test_path():
     )
     assert card["required_outputs"] == ["tests/test_a.py"]
     assert "src/a.py" not in card["required_outputs"]
+
+
+def test_bugfix_explicit_empty_mandatory_outputs_is_authoritative():
+    card = expand_template(
+        "bugfix_with_regression",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+        mandatory_changed_outputs=[],
+    )
+    assert card["required_outputs"] == []
+
+
+def test_bugfix_default_test_output_remains_unchanged_terminal_eligible():
+    card = expand_template(
+        "bugfix_with_regression",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    with pytest.raises(
+        TaskTemplateError, match="unchanged_required_public_test_output"
+    ):
+        reject_unchanged_public_test_outputs(
+            ["tests/test_a.py"], card["required_outputs"]
+        )
+
+
+def test_duplicate_mandatory_changed_outputs_fail_closed():
+    with pytest.raises(
+        TaskTemplateError, match="invalid_mandatory_changed_output_path_duplicate"
+    ):
+        expand_template(
+            "bugfix_with_regression",
+            production_paths=["src/a.py"],
+            test_paths=["tests/test_a.py"],
+            mandatory_changed_outputs=["src/a.py", "src/a.py"],
+        )
 
 
 def test_mandatory_changed_outputs_partially_out_of_scope_fails_closed():

@@ -119,6 +119,7 @@ def test_create_from_template_bugfix_forwards_generated_fields(monkeypatch):
     )
     assert captured["allowed_writes"] == card["allowed_writes"]
     assert captured["required_outputs"] == card["required_outputs"]
+    assert captured["required_outputs"] == ["src/a.py", "tests/test_a.py"]
     assert captured["read_first"] == card["read_first"]
     assert captured["read_only"] is card["read_only"] is False
     assert captured["task_type"] == card["task_type"]
@@ -132,6 +133,61 @@ def test_create_from_template_bugfix_forwards_generated_fields(monkeypatch):
     assert result["template_provenance"] == template_provenance_payload(
         card, classification_reason="explicit_template"
     )
+
+
+def test_create_from_template_bugfix_preserves_explicit_required_output_subset(
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_create_task(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(server.core, "create_task", fake_create_task)
+    result = server.aiworkhub_task_create_from_template(
+        task_id="TASK_TEMPLATE_BUGFIX_SUBSET",
+        title="Fix one production path",
+        runner="codex_worker",
+        topic="coding",
+        objective="Keep the authenticated mandatory subset exact.",
+        acceptance=["Only the declared output is mandatory."],
+        template_id="bugfix_with_regression",
+        production_paths=["src/a.py", "src/helper.py"],
+        test_paths=["tests/test_a.py"],
+        mandatory_changed_outputs=["src/a.py"],
+    )
+    assert result["ok"] is True
+    assert captured["allowed_writes"] == [
+        "src/a.py",
+        "src/helper.py",
+        "tests/test_a.py",
+    ]
+    assert captured["required_outputs"] == ["src/a.py"]
+
+
+def test_create_from_template_rejects_duplicate_mandatory_outputs_before_create(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        server.core, "create_task", lambda **kwargs: calls.append(kwargs)
+    )
+    result = server.aiworkhub_task_create_from_template(
+        task_id="TASK_TEMPLATE_BUGFIX_DUPLICATE",
+        title="Reject duplicate outputs",
+        runner="codex_worker",
+        topic="coding",
+        objective="Fail closed before persistence.",
+        acceptance=["Duplicate paths are rejected."],
+        template_id="bugfix_with_regression",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+        mandatory_changed_outputs=["src/a.py", "src/a.py"],
+    )
+    assert result["ok"] is False
+    assert result["stderr"] == "invalid_mandatory_changed_output_path_duplicate"
+    assert calls == []
 
 
 def test_create_from_template_read_only_analysis(monkeypatch):
