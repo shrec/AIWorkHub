@@ -2856,10 +2856,19 @@ def _admit_rework_overlay_observation(
     observed_hash: str,
     has_sealed: bool,
     allowed_writes: Sequence[str],
+    canonical_hash: str | None = None,
 ) -> Literal["match", "authorized_overlay"]:
     """Admit a workspace digest against immutable packet-sealed authority."""
 
-    if not expected_hash or observed_hash == expected_hash:
+    if not expected_hash:
+        return "match"
+    if observed_hash == expected_hash:
+        if (
+            not has_sealed
+            and relative in allowed_writes
+            and observed_hash != canonical_hash
+        ):
+            return "authorized_overlay"
         return "match"
     if has_sealed and relative in allowed_writes:
         return "authorized_overlay"
@@ -3012,6 +3021,7 @@ def _prepare_rework_overlay_view(
             observed_hash=observed_hash,
             has_sealed=sealed is not None,
             allowed_writes=ctx.allowed_writes,
+            canonical_hash=canonical_hashes.get(relative),
         )
         if admission == "authorized_overlay":
             authorized_sources[relative] = observed_bytes.decode(
@@ -3025,7 +3035,7 @@ def _prepare_rework_overlay_view(
             })
         else:
             snapshot_rows.append({"path": relative, "sha256": observed_hash})
-        if sealed is None:
+        if sealed is None and admission != "authorized_overlay":
             digest_refs[relative] = expected_hash
             continue
         if canonical_hashes.get(relative) == observed_hash:
@@ -3258,9 +3268,12 @@ def _merge_rework_overlay_payload(
         merged["ranked_symbols"] = overlay_matches + (
             ranked if isinstance(ranked, list) else []
         )
+    packet = ctx.rework_overlay_packet or {}
     merged["overlay"] = {
         "authority_source": "rework_overlay",
         "provenance": "request_scoped_worktree",
+        "predecessor_task_id": str(packet.get("predecessor_task_id") or ""),
+        "predecessor_request_id": str(packet.get("predecessor_request_id") or ""),
         "snapshot_sha256": view.snapshot_sha256,
         "changed_paths": sorted(view.changed),
         "deleted_paths": sorted(view.deleted),

@@ -1148,3 +1148,90 @@ def test_sealed_disallowed_writes_mismatch_fails_closed_on_every_path(
     with pytest.raises(w.WorkerToolError, match="rework_overlay_hash_mismatch"):
         w._rework_source_graph_binding(ctx)
     assert (ctx.repo / relative).read_bytes() == edited
+
+
+def test_exact_digest_retained_source_is_semantically_queryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    worktree = _worktree_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    relative = "retained/module.py"
+    symbol = "calculate_luminous_orbit"
+    source = (
+        f"def {symbol}(radius: float) -> float:\n"
+        "    return radius * 2.0\n"
+    ).encode()
+    target = worktree / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(source)
+    digest = hashlib.sha256(source).hexdigest()
+    entry = {"path": relative, "sha256": digest}
+    assert set(entry) == {"path", "sha256"}
+    packet = _rework_overlay_packet(authority, [entry])
+    ctx = replace(
+        _ctx(repo=worktree, authority_repo=authority, home=home),
+        rework_overlay_packet=packet,
+        allowed_writes=(relative,),
+    )
+
+    view = w._prepare_rework_overlay_view(
+        ctx, source_graph_mod.resolve_db_path(authority),
+        build_revision="test-rev",
+    )
+    assert view is not None
+    assert view.authorized_sources[relative] == source.decode()
+    assert view.authorized_digests[relative] == digest
+    assert relative in view.changed
+    assert relative not in view.digest_refs
+
+    merged, applied = w._merge_rework_overlay_payload(
+        ctx, {"matches": []}, view,
+        mode="focus", query=symbol, target=None, budget=8,
+    )
+    assert applied is True
+    match = next(item for item in merged["matches"] if item["name"] == symbol)
+    assert match["file_path"] == relative
+    assert match["kind"] == "function"
+    assert merged["overlay"]["authorized_overlay_paths"] == [relative]
+    assert merged["overlay"]["authorized_overlay_digests"][relative] == digest
+    assert merged["overlay"]["predecessor_task_id"] == "TASK_B834"
+    assert merged["overlay"]["predecessor_request_id"] == "pred1"
+
+
+def test_hash_only_canonical_exact_digest_remains_canonical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    worktree = _worktree_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    relative = "retained/canonical_module.py"
+    source = b"def canonical_luminous_orbit() -> int:\n    return 7\n"
+    for repo in (authority, worktree):
+        target = repo / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes(source)
+    source_graph_mod.build_index(authority)
+    digest = hashlib.sha256(source).hexdigest()
+    entry = {"path": relative, "sha256": digest}
+    assert set(entry) == {"path", "sha256"}
+    packet = _rework_overlay_packet(authority, [entry])
+    ctx = replace(
+        _ctx(repo=worktree, authority_repo=authority, home=home),
+        rework_overlay_packet=packet,
+        allowed_writes=(relative,),
+    )
+
+    view = w._prepare_rework_overlay_view(
+        ctx, source_graph_mod.resolve_db_path(authority),
+        build_revision="test-rev",
+    )
+    assert view is not None
+    assert view.authorized_sources == {}
+    assert view.authorized_digests == {}
+    assert relative not in view.changed
+    assert view.digest_refs[relative] == digest
