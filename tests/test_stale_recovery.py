@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from aiworkhub import core, stale_recovery, task_store
+from aiworkhub import core, runner_topic_policy, stale_recovery, task_store
 
 
 def _store(tmp_path, monkeypatch, *, alive=False, request_id="req-1", epoch=3):
@@ -82,6 +82,13 @@ def test_core_reconcile_binds_task_id_to_card_scoped_write_gate(monkeypatch):
     assert core.reconcile_dead_processing_task("T1", "req-1", 1) is blocked
     assert observed["action"] == "recover-stale"
     assert observed["task_id"] == "T1"
+
+
+def test_dead_processing_reconciliation_is_coordinator_allowlisted():
+    assert "recover-stale" in core.COORDINATOR_COMMANDS
+    assert runner_topic_policy.check_runner_topic_allowlist(
+        runner_topic_policy.CODEX_RUNNER, "quality_review", "recover-stale"
+    ) == {"allowed": True, "reason": "codex_wildcard_topic_allowed"}
 
 
 def test_reconcile_rejects_identity_mismatches_without_mutation(tmp_path, monkeypatch):

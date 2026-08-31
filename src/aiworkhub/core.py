@@ -76,7 +76,9 @@ WRITE_COMMANDS = {
     "usage",
 }
 
-COORDINATOR_COMMANDS = frozenset({"done", "reject-review", "release-launch", "archive", "restore"})
+COORDINATOR_COMMANDS = frozenset(
+    {"done", "reject-review", "release-launch", "archive", "restore", "recover-stale"}
+)
 # COORDINATOR_TOKEN_ENV / COORDINATOR_TOKEN_FILE_ENV are re-exported from the
 # package __init__ (imported above) so existing callers keep working against
 # core.COORDINATOR_TOKEN_ENV unchanged.
@@ -1387,7 +1389,8 @@ def run_taskctl(
         raise ValueError("taskctl args must not be empty")
     if coordinator_capability and args[0] not in COORDINATOR_COMMANDS:
         raise ValueError(
-            "coordinator capability may only be passed to done, reject-review, release-launch, archive, or restore"
+            "coordinator capability may only be passed to done, reject-review, release-launch, "
+            "archive, restore, or recover-stale"
         )
 
     command = list(args)

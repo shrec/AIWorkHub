@@ -457,6 +457,7 @@ CODEX_ALLOWED_ACTIONS: frozenset[str] = frozenset(
         "review",
         "reject-review",
         "recover-blocked-rework",
+        "recover-stale",
         "release-launch",
         "retry-terminal",
         "usage",
