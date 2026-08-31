@@ -1030,6 +1030,392 @@ def quota(repo: Path) -> dict[str, Any]:
     }
 
 
+_WINDOWS_FILE_SHARE_WRITE = 0x00000002
+_WINDOWS_FILE_LIST_DIRECTORY = 0x0001
+_WINDOWS_FILE_READ_ATTRIBUTES = 0x0080
+_WINDOWS_OPEN_EXISTING = 3
+_WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_WINDOWS_FILE_BASIC_INFO = 0
+_WINDOWS_FILE_STANDARD_INFO = 1
+_WINDOWS_FILE_ID_BOTH_DIRECTORY_INFO = 10
+_WINDOWS_FILE_ID_BOTH_DIRECTORY_RESTART_INFO = 11
+_WINDOWS_FILE_ID_INFO = 18
+_WINDOWS_ERROR_NO_MORE_FILES = 18
+_WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x10
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_WINDOWS_VOLUME_NAME_DOS = 0
+_WINDOWS_DIR_ENUM_BUFFER_BYTES = 64 * 1024
+_FILE_ID_BOTH_DIR_INFO_FILE_ATTRIBUTES = 56
+_FILE_ID_BOTH_DIR_INFO_FILE_NAME_LENGTH = 60
+_FILE_ID_BOTH_DIR_INFO_FILE_ID = 96
+_FILE_ID_BOTH_DIR_INFO_FILE_NAME = 104
+
+
+@dataclass(frozen=True)
+class WindowsDirectoryEntry:
+    name: str
+    file_id: int
+    file_attributes: int
+    is_directory: bool
+
+
+def _u32le(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 4], "little", signed=False)
+
+
+def _u64le(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset : offset + 8], "little", signed=False)
+
+
+def _parse_file_id_both_dir_info(
+    data: bytes,
+) -> tuple[WindowsDirectoryEntry, ...] | None:
+    if len(data) < _FILE_ID_BOTH_DIR_INFO_FILE_NAME:
+        return None
+    entries: list[WindowsDirectoryEntry] = []
+    offset = 0
+    length = len(data)
+    while True:
+        remaining = length - offset
+        if remaining < _FILE_ID_BOTH_DIR_INFO_FILE_NAME:
+            return None
+        next_entry_offset = _u32le(data, offset)
+        file_attributes = _u32le(data, offset + _FILE_ID_BOTH_DIR_INFO_FILE_ATTRIBUTES)
+        name_length = _u32le(data, offset + _FILE_ID_BOTH_DIR_INFO_FILE_NAME_LENGTH)
+        file_id = _u64le(data, offset + _FILE_ID_BOTH_DIR_INFO_FILE_ID)
+        name_start = offset + _FILE_ID_BOTH_DIR_INFO_FILE_NAME
+        name_end = name_start + name_length
+        if name_length % 2 != 0 or name_end > length:
+            return None
+        if file_id <= 0:
+            return None
+        try:
+            name = data[name_start:name_end].decode("utf-16-le")
+        except UnicodeDecodeError:
+            return None
+        if "\x00" in name:
+            return None
+        if name not in (".", ".."):
+            if not name:
+                return None
+            entries.append(
+                WindowsDirectoryEntry(
+                    name=name,
+                    file_id=file_id,
+                    file_attributes=file_attributes,
+                    is_directory=bool(
+                        file_attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+                    ),
+                )
+            )
+        if next_entry_offset == 0:
+            return tuple(entries)
+        if (
+            next_entry_offset % 8 != 0
+            or next_entry_offset < _FILE_ID_BOTH_DIR_INFO_FILE_NAME
+            or next_entry_offset > remaining
+            or next_entry_offset < _FILE_ID_BOTH_DIR_INFO_FILE_NAME + name_length
+        ):
+            return None
+        offset += next_entry_offset
+
+
+def _windows_normalize_extended_path(path: str) -> str | None:
+    if not path:
+        return None
+    text = path.replace("/", "\\")
+    if text.startswith("\\\\?\\UNC\\"):
+        text = "\\\\" + text[8:]
+    elif text.startswith("\\\\?\\"):
+        text = text[4:]
+    if (
+        text.startswith("\\\\?\\")
+        or text.startswith("\\??\\")
+        or text.startswith("\\\\.\\")
+    ):
+        return None
+    is_drive = (
+        len(text) >= 3
+        and text[1] == ":"
+        and text[0].isalpha()
+        and text[2] == "\\"
+    )
+    is_unc = text.startswith("\\\\") and len(text) > 2
+    if not is_drive and not is_unc:
+        return None
+    if is_drive and len(text) > 3:
+        text = text.rstrip("\\")
+    elif is_unc:
+        stripped = text.rstrip("\\")
+        if stripped.startswith("\\\\") and stripped != "\\\\":
+            text = stripped
+    return text
+
+
+def _windows_path_is_contained(path: str, root: str) -> bool:
+    child = _windows_normalize_extended_path(path)
+    parent = _windows_normalize_extended_path(root)
+    if child is None or parent is None:
+        return False
+    child_key = child.casefold()
+    parent_key = parent.casefold()
+    if child_key == parent_key:
+        return True
+    prefix = parent_key if parent_key.endswith("\\") else parent_key + "\\"
+    return child_key.startswith(prefix)
+
+
+class WindowsDirectoryAuthority:
+    def __init__(self, path: Path) -> None:
+        raw = str(path).replace("/", "\\")
+        requested = _windows_normalize_extended_path(raw)
+        if requested is None:
+            requested = _windows_normalize_extended_path(os.path.abspath(str(path)))
+        if requested is None:
+            raise RuntimeTempError("windows directory path invalid")
+        handle = self._open_directory_handle(str(path))
+        try:
+            self._reject_unavailable_non_directory_reparse(handle)
+            volume_serial, file_id = self._file_id_info(handle)
+            final_path = self._final_path(handle)
+            if not _windows_path_is_contained(final_path, requested):
+                raise RuntimeTempError("windows directory final path escapes root")
+        except Exception:
+            _windows_close_handle(handle)
+            raise
+        self._handle = handle
+        self._closed = False
+        self._volume_serial = volume_serial
+        self._file_id = file_id
+        self._root = requested
+
+    @property
+    def handle(self) -> int:
+        return self._handle
+
+    @property
+    def volume_serial(self) -> int:
+        return self._volume_serial
+
+    @property
+    def file_id(self) -> int:
+        return self._file_id
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def enumerate_entries(self) -> tuple[WindowsDirectoryEntry, ...]:
+        if self._closed:
+            raise RuntimeTempError("windows directory handle is closed")
+        kernel32 = _windows_kernel32()
+        kernel32.GetFileInformationByHandleEx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
+        collected: list[WindowsDirectoryEntry] = []
+        restart = True
+        while True:
+            buf = (ctypes.c_ubyte * _WINDOWS_DIR_ENUM_BUFFER_BYTES)()
+            info_class = (
+                _WINDOWS_FILE_ID_BOTH_DIRECTORY_RESTART_INFO
+                if restart
+                else _WINDOWS_FILE_ID_BOTH_DIRECTORY_INFO
+            )
+            restart = False
+            ok = kernel32.GetFileInformationByHandleEx(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_int(info_class),
+                buf,
+                ctypes.c_uint32(_WINDOWS_DIR_ENUM_BUFFER_BYTES),
+            )
+            if ok:
+                parsed = _parse_file_id_both_dir_info(bytes(buf))
+                if parsed is None:
+                    raise RuntimeTempError("malformed FILE_ID_BOTH_DIR_INFO batch")
+                collected.extend(parsed)
+                continue
+            if int(getattr(ctypes, "get_last_error")()) == _WINDOWS_ERROR_NO_MORE_FILES:
+                return tuple(collected)
+            raise RuntimeTempError("windows directory enumeration failed")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        kernel32 = _windows_kernel32()
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        if not kernel32.CloseHandle(ctypes.c_void_p(self._handle)):
+            raise RuntimeTempError("windows directory handle close failed")
+        self._closed = True
+
+    def __enter__(self) -> WindowsDirectoryAuthority:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        del exc_type, exc, tb
+        self.close()
+
+    @staticmethod
+    def _open_directory_handle(path: str) -> int:
+        kernel32 = _windows_kernel32()
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel32.CreateFileW(
+            path,
+            _WINDOWS_FILE_LIST_DIRECTORY | _WINDOWS_FILE_READ_ATTRIBUTES,
+            _WINDOWS_FILE_SHARE_READ | _WINDOWS_FILE_SHARE_WRITE,
+            None,
+            _WINDOWS_OPEN_EXISTING,
+            (
+                _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+                | _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT
+            ),
+            None,
+        )
+        if not handle or int(handle) == _windows_invalid_handle_value():
+            raise RuntimeTempError("windows directory handle open failed")
+        return int(handle)
+
+    @staticmethod
+    def _reject_unavailable_non_directory_reparse(handle: int) -> None:
+        class _FileBasicInfo(ctypes.Structure):
+            _fields_ = [
+                ("creation_time", ctypes.c_longlong),
+                ("last_access_time", ctypes.c_longlong),
+                ("last_write_time", ctypes.c_longlong),
+                ("change_time", ctypes.c_longlong),
+                ("file_attributes", ctypes.c_uint32),
+            ]
+
+        class _FileStandardInfo(ctypes.Structure):
+            _fields_ = [
+                ("allocation_size", ctypes.c_longlong),
+                ("end_of_file", ctypes.c_longlong),
+                ("number_of_links", ctypes.c_uint32),
+                ("delete_pending", ctypes.c_ubyte),
+                ("directory", ctypes.c_ubyte),
+            ]
+
+        kernel32 = _windows_kernel32()
+        kernel32.GetFileInformationByHandleEx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
+        basic = _FileBasicInfo()
+        if not kernel32.GetFileInformationByHandleEx(
+            ctypes.c_void_p(handle),
+            ctypes.c_int(_WINDOWS_FILE_BASIC_INFO),
+            ctypes.byref(basic),
+            ctypes.c_uint32(ctypes.sizeof(basic)),
+        ):
+            raise RuntimeTempError("windows directory handle metadata unavailable")
+        standard = _FileStandardInfo()
+        if not kernel32.GetFileInformationByHandleEx(
+            ctypes.c_void_p(handle),
+            ctypes.c_int(_WINDOWS_FILE_STANDARD_INFO),
+            ctypes.byref(standard),
+            ctypes.c_uint32(ctypes.sizeof(standard)),
+        ):
+            raise RuntimeTempError("windows directory handle metadata unavailable")
+        if not int(standard.directory):
+            raise RuntimeTempError("windows directory handle is not a directory")
+        if int(basic.file_attributes) & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT:
+            raise RuntimeTempError("windows directory handle is a reparse point")
+
+    @staticmethod
+    def _file_id_info(handle: int) -> tuple[int, int]:
+        class _FileIdInfo(ctypes.Structure):
+            _fields_ = [
+                ("volume_serial_number", ctypes.c_uint64),
+                ("file_id", ctypes.c_ubyte * 16),
+            ]
+
+        kernel32 = _windows_kernel32()
+        kernel32.GetFileInformationByHandleEx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
+        info = _FileIdInfo()
+        if not kernel32.GetFileInformationByHandleEx(
+            ctypes.c_void_p(handle),
+            ctypes.c_int(_WINDOWS_FILE_ID_INFO),
+            ctypes.byref(info),
+            ctypes.c_uint32(ctypes.sizeof(info)),
+        ):
+            raise RuntimeTempError("windows directory FILE_ID_INFO unavailable")
+        volume_serial = int(info.volume_serial_number)
+        file_id = int.from_bytes(bytes(info.file_id), "little")
+        if volume_serial <= 0 or file_id <= 0:
+            raise RuntimeTempError("windows directory FILE_ID_INFO invalid")
+        return (volume_serial, file_id)
+
+    @staticmethod
+    def _final_path(handle: int) -> str:
+        kernel32 = _windows_kernel32()
+        kernel32.GetFinalPathNameByHandleW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+        kernel32.GetFinalPathNameByHandleW.restype = ctypes.c_uint32
+        needed = int(
+            kernel32.GetFinalPathNameByHandleW(
+                ctypes.c_void_p(handle),
+                None,
+                0,
+                _WINDOWS_VOLUME_NAME_DOS,
+            )
+        )
+        if needed <= 1:
+            raise RuntimeTempError("windows directory final path unavailable")
+        buf = (ctypes.c_uint16 * needed)()
+        written = int(
+            kernel32.GetFinalPathNameByHandleW(
+                ctypes.c_void_p(handle),
+                ctypes.cast(buf, ctypes.c_void_p),
+                ctypes.c_uint32(needed),
+                _WINDOWS_VOLUME_NAME_DOS,
+            )
+        )
+        if written <= 0:
+            raise RuntimeTempError("windows directory final path unavailable")
+        if written >= needed:
+            raise RuntimeTempError("windows directory final path truncated")
+        encoded = ctypes.string_at(buf, written * 2)
+        try:
+            raw = encoded.decode("utf-16-le")
+        except UnicodeDecodeError:
+            raise RuntimeTempError("windows directory final path invalid") from None
+        if (
+            not raw
+            or "\x00" in raw
+            or any(0xD800 <= ord(ch) <= 0xDFFF for ch in raw)
+            or _windows_normalize_extended_path(raw) is None
+        ):
+            raise RuntimeTempError("windows directory final path invalid")
+        return raw
+
+
 __all__ = [
     "HOME_SUBDIR",
     "MYPY_CACHE_SUBDIR",

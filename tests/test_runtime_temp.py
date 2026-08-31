@@ -973,3 +973,574 @@ def test_worker_workspace_direct_script_resolves_sibling_runtime_temp() -> None:
         else:
             sys.modules.pop("aiworkhub.runtime_temp", None)
         sys.modules.pop("_direct_worker_workspace", None)
+
+
+class _BoundApi:
+    def __init__(self, fn: object) -> None:
+        self._fn = fn
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        return self._fn(*args, **kwargs)
+
+
+def _handle_int(value: object) -> int:
+    raw = getattr(value, "value", value)
+    if raw is None:
+        return 0
+    return int(raw)
+
+
+def _pack_file_id_both_dir_info(
+    entries: list[tuple[str, int, int]],
+) -> bytes:
+    blobs: list[bytes] = []
+    for index, (name, file_id, attrs) in enumerate(entries):
+        encoded = name.encode("utf-16-le")
+        used = runtime_temp._FILE_ID_BOTH_DIR_INFO_FILE_NAME + len(encoded)
+        aligned = (used + 7) & ~7
+        is_last = index == len(entries) - 1
+        next_off = 0 if is_last else aligned
+        header = bytearray(runtime_temp._FILE_ID_BOTH_DIR_INFO_FILE_NAME)
+        header[0:4] = int(next_off).to_bytes(4, "little")
+        header[56:60] = int(attrs).to_bytes(4, "little")
+        header[60:64] = len(encoded).to_bytes(4, "little")
+        header[96:104] = int(file_id).to_bytes(8, "little")
+        payload = bytes(header) + encoded
+        if not is_last:
+            payload = payload + bytes(aligned - len(payload))
+        blobs.append(payload)
+    return b"".join(blobs)
+
+
+class _FakeDirectoryKernel32:
+    def __init__(
+        self,
+        *,
+        handle: int,
+        final_path: str,
+        volume_serial: int,
+        file_id: int,
+        pages: list[bytes],
+        attributes: int = 0x10,
+        is_directory: bool = True,
+        reparse: bool = False,
+        fail_open: bool = False,
+        invalid_handle: bool = False,
+        fail_basic: bool = False,
+        fail_standard: bool = False,
+        fail_file_id: bool = False,
+        zero_volume: bool = False,
+        zero_file_id: bool = False,
+        final_needed: int | None = None,
+        final_written: int | None = None,
+        enum_error_after: int | None = None,
+        enum_error: int = 5,
+        close_results: list[int] | None = None,
+    ) -> None:
+        self.handle = handle
+        self.final_path = final_path
+        self.volume_serial = volume_serial
+        self.file_id = file_id
+        self.pages = pages
+        self.attributes = attributes
+        self.is_directory = is_directory
+        self.reparse = reparse
+        self.fail_open = fail_open
+        self.invalid_handle = invalid_handle
+        self.fail_basic = fail_basic
+        self.fail_standard = fail_standard
+        self.fail_file_id = fail_file_id
+        self.zero_volume = zero_volume
+        self.zero_file_id = zero_file_id
+        self.final_needed = final_needed
+        self.final_written = final_written
+        self.enum_error_after = enum_error_after
+        self.enum_error = enum_error
+        self.close_results = list(close_results or [])
+        self.last_error = 0
+        self.create_calls: list[tuple[str, int, int, int, int]] = []
+        self.info_handles: list[int] = []
+        self.dir_info_classes: list[int] = []
+        self.final_handles: list[int] = []
+        self.close_handles: list[int] = []
+        self.set_file_info_calls = 0
+        self._page_cursor = 0
+        self.CreateFileW = _BoundApi(self._create)
+        self.GetFileInformationByHandleEx = _BoundApi(self._info_ex)
+        self.GetFinalPathNameByHandleW = _BoundApi(self._final)
+        self.CloseHandle = _BoundApi(self._close)
+        self.SetFileInformationByHandle = _BoundApi(self._set_info)
+
+    def _create(
+        self,
+        path: object,
+        access: object,
+        share: object,
+        security: object,
+        creation: object,
+        flags: object,
+        template: object,
+    ) -> int:
+        del security, template
+        self.create_calls.append(
+            (str(path), int(access), int(share), int(creation), int(flags))
+        )
+        if self.fail_open:
+            return 0
+        if self.invalid_handle:
+            return runtime_temp._windows_invalid_handle_value()
+        return self.handle
+
+    def _info_ex(
+        self,
+        handle: object,
+        info_class: object,
+        buf: object,
+        size: object,
+    ) -> int:
+        ctypes = runtime_temp.ctypes
+        ic = _handle_int(info_class)
+        self.info_handles.append(_handle_int(handle))
+        if ic == runtime_temp._WINDOWS_FILE_BASIC_INFO:
+            if self.fail_basic:
+                return 0
+            attrs = self.attributes
+            if self.reparse:
+                attrs |= runtime_temp._WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+            blob = bytes(32) + int(attrs).to_bytes(4, "little") + bytes(4)
+            ctypes.memmove(buf, blob, min(len(blob), _handle_int(size)))
+            return 1
+        if ic == runtime_temp._WINDOWS_FILE_STANDARD_INFO:
+            if self.fail_standard:
+                return 0
+            directory = 1 if self.is_directory else 0
+            blob = bytes(16) + (1).to_bytes(4, "little") + bytes([0, directory])
+            ctypes.memmove(buf, blob, min(len(blob), _handle_int(size)))
+            return 1
+        if ic == runtime_temp._WINDOWS_FILE_ID_INFO:
+            if self.fail_file_id:
+                return 0
+            serial = 0 if self.zero_volume else self.volume_serial
+            fid = 0 if self.zero_file_id else self.file_id
+            blob = int(serial).to_bytes(8, "little") + int(fid).to_bytes(16, "little")
+            ctypes.memmove(buf, blob, min(len(blob), _handle_int(size)))
+            return 1
+        if ic in (
+            runtime_temp._WINDOWS_FILE_ID_BOTH_DIRECTORY_INFO,
+            runtime_temp._WINDOWS_FILE_ID_BOTH_DIRECTORY_RESTART_INFO,
+        ):
+            self.dir_info_classes.append(ic)
+            if ic == runtime_temp._WINDOWS_FILE_ID_BOTH_DIRECTORY_RESTART_INFO:
+                self._page_cursor = 0
+            if (
+                self.enum_error_after is not None
+                and len(self.dir_info_classes) > self.enum_error_after
+            ):
+                self.last_error = self.enum_error
+                return 0
+            if self._page_cursor < len(self.pages):
+                page = self.pages[self._page_cursor]
+                self._page_cursor += 1
+                ctypes.memmove(buf, page, min(len(page), _handle_int(size)))
+                return 1
+            self.last_error = runtime_temp._WINDOWS_ERROR_NO_MORE_FILES
+            return 0
+        self.last_error = 87
+        return 0
+
+    def _final(
+        self,
+        handle: object,
+        buf: object,
+        cch: object,
+        flags: object,
+    ) -> int:
+        del flags
+        ctypes = runtime_temp.ctypes
+        self.final_handles.append(_handle_int(handle))
+        path = self.final_path
+        encoded = path.encode("utf-16-le", errors="surrogatepass")
+        unit_count = len(encoded) // 2
+        needed = unit_count + 1 if self.final_needed is None else int(self.final_needed)
+        cch_i = _handle_int(cch)
+        if buf in (None, 0) or cch_i == 0:
+            return needed
+        written = unit_count if self.final_written is None else int(self.final_written)
+        if written > 0 and buf not in (None, 0) and cch_i > 0:
+            payload = encoded + b"\x00\x00"
+            ctypes.memmove(buf, payload, min(len(payload), cch_i * 2))
+        return written
+
+    def _close(self, handle: object) -> int:
+        self.close_handles.append(_handle_int(handle))
+        if self.close_results:
+            return int(self.close_results.pop(0))
+        return 1
+
+    def _set_info(self, *args: object, **kwargs: object) -> int:
+        del args, kwargs
+        self.set_file_info_calls += 1
+        raise AssertionError("SetFileInformationByHandle must not run")
+
+
+_ENUM_ROOT = Path("C:/aiworkhub-enum-root")
+_ENUM_FINAL = r"\\?\C:\aiworkhub-enum-root"
+_WIDE_HANDLE = (1 << 32) + 99
+
+
+def _install_directory_kernel32(
+    monkeypatch: pytest.MonkeyPatch, kernel32: _FakeDirectoryKernel32
+) -> None:
+    monkeypatch.setattr(
+        runtime_temp.ctypes,
+        "WinDLL",
+        lambda name, use_last_error=True: kernel32,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime_temp.ctypes,
+        "get_last_error",
+        lambda: kernel32.last_error,
+        raising=False,
+    )
+
+
+def _open_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pages: list[bytes] | None = None,
+    handle: int = _WIDE_HANDLE,
+    close_results: list[int] | None = None,
+    enum_error_after: int | None = None,
+    enum_error: int = 5,
+) -> tuple[runtime_temp.WindowsDirectoryAuthority, _FakeDirectoryKernel32]:
+    kernel32 = _FakeDirectoryKernel32(
+        handle=handle,
+        final_path=_ENUM_FINAL,
+        volume_serial=0xABCDEF12,
+        file_id=(1 << 80) + 7,
+        pages=list(pages or []),
+        close_results=close_results,
+        enum_error_after=enum_error_after,
+        enum_error=enum_error,
+    )
+    _install_directory_kernel32(monkeypatch, kernel32)
+    return runtime_temp.WindowsDirectoryAuthority(_ENUM_ROOT), kernel32
+
+def test_windows_directory_authority_two_page_pagination_and_info_classes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page1 = _pack_file_id_both_dir_info([("page-one", 11, 0x80)])
+    page2 = _pack_file_id_both_dir_info(
+        [("page-two", 12, runtime_temp._WINDOWS_FILE_ATTRIBUTE_DIRECTORY)]
+    )
+    auth, kernel32 = _open_authority(monkeypatch, pages=[page1, page2])
+    try:
+        entries = auth.enumerate_entries()
+        assert [entry.name for entry in entries] == ["page-one", "page-two"]
+        assert entries[0].file_id == 11
+        assert entries[0].is_directory is False
+        assert entries[1].file_id == 12
+        assert entries[1].is_directory is True
+        assert kernel32.dir_info_classes == [
+            runtime_temp._WINDOWS_FILE_ID_BOTH_DIRECTORY_RESTART_INFO,
+            runtime_temp._WINDOWS_FILE_ID_BOTH_DIRECTORY_INFO,
+            runtime_temp._WINDOWS_FILE_ID_BOTH_DIRECTORY_INFO,
+        ]
+        assert kernel32.set_file_info_calls == 0
+        assert kernel32.create_calls == [
+            (
+                str(_ENUM_ROOT),
+                runtime_temp._WINDOWS_FILE_LIST_DIRECTORY
+                | runtime_temp._WINDOWS_FILE_READ_ATTRIBUTES,
+                runtime_temp._WINDOWS_FILE_SHARE_READ
+                | runtime_temp._WINDOWS_FILE_SHARE_WRITE,
+                runtime_temp._WINDOWS_OPEN_EXISTING,
+                runtime_temp._WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+                | runtime_temp._WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        ]
+        share = kernel32.create_calls[0][2]
+        assert share & 0x00000004 == 0
+        assert auth.handle == _WIDE_HANDLE
+        assert auth.volume_serial == 0xABCDEF12
+        assert auth.file_id == (1 << 80) + 7
+        assert set(kernel32.info_handles) == {_WIDE_HANDLE}
+        assert kernel32.final_handles == [_WIDE_HANDLE, _WIDE_HANDLE]
+    finally:
+        auth.close()
+    assert kernel32.close_handles == [_WIDE_HANDLE]
+
+
+def test_windows_directory_authority_preserves_greater_than_32_bit_handles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth, kernel32 = _open_authority(monkeypatch, handle=_WIDE_HANDLE)
+    auth.close()
+    assert all(value == _WIDE_HANDLE for value in kernel32.info_handles)
+    assert kernel32.close_handles == [_WIDE_HANDLE]
+    assert _WIDE_HANDLE > 0xFFFFFFFF
+
+
+def test_file_id_both_dir_info_unsigned_dot_exclusion_and_malformed() -> None:
+    packed = _pack_file_id_both_dir_info(
+        [
+            (".", 1, runtime_temp._WINDOWS_FILE_ATTRIBUTE_DIRECTORY),
+            ("..", 2, runtime_temp._WINDOWS_FILE_ATTRIBUTE_DIRECTORY),
+            ("keep", 0x8000000000000001, 0x80),
+        ]
+    )
+    parsed = runtime_temp._parse_file_id_both_dir_info(packed)
+    assert parsed is not None
+    assert [entry.name for entry in parsed] == ["keep"]
+    assert parsed[0].file_id == 0x8000000000000001
+    assert runtime_temp._parse_file_id_both_dir_info(b"\x00" * 50) is None
+    header = bytearray(104)
+    header[60:64] = (0x80000000).to_bytes(4, "little")
+    header[96:104] = (3).to_bytes(8, "little")
+    assert runtime_temp._parse_file_id_both_dir_info(bytes(header)) is None
+    odd = bytearray(_pack_file_id_both_dir_info([("x", 4, 0x80)]))
+    odd[60:64] = (1).to_bytes(4, "little")
+    assert runtime_temp._parse_file_id_both_dir_info(bytes(odd)) is None
+    unaligned = bytearray(104 + 2)
+    unaligned[0:4] = (12).to_bytes(4, "little")
+    unaligned[60:64] = (2).to_bytes(4, "little")
+    unaligned[96:104] = (5).to_bytes(8, "little")
+    unaligned[104:106] = "a".encode("utf-16-le")
+    assert runtime_temp._parse_file_id_both_dir_info(bytes(unaligned)) is None
+    zero_id = bytearray(_pack_file_id_both_dir_info([("z", 6, 0x80)]))
+    zero_id[96:104] = (0).to_bytes(8, "little")
+    assert runtime_temp._parse_file_id_both_dir_info(bytes(zero_id)) is None
+
+
+def test_windows_directory_file_id_mapping_inequality_when_fields_drift() -> None:
+    base = runtime_temp.WindowsDirectoryEntry("same", 9, 0x80, False)
+    assert base != runtime_temp.WindowsDirectoryEntry("same", 10, 0x80, False)
+    assert base != runtime_temp.WindowsDirectoryEntry("same", 9, 0x20, False)
+    assert base != runtime_temp.WindowsDirectoryEntry("same", 9, 0x80, True)
+    left = {entry.name: entry for entry in (base,)}
+    right = {
+        "same": runtime_temp.WindowsDirectoryEntry("same", 9, 0x80, True),
+    }
+    assert left != right
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"fail_open": True}, "open failed"),
+        ({"invalid_handle": True}, "open failed"),
+        ({"fail_basic": True}, "metadata unavailable"),
+        ({"fail_standard": True}, "metadata unavailable"),
+        ({"is_directory": False}, "not a directory"),
+        ({"reparse": True}, "reparse"),
+        ({"fail_file_id": True}, "FILE_ID_INFO unavailable"),
+        ({"zero_volume": True}, "FILE_ID_INFO invalid"),
+        ({"zero_file_id": True}, "FILE_ID_INFO invalid"),
+        ({"final_needed": 0}, "final path unavailable"),
+        ({"final_written": 0}, "final path unavailable"),
+        ({"final_needed": 8, "final_written": 8}, "truncated"),
+        ({"final_path": r"\\.\C:\aiworkhub-enum-root"}, "final path invalid"),
+        ({"final_path": r"\\?\C:\other-root"}, "escapes root"),
+    ],
+)
+def test_windows_directory_authority_failure_close_paths(
+    monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, object], match: str
+) -> None:
+    kernel32 = _FakeDirectoryKernel32(
+        handle=_WIDE_HANDLE,
+        final_path=_ENUM_FINAL,
+        volume_serial=9,
+        file_id=9,
+        pages=[],
+    )
+    for key, value in kwargs.items():
+        setattr(kernel32, key, value)
+    _install_directory_kernel32(monkeypatch, kernel32)
+    with pytest.raises(runtime_temp.RuntimeTempError, match=match):
+        runtime_temp.WindowsDirectoryAuthority(_ENUM_ROOT)
+    if kwargs.get("fail_open") or kwargs.get("invalid_handle"):
+        assert kernel32.close_handles == []
+    else:
+        assert kernel32.close_handles == [_WIDE_HANDLE]
+
+
+def test_windows_directory_authority_path_and_containment_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(runtime_temp.RuntimeTempError, match="path invalid"):
+        runtime_temp.WindowsDirectoryAuthority(Path(r"\\.\pipe\aiworkhub-not-a-dir"))
+    kernel32 = _FakeDirectoryKernel32(
+        handle=_WIDE_HANDLE,
+        final_path=r"\\?\UNC\server\share\escaped",
+        volume_serial=3,
+        file_id=4,
+        pages=[],
+    )
+    _install_directory_kernel32(monkeypatch, kernel32)
+    with pytest.raises(runtime_temp.RuntimeTempError, match="escapes root"):
+        runtime_temp.WindowsDirectoryAuthority(Path(r"\\server\share\root"))
+
+
+def test_windows_directory_authority_final_path_decodes_non_bmp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    glyph = "\U0001F600"
+    root = Path("C:/aiworkhub-enum-root/" + glyph)
+    final = _ENUM_FINAL + "\\" + glyph
+    kernel32 = _FakeDirectoryKernel32(
+        handle=_WIDE_HANDLE,
+        final_path=final,
+        volume_serial=9,
+        file_id=9,
+        pages=[],
+    )
+    _install_directory_kernel32(monkeypatch, kernel32)
+    auth = runtime_temp.WindowsDirectoryAuthority(root)
+    try:
+        decoded = runtime_temp.WindowsDirectoryAuthority._final_path(auth.handle)
+        assert glyph in decoded
+        assert all(not (0xD800 <= ord(ch) <= 0xDFFF) for ch in decoded)
+    finally:
+        auth.close()
+
+
+def test_windows_directory_authority_final_path_rejects_malformed_utf16(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel32 = _FakeDirectoryKernel32(
+        handle=_WIDE_HANDLE,
+        final_path=_ENUM_FINAL + "\ud800",
+        volume_serial=9,
+        file_id=9,
+        pages=[],
+    )
+    _install_directory_kernel32(monkeypatch, kernel32)
+    with pytest.raises(runtime_temp.RuntimeTempError, match="final path invalid"):
+        runtime_temp.WindowsDirectoryAuthority(_ENUM_ROOT)
+    glyph = "\U0001F600"
+    truncated = _ENUM_FINAL + "\\" + glyph
+    kernel32 = _FakeDirectoryKernel32(
+        handle=_WIDE_HANDLE,
+        final_path=truncated,
+        volume_serial=9,
+        file_id=9,
+        pages=[],
+        final_written=len(truncated.encode("utf-16-le")) // 2 - 1,
+    )
+    _install_directory_kernel32(monkeypatch, kernel32)
+    with pytest.raises(runtime_temp.RuntimeTempError, match="final path invalid"):
+        runtime_temp.WindowsDirectoryAuthority(_ENUM_ROOT)
+
+
+def test_windows_directory_authority_enum_nonterminal_error_drops_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page1 = _pack_file_id_both_dir_info([("kept-internal", 21, 0x80)])
+    auth, kernel32 = _open_authority(
+        monkeypatch, pages=[page1], enum_error_after=1, enum_error=5
+    )
+    with pytest.raises(runtime_temp.RuntimeTempError, match="enumeration failed"):
+        auth.enumerate_entries()
+    auth.close()
+    assert kernel32.dir_info_classes[0] == (
+        runtime_temp._WINDOWS_FILE_ID_BOTH_DIRECTORY_RESTART_INFO
+    )
+
+
+def test_windows_directory_authority_malformed_batch_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth, _kernel32 = _open_authority(monkeypatch, pages=[b"\x00" * 40])
+    with pytest.raises(runtime_temp.RuntimeTempError, match="malformed"):
+        auth.enumerate_entries()
+    auth.close()
+
+
+def test_windows_directory_authority_checked_close_retry_and_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _pack_file_id_both_dir_info([("retryable", 31, 0x80)])
+    auth, kernel32 = _open_authority(
+        monkeypatch, pages=[page], close_results=[0, 1]
+    )
+    with pytest.raises(runtime_temp.RuntimeTempError, match="close failed"):
+        auth.close()
+    assert auth.closed is False
+    retry_entries = auth.enumerate_entries()
+    assert [entry.name for entry in retry_entries] == ["retryable"]
+    assert kernel32.close_handles == [_WIDE_HANDLE]
+    auth.close()
+    assert auth.closed is True
+    assert kernel32.close_handles == [_WIDE_HANDLE, _WIDE_HANDLE]
+    auth.close()
+    assert kernel32.close_handles == [_WIDE_HANDLE, _WIDE_HANDLE]
+    nested, nested_kernel = _open_authority(
+        monkeypatch, pages=[page], close_results=[0]
+    )
+    with pytest.raises(runtime_temp.RuntimeTempError, match="close failed"):
+        with nested:
+            pass
+    assert nested.closed is False
+    nested_kernel.close_results = [1]
+    nested.close()
+    assert nested.closed is True
+
+
+def test_windows_close_handle_owner_manifest_remains_non_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CloseHandle:
+        argtypes = None
+        restype = None
+
+        def __call__(self, handle: object) -> int:
+            del handle
+            return 0
+
+    class Kernel32:
+        pass
+
+    kernel32 = Kernel32()
+    kernel32.CloseHandle = CloseHandle()
+    monkeypatch.setattr(
+        runtime_temp.ctypes,
+        "WinDLL",
+        lambda name, use_last_error=True: kernel32,
+        raising=False,
+    )
+    runtime_temp._windows_close_handle(_WIDE_HANDLE)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows directory canary")
+def test_windows_directory_authority_native_file_id_canary(tmp_path: Path) -> None:
+    root = tmp_path / "native-dir"
+    root.mkdir()
+    regular = root / "regular.txt"
+    regular.write_text("payload", encoding="utf-8")
+    child = root / "child_dir"
+    child.mkdir()
+    first = runtime_temp.WindowsDirectoryAuthority(root)
+    second = runtime_temp.WindowsDirectoryAuthority(root)
+    try:
+        left = {entry.name: entry for entry in first.enumerate_entries()}
+        right = {entry.name: entry for entry in second.enumerate_entries()}
+        for name in ("regular.txt", "child_dir"):
+            assert name in left and name in right
+            assert left[name].file_id > 0
+            assert left[name].file_id == right[name].file_id
+            assert left[name].file_attributes == right[name].file_attributes
+            assert left[name].is_directory == right[name].is_directory
+        assert left["regular.txt"].is_directory is False
+        assert left["child_dir"].is_directory is True
+        assert first.volume_serial > 0
+        assert first.file_id > 0
+        assert first.volume_serial == second.volume_serial
+        assert first.file_id == second.file_id
+    finally:
+        first.close()
+        second.close()
+    (root / "after-close.txt").write_text("writable", encoding="utf-8")
+    assert (root / "after-close.txt").read_text(encoding="utf-8") == "writable"
