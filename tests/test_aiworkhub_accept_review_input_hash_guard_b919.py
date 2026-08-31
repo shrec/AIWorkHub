@@ -31,6 +31,7 @@ import copy
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import time
 import types
@@ -178,7 +179,7 @@ def _restore_aiworkhub_sys_modules() -> None:
 _ensure_aiworkhub_sibling_stubs()
 
 try:
-    from aiworkhub import process_launcher  # noqa: E402
+    from aiworkhub import process_launcher, task_store  # noqa: E402
 except BaseException:
     # Collection failures never reach fixture teardown.
     _restore_aiworkhub_sys_modules()
@@ -337,7 +338,9 @@ def _fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
                     "request_id": request_id,
                     "path": str(workspace_dir),
                     "home": str(workspace_dir),
+                    "base_oid": "fixture-base-oid",
                 },
+                "changed_paths": [output_relative],
                 "changed_path_hashes": {
                     output_relative: hashlib.sha256(output_bytes).hexdigest(),
                 },
@@ -443,13 +446,30 @@ def _fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
     accept_review_calls: list[dict] = []
 
-    def _accept_review(_repo: Path, _task_id: str, *, runner: str, topic: str, request_id: str, evidence: dict) -> dict:
+    def _accept_review(
+        _repo: Path,
+        _task_id: str,
+        *,
+        runner: str,
+        topic: str,
+        request_id: str,
+        evidence: dict,
+        accepted_outcome_receipt: dict,
+    ) -> dict:
         accept_review_calls.append({
-            "runner": runner, "topic": topic, "request_id": request_id, "evidence": evidence,
+            "runner": runner,
+            "topic": topic,
+            "request_id": request_id,
+            "evidence": evidence,
+            "accepted_outcome_receipt": accepted_outcome_receipt,
         })
         card["status"] = "finished"
         card["worker_status"] = "done"
         card["accepted_request_id"] = request_id
+        card["accept_evidence"] = {
+            **evidence,
+            "accepted_outcome_receipt": accepted_outcome_receipt,
+        }
         return {"ok": True, "returncode": 0, "command": [], "stdout": "", "stderr": ""}
 
     monkeypatch.setattr(process_launcher.task_engine, "accept_review", _accept_review)
@@ -528,8 +548,72 @@ def test_accept_review_promotes_exactly_once_when_input_unchanged(
     assert result["ok"] is True
     assert promote_calls == [["out/result.txt"]]
     assert len(accept_review_calls) == 1
+
+
+def test_process_manager_accept_review_persists_receipt_in_real_task_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real_accept_review = process_launcher.task_engine.accept_review
+    (
+        manager,
+        card,
+        request_id,
+        task_id,
+        runner,
+        topic,
+        repo,
+        _workspace_dir,
+        promote_calls,
+        accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        process_launcher.task_engine, "accept_review", real_accept_review
+    )
+    task_store.initialize_repository(repo)
+    _readiness, db_path = task_store._require_ready(repo)
+    now = "2026-08-31T00:00:00+00:00"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
+            "objective, card_json, created_at, updated_at, claimed_by, claimed_at, "
+            "started_at) VALUES (?, ?, ?, 'review', 'review', '', '', ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                topic,
+                json.dumps(card, sort_keys=True),
+                now,
+                now,
+                runner,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = manager.accept_review(request_id, task_id)
+
+    assert result["ok"] is True
+    stored = task_store.get_task(repo, task_id)
+    receipt = result["accepted_outcome_receipt"]
+    assert stored["accept_evidence"]["accepted_outcome_receipt"] == receipt
+    conn = sqlite3.connect(db_path)
+    try:
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM task_events WHERE task_id=? AND event=?",
+                (task_id, "accept_review"),
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+    assert payload["accepted_outcome_receipt"] == receipt
+    assert stored["accept_evidence"]["attempt_artifact_manifest"]
     assert (repo / "out" / "result.txt").read_bytes() == b"worker-result\n"
-    assert card["status"] == "finished"
+    assert stored["status"] == "finished"
 
     # Idempotent retry of the same request against the now-finished task:
     # short-circuits to already_accepted, never promotes/finalizes again.
@@ -537,7 +621,15 @@ def test_accept_review_promotes_exactly_once_when_input_unchanged(
     assert retry["ok"] is True
     assert retry.get("already_accepted") is True
     assert promote_calls == [["out/result.txt"]]
-    assert len(accept_review_calls) == 1
+    conn = sqlite3.connect(db_path)
+    try:
+        accept_event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND event=?",
+            (task_id, "accept_review"),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert accept_event_count == 1
 
 
 def test_accept_review_guard_is_noop_without_declared_immutable_inputs(

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import sys
+from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,6 +15,59 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import core, task_engine, task_store  # noqa: E402
+
+
+def _acceptance_kwargs(repo: Path) -> dict[str, Any]:
+    """Seal a minimal real candidate and return manager-shaped acceptance inputs."""
+    output = repo / "out.txt"
+    output.write_bytes(b"accepted\n")
+    digest = hashlib.sha256(output.read_bytes()).hexdigest()
+    manifest = {"schema_id": "aiworkhub.attempt_artifact_manifest.v1", "entries": []}
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        card = json.loads(
+            conn.execute(
+                "SELECT card_json FROM tasks WHERE task_id=?", ("TASK_B891",)
+            ).fetchone()[0]
+        )
+        card["claim_epoch"] = 2
+        sealed = card["terminal_review"]["evidence"]
+        sealed.update(
+            {
+                "changed_paths": ["out.txt"],
+                "changed_path_hashes": {"out.txt": digest},
+                "attempt_artifact_manifest": manifest,
+                "workspace": {"base_oid": "base-oid"},
+            }
+        )
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card, sort_keys=True), "TASK_B891"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    unsigned = {
+        "schema_id": task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
+        "task_id": "TASK_B891",
+        "request_id": "req-accept-b1",
+        "claim_epoch": 2,
+        "base_oid": "base-oid",
+        "promoted_paths": ["out.txt"],
+        "changed_path_hashes": {"out.txt": digest},
+        "attempt_artifact_manifest_id": task_engine._canonical_json_hash(manifest),
+        "repository_revision": "sha256:"
+        + task_engine._canonical_json_hash(
+            {"base_oid": "base-oid", "changed_path_hashes": {"out.txt": digest}}
+        ),
+    }
+    receipt = dict(unsigned)
+    receipt["receipt_id"] = "sha256:" + task_engine._canonical_json_hash(unsigned)
+    return {
+        "evidence": {"promoted_paths": ["out.txt"], "validation": [{"ok": True}]},
+        "accepted_outcome_receipt": receipt,
+    }
 
 
 def _repo_with_task(tmp_path: Path, *, status: str = "processing") -> Path:
@@ -130,13 +186,14 @@ def _repo_with_review_ready_task(tmp_path: Path, *, request_id: str = "req-accep
 
 def test_accept_review_promotes_and_finishes(tmp_path: Path) -> None:
     repo = _repo_with_review_ready_task(tmp_path)
+    acceptance = _acceptance_kwargs(repo)
     result = task_engine.accept_review(
         repo,
         "TASK_B891",
         runner="codex_worker_b891",
         topic="task_mcp",
         request_id="req-accept-b1",
-        evidence={"promoted_paths": ["out.txt"]},
+        **acceptance,
     )
     assert result["ok"] is True
 
@@ -145,14 +202,30 @@ def test_accept_review_promotes_and_finishes(tmp_path: Path) -> None:
     assert card["status"] == "finished"
     assert card["worker_status"] == "done"
     assert card["accepted_request_id"] == "req-accept-b1"
+    receipt = acceptance["accepted_outcome_receipt"]
+    assert card["accept_evidence"]["promoted_paths"] == ["out.txt"]
+    assert card["accept_evidence"]["accepted_outcome_receipt"] == receipt
     events = task_store.get_task_events(repo, "TASK_B891")
     assert events[0]["event"] == "accept_review"
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        event_payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM task_events WHERE task_id=? AND event=?",
+                ("TASK_B891", "accept_review"),
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+    assert event_payload["accepted_outcome_receipt"] == receipt
 
 
 def test_accept_review_cas_preserves_rival_terminal_transition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = _repo_with_review_ready_task(tmp_path)
+    acceptance = _acceptance_kwargs(repo)
     _readiness, db_path = task_store._require_ready(repo)
     real_connect = task_store._connect
 
@@ -205,6 +278,7 @@ def test_accept_review_cas_preserves_rival_terminal_transition(
         runner="codex_worker_b891",
         topic="task_mcp",
         request_id="req-accept-b1",
+        **acceptance,
     )
 
     assert result["ok"] is False
@@ -248,9 +322,10 @@ def test_missing_review_workspace_enqueues_finalize_failed_callback(tmp_path: Pa
 
 def test_accept_review_idempotent_retry_returns_already_accepted(tmp_path: Path) -> None:
     repo = _repo_with_review_ready_task(tmp_path)
+    acceptance = _acceptance_kwargs(repo)
     first = task_engine.accept_review(
         repo, "TASK_B891", runner="codex_worker_b891", topic="task_mcp",
-        request_id="req-accept-b1",
+        request_id="req-accept-b1", **acceptance,
     )
     assert first["ok"] is True
     retry = task_engine.accept_review(
@@ -258,14 +333,20 @@ def test_accept_review_idempotent_retry_returns_already_accepted(tmp_path: Path)
         request_id="req-accept-b1",
     )
     assert retry["ok"] is True
-    assert json.loads(retry["stdout"])["already_accepted"] is True
+    retry_payload = json.loads(retry["stdout"])
+    assert retry_payload["already_accepted"] is True
+    assert (
+        retry_payload["accepted_outcome_receipt"]
+        == acceptance["accepted_outcome_receipt"]
+    )
 
 
 def test_accept_review_rejects_different_request_after_finish(tmp_path: Path) -> None:
     repo = _repo_with_review_ready_task(tmp_path)
+    acceptance = _acceptance_kwargs(repo)
     first = task_engine.accept_review(
         repo, "TASK_B891", runner="codex_worker_b891", topic="task_mcp",
-        request_id="req-accept-b1",
+        request_id="req-accept-b1", **acceptance,
     )
     assert first["ok"] is True
     other = task_engine.accept_review(
@@ -274,6 +355,104 @@ def test_accept_review_rejects_different_request_after_finish(tmp_path: Path) ->
     )
     assert other["ok"] is False
     assert "already_finished" in other["stderr"]
+
+
+@pytest.mark.parametrize(
+    ("field", "forged"),
+    [
+        ("task_id", "TASK_FORGED"),
+        ("request_id", "request-forged"),
+        ("claim_epoch", 99),
+        ("promoted_paths", []),
+        ("changed_path_hashes", {"out.txt": "0" * 64}),
+        ("repository_revision", "sha256:" + "0" * 64),
+    ],
+)
+def test_accept_review_rejects_forged_receipt_identity(
+    tmp_path: Path, field: str, forged: object
+) -> None:
+    repo = _repo_with_review_ready_task(tmp_path)
+    acceptance = _acceptance_kwargs(repo)
+    tampered = deepcopy(acceptance)
+    tampered["accepted_outcome_receipt"][field] = forged
+
+    result = task_engine.accept_review(
+        repo,
+        "TASK_B891",
+        runner="codex_worker_b891",
+        topic="task_mcp",
+        request_id="req-accept-b1",
+        **tampered,
+    )
+
+    assert result["ok"] is False
+    assert "accepted_outcome_receipt" in result["stderr"]
+    assert task_store.get_task(repo, "TASK_B891")["status"] == "review"
+
+
+def test_accept_review_supports_authenticated_readonly_empty_candidate(tmp_path: Path) -> None:
+    repo = _repo_with_review_ready_task(tmp_path)
+    acceptance = _acceptance_kwargs(repo)
+    (repo / "out.txt").unlink()
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        card = json.loads(
+            conn.execute(
+                "SELECT card_json FROM tasks WHERE task_id=?", ("TASK_B891",)
+            ).fetchone()[0]
+        )
+        sealed = card["terminal_review"]["evidence"]
+        sealed["changed_paths"] = []
+        sealed["changed_path_hashes"] = {}
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card, sort_keys=True), "TASK_B891"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    receipt = acceptance["accepted_outcome_receipt"]
+    receipt["promoted_paths"] = []
+    receipt["changed_path_hashes"] = {}
+    receipt["repository_revision"] = "sha256:" + task_engine._canonical_json_hash(
+        {"base_oid": "base-oid", "changed_path_hashes": {}}
+    )
+    unsigned = {key: value for key, value in receipt.items() if key != "receipt_id"}
+    receipt["receipt_id"] = "sha256:" + task_engine._canonical_json_hash(unsigned)
+    acceptance["evidence"]["promoted_paths"] = []
+
+    result = task_engine.accept_review(
+        repo,
+        "TASK_B891",
+        runner="codex_worker_b891",
+        topic="task_mcp",
+        request_id="req-accept-b1",
+        **acceptance,
+    )
+
+    assert result["ok"] is True
+    card = task_store.get_task(repo, "TASK_B891")
+    assert card["accept_evidence"]["accepted_outcome_receipt"]["promoted_paths"] == []
+
+
+def test_accept_review_rejects_caller_receipt_override_in_evidence(tmp_path: Path) -> None:
+    repo = _repo_with_review_ready_task(tmp_path)
+    acceptance = _acceptance_kwargs(repo)
+    acceptance["evidence"]["accepted_outcome_receipt"] = {"forged": True}
+
+    result = task_engine.accept_review(
+        repo,
+        "TASK_B891",
+        runner="codex_worker_b891",
+        topic="task_mcp",
+        request_id="req-accept-b1",
+        **acceptance,
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"] == "accept_evidence_malformed"
+    assert task_store.get_task(repo, "TASK_B891")["status"] == "review"
 
 
 def test_accept_review_rejects_non_review_ready_substatus(tmp_path: Path) -> None:

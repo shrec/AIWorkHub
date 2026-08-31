@@ -24,6 +24,7 @@ whose canonical SQLite row always wins over any stale ``card_json`` copy.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -597,6 +598,105 @@ def retry_finalize_failed(
     }
 
 
+ACCEPTED_OUTCOME_RECEIPT_SCHEMA = "aiworkhub.accepted_outcome_receipt.v1"
+
+
+def _canonical_json_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+
+
+def _validate_accepted_outcome_receipt(
+    repo: Path,
+    card: dict[str, Any],
+    task_id: str,
+    request_id: str,
+    receipt: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str]:
+    if not isinstance(receipt, dict):
+        return None, "accepted_outcome_receipt_missing"
+    required = {
+        "schema_id", "receipt_id", "task_id", "request_id", "claim_epoch",
+        "base_oid", "promoted_paths", "changed_path_hashes",
+        "attempt_artifact_manifest_id", "repository_revision",
+    }
+    if (
+        set(receipt) != required
+        or receipt.get("schema_id") != ACCEPTED_OUTCOME_RECEIPT_SCHEMA
+    ):
+        return None, "accepted_outcome_receipt_malformed"
+    digest_fields = (
+        receipt.get("receipt_id"),
+        receipt.get("attempt_artifact_manifest_id"),
+        receipt.get("repository_revision"),
+    )
+    promoted_paths = receipt.get("promoted_paths")
+    if (
+        not isinstance(receipt.get("task_id"), str)
+        or not isinstance(receipt.get("request_id"), str)
+        or not isinstance(receipt.get("claim_epoch"), int)
+        or isinstance(receipt.get("claim_epoch"), bool)
+        or not isinstance(receipt.get("base_oid"), str)
+        or not receipt.get("base_oid")
+        or not isinstance(promoted_paths, list)
+        or any(not isinstance(path, str) for path in promoted_paths)
+        or promoted_paths != sorted(set(promoted_paths))
+        or not isinstance(receipt.get("changed_path_hashes"), dict)
+        or any(
+            not isinstance(raw_digest, str)
+            or len(raw_digest.removeprefix("sha256:")) != 64
+            or any(
+                char not in "0123456789abcdef"
+                for char in raw_digest.removeprefix("sha256:")
+            )
+            for raw_digest in digest_fields
+        )
+    ):
+        return None, "accepted_outcome_receipt_malformed"
+    terminal = card.get("terminal_review") or {}
+    sealed = terminal.get("evidence") or {}
+    paths = sorted(str(path) for path in (sealed.get("changed_paths") or []))
+    hashes = sealed.get("changed_path_hashes")
+    manifest = sealed.get("attempt_artifact_manifest")
+    workspace = sealed.get("workspace") or {}
+    expected = {
+        "schema_id": ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": int(card.get("claim_epoch") or 0),
+        "base_oid": str(workspace.get("base_oid") or ""),
+        "promoted_paths": paths,
+        "changed_path_hashes": hashes,
+        "attempt_artifact_manifest_id": _canonical_json_hash(manifest),
+    }
+    if not isinstance(hashes, dict) or not isinstance(manifest, dict):
+        return None, "accepted_outcome_receipt_sealed_evidence_missing"
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        return None, "accepted_outcome_receipt_identity_mismatch"
+    canonical_hashes: dict[str, str | None] = {}
+    for relative in paths:
+        path = repo / relative
+        canonical_hashes[relative] = (
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            if path.is_file() and not path.is_symlink() else None
+        )
+    if canonical_hashes != hashes:
+        return None, "accepted_outcome_receipt_canonical_hash_mismatch"
+    revision = "sha256:" + _canonical_json_hash({
+        "base_oid": expected["base_oid"], "changed_path_hashes": canonical_hashes,
+    })
+    if receipt.get("repository_revision") != revision:
+        return None, "accepted_outcome_receipt_revision_mismatch"
+    unsigned = dict(receipt)
+    receipt_id = str(unsigned.pop("receipt_id", ""))
+    if receipt_id != "sha256:" + _canonical_json_hash(unsigned):
+        return None, "accepted_outcome_receipt_id_mismatch"
+    return dict(receipt), ""
+
+
 def accept_review(
     repo: Path,
     task_id: str,
@@ -605,6 +705,7 @@ def accept_review(
     topic: str,
     request_id: str,
     evidence: dict[str, Any] | None = None,
+    accepted_outcome_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Coordinator-only promotion finalize: ``review`` -> ``finished``.
 
@@ -664,13 +765,26 @@ def accept_review(
         worker_status = str(row["worker_status"] or "")
         if status == "finished" or worker_status == "done":
             already = str(card.get("accepted_request_id") or "") == request_id
+            persisted_evidence = card.get("accept_evidence") or {}
+            persisted_receipt = (
+                persisted_evidence.get("accepted_outcome_receipt")
+                if isinstance(persisted_evidence, dict)
+                else None
+            )
             conn.rollback()
             return {
                 "ok": already,
                 "returncode": 0 if already else 1,
                 "command": command,
                 "stdout": json.dumps(
-                    {"task_id": task_id, "already_accepted": already}, ensure_ascii=False
+                    {
+                        "task_id": task_id,
+                        "already_accepted": already,
+                        "accepted_outcome_receipt": (
+                            persisted_receipt if already else None
+                        ),
+                    },
+                    ensure_ascii=False,
                 ),
                 "stderr": "" if already else "task_already_finished_by_other_request",
             }
@@ -697,10 +811,30 @@ def accept_review(
                 "ok": False, "returncode": 1, "command": command, "stdout": "",
                 "stderr": f"task_not_reviewable:status={status}:worker_status={worker_status}",
             }
+        receipt, receipt_error = _validate_accepted_outcome_receipt(
+            repo, card, task_id, request_id, accepted_outcome_receipt
+        )
+        if receipt is None:
+            conn.rollback()
+            return {
+                "ok": False,
+                "returncode": 1,
+                "command": command,
+                "stdout": "",
+                "stderr": receipt_error,
+            }
+        if not isinstance(evidence, dict) or "accepted_outcome_receipt" in evidence:
+            conn.rollback()
+            return {
+                "ok": False, "returncode": 1, "command": command, "stdout": "",
+                "stderr": "accept_evidence_malformed",
+            }
+        acceptance_evidence = dict(evidence)
+        acceptance_evidence["accepted_outcome_receipt"] = receipt
         card["accepted_request_id"] = request_id
         card["accepted_by"] = runner
         card["accepted_at"] = now
-        card["accept_evidence"] = dict(evidence or {})
+        card["accept_evidence"] = acceptance_evidence
         update = conn.execute(
             "UPDATE tasks SET status='finished', worker_status='done', "
             "completed_at=COALESCE(NULLIF(completed_at, ''), ?), updated_at=?, card_json=? "
@@ -733,7 +867,10 @@ def accept_review(
             (
                 task_id, "accept_review", runner,
                 json.dumps(
-                    {"request_id": request_id, **(evidence or {})},
+                    {
+                        "request_id": request_id,
+                        **acceptance_evidence,
+                    },
                     ensure_ascii=False, default=str, sort_keys=True,
                 ),
                 now,

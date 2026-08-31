@@ -2887,6 +2887,50 @@ def _changed_path_hashes(
     return hashes
 
 
+def _accepted_outcome_receipt(
+    repo: Path,
+    *,
+    task_id: str,
+    request_id: str,
+    claim_epoch: int,
+    base_oid: str,
+    promoted_paths: list[str],
+    changed_path_hashes: dict[str, str | None],
+    attempt_artifact_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the sole canonical, post-promotion acceptance identity."""
+    if not base_oid or not isinstance(attempt_artifact_manifest, dict):
+        raise WorkspaceError("accepted_outcome_identity_incomplete")
+    paths = sorted(promoted_paths)
+    canonical_hashes: dict[str, str | None] = {}
+    for relative in paths:
+        path = repo / relative
+        canonical_hashes[relative] = (
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            if path.is_file() and not path.is_symlink() else None
+        )
+    if paths != sorted(changed_path_hashes) or canonical_hashes != changed_path_hashes:
+        raise WorkspaceError("post_promotion_candidate_mismatch")
+    digest = lambda value: hashlib.sha256(  # noqa: E731 - local canonical primitive
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    receipt: dict[str, Any] = {
+        "schema_id": task_engine.ACCEPTED_OUTCOME_RECEIPT_SCHEMA,
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": int(claim_epoch),
+        "base_oid": base_oid,
+        "promoted_paths": paths,
+        "changed_path_hashes": canonical_hashes,
+        "attempt_artifact_manifest_id": digest(attempt_artifact_manifest),
+        "repository_revision": "sha256:" + digest({
+            "base_oid": base_oid, "changed_path_hashes": canonical_hashes,
+        }),
+    }
+    receipt["receipt_id"] = "sha256:" + digest(receipt)
+    return receipt
+
+
 def _committed_claim_card(
     result: Mapping[str, Any],
     *,
@@ -13181,6 +13225,23 @@ class ProcessManager:
                 }
 
             canonical = _canonical_task_status(card)
+            # ``show_task`` may be an adapter boundary whose in-memory view
+            # lags the canonical store after TaskEngine commits acceptance.
+            # Reconcile that durable row before deciding whether an identical
+            # retry may enter promotion again.  The direct store read is only
+            # an authority upgrade: if the store is unavailable, the normal
+            # fail-closed checks below still govern the supplied card.
+            if canonical != "finished":
+                try:
+                    stored_card = task_store.get_task(self.repo, task_id)
+                except (task_store.TaskStoreError, OSError, TypeError, ValueError):
+                    stored_card = None
+                if (
+                    isinstance(stored_card, dict)
+                    and _canonical_task_status(stored_card) == "finished"
+                ):
+                    card = stored_card
+                    canonical = "finished"
             if canonical == "finished":
                 already = str(card.get("accepted_request_id") or "") == request_id
                 closure = (
@@ -13194,6 +13255,10 @@ class ProcessManager:
                     "request_id": request_id,
                     "task_id": task_id,
                     "error": "" if already else "task_already_finished_by_other_request",
+                    "accepted_outcome_receipt": (
+                        (card.get("accept_evidence") or {}).get("accepted_outcome_receipt")
+                        if already else None
+                    ),
                     "needfix_closure": closure,
                 }
             if canonical != "review":
@@ -14105,6 +14170,26 @@ class ProcessManager:
 
             promoted = self._promote_accepted_candidate(workspace, changed)
 
+            try:
+                accepted_outcome_receipt = _accepted_outcome_receipt(
+                    self.repo,
+                    task_id=task_id,
+                    request_id=request_id,
+                    claim_epoch=int(card.get("claim_epoch") or 0),
+                    base_oid=str(workspace_meta.get("base_oid") or ""),
+                    promoted_paths=promoted,
+                    changed_path_hashes=stored_hashes,
+                    attempt_artifact_manifest=attempt_artifact_receipt,
+                )
+            except (OSError, TypeError, ValueError, WorkspaceError) as exc:
+                return {
+                    "ok": False,
+                    "error": f"accepted_outcome_receipt_failed:{exc}",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "promoted_paths": promoted,
+                }
+
             acceptance_evidence_record = self._canonical_outcome_evidence(
                 request_id,
                 attempt_artifact_receipt,
@@ -14130,6 +14215,7 @@ class ProcessManager:
                     "acceptance_evidence_record": acceptance_evidence_record,
                     "attempt_artifact_manifest": attempt_artifact_receipt,
                 },
+                accepted_outcome_receipt=accepted_outcome_receipt,
             )
             if not accept_result.get("ok"):
                 return {
@@ -14198,6 +14284,7 @@ class ProcessManager:
                     "cleanup_error": str(exc)[:500],
                     "reviewer_finalization": reviewer_finalization,
                     "acceptance_evidence_record": acceptance_evidence_record,
+                    "accepted_outcome_receipt": accepted_outcome_receipt,
                     "needfix_closure": needfix_closure,
                     "finished_at": _utcnow(),
                 })
@@ -14209,6 +14296,7 @@ class ProcessManager:
                     "cleanup_error": str(exc)[:500],
                     "reviewer_finalization": reviewer_finalization,
                     "acceptance_evidence_record": acceptance_evidence_record,
+                    "accepted_outcome_receipt": accepted_outcome_receipt,
                     "needfix_closure": needfix_closure,
                 }
 
@@ -14224,6 +14312,7 @@ class ProcessManager:
                 "workspace_retained": False,
                 "reviewer_finalization": reviewer_finalization,
                 "acceptance_evidence_record": acceptance_evidence_record,
+                "accepted_outcome_receipt": accepted_outcome_receipt,
                 "needfix_closure": needfix_closure,
                 "finished_at": _utcnow(),
             })
@@ -14234,6 +14323,7 @@ class ProcessManager:
                 "promoted_paths": promoted,
                 "reviewer_finalization": reviewer_finalization,
                 "acceptance_evidence_record": acceptance_evidence_record,
+                "accepted_outcome_receipt": accepted_outcome_receipt,
                 "needfix_closure": needfix_closure,
             }
 

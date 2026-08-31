@@ -9080,3 +9080,42 @@ def test_verified_quality_review_receipt_ingests_jsonl_once_across_retry(
     authenticated_entry = json.loads(ledger_lines[0])
     assert authenticated_entry["provenance"] == "live"
     assert authenticated_entry["authority_source"] == "supervisor"
+
+
+def test_accepted_outcome_receipt_binds_promoted_repository_bytes(tmp_path: Path) -> None:
+    (tmp_path / "result.txt").write_bytes(b"canonical-result\n")
+    digest = hashlib.sha256(b"canonical-result\n").hexdigest()
+
+    receipt = process_launcher._accepted_outcome_receipt(
+        tmp_path,
+        task_id="TASK_RECEIPT",
+        request_id="request-receipt",
+        claim_epoch=3,
+        base_oid="base-oid",
+        promoted_paths=["result.txt"],
+        changed_path_hashes={"result.txt": digest},
+        attempt_artifact_manifest={"entries": []},
+    )
+
+    assert receipt["promoted_paths"] == ["result.txt"]
+    assert receipt["changed_path_hashes"] == {"result.txt": digest}
+    assert receipt["repository_revision"].startswith("sha256:")
+    assert receipt["receipt_id"].startswith("sha256:")
+
+
+def test_accepted_outcome_receipt_rejects_post_promotion_byte_mismatch(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "result.txt").write_bytes(b"forged\n")
+
+    with pytest.raises(process_launcher.WorkspaceError, match="candidate_mismatch"):
+        process_launcher._accepted_outcome_receipt(
+            tmp_path,
+            task_id="TASK_RECEIPT",
+            request_id="request-receipt",
+            claim_epoch=3,
+            base_oid="base-oid",
+            promoted_paths=["result.txt"],
+            changed_path_hashes={"result.txt": "0" * 64},
+            attempt_artifact_manifest={"entries": []},
+        )
