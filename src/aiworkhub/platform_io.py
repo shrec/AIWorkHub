@@ -49,13 +49,11 @@ class _PlatformProcessBackend(Protocol):
     def process_is_alive(self, pid: int) -> bool: ...
 
 
-_platform_process_backend = cast(
-    _PlatformProcessBackend,
-    importlib.import_module(
-        "._platform_process" if __package__ else "_platform_process",
-        __package__ or None,
-    ),
+_platform_process = importlib.import_module(
+    "._platform_process" if __package__ else "_platform_process",
+    __package__ or None,
 )
+_platform_process_backend = cast(_PlatformProcessBackend, _platform_process)
 
 
 def _normalized_platform(platform_name: str | None = None) -> str:
