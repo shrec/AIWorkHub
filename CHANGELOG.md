@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.76] - 2026-09-01
+
+### Added
+
+- Quality-review Source Graph partition readiness is honored before review work runs.
+- Canonical platform OS primitives are available, with OS dependency ratchets
+  covering the full source tree.
+
+### Fixed
+
+- Credential permission calls and remaining chmod facades now use central
+  consolidation points.
+- Agent process-list responses are bounded, stale terminal task families archive
+  safely, and live usage binds to exact task claims.
+
+### Notes
+
+- Remaining process-callsite interface migration, full consolidation, B5 preview
+  measurement, NF546 and other pending work are not complete in this release.
+
 ## [0.10.75] - 2026-09-01
 
 ### Added

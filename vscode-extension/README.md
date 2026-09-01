@@ -12,6 +12,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.76 — 2026-09-01
+
+- Quality-review Source Graph partition readiness is honored before review work runs.
+- Canonical platform OS primitives are available, with OS dependency ratchets
+  covering the full source tree.
+- Credential permission calls and remaining chmod facades now use central
+  consolidation points.
+- Agent process-list responses are bounded, stale terminal task families archive
+  safely, and live usage binds to exact task claims.
+- Remaining process-callsite interface migration, full consolidation, B5 preview
+  measurement, NF546 and other pending work are not complete in this release.
+
 ## What's new in 0.10.75 — 2026-09-01
 
 - Platform process launching now runs through a facade with direct-import parity.
