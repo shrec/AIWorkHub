@@ -65,6 +65,38 @@ from . import process_event_ledger
 from .process_launcher_acceptance import accepted_outcome_receipt as _accepted_outcome_receipt
 from .process_launcher_acceptance import changed_path_hashes as _changed_path_hashes
 from .process_launcher_acceptance import finished_acceptance_result as _finished_acceptance_result
+from .launch_replay_guard import (
+    CARD_CONTENT_IDENTITY_KEYS,
+    IDENTICAL_RELAUNCH_BLOCKED_REASON,
+    TASK_CONTRACT_KEYS,
+    TERMINAL_ERROR_HASH_HEX_CHARS,
+    bounded_error_hash,
+    card_content_identity,
+    identical_relaunch_refusal,
+    review_feedback_identity,
+    strip_persistence_envelopes as _strip_persistence_envelopes,
+)
+from .launch_zero_delta import (
+    RUNTIME_NOTICE_EVENT_KIND,
+    ZERO_DELTA_DEFAULT_ELAPSED_SHARE,
+    ZERO_DELTA_ELAPSED_SHARE_ENV,
+    ZERO_DELTA_MAX_SECONDS,
+    ZERO_DELTA_MIN_SECONDS,
+    ZERO_DELTA_NOTICE,
+    ZERO_DELTA_POLL_SECONDS,
+    ZeroDeltaTripwire,
+    changed_allowed_write_paths,
+    evaluate_zero_delta_tripwire,
+    zero_delta_elapsed_share,
+    zero_delta_notice_after_seconds,
+)
+from .process_launcher_evidence import (
+    DELTA_RETAINING_TERMINAL_STATES,
+    is_rework_attempt as _is_rework_attempt,
+    path_manifest as _path_manifest,
+    retained_candidate_identity_evidence as _retained_candidate_identity_evidence,
+    retained_rework_candidate_evidence,
+)
 from . import process_launcher_validation as _launcher_validation
 from .process_launcher_read_efficiency import (
     _provider_read_efficiency_from_output,
@@ -275,169 +307,6 @@ if hasattr(_worker_workspace, "validate_required_outputs"):
 else:
     validate_required_outputs = _fallback_validate_required_outputs
     _worker_workspace.validate_required_outputs = validate_required_outputs
-
-
-# --- NF-2026-00548 (audit M3): in-run zero-delta tripwire -----------------
-#
-# Measured 2026-09-01: six attempts across five cards ran a full worker cycle
-# (about ten minutes plus provisioning each, one burning 76k tokens) without
-# touching a single required output, and that only surfaced at finalization as
-# ``required_output_unchanged``.  The supervisor monitor already waits on the
-# isolated workspace, so once a meaningful share of the declared run has
-# elapsed with zero delta inside ``allowed_writes`` it publishes ONE explicit
-# machine-readable notice into the process event stream.
-#
-# This is a notice, never an enforcement action: it does not kill the worker,
-# it does not transition the card, and it carries no lifecycle ``state`` so no
-# reader can mistake it for one.
-ZERO_DELTA_NOTICE = "zero_required_output_delta_warning"
-RUNTIME_NOTICE_EVENT_KIND = "runtime_notice"
-ZERO_DELTA_ELAPSED_SHARE_ENV = "AIWORKHUB_ZERO_DELTA_ELAPSED_SHARE"
-ZERO_DELTA_DEFAULT_ELAPSED_SHARE = 0.5
-ZERO_DELTA_MIN_SECONDS = 60.0
-ZERO_DELTA_MAX_SECONDS = 600.0
-ZERO_DELTA_POLL_SECONDS = 15.0
-
-
-def zero_delta_elapsed_share() -> float:
-    """Return the configured share of a run that counts as "meaningful"."""
-
-    raw = os.environ.get(ZERO_DELTA_ELAPSED_SHARE_ENV)
-    if raw is None or not str(raw).strip():
-        return ZERO_DELTA_DEFAULT_ELAPSED_SHARE
-    try:
-        share = float(str(raw).strip())
-    except ValueError:
-        return ZERO_DELTA_DEFAULT_ELAPSED_SHARE
-    if not 0.0 < share <= 1.0:
-        return ZERO_DELTA_DEFAULT_ELAPSED_SHARE
-    return share
-
-
-def zero_delta_notice_after_seconds(timeout_seconds: Any) -> float:
-    """Return the bounded elapsed threshold for one declared run ceiling.
-
-    The share is taken of the DECLARED ceiling so the threshold is known at
-    launch and identical on every observation; the bounds then keep a short
-    card from tripping immediately and a very long ceiling from pushing the
-    notice past the point where it could still save the run.
-    """
-
-    try:
-        ceiling = float(int(timeout_seconds))
-    except (TypeError, ValueError):
-        ceiling = 0.0
-    scaled = max(0.0, ceiling) * zero_delta_elapsed_share()
-    return min(ZERO_DELTA_MAX_SECONDS, max(ZERO_DELTA_MIN_SECONDS, scaled))
-
-
-def changed_allowed_write_paths(workspace: WorkerWorkspace) -> list[str]:
-    """Name every ``allowed_writes`` path already differing from its baseline.
-
-    This reads the same workspace baseline the finalizer's required-output
-    check reads, so the tripwire can never disagree with the terminal verdict
-    about what "changed" means.  Anything it cannot read exactly is reported
-    as changed: the tripwire must never be the thing that calls a working run
-    empty.
-    """
-
-    changed: list[str] = []
-    for raw in workspace.allowed_writes:
-        pattern = str(raw or "").strip().replace("\\", "/")
-        if not pattern:
-            continue
-        if any(ch in pattern for ch in "*?["):
-            matches = sorted(workspace.path.glob(pattern))
-        else:
-            candidate = workspace.path / pattern
-            matches = [candidate] if candidate.exists() else []
-        if not matches:
-            # A path that carried a baseline and no longer resolves was
-            # removed by the worker -- that is a delta, not an empty run.
-            if workspace.workspace_baseline.get(pattern) is not None:
-                changed.append(pattern)
-            continue
-        for path in matches:
-            try:
-                relative = path.relative_to(workspace.path).as_posix()
-            except ValueError:
-                continue
-            try:
-                if path.is_symlink() or not path.is_file():
-                    changed.append(relative)
-                    continue
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
-                current = f"file:{path.stat().st_mode & 0o777:o}:{digest}"
-            except OSError:
-                changed.append(relative)
-                continue
-            baseline = workspace.workspace_baseline.get(relative)
-            if baseline is None or baseline not in {digest, current}:
-                changed.append(relative)
-    return sorted(set(changed))
-
-
-@dataclass(frozen=True)
-class ZeroDeltaTripwire:
-    """One deterministic observation of a run's in-flight required delta.
-
-    ``settled`` means no later observation of this run can change the answer,
-    so the caller stops looking; ``notice`` carries the machine-readable
-    payload exactly once, and is ``None`` on every other outcome.
-    """
-
-    settled: bool
-    notice: dict[str, Any] | None = None
-
-
-def evaluate_zero_delta_tripwire(
-    *,
-    workspace: WorkerWorkspace,
-    elapsed_seconds: float,
-    timeout_seconds: Any,
-    required_outputs: Iterable[str] = (),
-    read_only: bool = False,
-    allow_unchanged_required_outputs: Iterable[str] = (),
-) -> ZeroDeltaTripwire:
-    """Decide whether this run has earned the zero-delta notice.
-
-    A read-only card has nothing to write, and a card carrying
-    ``allow_unchanged_required_outputs`` has already declared that an
-    unchanged output is a legitimate result -- neither can ever be empty in
-    the sense this tripwire names, so both settle silently.
-    """
-
-    allowed_writes = [
-        str(value) for value in workspace.allowed_writes if str(value or "").strip()
-    ]
-    if read_only or not allowed_writes:
-        return ZeroDeltaTripwire(settled=True)
-    if [str(value) for value in allow_unchanged_required_outputs]:
-        return ZeroDeltaTripwire(settled=True)
-    if changed_allowed_write_paths(workspace):
-        return ZeroDeltaTripwire(settled=True)
-    notice_after = zero_delta_notice_after_seconds(timeout_seconds)
-    elapsed = float(elapsed_seconds)
-    if elapsed < notice_after:
-        return ZeroDeltaTripwire(settled=False)
-    try:
-        ceiling = float(int(timeout_seconds))
-    except (TypeError, ValueError):
-        ceiling = 0.0
-    return ZeroDeltaTripwire(
-        settled=True,
-        notice={
-            "notice": ZERO_DELTA_NOTICE,
-            "elapsed_seconds": round(elapsed, 3),
-            "elapsed_share": round(elapsed / ceiling, 4) if ceiling > 0 else None,
-            "notice_after_seconds": round(notice_after, 3),
-            "timeout_seconds": int(ceiling),
-            "required_outputs": [str(value) for value in required_outputs],
-            "allowed_writes": allowed_writes,
-            "changed_allowed_writes": [],
-            "enforced": False,
-        },
-    )
 
 
 ALLOW_LAUNCH_ENV = "AIWORKHUB_ALLOW_LAUNCH"
@@ -3402,94 +3271,6 @@ def pid_identity_surface(event: Mapping[str, Any]) -> dict[str, Any]:
     return fields
 
 
-def _retained_candidate_identity_evidence(
-    workspace: WorkerWorkspace,
-    metadata: dict[str, Any],
-    request_id: str,
-    changed: list[str],
-    claim_state: str,
-) -> dict[str, Any]:
-    """Return mechanically bound identity for a retained failed candidate."""
-
-    if not changed:
-        return {}
-    changed_path_hashes = _changed_path_hashes(workspace, changed)
-    if not changed_path_hashes or set(changed_path_hashes) != set(changed):
-        return {}
-    workspace_metadata = workspace.as_metadata()
-    candidate_authority = {
-        "schema_id": "aiworkhub.python_candidate_authority.v1",
-        "sources": [
-            {
-                "path": path,
-                "state": (
-                    "added"
-                    if workspace.parent_baseline.get(path) is None
-                    else "modified"
-                ),
-                "bytes_sha256": changed_path_hashes[path],
-            }
-            for path in sorted(changed_path_hashes)
-        ],
-    }
-    workspace_metadata["python_candidate_authority"] = dict(candidate_authority)
-    return {
-        "changed_path_hashes": changed_path_hashes,
-        "claim_state": claim_state,
-        "python_candidate_authority": dict(candidate_authority),
-        "workspace": workspace_metadata,
-        "request_identity": {
-            "request_id": request_id,
-            "task_id": str(metadata["task_id"]),
-            "runner": str(metadata["runner"]),
-            "topic": str(metadata["topic"]),
-            "repo": str(workspace.repo),
-            "claim_epoch": metadata.get("claim_epoch"),
-            "allowed_writes": list(workspace.allowed_writes),
-            "base_oid": workspace.base_oid,
-            "parent_baseline": dict(workspace.parent_baseline),
-        },
-    }
-
-
-DELTA_RETAINING_TERMINAL_STATES = frozenset(
-    {"validation_failed", "timed_out", "worker_failed"}
-)
-
-
-def _is_rework_attempt(metadata: Mapping[str, Any]) -> bool:
-    """Whether this attempt is a rework materialized from a predecessor delta."""
-
-    predecessor = metadata.get("rework_predecessor")
-    return isinstance(predecessor, dict) and bool(predecessor)
-
-
-def retained_rework_candidate_evidence(
-    terminal_state: str,
-    workspace: WorkerWorkspace,
-    metadata: dict[str, Any],
-    request_id: str,
-    changed: list[str],
-    claim_state: str,
-) -> dict[str, Any]:
-    """Rework-predecessor evidence for a terminal state that left a delta.
-
-    A timed-out worker's partial delta is as recoverable as a validation
-    failure's; pinning it lets the successor start from the work instead of
-    from nothing.  A terminal state that never produces a usable delta, or an
-    empty change set, retains nothing.
-    """
-
-    if terminal_state not in DELTA_RETAINING_TERMINAL_STATES or not changed:
-        return {}
-    try:
-        return _retained_candidate_identity_evidence(
-            workspace, metadata, request_id, changed, claim_state,
-        )
-    except WorkspaceError:
-        return {}
-
-
 def _release_launch_request_resources(
     *,
     bridge_request: "vscode_lm_bridge.BridgeRequest | None",
@@ -3517,75 +3298,6 @@ def _release_launch_request_resources(
         except WorkspaceError as exc:
             errors.append(f"cleanup_failed:{exc}")
     return errors
-
-
-def _path_manifest(base: Path, declared: list[str]) -> dict[str, dict[str, Any]]:
-    """Bounded, deterministic manifest for declared repo-relative paths.
-
-    Used to detect canonical input/dependency drift between the review
-    evidence captured at claim time (``base`` == the canonical repo, read
-    just before ``task_engine.claim_start_exact``) and the state read again
-    immediately before promotion in ``ProcessManager.accept_review`` (B919,
-    closing the B914 race: a retained-worktree validation had passed against
-    a 29-row dependency snapshot while the canonical dependency had already
-    advanced to 3,522 rows by promotion time). A directory entry never
-    content-hashes its children -- only ``entry_count`` plus a
-    ``listing_sha256`` over each immediate child's name/size -- so cost stays
-    proportional to the declared path count, never a broad repository walk.
-    """
-    try:
-        base_resolved = base.resolve()
-    except OSError:
-        base_resolved = base
-    manifest: dict[str, dict[str, Any]] = {}
-    for relative in declared:
-        relative = str(relative)
-        target = base / relative
-        if target.is_symlink():
-            manifest[relative] = {"kind": "missing"}
-            continue
-        try:
-            resolved = target.resolve()
-        except OSError:
-            manifest[relative] = {"kind": "missing"}
-            continue
-        if resolved != base_resolved and base_resolved not in resolved.parents:
-            manifest[relative] = {"kind": "missing"}
-            continue
-        if resolved.is_dir():
-            try:
-                names = sorted(p.name for p in resolved.iterdir())
-            except OSError:
-                manifest[relative] = {"kind": "missing"}
-                continue
-            digest = hashlib.sha256()
-            for name in names:
-                child = resolved / name
-                try:
-                    size = child.stat().st_size if child.is_file() else -1
-                except OSError:
-                    size = -1
-                digest.update(f"{name}:{size}\n".encode("utf-8"))
-            manifest[relative] = {
-                "kind": "dir",
-                "entry_count": len(names),
-                "listing_sha256": digest.hexdigest(),
-            }
-        elif resolved.is_file():
-            try:
-                data = resolved.read_bytes()
-            except OSError:
-                manifest[relative] = {"kind": "missing"}
-                continue
-            manifest[relative] = {
-                "kind": "file",
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "size": len(data),
-                "line_count": data.count(b"\n"),
-            }
-        else:
-            manifest[relative] = {"kind": "missing"}
-    return manifest
 
 
 def _task_authority_repo(repo: Path, card: dict[str, Any]) -> Path:
@@ -4542,141 +4254,6 @@ MAX_TASK_CONTRACT_BYTES = 96 * 1024
 MAX_REWORK_TASK_CONTRACT_BYTES = 48 * 1024
 MAX_WORKER_PROMPT_BYTES = 160 * 1024
 MAX_REWORK_WORKER_PROMPT_BYTES = 112 * 1024
-
-# The exact card subset a worker is handed as its contract.  Card content
-# identity (``card_content_identity``) is computed from this same subset, so
-# "the card did not change" means precisely "the bytes the worker reads did not
-# change" -- never an incidental store column such as ``updated_at``.  The
-# single implementation lives in ``task_store`` because the terminal-failure
-# recorder there must stamp the very same identities this module's guard
-# compares (and task_store can never import this module back).
-TASK_CONTRACT_KEYS = task_store.TASK_CONTRACT_KEYS
-CARD_CONTENT_IDENTITY_KEYS = task_store.CARD_CONTENT_IDENTITY_KEYS
-_strip_persistence_envelopes = task_store.strip_persistence_envelopes
-
-
-# --- NF-2026-00548 (audit M3): identical-relaunch guard -------------------
-#
-# Measured 2026-09-01: one card failed twice with a byte-identical error 17
-# seconds apart and nothing between the two attempts had changed.  A relaunch
-# whose card content, pinned rework-reason identity and launch identity
-# (runner, adapter) all equal the attempt that recorded a terminal failure can
-# only reproduce that failure, so it is refused at the launch entry with a
-# named deterministic reason instead of burning another full worker cycle.
-#
-# The guard is fail-open by construction: a missing record, an unpinned piece
-# of evidence, any changed input, or an explicit terminal retry all permit the
-# launch.  Only a complete, exactly-matching identity refuses one.
-IDENTICAL_RELAUNCH_BLOCKED_REASON = "identical_relaunch_blocked"
-TERMINAL_ERROR_HASH_HEX_CHARS = task_store.TERMINAL_ERROR_HASH_HEX_CHARS
-bounded_error_hash = task_store.bounded_error_hash
-card_content_identity = task_store.card_content_identity
-review_feedback_identity = task_store.review_feedback_identity
-
-# ``terminal_review`` records successful submissions too (``review_ready``);
-# the guard may only ever read the failure substatuses out of it.  The
-# measured empty-relaunch class (validation_failed, twice byte-identical) is a
-# terminal REVIEW record, so terminal_failure alone would miss it entirely.
-_RELAUNCH_GUARD_FAILURE_SUBSTATUSES = frozenset(
-    {"validation_failed"} | set(task_store.MARK_TERMINAL_FAILURE_SUBSTATUSES)
-)
-
-
-def _latest_recorded(value: Any) -> dict[str, Any] | None:
-    """Return the most recently recorded mapping from a record or a list."""
-
-    if isinstance(value, dict):
-        return dict(value)
-    if not isinstance(value, list):
-        return None
-    records = [dict(item) for item in value if isinstance(item, dict)]
-    if not records:
-        return None
-    return max(records, key=lambda record: str(record.get("recorded_at") or ""))
-
-
-def _terminal_retry_supersedes(
-    retry: Mapping[str, Any], failure: Mapping[str, Any]
-) -> bool:
-    """Decide whether an explicit retry was recorded after ``failure``.
-
-    A retry naming the failed request is authoritative regardless of clocks.
-    Otherwise the recorded timestamps decide, and an unstamped retry is read as
-    the newer record so an explicit operator retry is never swallowed.
-    """
-
-    named = str(retry.get("predecessor_request_id") or "").strip()
-    if named and named == str(failure.get("request_id") or "").strip():
-        return True
-    retry_at = str(retry.get("recorded_at") or "").strip()
-    if not retry_at:
-        return True
-    return retry_at > str(failure.get("recorded_at") or "").strip()
-
-
-def identical_relaunch_refusal(
-    card: Mapping[str, Any] | None,
-    *,
-    runner: str,
-    adapter_id: str,
-) -> str:
-    """Name the refusal for a launch identical to a recorded terminal failure.
-
-    Returns the empty string whenever the launch is permitted.  The refusal
-    carries the predecessor request id and the bounded error hash so an
-    operator reads WHICH attempt this would have repeated, and WHICH failure.
-    """
-
-    candidates: list[dict[str, Any]] = []
-    for field in ("terminal_failure", "terminal_review"):
-        record = _latest_recorded(None if card is None else card.get(field))
-        if record is None:
-            continue
-        if (
-            field == "terminal_review"
-            and str(record.get("substatus") or "")
-            not in _RELAUNCH_GUARD_FAILURE_SUBSTATUSES
-        ):
-            continue
-        candidates.append(record)
-    if not candidates:
-        return ""
-    failure = max(
-        candidates, key=lambda record: str(record.get("recorded_at") or "")
-    )
-    predecessor_request_id = str(failure.get("request_id") or "").strip()
-    if not predecessor_request_id:
-        return ""
-    error_hash = str(failure.get("error_hash") or "").strip().lower()
-    if not error_hash:
-        error_hash = bounded_error_hash(failure.get("error"))
-    if not error_hash:
-        return ""
-    if str(failure.get("runner") or "") != str(runner):
-        return ""
-    if str(failure.get("adapter_id") or "") != str(adapter_id):
-        return ""
-    recorded_card_identity = str(failure.get("card_content_sha256") or "").strip()
-    if not recorded_card_identity:
-        return ""
-    if recorded_card_identity != card_content_identity(card):
-        return ""
-    recorded_feedback_identity = str(
-        failure.get("review_feedback_identity") or ""
-    ).strip()
-    if not recorded_feedback_identity:
-        return ""
-    if recorded_feedback_identity != review_feedback_identity(card):
-        return ""
-    retry = _latest_recorded(None if card is None else card.get("terminal_retry"))
-    if retry is not None and _terminal_retry_supersedes(retry, failure):
-        return ""
-    return ":".join((
-        IDENTICAL_RELAUNCH_BLOCKED_REASON,
-        predecessor_request_id,
-        error_hash,
-    ))
-
 
 def build_worker_prompt(
     *,
@@ -14768,15 +14345,7 @@ _pid_alive = process_is_alive
 
 
 def _pid_start_ticks(pid: int) -> int | None:
-    """Read a stable process creation timestamp to guard against PID reuse.
-
-    Cross-platform process identity lives in exactly one place --
-    :func:`runtime_temp.process_start_ticks` -- so the launcher, the standalone
-    supervisor, and the temp-owner GC can never disagree about what identifies
-    a process.  See that function for the per-platform source and units.  On a
-    platform that genuinely cannot supply a creation time this returns None;
-    every caller here treats None as "identity unknown" and fails closed.
-    """
+    """Read the canonical creation timestamp; ``None`` means unknown."""
     return runtime_temp.process_start_ticks(pid)
 
 
@@ -15052,22 +14621,10 @@ def _pid_identity_evidence(pid: Any, expected_start_ticks: Any) -> PidIdentityEv
 
 
 def _identity_verified_pid(pid: Any, ticks: Any) -> int:
-    """Return ``pid`` only when its recorded creation timestamp still matches.
+    """Return ``pid`` only when its creation timestamp still matches.
 
-    ``_pid_matches`` deliberately reports a match when no start ticks were
-    recorded, because bare liveness is good enough for *reporting*.  It is
-    never good enough for *termination*: a pid alone is not an identity once
-    the OS has recycled it.
-
-    The blast radius is what makes this platform-specific.  On Linux
-    ``_terminate_process_group`` calls ``os.killpg``, which fails closed with
-    ``ProcessLookupError`` unless the pid really is a process-group leader --
-    and workers get their own session via ``start_new_session=True``.  On
-    Windows there is no ``killpg``, so the same call becomes
-    ``taskkill /PID <pid> /T``, which terminates the pid *and every
-    descendant*.  Handed a recycled pid, that silently destroys an unrelated
-    process tree -- for example a VS Code extension host and the children it
-    owns.  Requiring the creation timestamp closes that hole.
+    Termination requires full identity because a recycled Windows PID could
+    otherwise destroy an unrelated process tree.
     """
 
     evidence = _pid_identity_evidence(pid, ticks)
@@ -15093,16 +14650,7 @@ def _process_proven_dead(pid: int, ticks: Any) -> bool:
 
 
 def _process_group_alive(pgid: int) -> bool:
-    """True while ANY member of the POSIX process group still exists.
-
-    ``_terminate_process_group`` signals the whole group (``killpg``); verifying
-    only the leader let a child outlive its already-dead leader and satisfy the
-    early-return, so the SIGKILL escalation never ran -- a narrow check gating a
-    wide action. ``killpg(pgid, 0)`` probes the group itself: ``ESRCH`` means the
-    group is empty (all members gone), ``EPERM`` means a member exists we may not
-    signal, and any other ambiguity fails closed to alive so escalation still
-    runs.
-    """
+    """True while any POSIX group member exists; ambiguity fails closed."""
     return probe_process_group(pgid, platform_name="posix")
 
 

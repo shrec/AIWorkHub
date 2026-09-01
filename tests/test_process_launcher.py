@@ -20,6 +20,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import (  # noqa: E402
+    launch_zero_delta,
     needfix_store,
     platform_io,
     process_launcher,
@@ -10004,7 +10005,7 @@ def test_zero_delta_monitor_wait_notices_once_without_killing_the_worker(
     process = _NF548Process(timeouts=3)
     live = _nf548_live(tmp_path, manager, _nf548_workspace(tmp_path), process=process)
     monkeypatch.setattr(
-        process_launcher, "zero_delta_notice_after_seconds", lambda _timeout: 0.0
+        launch_zero_delta, "zero_delta_notice_after_seconds", lambda _timeout: 0.0
     )
 
     manager._await_exit_watching_zero_delta(live)
