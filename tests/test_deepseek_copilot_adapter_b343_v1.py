@@ -882,15 +882,31 @@ def test_record_usage_labels_deepseek_copilot_provider(monkeypatch, tmp_path):
         "usage": {"prompt_tokens": 100, "completion_tokens": 20},
     }) + "\n", encoding="utf-8")
     card = _card()
-    captured: list[list[str]] = []
-    monkeypatch.setattr(process_launcher.core, "run_taskctl",
-                        lambda args, **_k: captured.append(args) or SimpleNamespace(returncode=0, stderr=""))
+    captured: list[dict] = []
+
+    def append_usage(repo, task_id, runner, **kwargs):
+        captured.append(
+            {"repo": repo, "task_id": task_id, "runner": runner, **kwargs}
+        )
+        return True, ""
+
+    monkeypatch.setattr(
+        process_launcher.task_store, "append_live_usage_event", append_usage
+    )
     manager = _manager(tmp_path, card, [sys.executable, "-c", "pass"], isolation=False)
     usage, recorded, error = manager._record_usage(
         "req-ds", card["task_id"], card["runner"], ADAPTER, "deepseek-v4-pro", output,
+        claim_authority={
+            "request_id": "req-ds",
+            "claimed_by": card["runner"],
+            "claim_epoch": 1,
+        },
     )
     assert recorded is True and error == ""
-    args = captured[0]
-    assert args[args.index("--provider") + 1] == "deepseek_copilot"
-    assert args[args.index("--input-tokens") + 1] == "100"
-    assert args[args.index("--model") + 1] == "deepseek-v4-pro"
+    event = captured[0]
+    assert event["request_id"] == "req-ds"
+    assert event["claimed_by"] == card["runner"]
+    assert event["claim_epoch"] == 1
+    assert event["payload"]["provider"] == "deepseek_copilot"
+    assert event["payload"]["input_tokens"] == 100
+    assert event["payload"]["model"] == "deepseek-v4-pro"

@@ -654,11 +654,6 @@ def test_committed_claim_card_rejects_tampered_identity(
 def _open_gates(monkeypatch):
     monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
-    monkeypatch.setattr(
-        process_launcher,
-        "_available_memory_bytes",
-        lambda: process_launcher.MEMORY_LAUNCH_REQUIRED_BYTES,
-    )
     # Generic launcher tests exercise process lifecycle with an injected
     # adapter command. Keep them independent of whether the CI host has a
     # first-party Claude subscription; auth failure/ready behavior has its own

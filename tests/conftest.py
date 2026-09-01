@@ -27,6 +27,19 @@ import pytest
 _CHILD_PROBE = "import aiworkhub, sys; sys.stdout.write(getattr(aiworkhub, '__file__', '') or '')"
 
 
+@pytest.fixture(autouse=True)
+def deterministic_process_launch_capacity(monkeypatch):
+    """Keep launcher tests independent of the CI host's instantaneous free RAM."""
+
+    module = sys.modules.get("aiworkhub.process_launcher")
+    if module is not None and hasattr(module, "_available_memory_bytes"):
+        monkeypatch.setattr(
+            module,
+            "_available_memory_bytes",
+            lambda: module.MEMORY_LAUNCH_REQUIRED_BYTES,
+        )
+
+
 def is_beneath(path: os.PathLike[str] | str, root: os.PathLike[str] | str) -> bool:
     try:
         Path(path).resolve().relative_to(Path(root).resolve())
