@@ -29,6 +29,8 @@ class _Manager:
         self.accepts: list[tuple[str, str]] = []
         self.status_result: dict = {"ok": True, "state": "starting"}
         self.status_results: dict[str, dict] = {}
+        self.events: list[dict] = []
+        self.target_status = _target_status()
 
     def launch_quality_reviewer(self, **kwargs):
         self.launches.append(kwargs)
@@ -40,6 +42,8 @@ class _Manager:
         }
 
     def status(self, request_id):
+        if request_id == "target-request":
+            return dict(self.target_status)
         return {
             "request_id": request_id,
             **self.status_results.get(request_id, self.status_result),
@@ -48,6 +52,23 @@ class _Manager:
     def accept_review(self, request_id, task_id, **kwargs):
         self.accepts.append((request_id, task_id))
         return {"ok": True, "request_id": request_id, "task_id": task_id, **kwargs}
+
+    def _append_event(self, event):
+        self.events.append(event)
+
+
+def _target_status(*, state: str = "review_ready", **card_overrides: object) -> dict:
+    card = {
+        "task_id": "TARGET",
+        "request_id": "target-request",
+        "claim_epoch": "1",
+        "packet_sha256": "a" * 64,
+        "candidate_sha256": "b" * 64,
+        "workspace_identity": "workspace-candidate-a",
+        "evidence": {"source_graph_partition_readiness": {"target": True}},
+    }
+    card.update(card_overrides)
+    return {"ok": True, "state": state, "task_card": card}
 
 
 def test_driver_launches_one_action_and_persists_exact_identity(tmp_path: Path) -> None:
@@ -72,6 +93,135 @@ def test_driver_launches_one_action_and_persists_exact_identity(tmp_path: Path) 
     rows = review_lifecycle.rows_for_test(tmp_path / "review.sqlite")
     assert rows[0]["state"] == "completed"
     assert rows[0]["chain_id"] == chain.chain_id
+
+
+def test_launch_waits_until_target_is_ready_then_launches_once(tmp_path: Path) -> None:
+    manager = _Manager(tmp_path)
+    manager.target_status = _target_status(state="processing")
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "review.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+
+    deferred = driver.drain(max_actions=2, now=NOW)
+
+    assert deferred.attempted == 1
+    assert deferred.pending == 1
+    assert manager.launches == []
+    assert manager.events[-1]["review_automation"]["reason"] == "target_not_review_ready"
+    manager.target_status = _target_status()
+    launched = driver.drain(max_actions=2, now=NOW)
+
+    assert launched.completed == 1
+    assert len(manager.launches) == 1
+
+
+def test_launch_rejects_identity_mismatch_and_empty_partition(tmp_path: Path) -> None:
+    manager = _Manager(tmp_path)
+    manager.target_status = _target_status(candidate_sha256="c" * 64)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "review.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+
+    invalid = driver.drain(max_actions=2, now=NOW)
+
+    assert invalid.failed == 1
+    assert manager.launches == []
+    rows = review_lifecycle.rows_for_test(tmp_path / "review.sqlite")
+    assert "target_candidate_identity_invalid" in rows[0]["failure_reason"]
+
+    manager = _Manager(tmp_path)
+    manager.target_status = _target_status(
+        evidence={"source_graph_partition_readiness": {}}
+    )
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "empty.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+
+    empty = driver.drain(max_actions=2, now=NOW)
+
+    assert empty.pending == 1
+    assert manager.launches == []
+    assert manager.events[-1]["review_automation"]["reason"] == "source_graph_partition_empty"
+
+
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [
+        ("task_id", "target_task_identity_invalid"),
+        ("request_id", "target_request_identity_invalid"),
+        ("claim_epoch", "target_claim_identity_invalid"),
+        ("packet_sha256", "target_packet_identity_invalid"),
+        ("candidate_sha256", "target_candidate_identity_invalid"),
+    ],
+)
+def test_launch_identity_mismatches_are_terminal_before_not_ready(
+    tmp_path: Path, field: str, reason: str
+) -> None:
+    manager = _Manager(tmp_path)
+    replacement = "wrong" if field != "candidate_sha256" else "c" * 64
+    manager.target_status = _target_status(state="processing", **{field: replacement})
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "identity.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.failed == 1
+    assert manager.launches == []
+    assert reason in review_lifecycle.rows_for_test(tmp_path / "identity.sqlite")[0]["failure_reason"]
+
+
+def test_launch_binds_workspace_when_canonical_card_becomes_available(tmp_path: Path) -> None:
+    manager = _Manager(tmp_path)
+    manager.target_status = {"ok": True, "state": "processing"}
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "late-card.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    manager.target_status = _target_status()
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.completed == 1
+    assert len(manager.launches) == 1
+
+
+def test_launch_rejects_different_nonempty_workspace_identity(tmp_path: Path) -> None:
+    manager = _Manager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "workspace.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    manager.target_status = _target_status(workspace_identity="workspace-candidate-b")
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.failed == 1
+    assert manager.launches == []
+    rows = review_lifecycle.rows_for_test(tmp_path / "workspace.sqlite")
+    assert "target_workspace_identity_invalid" in rows[0]["failure_reason"]
 
 
 def test_accept_waits_for_supervisor_terminal_receipt_without_busy_loop(

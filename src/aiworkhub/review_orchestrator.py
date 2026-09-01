@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -194,6 +195,15 @@ class DrainResult:
         }
 
 
+class _DeferredLaunch(RuntimeError):
+    """A recoverable launch gate result, kept distinct from effect failures."""
+
+    def __init__(self, reason: str, receipt: Mapping[str, Any]) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.receipt = dict(receipt)
+
+
 class ReviewOrchestrator:
     """Execute at most ``max_actions`` effects, never while SQLite is open."""
 
@@ -222,7 +232,7 @@ class ReviewOrchestrator:
         candidate_sha256: str,
         now: datetime | None = None,
     ) -> review_lifecycle.ReviewChain:
-        return review_lifecycle.create_or_replay_chain(
+        chain = review_lifecycle.create_or_replay_chain(
             self.db_path,
             target_task_id=target_task_id,
             target_request_id=target_request_id,
@@ -231,8 +241,59 @@ class ReviewOrchestrator:
             candidate_sha256=candidate_sha256,
             now=now,
         )
+        self._bind_expected_workspace(chain)
+        return chain
+
+    def _bind_expected_workspace(self, chain: review_lifecycle.ReviewChain) -> None:
+        """Persist the original workspace identity outside immutable lifecycle rows."""
+        identity = chain.chain_identity
+        expected = ""
+        try:
+            status = self.manager.status(str(identity["target_request_id"]))
+            card = status.get("task_card") if isinstance(status, Mapping) else None
+            if (
+                isinstance(card, Mapping)
+                and str(card.get("task_id") or "") == str(identity["target_task_id"])
+                and str(card.get("request_id") or "") == str(identity["target_request_id"])
+                and str(card.get("claim_epoch") or "") == str(identity["claim_epoch"])
+                and str(card.get("packet_sha256") or "") == str(identity["packet_sha256"])
+                and str(card.get("candidate_sha256") or "") == str(identity["candidate_sha256"])
+            ):
+                expected = str(card.get("workspace_identity") or "")
+        except Exception:
+            pass
+        self._repair_expected_workspace(chain.chain_id, expected)
+
+    def _repair_expected_workspace(self, chain_id: int, workspace_identity: str) -> None:
+        """Bind a later verified workspace only while the retained binding is empty."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS review_orchestrator_workspace_bindings "
+                "(chain_id INTEGER PRIMARY KEY, workspace_identity TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO review_orchestrator_workspace_bindings "
+                "(chain_id, workspace_identity) VALUES (?, ?)",
+                (chain_id, workspace_identity),
+            )
+            if workspace_identity:
+                conn.execute(
+                    "UPDATE review_orchestrator_workspace_bindings "
+                    "SET workspace_identity=? WHERE chain_id=? AND workspace_identity=''",
+                    (workspace_identity, chain_id),
+                )
+
+    def _expected_workspace_identity(self, chain_id: int) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT workspace_identity FROM review_orchestrator_workspace_bindings "
+                "WHERE chain_id=?",
+                (chain_id,),
+            ).fetchone()
+        return str(row[0]) if row is not None else ""
 
     def drain(self, *, max_actions: int = 1, now: datetime | None = None) -> DrainResult:
+        """Claim and execute a bounded number of lifecycle effects exactly once."""
         instant = now or datetime.now(timezone.utc)
         attempted = completed = failed = pending = 0
         for _ in range(max(0, min(int(max_actions), 12))):
@@ -257,6 +318,14 @@ class ReviewOrchestrator:
                     pending += 1
                     break
                 self._validate_receipt(action, receipt)
+            except _DeferredLaunch as deferred:
+                self._record_deferred_wait(action, deferred, instant)
+                review_lifecycle.defer_action(
+                    self.db_path, action_id=action.action_id, owner=self.owner,
+                    lease_token=token, now=instant,
+                )
+                pending += 1
+                break
             except Exception as exc:  # fail closed and stop this chain/pass
                 review_lifecycle.fail_action(
                     self.db_path,
@@ -292,6 +361,11 @@ class ReviewOrchestrator:
         reviewer_task = self._reviewer_task_id(identity, action.lens)
         prior = self._receipts(action.chain_id)
         if action.action_type == "launch":
+            readiness = self._launch_readiness(action)
+            if readiness["outcome"] == "deferred":
+                raise _DeferredLaunch(str(readiness["reason"]), readiness)
+            if readiness["outcome"] == "terminal":
+                raise RuntimeError(str(readiness["reason"]))
             route = dict(self.route_selector(self.manager.repo, reviewer_task, action.lens))
             runner = str(route.get("runner") or "")
             adapter_id = str(route.get("adapter_id") or "")
@@ -313,7 +387,8 @@ class ReviewOrchestrator:
                 raise RuntimeError("reviewer_launch_identity_invalid")
             return self._receipt(
                 action, reviewer_task_id=reviewer_task,
-                reviewer_request_id=request_id, reviewer_route=route, result=result,
+                reviewer_request_id=request_id, reviewer_route=route,
+                target_readiness_receipt=readiness, result=result,
             )
         if action.action_type == "accept":
             launch = self._lens_receipt(prior, action.lens, "launch")
@@ -399,6 +474,107 @@ class ReviewOrchestrator:
                 result={"ok": True, "state": "resolved"},
             )
         raise RuntimeError("unknown_review_action")
+
+    def _launch_readiness(self, action: review_lifecycle.ReviewAction) -> dict[str, Any]:
+        """Bind one launch evaluation to the retained canonical target envelope."""
+        identity = action.descriptor["chain_identity"]
+        target_request = str(identity["target_request_id"])
+        target_task = str(identity["target_task_id"])
+        try:
+            status = self.manager.status(target_request)
+        except Exception as exc:
+            return self._readiness_receipt(
+                action, "deferred", "target_status_unavailable:" + type(exc).__name__
+            )
+        if not isinstance(status, Mapping) or status.get("ok") is not True:
+            return self._readiness_receipt(action, "deferred", "target_status_unavailable")
+        card = status.get("task_card")
+        if not isinstance(card, Mapping):
+            return self._readiness_receipt(action, "deferred", "target_card_missing")
+        if str(card.get("task_id") or "") != target_task:
+            return self._readiness_receipt(action, "terminal", "target_task_identity_invalid")
+        if str(card.get("request_id") or "") != target_request:
+            return self._readiness_receipt(action, "terminal", "target_request_identity_invalid")
+        if str(card.get("claim_epoch") or "") != str(identity["claim_epoch"]):
+            return self._readiness_receipt(action, "terminal", "target_claim_identity_invalid")
+        if str(card.get("packet_sha256") or "") != str(identity["packet_sha256"]):
+            return self._readiness_receipt(action, "terminal", "target_packet_identity_invalid")
+        if str(card.get("candidate_sha256") or "") != str(identity["candidate_sha256"]):
+            return self._readiness_receipt(action, "terminal", "target_candidate_identity_invalid")
+        if str(status.get("state") or "") != "review_ready":
+            return self._readiness_receipt(action, "deferred", "target_not_review_ready")
+        workspace = str(card.get("workspace_identity") or "")
+        if not workspace:
+            return self._readiness_receipt(action, "deferred", "target_workspace_identity_missing")
+        expected_workspace = self._expected_workspace_identity(action.chain_id)
+        if not expected_workspace:
+            # Chain registration may predate canonical target availability.
+            # Bind only after all immutable identities above have matched.
+            self._repair_expected_workspace(action.chain_id, workspace)
+            expected_workspace = self._expected_workspace_identity(action.chain_id)
+            if not expected_workspace:
+                return self._readiness_receipt(
+                    action, "terminal", "target_workspace_identity_unbound"
+                )
+        if workspace != expected_workspace:
+            return self._readiness_receipt(
+                action, "terminal", "target_workspace_identity_invalid"
+            )
+        evidence = card.get("evidence")
+        partitions = (
+            evidence.get("source_graph_partition_readiness")
+            if isinstance(evidence, Mapping)
+            else None
+        )
+        if not isinstance(partitions, Mapping) or not partitions:
+            return self._readiness_receipt(action, "deferred", "source_graph_partition_empty")
+        if any(value is not True for value in partitions.values()):
+            return self._readiness_receipt(action, "deferred", "source_graph_partition_not_ready")
+        return self._readiness_receipt(action, "ready", "ready", workspace, partitions)
+
+    @staticmethod
+    def _readiness_receipt(
+        action: review_lifecycle.ReviewAction,
+        outcome: str,
+        reason: str,
+        workspace_identity: str = "",
+        partitions: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        identity = action.descriptor["chain_identity"]
+        return {
+            "schema_id": "aiworkhub.review_target_readiness_receipt.v1",
+            "action_id": action.action_id,
+            "target_task_id": identity["target_task_id"],
+            "target_request_id": identity["target_request_id"],
+            "claim_epoch": identity["claim_epoch"],
+            "packet_sha256": identity["packet_sha256"],
+            "candidate_sha256": identity["candidate_sha256"],
+            "workspace_identity": workspace_identity,
+            "partition_readiness": dict(partitions or {}),
+            "outcome": outcome,
+            "reason": reason,
+        }
+
+    def _record_deferred_wait(
+        self, action: review_lifecycle.ReviewAction, deferred: _DeferredLaunch, now: datetime
+    ) -> None:
+        append = getattr(self.manager, "_append_event", None)
+        if not callable(append):
+            return
+        identity = action.descriptor["chain_identity"]
+        append({
+            "event_type": "review_orchestrator_wait",
+            "request_id": identity["target_request_id"],
+            "task_id": identity["target_task_id"],
+            "review_automation": {
+                "state": "deferred",
+                "reason": deferred.reason,
+                "action_id": action.action_id,
+                "retry_after_seconds": 60,
+                "recorded_at": now.isoformat(),
+                "readiness_receipt": deferred.receipt,
+            },
+        })
 
     def _linked_needfix_rows(self, target_task_id: str) -> list[dict[str, Any]]:
         """Return every durable NeedFix row already bound to this exact task."""
