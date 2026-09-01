@@ -26,7 +26,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import aiworkhub  # noqa: E402
-from aiworkhub import callback_store, core, task_store, worker_workspace  # noqa: E402
+from aiworkhub import (  # noqa: E402
+    callback_store,
+    core,
+    task_retention,
+    task_store,
+    worker_workspace,
+)
 from aiworkhub import process_launcher  # noqa: E402
 
 NOW = "2026-07-20T00:00:00+00:00"
@@ -2247,6 +2253,61 @@ def test_pending_ordinary_recovery_consumes_stale_validation_only_replay_authori
         root, task_id
     )
     assert _consume_event_count(root, task_id) == 1
+
+
+def test_manager_bootstrap_hygiene_is_interval_throttled_and_nonfatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root_a = _init_repo(tmp_path, "hygiene-bootstrap-a")
+    root_b = _init_repo(tmp_path, "hygiene-bootstrap-b")
+    current_root = [root_a]
+    monkeypatch.setattr(core, "repo_root", lambda: current_root[0])
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: None)
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(core, "_TASK_HYGIENE_LAST_RUNS", {})
+    calls: list[Path] = []
+
+    def hygiene(repo: Path) -> dict[str, object]:
+        calls.append(repo)
+        return {
+            "ok": True,
+            "scanned": 9,
+            "eligible": 2,
+            "archived": 1,
+            "skipped": 1,
+            "reasons": {"callback_live": 1},
+        }
+
+    monkeypatch.setattr(task_retention, "run_automatic_hygiene", hygiene)
+    first_a = core.manager_bootstrap()
+    current_root[0] = root_b
+    first_b = core.manager_bootstrap()
+    current_root[0] = root_a
+    second_a = core.manager_bootstrap()
+
+    assert calls == [root_a.resolve(), root_b.resolve()]
+    expected_completed = {
+        "scanned": 9,
+        "eligible": 2,
+        "archived": 1,
+        "skipped": 1,
+        "reasons": {"callback_live": 1},
+        "state": "completed",
+    }
+    assert first_a["task_hygiene"] == expected_completed
+    assert first_b["task_hygiene"] == expected_completed
+    assert second_a["task_hygiene"] == {"state": "throttled"}
+
+    monkeypatch.setattr(core, "_TASK_HYGIENE_LAST_RUNS", {})
+    monkeypatch.setattr(
+        task_retention,
+        "run_automatic_hygiene",
+        lambda _repo: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    failed = core.manager_bootstrap()
+    assert failed["ok"] is True
+    assert failed["task_hygiene"]["state"] == "skipped"
 
 
 def test_pending_ordinary_recovery_absent_authorization_already_recovered(tmp_path):

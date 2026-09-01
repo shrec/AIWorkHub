@@ -18,7 +18,7 @@ import sqlite3
 import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 
 from . import repo_policy, task_store
 from .sqlite_readonly import connect_readonly
@@ -30,6 +30,51 @@ MAX_TASKS_PER_BATCH = 200
 MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 _BATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
+
+# Automatic queue hygiene is deliberately a same-day mechanism.  These are
+# operational bounds, not lifecycle authority: malformed configuration turns
+# the pass into a no-op.
+HYGIENE_TTL_ENV = "AIWORKHUB_TASK_HYGIENE_TTL_SECONDS"
+HYGIENE_INTERVAL_ENV = "AIWORKHUB_TASK_HYGIENE_INTERVAL_SECONDS"
+HYGIENE_BATCH_ENV = "AIWORKHUB_TASK_HYGIENE_BATCH_SIZE"
+HYGIENE_TTL_DEFAULT = 6 * 60 * 60
+HYGIENE_INTERVAL_DEFAULT = 15 * 60
+HYGIENE_BATCH_DEFAULT = 25
+_HYGIENE_TTL_RANGE = (60 * 60, 24 * 60 * 60)
+_HYGIENE_INTERVAL_RANGE = (60, 24 * 60 * 60)
+_HYGIENE_BATCH_RANGE = (1, 100)
+_HYGIENE_SCAN_LIMIT = 2_000
+_FAMILY_SUFFIX_RE = re.compile(
+    r"^(?P<family>[A-Za-z0-9][A-Za-z0-9_.:-]*?)"
+    r"(?:[_-](?:V(?P<version>[1-9][0-9]*)|R(?P<retry>[1-9][0-9]*)))"
+    r"(?:_(?:CODEX|CLAUDE|GLM|DEEPSEEK)[A-Z0-9-]*)?$",
+    re.IGNORECASE,
+)
+_REVIEWER_SUFFIX_RE = re.compile(
+    r"^(?P<family>[A-Za-z0-9][A-Za-z0-9_.:-]*?)_E(?P<lens>[1-9][0-9]*)_"
+    r"(?P<name>[A-Z][A-Z0-9_]*)_V(?P<version>[1-9][0-9]*)"
+    r"(?:_(?:CODEX|CLAUDE|GLM|DEEPSEEK)[A-Z0-9-]*)?$"
+)
+_TERMINAL_LEDGER_STATES = frozenset(
+    {
+        "accepted",
+        "blocked",
+        "cancelled",
+        "finished",
+        "launch_failed",
+        "review_ready",
+        "superseded",
+        "validation_failed",
+        "worker_failed",
+    }
+)
+_TERMINAL_TASK_STATES = frozenset({"blocked", "finished", "superseded"})
+
+
+class TaskFamily(NamedTuple):
+    family: str
+    generation: tuple[int, int]
+    reviewer: bool
 
 
 class TaskRetentionError(RuntimeError):
@@ -820,6 +865,293 @@ def validate_accepted_cleanup_evidence(
     }
 
 
+def task_family(task_id: str) -> TaskFamily | None:
+    """Parse only the explicit queue version/retry/reviewer suffix grammar."""
+
+    reviewer = _REVIEWER_SUFFIX_RE.fullmatch(task_id)
+    if reviewer:
+        return TaskFamily(
+            reviewer.group("family"),
+            (int(reviewer.group("version")), int(reviewer.group("lens"))),
+            True,
+        )
+    match = _FAMILY_SUFFIX_RE.fullmatch(task_id)
+    if not match:
+        return None
+    version = int(match.group("version") or 0)
+    retry = int(match.group("retry") or 0)
+    return TaskFamily(match.group("family"), (version, retry), False)
+
+
+def _bounded_env_int(name: str, default: int, bounds: tuple[int, int]) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise TaskRetentionError(f"task_hygiene_invalid_config:{name}")
+    value = int(raw)
+    if not bounds[0] <= value <= bounds[1]:
+        raise TaskRetentionError(f"task_hygiene_invalid_config:{name}")
+    return value
+
+
+def hygiene_config() -> dict[str, int]:
+    return {
+        "ttl_seconds": _bounded_env_int(
+            HYGIENE_TTL_ENV, HYGIENE_TTL_DEFAULT, _HYGIENE_TTL_RANGE
+        ),
+        "interval_seconds": _bounded_env_int(
+            HYGIENE_INTERVAL_ENV, HYGIENE_INTERVAL_DEFAULT, _HYGIENE_INTERVAL_RANGE
+        ),
+        "batch_size": _bounded_env_int(
+            HYGIENE_BATCH_ENV, HYGIENE_BATCH_DEFAULT, _HYGIENE_BATCH_RANGE
+        ),
+    }
+
+
+def _skip(summary: dict[str, Any], reason: str) -> None:
+    summary["skipped"] += 1
+    reasons = summary["reasons"]
+    reasons[reason] = int(reasons.get(reason, 0)) + 1
+
+
+def _hygiene_rows(root: Path | str) -> list[dict[str, Any]]:
+    connection = _connect(root, readonly=True)
+    try:
+        rows = connection.execute(
+            "SELECT task_id,topic,status,worker_status,claimed_by,updated_at,completed_at,"
+            "archived_at,card_json FROM tasks WHERE archived_at='' "
+            "ORDER BY updated_at DESC,task_id DESC LIMIT ?",
+            (_HYGIENE_SCAN_LIMIT,),
+        ).fetchall()
+    finally:
+        connection.close()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            card = json.loads(row["card_json"] or "{}")
+        except json.JSONDecodeError:
+            card = None
+        result.append({**dict(row), "card": card})
+    return result
+
+
+def _quality_reviewer(row: Mapping[str, Any]) -> bool:
+    card = row.get("card")
+    if not isinstance(card, Mapping):
+        return False
+    parsed = task_family(str(row.get("task_id") or ""))
+    return bool(
+        parsed
+        and parsed.reviewer
+        and str(row.get("status") or "").lower() in _TERMINAL_TASK_STATES
+        and str(row.get("worker_status") or "").lower()
+        in {"blocked", "done", "review", "superseded"}
+        and str(card.get("topic") or row.get("topic") or "").lower() == "quality_review"
+    )
+
+
+def _expired(row: Mapping[str, Any], cutoff: datetime) -> bool:
+    raw = str(row.get("completed_at") or row.get("updated_at") or "")
+    try:
+        observed = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    return observed <= cutoff
+
+
+def _candidate_ids(rows: list[dict[str, Any]], cutoff: datetime) -> set[str]:
+    families: dict[str, list[tuple[TaskFamily, dict[str, Any]]]] = {}
+    selected: set[str] = set()
+    for row in rows:
+        task_id = str(row.get("task_id") or "")
+        parsed = task_family(task_id)
+        if parsed and not parsed.reviewer:
+            families.setdefault(parsed.family, []).append((parsed, row))
+        elif _quality_reviewer(row) and _expired(row, cutoff):
+            selected.add(task_id)
+    for members in families.values():
+        # Generation first and task_id second makes the retained head stable
+        # even if malformed historical data duplicates a generation.
+        head = max(members, key=lambda item: (item[0].generation, str(item[1]["task_id"])))
+        for parsed, row in members:
+            task_id = str(row["task_id"])
+            if row is head[1]:
+                continue
+            if (
+                str(row.get("status") or "").lower() in _TERMINAL_TASK_STATES
+                and _expired(row, cutoff)
+            ):
+                selected.add(task_id)
+    return selected
+
+
+def _latest_process_row(root: Path | str, request_id: str) -> Mapping[str, Any] | None:
+    from . import process_event_ledger
+
+    return process_event_ledger.latest_events(
+        _process_event_log_path(root), key_field="request_id"
+    ).get(request_id)
+
+
+def _final_archive_fence(
+    root: Path | str, task_id: str, expected_request_id: str
+) -> tuple[dict[str, Any] | None, str]:
+    # This is intentionally a fresh canonical read immediately before the
+    # authority call.  Selection-time card bytes are never archive authority.
+    card = task_store.get_task(root, task_id)
+    if not isinstance(card, dict):
+        return None, "task_missing"
+    if str(card.get("task_id") or "") != task_id:
+        return None, "task_mismatch"
+    request_id = str(card.get("launch_request_id") or "").strip()
+    if not request_id or request_id != expected_request_id:
+        return None, "request_mismatch"
+    status = str(card.get("status") or "").lower()
+    worker_status = str(card.get("worker_status") or "").lower()
+    if status not in _TERMINAL_TASK_STATES or worker_status in {
+        "claimed", "in_progress", "processing", "running", "starting"
+    }:
+        return None, "task_live"
+    # Terminal failures intentionally retain ``claimed_by`` for attribution.
+    # It is not reservation authority once both canonical task state and the
+    # exact latest process-ledger row are terminal.  Explicit reservation
+    # artifacts remain a hard fence here, and archive_task performs its own
+    # final transactional reservation check.
+    reservation_keys = ("launch_reservation", "reservation", "reservation_id")
+    if any(card.get(key) for key in reservation_keys):
+        return None, "task_reserved"
+    terminal_review = card.get("terminal_review")
+    terminal_evidence = (
+        terminal_review.get("evidence") if isinstance(terminal_review, Mapping) else None
+    )
+    if any(
+        card.get(key)
+        for key in (
+            "candidate",
+            "candidate_evidence",
+            "retained_candidate",
+            "retained_workspace",
+            "rework_predecessor",
+            "workspace",
+        )
+    ) or (
+        isinstance(terminal_evidence, Mapping)
+        and any(
+            terminal_evidence.get(key)
+            for key in ("candidate", "candidate_evidence", "changed_path_hashes", "workspace")
+        )
+    ):
+        return None, "retained_evidence"
+    connection = _connect(root, readonly=True)
+    try:
+        callback = connection.execute(
+            "SELECT 1 FROM callback_outbox WHERE task_id=? AND state IN ('pending','inflight') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if callback:
+        return None, "callback_live"
+    ledger = _latest_process_row(root, request_id)
+    if not isinstance(ledger, Mapping):
+        return None, "ledger_missing"
+    if str(ledger.get("task_id") or "") != task_id:
+        return None, "ledger_task_mismatch"
+    if str(ledger.get("request_id") or "") != request_id:
+        return None, "ledger_request_mismatch"
+    ledger_state = str(ledger.get("state") or ledger.get("terminal_state") or "").lower()
+    if ledger_state in {"running", "starting", "processing", "claimed", "in_progress"}:
+        return None, "ledger_live"
+    if ledger_state not in _TERMINAL_LEDGER_STATES:
+        return None, "ledger_not_terminal"
+    ledger_timestamp = str(ledger.get("timestamp") or "")
+    card_updated = str(card.get("updated_at") or "")
+    try:
+        if datetime.fromisoformat(ledger_timestamp) < datetime.fromisoformat(card_updated):
+            return None, "ledger_stale"
+    except (TypeError, ValueError):
+        return None, "ledger_stale"
+    return card, ""
+
+
+def run_automatic_hygiene(
+    root: Path | str, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """Archive a bounded set through ``task_store.archive_task`` only."""
+
+    summary: dict[str, Any] = {
+        "ok": True,
+        "scanned": 0,
+        "eligible": 0,
+        "archived": 0,
+        "skipped": 0,
+        "reasons": {},
+    }
+    if os.environ.get("AIWORKHUB_ALLOW_WRITES") != "1":
+        summary.update(ok=False, reasons={"writes_disabled": 1})
+        return summary
+    try:
+        config = hygiene_config()
+        rows = _hygiene_rows(root)
+    except (TaskRetentionError, task_store.TaskStoreError, sqlite3.Error, OSError) as exc:
+        summary.update(ok=False, reasons={str(exc)[:80] or "scan_failed": 1})
+        return summary
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    cutoff = current - timedelta(seconds=config["ttl_seconds"])
+    candidates = _candidate_ids(rows, cutoff)
+    summary["scanned"] = len(rows)
+    summary["eligible"] = len(candidates)
+    indexed = {str(row["task_id"]): row for row in rows}
+    ordered = sorted(candidates)[: config["batch_size"]]
+    for task_id in ordered:
+        initial = indexed[task_id]
+        card = initial.get("card")
+        request_id = (
+            str(card.get("launch_request_id") or "").strip()
+            if isinstance(card, Mapping)
+            else ""
+        )
+        if not request_id:
+            _skip(summary, "request_missing")
+            continue
+        try:
+            fenced, reason = _final_archive_fence(root, task_id, request_id)
+        except (task_store.TaskStoreError, sqlite3.Error, OSError, ValueError):
+            _skip(summary, "authority_unavailable")
+            continue
+        if fenced is None:
+            _skip(summary, reason)
+            continue
+        try:
+            ok, authority_reason = task_store.archive_task(
+                root,
+                task_id,
+                actor="manager",
+                reason="automatic_task_hygiene",
+                operation="archived",
+            )
+        except (task_store.TaskStoreError, sqlite3.Error, OSError):
+            _skip(summary, "archive_authority_error")
+            continue
+        if not ok:
+            _skip(summary, f"archive_refused:{str(authority_reason)[:48]}")
+            continue
+        summary["archived"] += 1
+    overflow = max(0, len(candidates) - len(ordered))
+    if overflow:
+        summary["skipped"] += overflow
+        summary["reasons"]["batch_limited"] = overflow
+    summary["reasons"] = dict(
+        sorted(summary["reasons"].items(), key=lambda item: (-item[1], item[0]))[:12]
+    )
+    return summary
+
+
 __all__ = [
     "SCHEMA_ID",
     "TaskRetentionError",
@@ -832,5 +1164,8 @@ __all__ = [
     "purge",
     "quarantine",
     "restore",
+    "hygiene_config",
+    "run_automatic_hygiene",
+    "task_family",
     "validate_accepted_cleanup_evidence",
 ]

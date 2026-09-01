@@ -29,6 +29,7 @@ from . import repository_state
 from . import shared_router
 from . import sqlite_readonly
 from . import task_store
+from . import task_retention
 from . import callback_store
 from . import task_plan
 from . import dependency_autolaunch
@@ -85,6 +86,9 @@ COORDINATOR_COMMANDS = frozenset(
 DEFAULT_COORDINATOR_TOKEN_FILE = Path.home() / ".config/aiworkhub/taskctl_coordinator.token"
 _WORKSPACE_GC_JOBS_LOCK = threading.Lock()
 _WORKSPACE_GC_JOBS: set[str] = set()
+_TASK_HYGIENE_LOCK = threading.Lock()
+_TASK_HYGIENE_LAST_RUNS: dict[str, float] = {}
+_TASK_HYGIENE_REPOSITORY_LIMIT = 128
 # RFC 9562 defines UUID versions 6, 7 and 8 in addition to the historical
 # 1-5 set.  Current Codex thread ids are UUIDv7, so rejecting the version
 # nibble above 5 discards a genuine mux-owned origin thread.
@@ -2377,6 +2381,38 @@ MCP_MANAGER_CONTRACT_BANNER = (
 
 def manager_bootstrap() -> dict[str, Any]:
     """Compact, model-readable manager contract for a newly attached chat."""
+    hygiene: dict[str, Any] = {"state": "disabled"}
+    if os.environ.get("AIWORKHUB_ALLOW_WRITES") == "1":
+        try:
+            config = task_retention.hygiene_config()
+            canonical_root = repo_root().resolve()
+            repository_key = str(canonical_root)
+            monotonic_now = time.monotonic()
+            with _TASK_HYGIENE_LOCK:
+                last_run = _TASK_HYGIENE_LAST_RUNS.get(repository_key, 0.0)
+                due = monotonic_now - last_run >= config["interval_seconds"]
+                if due:
+                    # Reserve this repository's interval before running. The
+                    # bounded map prevents route changes from suppressing other
+                    # repositories or growing process state without limit.
+                    if (
+                        repository_key not in _TASK_HYGIENE_LAST_RUNS
+                        and len(_TASK_HYGIENE_LAST_RUNS) >= _TASK_HYGIENE_REPOSITORY_LIMIT
+                    ):
+                        del _TASK_HYGIENE_LAST_RUNS[next(iter(_TASK_HYGIENE_LAST_RUNS))]
+                    _TASK_HYGIENE_LAST_RUNS[repository_key] = monotonic_now
+            if due:
+                result = task_retention.run_automatic_hygiene(canonical_root)
+                hygiene = {
+                    key: result.get(key, 0)
+                    for key in ("scanned", "eligible", "archived", "skipped")
+                }
+                hygiene["reasons"] = dict(list((result.get("reasons") or {}).items())[:12])
+                hygiene["state"] = "completed" if result.get("ok") else "skipped"
+            else:
+                hygiene = {"state": "throttled"}
+        except Exception as exc:  # bootstrap must remain available during hygiene faults
+            hygiene = {"state": "skipped", "reasons": {type(exc).__name__: 1}}
     identity = _claude_manager_identity() or _codex_manager_identity()
     provider = str((identity or {}).get("provider") or _current_chat_provider())
     return {
@@ -2386,6 +2422,7 @@ def manager_bootstrap() -> dict[str, Any]:
         "provider": provider,
         "repo": str(repo_root()),
         "manager_route": identity or {},
+        "task_hygiene": hygiene,
         "responsibility_matrix": {
             "schema_id": "aiworkhub.manager_responsibility_matrix.v1",
             "aiworkhub_system": {

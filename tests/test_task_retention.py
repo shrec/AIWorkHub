@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -170,6 +171,255 @@ def test_confirmation_and_age_bounds_fail_closed(tmp_path: Path) -> None:
             preview_digest=preview["preview_digest"],
             older_than_days=30,
         )
+
+
+def test_task_family_parser_is_explicit_and_deterministic() -> None:
+    assert task_retention.task_family("AIWORKHUB_FEATURE_V4_CODEX56") == (
+        "AIWORKHUB_FEATURE",
+        (4, 0),
+        False,
+    )
+    assert task_retention.task_family("needfix-NF-2026-00401-r4") == (
+        "needfix-NF-2026-00401",
+        (0, 4),
+        False,
+    )
+    assert task_retention.task_family("AIWORKHUB_FEATURE_E12_CORRECTNESS_V9") == (
+        "AIWORKHUB_FEATURE",
+        (9, 12),
+        True,
+    )
+    assert task_retention.task_family("AIWORKHUB_FEATURE_COMMON_PREFIX") is None
+    assert task_retention.task_family("AIWORKHUB_FEATURE_V0") is None
+
+
+def test_hygiene_config_fails_closed_and_is_same_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        task_retention.HYGIENE_TTL_ENV,
+        task_retention.HYGIENE_INTERVAL_ENV,
+        task_retention.HYGIENE_BATCH_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    config = task_retention.hygiene_config()
+    assert 0 < config["interval_seconds"] <= 86_400
+    assert 0 < config["ttl_seconds"] <= 86_400
+    assert 0 < config["batch_size"] <= 100
+
+    monkeypatch.setenv(task_retention.HYGIENE_TTL_ENV, "six-hours")
+    with pytest.raises(task_retention.TaskRetentionError, match="invalid_config"):
+        task_retention.hygiene_config()
+
+
+def test_automatic_hygiene_keeps_head_and_uses_mocked_archive_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    old = "2026-08-31T00:00:00+00:00"
+    rows = [
+        {
+            "task_id": "FAMILY_V1",
+            "topic": "coding",
+            "status": "blocked",
+            "worker_status": "blocked",
+            "updated_at": old,
+            "completed_at": old,
+            "card": {"task_id": "FAMILY_V1", "launch_request_id": "req-v1"},
+        },
+        {
+            "task_id": "FAMILY_V2",
+            "topic": "coding",
+            "status": "blocked",
+            "worker_status": "blocked",
+            "updated_at": old,
+            "completed_at": old,
+            "card": {"task_id": "FAMILY_V2", "launch_request_id": "req-v2"},
+        },
+        {
+            "task_id": "FAMILY_E1_SECURITY_V1",
+            "topic": "quality_review",
+            "status": "finished",
+            "worker_status": "done",
+            "updated_at": old,
+            "completed_at": old,
+            "card": {
+                "task_id": "FAMILY_E1_SECURITY_V1",
+                "topic": "quality_review",
+                "launch_request_id": "req-review",
+            },
+        },
+        {
+            "task_id": "FAMILY_WITH_SHARED_PREFIX",
+            "topic": "coding",
+            "status": "blocked",
+            "worker_status": "blocked",
+            "updated_at": old,
+            "completed_at": old,
+            "card": {"task_id": "FAMILY_WITH_SHARED_PREFIX"},
+        },
+    ]
+    archived: list[str] = []
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(task_retention, "_hygiene_rows", lambda _root: rows)
+    monkeypatch.setattr(
+        task_retention,
+        "_final_archive_fence",
+        lambda _root, task_id, _request_id: ({"task_id": task_id}, ""),
+    )
+    monkeypatch.setattr(
+        task_store,
+        "archive_task",
+        lambda _root, task_id, **_kwargs: (archived.append(task_id) is None, "archived"),
+    )
+
+    result = task_retention.run_automatic_hygiene(
+        repo, now=datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    )
+
+    assert result["archived"] == 2
+    assert archived == ["FAMILY_E1_SECURITY_V1", "FAMILY_V1"]
+    assert "FAMILY_V2" not in archived
+    assert "FAMILY_WITH_SHARED_PREFIX" not in archived
+
+
+@pytest.mark.parametrize(
+    ("card_delta", "ledger_delta", "expected_reason"),
+    [
+        ({"status": "processing", "worker_status": "running"}, {}, "task_live"),
+        ({}, {"state": "starting"}, "ledger_live"),
+        ({}, {"state": "running"}, "ledger_live"),
+        ({"reservation_id": "held-1"}, {}, "task_reserved"),
+        ({"retained_workspace": {"path": "/tmp/retained"}}, {}, "retained_evidence"),
+        ({}, None, "ledger_missing"),
+        ({}, {"task_id": "OTHER"}, "ledger_task_mismatch"),
+        ({}, {"request_id": "other-request"}, "ledger_request_mismatch"),
+        ({}, {"timestamp": "2025-12-31T23:59:59+00:00"}, "ledger_stale"),
+    ],
+)
+def test_final_archive_fence_rejects_live_reserved_retained_and_bad_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    card_delta: dict[str, Any],
+    ledger_delta: dict[str, Any] | None,
+    expected_reason: str,
+) -> None:
+    repo = _repo(tmp_path)
+    card: dict[str, Any] = {
+        "task_id": "FAMILY_V1",
+        "launch_request_id": "req-v1",
+        "status": "blocked",
+        "worker_status": "blocked",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "claimed_by": "stale-worker-attribution",
+    }
+    card.update(card_delta)
+    ledger: dict[str, Any] | None = {
+        "task_id": "FAMILY_V1",
+        "request_id": "req-v1",
+        "state": "worker_failed",
+        "timestamp": "2026-01-01T00:00:01+00:00",
+    }
+    if ledger_delta is None:
+        ledger = None
+    elif ledger is not None:
+        ledger.update(ledger_delta)
+    monkeypatch.setattr(task_store, "get_task", lambda _root, _task_id: card)
+    monkeypatch.setattr(
+        task_retention, "_latest_process_row", lambda _root, _request: ledger
+    )
+
+    fenced, reason = task_retention._final_archive_fence(repo, "FAMILY_V1", "req-v1")
+
+    assert fenced is None
+    assert reason == expected_reason
+
+
+@pytest.mark.parametrize("callback_state", ["pending", "inflight"])
+def test_final_archive_fence_rejects_live_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, callback_state: str
+) -> None:
+    repo = _repo(tmp_path)
+    card = {
+        "task_id": "FAMILY_V1",
+        "launch_request_id": "req-v1",
+        "status": "blocked",
+        "worker_status": "blocked",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+    connection = sqlite3.connect(task_store.canonical_db_path(repo))
+    try:
+        connection.execute(
+            "INSERT INTO callback_outbox(task_id,origin_thread_id,state,created_at,updated_at) "
+            "VALUES(?,?,?,?,?)",
+            (
+                "FAMILY_V1",
+                "thread",
+                callback_state,
+                card["updated_at"],
+                card["updated_at"],
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    monkeypatch.setattr(task_store, "get_task", lambda _root, _task_id: card)
+
+    fenced, reason = task_retention._final_archive_fence(repo, "FAMILY_V1", "req-v1")
+
+    assert fenced is None
+    assert reason == "callback_live"
+
+
+def test_terminal_blocked_stale_claimed_by_reaches_mocked_archive_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    old = "2026-08-31T00:00:00+00:00"
+    rows = [
+        {
+            "task_id": task_id,
+            "topic": "coding",
+            "status": "blocked",
+            "worker_status": "blocked",
+            "claimed_by": "old-worker",
+            "updated_at": old,
+            "completed_at": old,
+            "card": {"task_id": task_id, "launch_request_id": request_id},
+        }
+        for task_id, request_id in (("FAMILY_V1", "req-v1"), ("FAMILY_V2", "req-v2"))
+    ]
+    canonical = {
+        **rows[0]["card"],
+        "status": "blocked",
+        "worker_status": "blocked",
+        "claimed_by": "old-worker",
+        "updated_at": old,
+    }
+    archived: list[str] = []
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(task_retention, "_hygiene_rows", lambda _root: rows)
+    monkeypatch.setattr(task_store, "get_task", lambda _root, _task_id: canonical)
+    monkeypatch.setattr(
+        task_retention,
+        "_latest_process_row",
+        lambda _root, _request: {
+            "task_id": "FAMILY_V1",
+            "request_id": "req-v1",
+            "state": "worker_failed",
+            "timestamp": "2026-08-31T00:00:01+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        task_store,
+        "archive_task",
+        lambda _root, task_id, **_kwargs: (archived.append(task_id) is None, "archived"),
+    )
+
+    result = task_retention.run_automatic_hygiene(
+        repo, now=datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    )
+
+    assert result["archived"] == 1
+    assert archived == ["FAMILY_V1"]
 
 
 def test_validate_accepted_cleanup_evidence_fail_closed(tmp_path: Path) -> None:
