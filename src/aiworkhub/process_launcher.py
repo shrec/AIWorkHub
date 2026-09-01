@@ -4480,6 +4480,7 @@ class _LiveProcess:
     supervisor_status_path: Path | None = None
     pid_start_ticks: int | None = None
     bridge_request: vscode_lm_bridge.BridgeRequest | None = None
+    claim_epoch: int | None = None
 
 
 class _QualityReviewPrepFlight:
@@ -8752,6 +8753,11 @@ class ProcessManager:
                     supervisor_status_path=status_path,
                     pid_start_ticks=start_ticks,
                     bridge_request=bridge_request,
+                    claim_epoch=(
+                        metadata.get("claim_epoch")
+                        if type(metadata.get("claim_epoch")) is int
+                        else None
+                    ),
                 )
                 with self._lock:
                     self._live[request_id] = live
@@ -9385,6 +9391,7 @@ class ProcessManager:
             live.model or live.adapter_id,
             live.stdout_path,
             topic=live.topic,
+            claim_authority=None,
         )
         context_ack = _project_context_receipt_from_output(
             live.stdout_path,
@@ -9422,6 +9429,7 @@ class ProcessManager:
         stdout_path: Path,
         topic: str | None = None,
         execution_mode: str = "",
+        claim_authority: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool, str]:
         usage = _usage_from_output(stdout_path, include_samples=True)
         usage["requested_model"] = model
@@ -9445,7 +9453,6 @@ class ProcessManager:
         else:
             usage["telemetry_reason"] = "provider_usage_report_not_observed"
         usage_role = "worker"
-        note = f"task_mcp_request:{request_id}"
         ledger_model = (
             "deterministic_validation_replay"
             if execution_mode == "validation_only_replay"
@@ -9456,63 +9463,64 @@ class ProcessManager:
             topic = topic or str(card.get("topic") or "")
             if _card_is_readonly_quality_review(card):
                 usage_role = "reviewer"
-            records = card.get("usage_records") or []
-            if isinstance(records, list) and any(
-                isinstance(record, dict)
-                and record.get("source") == "task_mcp_launcher"
-                and record.get("note") == note
-                for record in records
-            ):
-                return usage, True, ""
         except Exception:
             pass
         usage["role"] = usage_role
-        args = [
-            "usage", task_id,
-            "--runner", runner,
-            "--model", ledger_model,
-            "--requested-model", model,
-            "--observed-model", str(usage.get("observed_model") or ""),
-            "--role", usage_role,
-            "--provider", (
+        event_payload: dict[str, Any] = {
+            "runner": runner,
+            "model": ledger_model,
+            "requested_model": model,
+            "observed_model": str(usage.get("observed_model") or ""),
+            "role": usage_role,
+            "provider": (
                 "deterministic_validation_replay"
                 if execution_mode == "validation_only_replay"
                 else adapter_id.removesuffix("_cli")
             ),
-            "--source", "task_mcp_launcher",
-            "--note", note,
-            "--input-tokens", str(total_input),
-            "--output-tokens", str(total_output),
-            "--visible-output-tokens", str(usage["output_tokens"]),
-            "--reasoning-output-tokens", str(usage["reasoning_output_tokens"]),
-            "--total-tokens", str(total_input + total_output),
-            "--cached-input-tokens", str(usage["cached_input_tokens"]),
-            "--cache-creation-input-tokens", str(usage["cache_creation_input_tokens"]),
-            "--cache-write-input-tokens", str(usage["cache_write_input_tokens"]),
-            "--telemetry-reason", str(usage["telemetry_reason"]),
-            "--cost-usd", str(
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "visible_output_tokens": usage["output_tokens"],
+            "reasoning_output_tokens": usage["reasoning_output_tokens"],
+            "total_tokens": total_input + total_output,
+            "cached_input_tokens": usage["cached_input_tokens"],
+            "cache_creation_input_tokens": usage["cache_creation_input_tokens"],
+            "cache_write_input_tokens": usage["cache_write_input_tokens"],
+            "telemetry_reason": str(usage["telemetry_reason"]),
+            "cost_usd": (
                 float(usage["cost_usd"] or 0.0)
                 if usage.get("cost_observed")
                 else 0.0
             ),
-        ]
-        if usage.get("usage_observed"):
-            args.append("--usage-observed")
-        if usage.get("model_observed"):
-            args.append("--model-observed")
-        if usage.get("cache_metrics_observed"):
-            args.append("--cache-metrics-observed")
-        if usage.get("cost_observed"):
-            args.append("--cost-observed")
+            "usage_observed": bool(usage.get("usage_observed")),
+            "model_observed": bool(usage.get("model_observed")),
+            "cache_metrics_observed": bool(usage.get("cache_metrics_observed")),
+            "cost_observed": bool(usage.get("cost_observed")),
+            "adapter_id": adapter_id,
+            "execution_mode": usage["execution_mode"],
+            "provider_launched": usage["provider_launched"],
+        }
+        if claim_authority is None:
+            return usage, False, "claim_authority_unavailable"
+        claim_request_id = str(claim_authority.get("request_id") or "")
+        claimed_by = str(claim_authority.get("claimed_by") or "")
+        claim_epoch = claim_authority.get("claim_epoch")
+        if claim_request_id != request_id:
+            return usage, False, "claim_authority_request_mismatch"
+        if claimed_by != runner:
+            return usage, False, "claim_authority_claimed_by_mismatch"
+        if type(claim_epoch) is not int or claim_epoch < 1:
+            return usage, False, "claim_authority_claim_epoch_invalid"
         try:
-            result = core.run_taskctl(
-                args,
-                allow_write=True,
-                runner=runner,
-                topic=topic,
+            usage_recorded, usage_result = task_store.append_live_usage_event(
+                self.repo,
+                task_id,
+                runner,
+                request_id=request_id,
+                claimed_by=claimed_by,
+                claim_epoch=claim_epoch,
+                payload=event_payload,
             )
-            usage_recorded = result.returncode == 0
-            usage_error = result.stderr[:300] if not usage_recorded else ""
+            usage_error = "" if usage_recorded else usage_result
         except Exception as exc:
             usage_error = str(exc)[:300]
         return usage, usage_recorded, usage_error
@@ -10057,6 +10065,11 @@ class ProcessManager:
             metadata_path=metadata_path,
             supervisor_status_path=status_path,
             pid_start_ticks=start_ticks,
+            claim_epoch=(
+                metadata.get("claim_epoch")
+                if type(metadata.get("claim_epoch")) is int
+                else None
+            ),
         )
         with self._lock:
             self._live[request_id] = live
@@ -11721,6 +11734,11 @@ class ProcessManager:
                         stdout_path,
                         topic=str(metadata["topic"]),
                         execution_mode=str(metadata.get("execution_mode") or ""),
+                        claim_authority={
+                            "request_id": request_id,
+                            "claimed_by": str(metadata["runner"]),
+                            "claim_epoch": metadata.get("claim_epoch"),
+                        },
                     )
             elif terminal_state not in FINALIZATION_PENDING_STATES:
                 usage, usage_recorded, usage_error = self._record_usage(
@@ -11732,6 +11750,11 @@ class ProcessManager:
                     stdout_path,
                     topic=str(metadata["topic"]),
                     execution_mode=str(metadata.get("execution_mode") or ""),
+                    claim_authority={
+                        "request_id": request_id,
+                        "claimed_by": str(metadata["runner"]),
+                        "claim_epoch": metadata.get("claim_epoch"),
+                    },
                 )
             context_ack = _project_context_receipt_from_output(
                 stdout_path,

@@ -23,6 +23,7 @@ from aiworkhub import (  # noqa: E402
     platform_io,
     process_launcher,
     process_launcher_acceptance,
+    task_store,
     task_templates,
     worker_ai_tools_mcp,
 )
@@ -205,6 +206,63 @@ def _manager(tmp_path: Path, *, show_task, argv) -> process_launcher.ProcessMana
         adapter_builder=_plan(argv, repo),
         isolation_enabled=False,
     )
+
+
+def _canonical_claimed_task_repo(
+    tmp_path: Path,
+    *,
+    task_id: str = "TASK_USAGE",
+    runner: str = "claude_worker_b1",
+    request_id: str = "a" * 32,
+    claim_epoch: int = 3,
+) -> Path:
+    repo = tmp_path / f"repo-{task_id.lower()}"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    now = "2026-09-01T00:00:00+00:00"
+    card = {
+        "task_id": task_id,
+        "runner": runner,
+        "topic": "task_mcp",
+        "status": "processing",
+        "worker_status": "claimed",
+        "claimed_by": runner,
+        "launch_request_id": request_id,
+        "claim_epoch": claim_epoch,
+    }
+    conn = task_store._connect(task_store.canonical_db_path(repo))
+    try:
+        conn.execute(
+            "INSERT INTO tasks("
+            "task_id, runner, topic, mode, status, "
+            "worker_status, priority, objective, card_json, created_at, "
+            "updated_at, claimed_by, claimed_at, started_at, completed_at, "
+            "origin_thread_id, archived_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                "task_mcp",
+                "",
+                "processing",
+                "claimed",
+                "high",
+                "",
+                json.dumps(card, sort_keys=True),
+                now,
+                now,
+                runner,
+                now,
+                now,
+                "",
+                "",
+                "",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return repo
 
 
 def test_launch_reservation_refreshes_snapshot_after_lock_handoff_race(
@@ -3579,13 +3637,13 @@ def test_provider_free_replay_usage_is_labeled_without_fabricated_observation(
         show_task=_show(lambda: card),
         argv=[sys.executable, "-c", "pass"],
     )
-    calls = []
-
-    def fake_run_taskctl(args, **kwargs):
-        calls.append((args, kwargs))
-        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
-
-    monkeypatch.setattr(process_launcher.core, "run_taskctl", fake_run_taskctl)
+    monkeypatch.setattr(
+        process_launcher.core,
+        "run_taskctl",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("usage recording must not use taskctl")
+        ),
+    )
     usage, recorded, error = manager._record_usage(
         "request-replay",
         card["task_id"],
@@ -3597,16 +3655,285 @@ def test_provider_free_replay_usage_is_labeled_without_fabricated_observation(
         execution_mode="validation_only_replay",
     )
 
-    assert recorded is True
-    assert error == ""
+    assert recorded is False
+    assert error == "claim_authority_unavailable"
     assert usage["provider_launched"] is False
     assert usage["usage_observed"] is False
     assert usage["telemetry_reason"] == "provider_not_invoked_deterministic_replay"
-    argv = calls[0][0]
-    assert argv[argv.index("--provider") + 1] == "deterministic_validation_replay"
-    assert argv[argv.index("--model") + 1] == "deterministic_validation_replay"
-    assert argv[argv.index("--requested-model") + 1] == "claude-sonnet-5"
-    assert "--usage-observed" not in argv
+
+
+def test_append_live_usage_event_requires_exact_current_claim(tmp_path):
+    request_id = "b" * 32
+    repo = _canonical_claimed_task_repo(tmp_path, request_id=request_id, claim_epoch=7)
+    payload = {
+        "model": "claude-sonnet-5",
+        "requested_model": "claude-sonnet-5",
+        "observed_model": "",
+        "role": "worker",
+        "provider": "claude",
+        "input_tokens": 11,
+        "output_tokens": 5,
+        "total_tokens": 16,
+        "visible_output_tokens": 5,
+        "reasoning_output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "telemetry_reason": "",
+        "cost_usd": 0.0,
+        "usage_observed": True,
+        "model_observed": False,
+        "cache_metrics_observed": False,
+        "cost_observed": False,
+    }
+
+    assert task_store.append_live_usage_event(
+        repo,
+        "TASK_USAGE",
+        "claude_worker_b1",
+        request_id=request_id,
+        claimed_by="claude_worker_b1",
+        claim_epoch=7,
+        payload=payload,
+    ) == (True, "recorded")
+    assert task_store.append_live_usage_event(
+        repo,
+        "TASK_USAGE",
+        "claude_worker_b1",
+        request_id=request_id,
+        claimed_by="claude_worker_b1",
+        claim_epoch=7,
+        payload=payload,
+    ) == (True, "already_recorded")
+
+    events = task_store.list_usage_events(repo)
+    assert len(events) == 1
+    assert events[0]["source"] == "task_mcp_launcher"
+    assert events[0]["note"] == f"task_mcp_request:{request_id}"
+    assert events[0]["request_id"] == request_id
+    assert events[0]["claim_epoch"] == 7
+    assert events[0]["role"] == "worker"
+    assert events[0]["model"] == "claude-sonnet-5"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ({"claim_epoch": True}, "usage_live_claim_epoch_invalid"),
+        ({"claim_epoch": 6}, "claim_epoch_mismatch"),
+        ({"claimed_by": "other"}, "claimed_by_mismatch"),
+        ({"runner": "other"}, "runner_mismatch"),
+        ({"request_id": "c" * 32}, "request_id_mismatch"),
+        (
+            {"payload": {"request_id": "g" * 32}},
+            "usage_live_request_spoof",
+        ),
+        ({"payload": {"source": "terminal_log_backfill"}}, "usage_live_source_spoof"),
+        ({"payload": {"note": "task_mcp_request:" + "d" * 32}}, "usage_live_note_spoof"),
+        ({"sql": "UPDATE tasks SET status='review'"}, "lifecycle_mismatch:review"),
+        (
+            {"sql": "UPDATE tasks SET worker_status='in_progress'"},
+            "worker_status_mismatch",
+        ),
+    ],
+)
+def test_append_live_usage_event_fails_closed_on_authority_mismatch(
+    tmp_path, mutation, expected
+):
+    request_id = "e" * 32
+    repo = _canonical_claimed_task_repo(tmp_path, request_id=request_id, claim_epoch=7)
+    if mutation.get("sql"):
+        conn = task_store._connect(task_store.canonical_db_path(repo))
+        try:
+            conn.execute(str(mutation["sql"]))
+            conn.commit()
+        finally:
+            conn.close()
+    payload = {"model": "claude-sonnet-5", **mutation.get("payload", {})}
+
+    recorded, reason = task_store.append_live_usage_event(
+        repo,
+        "TASK_USAGE",
+        str(mutation.get("runner", "claude_worker_b1")),
+        request_id=str(mutation.get("request_id", request_id)),
+        claimed_by=str(mutation.get("claimed_by", "claude_worker_b1")),
+        claim_epoch=mutation.get("claim_epoch", 7),
+        payload=payload,
+    )
+
+    assert recorded is False
+    assert reason == expected
+    assert task_store.list_usage_events(repo) == []
+
+
+def test_record_usage_direct_harness_has_no_authoritative_live_ledger_call(
+    monkeypatch, tmp_path
+):
+    output = tmp_path / "usage.jsonl"
+    output.write_text("", encoding="utf-8")
+    card = _card()
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("direct harness must not append live usage")
+
+    monkeypatch.setattr(task_store, "append_live_usage_event", forbidden)
+    usage, recorded, error = manager._record_usage(
+        "request-direct",
+        card["task_id"],
+        card["runner"],
+        "claude_cli",
+        "claude-sonnet-5",
+        output,
+        topic=card["topic"],
+    )
+
+    assert recorded is False
+    assert error == "claim_authority_unavailable"
+    assert usage["provider_launched"] is True
+    assert usage["role"] == "worker"
+
+
+def _spoofed_usage_record_card(
+    request_id: str,
+    *,
+    task_id: str = "TASK_USAGE",
+    runner: str = "claude_worker_b1",
+) -> dict:
+    card = _card(task_id, "processing")
+    card.update({
+        "worker_status": "claimed",
+        "claimed_by": runner,
+        "launch_request_id": request_id,
+        "usage_records": [
+            {
+                "source": "task_mcp_launcher",
+                "note": f"task_mcp_request:{request_id}",
+            }
+        ],
+    })
+    return card
+
+
+@pytest.mark.parametrize(
+    ("claim_authority", "expected_error"),
+    [
+        (None, "claim_authority_unavailable"),
+        (
+            {
+                "request_id": "wrong-request",
+                "claimed_by": "claude_worker_b1",
+                "claim_epoch": 9,
+            },
+            "claim_authority_request_mismatch",
+        ),
+        (
+            {
+                "request_id": "f" * 32,
+                "claimed_by": "other-worker",
+                "claim_epoch": 9,
+            },
+            "claim_authority_claimed_by_mismatch",
+        ),
+        (
+            {
+                "request_id": "f" * 32,
+                "claimed_by": "claude_worker_b1",
+                "claim_epoch": 0,
+            },
+            "claim_authority_claim_epoch_invalid",
+        ),
+    ],
+)
+def test_record_usage_ignores_spoofed_card_usage_records_before_claim_authority(
+    monkeypatch, tmp_path, claim_authority, expected_error
+):
+    output = tmp_path / "usage.jsonl"
+    output.write_text("", encoding="utf-8")
+    request_id = "f" * 32
+    card = _spoofed_usage_record_card(request_id)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("invalid claim authority must not reach live usage store")
+
+    monkeypatch.setattr(task_store, "append_live_usage_event", forbidden)
+    usage, recorded, error = manager._record_usage(
+        request_id,
+        card["task_id"],
+        card["runner"],
+        "claude_cli",
+        "claude-sonnet-5",
+        output,
+        topic=card["topic"],
+        claim_authority=claim_authority,
+    )
+
+    assert recorded is False
+    assert error == expected_error
+    assert usage["role"] == "worker"
+
+
+def test_record_usage_forwards_exact_isolated_claim_epoch(monkeypatch, tmp_path):
+    output = tmp_path / "usage.jsonl"
+    output.write_text("", encoding="utf-8")
+    card = _card("TASK_USAGE", "processing")
+    card.update({
+        "worker_status": "claimed",
+        "claimed_by": card["runner"],
+        "launch_request_id": "f" * 32,
+        "claim_epoch": 9,
+        "usage_records": [
+            {
+                "source": "task_mcp_launcher",
+                "note": f"task_mcp_request:{'f' * 32}",
+            }
+        ],
+    })
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    captured = {}
+
+    def fake_append(repo, task_id, runner, **kwargs):
+        captured.update({"repo": repo, "task_id": task_id, "runner": runner, **kwargs})
+        return True, "recorded"
+
+    monkeypatch.setattr(task_store, "append_live_usage_event", fake_append)
+    usage, recorded, error = manager._record_usage(
+        "f" * 32,
+        "TASK_USAGE",
+        card["runner"],
+        "claude_cli",
+        "claude-sonnet-5",
+        output,
+        topic=card["topic"],
+        claim_authority={
+            "request_id": "f" * 32,
+            "claimed_by": card["runner"],
+            "claim_epoch": 9,
+        },
+    )
+
+    assert recorded is True
+    assert error == ""
+    assert usage["role"] == "worker"
+    assert captured["request_id"] == "f" * 32
+    assert captured["claimed_by"] == card["runner"]
+    assert captured["claim_epoch"] == 9
+    assert captured["payload"]["role"] == "worker"
+    assert captured["payload"]["model"] == "claude-sonnet-5"
+
 
 def test_usage_parser_reads_claude_result_json(tmp_path):
     output = tmp_path / "claude.json"
@@ -3663,13 +3990,13 @@ def test_vscode_lm_usage_records_explicit_provider_api_unavailability(
         }) + "\n",
         encoding="utf-8",
     )
-    captured: list[str] = []
+    captured: dict[str, object] = {}
 
-    def record(args, **_kwargs):
-        captured.extend(args)
-        return process_launcher.core.TaskCtlResult(args, 0, "ok", "")
+    def fake_append(repo, task_id, runner, **kwargs):
+        captured.update({"repo": repo, "task_id": task_id, "runner": runner, **kwargs})
+        return True, "recorded"
 
-    monkeypatch.setattr(process_launcher.core, "run_taskctl", record)
+    monkeypatch.setattr(task_store, "append_live_usage_event", fake_append)
     manager = process_launcher.ProcessManager(
         repo=tmp_path,
         process_log_path=tmp_path / "events.jsonl",
@@ -3685,14 +4012,19 @@ def test_vscode_lm_usage_records_explicit_provider_api_unavailability(
         "glm-5.2",
         output,
         topic="code",
+        claim_authority={
+            "request_id": "a" * 32,
+            "claimed_by": "glm_worker",
+            "claim_epoch": 1,
+        },
     )
 
     assert recorded is True
     assert error == ""
     assert usage["usage_observed"] is False
     assert usage["telemetry_reason"] == "provider_api_usage_unavailable"
-    reason_index = captured.index("--telemetry-reason")
-    assert captured[reason_index + 1] == "provider_api_usage_unavailable"
+    assert captured["payload"]["telemetry_reason"] == "provider_api_usage_unavailable"
+    assert captured["payload"]["provider"] == "glm_vscode_lm"
 
 
 def test_usage_parser_preserves_nested_per_turn_cache_and_model_evidence(tmp_path):
@@ -5947,10 +6279,10 @@ def test_release_pending_retry_records_provider_token_spend(monkeypatch, tmp_pat
         {**common, "state": "finalizing", "finalization_retry": True}
     )
 
-    recorded: list[str] = []
+    recorded: list[tuple[str, dict]] = []
 
-    def fake_record_usage(request_id_arg, *_args, **_kwargs):
-        recorded.append(request_id_arg)
+    def fake_record_usage(request_id_arg, *_args, **kwargs):
+        recorded.append((request_id_arg, dict(kwargs)))
         return {"input_tokens": 123, "output_tokens": 45}, True, ""
 
     monkeypatch.setattr(manager, "_record_usage", fake_record_usage)
@@ -5961,7 +6293,20 @@ def test_release_pending_retry_records_provider_token_spend(monkeypatch, tmp_pat
 
     event = manager._finalize_isolated_request(request_id, 0)
 
-    assert recorded == [request_id]
+    assert recorded == [
+        (
+            request_id,
+            {
+                "topic": "task_mcp",
+                "execution_mode": "",
+                "claim_authority": {
+                    "request_id": request_id,
+                    "claimed_by": "claude_worker_b1",
+                    "claim_epoch": 2,
+                },
+            },
+        )
+    ]
     assert event["usage_recorded"] is True
     assert event["usage"]["input_tokens"] == 123
 

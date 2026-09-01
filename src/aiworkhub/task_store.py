@@ -4194,6 +4194,126 @@ def append_usage_capture_event(
         conn.close()
 
 
+def _bool_safe_positive_int(value: Any) -> bool:
+    return type(value) is int and value >= 1
+
+
+def append_live_usage_event(
+    root: str | Path,
+    task_id: str,
+    runner: str,
+    *,
+    request_id: str,
+    claimed_by: str,
+    claim_epoch: int,
+    payload: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Append one live provider-usage event under exact claim authority."""
+
+    if not task_id or not runner:
+        return False, "usage_live_task_identity_invalid"
+    if not request_id:
+        return False, "usage_live_request_id_invalid"
+    if not claimed_by:
+        return False, "usage_live_claimed_by_invalid"
+    if not _bool_safe_positive_int(claim_epoch):
+        return False, "usage_live_claim_epoch_invalid"
+    if not isinstance(payload, Mapping):
+        return False, "usage_live_payload_invalid"
+
+    source = "task_mcp_launcher"
+    note = f"task_mcp_request:{request_id}"
+    if "source" in payload and str(payload.get("source") or "") != source:
+        return False, "usage_live_source_spoof"
+    if "note" in payload and str(payload.get("note") or "") != note:
+        return False, "usage_live_note_spoof"
+    if "request_id" in payload and str(payload.get("request_id") or "") != request_id:
+        return False, "usage_live_request_spoof"
+
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT runner, status, worker_status, claimed_by, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return False, "task_not_found"
+        if str(row["runner"] or "") != runner:
+            conn.rollback()
+            return False, "runner_mismatch"
+        if str(row["claimed_by"] or "") != claimed_by:
+            conn.rollback()
+            return False, "claimed_by_mismatch"
+        status = canonical_status(dict(row))
+        if status != "processing":
+            conn.rollback()
+            return False, f"lifecycle_mismatch:{status}"
+        if str(row["worker_status"] or "") != "claimed":
+            conn.rollback()
+            return False, "worker_status_mismatch"
+        try:
+            card = json.loads(str(row["card_json"] or "{}"))
+        except json.JSONDecodeError:
+            conn.rollback()
+            return False, "card_json_invalid"
+        if not isinstance(card, dict):
+            conn.rollback()
+            return False, "card_json_not_dict"
+        if str(card.get("task_id") or task_id) != task_id:
+            conn.rollback()
+            return False, "task_identity_mismatch"
+        if str(card.get("runner") or runner) != runner:
+            conn.rollback()
+            return False, "runner_identity_mismatch"
+        if str(card.get("claimed_by") or claimed_by) != claimed_by:
+            conn.rollback()
+            return False, "claimed_by_identity_mismatch"
+        if str(card.get("launch_request_id") or "") != request_id:
+            conn.rollback()
+            return False, "request_id_mismatch"
+        if card.get("claim_epoch") != claim_epoch:
+            conn.rollback()
+            return False, "claim_epoch_mismatch"
+
+        existing = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND event='usage_record' "
+            "AND json_extract(payload_json, '$.note')=? LIMIT 1",
+            (task_id, note),
+        ).fetchone()
+        if existing is not None:
+            conn.rollback()
+            return True, "already_recorded"
+
+        event_payload = {
+            **dict(payload),
+            "source": source,
+            "note": note,
+            "request_id": request_id,
+            "runner": runner,
+            "claimed_by": claimed_by,
+            "claim_epoch": claim_epoch,
+        }
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+            "VALUES (?, 'usage_record', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps(event_payload, ensure_ascii=False, sort_keys=True),
+                now,
+            ),
+        )
+        conn.commit()
+        return True, "recorded"
+    finally:
+        conn.close()
+
+
 def manager_decision_counts(root: str | Path) -> dict[str, Any]:
     """Return exact review decisions plus bounded review-to-decision latency."""
 
@@ -4457,6 +4577,7 @@ __all__ = [
     "storage_readiness",
     "TaskStoreError",
     "archive_task",
+    "append_live_usage_event",
     "begin_claim_episode",
     "callback_bridge_health",
     "canonical_db_path",
