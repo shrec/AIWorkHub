@@ -6,6 +6,40 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.77] - 2026-09-01
+
+### Added
+
+- Terminal ledger failure records persist a bounded fixed-key terminal_reason
+  and preserve the caller-supplied value in a bounded raw side field, so no
+  terminal failure is mute and no unbounded payload is persisted.
+- Named sandbox-impossibility causes classify as environment-unsupported,
+  machine-separable from real candidate failures; generic permission prose is
+  never promoted.
+- One canonical runner-id grammar folds variant runner spellings onto the
+  registered identity at workforce upsert and rejects conflicting variants
+  with a named reason.
+
+### Fixed
+
+- The launcher canonical workforce now covers every enabled claude-family
+  route, ending workforce_route_absent kills on pinned-model launches; the
+  catalog-launcher parity regression is strict instead of skipping
+  route-absent workers.
+- The cost ledger fills placeholder usage rows from durable process-event
+  evidence matched on exact identity, never overwriting observed telemetry.
+- The storage-retention preview overlaps its three I/O components on a
+  measured worker count under the existing single-flight fence.
+- Process-group launch and termination consolidate under platform_io,
+  reducing the direct OS dependency boundary from 153 to 149 calls.
+
+### Notes
+
+- 0.10.76 was prepared but never tagged; its changes ship in this release.
+- Open audit lines remaining: NF-548 zero-delta tripwire and
+  identical-relaunch guard, NF-547 orchestrator readiness gate (in flight),
+  reviewer report in-run validation, rework-replay receipt preflight.
+
 ## [0.10.76] - 2026-09-01
 
 ### Added

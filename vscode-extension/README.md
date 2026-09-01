@@ -12,6 +12,21 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.77 — 2026-09-01
+
+- No terminal failure is mute: ledger records persist a bounded fixed-key
+  terminal_reason, preserve the caller value in a bounded raw side field, and
+  classify named sandbox-impossibility causes as environment-unsupported.
+- Pinned-model claude-family launches no longer die with
+  workforce_route_absent: the launcher route table covers every enabled
+  claude-family worker and variant runner spellings fold onto one canonical
+  identity at workforce upsert.
+- The cost ledger fills placeholder usage rows from durable process-event
+  evidence without overwriting observed telemetry.
+- The storage-retention preview overlaps its I/O components under the existing
+  single-flight fence, and process-group launch/termination consolidate under
+  platform_io (OS dependency boundary 153 to 149).
+
 ## What's new in 0.10.76 — 2026-09-01
 
 - Quality-review Source Graph partition readiness is honored before review work runs.
