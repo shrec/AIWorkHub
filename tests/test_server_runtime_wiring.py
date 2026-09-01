@@ -60,6 +60,7 @@ class _FakeManager:
     def __init__(self):
         self.calls = []
         self.launch_environment = {}
+        self.list_payload = {"ok": True, "total_requests": 0, "processes": []}
 
     def launch(self, **kwargs):
         self.launch_environment = dict(os.environ)
@@ -93,7 +94,7 @@ class _FakeManager:
 
     def list_processes(self, limit):
         self.calls.append(("list", {"limit": limit}))
-        return {"ok": True, "processes": []}
+        return self.list_payload
 
 
 def test_runtime_tools_delegate_to_single_manager(monkeypatch):
@@ -110,7 +111,9 @@ def test_runtime_tools_delegate_to_single_manager(monkeypatch):
     assert server.aiworkhub_agent_retry_finalization("r1", "T1")[
         "provider_relaunched"
     ] is False
-    assert server.aiworkhub_agent_list_processes(20)["processes"] == []
+    summary = server.aiworkhub_agent_list_processes(20)
+    assert summary["detail"] == "summary"
+    assert summary["scanned_count"] == 0
 
     assert [name for name, _ in fake.calls] == [
         "launch",
@@ -120,6 +123,151 @@ def test_runtime_tools_delegate_to_single_manager(monkeypatch):
         "retry_finalization",
         "list",
     ]
+
+
+def test_list_processes_summary_is_bounded_deterministic_and_truthful(monkeypatch):
+    fake = _FakeManager()
+    rows = [
+        {
+            "request_id": f"request-{index:03d}",
+            "state": ("running", "review_ready", "blocked")[index % 3],
+            "terminal_substatus": (
+                "" if index % 3 == 0 else ("review_ready" if index % 2 else "validation_failed")
+            ),
+            "timestamp": f"2026-08-11T{index // 60:02d}:{index % 60:02d}:00+00:00",
+            "logs": "ლ" * 4000,
+            "workspace_baseline": {"files": ["x" * 1000]},
+            "tree_baseline": {"paths": ["y" * 1000]},
+            "validation": {"output": "z" * 1000},
+            "usage": {"payload": "u" * 1000},
+        }
+        for index in range(100)
+    ]
+    fake.list_payload = {
+        "ok": True,
+        "launch_implemented": True,
+        "launch_enabled": True,
+        "active_in_memory": 34,
+        "concurrency_limit": 8,
+        "total_requests": 125,
+        "processes": rows,
+    }
+    monkeypatch.setattr(process_launcher, "default_manager", lambda: fake)
+
+    first = server.aiworkhub_agent_list_processes()
+    second_fake = _FakeManager()
+    second_fake.list_payload = fake.list_payload
+    monkeypatch.setattr(process_launcher, "default_manager", lambda: second_fake)
+    second = server.aiworkhub_agent_list_processes()
+
+    assert first == second
+    assert len(json.dumps(first, ensure_ascii=False).encode("utf-8")) <= 4096
+    assert first == {
+        "ok": True,
+        "detail": "summary",
+        "requested_count": 100,
+        "scanned_count": 100,
+        "total_count": 125,
+        "returned_count": 0,
+        "truncated": True,
+        "full_detail_available": True,
+        "state_counts": {"blocked": 33, "review_ready": 33, "running": 34},
+        "terminal_substatus_counts": {"review_ready": 33, "validation_failed": 33},
+        "timing": {
+            "newest_timestamp": "2026-08-11T01:39:00+00:00",
+            "oldest_timestamp": "2026-08-11T00:00:00+00:00",
+        },
+    }
+    assert fake.calls == [("list", {"limit": 100})]
+    assert second_fake.calls == [("list", {"limit": 100})]
+    assert not ({"processes", "logs", "workspace_baseline", "tree_baseline", "validation", "usage"} & first.keys())
+
+
+def test_list_processes_summary_compares_aware_timestamps_by_instant(monkeypatch):
+    fake = _FakeManager()
+    fake.list_payload = {
+        "ok": True,
+        "total_requests": 4,
+        "processes": [
+            {"timestamp": "2026-08-11T01:00:00+00:00"},
+            {"timestamp": "2026-08-11T02:00:00+02:00"},
+            {"timestamp": "9999-malformed"},
+            {"timestamp": "2099-01-01T00:00:00"},
+        ],
+    }
+    monkeypatch.setattr(process_launcher, "default_manager", lambda: fake)
+
+    summary = server.aiworkhub_agent_list_processes()
+
+    assert summary["timing"] == {
+        "newest_timestamp": "2026-08-11T01:00:00+00:00",
+        "oldest_timestamp": "2026-08-11T02:00:00+02:00",
+    }
+    assert fake.calls == [("list", {"limit": 100})]
+
+
+def test_list_processes_summary_bounds_adversarial_aggregate_values(monkeypatch):
+    fake = _FakeManager()
+    fake.list_payload = {
+        "ok": True,
+        "total_requests": 100,
+        "processes": [
+            {
+                "state": f"state-{index:03d}-" + ("界" * 2000),
+                "terminal_substatus": f"substatus-{index:03d}-" + ("ლ" * 2000),
+                "timestamp": f"timestamp-{index:03d}-" + ("🕰" * 2000),
+            }
+            for index in range(100)
+        ],
+    }
+    monkeypatch.setattr(process_launcher, "default_manager", lambda: fake)
+
+    summary = server.aiworkhub_agent_list_processes()
+    encoded = json.dumps(summary, ensure_ascii=False).encode("utf-8")
+
+    assert len(encoded) <= 4096
+    assert fake.calls == [("list", {"limit": 100})]
+    for field in ("state_counts", "terminal_substatus_counts"):
+        aggregate = summary[field]
+        assert len(aggregate["values"]) == 6
+        assert sum(item["count"] for item in aggregate["values"]) == 6
+        assert aggregate["overflow"]["distinct_count"] == 94
+        assert aggregate["overflow"]["occurrence_count"] == 94
+        assert len(aggregate["overflow"]["all_counts_sha256"]) == 64
+    assert summary["timing"]["newest_timestamp"]["utf8_bytes"] > 4096
+    assert summary["timing"]["oldest_timestamp"]["utf8_bytes"] > 4096
+    assert "界" * 100 not in encoded.decode("utf-8")
+    assert "ლ" * 100 not in encoded.decode("utf-8")
+
+
+def test_list_processes_full_is_exact_legacy_payload(monkeypatch):
+    fake = _FakeManager()
+    legacy = {"ok": True, "total_requests": 1, "processes": [{"logs": "kept"}]}
+    fake.list_payload = legacy
+    monkeypatch.setattr(process_launcher, "default_manager", lambda: fake)
+
+    assert server.aiworkhub_agent_list_processes(7, detail="full") is legacy
+    assert fake.calls == [("list", {"limit": 7})]
+
+
+@pytest.mark.parametrize("detail", ["FULL", "", "records"])
+def test_list_processes_rejects_invalid_detail_before_manager(monkeypatch, detail):
+    fake = _FakeManager()
+    monkeypatch.setattr(process_launcher, "default_manager", lambda: fake)
+
+    with pytest.raises(ValueError, match="invalid_detail"):
+        server.aiworkhub_agent_list_processes(detail=detail)
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("limit", [0, 1001, True, 1.5, "10"])
+def test_list_processes_rejects_invalid_limit_before_manager(monkeypatch, limit):
+    fake = _FakeManager()
+    monkeypatch.setattr(process_launcher, "default_manager", lambda: fake)
+
+    with pytest.raises(ValueError, match="invalid_limit"):
+        server.aiworkhub_agent_list_processes(limit=limit)
+    assert fake.calls == []
 
 
 def test_launch_scrubs_coordinator_capability_before_manager_call(monkeypatch, tmp_path):

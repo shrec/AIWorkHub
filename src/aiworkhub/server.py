@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import inspect
 import json
 import os
@@ -2446,10 +2447,131 @@ def aiworkhub_agent_accept_review(
 
 
 @mcp.tool()
-def aiworkhub_agent_list_processes(limit: int = 100) -> dict[str, Any]:
-    """READ-ONLY: list latest process states for dashboard and orchestration."""
+def aiworkhub_agent_list_processes(
+    limit: int = 100,
+    detail: Literal["summary", "full"] = "summary",
+) -> dict[str, Any]:
+    """READ-ONLY: summarize latest processes; use detail='full' for legacy records."""
 
-    return process_launcher.default_manager().list_processes(limit=limit)
+    if detail not in {"summary", "full"}:
+        raise ValueError("invalid_detail: detail must be 'summary' or 'full'")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+        raise ValueError("invalid_limit: limit must be an integer from 1 through 1000")
+
+    payload = process_launcher.default_manager().list_processes(limit=limit)
+    if detail == "full":
+        return payload
+
+    processes = payload.get("processes")
+    rows = processes if isinstance(processes, list) else []
+    state_counts: dict[str, int] = {}
+    terminal_substatus_counts: dict[str, int] = {}
+    timestamps: list[str] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        state = str(row.get("state") or "unknown")
+        state_counts[state] = state_counts.get(state, 0) + 1
+        terminal_substatus = str(row.get("terminal_substatus") or "")
+        if terminal_substatus:
+            terminal_substatus_counts[terminal_substatus] = (
+                terminal_substatus_counts.get(terminal_substatus, 0) + 1
+            )
+        timestamp = str(row.get("timestamp") or "")
+        if timestamp:
+            timestamps.append(timestamp)
+
+    def bounded_text(value: str) -> str | dict[str, Any]:
+        encoded = value.encode("utf-8")
+        if len(encoded) <= 128:
+            return value
+        preview = encoded[:96].decode("utf-8", errors="ignore")
+        return {
+            "preview": preview,
+            "utf8_bytes": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+
+    def counts_digest(counts: dict[str, int]) -> str:
+        canonical = json.dumps(
+            dict(sorted(counts.items())),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def bounded_counts(counts: dict[str, int], *, include_values: bool = True) -> Any:
+        ordered = dict(sorted(counts.items()))
+        encoded = json.dumps(ordered, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(ordered) <= 16 and len(encoded) <= 1024:
+            return ordered
+        shown = list(ordered.items())[:6] if include_values else []
+        shown_total = sum(count for _, count in shown)
+        return {
+            "values": [
+                {"value": bounded_text(value), "count": count}
+                for value, count in shown
+            ],
+            "overflow": {
+                "distinct_count": len(ordered) - len(shown),
+                "occurrence_count": sum(ordered.values()) - shown_total,
+                "all_counts_sha256": counts_digest(ordered),
+            },
+        }
+
+    def timestamp_extrema(values: list[str]) -> tuple[str | None, str | None]:
+        aware: list[tuple[datetime, str]] = []
+        for value in values:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                continue
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                continue
+            aware.append((parsed.astimezone(timezone.utc), value))
+
+        if aware:
+            # Original strings break equal-instant ties deterministically.
+            newest = max(aware, key=lambda item: (item[0], item[1]))[1]
+            oldest = min(aware, key=lambda item: (item[0], item[1]))[1]
+            return newest, oldest
+        if values:
+            # Preserve deterministic legacy behavior when every value is malformed or naive.
+            return max(values), min(values)
+        return None, None
+
+    scanned_count = len(rows)
+    total_count = payload.get("total_requests")
+    if isinstance(total_count, bool) or not isinstance(total_count, int):
+        total_count = scanned_count
+    newest_timestamp, oldest_timestamp = timestamp_extrema(timestamps)
+    summary = {
+        "ok": bool(payload.get("ok")),
+        "detail": "summary",
+        "requested_count": limit,
+        "scanned_count": scanned_count,
+        "total_count": total_count,
+        "returned_count": 0,
+        "truncated": scanned_count > 0 or total_count > scanned_count,
+        "full_detail_available": True,
+        "state_counts": bounded_counts(state_counts),
+        "terminal_substatus_counts": bounded_counts(terminal_substatus_counts),
+        "timing": {
+            "newest_timestamp": (
+                bounded_text(newest_timestamp) if newest_timestamp is not None else None
+            ),
+            "oldest_timestamp": (
+                bounded_text(oldest_timestamp) if oldest_timestamp is not None else None
+            ),
+        },
+    }
+    if len(json.dumps(summary, ensure_ascii=False).encode("utf-8")) > 4096:
+        summary["state_counts"] = bounded_counts(state_counts, include_values=False)
+        summary["terminal_substatus_counts"] = bounded_counts(
+            terminal_substatus_counts,
+            include_values=False,
+        )
+    return summary
 
 
 @mcp.tool()
