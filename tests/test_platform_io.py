@@ -1026,7 +1026,7 @@ def test_posix_process_tree_zero_timeout_escalates_without_sleeping():
     assert sleeps == []
 
 
-def test_windows_process_tree_uses_taskkill_tree_command():
+def test_windows_process_tree_uses_graceful_taskkill_tree_command():
     calls = []
 
     def run(command, **kwargs):
@@ -1034,13 +1034,48 @@ def test_windows_process_tree_uses_taskkill_tree_command():
         return SimpleNamespace(returncode=0)
 
     assert platform_io.terminate_process_tree(
-        42, platform_name="windows", timeout=2.5, run=run
+        42,
+        platform_name="windows",
+        timeout=2.5,
+        run=run,
+        probe=lambda _pid: False,
     )
     assert calls == [
         (
-            ["taskkill", "/PID", "42", "/T", "/F"],
+            ["taskkill", "/PID", "42", "/T"],
             {"check": False, "shell": False, "timeout": 2.5},
         )
+    ]
+
+
+def test_windows_process_tree_forces_survivor_after_grace_period():
+    calls = []
+    probes = iter((True, True))
+    clock = iter((10.0, 10.1, 10.1))
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    assert platform_io.terminate_process_tree(
+        42,
+        platform_name="windows",
+        timeout=0.1,
+        poll_interval=0.1,
+        run=run,
+        probe=lambda _pid: next(probes),
+        monotonic=lambda: next(clock),
+        sleep=lambda _delay: None,
+    )
+    assert calls == [
+        (
+            ["taskkill", "/PID", "42", "/T"],
+            {"check": False, "shell": False, "timeout": 0.1},
+        ),
+        (
+            ["taskkill", "/F", "/PID", "42", "/T"],
+            {"check": False, "shell": False, "timeout": 0.1},
+        ),
     ]
 
 
@@ -1090,11 +1125,15 @@ def test_windows_module_import_and_process_branches_do_not_require_killpg(monkey
         return SimpleNamespace(returncode=0)
 
     assert imported.terminate_process_tree(
-        42, platform_name="windows", timeout=1.5, run=run
+        42,
+        platform_name="windows",
+        timeout=1.5,
+        run=run,
+        probe=lambda _pid: False,
     )
     assert calls == [
         (
-            ["taskkill", "/PID", "42", "/T", "/F"],
+            ["taskkill", "/PID", "42", "/T"],
             {"check": False, "shell": False, "timeout": 1.5},
         )
     ]

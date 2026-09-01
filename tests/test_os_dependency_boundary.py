@@ -79,7 +79,7 @@ def test_current_tree_passes_and_baseline_is_sorted():
     assert boundary is not None
     keys = [(entry.path, entry.pattern) for entry in boundary.baseline]
     assert keys == sorted(keys)
-    assert sum(entry.count for entry in boundary.baseline) == 153
+    assert sum(entry.count for entry in boundary.baseline) == 149
 
 
 def test_new_identity_and_same_identity_growth_fail(tmp_path):

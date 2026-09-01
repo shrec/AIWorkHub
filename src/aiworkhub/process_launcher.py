@@ -34,7 +34,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, cast
 
 from . import core
 from . import agent_tool_instructions
@@ -49,8 +49,12 @@ from .platform_io import (
     AdvisoryLockTimeout,
     chmod_fd,
     chmod_path,
+    is_windows,
     lock_fd,
+    probe_process_group,
+    process_group_launch_kwargs,
     process_is_alive,
+    terminate_process_tree,
     unlock_fd,
 )
 from . import quality_evidence
@@ -3879,6 +3883,8 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             "audit_ledger_numeric_decode_failed:" + ledger_decode_failure
         )
         return gate_result
+    assert policy_violations is not None
+    assert live_source_graph_calls is not None
     gate_result["policy_warning"] = policy_violations > 0
     gate_result["policy_warning_count"] = policy_violations
     if policy_violations:
@@ -4969,7 +4975,8 @@ class ProcessManager:
         claim_epoch = event.get("reviewer_claim_epoch")
         if not _is_bool_safe_int(claim_epoch):
             return "identity_incomplete"
-        if not task_id or not runner or claim_epoch < 1:
+        claim_epoch_int = int(cast(int, claim_epoch))
+        if not task_id or not runner or claim_epoch_int < 1:
             return "identity_incomplete"
         path = self._reviewer_terminal_intent_path(request_id)
         if path.is_file():
@@ -4980,7 +4987,7 @@ class ProcessManager:
                 "request_id": str(request_id),
                 "task_id": task_id,
                 "runner": runner,
-                "reviewer_claim_epoch": claim_epoch,
+                "reviewer_claim_epoch": claim_epoch_int,
                 "substatus": self._REVIEWER_TERMINAL_INTENT_SUBSTATUS,
                 "blocked_reason": blocked_reason,
                 "recorded_at": _utcnow(),
@@ -5522,7 +5529,7 @@ class ProcessManager:
                 or not task_id
                 or not runner
                 or not _is_bool_safe_int(claim_epoch)
-                or claim_epoch < 1
+                or int(cast(int, claim_epoch)) < 1
             ):
                 # An intent we cannot bind to an exact identity is never acted
                 # on and never deleted: it stays as evidence for an operator,
@@ -7315,7 +7322,7 @@ class ProcessManager:
                 if reviewer_claim_epoch is not None
                 else latest.get("reviewer_claim_epoch")
             )
-            if _is_bool_safe_int(epoch) and int(epoch) >= 1:
+            if epoch is not None and _is_bool_safe_int(epoch) and int(epoch) >= 1:
                 committed["reviewer_claim_epoch"] = int(epoch)
             if latest.get("quality_review_attempt") is not None:
                 committed["quality_review_attempt"] = latest["quality_review_attempt"]
@@ -7460,7 +7467,7 @@ class ProcessManager:
             self._settle_reviewer_terminal_intents_contained()
 
     def _reviewer_source_graph_prewarm_live_event(
-        self, event: dict[str, Any]
+        self, event: Mapping[str, Any]
     ) -> bool:
         """True when one event is a live, exact-owned Source Graph prewarm.
 
@@ -8733,7 +8740,7 @@ class ProcessManager:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     shell=False,
-                    start_new_session=True,
+                    **process_group_launch_kwargs(os.name),
                 )
                 started_at = _utcnow()
                 launch_phase = "supervisor_pid_identity"
@@ -9099,7 +9106,7 @@ class ProcessManager:
                         stdout=stdout_fh,
                         stderr=stderr_fh,
                         shell=False,
-                        start_new_session=True,
+                        **process_group_launch_kwargs(os.name),
                     )
                 start_ticks = _pid_start_ticks(process.pid)
                 live = _LiveProcess(
@@ -10043,7 +10050,7 @@ class ProcessManager:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             shell=False,
-            start_new_session=True,
+            **process_group_launch_kwargs(os.name),
         )
         start_ticks = _pid_start_ticks(process.pid)
         if start_ticks is None:
@@ -10525,7 +10532,8 @@ class ProcessManager:
         # failure with ``review_workspace_hashes_missing``.  Keep writable and
         # review-ready candidates on the existing fail-closed hash path.
         if (
-            stored_hashes is None
+            isinstance(terminal, dict)
+            and stored_hashes is None
             and changed_paths == []
             and not metadata_workspace.allowed_writes
             and not review_workspace.allowed_writes
@@ -14649,58 +14657,16 @@ def _process_group_alive(pgid: int) -> bool:
     signal, and any other ambiguity fails closed to alive so escalation still
     runs.
     """
-    if pgid <= 0:
-        return False
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
-    return True
+    return probe_process_group(pgid, platform_name="posix")
 
 
 def _terminate_process_group(pid: int, grace_seconds: float) -> None:
-    if os.name == "nt":
-        # Windows has no killpg(). taskkill /T addresses the exact process
-        # tree created for the worker without involving a command shell.
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            shell=False,
-        )
-        deadline = time.monotonic() + grace_seconds
-        while time.monotonic() < deadline:
-            if not _pid_alive(pid):
-                return
-            time.sleep(0.05)
-        subprocess.run(
-            ["taskkill", "/F", "/PID", str(pid), "/T"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            shell=False,
-        )
-        return
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    # Verify the GROUP we signalled, not just the leader: a surviving child
-    # keeps the group alive and must still force the SIGKILL escalation below.
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not _process_group_alive(pid):
-            return
-        time.sleep(0.05)
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    terminate_process_tree(
+        pid,
+        platform_name=os.name,
+        timeout=grace_seconds,
+        probe=_pid_alive if is_windows(os.name) else _process_group_alive,
+    )
 
 
 _DEFAULT_MANAGER: ProcessManager | None = None

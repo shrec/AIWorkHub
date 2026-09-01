@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import importlib
 import math
 import ntpath
 import os
@@ -21,11 +22,6 @@ import unicodedata
 from collections.abc import Callable
 from typing import Any, Protocol, TypedDict, cast
 
-if __package__:
-    from . import _platform_process
-else:  # direct-file import by the app-server mux entrypoint
-    import _platform_process
-
 
 class BackgroundProcessLaunchKwargs(TypedDict, total=False):
     """Platform-specific kwargs for a supervised headless subprocess."""
@@ -36,6 +32,25 @@ class BackgroundProcessLaunchKwargs(TypedDict, total=False):
 
 
 ProcessGroupLaunchKwargs = BackgroundProcessLaunchKwargs
+
+
+class _PlatformProcessBackend(Protocol):
+    def background_process_launch_kwargs(
+        self, platform_name: str | None = None
+    ) -> BackgroundProcessLaunchKwargs: ...
+
+    def windows_process_is_alive(self, pid: int) -> bool: ...
+
+    def process_is_alive(self, pid: int) -> bool: ...
+
+
+_platform_process_backend = cast(
+    _PlatformProcessBackend,
+    importlib.import_module(
+        "._platform_process" if __package__ else "_platform_process",
+        __package__ or None,
+    ),
+)
 
 
 def _normalized_platform(platform_name: str | None = None) -> str:
@@ -147,8 +162,26 @@ def terminate_process_tree(
         return False
     if is_windows(platform_name):
         try:
+            run(
+                ["taskkill", "/PID", str(identity), "/T"],
+                check=False,
+                shell=False,
+                timeout=timeout,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        alive = probe or (lambda pid: windows_pid_is_alive(pid))
+        deadline = monotonic() + timeout
+        while alive(identity):
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            sleep(min(poll_interval, remaining))
+        else:
+            return True
+        try:
             completed = run(
-                ["taskkill", "/PID", str(identity), "/T", "/F"],
+                ["taskkill", "/F", "/PID", str(identity), "/T"],
                 check=False,
                 shell=False,
                 timeout=timeout,
@@ -222,7 +255,7 @@ def background_process_launch_kwargs(
 ) -> BackgroundProcessLaunchKwargs:
     """Return only the headless process flags supported by this platform."""
 
-    return _platform_process.background_process_launch_kwargs(platform_name)
+    return _platform_process_backend.background_process_launch_kwargs(platform_name)
 
 
 _INVALID_HANDLE_VALUE = cast(int, ctypes.c_void_p(-1).value)
@@ -759,7 +792,7 @@ def windows_pid_is_alive(pid: int) -> bool:
     killed the VS Code extension host while the dashboard enumerated routes.
     """
 
-    return _platform_process.windows_process_is_alive(pid)
+    return _platform_process_backend.windows_process_is_alive(pid)
 
 
 def process_is_alive(pid: int) -> bool:
@@ -775,7 +808,7 @@ def process_is_alive(pid: int) -> bool:
     which never signals the target.
     """
 
-    return _platform_process.process_is_alive(pid)
+    return _platform_process_backend.process_is_alive(pid)
 
 
 def chmod_fd(fd: int, mode: int) -> None:
