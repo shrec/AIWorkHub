@@ -171,6 +171,8 @@ _FAILURE_TERMINAL_STATES = frozenset(
     }
 )
 _TERMINAL_REASON_MESSAGE_MAX_CHARS = 512
+_TERMINAL_REASON_RAW_MAX_CHARS = 512
+_TERMINAL_REASON_RAW_MAX_KEYS = 16
 
 
 def _bounded_cause(value: Any) -> str | None:
@@ -182,7 +184,64 @@ def _bounded_cause(value: Any) -> str | None:
     return message[:_TERMINAL_REASON_MESSAGE_MAX_CHARS]
 
 
+def _is_scalar(value: Any) -> bool:
+    return value is None or isinstance(value, (bool, int, float, str))
+
+
+def _bounded_scalar(value: Any) -> Any:
+    if isinstance(value, str):
+        return value[:_TERMINAL_REASON_RAW_MAX_CHARS]
+    return value
+
+
+def _bounded_raw_reason(value: Any) -> Any:
+    """Preserve a caller-supplied ``terminal_reason`` bounded, never mutated.
+
+    A mapping becomes a shallow copy of at most ``_TERMINAL_REASON_RAW_MAX_KEYS``
+    entries whose keys are already ``str`` (length-bounded) and whose values are
+    scalar; a non-``str`` key is dropped outright without ever invoking its
+    ``__str__``/``repr`` (a hostile key must never be able to crash or stall
+    ``append_event``), and nested or non-scalar values are dropped, so no
+    unbounded caller payload is persisted. A non-mapping scalar is
+    length-bounded; any other value collapses to None. There is no recursion or
+    stringification of arbitrary objects.
+    """
+
+    if isinstance(value, dict):
+        bounded: dict[str, Any] = {}
+        for key in list(value)[:_TERMINAL_REASON_RAW_MAX_KEYS]:
+            if not isinstance(key, str):
+                continue
+            item = value[key]
+            if _is_scalar(item):
+                bounded[key[:_TERMINAL_REASON_RAW_MAX_CHARS]] = _bounded_scalar(item)
+        return bounded
+    if _is_scalar(value):
+        return _bounded_scalar(value)
+    return None
+
+
 def _canonical_terminal_reason(event: dict[str, Any], state: str) -> dict[str, Any]:
+    """Build the bounded fixed-key terminal_reason for a failure-terminal event.
+
+    ``code``/``taxonomy``/``source`` are drawn only from server-side allowlisted
+    constants (never caller values) and ``message`` is hard length-bounded, so
+    no arbitrary or non-scalar caller payload flows into the canonical schema.
+
+    Cause selection is deterministic with this documented priority; the first
+    bounded scalar cause wins:
+
+    1. caller ``terminal_reason.message`` then ``terminal_reason.reason``
+    2. top-level ``error``
+    3. top-level ``blocked_reason`` then ``blocker_reason``
+    4. ``evidence.message`` then ``evidence.summary`` then ``evidence.reason``
+    5. top-level ``message``
+
+    When no supported scalar cause exists the record is forced to the
+    observability-missing-cause schema, regardless of any conflicting
+    caller-supplied ``code``/``taxonomy``.
+    """
+
     supplied = event.get("terminal_reason")
     reason = supplied if isinstance(supplied, dict) else {}
     candidates: list[tuple[str, Any]] = [
@@ -238,9 +297,19 @@ def append_event(
         state = state_value.strip().lower()
         if state in _FAILURE_TERMINAL_STATES:
             persisted_event["state"] = state
+            had_supplied_reason = "terminal_reason" in persisted_event
+            supplied_reason = persisted_event.get("terminal_reason")
             persisted_event["terminal_reason"] = _canonical_terminal_reason(
                 persisted_event, state
             )
+            if had_supplied_reason:
+                # Never discard what the caller sent: the canonical fixed-key
+                # schema above is authoritative, but the raw caller value is
+                # preserved bounded in a side field so conflicting or non-dict
+                # inputs stay auditable without unbounded passthrough.
+                persisted_event["terminal_reason_raw"] = _bounded_raw_reason(
+                    supplied_reason
+                )
     payload = (
         json.dumps(persisted_event, ensure_ascii=False, sort_keys=True) + "\n"
     ).encode("utf-8")

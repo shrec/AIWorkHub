@@ -432,3 +432,211 @@ def test_canonical_reason_survives_rotation_spill_and_latest_projection(
     assert latest["rotated"]["terminal_reason"] == rows[0]["terminal_reason"]
     assert latest["active"]["terminal_reason"] == rows[1]["terminal_reason"]
     assert latest["spill"]["terminal_reason"] == rows[2]["terminal_reason"]
+
+
+def test_caller_dict_terminal_reason_preserved_bounded_in_raw_side_field(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "raw-dict.jsonl"
+    huge_key = "k" * 5_000
+    event = {
+        "request_id": "raw-dict",
+        "state": "worker_failed",
+        "error": "primary cause",
+        "terminal_reason": {
+            "code": "caller_code",
+            huge_key: "x" * 5_000,
+            "nested": {"secret": "must not survive"},
+            "listy": ["also", "dropped"],
+            "flag": True,
+        },
+    }
+    original = deepcopy(event)
+
+    process_event_ledger.append_event(path, event)
+    persisted = list(process_event_ledger.iter_events(path))[0]
+
+    assert event == original
+    assert persisted["terminal_reason"]["source"] == "error"
+    assert set(persisted["terminal_reason"]) == {
+        "code",
+        "taxonomy",
+        "source",
+        "message",
+        "missing_cause",
+        "alertable",
+    }
+    raw = persisted["terminal_reason_raw"]
+    assert raw["code"] == "caller_code"
+    assert raw["flag"] is True
+    assert raw[huge_key[:512]] == "x" * 512
+    assert "nested" not in raw
+    assert "listy" not in raw
+    assert all(len(key) <= 512 for key in raw)
+
+
+def test_raw_side_field_bounds_dict_key_count(tmp_path: Path) -> None:
+    path = tmp_path / "raw-keys.jsonl"
+    reason = {f"k{index:03d}": index for index in range(100)}
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "raw-keys",
+            "state": "blocked",
+            "error": "cause",
+            "terminal_reason": reason,
+        },
+    )
+    raw = list(process_event_ledger.iter_events(path))[0]["terminal_reason_raw"]
+    assert len(raw) == 16
+
+
+def test_raw_side_field_drops_hostile_key_without_stringifying(tmp_path: Path) -> None:
+    path = tmp_path / "raw-hostile-key.jsonl"
+
+    class _HostileKey:
+        def __hash__(self) -> int:
+            return 0
+
+        def __str__(self) -> str:
+            raise RuntimeError("hostile __str__ must never be invoked")
+
+        __repr__ = __str__
+
+    hostile = _HostileKey()
+    event = {
+        "request_id": "raw-hostile-key",
+        "state": "worker_failed",
+        "error": "primary cause",
+        "terminal_reason": {hostile: "dropped without coercion", "safe": "kept"},
+    }
+
+    # A caller key whose __str__/__repr__ raises must never crash or stall
+    # append_event: the record still persists, the hostile key is dropped
+    # without being stringified, and only the already-``str`` key survives.
+    process_event_ledger.append_event(path, event)
+    persisted = list(process_event_ledger.iter_events(path))[0]
+
+    assert persisted["terminal_reason"]["source"] == "error"
+    assert persisted["terminal_reason_raw"] == {"safe": "kept"}
+    assert hostile in event["terminal_reason"]
+
+
+def test_non_dict_caller_terminal_reason_preserved_bounded(tmp_path: Path) -> None:
+    path = tmp_path / "raw-str.jsonl"
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "raw-str",
+            "state": "timed_out",
+            "error": "real cause",
+            "terminal_reason": "c" * 20_000,
+        },
+    )
+    persisted = list(process_event_ledger.iter_events(path))[0]
+    assert persisted["terminal_reason"]["source"] == "error"
+    assert persisted["terminal_reason_raw"] == "c" * 512
+
+
+def test_causeless_conflicting_reason_forces_canonical_yet_preserves_raw(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "raw-conflict.jsonl"
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "raw-conflict",
+            "state": "finalize_failed",
+            "terminal_reason": {
+                "code": "caller_override",
+                "taxonomy": "caller_taxonomy",
+                "note": "no scalar cause present",
+            },
+        },
+    )
+    persisted = list(process_event_ledger.iter_events(path))[0]
+    assert persisted["terminal_reason"] == {
+        "code": "terminal_reason_missing",
+        "taxonomy": "observability_missing_cause",
+        "source": "append_event",
+        "message": "terminal failure has no supported scalar cause",
+        "missing_cause": True,
+        "alertable": True,
+    }
+    assert persisted["terminal_reason_raw"] == {
+        "code": "caller_override",
+        "taxonomy": "caller_taxonomy",
+        "note": "no scalar cause present",
+    }
+
+
+def test_non_failure_event_receives_no_raw_side_field(tmp_path: Path) -> None:
+    path = tmp_path / "raw-nonfailure.jsonl"
+    event = {
+        "request_id": "raw-nonfailure",
+        "state": "running",
+        "terminal_reason": "caller text",
+    }
+    process_event_ledger.append_event(path, event)
+    persisted = list(process_event_ledger.iter_events(path))[0]
+    assert persisted == event
+    assert "terminal_reason_raw" not in persisted
+
+
+def test_raw_side_field_survives_rotation_spill_and_latest_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "process_events.jsonl"
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "rotated",
+            "state": "validation_failed",
+            "error": "rotation cause",
+            "terminal_reason": "caller-rotated",
+            "payload": "x" * 600,
+            "timestamp": "2026-08-21T00:00:00+00:00",
+        },
+        max_active_bytes=1024,
+    )
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "active",
+            "state": "worker_failed",
+            "terminal_reason": {"code": "caller", "message": "active cause"},
+            "payload": "y" * 600,
+            "timestamp": "2026-08-21T00:00:01+00:00",
+        },
+        max_active_bytes=1024,
+    )
+
+    @contextmanager
+    def timed_out_lock(_path: Path):
+        raise TimeoutError("locked")
+        yield
+
+    monkeypatch.setattr(process_event_ledger, "_append_lock", timed_out_lock)
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "spill",
+            "state": "process_lost",
+            "terminal_reason": {"reason": "spill cause", "extra": {"drop": "me"}},
+            "timestamp": "2026-08-21T00:00:02+00:00",
+        },
+        max_active_bytes=1024,
+    )
+
+    rows = list(process_event_ledger.iter_events(path))
+    assert len(process_event_ledger.ledger_paths(path)) == 3
+    assert rows[0]["terminal_reason_raw"] == "caller-rotated"
+    assert rows[1]["terminal_reason_raw"] == {
+        "code": "caller",
+        "message": "active cause",
+    }
+    assert rows[2]["terminal_reason_raw"] == {"reason": "spill cause"}
+    latest = process_event_ledger.latest_events(path)
+    assert latest["rotated"]["terminal_reason_raw"] == "caller-rotated"
+    assert latest["active"]["terminal_reason_raw"] == rows[1]["terminal_reason_raw"]
+    assert latest["spill"]["terminal_reason_raw"] == rows[2]["terminal_reason_raw"]
