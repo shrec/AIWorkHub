@@ -288,7 +288,7 @@ def test_automatic_hygiene_keeps_head_and_uses_mocked_archive_authority(
         ({}, {"state": "starting"}, "ledger_live"),
         ({}, {"state": "running"}, "ledger_live"),
         ({"reservation_id": "held-1"}, {}, "task_reserved"),
-        ({"retained_workspace": {"path": "/tmp/retained"}}, {}, "retained_evidence"),
+        ({"retained_workspace": {"path": "/"}}, {}, "retained_evidence"),
         ({}, None, "ledger_missing"),
         ({}, {"task_id": "OTHER"}, "ledger_task_mismatch"),
         ({}, {"request_id": "other-request"}, "ledger_request_mismatch"),
@@ -796,3 +796,45 @@ def test_hygiene_batch_budget_bounds_archives_not_examined_candidates(
     assert result["reasons"]["retained_evidence"] == 25
     assert "batch_limited" not in result["reasons"]
     assert "GRAVE_V31" not in archived
+
+
+def test_final_archive_fence_releases_retained_evidence_once_workspace_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bottleneck audit B4: evidence lives on disk, not on the card.  Once
+    # storage retention has quarantined or purged the recorded workspace the
+    # retained-evidence keys no longer protect anything and the terminal card
+    # becomes archivable; a card with no recorded path stays fenced.
+    repo = _repo(tmp_path)
+    gone = tmp_path / "worktrees" / "req-v1" / "worktree"
+    card: dict[str, Any] = {
+        "task_id": "FAMILY_V1",
+        "launch_request_id": "req-v1",
+        "status": "blocked",
+        "worker_status": "blocked",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "rework_predecessor": {"workspace": {"path": str(gone)}},
+    }
+    ledger = {
+        "task_id": "FAMILY_V1",
+        "request_id": "req-v1",
+        "state": "worker_failed",
+        "timestamp": "2026-01-01T00:00:01+00:00",
+    }
+    monkeypatch.setattr(task_store, "get_task", lambda _root, _task_id: card)
+    monkeypatch.setattr(
+        task_retention, "_latest_process_row", lambda _root, _request: ledger
+    )
+
+    fenced, reason = task_retention._final_archive_fence(repo, "FAMILY_V1", "req-v1")
+    assert fenced is not None and reason == ""
+
+    gone.mkdir(parents=True)
+    fenced, reason = task_retention._final_archive_fence(repo, "FAMILY_V1", "req-v1")
+    assert fenced is None and reason == "retained_evidence"
+
+    pathless = dict(card)
+    pathless["rework_predecessor"] = {"workspace": {"allowed_writes": ["a.py"]}}
+    monkeypatch.setattr(task_store, "get_task", lambda _root, _task_id: pathless)
+    fenced, reason = task_retention._final_archive_fence(repo, "FAMILY_V1", "req-v1")
+    assert fenced is None and reason == "retained_evidence"

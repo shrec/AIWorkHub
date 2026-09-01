@@ -996,6 +996,36 @@ def _latest_process_row(root: Path | str, request_id: str) -> Mapping[str, Any] 
     ).get(request_id)
 
 
+def _retained_workspace_present(
+    card: Mapping[str, Any], terminal_evidence: Any
+) -> bool:
+    """True while any recorded evidence workspace path still exists on disk.
+
+    A card without any recorded path is treated as present (fenced) so an
+    older record shape can never be archived by accident.
+    """
+
+    sources: list[Any] = [
+        (card.get("rework_predecessor") or {}).get("workspace")
+        if isinstance(card.get("rework_predecessor"), Mapping)
+        else None,
+        card.get("retained_workspace"),
+        card.get("workspace"),
+        terminal_evidence.get("workspace") if isinstance(terminal_evidence, Mapping) else None,
+    ]
+    recorded = 0
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        path = str(source.get("path") or "").strip()
+        if not path:
+            continue
+        recorded += 1
+        if Path(path).exists():
+            return True
+    return recorded == 0
+
+
 def _final_archive_fence(
     root: Path | str, task_id: str, expected_request_id: str
 ) -> tuple[dict[str, Any] | None, str]:
@@ -1044,7 +1074,16 @@ def _final_archive_fence(
             for key in ("candidate", "candidate_evidence", "changed_path_hashes", "workspace")
         )
     ):
-        return None, "retained_evidence"
+        # Bottleneck audit B4 (measured 2026-09-01): every blocked card that
+        # ever ran keeps these keys forever, so the fence held 124 of 135
+        # graveyard cards even though evidence lives on disk, not on the card.
+        # Retained evidence is only retained while its recorded workspace still
+        # exists; once storage retention has quarantined or purged it there is
+        # nothing left to protect and the terminal card may be archived (an
+        # archive is a status, never a deletion).  A card that records no
+        # workspace path stays fenced conservatively.
+        if _retained_workspace_present(card, terminal_evidence):
+            return None, "retained_evidence"
     connection = _connect(root, readonly=True)
     try:
         callback = connection.execute(
