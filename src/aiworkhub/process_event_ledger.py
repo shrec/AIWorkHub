@@ -173,6 +173,7 @@ _FAILURE_TERMINAL_STATES = frozenset(
 _TERMINAL_REASON_MESSAGE_MAX_CHARS = 512
 _TERMINAL_REASON_RAW_MAX_CHARS = 512
 _TERMINAL_REASON_RAW_MAX_KEYS = 16
+_TERMINAL_REASON_RAW_MAX_INT = 2**63
 # Exact named prefixes that mean the validation environment itself cannot
 # support the run (sandbox incapacity), never that the candidate is wrong.
 _ENVIRONMENT_UNSUPPORTED_PREFIXES: tuple[str, ...] = (
@@ -201,6 +202,16 @@ def _is_scalar(value: Any) -> bool:
 def _bounded_scalar(value: Any) -> Any:
     if isinstance(value, str):
         return value[:_TERMINAL_REASON_RAW_MAX_CHARS]
+    # json.dumps raises ValueError above the interpreter's int-to-str digit
+    # limit (and str() would too), so a huge caller integer must be replaced,
+    # never serialized or stringified, or append_event itself fails and the
+    # failure event is lost.
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and not -_TERMINAL_REASON_RAW_MAX_INT <= value <= _TERMINAL_REASON_RAW_MAX_INT
+    ):
+        return "int_out_of_bounds"
     return value
 
 

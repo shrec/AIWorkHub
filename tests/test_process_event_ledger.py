@@ -728,3 +728,37 @@ def test_environment_prefix_respects_supplied_alertable_and_missing_cause_parity
     assert causeless["code"] == "terminal_reason_missing"
     assert causeless["taxonomy"] == "observability_missing_cause"
     assert causeless["missing_cause"] is True
+
+
+def test_huge_integer_terminal_reason_is_replaced_not_serialized(
+    tmp_path: Path,
+) -> None:
+    # json.dumps raises ValueError above the int-to-str digit limit, so a huge
+    # caller integer must never reach serialization or the failure event is
+    # lost entirely.
+    path = tmp_path / "process_events.jsonl"
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "huge-nondict",
+            "state": "worker_failed",
+            "error": "real cause",
+            "terminal_reason": 10**5000,
+        },
+    )
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "huge-dictvalue",
+            "state": "validation_failed",
+            "error": "real cause",
+            "terminal_reason": {"code": "x", "big": 10**5000, "small": 7},
+        },
+    )
+
+    rows = {row["request_id"]: row for row in process_event_ledger.iter_events(path)}
+    assert rows["huge-nondict"]["terminal_reason_raw"] == "int_out_of_bounds"
+    raw = rows["huge-dictvalue"]["terminal_reason_raw"]
+    assert raw["big"] == "int_out_of_bounds"
+    assert raw["small"] == 7
+    assert raw["code"] == "x"
