@@ -201,6 +201,17 @@ than an already-available targeted check; the coordinator-side supervisor will
 still run the canonical validation after exit. Never use git add -A or git add
 . and never touch paths outside allowed_writes.
 
+SANDBOX_VALIDATION_FACTS: your worktree is a sparse checkout, so a declared
+.venv/bin/python does not exist inside it. Run the same declared commands with
+the coordinator-provided absolute paths in $AIWORKHUB_CANONICAL_PYTHON,
+$AIWORKHUB_CANONICAL_RUFF and $AIWORKHUB_CANONICAL_MYPY when they are set; tool
+caches are already routed into your writable temp (RUFF_CACHE_DIR,
+MYPY_CACHE_DIR, PYTEST_ADDOPTS). chmod/chown/utime are denied everywhere by
+sandbox policy, so a test or fixture that needs them cannot run here: report
+exactly which tests were blocked with the prefix
+validation_unsupported_in_sandbox: and never stub a denied call to claim a
+pass; the coordinator's canonical validation decides those tests after exit.
+
 MANDATORY_AIWORKHUB_TOOLS:
 - For code discovery call aiworkhub_worker_source_graph_query first and call it
   again whenever you need a new symbol, dependency, call path, control-flow,

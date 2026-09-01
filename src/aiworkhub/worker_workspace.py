@@ -5461,6 +5461,92 @@ def _normalize_validation_interpreter_argv(
     raise WorkspaceError("validation_environment:interpreter_missing")
 
 
+# Worker-adapter validation affordances (mechanical-failure audit follow-up,
+# measured 2026-09-01).  A worker worktree is a sparse checkout of tracked,
+# card-declared files, so a declared ``.venv/bin/python`` never exists inside
+# it and the adapter PATH is the sanitized system PATH; two Codex workers
+# failed closed on the relative spelling and submitted unvalidated candidates,
+# while Claude workers found the canonical interpreter by absolute path and
+# turned ruff/mypy cache denials into passes by redirecting the caches into
+# the request-owned temp.  These variables hand every worker those exact
+# proven facts.  They are read-only affordances: nothing here widens the
+# sandbox, grants a write on the shared canonical .venv, or seeds it into the
+# worktree (the seed copier rejects symlinks by design).
+CANONICAL_PYTHON_ENV = "AIWORKHUB_CANONICAL_PYTHON"
+CANONICAL_RUFF_ENV = "AIWORKHUB_CANONICAL_RUFF"
+CANONICAL_MYPY_ENV = "AIWORKHUB_CANONICAL_MYPY"
+_WORKER_PYTEST_ADDOPTS = "-p no:cacheprovider"
+
+
+def _sandbox_visible_repo_path(
+    repo: Path, host_path: Path, sandbox_backend: str | None
+) -> str:
+    """Spell a canonical-repo path the way the adapter process will see it.
+
+    Under bubblewrap the host repository is visible only at the
+    ``SANDBOX_AUTHORITY_REPO`` alias; every other backend sees real host paths.
+    """
+    if sandbox_backend == "bubblewrap":
+        relative = host_path.relative_to(repo)
+        return str(PurePosixPath(SANDBOX_AUTHORITY_REPO) / relative.as_posix())
+    return str(host_path)
+
+
+def worker_validation_affordance_env(
+    repo: Path | str,
+    temp_dir: str,
+    *,
+    sandbox_backend: str | None = None,
+) -> dict[str, str]:
+    """Return the validation affordance variables for one worker launch.
+
+    The interpreter is only exposed when it passes the same verification the
+    finalization validator applies to the canonical ``.venv/bin/python``
+    spelling (bound to the repository, symlink escape authenticated only
+    against the coordinator's own interpreter).  ``ruff``/``mypy`` are exposed
+    only when they resolve inside the repository ``.venv`` and are executable.
+    A missing or untrusted tool is simply not advertised -- never a launch
+    failure -- because the coordinator still runs canonical validation after
+    exit.  Tool caches are routed into ``temp_dir`` (the request-owned worker
+    temp), the one writable location the sandbox guarantees.
+    """
+    repo_path = Path(repo)
+    env: dict[str, str] = {}
+    python_relative = (
+        PurePosixPath(".venv/Scripts/python.exe")
+        if os.name == "nt"
+        else PurePosixPath(".venv/bin/python")
+    )
+    canonical_python = repo_path / Path(*python_relative.parts)
+    try:
+        if canonical_python.exists() or canonical_python.is_symlink():
+            _verify_validation_interpreter(
+                canonical_python,
+                repo_path,
+                authenticated_external_endpoint=Path(sys.executable).resolve(strict=True),
+            )
+            env[CANONICAL_PYTHON_ENV] = _sandbox_visible_repo_path(
+                repo_path, canonical_python, sandbox_backend
+            )
+    except (WorkspaceError, OSError, ValueError):
+        pass
+    venv_root = (repo_path / ".venv").resolve(strict=False)
+    for name, key in (("ruff", CANONICAL_RUFF_ENV), ("mypy", CANONICAL_MYPY_ENV)):
+        candidate = repo_path / ".venv" / Path(*_validation_executable_relative_path(name).parts)
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(venv_root)
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                env[key] = _sandbox_visible_repo_path(repo_path, candidate, sandbox_backend)
+        except (OSError, ValueError):
+            continue
+    temp = PurePosixPath(temp_dir) if os.name != "nt" else Path(temp_dir)
+    env["RUFF_CACHE_DIR"] = str(temp / "ruff-cache")
+    env["MYPY_CACHE_DIR"] = str(temp / "mypy-cache")
+    env["PYTEST_ADDOPTS"] = _WORKER_PYTEST_ADDOPTS
+    return env
+
+
 def _normalize_trusted_validation_executable_argv(
     argv: list[str], repo: Path | None = None
 ) -> list[str]:

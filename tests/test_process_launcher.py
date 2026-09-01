@@ -10202,3 +10202,88 @@ def test_bounded_error_hash_is_whitespace_stable_and_bounded() -> None:
     assert len(process_launcher.bounded_error_hash("boom")) == (
         process_launcher.TERMINAL_ERROR_HASH_HEX_CHARS
     )
+
+
+# ── worker validation affordances (sandbox parity) ────────────────────────
+
+
+def _fake_canonical_venv(repo: Path) -> None:
+    venv_bin = repo / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    # Production shape: the venv python is a symlink chain ending at the
+    # coordinator's own interpreter, which is the only authenticated escape.
+    (venv_bin / "python").symlink_to(Path(sys.executable).resolve())
+    for name in ("ruff", "mypy"):
+        tool = venv_bin / name
+        tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        tool.chmod(0o755)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="posix venv layout")
+def test_worker_launch_env_exposes_canonical_validation_affordances(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _fake_canonical_venv(repo)
+    env = process_launcher.worker_launch_env(
+        "claude_cli", repo=repo, request_id="req-affordance"
+    )
+    assert env["AIWORKHUB_CANONICAL_PYTHON"] == str(repo / ".venv" / "bin" / "python")
+    assert env["AIWORKHUB_CANONICAL_RUFF"] == str(repo / ".venv" / "bin" / "ruff")
+    assert env["AIWORKHUB_CANONICAL_MYPY"] == str(repo / ".venv" / "bin" / "mypy")
+    # Caches land inside the request-owned writable temp, never the worktree.
+    assert env["RUFF_CACHE_DIR"] == str(Path(env["TMPDIR"]) / "ruff-cache")
+    assert env["MYPY_CACHE_DIR"] == str(Path(env["TMPDIR"]) / "mypy-cache")
+    assert env["PYTEST_ADDOPTS"] == "-p no:cacheprovider"
+    # The sanitized PATH is untouched: the affordance is an explicit variable,
+    # never a PATH widening.
+    assert env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="posix venv layout")
+def test_worker_launch_env_spells_affordances_for_bubblewrap_alias(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _fake_canonical_venv(repo)
+    env = process_launcher.worker_launch_env(
+        "claude_cli",
+        repo=repo,
+        request_id="req-bwrap",
+        sandbox_backend="bubblewrap",
+    )
+    assert env["AIWORKHUB_CANONICAL_PYTHON"] == "/authority-repo/.venv/bin/python"
+    assert env["AIWORKHUB_CANONICAL_RUFF"] == "/authority-repo/.venv/bin/ruff"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="posix venv layout")
+def test_worker_launch_env_omits_missing_or_untrusted_affordances(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # No .venv at all: nothing is advertised, launch is not a failure, and the
+    # cache routing still applies.
+    env = process_launcher.worker_launch_env(
+        "claude_cli", repo=repo, request_id="req-novenv"
+    )
+    assert "AIWORKHUB_CANONICAL_PYTHON" not in env
+    assert "AIWORKHUB_CANONICAL_RUFF" not in env
+    assert env["PYTEST_ADDOPTS"] == "-p no:cacheprovider"
+    # A ruff that escapes the venv root by symlink is untrusted and omitted.
+    venv_bin = repo / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    outside = tmp_path / "outside-ruff"
+    outside.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    outside.chmod(0o755)
+    (venv_bin / "ruff").symlink_to(outside)
+    env = process_launcher.worker_launch_env(
+        "claude_cli", repo=repo, request_id="req-escape"
+    )
+    assert "AIWORKHUB_CANONICAL_RUFF" not in env
+
+
+def test_worker_runtime_policy_names_sandbox_validation_facts():
+    from aiworkhub import agent_tool_instructions
+
+    policy = agent_tool_instructions.render_worker_runtime_policy()
+    assert "SANDBOX_VALIDATION_FACTS" in policy
+    assert "$AIWORKHUB_CANONICAL_PYTHON" in policy
+    assert "validation_unsupported_in_sandbox:" in policy
+    assert "never stub a denied call" in policy

@@ -137,6 +137,7 @@ from .worker_workspace import (
     unlink_if_regular,
     validate_residual_contract,
     worker_temp_environment,
+    worker_validation_affordance_env,
     VSCODE_LM_IN_PROCESS_BACKEND,
     write_json_0600,
 )
@@ -566,6 +567,7 @@ def worker_launch_env(
     home: Path | None = None,
     isolated_task_queue_db: bool = False,
     provider_env: dict[str, str] | None = None,
+    sandbox_backend: str | None = None,
 ) -> dict[str, str]:
     """Build the sanitized worker env, then route TMPDIR/TMP/TEMP at the exact
     request-owned repository-local temp authority (NF430).
@@ -575,10 +577,13 @@ def worker_launch_env(
     worker-run pytest/tempfile lands in
     ``<repo>/.aiworkhub/temp/worker/<request_id>/tmp`` (provisioned 0700 and
     owner-stamped here) rather than the shared system temp or inside the
-    candidate worktree.  Nothing else changes: the sanitized allowlist, the
-    request-scoped HOME, and the explicit BYOK provider env are exactly as
-    ``sanitized_env`` built them; only the three temp keys are overlaid, from
-    the single declaration in ``runtime_adapters.WORKER_TEMP_ENV_VARS``.
+    candidate worktree.  The sanitized allowlist, the request-scoped HOME, and
+    the explicit BYOK provider env are exactly as ``sanitized_env`` built
+    them; the three temp keys are overlaid from the single declaration in
+    ``runtime_adapters.WORKER_TEMP_ENV_VARS``, and the read-only validation
+    affordances (canonical interpreter and tool paths spelled for
+    ``sandbox_backend``, tool caches routed into the worker temp) are added by
+    ``worker_validation_affordance_env``.
     """
     env = sanitized_env(
         adapter_id,
@@ -589,6 +594,13 @@ def worker_launch_env(
     temp_env = worker_temp_environment(repo, request_id)
     for key in runtime_adapters.WORKER_TEMP_ENV_VARS:
         env[key] = temp_env[key]
+    env.update(
+        worker_validation_affordance_env(
+            repo,
+            env[runtime_adapters.WORKER_TEMP_ENV_VARS[0]],
+            sandbox_backend=sandbox_backend,
+        )
+    )
     return env
 
 
@@ -8756,6 +8768,7 @@ class ProcessManager:
                     ),
                     isolated_task_queue_db=True,
                     provider_env=provider_env,
+                    sandbox_backend=sandbox_backend,
                 )
                 worker_argv = sandbox_argv(
                     workspace,
