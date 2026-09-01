@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import io
 import importlib.util
 import os
 import subprocess
@@ -10,6 +11,46 @@ from types import SimpleNamespace
 import pytest
 
 from aiworkhub import _platform_process, platform_io
+
+
+def test_available_memory_bytes_reads_linux_memavailable(monkeypatch):
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda *_args, **_kwargs: io.StringIO(
+            "MemTotal:       8192 kB\nMemAvailable:   4096 kB\n"
+        ),
+    )
+    assert platform_io.available_memory_bytes("linux") == 4096 * 1024
+
+
+def test_available_memory_bytes_fails_closed_for_invalid_linux_value(monkeypatch):
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda *_args, **_kwargs: io.StringIO("MemAvailable: unknown kB\n"),
+    )
+    assert platform_io.available_memory_bytes("linux") is None
+
+
+def test_available_memory_bytes_uses_posix_sysconf(monkeypatch):
+    values = {"SC_AVPHYS_PAGES": 100, "SC_PAGE_SIZE": 4096}
+    monkeypatch.setattr(platform_io.os, "sysconf", values.__getitem__)
+    assert platform_io.available_memory_bytes("freebsd") == 409_600
+
+
+def test_available_memory_bytes_reads_windows_status(monkeypatch):
+    def global_memory_status(status_pointer):
+        status_pointer._obj.available_physical = 123_456
+        return 1
+
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "windll",
+        SimpleNamespace(
+            kernel32=SimpleNamespace(GlobalMemoryStatusEx=global_memory_status)
+        ),
+        raising=False,
+    )
+    assert platform_io.available_memory_bytes("windows") == 123_456
 
 
 class _FakeWindowsFunction:

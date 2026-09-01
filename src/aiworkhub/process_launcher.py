@@ -9,9 +9,9 @@ never selects a task by keywords and it never invokes a shell.
 from __future__ import annotations
 
 import ast
-import fnmatch
 import ctypes
 import difflib
+import fnmatch
 import hashlib
 import hmac
 import html
@@ -47,6 +47,7 @@ from . import kilo_auth
 from . import needfix_store
 from .platform_io import (
     AdvisoryLockTimeout,
+    available_memory_bytes as _available_memory_bytes,
     chmod_fd,
     chmod_path,
     is_windows,
@@ -961,6 +962,38 @@ _terminal_authority_signing_material = terminal_authority.signing_material
 _load_or_create_terminal_authority_key = terminal_authority.load_or_create_key
 _write_terminal_authority_grant = terminal_authority.write_grant
 _read_terminal_authority_grant = terminal_authority.read_grant
+
+
+# NF-2026-00557 measured the resident extension/MCP/model baseline and launch
+# transient. Keep 4 GiB for that host baseline and budget 2 GiB for one new
+# heavy agent. These are admission headroom, not a replacement concurrency cap.
+MEMORY_RESERVED_HEADROOM_BYTES = 4 * 1024**3
+MEMORY_PER_LAUNCH_ESTIMATE_BYTES = 2 * 1024**3
+MEMORY_LAUNCH_REQUIRED_BYTES = (
+    MEMORY_RESERVED_HEADROOM_BYTES + MEMORY_PER_LAUNCH_ESTIMATE_BYTES
+)
+
+
+def _memory_launch_admission() -> dict[str, Any]:
+    available = _available_memory_bytes()
+    admitted = available is not None and available >= MEMORY_LAUNCH_REQUIRED_BYTES
+    return {
+        "admit": admitted,
+        "retryable": True,
+        "available_bytes": available,
+        "required_bytes": MEMORY_LAUNCH_REQUIRED_BYTES,
+        "reserved_headroom_bytes": MEMORY_RESERVED_HEADROOM_BYTES,
+        "per_launch_estimate_bytes": MEMORY_PER_LAUNCH_ESTIMATE_BYTES,
+        "reason": (
+            "memory_capacity_available"
+            if admitted
+            else (
+                "memory_probe_unavailable"
+                if available is None
+                else "memory_capacity_insufficient"
+            )
+        ),
+    }
 
 
 class LaunchRejected(RuntimeError):
@@ -8401,6 +8434,14 @@ class ProcessManager:
             model = validate_workforce_identity(
                 runner, adapter_id, model, risk_tier=card.get("risk_tier")
             )
+            memory_admission = _memory_launch_admission()
+            if not memory_admission["admit"]:
+                raise LaunchRejected(
+                    "memory_launch_capacity_denied:"
+                    + json.dumps(
+                        memory_admission, sort_keys=True, separators=(",", ":")
+                    )
+                )
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             authority_repo = _task_authority_repo(self.repo, card)
             context_result = _launch_project_context(
@@ -9308,6 +9349,14 @@ class ProcessManager:
             model = validate_workforce_identity(
                 runner, adapter_id, model, risk_tier=card.get("risk_tier")
             )
+            memory_admission = _memory_launch_admission()
+            if not memory_admission["admit"]:
+                raise LaunchRejected(
+                    "memory_launch_capacity_denied:"
+                    + json.dumps(
+                        memory_admission, sort_keys=True, separators=(",", ":")
+                    )
+                )
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             context_result = project_context.collect_project_context(self.repo, card)
             provider_env, model = self._resolve_provider_env(adapter_id, model)

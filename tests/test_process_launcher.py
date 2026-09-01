@@ -209,6 +209,70 @@ def _manager(tmp_path: Path, *, show_task, argv) -> process_launcher.ProcessMana
     )
 
 
+def test_memory_admission_rejects_insufficient_available_memory(monkeypatch) -> None:
+    monkeypatch.setattr(
+        process_launcher,
+        "_available_memory_bytes",
+        lambda: process_launcher.MEMORY_LAUNCH_REQUIRED_BYTES - 1,
+    )
+    verdict = process_launcher._memory_launch_admission()
+    assert verdict["admit"] is False
+    assert verdict["retryable"] is True
+    assert verdict["reason"] == "memory_capacity_insufficient"
+
+
+def test_memory_admission_accepts_sufficient_available_memory(monkeypatch) -> None:
+    monkeypatch.setattr(
+        process_launcher,
+        "_available_memory_bytes",
+        lambda: process_launcher.MEMORY_LAUNCH_REQUIRED_BYTES,
+    )
+    verdict = process_launcher._memory_launch_admission()
+    assert verdict["admit"] is True
+    assert verdict["reason"] == "memory_capacity_available"
+
+
+def test_memory_admission_fails_closed_when_probe_fails(monkeypatch) -> None:
+    monkeypatch.setattr(process_launcher, "_available_memory_bytes", lambda: None)
+    verdict = process_launcher._memory_launch_admission()
+    assert verdict["admit"] is False
+    assert verdict["retryable"] is True
+    assert verdict["reason"] == "memory_probe_unavailable"
+
+
+def test_memory_denial_precedes_launch_side_effects(monkeypatch, tmp_path: Path) -> None:
+    _open_gates(monkeypatch)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager.isolation_enabled = True
+    monkeypatch.setattr(
+        process_launcher,
+        "_available_memory_bytes",
+        lambda: process_launcher.MEMORY_LAUNCH_REQUIRED_BYTES - 1,
+    )
+
+    result = manager.launch(
+        task_id="TASK_B1",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+    )
+
+    assert result["ok"] is False
+    reason = result["blocked_reason"]
+    assert reason.startswith("memory_launch_capacity_denied:")
+    assert '"retryable":true' in reason
+    assert '"reason":"memory_capacity_insufficient"' in reason
+    assert manager._live == {}
+    assert not manager.process_dir.exists()
+    event = json.loads(manager.process_log_path.read_text(encoding="utf-8"))
+    assert event["state"] == "blocked"
+    assert event["blocked_reason"] == reason
+
+
 def _canonical_claimed_task_repo(
     tmp_path: Path,
     *,
@@ -590,6 +654,11 @@ def test_committed_claim_card_rejects_tampered_identity(
 def _open_gates(monkeypatch):
     monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    monkeypatch.setattr(
+        process_launcher,
+        "_available_memory_bytes",
+        lambda: process_launcher.MEMORY_LAUNCH_REQUIRED_BYTES,
+    )
     # Generic launcher tests exercise process lifecycle with an injected
     # adapter command. Keep them independent of whether the CI host has a
     # first-party Claude subscription; auth failure/ready behavior has its own

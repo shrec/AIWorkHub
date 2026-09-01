@@ -81,6 +81,54 @@ def is_macos(platform_name: str | None = None) -> bool:
     return _normalized_platform(platform_name) == "macos"
 
 
+def available_memory_bytes(platform_name: str | None = None) -> int | None:
+    """Return host-available physical memory, or ``None`` when it cannot be measured."""
+
+    if is_linux(platform_name):
+        try:
+            with open("/proc/meminfo", encoding="ascii") as handle:
+                for line in handle:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        if len(parts) == 3 and parts[2] == "kB":
+                            value = int(parts[1]) * 1024
+                            return value if value >= 0 else None
+                        return None
+            return None
+        except (OSError, UnicodeError, ValueError):
+            return None
+    if is_windows(platform_name):
+
+        class _MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_ulong),
+                ("memory_load", ctypes.c_ulong),
+                ("total_physical", ctypes.c_ulonglong),
+                ("available_physical", ctypes.c_ulonglong),
+                ("total_page_file", ctypes.c_ulonglong),
+                ("available_page_file", ctypes.c_ulonglong),
+                ("total_virtual", ctypes.c_ulonglong),
+                ("available_virtual", ctypes.c_ulonglong),
+                ("available_extended_virtual", ctypes.c_ulonglong),
+            ]
+
+        try:
+            status = _MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None
+            return int(status.available_physical)
+        except (AttributeError, OSError, ValueError):
+            return None
+    try:
+        pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available = pages * page_size
+        return available if pages >= 0 and page_size > 0 else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
 def _windows_creation_flag() -> int:
     """Return the named Windows process-group flag through a typed boundary."""
 
