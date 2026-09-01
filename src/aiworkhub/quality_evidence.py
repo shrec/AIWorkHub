@@ -521,10 +521,14 @@ _RISK_PROFILES: dict[str, dict[str, Any]] = {
         "explicit_human_approval_required": False,
     },
     RISK_HIGH: {
+        # Measured 2026-09-01: only correctness/security findings force
+        # refinement (see the refine_required fold below); a code_quality
+        # report almost never changes the outcome yet costs a full reviewer
+        # run (~150-450k input tokens) on the workhorse tier. code_quality
+        # stays required at critical only.
         "required_reviewer_lenses": (
             LENS_CORRECTNESS,
             LENS_SECURITY,
-            LENS_CODE_QUALITY,
         ),
         "combined_tree_required": True,
         "cross_provider_required": True,
