@@ -341,8 +341,9 @@ def test_stdlib_fallback_task_create_then_show_uses_binary_utf8_for_georgian(
         card.update(kwargs)
         return {"ok": True, "created": True, "task_id": kwargs["task_id"], **kwargs}
 
-    def fake_show_task(requested_task_id):
+    def fake_show_task(requested_task_id, *, full=False):
         assert requested_task_id == task_id
+        assert full is False
         return {"ok": True, "task_id": requested_task_id, "card": dict(card)}
 
     monkeypatch.setattr(server_module.core, "create_task", fake_create_task)

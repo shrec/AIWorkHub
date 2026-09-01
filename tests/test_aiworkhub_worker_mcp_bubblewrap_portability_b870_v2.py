@@ -65,10 +65,12 @@ _PACKAGE_FILES = (
     "quality_reviewer.py",
     "evidence_levels.py",
     "scoped_audit.py",
-    # worker_ai_tools_mcp imports the shared read-only SQLite helper; a synthetic
-    # layout that omits it cannot import the package at all, which would make
-    # this fixture fail for a missing file rather than for the import-root
-    # behaviour it exists to prove.
+    # worker_ai_tools_mcp imports the shared platform and read-only SQLite
+    # helpers; a synthetic layout that omits either cannot import the package
+    # at all, which would make this fixture fail for a missing file rather
+    # than for the import-root behaviour it exists to prove.
+    "platform_io.py",
+    "_platform_process.py",
     "sqlite_readonly.py",
 )
 
@@ -119,7 +121,7 @@ def _copy_minimal_package(dest_src_root: Path) -> Path:
     package_dir = dest_src_root / "aiworkhub"
     package_dir.mkdir(parents=True, exist_ok=True)
     for name in _PACKAGE_FILES:
-        shutil.copy2(_SRC / "aiworkhub" / name, package_dir / name)
+        shutil.copyfile(_SRC / "aiworkhub" / name, package_dir / name)
     return dest_src_root
 
 
