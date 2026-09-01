@@ -115,3 +115,26 @@ def test_registered_runner_ids_are_byte_stable_under_grammar(registered: str) ->
 )
 def test_unresolvable_or_malformed_runner_id_returns_none(value: str) -> None:
     assert policy.canonical_runner_id(value, _REGISTERED_RUNNER_IDS) is None
+
+
+def test_create_time_runner_folds_variants_and_refuses_unknown_claude_family() -> None:
+    # NF-2026-00549: variant spellings fold onto the registered launcher route
+    # at create; an unresolvable claude-family runner is refused with a named
+    # reason instead of dying later at launch with workforce_route_absent.
+    from aiworkhub import core
+
+    assert core.resolve_create_time_runner("claude_opus_5") == ("claude_opus-5", None)
+    assert core.resolve_create_time_runner("claude_opus5") == ("claude_opus-5", None)
+    assert core.resolve_create_time_runner("claude_opus-5") == ("claude_opus-5", None)
+    assert core.resolve_create_time_runner("claude_sonnet_5") == ("claude_sonnet-5", None)
+    # Non-claude families keep adapter-level resolution exactly as at launch.
+    assert core.resolve_create_time_runner("codex_5_6_sol") == ("codex_5_6_sol", None)
+    assert core.resolve_create_time_runner("codex_gpt-5.6-terra") == (
+        "codex_gpt-5.6-terra",
+        None,
+    )
+
+    # A runner that folds onto no registered route passes through unchanged:
+    # synthetic and unpinned claude-family runners are legitimate at launch.
+    assert core.resolve_create_time_runner("claude_ghost-9") == ("claude_ghost-9", None)
+    assert core.resolve_create_time_runner("claude_worker") == ("claude_worker", None)

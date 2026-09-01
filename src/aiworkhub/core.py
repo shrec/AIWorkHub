@@ -1038,6 +1038,7 @@ from .runner_topic_policy import (
     PER_WAVE_RUNNER_TOPIC_ALLOWLIST,
     RUNNER_TOPIC_ALLOWLIST,
     _is_malformed_identity_token,
+    canonical_runner_id,
     check_runner_topic_allowlist,
 )
 
@@ -2959,6 +2960,31 @@ def _task_context_query(
     return query or "repository"
 
 
+def resolve_create_time_runner(runner: str) -> tuple[str, dict[str, Any] | None]:
+    """Fold a variant card runner spelling onto its registered launcher route.
+
+    NF-2026-00549: a spelling that differs from a registered launcher route
+    only in case or ``-``/``_`` separators (measured: ``claude_opus_5`` and
+    ``claude_opus5`` beside ``claude_opus-5``) would die later at a
+    pinned-model launch with ``workforce_route_absent``; it folds onto the one
+    registered spelling here.  Nothing is refused: a runner that folds onto no
+    route is returned unchanged because launch resolves unpinned and non-claude
+    runners at the adapter level, and synthetic runner names are legitimate.
+    The second tuple member is reserved for a named refusal and is always
+    ``None`` today.
+    """
+    from . import process_launcher as _launcher_routes
+
+    launcher_route_runners = {
+        route_runner
+        for route_runner, _adapter in _launcher_routes._CANONICAL_WORKFORCE
+    }
+    folded_runner = canonical_runner_id(runner, launcher_route_runners)
+    if folded_runner is not None:
+        return folded_runner, None
+    return runner, None
+
+
 def create_task(
     task_id: str,
     title: str,
@@ -3029,6 +3055,9 @@ def create_task(
         return _lifecycle_error("invalid_task_id", 2)
     if not _TASK_IDENTITY_RE.fullmatch(runner) or not _TASK_IDENTITY_RE.fullmatch(topic):
         return _lifecycle_error("invalid_runner_or_topic", 2)
+    runner, route_error = resolve_create_time_runner(runner)
+    if route_error is not None:
+        return route_error
     coordinator_worker_runner = runner == CODEX_RUNNER
     if not title or len(title) > 300 or not objective or len(objective) > 4000:
         return _lifecycle_error("invalid_title_or_objective", 2)
