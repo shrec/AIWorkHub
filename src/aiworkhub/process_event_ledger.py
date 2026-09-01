@@ -155,6 +155,73 @@ def _write_immutable_spill(path: Path, payload: bytes) -> Path:
                 pass
 
 
+_FAILURE_TERMINAL_STATES = frozenset(
+    {
+        "validation_failed",
+        "worker_failed",
+        "launch_failed",
+        "finalize_failed",
+        "blocked",
+        "cancelled",
+        "timed_out",
+        "process_lost",
+        "liveness_lost",
+        "scope_rejected",
+        "output_budget_exceeded",
+    }
+)
+_TERMINAL_REASON_MESSAGE_MAX_CHARS = 512
+
+
+def _bounded_cause(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    message = value.strip()
+    if not message:
+        return None
+    return message[:_TERMINAL_REASON_MESSAGE_MAX_CHARS]
+
+
+def _canonical_terminal_reason(event: dict[str, Any], state: str) -> dict[str, Any]:
+    supplied = event.get("terminal_reason")
+    reason = supplied if isinstance(supplied, dict) else {}
+    candidates: list[tuple[str, Any]] = [
+        ("terminal_reason", reason.get("message")),
+        ("terminal_reason", reason.get("reason")),
+        ("error", event.get("error")),
+        ("blocked_reason", event.get("blocked_reason")),
+        ("blocker_reason", event.get("blocker_reason")),
+    ]
+    evidence = event.get("evidence")
+    if isinstance(evidence, dict):
+        candidates.extend(
+            ("evidence", evidence.get(key)) for key in ("message", "summary", "reason")
+        )
+    candidates.append(("message", event.get("message")))
+
+    for source, value in candidates:
+        message = _bounded_cause(value)
+        if message is not None:
+            alertable_value = reason.get("alertable")
+            alertable = alertable_value if isinstance(alertable_value, bool) else True
+            return {
+                "code": state,
+                "taxonomy": "lifecycle_terminal_failure",
+                "source": source,
+                "message": message,
+                "missing_cause": False,
+                "alertable": alertable,
+            }
+    return {
+        "code": "terminal_reason_missing",
+        "taxonomy": "observability_missing_cause",
+        "source": "append_event",
+        "message": "terminal failure has no supported scalar cause",
+        "missing_cause": True,
+        "alertable": True,
+    }
+
+
 def append_event(
     path: Path,
     event: dict[str, Any],
@@ -165,7 +232,18 @@ def append_event(
 
     if max_active_bytes < 1024:
         raise ValueError("process_ledger_max_bytes_too_small")
-    payload = (json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    persisted_event = event.copy()
+    state_value = persisted_event.get("state")
+    if isinstance(state_value, str):
+        state = state_value.strip().lower()
+        if state in _FAILURE_TERMINAL_STATES:
+            persisted_event["state"] = state
+            persisted_event["terminal_reason"] = _canonical_terminal_reason(
+                persisted_event, state
+            )
+    payload = (
+        json.dumps(persisted_event, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
     if len(payload) > max_active_bytes:
         raise ValueError("process_event_exceeds_active_ledger_bound")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

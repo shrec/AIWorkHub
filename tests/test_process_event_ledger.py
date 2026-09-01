@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -61,7 +62,20 @@ def test_append_lock_timeout_publishes_ordered_immutable_spill(
         if ".spill." in candidate.name
     ]
     assert len(spills) == 1
-    assert list(process_event_ledger.iter_events(path)) == [earlier, recovery]
+    assert list(process_event_ledger.iter_events(path)) == [
+        earlier,
+        {
+            **recovery,
+            "terminal_reason": {
+                "code": "terminal_reason_missing",
+                "taxonomy": "observability_missing_cause",
+                "source": "append_event",
+                "message": "terminal failure has no supported scalar cause",
+                "missing_cause": True,
+                "alertable": True,
+            },
+        },
+    ]
 
 
 def test_multiple_spills_merge_with_active_events_by_timestamp(
@@ -205,3 +219,216 @@ def test_latest_events_preserves_spill_timestamp_order(
         },
     )
     assert process_event_ledger.latest_events(path)["request-a"]["state"] == "finished"
+
+
+_FAILURE_STATES = (
+    "validation_failed",
+    "worker_failed",
+    "launch_failed",
+    "finalize_failed",
+    "blocked",
+    "cancelled",
+    "timed_out",
+    "process_lost",
+    "liveness_lost",
+    "scope_rejected",
+    "output_budget_exceeded",
+)
+
+
+@pytest.mark.parametrize("state", _FAILURE_STATES)
+def test_failure_states_persist_fixed_canonical_terminal_reason(
+    tmp_path: Path, state: str
+) -> None:
+    path = tmp_path / f"{state}.jsonl"
+    event = {
+        "request_id": state,
+        "state": state.upper(),
+        "terminal_reason": {
+            "code": "caller_safe_code",
+            "taxonomy": "caller_safe_taxonomy",
+            "source": "caller_safe_source",
+            "message": "  explicit cause  ",
+            "alertable": False,
+            "custom": {"secret": "must not survive"},
+        },
+    }
+    original = deepcopy(event)
+
+    process_event_ledger.append_event(path, event)
+    persisted = list(process_event_ledger.iter_events(path))[0]
+
+    assert event == original
+    assert persisted["state"] == state
+    assert persisted["terminal_reason"] == {
+        "code": state,
+        "taxonomy": "lifecycle_terminal_failure",
+        "source": "terminal_reason",
+        "message": "explicit cause",
+        "missing_cause": False,
+        "alertable": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("event_fields", "source", "message"),
+    [
+        ({"terminal_reason": {"reason": "reason cause"}}, "terminal_reason", "reason cause"),
+        ({"error": "error cause", "message": "later"}, "error", "error cause"),
+        ({"blocked_reason": "blocked cause"}, "blocked_reason", "blocked cause"),
+        ({"blocker_reason": "blocker cause"}, "blocker_reason", "blocker cause"),
+        ({"evidence": {"message": "evidence cause"}}, "evidence", "evidence cause"),
+        ({"evidence": {"summary": "summary cause"}}, "evidence", "summary cause"),
+        ({"evidence": {"reason": "evidence reason"}}, "evidence", "evidence reason"),
+        ({"message": "top-level cause"}, "message", "top-level cause"),
+    ],
+)
+def test_failure_cause_priority_and_source_are_deterministic(
+    tmp_path: Path,
+    event_fields: dict[str, object],
+    source: str,
+    message: str,
+) -> None:
+    path = tmp_path / f"{source}-{message}.jsonl"
+    event = {"request_id": message, "state": "worker_failed", **event_fields}
+
+    process_event_ledger.append_event(path, event)
+    reason = list(process_event_ledger.iter_events(path))[0]["terminal_reason"]
+
+    assert reason["source"] == source
+    assert reason["message"] == message
+    assert reason["code"] == "worker_failed"
+    assert reason["taxonomy"] == "lifecycle_terminal_failure"
+
+
+@pytest.mark.parametrize(
+    "terminal_reason",
+    [
+        None,
+        "caller text",
+        {"code": "safe_but_ignored", "taxonomy": "safe", "source": "safe"},
+        {"message": {"nested": "not scalar"}, "reason": ["also", "nested"]},
+        {"message": ""},
+    ],
+)
+def test_causeless_failure_forces_observability_alert(
+    tmp_path: Path, terminal_reason: object
+) -> None:
+    path = tmp_path / "missing.jsonl"
+    event = {
+        "request_id": "missing",
+        "state": "finalize_failed",
+        "terminal_reason": terminal_reason,
+        "error": {"nested": "ignored"},
+        "evidence": [{"message": "not recursively inspected"}],
+        "message": False,
+    }
+
+    process_event_ledger.append_event(path, event)
+    reason = list(process_event_ledger.iter_events(path))[0]["terminal_reason"]
+
+    assert reason == {
+        "code": "terminal_reason_missing",
+        "taxonomy": "observability_missing_cause",
+        "source": "append_event",
+        "message": "terminal failure has no supported scalar cause",
+        "missing_cause": True,
+        "alertable": True,
+    }
+
+
+def test_failure_reason_bounds_message_and_alertable_type(tmp_path: Path) -> None:
+    path = tmp_path / "bounded.jsonl"
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "bounded",
+            "state": "scope_rejected",
+            "terminal_reason": {
+                "message": "x" * 20_000,
+                "alertable": 1,
+                "code": "a" * 20_000,
+                "taxonomy": "b" * 20_000,
+                "source": "c" * 20_000,
+                "nested": {"raw": "never copied"},
+            },
+        },
+    )
+    reason = list(process_event_ledger.iter_events(path))[0]["terminal_reason"]
+
+    assert set(reason) == {
+        "code",
+        "taxonomy",
+        "source",
+        "message",
+        "missing_cause",
+        "alertable",
+    }
+    assert reason["message"] == "x" * 512
+    assert reason["alertable"] is True
+
+
+@pytest.mark.parametrize("state", ["starting", "running", "finished"])
+def test_non_failure_events_remain_value_equivalent(tmp_path: Path, state: str) -> None:
+    path = tmp_path / f"{state}.jsonl"
+    event = {
+        "request_id": state,
+        "state": state,
+        "terminal_reason": {"arbitrary": {"value": "unchanged"}},
+    }
+    process_event_ledger.append_event(path, event)
+    assert list(process_event_ledger.iter_events(path)) == [event]
+
+
+def test_canonical_reason_survives_rotation_spill_and_latest_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "process_events.jsonl"
+    first = {
+        "request_id": "rotated",
+        "state": "validation_failed",
+        "error": "rotation cause",
+        "payload": "x" * 600,
+        "timestamp": "2026-08-21T00:00:00+00:00",
+    }
+    process_event_ledger.append_event(path, first, max_active_bytes=1024)
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "active",
+            "state": "worker_failed",
+            "blocked_reason": "active cause",
+            "payload": "y" * 600,
+            "timestamp": "2026-08-21T00:00:01+00:00",
+        },
+        max_active_bytes=1024,
+    )
+
+    @contextmanager
+    def timed_out_lock(_path: Path):
+        raise TimeoutError("locked")
+        yield
+
+    monkeypatch.setattr(process_event_ledger, "_append_lock", timed_out_lock)
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "spill",
+            "state": "process_lost",
+            "message": "spill cause",
+            "timestamp": "2026-08-21T00:00:02+00:00",
+        },
+        max_active_bytes=1024,
+    )
+
+    rows = list(process_event_ledger.iter_events(path))
+    assert len(process_event_ledger.ledger_paths(path)) == 3
+    assert [row["terminal_reason"]["source"] for row in rows] == [
+        "error",
+        "blocked_reason",
+        "message",
+    ]
+    latest = process_event_ledger.latest_events(path)
+    assert latest["rotated"]["terminal_reason"] == rows[0]["terminal_reason"]
+    assert latest["active"]["terminal_reason"] == rows[1]["terminal_reason"]
+    assert latest["spill"]["terminal_reason"] == rows[2]["terminal_reason"]
