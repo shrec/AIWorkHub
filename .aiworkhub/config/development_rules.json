@@ -816,12 +816,12 @@
           {
                 "path": "src/aiworkhub/worker_workspace.py",
                 "pattern": "os_name_eq",
-                "count": 9
+                "count": 10
           },
           {
                 "path": "src/aiworkhub/worker_workspace.py",
                 "pattern": "os_name_ne",
-                "count": 8
+                "count": 9
           },
           {
                 "path": "src/aiworkhub/worker_workspace.py",
@@ -857,8 +857,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 151,
-      "accepted_predecessor_delta": -10
+      "current_total": 153,
+      "accepted_predecessor_delta": -8
     }
   }
 }
