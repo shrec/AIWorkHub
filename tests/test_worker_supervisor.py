@@ -17,7 +17,44 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import worker_supervisor  # noqa: E402
+from aiworkhub import platform_io  # noqa: E402
 from aiworkhub.worker_workspace import write_json_0600  # noqa: E402
+
+
+def test_supervisor_uses_canonical_platform_chmod_fd_in_package_and_direct_context():
+    assert worker_supervisor.chmod_fd is platform_io.chmod_fd
+
+    script = """
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+path = Path('worker_supervisor.py')
+spec = importlib.util.spec_from_file_location('direct_worker_supervisor', path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+facade = sys.modules['platform_io']
+print(json.dumps({
+    'facade': facade.__name__,
+    'chmod_fd_identity': module.chmod_fd is facade.chmod_fd,
+}))
+"""
+    package_root = Path(worker_supervisor.__file__).resolve().parent
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=package_root,
+        env={**os.environ, "PYTHONPATH": str(package_root)},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    assert json.loads(result.stdout) == {
+        "facade": "platform_io",
+        "chmod_fd_identity": True,
+    }
 
 
 def _spec(tmp_path: Path, argv: list[str], timeout: int = 10) -> tuple[Path, dict]:

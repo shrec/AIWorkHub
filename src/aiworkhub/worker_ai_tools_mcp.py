@@ -98,10 +98,7 @@ from typing import Any, Literal, Mapping, NamedTuple, Sequence
 try:
     from .platform_io import chmod_fd
 except ImportError:  # minimal copied worker package / direct-script mode
-    def chmod_fd(fd: int, mode: int) -> None:
-        fchmod = getattr(os, "fchmod", None)
-        if fchmod is not None:
-            fchmod(fd, mode)
+    from platform_io import chmod_fd
 
 from .repository_state import RepositoryStateError
 from . import quality_reviewer

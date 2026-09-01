@@ -20,6 +20,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import worker_workspace  # noqa: E402
+from aiworkhub import platform_io  # noqa: E402
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -496,6 +497,73 @@ def _commit_validation_worker_package(repo: Path) -> None:
         == 0
     )
     assert _git(repo, "commit", "-qm", "validation worker package").returncode == 0
+
+
+def test_worker_workspace_binds_platform_helpers_after_runtime_temp_closure(
+    tmp_path: Path,
+) -> None:
+    assert worker_workspace.atomic_replace is platform_io.atomic_replace
+    assert worker_workspace.chmod_fd is platform_io.chmod_fd
+    assert worker_workspace.chmod_path is platform_io.chmod_path
+    assert (
+        worker_workspace.posix_path_modes_supported
+        is platform_io.posix_path_modes_supported
+    )
+
+    source_package = Path(worker_workspace.__file__).resolve().parent
+    destination_package = tmp_path / "aiworkhub-direct"
+    destination_package.mkdir()
+    for name in (
+        "_platform_process.py",
+        "platform_io.py",
+        "runtime_temp.py",
+        "worker_workspace.py",
+    ):
+        shutil.copyfile(source_package / name, destination_package / name)
+    script = """
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+path = Path('worker_workspace.py')
+spec = importlib.util.spec_from_file_location('direct_worker_workspace', path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+facade = sys.modules['aiworkhub.platform_io']
+print(json.dumps({
+    'runtime_temp': module.runtime_temp.__name__,
+    'facade': facade.__name__,
+    'atomic_replace_identity': module.atomic_replace is facade.atomic_replace,
+    'chmod_fd_identity': module.chmod_fd is facade.chmod_fd,
+    'chmod_path_identity': module.chmod_path is facade.chmod_path,
+    'modes_identity': (
+        module.posix_path_modes_supported is facade.posix_path_modes_supported
+    ),
+    'top_level_duplicates': [
+        name for name in ('runtime_temp', 'platform_io', '_platform_process')
+        if name in sys.modules
+    ],
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=destination_package,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    assert json.loads(result.stdout) == {
+        "runtime_temp": "aiworkhub.runtime_temp",
+        "facade": "aiworkhub.platform_io",
+        "atomic_replace_identity": True,
+        "chmod_fd_identity": True,
+        "chmod_path_identity": True,
+        "modes_identity": True,
+        "top_level_duplicates": [],
+    }
 
 
 def test_validation_workspace_seeds_exact_worker_package_support_and_imports_candidate(

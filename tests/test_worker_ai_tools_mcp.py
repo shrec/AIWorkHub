@@ -1,21 +1,80 @@
 from __future__ import annotations
 
-import hashlib
 import asyncio
+import hashlib
+import inspect
 import json
 import os
 import sqlite3
+import stat
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import get_args, get_type_hints
 
 import pytest
-import stat
 
 from aiworkhub import quality_reviewer
+from aiworkhub import platform_io
 from aiworkhub import repository_state
 from aiworkhub import source_graph
 from aiworkhub import worker_ai_tools_mcp as worker_tools
+
+
+def test_worker_tools_uses_canonical_platform_chmod_fd() -> None:
+    assert worker_tools.chmod_fd is platform_io.chmod_fd
+    assert "def chmod_fd" not in inspect.getsource(worker_tools)
+
+    src_root = Path(worker_tools.__file__).resolve().parents[1]
+    package_root = Path(worker_tools.__file__).resolve().parent
+    probe = """
+import importlib.abc
+import json
+import sys
+
+
+class BlockPackagePlatformIoOnce(importlib.abc.MetaPathFinder):
+    def __init__(self):
+        self.blocked = False
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "aiworkhub.platform_io" and not self.blocked:
+            self.blocked = True
+            raise ImportError("forced package platform_io miss")
+        return None
+
+
+sys.meta_path.insert(0, BlockPackagePlatformIoOnce())
+from aiworkhub import worker_ai_tools_mcp as module
+
+facade = sys.modules["platform_io"]
+backend = sys.modules["_platform_process"]
+print(json.dumps({
+    "facade": facade.__name__,
+    "backend": backend.__name__,
+    "facade_backend_identity": facade._platform_process is backend,
+    "chmod_fd_identity": module.chmod_fd is facade.chmod_fd,
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=src_root,
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join((str(src_root), str(package_root))),
+        },
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    assert json.loads(result.stdout) == {
+        "facade": "platform_io",
+        "backend": "_platform_process",
+        "facade_backend_identity": True,
+        "chmod_fd_identity": True,
+    }
 
 
 def test_generate_worker_runtime_writes_exact_private_kilo_config(tmp_path):

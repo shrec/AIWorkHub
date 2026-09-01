@@ -34,7 +34,7 @@ try:
         supervisor_evidence,
     )
 except ImportError:  # direct-script entrypoint
-    from platform_io import atomic_replace, chmod_path
+    from platform_io import atomic_replace, chmod_fd, chmod_path
     from provider_usage import live_total_tokens, read_provider_usage
     from token_budget import (  # type: ignore[no-redef]
         SampleKind,
@@ -45,11 +45,6 @@ except ImportError:  # direct-script entrypoint
         consume_sample,
         supervisor_evidence,
     )
-
-    def chmod_fd(fd: int, mode: int) -> None:
-        fchmod = getattr(os, "fchmod", None)
-        if fchmod is not None:
-            fchmod(fd, mode)
 
 try:
     from .runtime_temp import process_start_ticks

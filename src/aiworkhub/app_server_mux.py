@@ -118,12 +118,7 @@ if os.name == "nt":  # pragma: no cover - imported only on Windows hosts
 try:
     from .platform_io import background_process_launch_kwargs, chmod_fd
 except ImportError:  # direct-script Codex mux entrypoint
-    from platform_io import background_process_launch_kwargs
-
-    def chmod_fd(fd: int, mode: int) -> None:
-        fchmod = getattr(os, "fchmod", None)
-        if fchmod is not None:
-            fchmod(fd, mode)
+    from platform_io import background_process_launch_kwargs, chmod_fd
 
 if __package__:
     from . import shared_router

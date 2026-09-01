@@ -39,31 +39,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
-try:
-    from .platform_io import (
-        atomic_replace,
-        chmod_fd,
-        chmod_path,
-        posix_path_modes_supported,
-    )
-except ImportError:  # direct-script Landlock entrypoint
-    def atomic_replace(
-        source: str | os.PathLike[str], destination: str | os.PathLike[str]
-    ) -> None:
-        os.replace(source, destination)
-
-    def chmod_fd(fd: int, mode: int) -> None:
-        fchmod = getattr(os, "fchmod", None)
-        if fchmod is not None:
-            fchmod(fd, mode)
-
-    def chmod_path(path: str | os.PathLike[str], mode: int) -> None:
-        if os.name != "nt":
-            os.chmod(path, mode)
-
-    def posix_path_modes_supported(platform_name: str | None = None) -> bool:
-        return (platform_name or os.name) != "nt"
-
 
 # ``VALIDATION_FAILED`` / ``VALIDATION_ENVIRONMENT_BLOCKED`` name the two terminal
 # states this module's ``ValidationRunError`` hierarchy carries at class-definition
@@ -188,6 +163,14 @@ def _load_runtime_temp():
 
 
 runtime_temp = _load_runtime_temp()
+if __package__:
+    from . import platform_io as _platform_io
+else:
+    _platform_io = sys.modules["aiworkhub.platform_io"]
+atomic_replace = _platform_io.atomic_replace
+chmod_fd = _platform_io.chmod_fd
+chmod_path = _platform_io.chmod_path
+posix_path_modes_supported = _platform_io.posix_path_modes_supported
 
 
 def bubblewrap_home_env_value() -> str:

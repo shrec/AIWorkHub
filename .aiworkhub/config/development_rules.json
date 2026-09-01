@@ -475,11 +475,6 @@
     "baseline": [
           {
                 "path": "src/aiworkhub/app_server_mux.py",
-                "pattern": "def_chmod_fd",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/app_server_mux.py",
                 "pattern": "os_name_eq",
                 "count": 4
           },
@@ -765,11 +760,6 @@
           },
           {
                 "path": "src/aiworkhub/worker_ai_tools_mcp.py",
-                "pattern": "def_chmod_fd",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/worker_ai_tools_mcp.py",
                 "pattern": "os_name_eq",
                 "count": 2
           },
@@ -781,11 +771,6 @@
       {
         "path": "src/aiworkhub/worker_supervisor.py",
         "pattern": "creationflags",
-        "count": 1
-      },
-      {
-        "path": "src/aiworkhub/worker_supervisor.py",
-        "pattern": "def_chmod_fd",
         "count": 1
       },
       {
@@ -820,11 +805,6 @@
           },
           {
                 "path": "src/aiworkhub/worker_workspace.py",
-                "pattern": "def_chmod_fd",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/worker_workspace.py",
                 "pattern": "os_killpg",
                 "count": 3
           },
@@ -836,7 +816,7 @@
           {
                 "path": "src/aiworkhub/worker_workspace.py",
                 "pattern": "os_name_ne",
-                "count": 9
+                "count": 8
           },
           {
                 "path": "src/aiworkhub/worker_workspace.py",
@@ -872,8 +852,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 158,
-      "accepted_predecessor_delta": -3
+      "current_total": 153,
+      "accepted_predecessor_delta": -8
     }
   }
 }

@@ -96,6 +96,7 @@ def test_platform_facade_imports_in_package_and_direct_script_context():
     from aiworkhub import _platform_process, platform_io
 
     assert platform_io._platform_process is _platform_process
+    assert app_server_mux.chmod_fd is platform_io.chmod_fd
 
     probe = """
 import importlib.util
@@ -104,7 +105,6 @@ import sys
 from pathlib import Path
 
 mux_path = Path(sys.argv[1])
-sys.path.insert(0, str(mux_path.parent))
 spec = importlib.util.spec_from_file_location("direct_app_server_mux", mux_path)
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
@@ -113,6 +113,7 @@ facade = sys.modules["platform_io"]
 print(json.dumps({
     "facade": facade.__name__,
     "backend": facade._platform_process.__name__,
+    "chmod_fd_identity": module.chmod_fd is facade.chmod_fd,
 }))
 """
     completed = subprocess.run(
@@ -120,10 +121,13 @@ print(json.dumps({
         check=True,
         capture_output=True,
         text=True,
+        cwd=MUX_MODULE.parent,
+        env={**os.environ, "PYTHONPATH": str(MUX_MODULE.parent)},
     )
     assert json.loads(completed.stdout) == {
         "facade": "platform_io",
         "backend": "_platform_process",
+        "chmod_fd_identity": True,
     }
 
 
