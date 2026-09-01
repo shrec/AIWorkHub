@@ -208,3 +208,100 @@ def test_adapter_families_and_two_repository_isolation(tmp_path):
     assert sorted(row["task_id"] for row in out1["launched"]) == sorted(tid for tid, _runner in adapters)
     assert calls2 == []
     assert _state(repo2, "CLAUDE_CHILD")[:2] == ("pending", "unclaimed")
+
+
+def test_deterministic_denial_holds_until_card_changes(tmp_path):
+    repo = _init_repo(tmp_path)
+    _add(repo, "PARENT", status="finished", worker="done")
+    _add(repo, "CHILD", deps=["PARENT"])
+    calls: list[str] = []
+
+    def denying_launch(task_id, runner, topic, request_id):
+        calls.append(task_id)
+        return {
+            "ok": False,
+            "stderr": "workforce_route_absent:runner=claude_opus-5:adapter=claude_cli",
+        }
+
+    first = autolaunch.reconcile(repo, trigger_task_id="t", launch=denying_launch)
+    assert calls == ["CHILD"]
+    [delayed] = first["delayed"]
+    assert delayed["denial_kind"] == "deterministic"
+    assert delayed["next_attempt_at"] == ""
+
+    # An identical trigger no longer re-issues the doomed launch.
+    second = autolaunch.reconcile(repo, trigger_task_id="t", launch=denying_launch)
+    assert calls == ["CHILD"]
+    [skipped] = [row for row in second["skipped"] if row["task_id"] == "CHILD"]
+    assert skipped["reason"].startswith("deterministic_denial_hold:")
+
+    # Any card change releases the hold for exactly one fresh attempt.
+    conn = sqlite3.connect(repo / ".aiworkhub" / "tasking" / "task_queue.sqlite")
+    conn.execute(
+        "UPDATE tasks SET updated_at='2026-09-01T12:00:00+00:00' WHERE task_id='CHILD'"
+    )
+    conn.commit()
+    conn.close()
+    autolaunch.reconcile(repo, trigger_task_id="t", launch=denying_launch)
+    assert calls == ["CHILD", "CHILD"]
+
+
+def test_transient_denial_backs_off_and_relaunches_when_due(tmp_path):
+    repo = _init_repo(tmp_path)
+    _add(repo, "PARENT", status="finished", worker="done")
+    _add(repo, "CHILD", deps=["PARENT"])
+    calls: list[str] = []
+
+    def flaky_launch(task_id, runner, topic, request_id):
+        calls.append(task_id)
+        return {"ok": False, "stderr": "sqlite3.OperationalError: database is locked"}
+
+    first = autolaunch.reconcile(repo, trigger_task_id="t", launch=flaky_launch)
+    [delayed] = first["delayed"]
+    assert delayed["denial_kind"] == "transient"
+    assert delayed["next_attempt_at"] > autolaunch._now()[:19]
+
+    # Before the backoff is due the identical trigger does not relaunch.
+    second = autolaunch.reconcile(repo, trigger_task_id="t", launch=flaky_launch)
+    assert calls == ["CHILD"]
+    [held] = [row for row in second["delayed"] if row["task_id"] == "CHILD"]
+    assert held["reason"] == "transient_backoff_hold"
+
+    conn = sqlite3.connect(repo / ".aiworkhub" / "tasking" / "task_queue.sqlite")
+    conn.execute(
+        "UPDATE dependency_autolaunch_holds SET next_attempt_at='2000-01-01T00:00:00+00:00'"
+    )
+    conn.commit()
+    conn.close()
+    autolaunch.reconcile(repo, trigger_task_id="t", launch=flaky_launch)
+    assert calls == ["CHILD", "CHILD"]
+
+
+def test_successful_launch_clears_denial_hold(tmp_path):
+    repo = _init_repo(tmp_path)
+    _add(repo, "PARENT", status="finished", worker="done")
+    _add(repo, "CHILD", deps=["PARENT"])
+    calls: list[str] = []
+
+    def flaky_once(task_id, runner, topic, request_id):
+        calls.append(task_id)
+        if len(calls) == 1:
+            return {"ok": False, "stderr": "transient provider hiccup"}
+        return _claim(repo, [], task_id, runner, topic, request_id)
+
+    autolaunch.reconcile(repo, trigger_task_id="t", launch=flaky_once)
+    conn = sqlite3.connect(repo / ".aiworkhub" / "tasking" / "task_queue.sqlite")
+    conn.execute(
+        "UPDATE dependency_autolaunch_holds SET next_attempt_at='2000-01-01T00:00:00+00:00'"
+    )
+    conn.commit()
+    conn.close()
+
+    outcome = autolaunch.reconcile(repo, trigger_task_id="t", launch=flaky_once)
+    assert [row["task_id"] for row in outcome["launched"]] == ["CHILD"]
+    conn = sqlite3.connect(repo / ".aiworkhub" / "tasking" / "task_queue.sqlite")
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM dependency_autolaunch_holds"
+    ).fetchone()[0]
+    conn.close()
+    assert remaining == 0
