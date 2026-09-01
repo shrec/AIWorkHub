@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -101,9 +102,185 @@ def _launch_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+_USAGE_FIELDS = (
+    "input_tokens", "output_tokens", "visible_output_tokens",
+    "reasoning_output_tokens", "total_tokens",
+)
+_CACHE_FIELDS = (
+    "cached_input_tokens", "cache_creation_input_tokens",
+    "cache_write_input_tokens",
+)
+_PROCESS_EVENTS_PATH = Path(".aiworkhub/runtime/process_logs/process_events.jsonl")
+_PROCESS_EVENT_LIMIT = 10_000
+
+
+def _request_identity(entry: dict[str, Any]) -> str:
+    note = str(entry.get("note") or "")
+    return str(
+        entry.get("request_id")
+        or entry.get("attempt_id")
+        or (note.removeprefix("task_mcp_request:") if note.startswith("task_mcp_request:") else "")
+    )
+
+
+def _repository_identity(entry: dict[str, Any], repo_root: Path | str) -> str:
+    return str(
+        entry.get("repository_id")
+        or entry.get("repo_id")
+        or entry.get("repository")
+        or entry.get("repo_root")
+        or Path(repo_root).resolve()
+    )
+
+
+def _event_telemetry_field_is_observed(event: dict[str, Any], field: str) -> bool:
+    """Whether an event has durable evidence for one telemetry field."""
+
+    value = event.get(field)
+    if value is None:
+        return False
+    observed_flag = (
+        "usage_observed"
+        if field in _USAGE_FIELDS
+        else "cache_metrics_observed"
+        if field in _CACHE_FIELDS
+        else "cost_observed"
+    )
+    return bool(event.get(observed_flag)) or bool(value)
+
+
+def _merge_process_events(
+    earlier: dict[str, Any], later: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep later lifecycle metadata without discarding observed telemetry."""
+
+    merged = {**earlier, **later}
+    for field in (*_USAGE_FIELDS, *_CACHE_FIELDS, "cost_usd"):
+        if (
+            not _event_telemetry_field_is_observed(later, field)
+            and field in earlier
+        ):
+            merged[field] = earlier[field]
+    for observed_flag in (
+        "usage_observed",
+        "cache_metrics_observed",
+        "cost_observed",
+    ):
+        if not bool(later.get(observed_flag)) and bool(earlier.get(observed_flag)):
+            merged[observed_flag] = True
+    return merged
+
+
+def _process_event_index(repo_root: Path | str) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """Read the bounded repository-local process ledger, ignoring bad records."""
+
+    path = Path(repo_root) / _PROCESS_EVENTS_PATH
+    if not path.is_file():
+        return {}
+    events: dict[tuple[str, str, str], dict[str, Any]] = {}
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle):
+                if line_number >= _PROCESS_EVENT_LIMIT:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                task_id = str(event.get("task_id") or "")
+                request_id = _request_identity(event)
+                repository = _repository_identity(event, repo_root)
+                if task_id and request_id and repository:
+                    identity = (repository, task_id, request_id)
+                    previous = events.get(identity)
+                    events[identity] = (
+                        _merge_process_events(previous, event)
+                        if previous is not None
+                        else event
+                    )
+    except OSError:
+        return {}
+    return events
+
+
+def _matching_process_event(
+    entry: dict[str, Any],
+    repo_root: Path | str,
+    process_events: dict[tuple[str, str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    task_id = str(entry.get("task_id") or "")
+    request_id = _request_identity(entry)
+    repository = _repository_identity(entry, repo_root)
+    if not task_id or not request_id:
+        return None
+    candidates: list[dict[str, Any]] = []
+    if process_events is not None:
+        event = process_events.get((repository, task_id, request_id))
+        if event is not None:
+            candidates.append(event)
+    nested = entry.get("process_events") or entry.get("process_event") or []
+    if isinstance(nested, dict):
+        nested = [nested]
+    if isinstance(nested, list):
+        candidates.extend(event for event in nested if isinstance(event, dict))
+    for event in candidates:
+        if (
+            str(event.get("task_id") or "") != task_id
+            or _request_identity(event) != request_id
+            or _repository_identity(event, repo_root) != repository
+        ):
+            continue
+        usage = event.get("usage")
+        if isinstance(usage, dict):
+            return {**event, **usage}
+        return event
+    return None
+
+
+def _fill_process_usage(
+    entry: dict[str, Any],
+    repo_root: Path | str,
+    process_events: dict[tuple[str, str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Fill unobserved placeholders only from an exactly matched process event."""
+
+    event = _matching_process_event(entry, repo_root, process_events)
+    if event is None:
+        return entry
+    merged = dict(entry)
+    if not bool(entry.get("usage_observed")):
+        for field in _USAGE_FIELDS:
+            if not entry.get(field) and event.get(field) is not None:
+                merged[field] = event[field]
+        merged["usage_observed"] = bool(
+            any(merged.get(field) for field in _USAGE_FIELDS)
+            or event.get("usage_observed")
+        )
+    if not bool(entry.get("cache_metrics_observed")) and bool(
+        event.get("cache_metrics_observed")
+    ):
+        for field in _CACHE_FIELDS:
+            if not entry.get(field) and event.get(field) is not None:
+                merged[field] = event[field]
+        merged["cache_metrics_observed"] = True
+    if not bool(entry.get("cost_observed")) and event.get("cost_observed") is True:
+        merged["cost_usd"] = event.get("cost_usd") or 0.0
+        merged["cost_observed"] = True
+    if (
+        str(entry.get("role") or "").strip().lower() not in {"worker", "reviewer"}
+        and str(event.get("role") or "").strip().lower() in {"worker", "reviewer"}
+    ):
+        merged["role"] = event["role"]
+    return merged
+
+
 def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for entry in task_store.list_usage_events(repo_root, limit=10_000):
+    process_events = _process_event_index(repo_root)
+    for raw_entry in task_store.list_usage_events(repo_root, limit=10_000):
+        entry = _fill_process_usage(raw_entry, repo_root, process_events)
         created_at = str(entry.get("created_at") or "")
         topic = str(entry.get("topic") or "")
         explicit_role = str(entry.get("role") or "").strip().lower()
@@ -156,7 +333,7 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
             ),
             "source_detail": str(entry.get("source") or ""),
             "note": note,
-            "attempt_id": note.removeprefix("task_mcp_request:") if note.startswith("task_mcp_request:") else "",
+            "attempt_id": _request_identity(entry),
             "created_at": created_at,
             "day": created_at[:10] if len(created_at) >= 10 else "",
         })
@@ -428,12 +605,12 @@ def cost_per_accepted_outcome_view(
         if len(models) != 1:
             mixed_model_tasks += 1
             continue
-        routes = {_economic_route_identity(row) for row in rows}
-        if len(routes) != 1:
+        route_ids = {_economic_route_identity(row) for row in rows}
+        if len(route_ids) != 1:
             mixed_model_tasks += 1
             continue
         model = next(iter(models))
-        route = next(iter(routes))
+        route = next(iter(route_ids))
         family = _task_family(card_by_task.get(task_id) or {})
         risk = _task_risk(card_by_task.get(task_id) or {})
         bucket = buckets[(model, route, family, risk)]
@@ -452,7 +629,7 @@ def cost_per_accepted_outcome_view(
             else:
                 bucket["cost_unknown_attempts"] += 1
 
-    routes: dict[str, dict[str, dict[str, dict[str, Any]]]] = defaultdict(
+    route_tree: dict[str, dict[str, dict[str, dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(dict))
     )
     for (model, route, family, risk), raw in sorted(buckets.items()):
@@ -493,7 +670,7 @@ def cost_per_accepted_outcome_view(
                 else "not_persisted_on_historical_task_card"
             ),
         })
-        routes[model][route][family][risk] = row
+        route_tree[model][route][family][risk] = row
 
     return {
         "schema_id": "aiworkhub.cost_per_accepted_outcome.v1",
@@ -508,7 +685,7 @@ def cost_per_accepted_outcome_view(
                 }
                 for route, families in sorted(model_routes.items())
             }
-            for model, model_routes in sorted(routes.items())
+            for model, model_routes in sorted(route_tree.items())
         },
         "unmatched_decisions": unmatched_decisions,
         "unknown_model_tasks": unknown_model_tasks,
@@ -526,7 +703,6 @@ def _retry_economics(
     decisions: dict[str, dict[str, str]],
 ) -> dict[str, Any]:
     """Measure durable repeated attempts without calling activity savings."""
-
     by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in usage_rows:
         task_id = str(row.get("task_id") or "")

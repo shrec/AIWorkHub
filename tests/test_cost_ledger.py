@@ -434,3 +434,116 @@ def test_repo_bound_unobserved_attempt_is_counted_but_not_measured(monkeypatch, 
     assert aggregate["usage_observed_records"] == 0
     assert aggregate["usage_unknown_records"] == 1
     assert aggregate["total_tokens"] == 0
+
+
+def test_process_event_fills_unobserved_placeholder_usage(monkeypatch, tmp_path) -> None:
+    ledger = tmp_path / ".aiworkhub/runtime/process_logs/process_events.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(
+        '{"task_id":"T1","request_id":"R1","repository_id":"repo-1","role":"worker","input_tokens":100,"output_tokens":20,"total_tokens":120,"cache_metrics_observed":true,"cached_input_tokens":40,"cost_observed":true,"cost_usd":0.25}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cost_ledger.task_store,
+        "list_usage_events",
+        lambda _root, limit=10_000: [{
+            "task_id": "T1",
+            "request_id": "R1",
+            "repository_id": "repo-1",
+            "role": "reviewer",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "usage_observed": False,
+        }],
+    )
+
+    [row] = cost_ledger._canonical_usage_rows(tmp_path)
+
+    assert row["total_tokens"] == 120
+    assert row["cached_input_tokens"] == 40
+    assert row["cost_usd"] == 0.25
+    assert row["usage_observed"] is True
+    assert row["role"] == "reviewer"
+
+
+def test_process_event_preserves_explicit_zero_and_identity_containment(
+    monkeypatch, tmp_path
+) -> None:
+    ledger = tmp_path / ".aiworkhub/runtime/process_logs/process_events.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(
+        "\n".join((
+            '{"task_id":"T1","request_id":"R1","repository_id":"repo-2","total_tokens":120}',
+            '{"task_id":"T2","request_id":"R1","repository_id":"repo-1","total_tokens":120}',
+            '{"task_id":"T1","request_id":"R2","repository_id":"repo-1","total_tokens":120}',
+            '{"task_id":"T1","request_id":"R1","repository_id":"repo-1","total_tokens":120}',
+            '{malformed terminal record',
+        )),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cost_ledger.task_store,
+        "list_usage_events",
+        lambda _root, limit=10_000: [
+            {
+                "task_id": "T1",
+                "request_id": "R1",
+                "repository_id": "repo-1",
+                "usage_observed": True,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            {
+                "task_id": "T1",
+                "request_id": "R3",
+                "repository_id": "repo-1",
+                "usage_observed": False,
+                "total_tokens": 0,
+            },
+        ],
+    )
+
+    rows = cost_ledger._canonical_usage_rows(tmp_path)
+
+    assert rows[0]["total_tokens"] == 0
+    assert rows[0]["usage_observed"] is True
+    assert rows[1]["total_tokens"] == 0
+    assert rows[1]["usage_observed"] is False
+
+
+def test_process_event_index_retains_telemetry_across_later_lifecycle_event(
+    monkeypatch, tmp_path
+) -> None:
+    ledger = tmp_path / ".aiworkhub/runtime/process_logs/process_events.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(
+        "\n".join((
+            '{"task_id":"T1","request_id":"R1","repository_id":"repo-1","input_tokens":100,"output_tokens":20,"total_tokens":120,"usage_observed":true}',
+            '{"task_id":"T1","request_id":"R1","repository_id":"repo-1","status":"completed","finished_at":"2026-09-01T01:02:03+00:00"}',
+        )),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cost_ledger.task_store,
+        "list_usage_events",
+        lambda _root, limit=10_000: [{
+            "task_id": "T1",
+            "request_id": "R1",
+            "repository_id": "repo-1",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "usage_observed": False,
+        }],
+    )
+
+    [row] = cost_ledger._canonical_usage_rows(tmp_path)
+    [event] = cost_ledger._process_event_index(tmp_path).values()
+
+    assert row["total_tokens"] == 120
+    assert row["input_tokens"] == 100
+    assert row["usage_observed"] is True
+    assert event["status"] == "completed"
+    assert event["finished_at"] == "2026-09-01T01:02:03+00:00"
