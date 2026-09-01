@@ -12,6 +12,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.75 — 2026-09-01
+
+- Platform process launching now runs through a facade with direct-import parity.
+- Retained review and validation candidates are recovered consistently.
+- Windows authorization has a byte-exact ACL snapshot foundation.
+- Source Graph publishes the mode catalog with retained overlay digest authority.
+- Stale-recovery paths preserve CAS truth, and validation package-support inputs
+  are materialized for release assurance.
+- This release does not claim completion of Windows ACL mutation/restore,
+  DevRules ratchet replay, validation-tool authority, broker-boundary work or
+  remaining staged work.
+
 ## What's new in 0.10.74 — 2026-08-31
 
 - Reviewers can read authenticated, evidence-bound input packets through a

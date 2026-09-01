@@ -1,5 +1,25 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.75 — 2026-09-01
+
+### Added
+
+- Platform process launching now runs through a facade with direct-import parity.
+- Windows authorization has a byte-exact ACL snapshot foundation.
+- Source Graph publishes the mode catalog with retained overlay digest authority.
+
+### Fixed
+
+- Retained review and validation candidates are recovered consistently.
+- Stale-recovery paths preserve CAS truth when reconciling retained state.
+- Validation package-support inputs are materialized for release assurance.
+
+### Notes
+
+- This release does not claim completion of Windows ACL mutation/restore,
+  DevRules ratchet replay, validation-tool authority, broker-boundary work or
+  remaining staged work.
+
 ## 0.10.74 — 2026-08-31
 
 ### Added
