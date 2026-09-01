@@ -2428,8 +2428,11 @@ def manager_bootstrap() -> dict[str, Any]:
             repository_key = str(canonical_root)
             monotonic_now = time.monotonic()
             with _TASK_HYGIENE_LOCK:
-                last_run = _TASK_HYGIENE_LAST_RUNS.get(repository_key, 0.0)
-                due = monotonic_now - last_run >= config["interval_seconds"]
+                last_run = _TASK_HYGIENE_LAST_RUNS.get(repository_key)
+                due = (
+                    last_run is None
+                    or monotonic_now - last_run >= config["interval_seconds"]
+                )
                 if due:
                     # Reserve this repository's interval before running. The
                     # bounded map prevents route changes from suppressing other

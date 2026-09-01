@@ -2266,6 +2266,10 @@ def test_manager_bootstrap_hygiene_is_interval_throttled_and_nonfatal(
     monkeypatch.setattr(core, "_codex_manager_identity", lambda: None)
     monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
     monkeypatch.setattr(core, "_TASK_HYGIENE_LAST_RUNS", {})
+    monkeypatch.setattr(core.time, "monotonic", lambda: 1.0)
+    monkeypatch.setattr(
+        task_retention, "hygiene_config", lambda: {"interval_seconds": 60}
+    )
     calls: list[Path] = []
 
     def hygiene(repo: Path) -> dict[str, object]:
