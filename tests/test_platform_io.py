@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import importlib.util
 import os
 import subprocess
 import sys
@@ -866,3 +867,236 @@ def test_windows_blocking_lock_preserves_unexpected_os_error(tmp_path, monkeypat
 
     assert raised.value.errno == errno.EIO
     assert not isinstance(raised.value, platform_io.AdvisoryLockTimeout)
+
+
+@pytest.mark.parametrize(
+    ("name", "windows", "linux", "macos"),
+    [
+        ("win32", True, False, False),
+        ("nt", True, False, False),
+        ("linux2", False, True, False),
+        ("posix", False, True, False),
+        ("darwin", False, False, True),
+    ],
+)
+def test_platform_predicates_share_one_normalized_contract(name, windows, linux, macos):
+    assert platform_io.is_windows(name) is windows
+    assert platform_io.is_linux(name) is linux
+    assert platform_io.is_macos(name) is macos
+
+
+def test_process_group_launch_kwargs_uses_named_windows_flag(monkeypatch):
+    monkeypatch.setattr(
+        platform_io.subprocess, "CREATE_NEW_PROCESS_GROUP", 512, raising=False
+    )
+    assert platform_io.process_group_launch_kwargs("windows") == {
+        "creationflags": 512
+    }
+    assert platform_io.process_group_launch_kwargs("linux") == {
+        "start_new_session": True
+    }
+
+
+@pytest.mark.parametrize("identity", [0, -1, True, False, 1.5, "42", None])
+def test_process_group_primitives_reject_unsafe_identities(identity):
+    assert not platform_io.probe_process_group(
+        identity, killpg=lambda *_args: pytest.fail("killpg")
+    )
+    assert not platform_io.terminate_process_tree(
+        identity,
+        killpg=lambda *_args: pytest.fail("killpg"),
+        run=lambda *_args, **_kwargs: pytest.fail("run"),
+    )
+
+
+@pytest.mark.parametrize("argument", ["timeout", "poll_interval"])
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_process_tree_rejects_nonfinite_waits_before_process_actions(argument, value):
+    calls = []
+    assert not platform_io.terminate_process_tree(
+        42,
+        platform_name="windows",
+        killpg=lambda *_args: calls.append("killpg"),
+        probe=lambda *_args: calls.append("probe") or True,
+        run=lambda *_args, **_kwargs: calls.append("run"),
+        sleep=lambda *_args: calls.append("sleep"),
+        **{argument: value},
+    )
+    assert calls == []
+
+
+def test_posix_process_group_probe_is_nondestructive_and_fails_closed():
+    calls = []
+
+    def probe(pgid, sig):
+        calls.append((pgid, sig))
+        raise PermissionError
+
+    assert platform_io.probe_process_group(42, platform_name="linux", killpg=probe)
+    assert calls == [(42, 0)]
+
+
+def test_posix_process_group_probe_fails_closed_for_other_oserror():
+    def probe(_pgid, _sig):
+        raise OSError(errno.EIO, "fake I/O failure")
+
+    assert not platform_io.probe_process_group(
+        42, platform_name="linux", killpg=probe
+    )
+
+
+def test_posix_process_tree_terminates_without_escalation():
+    signals = []
+    states = iter((True, False))
+    assert platform_io.terminate_process_tree(
+        42,
+        platform_name="linux",
+        timeout=1.0,
+        poll_interval=0.01,
+        killpg=lambda pgid, sig: signals.append((pgid, sig)),
+        probe=lambda _pgid: next(states),
+        monotonic=lambda: 0.0,
+        sleep=lambda _delay: None,
+    )
+    assert signals == [(42, platform_io.signal.SIGTERM)]
+
+
+def test_posix_process_tree_polls_after_kill_until_group_disappears():
+    signals = []
+    sleeps = []
+    clock = iter((10.0, 10.1, 10.1, 10.1))
+    states = iter((True, True, False))
+    assert platform_io.terminate_process_tree(
+        42,
+        platform_name="macos",
+        timeout=0.1,
+        poll_interval=0.1,
+        killpg=lambda pgid, sig: signals.append((pgid, sig)),
+        probe=lambda _pgid: next(states),
+        monotonic=lambda: next(clock),
+        sleep=lambda delay: sleeps.append(delay),
+    )
+    assert signals == [
+        (42, platform_io.signal.SIGTERM),
+        (42, platform_io.signal.SIGKILL),
+    ]
+    assert sleeps == [pytest.approx(0.1)]
+
+
+def test_posix_process_tree_reports_persistent_survivor_at_post_kill_deadline():
+    signals = []
+    sleeps = []
+    clock = iter((10.0, 10.1, 10.1, 10.1, 10.2))
+    assert not platform_io.terminate_process_tree(
+        42,
+        platform_name="linux",
+        timeout=0.1,
+        poll_interval=0.1,
+        killpg=lambda pgid, sig: signals.append((pgid, sig)),
+        probe=lambda _pgid: True,
+        monotonic=lambda: next(clock),
+        sleep=lambda delay: sleeps.append(delay),
+    )
+    assert signals == [
+        (42, platform_io.signal.SIGTERM),
+        (42, platform_io.signal.SIGKILL),
+    ]
+    assert sleeps == [pytest.approx(0.1)]
+
+
+def test_posix_process_tree_zero_timeout_escalates_without_sleeping():
+    signals = []
+    probes = []
+    sleeps = []
+    assert not platform_io.terminate_process_tree(
+        42,
+        platform_name="linux",
+        timeout=0.0,
+        poll_interval=0.0,
+        killpg=lambda pgid, sig: signals.append((pgid, sig)),
+        probe=lambda pgid: probes.append(pgid) or True,
+        monotonic=lambda: 10.0,
+        sleep=lambda delay: sleeps.append(delay),
+    )
+    assert signals == [
+        (42, platform_io.signal.SIGTERM),
+        (42, platform_io.signal.SIGKILL),
+    ]
+    assert probes == [42, 42]
+    assert sleeps == []
+
+
+def test_windows_process_tree_uses_taskkill_tree_command():
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    assert platform_io.terminate_process_tree(
+        42, platform_name="windows", timeout=2.5, run=run
+    )
+    assert calls == [
+        (
+            ["taskkill", "/PID", "42", "/T", "/F"],
+            {"check": False, "shell": False, "timeout": 2.5},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        subprocess.TimeoutExpired(cmd="taskkill", timeout=2.5),
+        OSError(errno.ENOENT, "fake missing taskkill"),
+    ],
+)
+def test_windows_process_tree_fails_closed_when_taskkill_cannot_complete(error):
+    def run(*_args, **_kwargs):
+        raise error
+
+    assert not platform_io.terminate_process_tree(
+        42, platform_name="windows", timeout=2.5, run=run
+    )
+
+
+def test_path_identity_and_executable_names_are_platform_specific():
+    assert platform_io.executable_name("worker", "windows") == "worker.exe"
+    assert platform_io.executable_name("WORKER.EXE", "windows") == "WORKER.EXE"
+    assert platform_io.executable_name("worker", "linux") == "worker"
+    assert platform_io.paths_equal(r"C:\\Temp\\..\\Work", r"c:\\work", "win32")
+    assert not platform_io.paths_equal("Work", "work", "linux")
+    assert platform_io.path_key("a/../b", "linux").endswith("/b")
+
+
+def test_windows_module_import_and_process_branches_do_not_require_killpg(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "aiworkhub._platform_io_windows_import", platform_io.__file__
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    imported = importlib.util.module_from_spec(spec)
+    monkeypatch.delattr(os, "killpg")
+    spec.loader.exec_module(imported)
+
+    assert imported.is_windows("win32")
+    assert imported.probe_process_group(
+        42, platform_name="windows", windows_probe=lambda pid: pid == 42
+    )
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    assert imported.terminate_process_tree(
+        42, platform_name="windows", timeout=1.5, run=run
+    )
+    assert calls == [
+        (
+            ["taskkill", "/PID", "42", "/T", "/F"],
+            {"check": False, "shell": False, "timeout": 1.5},
+        )
+    ]
+    assert not imported.probe_process_group(42, platform_name="linux")
+    assert not imported.terminate_process_tree(42, platform_name="linux")

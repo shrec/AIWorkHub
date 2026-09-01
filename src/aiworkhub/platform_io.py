@@ -9,7 +9,13 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import math
+import ntpath
 import os
+import posixpath
+import signal
+import subprocess
+import sys
 import time
 import unicodedata
 from collections.abc import Callable
@@ -27,6 +33,188 @@ class BackgroundProcessLaunchKwargs(TypedDict, total=False):
     creationflags: int
     startupinfo: Any
     start_new_session: bool
+
+
+ProcessGroupLaunchKwargs = BackgroundProcessLaunchKwargs
+
+
+def _normalized_platform(platform_name: str | None = None) -> str:
+    """Return the canonical ``windows``, ``linux`` or ``macos`` platform name."""
+
+    name = (sys.platform if platform_name is None else platform_name).lower()
+    if name in {"nt", "windows", "win32", "cygwin", "msys"}:
+        return "windows"
+    if name.startswith("linux") or name == "posix":
+        return "linux"
+    if name in {"darwin", "mac", "macos", "osx"}:
+        return "macos"
+    return name
+
+
+def is_windows(platform_name: str | None = None) -> bool:
+    return _normalized_platform(platform_name) == "windows"
+
+
+def is_linux(platform_name: str | None = None) -> bool:
+    return _normalized_platform(platform_name) == "linux"
+
+
+def is_macos(platform_name: str | None = None) -> bool:
+    return _normalized_platform(platform_name) == "macos"
+
+
+def _windows_creation_flag() -> int:
+    """Return the named Windows process-group flag through a typed boundary."""
+
+    return cast(int, getattr(subprocess, "CREATE_NEW_PROCESS_GROUP"))
+
+
+def process_group_launch_kwargs(
+    platform_name: str | None = None,
+) -> ProcessGroupLaunchKwargs:
+    """Return subprocess kwargs that create a separately signalable process group."""
+
+    if is_windows(platform_name):
+        return {"creationflags": _windows_creation_flag()}
+    return {"start_new_session": True}
+
+
+def _valid_process_identity(identity: object) -> bool:
+    return (
+        isinstance(identity, int)
+        and not isinstance(identity, bool)
+        and identity > 0
+    )
+
+
+def _resolve_posix_killpg(
+    killpg: Callable[[int, int], None] | None,
+) -> Callable[[int, int], None] | None:
+    if killpg is not None:
+        return killpg
+    candidate = getattr(os, "killpg", None)
+    return candidate if callable(candidate) else None
+
+
+def probe_process_group(
+    identity: int,
+    *,
+    platform_name: str | None = None,
+    killpg: Callable[[int, int], None] | None = None,
+    windows_probe: Callable[[int], bool] | None = None,
+) -> bool:
+    """Probe a process group, failing closed except for permission denial."""
+
+    if not _valid_process_identity(identity):
+        return False
+    if is_windows(platform_name):
+        return (windows_probe or windows_pid_is_alive)(identity)
+    posix_killpg = _resolve_posix_killpg(killpg)
+    if posix_killpg is None:
+        return False
+    try:
+        posix_killpg(identity, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as error:
+        return error.errno == errno.EPERM
+    return True
+
+
+def terminate_process_tree(
+    identity: int,
+    *,
+    platform_name: str | None = None,
+    timeout: float = 5.0,
+    poll_interval: float = 0.05,
+    killpg: Callable[[int, int], None] | None = None,
+    probe: Callable[[int], bool] | None = None,
+    run: Callable[..., Any] = subprocess.run,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Terminate one process tree, escalating a surviving POSIX group to KILL."""
+
+    if (
+        not _valid_process_identity(identity)
+        or not math.isfinite(timeout)
+        or not math.isfinite(poll_interval)
+        or timeout < 0
+        or poll_interval < 0
+    ):
+        return False
+    if is_windows(platform_name):
+        try:
+            completed = run(
+                ["taskkill", "/PID", str(identity), "/T", "/F"],
+                check=False,
+                shell=False,
+                timeout=timeout,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return int(completed.returncode) == 0
+
+    posix_killpg = _resolve_posix_killpg(killpg)
+    if posix_killpg is None:
+        return False
+    alive = probe or (
+        lambda pgid: probe_process_group(
+            pgid, platform_name="posix", killpg=posix_killpg
+        )
+    )
+
+    def wait_until_gone() -> bool:
+        deadline = monotonic() + timeout
+        while alive(identity):
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False
+            sleep(min(poll_interval, remaining))
+        return True
+
+    try:
+        posix_killpg(identity, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    if wait_until_gone():
+        return True
+    try:
+        posix_killpg(identity, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    return wait_until_gone()
+
+
+def executable_name(name: str, platform_name: str | None = None) -> str:
+    """Return a platform-appropriate executable filename."""
+
+    if is_windows(platform_name) and not name.lower().endswith(".exe"):
+        return f"{name}.exe"
+    return name
+
+
+def path_key(path: str | os.PathLike[str], platform_name: str | None = None) -> str:
+    """Return a lexical path identity key with platform-specific case semantics."""
+
+    value = os.fspath(path)
+    if is_windows(platform_name):
+        return ntpath.normcase(ntpath.abspath(ntpath.normpath(value)))
+    return posixpath.abspath(posixpath.normpath(value))
+
+
+def paths_equal(
+    left: str | os.PathLike[str],
+    right: str | os.PathLike[str],
+    platform_name: str | None = None,
+) -> bool:
+    return path_key(left, platform_name) == path_key(right, platform_name)
 
 
 def background_process_launch_kwargs(
