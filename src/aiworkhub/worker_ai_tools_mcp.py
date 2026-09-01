@@ -5131,6 +5131,82 @@ def _prior_rejected_finding_intent(ctx: WorkerToolContext, tool: str) -> bool:
     )
 
 
+# One initial submission plus exactly one correction retry, and never a third
+# provider attempt.  M6 measured a ~300k-input-token review run discarded at
+# finalize with review_protocol:structured_report_invalid because the reviewer
+# only learned its report was out of scope after the run had ended; an
+# unbounded correction loop would burn the same tokens a different way.
+QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS = 2
+
+_QUALITY_REVIEW_ATTEMPT_LOCK = threading.Lock()
+_QUALITY_REVIEW_ATTEMPTS: dict[tuple[str, str, str, str], int] = {}
+
+
+def _quality_review_attempt_key(
+    ctx: WorkerToolContext, tool: str
+) -> tuple[str, str, str, str]:
+    """Scope the correction budget to this exact reviewer run and ledger."""
+    return (ctx.request_id, ctx.task_id, str(ctx.audit_ledger_path), tool)
+
+
+def _durable_failed_submit_attempts(ctx: WorkerToolContext, tool: str) -> int:
+    """Count this run's authenticated submission attempts that never landed."""
+    if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
+        return 0
+    verification = verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    if not verification.get("ok") or int(verification.get("entries_tampered") or 0):
+        return 0
+    calls = verification.get("call_count_by_tool") or {}
+    successful = verification.get("successful_call_count_by_tool") or {}
+    return max(0, int(calls.get(tool) or 0) - int(successful.get(tool) or 0))
+
+
+def _spent_submit_attempts(ctx: WorkerToolContext, tool: str) -> int:
+    """Report how much of the correction budget this run has already spent.
+
+    The authenticated ledger is the durable source, so a provider cannot reset
+    its own budget.  The in-process tally is kept beside it because an
+    unavailable or tampered ledger authenticates nothing: without it a failing
+    audit writer would hand the reviewer an unbounded retry loop.
+    """
+    with _QUALITY_REVIEW_ATTEMPT_LOCK:
+        spent = _QUALITY_REVIEW_ATTEMPTS.get(
+            _quality_review_attempt_key(ctx, tool), 0
+        )
+    return max(spent, _durable_failed_submit_attempts(ctx, tool))
+
+
+def _charge_failed_submit_attempt(
+    ctx: WorkerToolContext, tool: str, result: dict[str, Any]
+) -> dict[str, Any]:
+    """Spend one attempt and tell the reviewer whether a correction remains.
+
+    The validator's own machine-readable reason is passed through untouched:
+    the reviewer has to see the exact error for the one retry to be useful.
+    """
+    key = _quality_review_attempt_key(ctx, tool)
+    durable = _durable_failed_submit_attempts(ctx, tool)
+    with _QUALITY_REVIEW_ATTEMPT_LOCK:
+        spent = min(
+            QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS,
+            max(_QUALITY_REVIEW_ATTEMPTS.get(key, 0) + 1, durable),
+        )
+        _QUALITY_REVIEW_ATTEMPTS[key] = spent
+    return {
+        **result,
+        "attempt": spent,
+        "corrections_remaining": QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS - spent,
+        "terminal": spent >= QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS,
+    }
+
+
 def quality_review_submit(
     ctx: WorkerToolContext,
     *,
@@ -5145,6 +5221,12 @@ def quality_review_submit(
     keys are rejected by name and an empty findings list is valid. A finding
     may also be a bounded JSON string encoding one canonical finding object.
 
+    The report's schema and scope are validated here, inside the run, at
+    submission time. A rejected attempt returns the validator's exact
+    machine-readable reason plus ``attempt``/``corrections_remaining``/
+    ``terminal``, so the reviewer can correct and resubmit once. The second
+    failed attempt is terminal and a third attempt is refused outright.
+
     This tool is inert for ordinary workers: the launcher must bind one
     immutable packet path into the worker runtime. The model cannot choose a
     target task/provider, and the signed audit payload carries the worker's
@@ -5154,6 +5236,18 @@ def quality_review_submit(
     from . import quality_evidence
 
     tool = "quality_review_submit"
+    spent = _spent_submit_attempts(ctx, tool)
+    if spent >= QUALITY_REVIEW_SUBMIT_MAX_ATTEMPTS:
+        # Refuse before validating anything so no third provider attempt can
+        # exist, and so an exhausted reviewer cannot append further evidence.
+        return {
+            "ok": False,
+            "tool": tool,
+            "reason": "quality_review_correction_retry_exhausted",
+            "attempt": spent,
+            "corrections_remaining": 0,
+            "terminal": True,
+        }
     path = ctx.quality_review_packet_path
     if path is None:
         return _violation(ctx, tool, "quality_review_packet_not_bound")
@@ -5174,13 +5268,17 @@ def quality_review_submit(
         if isinstance(raw_finding, str):
             decoded, decode_reason = _decode_finding_json_object(raw_finding)
             if decoded is None:
-                return _record_rejected_finding_intent(
+                return _charge_failed_submit_attempt(
                     ctx,
                     tool,
-                    decode_reason,
-                    packet_sha256=packet_sha256,
-                    lens=lens,
-                    raw_findings=list(findings),
+                    _record_rejected_finding_intent(
+                        ctx,
+                        tool,
+                        decode_reason,
+                        packet_sha256=packet_sha256,
+                        lens=lens,
+                        raw_findings=list(findings),
+                    ),
                 )
             decoded_findings.append(decoded)
         else:
@@ -5217,13 +5315,17 @@ def quality_review_submit(
             audit_verified=True,
         )
     except quality_reviewer.ReviewerEvidenceError as exc:
-        return _record_rejected_finding_intent(
+        return _charge_failed_submit_attempt(
             ctx,
             tool,
-            str(exc),
-            packet_sha256=packet_sha256,
-            lens=lens,
-            raw_findings=list(findings),
+            _record_rejected_finding_intent(
+                ctx,
+                tool,
+                str(exc),
+                packet_sha256=packet_sha256,
+                lens=lens,
+                raw_findings=list(findings),
+            ),
         )
     normalized, errors = quality_evidence.normalize_reviewer_reports(
         [
@@ -5237,22 +5339,30 @@ def quality_review_submit(
         ]
     )
     if errors or len(normalized) != 1:
-        return _record_rejected_finding_intent(
+        return _charge_failed_submit_attempt(
             ctx,
             tool,
-            (errors[0] if errors else "reviewer_report_invalid"),
-            packet_sha256=packet_sha256,
-            lens=lens,
-            raw_findings=list(findings),
+            _record_rejected_finding_intent(
+                ctx,
+                tool,
+                (errors[0] if errors else "reviewer_report_invalid"),
+                packet_sha256=packet_sha256,
+                lens=lens,
+                raw_findings=list(findings),
+            ),
         )
     if not normalized_findings and _prior_rejected_finding_intent(ctx, tool):
-        return _record_rejected_finding_intent(
+        return _charge_failed_submit_attempt(
             ctx,
             tool,
-            "quality_review_empty_after_rejected_intent",
-            packet_sha256=packet_sha256,
-            lens=lens,
-            raw_findings=[],
+            _record_rejected_finding_intent(
+                ctx,
+                tool,
+                "quality_review_empty_after_rejected_intent",
+                packet_sha256=packet_sha256,
+                lens=lens,
+                raw_findings=[],
+            ),
         )
     receipt = {
         "schema_id": quality_reviewer.RECEIPT_SCHEMA_ID,
@@ -5315,13 +5425,17 @@ def quality_review_submit(
     before, prior_payloads = verified_payloads()
     if prior_payloads:
         if any(payload != receipt for payload in prior_payloads):
-            return {
-                "ok": False,
-                "tool": tool,
-                "reason": "quality_review_submission_conflict",
-                "submission_id": submission_id,
-                "durable": bool(before.get("ok")),
-            }
+            return _charge_failed_submit_attempt(
+                ctx,
+                tool,
+                {
+                    "ok": False,
+                    "tool": tool,
+                    "reason": "quality_review_submission_conflict",
+                    "submission_id": submission_id,
+                    "durable": bool(before.get("ok")),
+                },
+            )
         if before.get("ok") and int(before.get("entries_tampered") or 0) == 0:
             return durable_ack(deduplicated=True, retry_count=len(prior_payloads))
 
@@ -5337,34 +5451,48 @@ def quality_review_submit(
         payload=receipt,
     )
     if not appended:
-        return {
-            "ok": False,
-            "tool": tool,
-            "reason": "quality_review_submission_not_durable",
-            "submission_id": submission_id,
-            "durable": False,
-        }
+        # The audit ledger is unavailable, so nothing about this submission can
+        # be authenticated: fail closed and spend the attempt.
+        return _charge_failed_submit_attempt(
+            ctx,
+            tool,
+            {
+                "ok": False,
+                "tool": tool,
+                "reason": "quality_review_submission_not_durable",
+                "submission_id": submission_id,
+                "durable": False,
+            },
+        )
     after, persisted_payloads = verified_payloads()
     if (
         not after.get("ok")
         or int(after.get("entries_tampered") or 0) != 0
         or not persisted_payloads
     ):
-        return {
-            "ok": False,
-            "tool": tool,
-            "reason": "quality_review_submission_not_durable",
-            "submission_id": submission_id,
-            "durable": False,
-        }
+        return _charge_failed_submit_attempt(
+            ctx,
+            tool,
+            {
+                "ok": False,
+                "tool": tool,
+                "reason": "quality_review_submission_not_durable",
+                "submission_id": submission_id,
+                "durable": False,
+            },
+        )
     if any(payload != receipt for payload in persisted_payloads):
-        return {
-            "ok": False,
-            "tool": tool,
-            "reason": "quality_review_submission_conflict",
-            "submission_id": submission_id,
-            "durable": True,
-        }
+        return _charge_failed_submit_attempt(
+            ctx,
+            tool,
+            {
+                "ok": False,
+                "tool": tool,
+                "reason": "quality_review_submission_conflict",
+                "submission_id": submission_id,
+                "durable": True,
+            },
+        )
     return durable_ack(
         deduplicated=len(persisted_payloads) > 1,
         retry_count=max(0, len(persisted_payloads) - 1),

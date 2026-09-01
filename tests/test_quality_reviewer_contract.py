@@ -244,6 +244,9 @@ def test_rejected_nonempty_intent_then_empty_finding_fails_closed(
         "reason": "quality_review_empty_after_rejected_intent",
         "rejected_intent_authenticated": True,
         "rejected_intent_sha256": empty["rejected_intent_sha256"],
+        "attempt": 2,
+        "corrections_remaining": 0,
+        "terminal": True,
     }
     report = worker_tools.verify_audit_ledger(
         ctx.audit_ledger_path,
@@ -1407,6 +1410,211 @@ def test_nf469_review_workspace_materializes_explicit_target_inputs(
         worker_workspace.cleanup_workspace(repo, source.path, source.home)
 
 
+def _in_scope_finding(finding_id: str) -> dict[str, object]:
+    return {
+        "id": finding_id,
+        "severity": "medium",
+        "summary": "Changed branch violates the invariant",
+        "evidence": "src/aiworkhub/core.py:7",
+        "path": "src/aiworkhub/core.py",
+        "line_start": 7,
+        "line_end": 7,
+        "symbol": "src/aiworkhub/core.py.target",
+        "confidence": "high",
+        "evidence_level": "reproduced",
+        "required_validation": "run the focused regression",
+    }
+
+
+def _out_of_scope_finding() -> dict[str, object]:
+    return {
+        "id": "outside",
+        "severity": "medium",
+        "summary": "Outside scope",
+        "evidence": "other.py:1",
+        "path": "other.py",
+        "line_start": 1,
+        "line_end": 1,
+    }
+
+
+def _ungrounded_finding() -> dict[str, object]:
+    return {
+        "id": "ungrounded",
+        "severity": "high",
+        "summary": "Unverified claim",
+        "evidence": "the code looks unsafe",
+    }
+
+
+def _submit_context(
+    tmp_path: Path,
+) -> tuple[worker_tools.WorkerToolContext, dict[str, object]]:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    return _worker_context(tmp_path, packet_path), packet
+
+
+def _submit(
+    ctx: worker_tools.WorkerToolContext,
+    packet: dict[str, object],
+    findings: list[object],
+    *,
+    lens: str = "correctness",
+) -> dict[str, object]:
+    return worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens=lens,
+        findings=findings,
+    )
+
+
+def _verified_payloads(ctx: worker_tools.WorkerToolContext) -> list[dict[str, object]]:
+    return worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )["verified_payloads"]
+
+
+def test_invalid_first_report_returns_exact_error_and_keeps_one_correction(
+    tmp_path: Path,
+) -> None:
+    # M6: a whole review run used to be discarded at finalize with
+    # review_protocol:structured_report_invalid.  The reviewer must instead see
+    # the validator's exact machine-readable error while it can still act on it.
+    ctx, packet = _submit_context(tmp_path)
+
+    first = _submit(ctx, packet, [_out_of_scope_finding()])
+    assert first["ok"] is False
+    assert first["reason"] == "review_finding_0_path_out_of_scope"
+    assert first["attempt"] == 1
+    assert first["corrections_remaining"] == 1
+    assert first["terminal"] is False
+
+    corrected = _submit(ctx, packet, [_in_scope_finding("corrected")])
+    assert corrected["ok"] is True, corrected
+    payloads = _verified_payloads(ctx)
+    assert len(payloads) == 1
+    assert payloads[0]["report"]["findings"][0]["id"] == "corrected"
+
+
+def test_invalid_then_different_invalid_returns_the_exact_second_error(
+    tmp_path: Path,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+
+    first = _submit(ctx, packet, [_ungrounded_finding()], lens="security")
+    assert first["reason"] == "review_finding_0_exact_evidence_required"
+    assert first["terminal"] is False
+
+    second = _submit(ctx, packet, [_out_of_scope_finding()], lens="security")
+    # The correction retry is validated on its own merits: the reviewer gets
+    # the second attempt's error, never a replay of the first attempt's.
+    assert second["reason"] == "review_finding_0_path_out_of_scope"
+    assert second["reason"] != first["reason"]
+    assert second["attempt"] == 2
+    assert second["corrections_remaining"] == 0
+    assert second["terminal"] is True
+
+    third = _submit(ctx, packet, [_in_scope_finding("too-late")], lens="security")
+    assert third == {
+        "ok": False,
+        "tool": "quality_review_submit",
+        "reason": "quality_review_correction_retry_exhausted",
+        "attempt": 2,
+        "corrections_remaining": 0,
+        "terminal": True,
+    }
+    assert _verified_payloads(ctx) == []
+
+
+def test_audit_unavailable_submission_fails_closed_after_one_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, packet = _submit_context(tmp_path)
+
+    def fail_append(_path: Path, _line: str) -> None:
+        raise PermissionError("simulated denied audit append")
+
+    monkeypatch.setattr(worker_tools, "_append_line_0600", fail_append)
+
+    first = _submit(ctx, packet, [_in_scope_finding("unauthenticated")])
+    assert first["ok"] is False
+    assert first["reason"] == "quality_review_submission_not_durable"
+    assert first["durable"] is False
+    assert first["attempt"] == 1
+    assert first["corrections_remaining"] == 1
+    assert first["terminal"] is False
+
+    second = _submit(ctx, packet, [_in_scope_finding("unauthenticated")])
+    assert second["reason"] == "quality_review_submission_not_durable"
+    assert second["terminal"] is True
+
+    third = _submit(ctx, packet, [_in_scope_finding("unauthenticated")])
+    assert third["reason"] == "quality_review_correction_retry_exhausted"
+    assert third["terminal"] is True
+    assert _verified_payloads(ctx) == []
+
+
+def test_audit_tampered_submission_is_never_acknowledged(tmp_path: Path) -> None:
+    ctx, packet = _submit_context(tmp_path)
+    forged = {
+        "schema_id": worker_tools.AUDIT_ENTRY_SCHEMA_ID,
+        "task_id": ctx.task_id,
+        "runner": ctx.runner,
+        "topic": ctx.topic,
+        "request_id": ctx.request_id,
+        "tool": "quality_review_submit",
+        "ok": True,
+        "cache_hit": False,
+        "hit_count": 1,
+        "bytes_returned": 0,
+        "violation": "",
+        "authority_source": "runtime",
+        "authority_state": "process_bound",
+        "authority_repo": str(ctx.authority_repo),
+        "payload": {"report": {"findings": [_in_scope_finding("forged")]}},
+        "hmac_sha256": "0" * 64,
+    }
+    ctx.audit_ledger_path.write_text(
+        json.dumps(forged, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    first = _submit(ctx, packet, [_in_scope_finding("real")])
+    assert first["ok"] is False
+    assert first["reason"] == "quality_review_submission_not_durable"
+    assert first["durable"] is False
+    assert "status" not in first
+    assert first["terminal"] is False
+
+    audit = worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    assert audit["entries_tampered"] == 1
+    assert not any(
+        _r4_finding(payload) == "forged"
+        for payload in audit["verified_payloads"]
+    )
+
+    second = _submit(ctx, packet, [_in_scope_finding("real")])
+    assert second["reason"] == "quality_review_submission_not_durable"
+    assert second["terminal"] is True
+
+    third = _submit(ctx, packet, [_in_scope_finding("real")])
+    assert third["reason"] == "quality_review_correction_retry_exhausted"
+    assert third["terminal"] is True
 def test_quality_review_read_only_input_paths_are_strict_path_declarations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
