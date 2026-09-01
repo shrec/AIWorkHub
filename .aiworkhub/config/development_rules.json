@@ -493,16 +493,31 @@
                 "pattern": "os_name_eq",
                 "count": 2
           },
-          {
-                "path": "src/aiworkhub/callback_store.py",
-                "pattern": "sqlite_connect",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/context_graph.py",
-                "pattern": "sqlite_connect",
-                "count": 1
-          },
+      {
+        "path": "src/aiworkhub/callback_store.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/context_cache.py",
+        "pattern": "def_atomic",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/context_cache.py",
+        "pattern": "os_name_eq",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/context_graph.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/context_importer.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
           {
                 "path": "src/aiworkhub/context_write_intents.py",
                 "pattern": "sqlite_connect",
@@ -543,11 +558,21 @@
                 "pattern": "sqlite_connect",
                 "count": 1
           },
-          {
-                "path": "src/aiworkhub/development_rules.py",
-                "pattern": "creationflags",
-                "count": 1
-          },
+      {
+        "path": "src/aiworkhub/development_rules.py",
+        "pattern": "creationflags",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/fresh_task_store.py",
+        "pattern": "def_atomic",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/fresh_task_store.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
           {
                 "path": "src/aiworkhub/glm_credentials.py",
                 "pattern": "def_chmod_fd",
@@ -668,36 +693,76 @@
                 "pattern": "os_killpg",
                 "count": 2
           },
-          {
-                "path": "src/aiworkhub/source_graph_daemon.py",
-                "pattern": "os_name_eq",
-                "count": 5
-          },
+      {
+        "path": "src/aiworkhub/source_graph_daemon.py",
+        "pattern": "os_name_eq",
+        "count": 5
+      },
+      {
+        "path": "src/aiworkhub/source_graph_migration.py",
+        "pattern": "def_atomic",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/source_graph_migration.py",
+        "pattern": "sqlite_connect",
+        "count": 3
+      },
           {
                 "path": "src/aiworkhub/source_graph_partition.py",
                 "pattern": "sqlite_connect",
                 "count": 3
           },
-          {
-                "path": "src/aiworkhub/sqlite_readonly.py",
-                "pattern": "sqlite_connect",
-                "count": 3
-          },
-          {
-                "path": "src/aiworkhub/task_store.py",
-                "pattern": "def_atomic",
+      {
+        "path": "src/aiworkhub/sqlite_readonly.py",
+        "pattern": "sqlite_connect",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/storage_retention.py",
+        "pattern": "def_atomic",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/storage_retention.py",
+        "pattern": "sqlite_connect",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/suite_profile_plugin.py",
+        "pattern": "os_name_eq",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/task_retention.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/task_store.py",
+        "pattern": "def_atomic",
                 "count": 2
           },
-          {
-                "path": "src/aiworkhub/task_store.py",
-                "pattern": "sqlite_connect",
-                "count": 4
-          },
-          {
-                "path": "src/aiworkhub/terminal_authority.py",
-                "pattern": "os_name_ne",
-                "count": 1
-          },
+      {
+        "path": "src/aiworkhub/task_store.py",
+        "pattern": "sqlite_connect",
+        "count": 4
+      },
+      {
+        "path": "src/aiworkhub/task_store_migration.py",
+        "pattern": "sqlite_connect",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/terminal_authority.py",
+        "pattern": "os_name_ne",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/terminal_log_retention.py",
+        "pattern": "def_atomic",
+        "count": 1
+      },
           {
                 "path": "src/aiworkhub/vscode_lm_bridge.py",
                 "pattern": "def_atomic",
@@ -723,11 +788,46 @@
                 "pattern": "os_name_eq",
                 "count": 2
           },
-          {
-                "path": "src/aiworkhub/worker_ai_tools_mcp.py",
-                "pattern": "sqlite_connect",
-                "count": 7
-          },
+      {
+        "path": "src/aiworkhub/worker_ai_tools_mcp.py",
+        "pattern": "sqlite_connect",
+        "count": 7
+      },
+      {
+        "path": "src/aiworkhub/worker_supervisor.py",
+        "pattern": "creationflags",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/worker_supervisor.py",
+        "pattern": "def_chmod_fd",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/worker_supervisor.py",
+        "pattern": "import_msvcrt",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/worker_supervisor.py",
+        "pattern": "os_killpg",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/worker_supervisor.py",
+        "pattern": "os_name_eq",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/worker_supervisor.py",
+        "pattern": "os_name_ne",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/worker_supervisor.py",
+        "pattern": "sys_platform",
+        "count": 1
+      },
           {
                 "path": "src/aiworkhub/worker_workspace.py",
                 "pattern": "creationflags",
@@ -787,8 +887,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 134,
-      "accepted_predecessor_delta": -27
+      "current_total": 162,
+      "accepted_predecessor_delta": 1
     }
   }
 }
