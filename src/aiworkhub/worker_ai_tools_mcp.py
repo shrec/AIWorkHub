@@ -770,40 +770,35 @@ _CANDIDATE_SOURCE_GRAPH_REQUIRED_TABLES = (
 )
 
 
-def _is_indexable_changed_path(relative: str) -> bool:
-    """True when Source Graph indexes files with this path's extension.
-
-    Shared by the prewarm reconciliation loop and its readiness check so a
-    non-indexable packet path (for example ``.txt`` or ``.csv``) is treated
-    identically by both: skipped during indexing and never required to have
-    a ``files`` row.  Without this shared gate the two could disagree and a
-    packet touching only non-indexable files would leave the candidate DB
-    permanently "not ready", aborting an otherwise valid prewarm.
-    """
+def _is_admitted_existing_changed_path(repo: Path, relative: str) -> bool:
+    """Use the partition builder's canonical policy for readiness admission."""
 
     from . import source_graph as _source_graph_mod
+    from . import source_graph_partition as _source_graph_partition
 
-    return Path(relative).suffix.casefold() in _source_graph_mod._INDEXED_EXTENSION_SET
+    candidate = (repo / relative).resolve(strict=False)
+    return candidate.is_file() and _source_graph_partition._admits(
+        _source_graph_mod.load_ignore_policy(repo), relative,
+    )
 
 
 def _candidate_db_is_ready(
     db_path: Path,
+    repo: Path,
     packet_sha256: str,
     target_request_id: str,
     target_task_id: str,
     changed_paths: Sequence[Mapping[str, str]],
 ) -> bool:
-    """True only when the overlay is schema-complete, non-empty and exactly
-    packet-bound for every indexable changed path.
+    """True only when the overlay is schema-complete and exactly packet-bound.
 
     Marker-only readiness is insufficient: a partial, stale or tampered DB with
     a correct marker must fail closed.  The database is opened read-only and
-    must (1) contain the Source Graph schema, (2) hold at least one indexed
-    ``files`` row, and (3) for every packet changed-path row whose extension
-    Source Graph indexes, the exact ``file_path`` and ``source_hash`` must
-    already be present.  A changed path with a non-indexable extension is
-    never Source Graph-representable, so it is exempt from (3) and can never
-    block readiness.  This runs both before ``os.replace`` and again on
+    must (1) contain the Source Graph schema and (2) for every existing packet
+    path admitted by the partition builder's canonical policy, contain the
+    exact ``file_path`` and ``source_hash``. Deleted and policy-skipped paths
+    legitimately have no row, including partitions with zero rows. This runs
+    both before ``os.replace`` and again on
     runtime binding, so publish and query always agree on the same bytes.
     """
 
@@ -835,15 +830,12 @@ def _candidate_db_is_ready(
             }
             if not set(_CANDIDATE_SOURCE_GRAPH_REQUIRED_TABLES).issubset(tables):
                 return False
-            count_row = conn.execute("SELECT COUNT(*) FROM files").fetchone()
-            if count_row is None or int(count_row[0]) <= 0:
-                return False
             for changed in changed_paths:
                 relative = str(changed.get("path") or "")
                 expected = str(changed.get("sha256") or "")
                 if not relative or not expected:
                     return False
-                if not _is_indexable_changed_path(relative):
+                if not _is_admitted_existing_changed_path(repo, relative):
                     continue
                 found = conn.execute(
                     "SELECT source_hash FROM files WHERE file_path=?",
@@ -978,7 +970,7 @@ def prewarm_quality_review_source_graph(
     if db_path.is_symlink():
         raise WorkerToolError("quality_review_candidate_source_graph_symlink")
     if _candidate_db_is_ready(
-        db_path, packet_sha256, target_request_id, target_task_id,
+        db_path, repo, packet_sha256, target_request_id, target_task_id,
         changed_paths,
     ):
         return _candidate_prewarm_result(
@@ -994,7 +986,7 @@ def prewarm_quality_review_source_graph(
     if not is_owner:
         flight.wait()
         if not _candidate_db_is_ready(
-            db_path, packet_sha256, target_request_id, target_task_id,
+            db_path, repo, packet_sha256, target_request_id, target_task_id,
             changed_paths,
         ):
             raise WorkerToolError("quality_review_candidate_source_graph_empty")
@@ -1032,7 +1024,7 @@ def prewarm_quality_review_source_graph(
                 temporary, packet_sha256, target_request_id, target_task_id,
             )
             if not _candidate_db_is_ready(
-                temporary, packet_sha256, target_request_id, target_task_id,
+                temporary, repo, packet_sha256, target_request_id, target_task_id,
                 changed_paths,
             ):
                 raise WorkerToolError(
@@ -1042,7 +1034,7 @@ def prewarm_quality_review_source_graph(
         finally:
             temporary.unlink(missing_ok=True)
         if not _candidate_db_is_ready(
-            db_path, packet_sha256, target_request_id, target_task_id,
+            db_path, repo, packet_sha256, target_request_id, target_task_id,
             changed_paths,
         ):
             raise WorkerToolError("quality_review_candidate_source_graph_empty")
@@ -1103,7 +1095,7 @@ def _candidate_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding 
     if db_path.is_symlink():
         raise WorkerToolError("quality_review_candidate_source_graph_symlink")
     if not _candidate_db_is_ready(
-        db_path, packet_sha256, target_request_id, target_task_id,
+        db_path, ctx.repo, packet_sha256, target_request_id, target_task_id,
         changed_paths,
     ):
         raise WorkerToolError("quality_review_candidate_source_graph_unavailable")

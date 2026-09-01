@@ -117,6 +117,106 @@ def _write_candidate(tmp_path: Path, *, index: int = 0) -> tuple[Path, Path, Pat
     return canonical, candidate, runtime, packet
 
 
+def test_quality_review_prewarm_accepts_policy_excluded_and_zero_row_partitions(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical-devrules"
+    canonical.mkdir()
+    (canonical / "base.py").write_text(
+        "def canonical_devrules_base():\n    return True\n", encoding="utf-8"
+    )
+    repository_state.bootstrap_repository(canonical)
+    source_graph.build_index(canonical)
+
+    def prewarm_packet(
+        name: str, files: dict[str, str], *, request_id: str, task_id: str
+    ) -> tuple[dict, Path, Path]:
+        candidate = tmp_path / name
+        runtime = tmp_path / f"{name}-runtime"
+        candidate.mkdir()
+        runtime.mkdir()
+        changed_hashes: dict[str, str] = {}
+        for relative, content in files.items():
+            path = candidate / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            changed_hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        packet = quality_reviewer.build_review_packet(
+            request_id=request_id,
+            task_id=task_id,
+            claim_epoch=1,
+            worker_provider="codex_cli",
+            changed_path_hashes=changed_hashes,
+        )
+        packet_path = runtime / "quality_review_packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        result = worker_tools.prewarm_quality_review_source_graph(
+            packet_path, repo=candidate, authority_repo=canonical
+        )
+        assert result["ok"] is True
+        return result, candidate, packet_path
+
+    mixed, mixed_repo, mixed_packet = prewarm_packet(
+        "candidate-devrules",
+        {
+            "src/aiworkhub/development_rules.py": (
+                "def devrules_candidate_symbol():\n    return 'ready'\n"
+            ),
+            "scripts/check_development_rules.sh": "#!/bin/sh\nexit 0\n",
+            "tests/development_rules_fixture.txt": "excluded test fixture\n",
+            "config/development_rules.json": "{}\n",
+            ".aiworkhub/config/development_rules.json": "{}\n",
+        },
+        request_id="devrules-request",
+        task_id="DEVRULES_TASK",
+    )
+    mixed_db = Path(mixed["db_path"])
+    admitted_paths = {
+        "src/aiworkhub/development_rules.py",
+        "scripts/check_development_rules.sh",
+        "config/development_rules.json",
+    }
+    excluded_paths = {
+        "tests/development_rules_fixture.txt",
+        ".aiworkhub/config/development_rules.json",
+    }
+    with sqlite3.connect(str(mixed_db)) as conn:
+        indexed = dict(conn.execute("SELECT file_path, source_hash FROM files"))
+        assert set(indexed) == admitted_paths
+        for relative in admitted_paths:
+            assert indexed[relative] == hashlib.sha256(
+                (mixed_repo / relative).read_bytes()
+            ).hexdigest()
+        for relative in excluded_paths:
+            assert relative not in indexed
+
+    mixed_ctx = _ctx(
+        mixed_db.parent,
+        repo=mixed_repo,
+        authority_repo=canonical,
+        packet_path=mixed_packet,
+        task_id="REVIEW_DEVRULES_TASK",
+    )
+    worker_tools._CACHE.clear()
+    query = worker_tools.source_graph_query(
+        mixed_ctx, mode="function", query="devrules_candidate_symbol", budget=16
+    )
+    assert query["ok"] is True
+    assert "devrules_candidate_symbol" in query["content"]
+
+    empty, _, _ = prewarm_packet(
+        "candidate-zero-row",
+        {
+            "tests/development_rules_fixture.txt": "not source\n",
+            ".aiworkhub/config/development_rules.json": "{}\n",
+        },
+        request_id="zero-row-request",
+        task_id="ZERO_ROW_TASK",
+    )
+    with sqlite3.connect(str(empty["db_path"])) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM files").fetchone() == (0,)
+
+
 def test_quality_review_prewarm_verifies_candidate_bytes_before_build(
     tmp_path: Path,
 ) -> None:
