@@ -101,7 +101,7 @@ def _insert_card(repo: Path, task_id: str, *, status: str, rework_predecessor_re
         conn.close()
 
 
-def _blocking_size(monkeypatch, *, block_after: int):
+def _blocking_size(monkeypatch, *, worktree_base: Path, block_after: int):
     """Install a ``directory_size_bytes`` that measures the first ``block_after``
     entries for real, then blocks -- so the walk fully establishes exactly those
     entries before the deadline fires. Returns the release event; callers MUST
@@ -112,6 +112,9 @@ def _blocking_size(monkeypatch, *, block_after: int):
     seen = {"n": 0}
 
     def blocking(path, **kwargs):
+        resolved = Path(path).resolve()
+        if resolved.parent != worktree_base.resolve():
+            return real(path, **kwargs)
         with lock:
             seen["n"] += 1
             index = seen["n"]
@@ -130,7 +133,7 @@ def test_deadline_hit_returns_partial_candidates_not_an_empty_clean_list(
     for index in range(4):
         _add_clean_worktree(repo, base, f"wt-{index:02d}")
 
-    release = _blocking_size(monkeypatch, block_after=2)
+    release = _blocking_size(monkeypatch, worktree_base=base, block_after=2)
     try:
         result = storage_retention.preview(
             repo, base=base, now=_aged_now(), deadline_seconds=3.0
@@ -170,7 +173,9 @@ def test_a_stalled_walk_that_established_nothing_is_not_reported_as_clean(
     for index in range(3):
         _add_clean_worktree(repo, base, f"wt-{index:02d}")
 
-    release = _blocking_size(monkeypatch, block_after=0)  # block on the very first
+    release = _blocking_size(
+        monkeypatch, worktree_base=base, block_after=0
+    )  # block on the very first
     try:
         result = storage_retention.preview(
             repo, base=base, now=_aged_now(), deadline_seconds=2.0
@@ -201,7 +206,7 @@ def test_partial_never_includes_a_protected_worktree_verified_by_lineage(
     _add_clean_worktree(repo, base, "c-blocked")
     _insert_card(repo, "NF-1", status="pending", rework_predecessor_request_id="a-predecessor")
 
-    release = _blocking_size(monkeypatch, block_after=2)
+    release = _blocking_size(monkeypatch, worktree_base=base, block_after=2)
     try:
         result = storage_retention.preview(
             repo, base=base, now=_aged_now(), deadline_seconds=3.0

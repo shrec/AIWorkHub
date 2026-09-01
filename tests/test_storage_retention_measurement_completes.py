@@ -26,9 +26,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -262,3 +265,114 @@ def test_worktree_a_live_process_holds_is_never_a_candidate(repo_with_worktrees)
     assert {"id": "live-attempt", "reason": "live_worker"} in result["protected"]
     assert "idle-attempt" in candidate_ids  # an unheld clean worktree stays reclaimable
     assert (base / "live-attempt").is_dir()
+
+
+class _CountingEvent(threading.Event):
+    def __init__(self, before_set=None) -> None:
+        super().__init__()
+        self.set_count = 0
+        self.before_set = before_set
+
+    def set(self) -> None:
+        if self.before_set is not None:
+            self.before_set()
+        self.set_count += 1
+        super().set()
+
+
+def test_measure_worker_legacy_aliased_ready_done_is_published_once() -> None:
+    done = _CountingEvent()
+    measurement = SimpleNamespace(
+        done=done, ready=done, value=None, error=None, succeeded=False, progress=None
+    )
+    key = ("legacy",)
+    storage_retention._measurements[key] = measurement
+
+    storage_retention._measure_worker(key, measurement, lambda: 7)
+
+    assert done.set_count == 1
+    assert measurement.value == 7
+    assert key not in storage_retention._measurements
+
+
+def test_measure_worker_distinct_ready_follows_done_before_eviction() -> None:
+    done = _CountingEvent()
+    key = ("native",)
+    measurement = SimpleNamespace(
+        done=done, value=None, error=None, succeeded=False, progress=None
+    )
+    ready = _CountingEvent(
+        lambda: (
+            done.is_set()
+            and storage_retention._measurements.get(key) is measurement
+        )
+        or pytest.fail("ready must follow done while the key remains fenced")
+    )
+    measurement.ready = ready
+    storage_retention._measurements[key] = measurement
+
+    storage_retention._measure_worker(key, measurement, lambda: 9)
+
+    assert done.set_count == 1
+    assert ready.set_count == 1
+    assert key not in storage_retention._measurements
+
+
+def test_failed_parallel_preview_retry_keeps_blocked_scan_single_flight(
+    repo_with_worktrees, monkeypatch
+) -> None:
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    (repo / "logs").mkdir()
+    release = threading.Event()
+    scan_started = threading.Event()
+    scan_starts = 0
+    lock = threading.Lock()
+    known = RuntimeError("known-component-failure")
+
+    def blocked_scan(*args, **kwargs):
+        nonlocal scan_starts
+        with lock:
+            scan_starts += 1
+        scan_started.set()
+        release.wait(30.0)
+        return {"summary": {}, "global_summary": {}, "worktrees": []}
+
+    real_size = worktree_storage.directory_size_bytes
+
+    def failing_size(path, **kwargs):
+        if Path(path).resolve() == (repo / "logs").resolve():
+            assert scan_started.wait(5.0)
+            raise known
+        return real_size(path, **kwargs)
+
+    monkeypatch.setattr(worktree_storage, "scan_worktrees", blocked_scan)
+    monkeypatch.setattr(worktree_storage, "directory_size_bytes", failing_size)
+    monkeypatch.setattr(
+        storage_retention.parallelism,
+        "compute_worker_count",
+        lambda **kwargs: (3, None),
+    )
+    now = _aged_now()
+    key = storage_retention._measure_key(repo.resolve(), base.resolve(), now)
+
+    def call_preview():
+        with pytest.raises(RuntimeError, match="known-component-failure") as caught:
+            storage_retention.preview(repo, base=base, now=now, deadline_seconds=10.0)
+        return caught.value
+
+    with ThreadPoolExecutor(max_workers=2) as callers:
+        first = callers.submit(call_preview)
+        assert scan_started.wait(5.0)
+        assert first.result(timeout=5.0) is known
+        assert key in storage_retention._measurements
+        second = callers.submit(call_preview)
+        assert second.result(timeout=5.0) is known
+        assert scan_starts == 1
+        assert key in storage_retention._measurements
+        release.set()
+
+    deadline = time.monotonic() + 5.0
+    while key in storage_retention._measurements and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert key not in storage_retention._measurements
+    assert scan_starts == 1

@@ -23,11 +23,12 @@ import stat
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from . import repo_policy, task_store, worktree_storage
+from . import parallelism, repo_policy, task_store, worktree_storage
 from .worker_workspace import configured_worktree_root, has_verified_rework_delta
 
 
@@ -457,28 +458,68 @@ def repo_storage_footprint(
     """
     root = Path(repo_root).resolve()
     worktree_base = (base or configured_worktree_root(root)).resolve()
-    scan = worktree_storage.scan_worktrees(
-        worktree_base, with_sizes=True, repo_root=root, progress=progress
+    legacy_log_root = root / LEGACY_LOG_RELATIVE_PATH
+    canonical_runtime_root = root / CANONICAL_RUNTIME_RELATIVE_PATH
+    components = (
+        (
+            "scan",
+            lambda: worktree_storage.scan_worktrees(
+                worktree_base, with_sizes=True, repo_root=root, progress=progress
+            ),
+        ),
+        (
+            "legacy_log_bytes",
+            lambda: (
+                worktree_storage.directory_size_bytes(legacy_log_root)
+                if legacy_log_root.is_dir() and not legacy_log_root.is_symlink()
+                else 0
+            ),
+        ),
+        (
+            "canonical_runtime_bytes",
+            lambda: (
+                worktree_storage.directory_size_bytes(
+                    canonical_runtime_root, exclude=[worktree_base]
+                )
+                if canonical_runtime_root.is_dir()
+                and not canonical_runtime_root.is_symlink()
+                else 0
+            ),
+        ),
     )
+    worker_count, _selection = parallelism.compute_worker_count(
+        candidate_count=len(components), reserve=1, ceiling=len(components)
+    )
+    values: dict[str, Any] = {}
+    if worker_count == 1:
+        for name, component in components:
+            values[name] = component()
+    else:
+        executor = ThreadPoolExecutor(
+            max_workers=worker_count, thread_name_prefix="aiworkhub-retention-component"
+        )
+        futures = {executor.submit(component): name for name, component in components}
+        try:
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    values[name] = future.result()
+                except BaseException as exc:
+                    _publish_component_failure(exc)
+                    raise
+        finally:
+            # Futures cannot safely be cancelled once their filesystem walk has
+            # started. Keep the composite worker alive (and its single-flight key
+            # fenced) until every such sibling has terminated.
+            executor.shutdown(wait=True, cancel_futures=True)
+    scan = values["scan"]
     global_summary = scan.get("global_summary") or scan.get("summary") or {}
     repository_worktree_bytes = int(scan.get("summary", {}).get("total_bytes") or 0)
     global_worktree_bytes = int(global_summary.get("total_bytes") or 0)
     repository_worktree_count = int(scan.get("summary", {}).get("count") or 0)
     global_worktree_count = int(global_summary.get("count") or 0)
-    legacy_log_root = root / LEGACY_LOG_RELATIVE_PATH
-    canonical_runtime_root = root / CANONICAL_RUNTIME_RELATIVE_PATH
-    legacy_log_bytes = (
-        worktree_storage.directory_size_bytes(legacy_log_root)
-        if legacy_log_root.is_dir() and not legacy_log_root.is_symlink()
-        else 0
-    )
-    canonical_runtime_bytes = (
-        worktree_storage.directory_size_bytes(
-            canonical_runtime_root, exclude=[worktree_base]
-        )
-        if canonical_runtime_root.is_dir() and not canonical_runtime_root.is_symlink()
-        else 0
-    )
+    legacy_log_bytes = int(values["legacy_log_bytes"])
+    canonical_runtime_bytes = int(values["canonical_runtime_bytes"])
     observed_total_bytes = global_worktree_bytes + legacy_log_bytes + canonical_runtime_bytes
     return {
         "base": worktree_base,
@@ -670,13 +711,15 @@ def _public_preview(value: Mapping[str, Any]) -> dict[str, Any]:
 # already-bounded ``storage_observability`` snapshot does.
 _measure_lock = threading.Lock()
 _measurements: dict[Any, "_Measurement"] = {}
+_measurement_local = threading.local()
 
 
 class _Measurement:
-    __slots__ = ("done", "value", "error", "succeeded", "progress")
+    __slots__ = ("done", "ready", "value", "error", "succeeded", "progress")
 
     def __init__(self) -> None:
         self.done = threading.Event()
+        self.ready = threading.Event()
         self.value: Any = None
         self.error: Exception | None = None
         # Set True ONLY when ``fn()`` returns a value. Completion (``done``) plus
@@ -693,6 +736,26 @@ class _Measurement:
         # evidence the shared walk established -- never its own empty sink handed
         # straight to ``_incomplete_preview`` as a false "clean" candidates=[].
         self.progress: "_PreviewProgress | None" = None
+
+
+def _ready_event(measurement: Any) -> Any:
+    """Native readiness when available; legacy measurements alias completion."""
+    return getattr(measurement, "ready", measurement.done)
+
+
+def _set_ready_once(measurement: Any) -> None:
+    ready = _ready_event(measurement)
+    if ready is not measurement.done and not ready.is_set():
+        ready.set()
+
+
+def _publish_component_failure(exc: BaseException) -> None:
+    measurement = getattr(_measurement_local, "measurement", None)
+    if measurement is None:
+        return
+    if isinstance(exc, Exception):
+        measurement.error = exc
+    _set_ready_once(measurement)
 
 
 class _PreviewProgress:
@@ -884,6 +947,7 @@ def _resolve_now(now: float | None) -> float | None:
 
 
 def _measure_worker(key: Any, measurement: "_Measurement", fn: Any) -> None:
+    _measurement_local.measurement = measurement
     try:
         measurement.value = fn()
         # Reached only on a genuine return: this is the ONE place success is
@@ -906,9 +970,11 @@ def _measure_worker(key: Any, measurement: "_Measurement", fn: Any) -> None:
         # arriving through a race. With ``done`` set first, any caller that still
         # sees the entry attaches to the finished measurement instead.
         measurement.done.set()
+        _set_ready_once(measurement)
         with _measure_lock:
             if _measurements.get(key) is measurement:
                 _measurements.pop(key, None)
+        _measurement_local.measurement = None
 
 
 def _measure_within_deadline(
@@ -960,8 +1026,9 @@ def _measure_within_deadline(
             name="aiworkhub-retention-preview",
         ).start()
 
-    finished = measurement.done.wait(deadline_seconds)
-    if not finished and not measurement.done.is_set():
+    ready = _ready_event(measurement)
+    finished = ready.wait(deadline_seconds)
+    if not finished and not ready.is_set():
         # Genuinely still walking: an honest incomplete result, never a failure
         # dressed as one -- no error has occurred yet at this point. Hand back the
         # SHARED walk's partial evidence so the attaching caller sees exactly what
