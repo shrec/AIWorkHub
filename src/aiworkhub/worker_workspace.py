@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -112,41 +113,78 @@ _NESTED_LANDLOCK_AUTHORITY_LOCATOR_KIND = "coordinator_nested_landlock_locator"
 _NESTED_LANDLOCK_AUTHORITY_LOCATOR_MAX_ANCESTORS = 16
 
 
+def _runtime_temp_support_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _require_regular_runtime_temp_support(
+    sibling_root: Path, module_name: str, filename: str
+) -> Path:
+    qualified = f"aiworkhub.{module_name}"
+    sibling = sibling_root / filename
+    try:
+        sibling_lstat = sibling.lstat()
+    except OSError as exc:
+        raise ImportError(f"{qualified} sibling unreadable: {sibling}") from exc
+    if not stat.S_ISREG(sibling_lstat.st_mode):
+        raise ImportError(f"{qualified} sibling is not a regular file: {sibling}")
+    return sibling
+
+
 def _load_runtime_temp():
     """Resolve the runtime_temp authority module deterministically.
 
-    ``worker_workspace.py`` is both package-imported (``from aiworkhub import
-    worker_workspace``) and executed directly as the Landlock wrapper
-    (``<python> src/aiworkhub/worker_workspace.py --landlock-exec ...``). In the
-    direct-script case the package-relative import fails and the installed
-    ``aiworkhub.runtime_temp`` is not guaranteed to be importable inside the
-    retained workspace. Resolve the authenticated sibling file beside this
-    module first; fall back to the package import only when the sibling is not
-    a regular file (installed/bundled layouts). A missing, symlinked, or
-    unloadable sibling fails closed.
+    Package imports use the normal ``aiworkhub.*`` package path and surface
+    transitive dependency failures unchanged. Direct-script execution has no
+    package context, so it loads authenticated regular siblings under
+    package-qualified names only and rolls back partial registrations on any
+    failure.
     """
-    try:
+    sibling_root = _runtime_temp_support_root()
+    if __package__:
+        for module_name, filename in (
+            ("_platform_process", "_platform_process.py"),
+            ("platform_io", "platform_io.py"),
+            ("runtime_temp", "runtime_temp.py"),
+        ):
+            _require_regular_runtime_temp_support(sibling_root, module_name, filename)
         from . import runtime_temp
         return runtime_temp
-    except ImportError:
-        pass
-    sibling = Path(__file__).resolve().parent / "runtime_temp.py"
-    try:
-        is_regular = sibling.is_file() and not sibling.is_symlink()
-    except OSError as exc:
-        raise ImportError(f"runtime_temp sibling unreadable: {sibling}") from exc
-    if not is_regular:
-        raise ImportError(
-            "runtime_temp unavailable: no package import and no regular "
-            f"sibling at {sibling}"
+
+    package_created = "aiworkhub" not in sys.modules
+    if package_created:
+        package = types.ModuleType("aiworkhub")
+        package.__path__ = [str(sibling_root)]  # type: ignore[attr-defined]
+        package.__package__ = "aiworkhub"
+        sys.modules["aiworkhub"] = package
+    loaded_names: list[str] = []
+
+    def load_regular_sibling(module_name: str, filename: str):
+        qualified = f"aiworkhub.{module_name}"
+        sibling = _require_regular_runtime_temp_support(
+            sibling_root, module_name, filename
         )
-    spec = importlib.util.spec_from_file_location("aiworkhub.runtime_temp", sibling)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"runtime_temp sibling has no loader: {sibling}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["aiworkhub.runtime_temp"] = module
-    spec.loader.exec_module(module)
-    return module
+        spec = importlib.util.spec_from_file_location(qualified, sibling)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"{qualified} sibling has no loader: {sibling}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[qualified] = module
+        loaded_names.append(qualified)
+        spec.loader.exec_module(module)
+        return module
+
+    try:
+        load_regular_sibling("_platform_process", "_platform_process.py")
+        load_regular_sibling("platform_io", "platform_io.py")
+        return load_regular_sibling("runtime_temp", "runtime_temp.py")
+    except Exception as exc:
+        for name in reversed(loaded_names):
+            sys.modules.pop(name, None)
+        if package_created:
+            sys.modules.pop("aiworkhub", None)
+        raise ImportError(
+            "aiworkhub.runtime_temp direct-script support closure failed"
+        ) from exc
 
 
 runtime_temp = _load_runtime_temp()
@@ -204,6 +242,7 @@ _VALIDATION_WORKER_PACKAGE_SUPPORT = (
     "pyproject.toml",
     "src/aiworkhub/__init__.py",
     "src/aiworkhub/_version.py",
+    "src/aiworkhub/_platform_process.py",
     "src/aiworkhub/platform_io.py",
     "src/aiworkhub/runtime_temp.py",
     "src/aiworkhub/validation_runner.py",

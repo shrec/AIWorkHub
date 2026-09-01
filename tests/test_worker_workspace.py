@@ -450,6 +450,7 @@ def _commit_validation_worker_package(repo: Path) -> None:
     for name in (
         "__init__.py",
         "_version.py",
+        "_platform_process.py",
         "platform_io.py",
         "runtime_temp.py",
         "validation_runner.py",
@@ -458,8 +459,15 @@ def _commit_validation_worker_package(repo: Path) -> None:
         shutil.copyfile(source_package / name, destination_package / name)
     (repo / "probe_candidate_import.py").write_text(
         "import os\n"
+        "import sys\n"
+        "from aiworkhub import _platform_process, platform_io, runtime_temp\n"
         "from aiworkhub import worker_workspace as w\n"
         "print(w.__file__)\n"
+        "print(runtime_temp.__name__)\n"
+        "print(platform_io.__name__)\n"
+        "print(_platform_process.__name__)\n"
+        "print(any(name in sys.modules for name in "
+        "('runtime_temp', 'platform_io', '_platform_process')))\n"
         "print(w.NF376_CANDIDATE_SENTINEL)\n"
         "print(os.environ.get(w.PYTHON_CANDIDATE_AUTHORITY_ENV, ''))\n",
         encoding="utf-8",
@@ -537,6 +545,10 @@ def test_validation_workspace_seeds_exact_worker_package_support_and_imports_can
 
         assert result["returncode"] == 0
         assert str(candidate_module) in result["stdout_head"]
+        assert "aiworkhub.runtime_temp" in result["stdout_head"]
+        assert "aiworkhub.platform_io" in result["stdout_head"]
+        assert "aiworkhub._platform_process" in result["stdout_head"]
+        assert "False" in result["stdout_head"]
         assert "candidate-worktree" in result["stdout_head"]
         assert expected_authority["digest"] in result["stdout_head"]
         assert result["python_candidate_authority"] == expected_authority
@@ -545,6 +557,153 @@ def test_validation_workspace_seeds_exact_worker_package_support_and_imports_can
         ]
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_validation_workspace_package_support_preserves_single_aiworkhub_module_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    _commit_validation_worker_package(repo)
+    probe = repo / "probe_worker_package_identity.py"
+    probe.write_text(
+        "import sys\n"
+        "from aiworkhub import _platform_process, platform_io, runtime_temp\n"
+        "from aiworkhub import worker_workspace\n"
+        "print(worker_workspace.__name__)\n"
+        "print(runtime_temp.__name__)\n"
+        "print(platform_io.__name__)\n"
+        "print(_platform_process.__name__)\n"
+        "print([name for name in ('runtime_temp', 'platform_io', "
+        "'_platform_process') if name in sys.modules])\n",
+        encoding="utf-8",
+    )
+    assert _git(repo, "add", "probe_worker_package_identity.py").returncode == 0
+    assert _git(repo, "commit", "-qm", "worker package identity probe").returncode == 0
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "package-identity-worktrees"),
+    )
+
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "package-identity",
+        {
+            "allowed_writes": ["src/aiworkhub/worker_workspace.py"],
+            "read_first": [
+                "src/aiworkhub/worker_workspace.py",
+                "probe_worker_package_identity.py",
+            ],
+            "validation": ["PYTHONPATH=src python3 probe_worker_package_identity.py"],
+        },
+        "glm_vscode_lm",
+    )
+    try:
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["PYTHONPATH=src python3 probe_worker_package_identity.py"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="glm_vscode_lm",
+        )
+
+        assert result["returncode"] == 0, result["stderr_tail"]
+        assert "aiworkhub.worker_workspace" in result["stdout_head"]
+        assert "aiworkhub.runtime_temp" in result["stdout_head"]
+        assert "aiworkhub.platform_io" in result["stdout_head"]
+        assert "aiworkhub._platform_process" in result["stdout_head"]
+        assert "[]" in result["stdout_head"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_package_runtime_temp_loader_rejects_missing_private_support_without_top_level_fallback(
+    tmp_path: Path,
+) -> None:
+    source_package = Path(worker_workspace.__file__).resolve().parent
+    destination_package = tmp_path / "src" / "aiworkhub"
+    destination_package.mkdir(parents=True)
+    for name in (
+        "__init__.py",
+        "_version.py",
+        "platform_io.py",
+        "runtime_temp.py",
+        "worker_workspace.py",
+    ):
+        shutil.copyfile(source_package / name, destination_package / name)
+    script = (
+        "import sys\n"
+        "try:\n"
+        "    import aiworkhub.worker_workspace\n"
+        "except ImportError as exc:\n"
+        "    print(type(exc).__name__)\n"
+        "    print(str(exc))\n"
+        "    print([name for name in ('runtime_temp', 'platform_io', "
+        "'_platform_process') if name in sys.modules])\n"
+        "else:\n"
+        "    raise SystemExit('import unexpectedly succeeded')\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(tmp_path / "src")},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ImportError" in result.stdout
+    assert "aiworkhub._platform_process sibling unreadable" in result.stdout
+    assert "No module named 'platform_io'" not in result.stdout + result.stderr
+    assert "[]" in result.stdout
+
+
+def test_direct_runtime_temp_loader_rejects_missing_private_support_without_top_level_duplicates(
+    tmp_path: Path,
+) -> None:
+    source_package = Path(worker_workspace.__file__).resolve().parent
+    destination_package = tmp_path / "aiworkhub-direct"
+    destination_package.mkdir()
+    for name in ("platform_io.py", "runtime_temp.py", "worker_workspace.py"):
+        shutil.copyfile(source_package / name, destination_package / name)
+    script = (
+        "import importlib.util\n"
+        "import sys\n"
+        f"path = {str(destination_package / 'worker_workspace.py')!r}\n"
+        "spec = importlib.util.spec_from_file_location('direct_worker_workspace', path)\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "try:\n"
+        "    spec.loader.exec_module(module)\n"
+        "except ImportError as exc:\n"
+        "    print(type(exc).__name__)\n"
+        "    print(str(exc))\n"
+        "    print(str(exc.__cause__))\n"
+        "    print([name for name in ('runtime_temp', 'platform_io', "
+        "'_platform_process') if name in sys.modules])\n"
+        "    print([name for name in ('aiworkhub.runtime_temp', "
+        "'aiworkhub.platform_io', 'aiworkhub._platform_process') "
+        "if name in sys.modules])\n"
+        "else:\n"
+        "    raise SystemExit('direct import unexpectedly succeeded')\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ImportError" in result.stdout
+    assert "aiworkhub.runtime_temp direct-script support closure failed" in result.stdout
+    assert "aiworkhub._platform_process sibling unreadable" in result.stdout
+    assert "No module named '_platform_process'" not in result.stdout + result.stderr
+    assert "[]" in result.stdout
 
 
 def test_python_validation_seeds_transitive_local_import_closure(
