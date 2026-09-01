@@ -3471,6 +3471,11 @@ def create_workspace(
     provisioning_started = time.monotonic()
     provisioning_timings_ms: dict[str, float] = {}
 
+    # Bottleneck audit T4 (2026-09-01): 85% of a sampled provisioning total was
+    # attributed to no named phase.  The import/require closure resolution
+    # below was the untimed step; it is now its own phase so the named phases
+    # account for the total.
+    phase_started = time.monotonic()
     if pinned_base_oid is None:
         live_seeded, support_seeded, seeded = _declared_workspace_seed_closure(
             repo, card, allowed
@@ -3479,6 +3484,9 @@ def create_workspace(
         # A pinned comparator must derive its dependency closure from the
         # pinned commit, never from newer live-canonical imports.
         live_seeded, support_seeded, seeded = [], (), []
+    provisioning_timings_ms["seed_closure"] = round(
+        (time.monotonic() - phase_started) * 1000.0, 3
+    )
 
     try:
         phase_started = time.monotonic()

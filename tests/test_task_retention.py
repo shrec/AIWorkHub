@@ -741,3 +741,58 @@ def test_validate_accepted_cleanup_evidence_accepts_canonical_task_ids(
     assert malformed["ok"] is False
     assert malformed["reason"] == "unknown_identity"
     assert malformed["deleted"] is False
+
+
+def test_hygiene_batch_budget_bounds_archives_not_examined_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bottleneck audit B4: 25 permanently fenced cards sorted first used to
+    # occupy the whole batch on every run, so the remaining eligible cards were
+    # never examined (measured eligible 263, archived 0, batch_limited 238).
+    repo = _repo(tmp_path)
+    old = "2026-01-01T00:00:00+00:00"
+    rows = [
+        {
+            "task_id": f"GRAVE_V{index}",
+            "status": "blocked",
+            "worker_status": "blocked",
+            "updated_at": old,
+            "completed_at": old,
+            "card": {"task_id": f"GRAVE_V{index}", "launch_request_id": f"req-{index}"},
+        }
+        for index in range(1, 32)
+    ]
+    fenced_ids = set(sorted(f"GRAVE_V{index}" for index in range(1, 31))[:25])
+    archived: list[str] = []
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(task_retention, "_hygiene_rows", lambda _root: rows)
+    monkeypatch.setattr(
+        task_retention,
+        "hygiene_config",
+        lambda: {"ttl_seconds": 3600, "batch_size": 25, "reviewer_stale_grace_seconds": 60},
+    )
+    monkeypatch.setattr(
+        task_retention,
+        "_final_archive_fence",
+        lambda _root, task_id, _request_id: (
+            (None, "retained_evidence") if task_id in fenced_ids else ({"task_id": task_id}, "")
+        ),
+    )
+    monkeypatch.setattr(
+        task_store,
+        "archive_task",
+        lambda _root, task_id, **_kwargs: (archived.append(task_id) is None, "archived"),
+    )
+
+    result = task_retention.run_automatic_hygiene(
+        repo, now=datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    )
+
+    # GRAVE_V31 is the retained family head; the other 30 are eligible, the 25
+    # fenced ones are skipped without consuming the budget, and the remaining
+    # 5 are archived instead of being starved behind the fenced prefix.
+    assert result["eligible"] == 30
+    assert result["archived"] == 5
+    assert result["reasons"]["retained_evidence"] == 25
+    assert "batch_limited" not in result["reasons"]
+    assert "GRAVE_V31" not in archived

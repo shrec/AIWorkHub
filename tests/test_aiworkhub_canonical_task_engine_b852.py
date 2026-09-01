@@ -1482,3 +1482,32 @@ def test_two_repos_same_task_id_stay_isolated(tmp_path, monkeypatch):
     row_a_again = _row(root_a, "SAME_TASK_ID")
     assert row_a_again["worker_status"] == "claimed"
     assert row_a_again["claimed_by"] == "claude_coding"
+
+
+def test_summarize_card_baselines_folds_large_hash_maps_only() -> None:
+    # Bottleneck audit T6: manager lookups fold the ~90-entry baseline hash
+    # maps to count plus digest; small maps and every other field are exact.
+    big = {f"src/aiworkhub/file{i}.py": f"file:664:{i:064x}" for i in range(40)}
+    card = {
+        "task_id": "T6",
+        "rework_predecessor": {
+            "workspace": {
+                "tree_baseline": dict(big),
+                "workspace_baseline": dict(big),
+                "parent_baseline": {"a.py": "file:664:abc"},
+                "allowed_writes": ["a.py"],
+            }
+        },
+        "acceptance": ["exact"],
+    }
+    folded = core.summarize_card_baselines(card)
+    workspace = folded["rework_predecessor"]["workspace"]
+    assert workspace["tree_baseline"]["summarized"] is True
+    assert workspace["tree_baseline"]["entry_count"] == 40
+    assert len(workspace["tree_baseline"]["sha256"]) == 64
+    assert workspace["tree_baseline"]["sha256"] == workspace["workspace_baseline"]["sha256"]
+    assert workspace["parent_baseline"] == {"a.py": "file:664:abc"}
+    assert workspace["allowed_writes"] == ["a.py"]
+    assert folded["acceptance"] == ["exact"]
+    # The stored card is never mutated by the render.
+    assert len(card["rework_predecessor"]["workspace"]["tree_baseline"]) == 40

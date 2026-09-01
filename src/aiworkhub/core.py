@@ -1743,7 +1743,44 @@ def list_tasks(status: str = "pending", topic: str | None = None, limit: int = 8
     return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
 
 
-def show_task(task_id: str) -> dict[str, Any]:
+# Bottleneck audit T6 (2026-09-01): one two-file card rendered ~45-95KB because
+# the retained rework workspace carries three per-file hash maps (tree,
+# workspace and parent baselines, ~90 entries each).  A manager lookup needs
+# the identity of those maps, not their bytes; the maps stay intact in the
+# store and in every internal consumer, only the summary-first render folds
+# them.
+_BASELINE_MAP_KEYS = frozenset({"tree_baseline", "workspace_baseline", "parent_baseline"})
+_BASELINE_SUMMARY_MIN_ENTRIES = 8
+
+
+def summarize_card_baselines(value: Any, *, depth: int = 0) -> Any:
+    """Return ``value`` with large baseline hash maps folded to count plus digest."""
+
+    if depth > 24:
+        return value
+    if isinstance(value, dict):
+        folded: dict[str, Any] = {}
+        for key, item in value.items():
+            if (
+                str(key) in _BASELINE_MAP_KEYS
+                and isinstance(item, dict)
+                and len(item) >= _BASELINE_SUMMARY_MIN_ENTRIES
+            ):
+                canonical = json.dumps(item, sort_keys=True, separators=(",", ":"), default=str)
+                folded[key] = {
+                    "summarized": True,
+                    "entry_count": len(item),
+                    "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                }
+                continue
+            folded[key] = summarize_card_baselines(item, depth=depth + 1)
+        return folded
+    if isinstance(value, list):
+        return [summarize_card_baselines(item, depth=depth + 1) for item in value]
+    return value
+
+
+def show_task(task_id: str, *, full: bool = True) -> dict[str, Any]:
     command = ["show", task_id]
     try:
         card = task_store.get_task(repo_root(), task_id)
@@ -1751,7 +1788,8 @@ def show_task(task_id: str) -> dict[str, Any]:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     if card is None:
         return _canonical_result(ok=True, returncode=0, stdout=f"Task not found: {task_id}", command=command)
-    stdout = json.dumps(card, indent=2, ensure_ascii=False, default=str)
+    rendered = card if full else summarize_card_baselines(card)
+    stdout = json.dumps(rendered, indent=2, ensure_ascii=False, default=str)
     return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
 
 

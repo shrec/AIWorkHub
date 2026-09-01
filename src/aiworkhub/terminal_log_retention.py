@@ -670,6 +670,10 @@ def preview(
     candidates = list(result.pop("candidates", []))
     total = len(candidates)
     end = min(total, start + page_limit)
+    # Bottleneck audit T6 (2026-09-01): the protected list was returned whole
+    # (3,417 entries, 2.5MB on a limit=10 call) while candidates were paged.
+    # The same page window bounds it; ``protected_count`` keeps the total.
+    protected = list(result.pop("protected", []))
     result.update({
         "candidate_total": total,
         "cursor": start,
@@ -677,6 +681,8 @@ def preview(
         "returned_count": max(0, end - start) if include_candidates else 0,
         "next_cursor": end if include_candidates and end < total else None,
         "response_bounded": True,
+        "protected": protected[start : start + page_limit],
+        "protected_returned_count": len(protected[start : start + page_limit]),
     })
     if include_candidates:
         result["candidates"] = candidates[start:end]

@@ -1107,8 +1107,20 @@ def run_automatic_hygiene(
     summary["scanned"] = len(rows)
     summary["eligible"] = len(candidates)
     indexed = {str(row["task_id"]): row for row in rows}
-    ordered = sorted(candidates)[: config["batch_size"]]
-    for task_id in ordered:
+    # Bottleneck audit B4 (2026-09-01): the batch budget bounds ARCHIVE
+    # attempts, never the candidates examined.  Taking a fixed sorted prefix
+    # of candidates let 25 permanently fenced cards (retained evidence) occupy
+    # the whole batch on every run, so the other 238 eligible cards were never
+    # examined and the graveyard could not drain (measured: eligible 263,
+    # archived 0, batch_limited 238 on every bootstrap).  Fence reads are
+    # cheap canonical reads; the bounded, expensive step is the archive.
+    batch_size = int(config["batch_size"])
+    attempted = 0
+    overflow = 0
+    for task_id in sorted(candidates):
+        if attempted >= batch_size:
+            overflow += 1
+            continue
         initial = indexed[task_id]
         card = initial.get("card")
         request_id = (
@@ -1127,6 +1139,7 @@ def run_automatic_hygiene(
         if fenced is None:
             _skip(summary, reason)
             continue
+        attempted += 1
         try:
             ok, authority_reason = task_store.archive_task(
                 root,
@@ -1142,7 +1155,6 @@ def run_automatic_hygiene(
             _skip(summary, f"archive_refused:{str(authority_reason)[:48]}")
             continue
         summary["archived"] += 1
-    overflow = max(0, len(candidates) - len(ordered))
     if overflow:
         summary["skipped"] += overflow
         summary["reasons"]["batch_limited"] = overflow

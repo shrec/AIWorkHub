@@ -1392,10 +1392,15 @@ def aiworkhub_task_list(status: str = "pending", topic: str | None = None, limit
 
 
 @mcp.tool()
-def aiworkhub_task_show(task_id: str) -> dict[str, Any]:
-    """Show a single task card by task_id."""
+def aiworkhub_task_show(task_id: str, full: bool = False) -> dict[str, Any]:
+    """Show a single task card by task_id.
 
-    return core.show_task(task_id)
+    Summary-first by default: retained baseline hash maps (tree, workspace and
+    parent baselines) are folded to entry count plus sha256 so a lookup stays a
+    few KB; pass ``full=True`` for the exact stored card.
+    """
+
+    return core.show_task(task_id, full=full)
 
 
 @mcp.tool()
