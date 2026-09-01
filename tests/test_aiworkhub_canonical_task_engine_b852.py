@@ -1372,6 +1372,15 @@ def test_provider_stream_usage_reaches_durable_ledger_without_field_loss(
         worker_status="claimed",
         status="processing",
         claimed_by="codex_worker",
+        # Live usage appends are claim-bound: the card must carry the exact
+        # committed launch identity production always has.
+        card_extra={
+            "task_id": "TASK_USAGE_STREAM",
+            "runner": "codex_worker",
+            "claimed_by": "codex_worker",
+            "launch_request_id": "stream-attempt-1",
+            "claim_epoch": 1,
+        },
     )
     stdout_path = writable_repo / "provider.jsonl"
     stdout_path.write_text(
@@ -1406,6 +1415,11 @@ def test_provider_stream_usage_reaches_durable_ledger_without_field_loss(
         "gpt-5.5-codex-requested",
         stdout_path,
         topic="coding",
+        claim_authority={
+            "request_id": "stream-attempt-1",
+            "claimed_by": "codex_worker",
+            "claim_epoch": 1,
+        },
     )
 
     assert recorded is True, error

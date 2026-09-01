@@ -978,7 +978,7 @@ def test_posix_process_tree_polls_after_kill_until_group_disappears():
     )
     assert signals == [
         (42, platform_io.signal.SIGTERM),
-        (42, platform_io.signal.SIGKILL),
+        (42, platform_io._POSIX_SIGKILL),
     ]
     assert sleeps == [pytest.approx(0.1)]
 
@@ -999,7 +999,7 @@ def test_posix_process_tree_reports_persistent_survivor_at_post_kill_deadline():
     )
     assert signals == [
         (42, platform_io.signal.SIGTERM),
-        (42, platform_io.signal.SIGKILL),
+        (42, platform_io._POSIX_SIGKILL),
     ]
     assert sleeps == [pytest.approx(0.1)]
 
@@ -1020,7 +1020,7 @@ def test_posix_process_tree_zero_timeout_escalates_without_sleeping():
     )
     assert signals == [
         (42, platform_io.signal.SIGTERM),
-        (42, platform_io.signal.SIGKILL),
+        (42, platform_io._POSIX_SIGKILL),
     ]
     assert probes == [42, 42]
     assert sleeps == []
@@ -1111,7 +1111,7 @@ def test_windows_module_import_and_process_branches_do_not_require_killpg(monkey
     assert spec is not None
     assert spec.loader is not None
     imported = importlib.util.module_from_spec(spec)
-    monkeypatch.delattr(os, "killpg")
+    monkeypatch.delattr(os, "killpg", raising=False)
     spec.loader.exec_module(imported)
 
     assert imported.is_windows("win32")

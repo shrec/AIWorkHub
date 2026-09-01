@@ -33,6 +33,11 @@ class BackgroundProcessLaunchKwargs(TypedDict, total=False):
 
 ProcessGroupLaunchKwargs = BackgroundProcessLaunchKwargs
 
+# ``signal.SIGKILL`` does not exist on Windows, but the POSIX escalation path
+# must still be importable (and unit-testable with an injected ``killpg``)
+# there; 9 is the invariant POSIX value.
+_POSIX_SIGKILL = getattr(signal, "SIGKILL", 9)
+
 
 class _PlatformProcessBackend(Protocol):
     def background_process_launch_kwargs(
@@ -217,7 +222,7 @@ def terminate_process_tree(
     if wait_until_gone():
         return True
     try:
-        posix_killpg(identity, signal.SIGKILL)
+        posix_killpg(identity, _POSIX_SIGKILL)
     except ProcessLookupError:
         return True
     except (PermissionError, OSError):
