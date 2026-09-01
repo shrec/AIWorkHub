@@ -25,6 +25,7 @@ from . import (
     learning_commit,
     model_settings,
     repo_policy,
+    runner_topic_policy,
     runtime_adapters,
     task_store,
     workforce_router,
@@ -369,6 +370,35 @@ def upsert_worker(repo_root: Path | str, worker: Mapping[str, Any], *, actor: Ma
     catalog = load_catalog(root)
     normalized = _worker(worker)
     workers = [dict(item) for item in catalog["workers"]]
+    # NF-2026-00549 slice A: fold a variant runner-id spelling onto the one
+    # already-registered canonical identity (runner_topic_policy is the single
+    # grammar authority). An accepted upsert must never persist a second
+    # spelling of an existing runner, because the launcher would then fail to
+    # resolve it with workforce_route_absent. A spelling that folds onto a
+    # registered runner but carries a conflicting adapter/model/provider is an
+    # unresolvable identity and is rejected with a deterministic named reason.
+    registered_runner_ids = {
+        execution_runner(item["worker_id"], item["adapter_id"]): item["worker_id"]
+        for item in workers
+    }
+    incoming_runner = execution_runner(
+        normalized["worker_id"], normalized["adapter_id"]
+    )
+    canonical_runner = runner_topic_policy.canonical_runner_id(
+        incoming_runner, registered_runner_ids.keys()
+    )
+    if canonical_runner is not None and canonical_runner != incoming_runner:
+        registered_worker_id = registered_runner_ids[canonical_runner]
+        registered_worker = next(
+            item for item in workers if item["worker_id"] == registered_worker_id
+        )
+        if (
+            normalized["adapter_id"] != registered_worker["adapter_id"]
+            or normalized["model"] != registered_worker["model"]
+            or normalized["provider"] != registered_worker["provider"]
+        ):
+            raise WorkforceCatalogError("runner_id_variant_identity_conflict")
+        normalized["worker_id"] = registered_worker_id
     index = next((idx for idx, item in enumerate(workers) if item["worker_id"] == normalized["worker_id"]), None)
     action = "updated" if index is not None else "created"
     if index is None:

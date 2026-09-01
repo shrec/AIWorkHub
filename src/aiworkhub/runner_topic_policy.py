@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -548,3 +549,58 @@ def check_runner_topic_allowlist(
         return {"allowed": True, "reason": "per_wave_prefix_allowlisted"}
 
     return {"allowed": False, "reason": "unknown_runner_topic_pair"}
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00549 slice A: one canonical runner-id grammar.
+#
+# Two live models were observed running under six runner identities
+# (``claude_opus-5`` / ``claude_opus_5`` / ``claude_opus5`` and the matching
+# ``claude_sonnet-5`` trio); a hyphen-versus-underscore variant even killed a
+# launch with ``workforce_route_absent:runner=claude_opus-5`` because the
+# catalog and launcher disagreed about identity. This module is the single
+# authority for the runner-id grammar so that split can never reopen: ASCII
+# case and the two interchangeable separators ``-`` and ``_`` are the only
+# non-identity-bearing differences, so every spelling that differs only in
+# those folds onto the one already-registered runner id. ``workforce_catalog``
+# imports these helpers instead of re-deriving the rule.
+# ---------------------------------------------------------------------------
+
+# Only ASCII case and the interchangeable ``-``/``_`` separators are folded;
+# every other character (including ``.`` and ``:``) is identity-bearing, so
+# distinct models such as ``claude_opus-5`` and ``claude_sonnet-5`` never
+# collapse onto one key.
+_RUNNER_ID_SEPARATOR_RE = re.compile(r"[-_]+")
+
+
+def runner_id_fold_key(value: str) -> str:
+    """Return the identity comparison key for a single runner-id spelling.
+
+    ``claude_opus-5``, ``claude_opus_5`` and ``claude_opus5`` all fold to
+    ``claudeopus5`` while ``claude_sonnet-5`` folds to a distinct key. Case and
+    the two interchangeable separators are removed; nothing else is.
+    """
+    return _RUNNER_ID_SEPARATOR_RE.sub("", str(value).strip().casefold())
+
+
+def canonical_runner_id(value: str, registered_ids: Iterable[str]) -> str | None:
+    """Resolve a runner-id spelling onto its one registered canonical spelling.
+
+    ``registered_ids`` is the authoritative set of already-registered canonical
+    runner ids (``workforce_catalog`` supplies its catalog identities). A
+    spelling that differs from a registered id only in ASCII case or ``-``/``_``
+    separators is a variant and resolves to that registered id byte-for-byte, so
+    a registered id always resolves to itself unchanged. ``None`` is returned
+    for a malformed identity token or a spelling that folds onto no registered
+    id; the caller treats that as an unresolvable identity rather than silently
+    persisting a new variant spelling.
+    """
+    if not isinstance(value, str) or _is_malformed_identity_token(value) is not None:
+        return None
+    key = runner_id_fold_key(value)
+    if not key:
+        return None
+    for registered in registered_ids:
+        if isinstance(registered, str) and runner_id_fold_key(registered) == key:
+            return registered
+    return None

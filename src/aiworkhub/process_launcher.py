@@ -2719,11 +2719,28 @@ def _validate_adapter_identity(runner: str, adapter_id: str) -> None:
 # exactly, or the launch is rejected before any provider credential is
 # touched and before core.claim_start_exact runs.
 _WORKFORCE_MODEL_ALIASES: dict[str, str] = {
+    "opus": "claude-opus-5",
     "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4.5",
 }
 
 _CANONICAL_WORKFORCE: dict[tuple[str, str], dict[str, Any]] = {
+    # NF-2026-00549 slice B: every enabled claude-family catalog worker must
+    # resolve a pinned-model route here; a catalog-enabled runner absent from
+    # this table dies at launch with workforce_route_absent (measured live on
+    # claude_opus-5 and claude_haiku, 2026-09-01).
+    ("claude_opus-5", "claude_cli"): {
+        "model": "claude-opus-5",
+        "enabled": True,
+        "available": True,
+        "risk_tiers": frozenset({"low", "medium", "high", "critical"}),
+    },
+    ("claude_haiku", "claude_cli"): {
+        "model": "claude-haiku-4.5",
+        "enabled": True,
+        "available": True,
+        "risk_tiers": frozenset({"low", "medium"}),
+    },
     ("claude_sonnet-5", "claude_cli"): {
         "model": "claude-sonnet-5",
         "enabled": True,

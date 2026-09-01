@@ -6,7 +6,15 @@ import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
-from aiworkhub import core, learning_commit, model_settings, workforce_catalog, workforce_router
+from aiworkhub import (
+    core,
+    learning_commit,
+    model_settings,
+    process_launcher,
+    runner_topic_policy,
+    workforce_catalog,
+    workforce_router,
+)
 
 
 def test_catalog_atomic_write_skips_redundant_chmod_when_already_private(
@@ -1628,3 +1636,137 @@ def test_sealed_auth_401_403_open_only_exact_route_and_sealed_success_recovers(
     assert pro["route_health"]["state"] == "closed"
     assert pro["route_health"]["failure_kind"] == ""
     assert pro["route_health"]["consecutive_failures"] == 0
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00549 slice A: one canonical runner-id grammar shared with
+# runner_topic_policy, workforce-upsert normalization, and a catalog-to-launcher
+# route parity regression.
+# ---------------------------------------------------------------------------
+
+
+def _opus_worker(**overrides) -> dict:
+    worker = {
+        "adapter_id": "claude_cli",
+        "model": "opus",
+        "provider": "anthropic",
+        "enabled": True,
+        "supports": ["code", "research", "linguistic", "review"],
+        "tools": ["filesystem", "source-graph"],
+        "max_context_tokens": 1_000_000,
+        "max_risk": "critical",
+        "quality_ceiling": 1.0,
+        "manager_score_adjustment": 3.0,
+    }
+    worker.update(overrides)
+    return worker
+
+
+def test_all_registered_catalog_runner_ids_are_byte_stable_under_grammar() -> None:
+    registered = [
+        workforce_catalog.execution_runner(item["worker_id"], item["adapter_id"])
+        for item in workforce_catalog.DEFAULT_WORKERS
+    ]
+    # No two registered runner ids share a fold key, and each resolves to
+    # itself byte-for-byte -- no existing enabled route changes identity.
+    assert len(registered) == len(set(registered))
+    for runner in registered:
+        assert runner_topic_policy.canonical_runner_id(runner, registered) == runner
+
+
+def test_upsert_normalizes_variant_runner_spelling_onto_registered_id(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    workforce_catalog.ensure_catalog(root)
+    count = len(workforce_catalog.load_catalog(root)["workers"])
+
+    result = workforce_catalog.upsert_worker(
+        root,
+        _opus_worker(worker_id="claude_opus_5"),  # underscore variant
+        actor={"role": "manager", "provider": "codex", "actor_id": "x"},
+    )
+
+    assert result["action"] == "updated"
+    assert result["worker_id"] == "claude-opus-5"
+    catalog = workforce_catalog.load_catalog(root)
+    worker_ids = {item["worker_id"] for item in catalog["workers"]}
+    assert "claude_opus_5" not in worker_ids  # variant spelling never persisted
+    assert len(catalog["workers"]) == count  # no divergent second identity
+    opus = next(
+        item for item in catalog["workers"] if item["worker_id"] == "claude-opus-5"
+    )
+    assert opus["manager_score_adjustment"] == 3.0
+
+
+def test_upsert_rejects_unresolvable_runner_variant_identity_conflict(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    workforce_catalog.ensure_catalog(root)
+    try:
+        # Folds onto registered claude_opus-5 but pins a conflicting model.
+        workforce_catalog.upsert_worker(
+            root,
+            _opus_worker(worker_id="claude_opus_5", model="sonnet"),
+            actor={"role": "manager", "provider": "codex", "actor_id": "x"},
+        )
+    except workforce_catalog.WorkforceCatalogError as exc:
+        assert str(exc) == "runner_id_variant_identity_conflict"
+    else:  # pragma: no cover - explicit assertion without pytest dependency
+        raise AssertionError("conflicting runner-id variant was accepted")
+
+
+def test_every_enabled_catalog_worker_resolves_a_launcher_route(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=_preflight()
+    )
+    # Read the launcher route authority read-only.
+    routes = process_launcher._CANONICAL_WORKFORCE
+    enabled = [row for row in snapshot["workers"] if row["enabled"]]
+    registered = [row["execution_runner"] for row in enabled]
+    governed = 0
+    for row in enabled:
+        runner = row["execution_runner"]
+        adapter = row["effective_adapter_id"]
+        # Identity is byte-stable and accepted by the launcher.
+        assert (
+            runner_topic_policy.canonical_runner_id(runner, registered) == runner
+        )
+        assert (
+            process_launcher.validate_workforce_identity(runner, adapter, None)
+            is None
+        )
+        # The launcher governs the claude_ family: every enabled claude-family
+        # worker must have a launcher-authority row, so an enabled claude model
+        # that would die with workforce_route_absent (the measured F5/NF-549
+        # failure on claude_opus-5) fails this test instead of being skipped.
+        if runner.startswith("claude_"):
+            assert (runner, adapter) in routes, f"launcher route absent: {runner}"
+        # Where the launcher governs an exact route, the enabled model must
+        # resolve with its pinned catalog model and risk tier.
+        if (runner, adapter) in routes:
+            governed += 1
+            resolved = process_launcher.validate_workforce_identity(
+                runner, adapter, row["model"], risk_tier=row["max_risk"]
+            )
+            assert resolved == routes[(runner, adapter)]["model"]
+    assert governed >= 3  # claude_opus-5, claude_sonnet-5, codex_gpt-5.5 minimum
+
+
+def test_launcher_route_absent_for_an_enabled_model_fails_the_suite() -> None:
+    # The exact regression shape: a claude-family enabled model whose canonical
+    # runner id is missing from the launcher authority must raise
+    # workforce_route_absent, so the parity guard above can never pass silently.
+    assert ("claude_ghost-9", "claude_cli") not in process_launcher._CANONICAL_WORKFORCE
+    try:
+        process_launcher.validate_workforce_identity(
+            "claude_ghost-9", "claude_cli", "ghost-9"
+        )
+    except process_launcher.LaunchRejected as exc:
+        assert str(exc).startswith("workforce_route_absent:")
+    else:  # pragma: no cover - explicit assertion without pytest dependency
+        raise AssertionError("missing launcher route did not raise route-absent")

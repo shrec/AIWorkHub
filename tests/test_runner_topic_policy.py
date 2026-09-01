@@ -65,3 +65,53 @@ def test_core_reexports_single_policy_authority() -> None:
 )
 def test_identity_token_characterization(value: str, reason: str | None) -> None:
     assert policy._is_malformed_identity_token(value) == reason
+
+
+# NF-2026-00549 slice A: one canonical runner-id grammar. Case and the
+# interchangeable ``-``/``_`` separators are the only non-identity-bearing
+# differences, so the six measured spellings fold onto exactly two ids.
+_REGISTERED_RUNNER_IDS = ("claude_opus-5", "claude_sonnet-5")
+
+
+@pytest.mark.parametrize("variant", ["claude_opus-5", "claude_opus_5", "claude_opus5"])
+def test_opus_variants_canonicalize_to_one_registered_id(variant: str) -> None:
+    assert (
+        policy.canonical_runner_id(variant, _REGISTERED_RUNNER_IDS) == "claude_opus-5"
+    )
+
+
+@pytest.mark.parametrize(
+    "variant", ["claude_sonnet-5", "claude_sonnet_5", "claude_sonnet5"]
+)
+def test_sonnet_variants_canonicalize_to_one_registered_id(variant: str) -> None:
+    assert (
+        policy.canonical_runner_id(variant, _REGISTERED_RUNNER_IDS)
+        == "claude_sonnet-5"
+    )
+
+
+def test_runner_id_fold_key_ignores_only_case_and_separators() -> None:
+    assert (
+        policy.runner_id_fold_key("Claude_Opus-5")
+        == policy.runner_id_fold_key("claude_opus_5")
+        == policy.runner_id_fold_key("claudeopus5")
+    )
+    # ``.`` is identity-bearing, so distinct versions never collide.
+    assert policy.runner_id_fold_key("codex_gpt-5.5") != policy.runner_id_fold_key(
+        "codex_gpt-5.3"
+    )
+
+
+@pytest.mark.parametrize("registered", ["claude_opus-5", "claude_sonnet-5"])
+def test_registered_runner_ids_are_byte_stable_under_grammar(registered: str) -> None:
+    assert (
+        policy.canonical_runner_id(registered, _REGISTERED_RUNNER_IDS) == registered
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["claude_haiku-4.5", "deepseek_v4-pro", "bad/runner", "", "\x00"],
+)
+def test_unresolvable_or_malformed_runner_id_returns_none(value: str) -> None:
+    assert policy.canonical_runner_id(value, _REGISTERED_RUNNER_IDS) is None
