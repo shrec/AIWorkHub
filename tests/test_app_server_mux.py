@@ -92,6 +92,41 @@ def _write_executable_script(path: Path, script_text: str) -> None:
         os.close(fd)
 
 
+def test_platform_facade_imports_in_package_and_direct_script_context():
+    from aiworkhub import _platform_process, platform_io
+
+    assert platform_io._platform_process is _platform_process
+
+    probe = """
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+mux_path = Path(sys.argv[1])
+sys.path.insert(0, str(mux_path.parent))
+spec = importlib.util.spec_from_file_location("direct_app_server_mux", mux_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+facade = sys.modules["platform_io"]
+print(json.dumps({
+    "facade": facade.__name__,
+    "backend": facade._platform_process.__name__,
+}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, str(MUX_MODULE)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "facade": "platform_io",
+        "backend": "_platform_process",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Invocation-shape detection / executable resolution
 # ---------------------------------------------------------------------------

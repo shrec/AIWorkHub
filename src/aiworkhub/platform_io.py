@@ -7,15 +7,18 @@ repository-local locking contract on Linux, macOS, and Windows.
 
 from __future__ import annotations
 
-import errno
 import ctypes
+import errno
 import os
 import time
 import unicodedata
 from collections.abc import Callable
 from typing import Any, Protocol, TypedDict, cast
 
-from . import _platform_process
+if __package__:
+    from . import _platform_process
+else:  # direct-file import by the app-server mux entrypoint
+    import _platform_process
 
 
 class BackgroundProcessLaunchKwargs(TypedDict, total=False):
