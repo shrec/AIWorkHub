@@ -1273,10 +1273,11 @@ def reconcile_dead_processing_claim(
     _readiness, db_path = _require_ready(root)
     conn = _connect(db_path)
     try:
-        # Serialize the status check, authorization mint, transition and event.
-        # A retry therefore observes the committed pending episode instead of
-        # racing a second blocked->pending transition.
-        conn.execute("BEGIN IMMEDIATE")
+        # Establish a read snapshot without reserving the writer slot. The
+        # card_json predicate then remains the write authority: a competing
+        # authenticated update either makes the CAS miss or makes this stale
+        # WAL snapshot fail with SQLITE_BUSY/SQLITE_LOCKED.
+        conn.execute("BEGIN")
         row = conn.execute(
             "SELECT status, worker_status, card_json FROM tasks WHERE task_id=?",
             (task_id,),
@@ -1321,15 +1322,44 @@ def reconcile_dead_processing_claim(
         card["worker_status"] = "blocked"
         card["claimed_by"] = ""
         card.pop("launch_request_id", None)
-        cur = conn.execute(
-            "UPDATE tasks SET status='blocked', worker_status='blocked', claimed_by=NULL, "
-            "claimed_at=NULL, completed_at=?, updated_at=?, card_json=? "
-            "WHERE task_id=? AND status=? AND worker_status='claimed' AND card_json=?",
-            (
-                now, now, json.dumps(card, ensure_ascii=False, sort_keys=True),
-                task_id, str(row["status"]), raw_card_json,
-            ),
-        )
+        try:
+            cur = conn.execute(
+                "UPDATE tasks SET status='blocked', worker_status='blocked', claimed_by=NULL, "
+                "claimed_at=NULL, completed_at=?, updated_at=?, card_json=? "
+                "WHERE task_id=? AND status=? AND worker_status='claimed' AND card_json=?",
+                (
+                    now, now, json.dumps(card, ensure_ascii=False, sort_keys=True),
+                    task_id, str(row["status"]), raw_card_json,
+                ),
+            )
+        except sqlite3.OperationalError as exc:
+            error_code = getattr(exc, "sqlite_errorcode", None)
+            if (
+                isinstance(error_code, int)
+                and error_code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            ):
+                conn.rollback()
+                # BUSY/LOCKED can be caused by any writer invalidating this
+                # deferred transaction's WAL snapshot.  It proves a CAS
+                # conflict only when a fresh snapshot shows that this exact
+                # target's authenticated preimage drifted.
+                verify = _connect(db_path, readonly=True)
+                try:
+                    current = verify.execute(
+                        "SELECT status, worker_status, card_json "
+                        "FROM tasks WHERE task_id=?",
+                        (task_id,),
+                    ).fetchone()
+                finally:
+                    verify.close()
+                if (
+                    current is None
+                    or str(current["status"]) != str(row["status"])
+                    or str(current["worker_status"]) != str(row["worker_status"])
+                    or current["card_json"] != raw_card_json
+                ):
+                    return False, "reconcile_write_conflict"
+            raise
         if cur.rowcount != 1:
             conn.rollback()
             return False, "reconcile_write_conflict"

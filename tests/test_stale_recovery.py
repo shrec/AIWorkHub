@@ -173,3 +173,88 @@ def test_reconcile_card_json_preimage_swap_fails_without_mutation(tmp_path, monk
     assert check.execute(
         "SELECT count(*) FROM task_events WHERE event='dead_process_reconciled'"
     ).fetchone()[0] == 0
+
+
+def test_reconcile_unrelated_operational_error_remains_write_failure(
+    tmp_path, monkeypatch
+):
+    db, evidence = _store(tmp_path, monkeypatch)
+    real_connect = task_store._connect
+    conn = real_connect(db)
+
+    class FailingConnection:
+        def execute(self, sql, parameters=()):
+            if sql.startswith("UPDATE tasks SET status='blocked'"):
+                raise sqlite3.OperationalError("disk I/O error")
+            return conn.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
+    def connect(_db, *, readonly=False):
+        if readonly:
+            return real_connect(_db, readonly=True)
+        return FailingConnection()
+
+    monkeypatch.setattr(task_store, "_connect", connect)
+    result = stale_recovery.reconcile_dead_processing_claim(
+        root=str(tmp_path), task_id="T1", request_id="req-1", claim_epoch=3,
+        process_status=evidence, actor="manager",
+    )
+    assert result == (False, "reconcile_write_failed:OperationalError")
+    assert task_store.get_task(tmp_path, "T1")["status"] == "processing"
+
+
+def test_reconcile_unrelated_wal_writer_remains_write_failure(
+    tmp_path, monkeypatch
+):
+    db, evidence = _store(tmp_path, monkeypatch)
+    other = sqlite3.connect(db)
+    other.execute(
+        "INSERT INTO tasks(task_id,status,worker_status,card_json,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?)",
+        ("T2", "pending", "unclaimed", "{}", "now", "now"),
+    )
+    other.commit()
+    other.close()
+    real_connect = task_store._connect
+    conn = real_connect(db)
+
+    class UnrelatedWriterConnection:
+        def __init__(self):
+            self.wrote = False
+
+        def execute(self, sql, parameters=()):
+            if sql.startswith("UPDATE tasks SET status='blocked'") and not self.wrote:
+                self.wrote = True
+                writer = sqlite3.connect(db)
+                writer.execute(
+                    "UPDATE tasks SET updated_at='concurrent' WHERE task_id='T2'"
+                )
+                writer.commit()
+                writer.close()
+            return conn.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
+    def connect(_db, *, readonly=False):
+        if readonly:
+            return real_connect(_db, readonly=True)
+        return UnrelatedWriterConnection()
+
+    before = task_store.get_task(tmp_path, "T1")
+    monkeypatch.setattr(task_store, "_connect", connect)
+    result = stale_recovery.reconcile_dead_processing_claim(
+        root=str(tmp_path), task_id="T1", request_id="req-1", claim_epoch=3,
+        process_status=evidence, actor="manager",
+    )
+    assert result == (False, "reconcile_write_failed:OperationalError")
+    assert task_store.get_task(tmp_path, "T1") == before
+    check = sqlite3.connect(db)
+    assert check.execute(
+        "SELECT count(*) FROM task_events WHERE event='dead_process_reconciled'"
+    ).fetchone()[0] == 0
+    assert check.execute(
+        "SELECT updated_at FROM tasks WHERE task_id='T2'"
+    ).fetchone()[0] == "concurrent"
