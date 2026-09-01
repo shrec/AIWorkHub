@@ -451,5 +451,344 @@
         "severity": "error"
       }
     }
-  ]
+  ],
+  "os_dependency_boundary": {
+    "scan_root": "src/aiworkhub",
+    "public_facade": "src/aiworkhub/platform_io.py",
+    "sanctioned_modules": [
+      "src/aiworkhub/_platform_process.py",
+      "src/aiworkhub/platform_io.py",
+      "src/aiworkhub/windows_appcontainer.py"
+    ],
+    "patterns": [
+      "creationflags",
+      "def_atomic",
+      "def_chmod_fd",
+      "import_fcntl",
+      "import_msvcrt",
+      "os_killpg",
+      "os_name_eq",
+      "os_name_ne",
+      "sqlite_connect",
+      "sys_platform"
+    ],
+    "baseline": [
+          {
+                "path": "src/aiworkhub/app_server_mux.py",
+                "pattern": "def_chmod_fd",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/app_server_mux.py",
+                "pattern": "os_name_eq",
+                "count": 4
+          },
+          {
+                "path": "src/aiworkhub/app_server_mux.py",
+                "pattern": "os_name_ne",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/callback_bridge.py",
+                "pattern": "os_name_eq",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/callback_store.py",
+                "pattern": "sqlite_connect",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/context_graph.py",
+                "pattern": "sqlite_connect",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/context_write_intents.py",
+                "pattern": "sqlite_connect",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/context_writes.py",
+                "pattern": "sqlite_connect",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/core.py",
+                "pattern": "os_name_eq",
+                "count": 4
+          },
+          {
+                "path": "src/aiworkhub/core.py",
+                "pattern": "os_name_ne",
+                "count": 3
+          },
+          {
+                "path": "src/aiworkhub/core.py",
+                "pattern": "sqlite_connect",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/deepseek_credentials.py",
+                "pattern": "def_chmod_fd",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/deepseek_credentials.py",
+                "pattern": "os_name_ne",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/dependency_autolaunch.py",
+                "pattern": "sqlite_connect",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/development_rules.py",
+                "pattern": "creationflags",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/glm_credentials.py",
+                "pattern": "def_chmod_fd",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/glm_credentials.py",
+                "pattern": "os_name_ne",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/kilo_auth.py",
+                "pattern": "os_name_eq",
+                "count": 4
+          },
+          {
+                "path": "src/aiworkhub/needfix_store.py",
+                "pattern": "sqlite_connect",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/process_launcher.py",
+                "pattern": "os_killpg",
+                "count": 4
+          },
+          {
+                "path": "src/aiworkhub/process_launcher.py",
+                "pattern": "os_name_eq",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/process_launcher.py",
+                "pattern": "os_name_ne",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/process_launcher.py",
+                "pattern": "sqlite_connect",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/provider_tool_guards.py",
+                "pattern": "def_atomic",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/quality_evidence.py",
+                "pattern": "os_name_eq",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/repo_policy.py",
+                "pattern": "os_name_eq",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/repository_state.py",
+                "pattern": "def_atomic",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/review_lifecycle.py",
+                "pattern": "sqlite_connect",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/roadmap_store.py",
+                "pattern": "sqlite_connect",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/runtime_adapters.py",
+                "pattern": "os_name_eq",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/runtime_temp.py",
+                "pattern": "def_atomic",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/runtime_temp.py",
+                "pattern": "import_msvcrt",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/runtime_temp.py",
+                "pattern": "os_name_eq",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/runtime_temp.py",
+                "pattern": "sys_platform",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/source_graph.py",
+                "pattern": "import_fcntl",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/source_graph.py",
+                "pattern": "import_msvcrt",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/source_graph.py",
+                "pattern": "sqlite_connect",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/source_graph_daemon.py",
+                "pattern": "creationflags",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/source_graph_daemon.py",
+                "pattern": "os_killpg",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/source_graph_daemon.py",
+                "pattern": "os_name_eq",
+                "count": 5
+          },
+          {
+                "path": "src/aiworkhub/source_graph_partition.py",
+                "pattern": "sqlite_connect",
+                "count": 3
+          },
+          {
+                "path": "src/aiworkhub/sqlite_readonly.py",
+                "pattern": "sqlite_connect",
+                "count": 3
+          },
+          {
+                "path": "src/aiworkhub/task_store.py",
+                "pattern": "def_atomic",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/task_store.py",
+                "pattern": "sqlite_connect",
+                "count": 4
+          },
+          {
+                "path": "src/aiworkhub/terminal_authority.py",
+                "pattern": "os_name_ne",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/vscode_lm_bridge.py",
+                "pattern": "def_atomic",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/vscode_lm_bridge.py",
+                "pattern": "def_chmod_fd",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/vscode_lm_bridge.py",
+                "pattern": "os_name_ne",
+                "count": 3
+          },
+          {
+                "path": "src/aiworkhub/worker_ai_tools_mcp.py",
+                "pattern": "def_chmod_fd",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/worker_ai_tools_mcp.py",
+                "pattern": "os_name_eq",
+                "count": 2
+          },
+          {
+                "path": "src/aiworkhub/worker_ai_tools_mcp.py",
+                "pattern": "sqlite_connect",
+                "count": 7
+          },
+          {
+                "path": "src/aiworkhub/worker_workspace.py",
+                "pattern": "creationflags",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/worker_workspace.py",
+                "pattern": "def_chmod_fd",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/worker_workspace.py",
+                "pattern": "os_killpg",
+                "count": 3
+          },
+          {
+                "path": "src/aiworkhub/worker_workspace.py",
+                "pattern": "os_name_eq",
+                "count": 9
+          },
+          {
+                "path": "src/aiworkhub/worker_workspace.py",
+                "pattern": "os_name_ne",
+                "count": 9
+          },
+          {
+                "path": "src/aiworkhub/worker_workspace.py",
+                "pattern": "sys_platform",
+                "count": 6
+          },
+          {
+                "path": "src/aiworkhub/workforce_catalog.py",
+                "pattern": "def_atomic",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/workspace_hygiene.py",
+                "pattern": "def_atomic",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/workspace_hygiene.py",
+                "pattern": "import_fcntl",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/workspace_hygiene.py",
+                "pattern": "import_msvcrt",
+                "count": 1
+          },
+          {
+                "path": "src/aiworkhub/workspace_hygiene.py",
+                "pattern": "os_name_eq",
+                "count": 1
+          }
+    ],
+    "measurement": {
+      "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
+      "reference_total": 161,
+      "current_total": 134,
+      "accepted_predecessor_delta": -27
+    }
+  }
 }

@@ -11,9 +11,12 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Union
+from typing import Protocol, TypeVar, Union
+
+_EnumT = TypeVar("_EnumT", bound=Enum)
 
 SCHEMA_ID = "aiworkhub.development_rules_manifest"
 SCHEMA_VERSION = "1.0.0"
@@ -183,6 +186,38 @@ class DevelopmentRulesManifest:
     schema_version: str
     languages: tuple[str, ...]
     rules: tuple[DevelopmentRule, ...]
+    os_dependency_boundary: "OSDependencyBoundary | None" = None
+
+
+OS_DEPENDENCY_PATTERN_IDENTITIES = (
+    "os_name_eq", "os_name_ne", "sys_platform", "import_fcntl", "import_msvcrt",
+    "creationflags", "os_killpg", "def_chmod_fd", "def_atomic", "sqlite_connect",
+)
+OS_DEPENDENCY_SANCTIONED_MODULES = (
+    "src/aiworkhub/_platform_process.py",
+    "src/aiworkhub/platform_io.py",
+    "src/aiworkhub/windows_appcontainer.py",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class OSDependencyBaselineEntry:
+    path: str
+    pattern: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class OSDependencyBoundary:
+    scan_root: str
+    public_facade: str
+    sanctioned_modules: tuple[str, ...]
+    patterns: tuple[str, ...]
+    baseline: tuple[OSDependencyBaselineEntry, ...]
+    reference_commit: str
+    reference_total: int
+    current_total: int
+    accepted_predecessor_delta: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,8 +245,10 @@ def _stable_diagnostic_key(value: object) -> tuple[str, str]:
     return (type(value).__name__, _safe_repr(value))
 
 
-def _check_keys(mapping: object, allowed: frozenset[str], required: frozenset[str], *, path: str) -> dict:
-    if not isinstance(mapping, dict):
+def _check_keys(
+    mapping: object, allowed: frozenset[str], required: frozenset[str], *, path: str
+) -> Mapping[str, object]:
+    if not isinstance(mapping, Mapping):
         raise ManifestValidationError(ReasonCode.WRONG_TYPE, f"{path}: expected object, got {type(mapping).__name__}")
     keys = set(mapping.keys())
     unknown = keys - allowed
@@ -312,7 +349,7 @@ def _validate_path_selectors(values: object, *, path: str) -> tuple[str, ...]:
     return tuple(sorted(parsed))
 
 
-def _parse_enum(value: object, enum_cls: type[Enum], *, path: str) -> Enum:
+def _parse_enum(value: object, enum_cls: type[_EnumT], *, path: str) -> _EnumT:
     if not isinstance(value, str):
         raise ManifestValidationError(ReasonCode.WRONG_TYPE, f"{path}: expected str, got {type(value).__name__}")
     try:
@@ -327,7 +364,7 @@ def _parse_applicability(mapping: object, *, path: str, known_languages: frozens
     if mapping is None:
         return Applicability((), (), (), ())
     allowed = frozenset({"languages", "paths", "tasks", "risk_levels"})
-    _check_keys(mapping, allowed, required=frozenset(), path=path)
+    mapping = _check_keys(mapping, allowed, required=frozenset(), path=path)
     languages = _validate_identifier_tuple(mapping.get("languages", []), path=f"{path}.languages", allow_empty=True)
     for language in languages:
         if language not in known_languages:
@@ -347,14 +384,14 @@ def _parse_applicability(mapping: object, *, path: str, known_languages: frozens
 
 
 def _parse_coding_convention_payload(mapping: object, *, path: str) -> CodingConventionRequirement:
-    _check_keys(mapping, frozenset({"guideline_ids", "severity"}), required=frozenset({"guideline_ids", "severity"}), path=path)
+    mapping = _check_keys(mapping, frozenset({"guideline_ids", "severity"}), required=frozenset({"guideline_ids", "severity"}), path=path)
     guideline_ids = _validate_identifier_tuple(mapping["guideline_ids"], path=f"{path}.guideline_ids", allow_empty=False)
     severity = _parse_enum(mapping["severity"], Severity, path=f"{path}.severity")
     return CodingConventionRequirement(guideline_ids=guideline_ids, severity=severity)
 
 
 def _parse_forbidden_pattern_payload(mapping: object, *, path: str) -> ForbiddenPatternRequirement:
-    _check_keys(mapping, frozenset({"severity", "rationale_id"}), required=frozenset({"severity", "rationale_id"}), path=path)
+    mapping = _check_keys(mapping, frozenset({"severity", "rationale_id"}), required=frozenset({"severity", "rationale_id"}), path=path)
     severity = _parse_enum(mapping["severity"], Severity, path=f"{path}.severity")
     rationale_id = _validate_identifier(mapping["rationale_id"], path=f"{path}.rationale_id")
     return ForbiddenPatternRequirement(severity=severity, rationale_id=rationale_id)
@@ -373,7 +410,7 @@ _PERFORMANCE_PAYLOAD_KEYS = frozenset(
 
 
 def _parse_performance_payload(mapping: object, *, path: str) -> PerformanceRequirement:
-    _check_keys(mapping, _PERFORMANCE_PAYLOAD_KEYS, required=_PERFORMANCE_PAYLOAD_KEYS, path=path)
+    mapping = _check_keys(mapping, _PERFORMANCE_PAYLOAD_KEYS, required=_PERFORMANCE_PAYLOAD_KEYS, path=path)
     max_allocations = _validate_bounded_int(
         mapping["max_allocations_per_iteration"],
         path=f"{path}.max_allocations_per_iteration",
@@ -401,7 +438,7 @@ _OWNERSHIP_PAYLOAD_KEYS = frozenset(
 
 
 def _parse_ownership_payload(mapping: object, *, path: str) -> OwnershipLifetimeRequirement:
-    _check_keys(mapping, _OWNERSHIP_PAYLOAD_KEYS, required=_OWNERSHIP_PAYLOAD_KEYS, path=path)
+    mapping = _check_keys(mapping, _OWNERSHIP_PAYLOAD_KEYS, required=_OWNERSHIP_PAYLOAD_KEYS, path=path)
     requires_raii = _expect_bool(mapping["requires_raii"], path=f"{path}.requires_raii")
     requires_context_manager = _expect_bool(mapping["requires_context_manager"], path=f"{path}.requires_context_manager")
     requires_explicit_cleanup = _expect_bool(mapping["requires_explicit_cleanup"], path=f"{path}.requires_explicit_cleanup")
@@ -417,14 +454,14 @@ def _parse_ownership_payload(mapping: object, *, path: str) -> OwnershipLifetime
 
 
 def _parse_concurrency_payload(mapping: object, *, path: str) -> ConcurrencyPolicy:
-    _check_keys(mapping, frozenset({"model", "min_headroom_fraction"}), required=frozenset({"model", "min_headroom_fraction"}), path=path)
+    mapping = _check_keys(mapping, frozenset({"model", "min_headroom_fraction"}), required=frozenset({"model", "min_headroom_fraction"}), path=path)
     model = _parse_enum(mapping["model"], ConcurrencyModel, path=f"{path}.model")
     min_headroom_fraction = _validate_fraction(mapping["min_headroom_fraction"], path=f"{path}.min_headroom_fraction")
     return ConcurrencyPolicy(model=model, min_headroom_fraction=min_headroom_fraction)
 
 
 def _parse_evidence_payload(mapping: object, *, path: str) -> EvidenceRequirement:
-    _check_keys(mapping, frozenset({"required_evidence_types", "min_count"}), required=frozenset({"required_evidence_types", "min_count"}), path=path)
+    mapping = _check_keys(mapping, frozenset({"required_evidence_types", "min_count"}), required=frozenset({"required_evidence_types", "min_count"}), path=path)
     required_evidence_types = _validate_identifier_tuple(
         mapping["required_evidence_types"], path=f"{path}.required_evidence_types", allow_empty=False
     )
@@ -432,7 +469,11 @@ def _parse_evidence_payload(mapping: object, *, path: str) -> EvidenceRequiremen
     return EvidenceRequirement(required_evidence_types=required_evidence_types, min_count=min_count)
 
 
-_PAYLOAD_PARSERS = {
+class _PayloadParser(Protocol):
+    def __call__(self, mapping: object, *, path: str) -> RulePayload: ...
+
+
+_PAYLOAD_PARSERS: Mapping[RuleKind, _PayloadParser] = {
     RuleKind.CODING_CONVENTION: _parse_coding_convention_payload,
     RuleKind.FORBIDDEN_PATTERN: _parse_forbidden_pattern_payload,
     RuleKind.PERFORMANCE: _parse_performance_payload,
@@ -446,7 +487,7 @@ _RULE_REQUIRED_KEYS = frozenset({"id", "kind", "payload"})
 
 
 def _parse_rule(mapping: object, *, path: str, known_languages: frozenset[str]) -> DevelopmentRule:
-    _check_keys(mapping, _RULE_ALLOWED_KEYS, required=_RULE_REQUIRED_KEYS, path=path)
+    mapping = _check_keys(mapping, _RULE_ALLOWED_KEYS, required=_RULE_REQUIRED_KEYS, path=path)
     rule_id = _validate_identifier(mapping["id"], path=f"{path}.id")
     topic = _validate_identifier(mapping["topic"], path=f"{path}.topic") if "topic" in mapping else rule_id
     kind = _parse_enum(mapping["kind"], RuleKind, path=f"{path}.kind")
@@ -465,12 +506,56 @@ def _parse_rule(mapping: object, *, path: str, known_languages: frozenset[str]) 
     )
 
 
-_TOP_LEVEL_KEYS = frozenset({"schema", "schema_version", "languages", "rules"})
+_TOP_LEVEL_KEYS = frozenset({"schema", "schema_version", "languages", "rules", "os_dependency_boundary"})
+
+
+def _parse_os_dependency_boundary(value: object) -> OSDependencyBoundary:
+    path = "$.os_dependency_boundary"
+    keys = frozenset({"scan_root", "public_facade", "sanctioned_modules", "patterns", "baseline", "measurement"})
+    mapping = _check_keys(value, keys, required=keys, path=path)
+    scan_root = _validate_path_selector(mapping["scan_root"], path=f"{path}.scan_root")
+    public_facade = _validate_path_selector(mapping["public_facade"], path=f"{path}.public_facade")
+    modules = _validate_path_selectors(mapping["sanctioned_modules"], path=f"{path}.sanctioned_modules")
+    if scan_root != "src/aiworkhub" or public_facade != "src/aiworkhub/platform_io.py":
+        raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{path}: canonical platform_io facade is required")
+    if modules != OS_DEPENDENCY_SANCTIONED_MODULES:
+        raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{path}.sanctioned_modules: exact boundary modules required")
+    patterns = _validate_identifier_tuple(mapping["patterns"], path=f"{path}.patterns", allow_empty=False)
+    if patterns != tuple(sorted(OS_DEPENDENCY_PATTERN_IDENTITIES)):
+        raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{path}.patterns: exact fixed identities required")
+    raw_baseline = mapping["baseline"]
+    if not isinstance(raw_baseline, list):
+        raise ManifestValidationError(ReasonCode.WRONG_TYPE, f"{path}.baseline: expected array")
+    entries: list[OSDependencyBaselineEntry] = []
+    identities: set[tuple[str, str]] = set()
+    for index, raw in enumerate(raw_baseline):
+        item_path = f"{path}.baseline[{index}]"
+        item = _check_keys(raw, frozenset({"path", "pattern", "count"}), required=frozenset({"path", "pattern", "count"}), path=item_path)
+        file_path = _validate_path_selector(item["path"], path=f"{item_path}.path")
+        pattern = _validate_identifier(item["pattern"], path=f"{item_path}.pattern")
+        count = _validate_bounded_int(item["count"], path=f"{item_path}.count", minimum=1, maximum=1_000_000)
+        if not file_path.startswith("src/aiworkhub/") or pattern not in OS_DEPENDENCY_PATTERN_IDENTITIES:
+            raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{item_path}: unknown baseline identity")
+        identity = (file_path, pattern)
+        if identity in identities:
+            raise ManifestValidationError(ReasonCode.DUPLICATE_IDENTIFIER, f"{item_path}: duplicate baseline identity")
+        identities.add(identity)
+        entries.append(OSDependencyBaselineEntry(file_path, pattern, count))
+    measurement = _check_keys(mapping["measurement"], frozenset({"reference_commit", "reference_total", "current_total", "accepted_predecessor_delta"}), required=frozenset({"reference_commit", "reference_total", "current_total", "accepted_predecessor_delta"}), path=f"{path}.measurement")
+    commit = measurement["reference_commit"]
+    if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise ManifestValidationError(ReasonCode.WRONG_TYPE, f"{path}.measurement.reference_commit: expected 40 lowercase hex characters")
+    reference_total = _validate_bounded_int(measurement["reference_total"], path=f"{path}.measurement.reference_total", minimum=0, maximum=1_000_000)
+    current_total = _validate_bounded_int(measurement["current_total"], path=f"{path}.measurement.current_total", minimum=0, maximum=1_000_000)
+    delta = _expect_int_strict(measurement["accepted_predecessor_delta"], path=f"{path}.measurement.accepted_predecessor_delta")
+    if sum(entry.count for entry in entries) != current_total or current_total - reference_total != delta:
+        raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{path}.measurement: totals or predecessor delta are inconsistent")
+    return OSDependencyBoundary(scan_root, public_facade, modules, patterns, tuple(sorted(entries, key=lambda entry: (entry.path, entry.pattern))), commit, reference_total, current_total, delta)
 
 
 def parse_manifest(mapping: object) -> DevelopmentRulesManifest:
     """Parse and validate an explicit mapping into an immutable manifest. Fails closed."""
-    _check_keys(mapping, _TOP_LEVEL_KEYS, required=_TOP_LEVEL_KEYS, path="$")
+    mapping = _check_keys(mapping, _TOP_LEVEL_KEYS, required=frozenset({"schema", "schema_version", "languages", "rules"}), path="$")
     schema = mapping["schema"]
     if not isinstance(schema, str) or schema != SCHEMA_ID:
         raise ManifestValidationError(ReasonCode.UNKNOWN_SCHEMA, f"$.schema: expected {SCHEMA_ID!r}, got {schema!r}")
@@ -498,7 +583,8 @@ def parse_manifest(mapping: object) -> DevelopmentRulesManifest:
         seen_ids.add(rule.id)
         rules.append(rule)
     rules_sorted = tuple(sorted(rules, key=lambda r: r.id))
-    return DevelopmentRulesManifest(schema=schema, schema_version=schema_version, languages=languages, rules=rules_sorted)
+    boundary = _parse_os_dependency_boundary(mapping["os_dependency_boundary"]) if "os_dependency_boundary" in mapping else None
+    return DevelopmentRulesManifest(schema=schema, schema_version=schema_version, languages=languages, rules=rules_sorted, os_dependency_boundary=boundary)
 
 
 def parse_manifest_bytes(data: bytes) -> DevelopmentRulesManifest:
@@ -520,7 +606,12 @@ def _to_canonical(obj: object) -> object:
             "schema_version": obj.schema_version,
             "languages": list(obj.languages),
             "rules": [_to_canonical(rule) for rule in obj.rules],
+            **({"os_dependency_boundary": _to_canonical(obj.os_dependency_boundary)} if obj.os_dependency_boundary else {}),
         }
+    if isinstance(obj, OSDependencyBoundary):
+        return {"scan_root": obj.scan_root, "public_facade": obj.public_facade, "sanctioned_modules": list(obj.sanctioned_modules), "patterns": list(obj.patterns), "baseline": [_to_canonical(entry) for entry in obj.baseline], "measurement": {"reference_commit": obj.reference_commit, "reference_total": obj.reference_total, "current_total": obj.current_total, "accepted_predecessor_delta": obj.accepted_predecessor_delta}}
+    if isinstance(obj, OSDependencyBaselineEntry):
+        return {"path": obj.path, "pattern": obj.pattern, "count": obj.count}
     if isinstance(obj, DevelopmentRule):
         return {
             "id": obj.id,
@@ -811,7 +902,7 @@ def _parse_template_applicability(mapping: object, *, path: str, known_languages
     if mapping is None:
         return TemplateApplicability((), (), (), ())
     allowed = frozenset({"languages", "symbol_kinds", "task_kinds", "risk_levels"})
-    _check_keys(mapping, allowed, required=frozenset(), path=path)
+    mapping = _check_keys(mapping, allowed, required=frozenset(), path=path)
     languages = _validate_identifier_tuple(mapping.get("languages", []), path=f"{path}.languages", allow_empty=True)
     for language in languages:
         if language not in known_languages:
@@ -839,7 +930,7 @@ def _parse_template_applicability(mapping: object, *, path: str, known_languages
 
 def _parse_template_slot(mapping: object, *, path: str) -> ConstructionTemplateSlot:
     keys = frozenset({"id", "type", "required"})
-    _check_keys(mapping, keys, required=keys, path=path)
+    mapping = _check_keys(mapping, keys, required=keys, path=path)
     return ConstructionTemplateSlot(
         id=_validate_identifier(mapping["id"], path=f"{path}.id"),
         type=_parse_enum(mapping["type"], LogicSlotType, path=f"{path}.type"),
@@ -848,7 +939,7 @@ def _parse_template_slot(mapping: object, *, path: str) -> ConstructionTemplateS
 
 
 def _parse_pattern_node(mapping: object, *, path: str) -> PatternNode:
-    _check_keys(mapping, frozenset({"literal", "logic_slot"}), required=frozenset(), path=path)
+    mapping = _check_keys(mapping, frozenset({"literal", "logic_slot"}), required=frozenset(), path=path)
     has_literal = "literal" in mapping
     has_slot = "logic_slot" in mapping
     if has_literal == has_slot:
@@ -862,7 +953,7 @@ def _parse_pattern_node(mapping: object, *, path: str) -> PatternNode:
 
 
 def _parse_construction_template(mapping: object, *, path: str, known_languages: frozenset[str]) -> ConstructionTemplate:
-    _check_keys(
+    mapping = _check_keys(
         mapping,
         frozenset({"id", "applicability", "slots", "pattern"}),
         required=frozenset({"id", "slots", "pattern"}),
@@ -903,7 +994,7 @@ def _parse_construction_template(mapping: object, *, path: str, known_languages:
 def parse_construction_template_registry(mapping: object) -> ConstructionTemplateRegistry:
     """Parse inert construction-template data without rendering or executing it."""
     required = frozenset({"schema", "schema_version", "languages", "templates"})
-    _check_keys(mapping, required, required=required, path="$")
+    mapping = _check_keys(mapping, required, required=required, path="$")
     if mapping["schema"] != CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_ID:
         raise ManifestValidationError(ReasonCode.UNKNOWN_SCHEMA, "$.schema: unsupported construction-template registry schema")
     version = mapping["schema_version"]
@@ -1017,6 +1108,10 @@ __all__ = [
     "EvidenceRequirement",
     "DevelopmentRule",
     "DevelopmentRulesManifest",
+    "OS_DEPENDENCY_PATTERN_IDENTITIES",
+    "OS_DEPENDENCY_SANCTIONED_MODULES",
+    "OSDependencyBaselineEntry",
+    "OSDependencyBoundary",
     "ResolvedRuleSet",
     "CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_ID",
     "CONSTRUCTION_TEMPLATE_REGISTRY_SCHEMA_VERSION",

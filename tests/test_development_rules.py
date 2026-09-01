@@ -617,6 +617,39 @@ def test_module_has_no_io_subprocess_or_network_imports():
         assert token not in source
 
 
+def test_os_dependency_boundary_is_optional_but_canonical_and_digest_stable():
+    legacy = _manifest_mapping()
+    assert dr.parse_manifest(legacy).os_dependency_boundary is None
+    boundary = {
+        "scan_root": "src/aiworkhub",
+        "public_facade": "src/aiworkhub/platform_io.py",
+        "sanctioned_modules": list(dr.OS_DEPENDENCY_SANCTIONED_MODULES),
+        "patterns": sorted(dr.OS_DEPENDENCY_PATTERN_IDENTITIES),
+        "baseline": [{"path": "src/aiworkhub/sample.py", "pattern": "sys_platform", "count": 2}],
+        "measurement": {"reference_commit": "0" * 40, "reference_total": 3, "current_total": 2, "accepted_predecessor_delta": -1},
+    }
+    legacy["os_dependency_boundary"] = boundary
+    parsed = dr.parse_manifest(legacy)
+    reordered = copy.deepcopy(legacy)
+    reordered["os_dependency_boundary"]["baseline"] = list(reversed(reordered["os_dependency_boundary"]["baseline"]))
+    assert parsed.os_dependency_boundary is not None
+    assert dr.canonical_digest(parsed) == dr.canonical_digest(dr.parse_manifest(reordered))
+
+
+@pytest.mark.parametrize("field,value", [("patterns", ["sys_platform"]), ("sanctioned_modules", ["src/aiworkhub/platform_io.py"])])
+def test_os_dependency_boundary_rejects_widening_or_pattern_configuration(field, value):
+    mapping = _manifest_mapping()
+    mapping["os_dependency_boundary"] = {
+        "scan_root": "src/aiworkhub", "public_facade": "src/aiworkhub/platform_io.py",
+        "sanctioned_modules": list(dr.OS_DEPENDENCY_SANCTIONED_MODULES),
+        "patterns": sorted(dr.OS_DEPENDENCY_PATTERN_IDENTITIES), "baseline": [],
+        "measurement": {"reference_commit": "0" * 40, "reference_total": 0, "current_total": 0, "accepted_predecessor_delta": 0},
+    }
+    mapping["os_dependency_boundary"][field] = value
+    with pytest.raises(dr.ManifestValidationError):
+        dr.parse_manifest(mapping)
+
+
 def test_valid_manifest_is_round_trip_deep_copyable_without_mutation_sharing():
     mapping = _manifest_mapping()
     manifest_a = dr.parse_manifest(mapping)
