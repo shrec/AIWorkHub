@@ -33,7 +33,9 @@ def test_available_memory_bytes_fails_closed_for_invalid_linux_value(monkeypatch
 
 def test_available_memory_bytes_uses_posix_sysconf(monkeypatch):
     values = {"SC_AVPHYS_PAGES": 100, "SC_PAGE_SIZE": 4096}
-    monkeypatch.setattr(platform_io.os, "sysconf", values.__getitem__)
+    monkeypatch.setattr(
+        platform_io.os, "sysconf", values.__getitem__, raising=False
+    )
     assert platform_io.available_memory_bytes("freebsd") == 409_600
 
 
