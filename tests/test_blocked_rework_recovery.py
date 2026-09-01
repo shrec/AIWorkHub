@@ -1049,3 +1049,204 @@ def test_recovery_accepts_launch_failed_and_timed_out_substatuses(
         )
         assert (ok, state) == (True, "recovered"), f"failed for {substatus}"
         assert _get_card(repo, task_id)["status"] == "pending"
+
+
+def test_validation_only_replay_falls_back_to_authenticated_validation_failed_terminal_failure(
+    tmp_path: Path,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    task_id = "C157_RETAINED_VALIDATION_FAILURE"
+    request_id = "c" * 32
+    claim_epoch = 2
+    workspace = repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+    candidate = workspace / "src" / "result.py"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"retained candidate\n")
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    workspace_evidence = {
+        "request_id": request_id,
+        "repo": str(repo),
+        "path": str(workspace),
+    }
+    predecessor = {
+        "request_id": request_id,
+        "task_id": task_id,
+        "changed_path_hashes": {"src/result.py": digest},
+        "workspace": workspace_evidence,
+    }
+    _insert_blocked_task(
+        repo,
+        task_id,
+        reject_review_reason="rerun retained validation",
+        extra_card={"claim_epoch": claim_epoch, "rework_predecessor": predecessor},
+    )
+    # mark_terminal_failure persists identity under evidence; it does not copy
+    # request_id or task_id into the terminal event's top-level payload.
+    failure = {
+        "substatus": "validation_failed",
+        "claim_epoch": claim_epoch,
+        "evidence": {
+            "request_id": request_id,
+            "changed_path_hashes": {"src/result.py": digest},
+            "request_identity": {
+                "request_id": request_id,
+                "task_id": task_id,
+                "repo": str(repo),
+                "claim_epoch": claim_epoch,
+            },
+            "workspace": workspace_evidence,
+        },
+    }
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id=? AND event='terminal_review'",
+            (task_id,),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+            "VALUES (?, 'terminal_failure', 'codex_worker_test', ?, ?)",
+            (task_id, json.dumps(failure), "2026-08-06T00:00:01+00:00"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    before = candidate.read_bytes()
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        feedback_reason="rerun retained validation",
+        validation_only_replay=True,
+    ) == (True, "recovered")
+    card = _get_card(repo, task_id)
+    assert card["status"] == "pending"
+    assert card["claim_epoch"] == claim_epoch + 1
+    assert card["validation_only_replay_authorization"]["next_claim_epoch"] == claim_epoch + 1
+    assert candidate.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("event_epoch", "identity_epoch", "predecessor_epoch", "identity_mutation"),
+    [
+        (8, 8, None, None),
+        (7, 8, None, None),
+        (7, 7, 8, None),
+        (7, 7, None, "conflicting_nested_request_id"),
+        (7, 7, None, "conflicting_nested_task_id"),
+        (7, 7, None, "conflicting_top_level_request_id"),
+        (7, 7, None, "conflicting_top_level_task_id"),
+        (7, 7, None, "conflicting_evidence_request_id"),
+        (7, 7, None, "conflicting_workspace_request_id"),
+        (7, 7, None, "conflicting_workspace_task_id"),
+        (7, 7, None, "missing_request_identity_claim_epoch"),
+    ],
+    ids=[
+        "terminal-event-vs-card",
+        "conflicting-event-identities",
+        "optional-predecessor-mismatch",
+        "conflicting-nested-request-id",
+        "conflicting-nested-task-id",
+        "conflicting-top-level-request-id",
+        "conflicting-top-level-task-id",
+        "conflicting-evidence-request-id",
+        "conflicting-workspace-request-id",
+        "conflicting-workspace-task-id",
+        "missing-request-identity-claim-epoch",
+    ],
+)
+def test_validation_only_replay_rejects_terminal_failure_claim_epoch_mismatch(
+    tmp_path: Path,
+    event_epoch: int,
+    identity_epoch: int,
+    predecessor_epoch: int | None,
+    identity_mutation: str | None,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    task_id = "RETAINED_VALIDATION_FAILURE_EPOCH_MISMATCH"
+    request_id = "d" * 32
+    claim_epoch = 7
+    workspace = repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+    candidate = workspace / "src" / "result.py"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"retained candidate\n")
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    workspace_evidence = {
+        "request_id": request_id,
+        "repo": str(repo),
+        "path": str(workspace),
+    }
+    predecessor = {
+        "request_id": request_id,
+        "task_id": task_id,
+        "changed_path_hashes": {"src/result.py": digest},
+        "workspace": workspace_evidence,
+    }
+    if predecessor_epoch is not None:
+        predecessor["claim_epoch"] = predecessor_epoch
+    _insert_blocked_task(
+        repo,
+        task_id,
+        reject_review_reason="rerun retained validation",
+        extra_card={"claim_epoch": claim_epoch, "rework_predecessor": predecessor},
+    )
+    failure = {
+        "task_id": task_id,
+        "request_id": request_id,
+        "substatus": "validation_failed",
+        "claim_epoch": event_epoch,
+        "evidence": {
+            "request_id": request_id,
+            "changed_path_hashes": {"src/result.py": digest},
+            "request_identity": {
+                "request_id": request_id,
+                "task_id": task_id,
+                "repo": str(repo),
+                "claim_epoch": identity_epoch,
+            },
+            "workspace": workspace_evidence,
+        },
+    }
+    request_identity = failure["evidence"]["request_identity"]
+    if identity_mutation == "conflicting_nested_request_id":
+        request_identity["request_id"] = "wrong-request"
+    elif identity_mutation == "conflicting_nested_task_id":
+        request_identity["task_id"] = "WRONG_TASK"
+    elif identity_mutation == "conflicting_top_level_request_id":
+        failure["request_id"] = "wrong-request"
+    elif identity_mutation == "conflicting_top_level_task_id":
+        failure["task_id"] = "WRONG_TASK"
+    elif identity_mutation == "conflicting_evidence_request_id":
+        failure["evidence"]["request_id"] = "wrong-request"
+    elif identity_mutation == "conflicting_workspace_request_id":
+        failure["evidence"]["workspace"]["request_id"] = "wrong-request"
+    elif identity_mutation == "conflicting_workspace_task_id":
+        failure["evidence"]["workspace"]["task_id"] = "WRONG_TASK"
+    elif identity_mutation == "missing_request_identity_claim_epoch":
+        request_identity.pop("claim_epoch")
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id=? AND event='terminal_review'",
+            (task_id,),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+            "VALUES (?, 'terminal_failure', 'codex_worker_test', ?, ?)",
+            (task_id, json.dumps(failure), "2026-08-06T00:00:01+00:00"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        feedback_reason="rerun retained validation",
+        validation_only_replay=True,
+    ) == (False, "validation_only_replay_terminal_review_mismatch")
+    card = _get_card(repo, task_id)
+    assert card["status"] == "blocked"
+    assert "validation_only_replay_authorization" not in card

@@ -3447,9 +3447,9 @@ def recover_blocked_rework(
             retained_predecessor.get("workspace"), dict
         )
 
-        # Retained reviewer transport is authoritative when present.  The
-        # older terminal_failure synthesis branch remains available only when
-        # no reviewer-pinned predecessor exists.
+        # Retained reviewer transport is authoritative when present.  Search
+        # reviewer evidence first; a reviewer-pinned validation replay may use
+        # terminal_failure only when no exactly matching review exists.
         terminal_event = (
             "terminal_failure"
             if validation_only_replay and not has_reviewer_transport
@@ -3602,7 +3602,102 @@ def recover_blocked_rework(
                     terminal_row = candidate_row
                     break
             if terminal_row is None:
-                return False, "validation_only_replay_terminal_review_mismatch"
+                failure_rows = conn.execute(
+                    "SELECT runner, payload_json, created_at FROM task_events "
+                    "WHERE task_id=? AND event='terminal_failure' ORDER BY rowid DESC",
+                    (task_id,),
+                ).fetchall()
+                predecessor_claim_epoch = retained_predecessor.get("claim_epoch")
+                current_claim_epoch = card.get("claim_epoch")
+                for candidate_row in failure_rows:
+                    try:
+                        candidate_event = json.loads(
+                            str(candidate_row["payload_json"] or "{}")
+                        )
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(candidate_event, dict):
+                        continue
+                    candidate_evidence = candidate_event.get("evidence")
+                    if not isinstance(candidate_evidence, dict):
+                        continue
+                    candidate_identity = candidate_evidence.get("request_identity")
+                    candidate_workspace = candidate_evidence.get("workspace")
+                    if not isinstance(candidate_identity, dict):
+                        continue
+                    if not isinstance(candidate_workspace, dict):
+                        continue
+
+                    request_ids_match = (
+                        candidate_identity.get("request_id")
+                        == predecessor_request_id
+                        and candidate_workspace.get("request_id")
+                        == predecessor_request_id
+                        and all(
+                            "request_id" not in source
+                            or source.get("request_id") == predecessor_request_id
+                            for source in (candidate_event, candidate_evidence)
+                        )
+                    )
+                    task_ids_match = (
+                        candidate_identity.get("task_id") == task_id
+                        and all(
+                            "task_id" not in source or source.get("task_id") == task_id
+                            for source in (
+                                candidate_event,
+                                candidate_evidence,
+                                candidate_workspace,
+                            )
+                        )
+                    )
+                    event_substatus = str(
+                        candidate_event.get("substatus") or ""
+                    ).strip()
+                    top_level_claim_epoch = candidate_event.get("claim_epoch")
+                    identity_claim_epoch = candidate_identity.get("claim_epoch")
+                    mandatory_claim_epochs_match = (
+                        type(top_level_claim_epoch) is int
+                        and top_level_claim_epoch > 0
+                        and type(identity_claim_epoch) is int
+                        and identity_claim_epoch > 0
+                        and top_level_claim_epoch == identity_claim_epoch
+                    )
+                    optional_claim_epochs_match = all(
+                        "claim_epoch" not in source
+                        or (
+                            type(source.get("claim_epoch")) is int
+                            and source.get("claim_epoch") == top_level_claim_epoch
+                        )
+                        for source in (candidate_evidence, candidate_workspace)
+                    )
+                    predecessor_epoch_matches = (
+                        predecessor_claim_epoch is None
+                        or (
+                            type(predecessor_claim_epoch) is int
+                            and predecessor_claim_epoch == top_level_claim_epoch
+                        )
+                    )
+                    if (
+                        event_substatus == "validation_failed"
+                        and request_ids_match
+                        and task_ids_match
+                        and candidate_identity.get("repo") == str(expected_repo)
+                        and candidate_workspace.get("repo") == str(expected_repo)
+                        and candidate_workspace.get("path")
+                        == str(resolved_workspace)
+                        and candidate_evidence.get("changed_path_hashes")
+                        == predecessor_hashes
+                        and type(current_claim_epoch) is int
+                        and current_claim_epoch > 0
+                        and mandatory_claim_epochs_match
+                        and optional_claim_epochs_match
+                        and top_level_claim_epoch == current_claim_epoch
+                        and predecessor_epoch_matches
+                    ):
+                        terminal_row = candidate_row
+                        break
+                if terminal_row is None:
+                    return False, "validation_only_replay_terminal_review_mismatch"
         if terminal_row is None:
             return False, "no_retained_predecessor_evidence"
 
