@@ -770,3 +770,81 @@ def test_exact_status_counts_includes_superseded_without_keyerror(tmp_path: Path
     # Superseded must not be folded into pending or any active lifecycle bucket.
     assert counts["pending"] == 0
     assert counts["review"] == 0
+
+
+def test_mark_terminal_failure_stamps_relaunch_guard_identity(tmp_path: Path) -> None:
+    # NF-2026-00548 reachability: the guard in process_launcher can only fire
+    # against records this recorder actually writes, so the two are proven
+    # together, end to end, with no hand-built failure record.
+    from aiworkhub import process_launcher
+
+    repo = tmp_path
+    task_store.initialize_repository(repo)
+    _readiness, db_path = task_store._require_ready(repo)
+    card = {
+        "task_id": "GUARD_TASK",
+        "runner": "codex_worker_b891",
+        "topic": "task_mcp",
+        "objective": "guard reachability",
+        "allowed_writes": ["out.txt"],
+        "acceptance": ["out.txt changes"],
+        "launch_request_id": "guard-req-1",
+        "claim_epoch": 1,
+    }
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
+            "objective, card_json, created_at, updated_at, claimed_by) "
+            "VALUES (?, ?, 'task_mcp', 'processing', 'claimed', '', 'guard reachability', ?, ?, ?, ?)",
+            (
+                "GUARD_TASK",
+                "codex_worker_b891",
+                json.dumps(card),
+                "2026-09-01T00:00:00+00:00",
+                "2026-09-01T00:00:00+00:00",
+                "codex_worker_b891",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ok, state = task_store.mark_terminal_review(
+        repo,
+        "GUARD_TASK",
+        runner="codex_worker_b891",
+        substatus="validation_failed",
+        evidence={
+            "request_id": "guard-req-1",
+            "adapter_id": "codex_cli",
+            "error": "validation_failed: exact repeated red",
+        },
+    )
+    assert ok, state
+
+    recorded = task_store.get_task(repo, "GUARD_TASK")
+    failure = recorded["terminal_review"]
+    assert failure["request_id"] == "guard-req-1"
+    assert failure["adapter_id"] == "codex_cli"
+    assert failure["error_hash"] == task_store.bounded_error_hash(
+        "validation_failed: exact repeated red"
+    )
+    assert failure["card_content_sha256"] == task_store.card_content_identity(recorded)
+    assert failure["review_feedback_identity"] == task_store.review_feedback_identity(
+        recorded
+    )
+
+    refusal = process_launcher.identical_relaunch_refusal(
+        recorded, runner="codex_worker_b891", adapter_id="codex_cli"
+    )
+    assert refusal.startswith("identical_relaunch_blocked:guard-req-1:")
+
+    reworked = dict(recorded)
+    reworked["review_feedback"] = {"reason": "new manager instruction"}
+    assert (
+        process_launcher.identical_relaunch_refusal(
+            reworked, runner="codex_worker_b891", adapter_id="codex_cli"
+        )
+        == ""
+    )

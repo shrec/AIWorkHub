@@ -2058,6 +2058,19 @@ def _mark_terminal_review_transaction(
             "recorded_at": now,
             "runner": runner,
             "claim_epoch": claim_epoch,
+            # NF-2026-00548: the identical-relaunch guard compares the card as
+            # it stood at a failed terminal review (validation_failed is the
+            # measured empty-relaunch class) against the card at the next
+            # launch; the guard ignores non-failure substatuses.
+            "request_id": str(
+                evidence_payload.get("request_id")
+                or card.get("launch_request_id")
+                or ""
+            ),
+            "adapter_id": str(evidence_payload.get("adapter_id") or ""),
+            "error_hash": bounded_error_hash(evidence_payload.get("error")),
+            "card_content_sha256": card_content_identity(card),
+            "review_feedback_identity": review_feedback_identity(card),
         }
         card["terminal_review"] = terminal
         card["terminal_substatus"] = terminal["substatus"]
@@ -2376,6 +2389,114 @@ def is_bool_safe_int(value: object) -> bool:
 _is_bool_safe_int = is_bool_safe_int
 
 
+# --- NF-2026-00548: launch/failure identity helpers -----------------------
+#
+# The identical-relaunch guard in ``process_launcher`` compares the card the
+# way it stood WHEN a terminal failure was recorded against the card as it
+# stands at the next launch.  The recorder and the guard must therefore share
+# one identity implementation, and since ``process_launcher`` imports this
+# module (never the reverse), the single home is here.
+TASK_CONTRACT_KEYS = (
+    "task_id", "runner", "topic", "mode", "objective", "read_first",
+    "run_before_writing", "allowed_writes", "acceptance", "validation",
+    "forbidden", "review_feedback", "commit_contract",
+    "project_context", "required_outputs", "allow_empty_required_outputs",
+    "allow_unchanged_required_outputs", "external_readonly_sources",
+    "read_only",
+)
+# ``review_feedback`` carries the rework reason and is authenticated on its own
+# axis (``review_feedback_identity``), so it is excluded here: the two
+# relaunch-guard inputs stay independent instead of collapsing into one hash.
+CARD_CONTENT_IDENTITY_KEYS = tuple(
+    key for key in TASK_CONTRACT_KEYS if key != "review_feedback"
+)
+TERMINAL_ERROR_HASH_HEX_CHARS = 16
+
+
+def strip_persistence_envelopes(value: Any, *, depth: int = 0) -> Any:
+    """Drop nested ``card_json`` persistence envelopes from contract values."""
+
+    if depth > 16:
+        raise ValueError("task_contract_too_deep")
+    if isinstance(value, dict):
+        return {
+            str(key): strip_persistence_envelopes(item, depth=depth + 1)
+            for key, item in value.items()
+            if str(key) != "card_json"
+        }
+    if isinstance(value, list):
+        return [strip_persistence_envelopes(item, depth=depth + 1) for item in value]
+    return value
+
+
+def bounded_error_hash(error_text: Any) -> str:
+    """Return the bounded, whitespace-stable identity of a terminal error."""
+
+    normalized = " ".join(str(error_text or "").split())
+    if not normalized:
+        return ""
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return digest[:TERMINAL_ERROR_HASH_HEX_CHARS]
+
+
+def card_content_identity(card: Mapping[str, Any] | None) -> str:
+    """Digest exactly the contract bytes a worker would be handed.
+
+    Empty values are treated as absent: the recorder hashes the parsed
+    ``card_json`` while the launch guard hashes the rendered card, and the
+    renderer injects empty strings for row columns (``mode``) the stored card
+    never carried.  Absent-versus-empty must not read as a content change.
+    """
+
+    contract: dict[str, Any] = {}
+    for key in CARD_CONTENT_IDENTITY_KEYS:
+        if card is None or key not in card:
+            continue
+        value = card[key]
+        if value is None or value == "" or value == [] or value == {}:
+            continue
+        contract[key] = value
+    canonical = json.dumps(
+        strip_persistence_envelopes(contract),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _review_feedback_reasons(card: Mapping[str, Any] | None) -> list[str]:
+    raw = None if card is None else card.get("review_feedback")
+    if raw is None:
+        items: list[Any] = []
+    elif isinstance(raw, list):
+        items = list(raw)
+    else:
+        items = [raw]
+    reasons: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            reason = item.get("reason")
+            if reason is None:
+                reason = item.get("code")
+            reasons.append("" if reason is None else str(reason))
+            continue
+        reasons.append(str(item))
+    return reasons
+
+
+def review_feedback_identity(card: Mapping[str, Any] | None) -> str:
+    """Digest the pinned rework-reason identity carried by ``card``."""
+
+    canonical = json.dumps(
+        _review_feedback_reasons(card),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def mark_terminal_failure(
     root: str | Path,
     task_id: str,
@@ -2458,6 +2579,16 @@ def mark_terminal_failure(
             "recorded_at": now,
             "runner": runner,
             "claim_epoch": card_claim_epoch,
+            # NF-2026-00548: the identical-relaunch guard compares the card as
+            # it stood at this failure against the card at the next launch.
+            # Without these stamps the guard is fail-open forever.
+            "request_id": str(
+                evidence_payload.get("request_id") or attached_request_id or ""
+            ),
+            "adapter_id": str(evidence_payload.get("adapter_id") or ""),
+            "error_hash": bounded_error_hash(evidence_payload.get("error")),
+            "card_content_sha256": card_content_identity(card),
+            "review_feedback_identity": review_feedback_identity(card),
         }
         card.update(
             status="blocked",

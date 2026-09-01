@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -9702,3 +9703,502 @@ def test_parity_schema_mypy_baseline_non_comparable_fails_closed(overrides, erro
     row = _nf523_parity_mypy_row(**overrides)
     with pytest.raises(WorkspaceError, match=error):
         compare([row])
+
+
+# --- NF-2026-00548 (audit M3): in-run zero-delta tripwire and the
+# identical-relaunch guard. Both are named, deterministic platform mechanics:
+# the tripwire only ever appends a notice, and the guard only ever refuses a
+# launch whose every input is provably identical to a recorded failure. ------
+
+
+_NF548_SEED = b"seed-content\n"
+_NF548_ALLOWED_WRITE = "out/result.json"
+
+
+def _nf548_workspace(
+    tmp_path: Path, *, content: bytes = _NF548_SEED
+) -> process_launcher.WorkerWorkspace:
+    """A provisioned workspace whose baseline describes ``_NF548_SEED``."""
+    return _seeded_workspace(
+        tmp_path,
+        files={_NF548_ALLOWED_WRITE: content},
+        baselines={_NF548_ALLOWED_WRITE: hashlib.sha256(_NF548_SEED).hexdigest()},
+        allowed_writes=(_NF548_ALLOWED_WRITE,),
+    )
+
+
+class _NF548Process:
+    """A worker that times out ``timeouts`` times before exiting cleanly."""
+
+    def __init__(self, timeouts: int = 0) -> None:
+        self.pid = 4242
+        self.waits = 0
+        self.terminated = False
+        self.killed = False
+        self._timeouts = timeouts
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        if self.waits <= self._timeouts:
+            raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout or 0)
+        return 0
+
+    def poll(self):
+        return 0 if self.waits > self._timeouts else None
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+
+def _nf548_live(
+    tmp_path: Path,
+    manager: process_launcher.ProcessManager,
+    workspace: process_launcher.WorkerWorkspace,
+    *,
+    process: object | None = None,
+    timeout_seconds: int = 600,
+    read_only: bool = False,
+    allow_unchanged: tuple[str, ...] = (),
+) -> process_launcher._LiveProcess:
+    request_id = "nf548request"
+    manager.process_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = manager.process_dir / f"{request_id}.request.json"
+    metadata_path.write_text(
+        json.dumps({
+            "request_id": request_id,
+            "workspace": workspace.as_metadata(),
+            "required_outputs": [_NF548_ALLOWED_WRITE],
+            "read_only": read_only,
+            "allow_unchanged_required_outputs": list(allow_unchanged),
+        }),
+        encoding="utf-8",
+    )
+    return process_launcher._LiveProcess(
+        request_id=request_id,
+        task_id="TASK_B1",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        model="claude-opus-5",
+        process=process if process is not None else _NF548Process(),
+        stdout_path=tmp_path / "stdout.log",
+        stderr_path=tmp_path / "stderr.log",
+        started_at="2026-09-01T00:00:00+00:00",
+        timeout_seconds=timeout_seconds,
+        isolated=True,
+        metadata_path=metadata_path,
+    )
+
+
+def _nf548_notices(manager: process_launcher.ProcessManager) -> list[dict]:
+    return [
+        event
+        for event in manager._events()
+        if event.get("notice") == process_launcher.ZERO_DELTA_NOTICE
+    ]
+
+
+def test_zero_delta_tripwire_emits_exactly_one_notice_per_empty_run(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(_card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    live = _nf548_live(tmp_path, manager, _nf548_workspace(tmp_path))
+    manager._append_event({
+        "request_id": live.request_id,
+        "task_id": live.task_id,
+        "state": "running",
+        "pid": live.process.pid,
+    })
+
+    first = manager._maybe_emit_zero_delta_notice(live, elapsed_seconds=420.0)
+    assert first is not None
+    assert first["notice"] == "zero_required_output_delta_warning"
+    assert first["event_kind"] == process_launcher.RUNTIME_NOTICE_EVENT_KIND
+    assert first["request_id"] == live.request_id
+    assert first["required_outputs"] == [_NF548_ALLOWED_WRITE]
+    assert first["allowed_writes"] == [_NF548_ALLOWED_WRITE]
+    assert first["changed_allowed_writes"] == []
+    assert first["elapsed_share"] == 0.7
+    assert first["notice_after_seconds"] == 300.0
+    assert first["enforced"] is False
+    # A notice carries no lifecycle state at all, so nothing can read it as one.
+    assert "state" not in first
+
+    assert manager._maybe_emit_zero_delta_notice(live, elapsed_seconds=500.0) is None
+    assert manager._maybe_emit_zero_delta_notice(live, elapsed_seconds=590.0) is None
+    assert len(_nf548_notices(manager)) == 1
+
+    # Lifecycle semantics are untouched: the request's state row is still the
+    # one the supervisor published, not the notice.
+    assert manager._latest_by_request()[live.request_id]["state"] == "running"
+
+
+def test_zero_delta_tripwire_stays_silent_when_an_allowed_write_changed(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(_card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    workspace = _nf548_workspace(tmp_path, content=b"the worker actually wrote\n")
+    assert process_launcher.changed_allowed_write_paths(workspace) == [
+        _NF548_ALLOWED_WRITE
+    ]
+    live = _nf548_live(tmp_path, manager, workspace)
+
+    assert manager._maybe_emit_zero_delta_notice(live, elapsed_seconds=599.0) is None
+    assert live.zero_delta_tripwire_settled is True
+    assert _nf548_notices(manager) == []
+
+
+@pytest.mark.parametrize(
+    "exemption",
+    [{"read_only": True}, {"allow_unchanged": (_NF548_ALLOWED_WRITE,)}],
+    ids=["read_only", "allow_unchanged_required_outputs"],
+)
+def test_zero_delta_tripwire_never_fires_for_exempt_cards(
+    tmp_path: Path, exemption: dict
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(_card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    live = _nf548_live(tmp_path, manager, _nf548_workspace(tmp_path), **exemption)
+
+    assert manager._maybe_emit_zero_delta_notice(live, elapsed_seconds=10_000.0) is None
+    assert _nf548_notices(manager) == []
+
+
+def test_zero_delta_tripwire_holds_until_the_configured_share_elapsed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(_card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    live = _nf548_live(tmp_path, manager, _nf548_workspace(tmp_path))
+
+    assert process_launcher.zero_delta_notice_after_seconds(600) == 300.0
+    assert manager._maybe_emit_zero_delta_notice(live, elapsed_seconds=299.0) is None
+    assert live.zero_delta_tripwire_settled is False
+    assert _nf548_notices(manager) == []
+
+    monkeypatch.setenv(process_launcher.ZERO_DELTA_ELAPSED_SHARE_ENV, "0.9")
+    assert process_launcher.zero_delta_elapsed_share() == 0.9
+    assert process_launcher.zero_delta_notice_after_seconds(600) == 540.0
+    assert manager._maybe_emit_zero_delta_notice(live, elapsed_seconds=400.0) is None
+    assert _nf548_notices(manager) == []
+
+    emitted = manager._maybe_emit_zero_delta_notice(live, elapsed_seconds=560.0)
+    assert emitted is not None
+    assert emitted["notice_after_seconds"] == 540.0
+
+
+@pytest.mark.parametrize(
+    "raw", ["", "   ", "not-a-number", "0", "-0.5", "1.5"], ids=range(6)
+)
+def test_zero_delta_elapsed_share_falls_back_to_the_bounded_default(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv(process_launcher.ZERO_DELTA_ELAPSED_SHARE_ENV, raw)
+    assert (
+        process_launcher.zero_delta_elapsed_share()
+        == process_launcher.ZERO_DELTA_DEFAULT_ELAPSED_SHARE
+    )
+
+
+def test_zero_delta_notice_bounds_hold_for_short_and_long_ceilings() -> None:
+    assert process_launcher.zero_delta_notice_after_seconds(60) == (
+        process_launcher.ZERO_DELTA_MIN_SECONDS
+    )
+    assert process_launcher.zero_delta_notice_after_seconds(86_400) == (
+        process_launcher.ZERO_DELTA_MAX_SECONDS
+    )
+    assert process_launcher.zero_delta_notice_after_seconds("nonsense") == (
+        process_launcher.ZERO_DELTA_MIN_SECONDS
+    )
+
+
+def test_zero_delta_monitor_wait_notices_once_without_killing_the_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(_card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    process = _NF548Process(timeouts=3)
+    live = _nf548_live(tmp_path, manager, _nf548_workspace(tmp_path), process=process)
+    monkeypatch.setattr(
+        process_launcher, "zero_delta_notice_after_seconds", lambda _timeout: 0.0
+    )
+
+    manager._await_exit_watching_zero_delta(live)
+
+    assert process.waits == 4
+    assert process.poll() == 0
+    assert process.terminated is False and process.killed is False
+    assert len(_nf548_notices(manager)) == 1
+
+
+def test_zero_delta_monitor_wait_supports_a_process_without_timeout(
+    tmp_path: Path,
+) -> None:
+    """A process-like object whose ``wait`` takes no timeout still exits."""
+
+    manager = _manager(
+        tmp_path,
+        show_task=_show(_card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    waits: list[int] = []
+
+    def wait() -> int:
+        waits.append(1)
+        return 0
+
+    legacy = SimpleNamespace(pid=99, wait=wait, poll=lambda: 0)
+    live = _nf548_live(tmp_path, manager, _nf548_workspace(tmp_path), process=legacy)
+
+    manager._await_exit_watching_zero_delta(live)
+
+    assert waits == [1]
+    assert _nf548_notices(manager) == []
+
+
+def _nf548_failed_card(**overrides) -> dict:
+    """A card carrying a recorded terminal failure pinned to its own content."""
+    card = _card()
+    card["objective"] = "NF548 identical relaunch guard"
+    card["review_feedback"] = [{"reason": "validation_failed"}]
+    card.update(overrides)
+    card["terminal_failure"] = {
+        "request_id": "predecessor-request-1",
+        "error": "WorkspaceError: required_output_mismatch on every file",
+        "runner": card["runner"],
+        "adapter_id": "claude_cli",
+        "card_content_sha256": process_launcher.card_content_identity(card),
+        "review_feedback_identity": process_launcher.review_feedback_identity(card),
+        "recorded_at": "2026-09-01T10:00:00+00:00",
+    }
+    return card
+
+
+def _nf548_preflight(
+    tmp_path: Path, card: dict, *, adapter_id: str = "claude_cli"
+) -> dict:
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    return manager._preflight_card(
+        card["task_id"], card["runner"], card["topic"], adapter_id
+    )
+
+
+def test_identical_relaunch_is_refused_with_a_named_deterministic_reason(
+    tmp_path: Path,
+) -> None:
+    card = _nf548_failed_card()
+    expected_hash = process_launcher.bounded_error_hash(
+        card["terminal_failure"]["error"]
+    )
+    assert len(expected_hash) == process_launcher.TERMINAL_ERROR_HASH_HEX_CHARS
+
+    with pytest.raises(process_launcher.LaunchRejected) as excinfo:
+        _nf548_preflight(tmp_path, card)
+
+    reason = str(excinfo.value)
+    assert reason == (
+        f"identical_relaunch_blocked:predecessor-request-1:{expected_hash}"
+    )
+    # The refusal is pure: the guard runs before anything is claimed.
+    assert card["status"] == "pending"
+    assert card["worker_status"] == "unclaimed"
+
+
+def test_identical_relaunch_refusal_is_the_same_reason_every_time() -> None:
+    card = _nf548_failed_card()
+    first = process_launcher.identical_relaunch_refusal(
+        card, runner=card["runner"], adapter_id="claude_cli"
+    )
+    second = process_launcher.identical_relaunch_refusal(
+        dict(card), runner=card["runner"], adapter_id="claude_cli"
+    )
+    assert first == second and first.startswith("identical_relaunch_blocked:")
+
+
+def test_identical_relaunch_guard_accepts_a_recorded_error_hash(tmp_path: Path) -> None:
+    card = _nf548_failed_card()
+    card["terminal_failure"]["error_hash"] = "0123456789abcdef"
+    card["terminal_failure"].pop("error")
+
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match="identical_relaunch_blocked:predecessor-request-1:0123456789abcdef",
+    ):
+        _nf548_preflight(tmp_path, card)
+
+
+def _nf548_terminal_retry_card() -> dict:
+    card = _nf548_failed_card()
+    card["terminal_retry"] = {
+        "predecessor_request_id": "predecessor-request-1",
+        "recorded_at": "2026-09-01T10:00:17+00:00",
+    }
+    return card
+
+
+def _nf548_changed_feedback_card() -> dict:
+    card = _nf548_failed_card()
+    card["review_feedback"] = [{"reason": "scope_violation"}]
+    return card
+
+
+def _nf548_changed_runner_card() -> dict:
+    card = _nf548_failed_card()
+    card["terminal_failure"]["runner"] = "claude_worker_other"
+    return card
+
+
+def _nf548_changed_adapter_card() -> dict:
+    card = _nf548_failed_card()
+    card["terminal_failure"]["adapter_id"] = "codex_cli"
+    return card
+
+
+def _nf548_changed_content_card() -> dict:
+    card = _nf548_failed_card()
+    card["objective"] = "NF548 identical relaunch guard, now with a new objective"
+    return card
+
+
+@pytest.mark.parametrize(
+    "card_fn",
+    [
+        _nf548_terminal_retry_card,
+        _nf548_changed_feedback_card,
+        _nf548_changed_runner_card,
+        _nf548_changed_adapter_card,
+        _nf548_changed_content_card,
+    ],
+    ids=[
+        "explicit_terminal_retry",
+        "changed_review_feedback_reason",
+        "changed_runner",
+        "changed_adapter",
+        "changed_card_content",
+    ],
+)
+def test_identical_relaunch_guard_permits_every_changed_input(
+    tmp_path: Path, card_fn
+) -> None:
+    card = card_fn()
+    assert (
+        process_launcher.identical_relaunch_refusal(
+            card, runner=card["runner"], adapter_id="claude_cli"
+        )
+        == ""
+    )
+    assert _nf548_preflight(tmp_path, card)["task_id"] == card["task_id"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"request_id": ""},
+        {"error": "   "},
+        {"card_content_sha256": ""},
+        {"review_feedback_identity": ""},
+    ],
+    ids=["no_predecessor", "no_error_text", "unpinned_card", "unpinned_feedback"],
+)
+def test_identical_relaunch_guard_fails_open_on_unpinned_evidence(
+    tmp_path: Path, mutation: dict
+) -> None:
+    card = _nf548_failed_card()
+    card["terminal_failure"].update(mutation)
+    assert (
+        process_launcher.identical_relaunch_refusal(
+            card, runner=card["runner"], adapter_id="claude_cli"
+        )
+        == ""
+    )
+    assert _nf548_preflight(tmp_path, card)["task_id"] == card["task_id"]
+
+
+def test_identical_relaunch_guard_reads_the_latest_recorded_failure() -> None:
+    card = _nf548_failed_card()
+    latest = dict(card["terminal_failure"])
+    latest["request_id"] = "predecessor-request-2"
+    latest["recorded_at"] = "2026-09-01T11:00:00+00:00"
+    card["terminal_failure"] = [dict(card["terminal_failure"]), latest]
+
+    refusal = process_launcher.identical_relaunch_refusal(
+        card, runner=card["runner"], adapter_id="claude_cli"
+    )
+    assert refusal.split(":")[1] == "predecessor-request-2"
+
+
+def test_identical_relaunch_guard_ignores_launches_without_a_failure_record(
+    tmp_path: Path,
+) -> None:
+    card = _card()
+    assert (
+        process_launcher.identical_relaunch_refusal(
+            card, runner=card["runner"], adapter_id="claude_cli"
+        )
+        == ""
+    )
+    assert _nf548_preflight(tmp_path, card)["task_id"] == card["task_id"]
+
+
+def test_card_content_identity_ignores_non_contract_bookkeeping() -> None:
+    card = _nf548_failed_card()
+    identity = process_launcher.card_content_identity(card)
+    noisy = dict(card)
+    noisy["updated_at"] = "2026-09-01T12:00:00+00:00"
+    noisy["card_json"] = json.dumps(card)
+    noisy["terminal_failure"] = {"request_id": "unrelated"}
+    assert process_launcher.card_content_identity(noisy) == identity
+
+    changed = dict(card)
+    changed["allowed_writes"] = ["out/other.json"]
+    assert process_launcher.card_content_identity(changed) != identity
+
+
+def test_review_feedback_identity_tracks_only_the_reason() -> None:
+    base = {"review_feedback": [{"reason": "validation_failed", "detail": "one"}]}
+    same_reason = {"review_feedback": [{"reason": "validation_failed", "detail": "two"}]}
+    other_reason = {"review_feedback": [{"reason": "scope_violation"}]}
+    assert process_launcher.review_feedback_identity(
+        base
+    ) == process_launcher.review_feedback_identity(same_reason)
+    assert process_launcher.review_feedback_identity(
+        base
+    ) != process_launcher.review_feedback_identity(other_reason)
+    assert process_launcher.review_feedback_identity(
+        {}
+    ) == process_launcher.review_feedback_identity({"review_feedback": None})
+
+
+def test_bounded_error_hash_is_whitespace_stable_and_bounded() -> None:
+    assert process_launcher.bounded_error_hash("  a   b\n") == (
+        process_launcher.bounded_error_hash("a b")
+    )
+    assert process_launcher.bounded_error_hash("") == ""
+    assert process_launcher.bounded_error_hash(None) == ""
+    assert len(process_launcher.bounded_error_hash("boom")) == (
+        process_launcher.TERMINAL_ERROR_HASH_HEX_CHARS
+    )

@@ -275,6 +275,169 @@ else:
     _worker_workspace.validate_required_outputs = validate_required_outputs
 
 
+# --- NF-2026-00548 (audit M3): in-run zero-delta tripwire -----------------
+#
+# Measured 2026-09-01: six attempts across five cards ran a full worker cycle
+# (about ten minutes plus provisioning each, one burning 76k tokens) without
+# touching a single required output, and that only surfaced at finalization as
+# ``required_output_unchanged``.  The supervisor monitor already waits on the
+# isolated workspace, so once a meaningful share of the declared run has
+# elapsed with zero delta inside ``allowed_writes`` it publishes ONE explicit
+# machine-readable notice into the process event stream.
+#
+# This is a notice, never an enforcement action: it does not kill the worker,
+# it does not transition the card, and it carries no lifecycle ``state`` so no
+# reader can mistake it for one.
+ZERO_DELTA_NOTICE = "zero_required_output_delta_warning"
+RUNTIME_NOTICE_EVENT_KIND = "runtime_notice"
+ZERO_DELTA_ELAPSED_SHARE_ENV = "AIWORKHUB_ZERO_DELTA_ELAPSED_SHARE"
+ZERO_DELTA_DEFAULT_ELAPSED_SHARE = 0.5
+ZERO_DELTA_MIN_SECONDS = 60.0
+ZERO_DELTA_MAX_SECONDS = 600.0
+ZERO_DELTA_POLL_SECONDS = 15.0
+
+
+def zero_delta_elapsed_share() -> float:
+    """Return the configured share of a run that counts as "meaningful"."""
+
+    raw = os.environ.get(ZERO_DELTA_ELAPSED_SHARE_ENV)
+    if raw is None or not str(raw).strip():
+        return ZERO_DELTA_DEFAULT_ELAPSED_SHARE
+    try:
+        share = float(str(raw).strip())
+    except ValueError:
+        return ZERO_DELTA_DEFAULT_ELAPSED_SHARE
+    if not 0.0 < share <= 1.0:
+        return ZERO_DELTA_DEFAULT_ELAPSED_SHARE
+    return share
+
+
+def zero_delta_notice_after_seconds(timeout_seconds: Any) -> float:
+    """Return the bounded elapsed threshold for one declared run ceiling.
+
+    The share is taken of the DECLARED ceiling so the threshold is known at
+    launch and identical on every observation; the bounds then keep a short
+    card from tripping immediately and a very long ceiling from pushing the
+    notice past the point where it could still save the run.
+    """
+
+    try:
+        ceiling = float(int(timeout_seconds))
+    except (TypeError, ValueError):
+        ceiling = 0.0
+    scaled = max(0.0, ceiling) * zero_delta_elapsed_share()
+    return min(ZERO_DELTA_MAX_SECONDS, max(ZERO_DELTA_MIN_SECONDS, scaled))
+
+
+def changed_allowed_write_paths(workspace: WorkerWorkspace) -> list[str]:
+    """Name every ``allowed_writes`` path already differing from its baseline.
+
+    This reads the same workspace baseline the finalizer's required-output
+    check reads, so the tripwire can never disagree with the terminal verdict
+    about what "changed" means.  Anything it cannot read exactly is reported
+    as changed: the tripwire must never be the thing that calls a working run
+    empty.
+    """
+
+    changed: list[str] = []
+    for raw in workspace.allowed_writes:
+        pattern = str(raw or "").strip().replace("\\", "/")
+        if not pattern:
+            continue
+        if any(ch in pattern for ch in "*?["):
+            matches = sorted(workspace.path.glob(pattern))
+        else:
+            candidate = workspace.path / pattern
+            matches = [candidate] if candidate.exists() else []
+        if not matches:
+            # A path that carried a baseline and no longer resolves was
+            # removed by the worker -- that is a delta, not an empty run.
+            if workspace.workspace_baseline.get(pattern) is not None:
+                changed.append(pattern)
+            continue
+        for path in matches:
+            try:
+                relative = path.relative_to(workspace.path).as_posix()
+            except ValueError:
+                continue
+            try:
+                if path.is_symlink() or not path.is_file():
+                    changed.append(relative)
+                    continue
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                current = f"file:{path.stat().st_mode & 0o777:o}:{digest}"
+            except OSError:
+                changed.append(relative)
+                continue
+            baseline = workspace.workspace_baseline.get(relative)
+            if baseline is None or baseline not in {digest, current}:
+                changed.append(relative)
+    return sorted(set(changed))
+
+
+@dataclass(frozen=True)
+class ZeroDeltaTripwire:
+    """One deterministic observation of a run's in-flight required delta.
+
+    ``settled`` means no later observation of this run can change the answer,
+    so the caller stops looking; ``notice`` carries the machine-readable
+    payload exactly once, and is ``None`` on every other outcome.
+    """
+
+    settled: bool
+    notice: dict[str, Any] | None = None
+
+
+def evaluate_zero_delta_tripwire(
+    *,
+    workspace: WorkerWorkspace,
+    elapsed_seconds: float,
+    timeout_seconds: Any,
+    required_outputs: Iterable[str] = (),
+    read_only: bool = False,
+    allow_unchanged_required_outputs: Iterable[str] = (),
+) -> ZeroDeltaTripwire:
+    """Decide whether this run has earned the zero-delta notice.
+
+    A read-only card has nothing to write, and a card carrying
+    ``allow_unchanged_required_outputs`` has already declared that an
+    unchanged output is a legitimate result -- neither can ever be empty in
+    the sense this tripwire names, so both settle silently.
+    """
+
+    allowed_writes = [
+        str(value) for value in workspace.allowed_writes if str(value or "").strip()
+    ]
+    if read_only or not allowed_writes:
+        return ZeroDeltaTripwire(settled=True)
+    if [str(value) for value in allow_unchanged_required_outputs]:
+        return ZeroDeltaTripwire(settled=True)
+    if changed_allowed_write_paths(workspace):
+        return ZeroDeltaTripwire(settled=True)
+    notice_after = zero_delta_notice_after_seconds(timeout_seconds)
+    elapsed = float(elapsed_seconds)
+    if elapsed < notice_after:
+        return ZeroDeltaTripwire(settled=False)
+    try:
+        ceiling = float(int(timeout_seconds))
+    except (TypeError, ValueError):
+        ceiling = 0.0
+    return ZeroDeltaTripwire(
+        settled=True,
+        notice={
+            "notice": ZERO_DELTA_NOTICE,
+            "elapsed_seconds": round(elapsed, 3),
+            "elapsed_share": round(elapsed / ceiling, 4) if ceiling > 0 else None,
+            "notice_after_seconds": round(notice_after, 3),
+            "timeout_seconds": int(ceiling),
+            "required_outputs": [str(value) for value in required_outputs],
+            "allowed_writes": allowed_writes,
+            "changed_allowed_writes": [],
+            "enforced": False,
+        },
+    )
+
+
 ALLOW_LAUNCH_ENV = "AIWORKHUB_ALLOW_LAUNCH"
 ALLOW_WRITES_ENV = "AIWORKHUB_ALLOW_WRITES"
 MAX_PROCESSES_ENV = "AIWORKHUB_MAX_PROCESSES"
@@ -1347,6 +1510,11 @@ def _latest_process_row_for_task(
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
         if not isinstance(event, dict):
+            continue
+        # Runtime notices (NF-2026-00548) ride the same ledger but are not
+        # process rows; merging one here would move the Live Output row's
+        # timestamp without any lifecycle change behind it.
+        if str(event.get("event_kind") or "") == RUNTIME_NOTICE_EVENT_KIND:
             continue
         if str(event.get("task_id") or "") != task_id:
             continue
@@ -4330,6 +4498,140 @@ MAX_REWORK_TASK_CONTRACT_BYTES = 48 * 1024
 MAX_WORKER_PROMPT_BYTES = 160 * 1024
 MAX_REWORK_WORKER_PROMPT_BYTES = 112 * 1024
 
+# The exact card subset a worker is handed as its contract.  Card content
+# identity (``card_content_identity``) is computed from this same subset, so
+# "the card did not change" means precisely "the bytes the worker reads did not
+# change" -- never an incidental store column such as ``updated_at``.  The
+# single implementation lives in ``task_store`` because the terminal-failure
+# recorder there must stamp the very same identities this module's guard
+# compares (and task_store can never import this module back).
+TASK_CONTRACT_KEYS = task_store.TASK_CONTRACT_KEYS
+CARD_CONTENT_IDENTITY_KEYS = task_store.CARD_CONTENT_IDENTITY_KEYS
+_strip_persistence_envelopes = task_store.strip_persistence_envelopes
+
+
+# --- NF-2026-00548 (audit M3): identical-relaunch guard -------------------
+#
+# Measured 2026-09-01: one card failed twice with a byte-identical error 17
+# seconds apart and nothing between the two attempts had changed.  A relaunch
+# whose card content, pinned rework-reason identity and launch identity
+# (runner, adapter) all equal the attempt that recorded a terminal failure can
+# only reproduce that failure, so it is refused at the launch entry with a
+# named deterministic reason instead of burning another full worker cycle.
+#
+# The guard is fail-open by construction: a missing record, an unpinned piece
+# of evidence, any changed input, or an explicit terminal retry all permit the
+# launch.  Only a complete, exactly-matching identity refuses one.
+IDENTICAL_RELAUNCH_BLOCKED_REASON = "identical_relaunch_blocked"
+TERMINAL_ERROR_HASH_HEX_CHARS = task_store.TERMINAL_ERROR_HASH_HEX_CHARS
+bounded_error_hash = task_store.bounded_error_hash
+card_content_identity = task_store.card_content_identity
+review_feedback_identity = task_store.review_feedback_identity
+
+# ``terminal_review`` records successful submissions too (``review_ready``);
+# the guard may only ever read the failure substatuses out of it.  The
+# measured empty-relaunch class (validation_failed, twice byte-identical) is a
+# terminal REVIEW record, so terminal_failure alone would miss it entirely.
+_RELAUNCH_GUARD_FAILURE_SUBSTATUSES = frozenset(
+    {"validation_failed"} | set(task_store.MARK_TERMINAL_FAILURE_SUBSTATUSES)
+)
+
+
+def _latest_recorded(value: Any) -> dict[str, Any] | None:
+    """Return the most recently recorded mapping from a record or a list."""
+
+    if isinstance(value, dict):
+        return dict(value)
+    if not isinstance(value, list):
+        return None
+    records = [dict(item) for item in value if isinstance(item, dict)]
+    if not records:
+        return None
+    return max(records, key=lambda record: str(record.get("recorded_at") or ""))
+
+
+def _terminal_retry_supersedes(
+    retry: Mapping[str, Any], failure: Mapping[str, Any]
+) -> bool:
+    """Decide whether an explicit retry was recorded after ``failure``.
+
+    A retry naming the failed request is authoritative regardless of clocks.
+    Otherwise the recorded timestamps decide, and an unstamped retry is read as
+    the newer record so an explicit operator retry is never swallowed.
+    """
+
+    named = str(retry.get("predecessor_request_id") or "").strip()
+    if named and named == str(failure.get("request_id") or "").strip():
+        return True
+    retry_at = str(retry.get("recorded_at") or "").strip()
+    if not retry_at:
+        return True
+    return retry_at > str(failure.get("recorded_at") or "").strip()
+
+
+def identical_relaunch_refusal(
+    card: Mapping[str, Any] | None,
+    *,
+    runner: str,
+    adapter_id: str,
+) -> str:
+    """Name the refusal for a launch identical to a recorded terminal failure.
+
+    Returns the empty string whenever the launch is permitted.  The refusal
+    carries the predecessor request id and the bounded error hash so an
+    operator reads WHICH attempt this would have repeated, and WHICH failure.
+    """
+
+    candidates: list[dict[str, Any]] = []
+    for field in ("terminal_failure", "terminal_review"):
+        record = _latest_recorded(None if card is None else card.get(field))
+        if record is None:
+            continue
+        if (
+            field == "terminal_review"
+            and str(record.get("substatus") or "")
+            not in _RELAUNCH_GUARD_FAILURE_SUBSTATUSES
+        ):
+            continue
+        candidates.append(record)
+    if not candidates:
+        return ""
+    failure = max(
+        candidates, key=lambda record: str(record.get("recorded_at") or "")
+    )
+    predecessor_request_id = str(failure.get("request_id") or "").strip()
+    if not predecessor_request_id:
+        return ""
+    error_hash = str(failure.get("error_hash") or "").strip().lower()
+    if not error_hash:
+        error_hash = bounded_error_hash(failure.get("error"))
+    if not error_hash:
+        return ""
+    if str(failure.get("runner") or "") != str(runner):
+        return ""
+    if str(failure.get("adapter_id") or "") != str(adapter_id):
+        return ""
+    recorded_card_identity = str(failure.get("card_content_sha256") or "").strip()
+    if not recorded_card_identity:
+        return ""
+    if recorded_card_identity != card_content_identity(card):
+        return ""
+    recorded_feedback_identity = str(
+        failure.get("review_feedback_identity") or ""
+    ).strip()
+    if not recorded_feedback_identity:
+        return ""
+    if recorded_feedback_identity != review_feedback_identity(card):
+        return ""
+    retry = _latest_recorded(None if card is None else card.get("terminal_retry"))
+    if retry is not None and _terminal_retry_supersedes(retry, failure):
+        return ""
+    return ":".join((
+        IDENTICAL_RELAUNCH_BLOCKED_REASON,
+        predecessor_request_id,
+        error_hash,
+    ))
+
 
 def build_worker_prompt(
     *,
@@ -4353,33 +4655,12 @@ def build_worker_prompt(
         if extra
         else ""
     )
-    contract_keys = (
-        "task_id", "runner", "topic", "mode", "objective", "read_first",
-        "run_before_writing", "allowed_writes", "acceptance", "validation",
-        "forbidden", "review_feedback", "commit_contract",
-        "project_context", "required_outputs", "allow_empty_required_outputs",
-        "allow_unchanged_required_outputs", "external_readonly_sources",
-        "read_only",
-    )
     contract = {
         key: card[key]
-        for key in contract_keys
+        for key in TASK_CONTRACT_KEYS
         if card is not None and key in card
     }
-    def strip_persistence_envelopes(value: Any, *, depth: int = 0) -> Any:
-        if depth > 16:
-            raise ValueError("task_contract_too_deep")
-        if isinstance(value, dict):
-            return {
-                str(key): strip_persistence_envelopes(item, depth=depth + 1)
-                for key, item in value.items()
-                if str(key) != "card_json"
-            }
-        if isinstance(value, list):
-            return [strip_persistence_envelopes(item, depth=depth + 1) for item in value]
-        return value
-
-    contract = strip_persistence_envelopes(contract)
+    contract = _strip_persistence_envelopes(contract)
     contract.update({"task_id": task_id, "runner": runner, "topic": topic})
     # One-line canonical JSON removes indentation/newline overhead without
     # weakening the exact task contract or its stable identity.
@@ -4504,6 +4785,10 @@ class _LiveProcess:
     pid_start_ticks: int | None = None
     bridge_request: vscode_lm_bridge.BridgeRequest | None = None
     claim_epoch: int | None = None
+    # NF-2026-00548: once the zero-delta tripwire has settled (notice emitted,
+    # a real delta observed, or the card exempt) no later observation of this
+    # run can change the answer, so the monitor stops re-hashing the workspace.
+    zero_delta_tripwire_settled: bool = False
 
 
 class _QualityReviewPrepFlight:
@@ -4905,6 +5190,12 @@ class ProcessManager:
 
         latest: dict[str, dict[str, Any]] = {}
         for event in self._events():
+            # A runtime notice is an observation appended alongside the
+            # lifecycle rows, never one of them.  This map REPLACES the row
+            # per request, so letting a notice land here would erase the
+            # ``state`` every reconciler and reporter reads.
+            if str(event.get("event_kind") or "") == RUNTIME_NOTICE_EVENT_KIND:
+                continue
             request_id = str(event.get("request_id") or "")
             if request_id:
                 latest[request_id] = event
@@ -6080,6 +6371,16 @@ class ProcessManager:
         policy_result = repo_policy.validate_launch(self.repo, card, adapter_id)
         if not policy_result.get("ok"):
             raise LaunchRejected(str(policy_result.get("reason") or "repo_policy_rejected"))
+        # NF-2026-00548 (audit M3): refuse a relaunch that is byte-identical to
+        # a recorded terminal failure BEFORE anything is claimed or
+        # provisioned, so the identical attempt is never burned.  Every
+        # changed input and every explicit terminal retry permits the launch;
+        # see ``identical_relaunch_refusal``.
+        relaunch_refusal = identical_relaunch_refusal(
+            card, runner=runner, adapter_id=adapter_id
+        )
+        if relaunch_refusal:
+            raise LaunchRejected(relaunch_refusal)
         collision = self._collision_guard(task_id=task_id, print_json=True)
         if collision.get("returncode") != 0:
             raise LaunchRejected("collision_guard_failed")
@@ -9226,7 +9527,7 @@ class ProcessManager:
     def _monitor(self, live: _LiveProcess) -> None:
         if live.isolated:
             try:
-                live.process.wait()
+                self._await_exit_watching_zero_delta(live)
             except Exception as exc:
                 self._append_event({
                     "request_id": live.request_id,
@@ -9256,6 +9557,89 @@ class ProcessManager:
             return
 
         self._monitor_direct_for_tests(live)
+
+    def _await_exit_watching_zero_delta(self, live: _LiveProcess) -> None:
+        """Wait for the worker exactly as before, observing the delta meanwhile.
+
+        The wait is sliced so the already-running monitor thread can look at
+        the isolated workspace it is supervising.  Nothing here influences
+        exit, timeout, cancellation or finalization: the loop ends only when
+        the process ends, and the one thing it can do is append a notice.
+
+        A test double whose ``wait`` takes no ``timeout`` falls back to the
+        original blocking call, so the monitor keeps working against any
+        process-like object it was already given.
+        """
+
+        started = time.monotonic()
+        while True:
+            try:
+                live.process.wait(timeout=ZERO_DELTA_POLL_SECONDS)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            except TypeError:
+                live.process.wait()
+                return
+            self._maybe_emit_zero_delta_notice(
+                live, elapsed_seconds=time.monotonic() - started
+            )
+
+    def _maybe_emit_zero_delta_notice(
+        self, live: _LiveProcess, *, elapsed_seconds: float
+    ) -> dict[str, Any] | None:
+        """Append the one zero-delta notice this run is owed, if it is owed.
+
+        Returns the appended event, or ``None`` when nothing was emitted.  The
+        notice carries no lifecycle ``state`` and is tagged as a runtime
+        notice, so the reconcilers and reporters that read the ledger for a
+        request's state never see it (see ``_latest_by_request``).
+        """
+
+        if live.zero_delta_tripwire_settled or live.metadata_path is None:
+            return None
+        try:
+            metadata = json.loads(live.metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(metadata, dict):
+            return None
+        workspace_metadata = metadata.get("workspace")
+        if not isinstance(workspace_metadata, dict):
+            return None
+        try:
+            workspace = WorkerWorkspace.from_metadata(dict(workspace_metadata))
+        except (KeyError, TypeError, ValueError, OSError):
+            return None
+        try:
+            observation = evaluate_zero_delta_tripwire(
+                workspace=workspace,
+                elapsed_seconds=elapsed_seconds,
+                timeout_seconds=live.timeout_seconds,
+                required_outputs=metadata.get("required_outputs") or (),
+                read_only=metadata.get("read_only") is True,
+                allow_unchanged_required_outputs=(
+                    metadata.get("allow_unchanged_required_outputs") or ()
+                ),
+            )
+        except OSError:
+            # An unreadable workspace is not evidence of an empty run.
+            return None
+        if observation.settled:
+            live.zero_delta_tripwire_settled = True
+        if observation.notice is None:
+            return None
+        return self._append_event({
+            "request_id": live.request_id,
+            "task_id": live.task_id,
+            "runner": live.runner,
+            "topic": live.topic,
+            "adapter_id": live.adapter_id,
+            "model": live.model,
+            "event_kind": RUNTIME_NOTICE_EVENT_KIND,
+            "pid": live.process.pid,
+            **observation.notice,
+        })
 
     def _bridge_request_for_cancellation(
         self,
