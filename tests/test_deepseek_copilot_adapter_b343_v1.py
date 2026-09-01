@@ -26,6 +26,7 @@ if str(_SRC) not in sys.path:
 
 from aiworkhub import (  # noqa: E402
     deepseek_credentials as dc,
+    platform_io,
     process_launcher,
     runtime_adapters,
     worker_workspace,
@@ -97,6 +98,26 @@ def _card() -> dict:
         "validation": [],
         "priority": "high",
     }
+
+
+def test_deepseek_credential_uses_canonical_chmod_helpers():
+    assert dc.chmod_fd is platform_io.chmod_fd
+    assert dc.chmod_path is platform_io.chmod_path
+
+
+def test_deepseek_bootstrap_delegates_path_modes_to_chmod_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential = tmp_path / "credential.json"
+    calls: list[tuple[Path, int]] = []
+
+    def record_chmod_path(path: os.PathLike[str] | str, mode: int) -> None:
+        calls.append((Path(path), mode))
+
+    monkeypatch.setattr(dc, "chmod_path", record_chmod_path)
+
+    assert dc.bootstrap_credential(path=credential, api_key=FAKE_KEY) == credential
+    assert calls == [(credential.parent, 0o700), (credential, 0o600)]
 
 
 def _show(card: dict):

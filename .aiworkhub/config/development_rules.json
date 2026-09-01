@@ -545,11 +545,6 @@
           },
           {
                 "path": "src/aiworkhub/deepseek_credentials.py",
-                "pattern": "def_chmod_fd",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/deepseek_credentials.py",
                 "pattern": "os_name_ne",
                 "count": 2
           },
@@ -573,11 +568,6 @@
         "pattern": "sqlite_connect",
         "count": 1
       },
-          {
-                "path": "src/aiworkhub/glm_credentials.py",
-                "pattern": "def_chmod_fd",
-                "count": 1
-          },
           {
                 "path": "src/aiworkhub/glm_credentials.py",
                 "pattern": "os_name_ne",
@@ -770,13 +760,8 @@
           },
           {
                 "path": "src/aiworkhub/vscode_lm_bridge.py",
-                "pattern": "def_chmod_fd",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/vscode_lm_bridge.py",
                 "pattern": "os_name_ne",
-                "count": 3
+                "count": 2
           },
           {
                 "path": "src/aiworkhub/worker_ai_tools_mcp.py",
@@ -887,8 +872,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 162,
-      "accepted_predecessor_delta": 1
+      "current_total": 158,
+      "accepted_predecessor_delta": -3
     }
   }
 }

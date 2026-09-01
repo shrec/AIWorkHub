@@ -17,8 +17,12 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import glm_credentials as gc  # noqa: E402
-from aiworkhub import deepseek_credentials, process_launcher, runtime_adapters  # noqa: E402
-
+from aiworkhub import (  # noqa: E402
+    deepseek_credentials,
+    platform_io,
+    process_launcher,
+    runtime_adapters,
+)
 
 FAKE_KEY = "sk-glm-B814-FAKE-not-a-real-key"
 ADAPTER = "glm_copilot_cli"
@@ -127,6 +131,26 @@ def _manager(tmp_path: Path, repo: Path, card: dict) -> process_launcher.Process
         adapter_builder=lambda **_kwargs: SimpleNamespace(argv=[], launchable=True, reason=""),
         isolation_enabled=True,
     )
+
+
+def test_glm_credential_uses_canonical_chmod_helpers() -> None:
+    assert gc.chmod_fd is platform_io.chmod_fd
+    assert gc.chmod_path is platform_io.chmod_path
+
+
+def test_glm_bootstrap_delegates_path_modes_to_chmod_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential = tmp_path / "credential.json"
+    calls: list[tuple[Path, int]] = []
+
+    def record_chmod_path(path: os.PathLike[str] | str, mode: int) -> None:
+        calls.append((Path(path), mode))
+
+    monkeypatch.setattr(gc, "chmod_path", record_chmod_path)
+
+    assert gc.bootstrap_credential(path=credential, api_key=FAKE_KEY) == credential
+    assert calls == [(credential.parent, 0o700), (credential, 0o600)]
 
 
 def test_glm_copilot_is_supported_local_adapter() -> None:

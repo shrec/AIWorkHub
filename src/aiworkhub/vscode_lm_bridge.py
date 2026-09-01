@@ -29,20 +29,7 @@ from .runtime_adapters import (  # the ONE editor model vocabulary declaration
     discover_callable_model_names,
 )
 from .source_graph import SOURCE_GRAPH_MODES
-try:
-    from .platform_io import chmod_fd, chmod_path, posix_path_modes_supported
-except ImportError:  # pragma: no cover - standalone compatibility
-    def chmod_fd(fd: int, mode: int) -> None:
-        fchmod = getattr(os, "fchmod", None)
-        if fchmod is not None:
-            fchmod(fd, mode)
-
-    def posix_path_modes_supported() -> bool:
-        return os.name != "nt"
-
-    def chmod_path(path: str | os.PathLike[str], mode: int) -> None:
-        if posix_path_modes_supported():
-            os.chmod(path, mode)
+from .platform_io import chmod_fd, chmod_path, posix_path_modes_supported
 
 
 REQUEST_SCHEMA_ID = "aiworkhub.vscode_lm.request.v1"

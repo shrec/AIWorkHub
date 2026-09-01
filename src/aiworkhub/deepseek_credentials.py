@@ -34,13 +34,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from . import runtime_adapters
-try:
-    from .platform_io import chmod_fd
-except ImportError:  # pragma: no cover - standalone compatibility
-    def chmod_fd(fd: int, mode: int) -> None:
-        fchmod = getattr(os, "fchmod", None)
-        if fchmod is not None:
-            fchmod(fd, mode)
+from .platform_io import chmod_fd, chmod_path
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +276,7 @@ def bootstrap_credential(
             raise CredentialError("credential_inside_repository")
 
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(target.parent, 0o700)
+    chmod_path(target.parent, 0o700)
 
     document = {
         "provider": "deepseek",
@@ -308,7 +302,7 @@ def bootstrap_credential(
         os.close(fd)
         fd = -1
         os.replace(tmp, target)
-        os.chmod(target, 0o600)
+        chmod_path(target, 0o600)
     finally:
         if fd >= 0:
             os.close(fd)

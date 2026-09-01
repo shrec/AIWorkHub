@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from aiworkhub import (
+    platform_io,
     process_launcher,
     repository_state,
     task_store,
@@ -19,6 +20,12 @@ from aiworkhub import (
     vscode_lm_worker,
     worker_ai_tools_mcp,
 )
+
+
+def test_vscode_lm_bridge_uses_canonical_platform_io_helpers() -> None:
+    assert vscode_lm_bridge.chmod_fd is platform_io.chmod_fd
+    assert vscode_lm_bridge.chmod_path is platform_io.chmod_path
+    assert vscode_lm_bridge.posix_path_modes_supported is platform_io.posix_path_modes_supported
 
 
 def test_atomic_json_skips_redundant_chmod_in_restricted_sandbox(
