@@ -640,3 +640,91 @@ def test_raw_side_field_survives_rotation_spill_and_latest_projection(
     assert latest["rotated"]["terminal_reason_raw"] == "caller-rotated"
     assert latest["active"]["terminal_reason_raw"] == rows[1]["terminal_reason_raw"]
     assert latest["spill"]["terminal_reason_raw"] == rows[2]["terminal_reason_raw"]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "validation_unsupported_in_sandbox:",
+        "unsupported_sandbox_backend:",
+        "validation_exec_scratch_unavailable:",
+        "validation_executable_unavailable:",
+        "validation_pytest_runtime_unavailable:",
+        "validation_pytest_runtime_missing_pytest:",
+    ],
+)
+def test_named_environment_prefix_classifies_environment_unsupported(
+    tmp_path: Path, prefix: str
+) -> None:
+    path = tmp_path / "process_events.jsonl"
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "env",
+            "state": "validation_failed",
+            "error": prefix + "landlock denies os.chmod on the ledger dir",
+        },
+    )
+
+    persisted = list(process_event_ledger.iter_events(path))[0]
+    reason = persisted["terminal_reason"]
+    assert reason["code"] == "validation_unsupported_in_sandbox"
+    assert reason["taxonomy"] == "validation_environment_unsupported"
+    assert reason["source"] == "error"
+    assert reason["message"].startswith(prefix)
+    assert reason["missing_cause"] is False
+    assert reason["alertable"] is True
+
+
+def test_generic_permission_prose_is_not_promoted_to_environment_unsupported(
+    tmp_path: Path,
+) -> None:
+    # Tests may assert chmod/landlock authority on purpose: substring prose
+    # without an approved named prefix stays an ordinary candidate failure.
+    path = tmp_path / "process_events.jsonl"
+    for request_id, error in (
+        ("perm", "PermissionError: [Errno 1] Operation not permitted: fchmod"),
+        ("chmod", "test asserts chmod authority: landlock permission denied"),
+        ("midfix", "wrapped validation_unsupported_in_sandbox: not a prefix"),
+    ):
+        process_event_ledger.append_event(
+            path,
+            {"request_id": request_id, "state": "validation_failed", "error": error},
+        )
+
+    for persisted in process_event_ledger.iter_events(path):
+        reason = persisted["terminal_reason"]
+        assert reason["code"] == "validation_failed"
+        assert reason["taxonomy"] == "lifecycle_terminal_failure"
+
+
+def test_environment_prefix_respects_supplied_alertable_and_missing_cause_parity(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "process_events.jsonl"
+    process_event_ledger.append_event(
+        path,
+        {
+            "request_id": "env-alert",
+            "state": "blocked",
+            "terminal_reason": {
+                "message": "unsupported_sandbox_backend: seatbelt missing",
+                "alertable": False,
+            },
+        },
+    )
+    process_event_ledger.append_event(
+        path,
+        {"request_id": "causeless", "state": "worker_failed"},
+    )
+
+    rows = {row["request_id"]: row for row in process_event_ledger.iter_events(path)}
+    env = rows["env-alert"]["terminal_reason"]
+    assert env["code"] == "validation_unsupported_in_sandbox"
+    assert env["taxonomy"] == "validation_environment_unsupported"
+    assert env["source"] == "terminal_reason"
+    assert env["alertable"] is False
+    causeless = rows["causeless"]["terminal_reason"]
+    assert causeless["code"] == "terminal_reason_missing"
+    assert causeless["taxonomy"] == "observability_missing_cause"
+    assert causeless["missing_cause"] is True

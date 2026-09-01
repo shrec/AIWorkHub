@@ -173,6 +173,16 @@ _FAILURE_TERMINAL_STATES = frozenset(
 _TERMINAL_REASON_MESSAGE_MAX_CHARS = 512
 _TERMINAL_REASON_RAW_MAX_CHARS = 512
 _TERMINAL_REASON_RAW_MAX_KEYS = 16
+# Exact named prefixes that mean the validation environment itself cannot
+# support the run (sandbox incapacity), never that the candidate is wrong.
+_ENVIRONMENT_UNSUPPORTED_PREFIXES: tuple[str, ...] = (
+    "validation_unsupported_in_sandbox:",
+    "unsupported_sandbox_backend:",
+    "validation_exec_scratch_unavailable:",
+    "validation_executable_unavailable:",
+    "validation_pytest_runtime_unavailable:",
+    "validation_pytest_runtime_missing_pytest:",
+)
 
 
 def _bounded_cause(value: Any) -> str | None:
@@ -263,9 +273,20 @@ def _canonical_terminal_reason(event: dict[str, Any], state: str) -> dict[str, A
         if message is not None:
             alertable_value = reason.get("alertable")
             alertable = alertable_value if isinstance(alertable_value, bool) else True
+            code = state
+            taxonomy = "lifecycle_terminal_failure"
+            # NF-548/M7: strictly named validation-environment impossibility
+            # prefixes classify as environment-unsupported so sandbox
+            # incapacity is machine-separable from real candidate failures.
+            # Generic chmod/landlock/PermissionError prose is deliberately NOT
+            # promoted: such text may come from tests that assert chmod
+            # authority on purpose, so only these exact named prefixes count.
+            if message.startswith(_ENVIRONMENT_UNSUPPORTED_PREFIXES):
+                code = "validation_unsupported_in_sandbox"
+                taxonomy = "validation_environment_unsupported"
             return {
-                "code": state,
-                "taxonomy": "lifecycle_terminal_failure",
+                "code": code,
+                "taxonomy": taxonomy,
                 "source": source,
                 "message": message,
                 "missing_cause": False,
