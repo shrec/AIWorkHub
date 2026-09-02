@@ -966,12 +966,13 @@ def aiworkhub_vscode_lm_worker_tool(
     )
 
 
-@mcp.tool()
-def aiworkhub_router_known_repositories(limit: int = 64, include_inactive: bool = False) -> dict[str, Any]:
-    """READ-ONLY: bounded shared registry of live AIWorkHub repository routes.
+def _known_repositories(limit: int, include_inactive: bool) -> dict[str, Any]:
+    """The one repository-listing body both tool names expose.
 
-    This is discovery only.  Task storage and task mutation remain scoped to
-    the current repository's own ``.aiworkhub`` MCP child.
+    ``aiworkhub_router_known_repositories`` and ``aiworkhub_repo_list`` had
+    byte-identical bodies. Two tool names answering one question is a choice;
+    two copies of the answer is how they start disagreeing, and a model calling
+    either has no way to know which one drifted.
     """
 
     return shared_router.list_known_repositories(
@@ -982,12 +983,21 @@ def aiworkhub_router_known_repositories(limit: int = 64, include_inactive: bool 
 
 
 @mcp.tool()
+def aiworkhub_router_known_repositories(limit: int = 64, include_inactive: bool = False) -> dict[str, Any]:
+    """READ-ONLY: bounded shared registry of live AIWorkHub repository routes.
+
+    This is discovery only.  Task storage and task mutation remain scoped to
+    the current repository's own ``.aiworkhub`` MCP child.
+    """
+
+    return _known_repositories(limit, include_inactive)
+
+
+@mcp.tool()
 def aiworkhub_repo_list(limit: int = 64, include_inactive: bool = False) -> dict[str, Any]:
     """READ-ONLY: bounded live repository identities available to this manager."""
 
-    return shared_router.list_known_repositories(
-        current_root=core.repo_root(), limit=limit, include_inactive=include_inactive,
-    )
+    return _known_repositories(limit, include_inactive)
 
 
 @mcp.tool()
