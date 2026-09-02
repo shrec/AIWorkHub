@@ -13,7 +13,8 @@ import hashlib
 import json
 import re
 import sqlite3
-from datetime import datetime, timezone
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, cast
 
@@ -271,6 +272,81 @@ def _summary(commit_id: str, request_id: str, commit: LearningCommit) -> dict[st
         "evidence_count": len(commit.evidence_ids),
         "evidence_sha256": hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
         "primary_evidence": commit.evidence_ids[0] if commit.evidence_ids else "",
+    }
+
+
+# How far back a coverage measurement looks. Older cards predate the learning
+# path being wired at all, so counting them would report a permanent failure
+# rather than current practice.
+COVERAGE_WINDOW_DAYS = 14
+
+
+def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> dict[str, Any]:
+    """Measure how much of what was decided recently produced a lesson.
+
+    Committing a lesson after an accept or a reject is a manager duty with no
+    gate: nothing failed when it was skipped, and nothing said so. Measured on
+    this repository the day the loop first closed: 3 lessons against 758
+    finished cards. A duty nobody measures is a duty that quietly stops.
+
+    Bounded and read-only. Cards older than the window are excluded because
+    they were decided before a lesson could be recorded at all -- counting them
+    would report history as a failure of present practice.
+
+    Quality-review children are excluded too: a reviewer run is the review
+    mechanism, not a decision about code, and a lesson drawn from one would be
+    a lesson about reviewing. Left in, they dominated the denominator -- every
+    one of the five most recent uncommitted cards was a reviewer child.
+    """
+
+    _readiness, db_path = task_store._require_ready(root)
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=max(1, int(window_days)))
+    ).isoformat()
+    with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        # The table is created lazily by the first commit, so a repository that
+        # has never recorded a lesson has none. That is a true measurement --
+        # zero coverage -- and exactly the state where this number matters, so
+        # it must not raise.
+        has_store = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='learning_commits'"
+        ).fetchone() is not None
+        decided = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE updated_at >= ? "
+            "AND topic <> 'quality_review' AND (status='finished' OR status LIKE 'blocked%')",
+            (cutoff,),
+        ).fetchone()[0]
+        with_lesson = conn.execute(
+            "SELECT COUNT(DISTINCT t.task_id) FROM tasks t "
+            "JOIN learning_commits l ON l.task_id = t.task_id "
+            "WHERE t.updated_at >= ? "
+            "AND t.topic <> 'quality_review' AND (t.status='finished' OR t.status LIKE 'blocked%')",
+            (cutoff,),
+        ).fetchone()[0] if has_store else 0
+        missing = conn.execute(
+            "SELECT t.task_id FROM tasks t "
+            + ("LEFT JOIN learning_commits l ON l.task_id = t.task_id "
+               if has_store else "")
+            + "WHERE t.updated_at >= ? "
+            + ("AND l.task_id IS NULL " if has_store else "")
+            + "AND t.topic <> 'quality_review' AND (t.status='finished' OR t.status LIKE 'blocked%') "
+            "ORDER BY t.updated_at DESC LIMIT 5",
+            (cutoff,),
+        ).fetchall()
+    decided = int(decided)
+    with_lesson = int(with_lesson)
+    return {
+        "schema_id": "aiworkhub.learning_coverage.v1",
+        "window_days": int(window_days),
+        "decided_cards": decided,
+        "cards_with_lesson": with_lesson,
+        "cards_without_lesson": max(0, decided - with_lesson),
+        "coverage_percent": (
+            round(with_lesson / decided * 100.0, 1) if decided else None
+        ),
+        "recent_without_lesson": [str(row["task_id"]) for row in missing],
     }
 
 

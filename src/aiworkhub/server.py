@@ -471,6 +471,7 @@ from . import evidence_instruments
 from . import launch_queue_contract
 from . import launch_queue_persist
 from . import known_bug_scanner
+from . import learning_commit_store
 from . import manager_ai_tools
 from . import process_launcher
 from . import review_summarizer
@@ -1394,6 +1395,17 @@ def aiworkhub_task_health() -> dict[str, Any]:
         result["reconciler"] = {
             "ok": False,
             "last_error": f"reconciler_health_unavailable:{type(exc).__name__}",
+        }
+    # Committing a lesson after an accept or a reject is a manager duty with no
+    # gate: nothing fails when it is skipped and nothing said so. Measured the
+    # day the loop first closed: 2 lessons against 198 decided cards. Report it
+    # where the manager already looks, so the duty stops being invisible.
+    try:
+        result["learning_coverage"] = learning_commit_store.coverage(core.repo_root())
+    except Exception as exc:  # noqa: BLE001 -- health must never fail closed
+        result["learning_coverage"] = {
+            "ok": False,
+            "last_error": f"learning_coverage_unavailable:{type(exc).__name__}",
         }
     return result
 
