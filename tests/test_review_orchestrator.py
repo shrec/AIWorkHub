@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import hashlib
+import json
 import sqlite3
 from types import SimpleNamespace
 from datetime import datetime, timezone
@@ -511,3 +512,146 @@ def test_archive_status_uses_canonical_task_envelope(monkeypatch, tmp_path: Path
     )
 
     assert driver._is_archived("REVIEWER") is True
+
+
+def _show(status_by_task: dict) -> object:
+    def show(_repo: Path, task_id: str) -> dict:
+        if task_id not in status_by_task:
+            return {"returncode": 1, "stdout": ""}
+        return {"returncode": 0, "stdout": json.dumps(status_by_task[task_id])}
+
+    return show
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        {"task_id": "TARGET", "status": "finished", "archived_at": "2026-08-29T00:00:00Z"},
+        {"task_id": "TARGET", "status": "superseded", "worker_status": "superseded"},
+        {"task_id": "TARGET", "status": "blocked"},
+        {"task_id": "TARGET", "status": "finished"},
+    ],
+)
+def test_an_action_whose_target_left_review_retires_instead_of_failing(
+    monkeypatch, tmp_path: Path, card: dict
+) -> None:
+    """A decided target cannot be driven through review -- that is not a failure.
+
+    Failing it was: a failed action parks every later action in its chain, so
+    one moot launch stranded eleven more. Measured on this repository: 129
+    chains and 1,389 actions permanently unreservable, and every one of the 39
+    chains still live targeted an already-decided card.
+    """
+    manager = _Manager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "review.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    monkeypatch.setattr(review_orchestrator.task_engine, "show_task", _show({"TARGET": card}))
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.completed == 1
+    assert result.failed == 0
+    assert manager.launches == [], "a decided target must not spawn a reviewer"
+    rows = review_lifecycle.rows_for_test(tmp_path / "review.sqlite")
+    assert rows[0]["state"] == "completed"
+    receipt = json.loads(rows[0]["receipt_json"])
+    assert receipt["obsolete_reason"].startswith("target_left_review:")
+    assert receipt["result"]["state"] == "obsolete"
+
+
+def test_a_reviewable_target_is_still_driven(monkeypatch, tmp_path: Path) -> None:
+    """Retirement must not swallow live work."""
+    manager = _Manager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "review.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    monkeypatch.setattr(
+        review_orchestrator.task_engine, "show_task",
+        _show({"TARGET": {"task_id": "TARGET", "status": "review"}}),
+    )
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.completed == 1
+    assert len(manager.launches) == 1, "a target still in review must be launched"
+
+
+def test_an_unreadable_card_is_never_treated_as_decided(monkeypatch, tmp_path: Path) -> None:
+    """Fail closed: not knowing is not the same as knowing it is over."""
+    manager = _Manager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "review.sqlite", route_selector=_route
+    )
+    monkeypatch.setattr(
+        review_orchestrator.task_engine, "show_task",
+        lambda _repo, _task_id: {"returncode": 1, "stdout": ""},
+    )
+    assert driver._target_left_review("TARGET") == ""
+
+    monkeypatch.setattr(
+        review_orchestrator.task_engine, "show_task",
+        lambda _repo, _task_id: {"returncode": 0, "stdout": "not json"},
+    )
+    assert driver._target_left_review("TARGET") == ""
+
+
+def test_needfix_close_is_not_retired_by_a_decided_target() -> None:
+    """Bookkeeping outlives the review it followed.
+
+    needfix_close resolves NeedFix rows linked to the target. That stays
+    meaningful once the target is accepted or archived, so it is deliberately
+    absent from the driving set.
+    """
+    assert "needfix_close" not in review_orchestrator.REVIEW_DRIVING_ACTIONS
+    assert review_orchestrator.REVIEW_DRIVING_ACTIONS == {
+        "launch", "accept", "archive", "target_accept", "target_archive",
+    }
+
+
+def test_needfix_close_survives_a_chain_whose_reviewers_were_retired(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Bookkeeping must not die of a dependency it never had.
+
+    reviewer_request_ids were hoisted above the action branch, so needfix_close
+    -- which never reads them -- raised KeyError as soon as the reviewer
+    actions ahead of it were retired as obsolete. Measured live the moment
+    retirement landed.
+    """
+    manager = _Manager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "review.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    monkeypatch.setattr(
+        review_orchestrator.task_engine, "show_task",
+        _show({"TARGET": {"task_id": "TARGET", "status": "finished",
+                          "archived_at": "2026-08-29T00:00:00Z"}}),
+    )
+    monkeypatch.setattr(
+        review_orchestrator.needfix_store, "list_needfix",
+        lambda _repo, **_kwargs: [],
+    )
+
+    # eleven retirements, then the bookkeeping action itself
+    result = driver.drain(max_actions=12, now=NOW)
+
+    assert result.failed == 0, "no action in a retired chain may fail"
+    assert result.completed == 12
+    rows = review_lifecycle.rows_for_test(tmp_path / "review.sqlite")
+    assert [r["state"] for r in rows] == ["completed"] * 12
+    last = json.loads(rows[-1]["receipt_json"])
+    assert last["action_type"] == "needfix_close"
+    assert "obsolete_reason" not in last, "bookkeeping ran, it was not retired"

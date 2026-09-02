@@ -25,6 +25,20 @@ from . import (
 
 LENSES = ("correctness", "security", "code_quality")
 RECEIPT_SCHEMA = "aiworkhub.review_orchestrator_receipt.v1"
+
+# The actions whose whole purpose is to drive ONE candidate through review.
+# A target that has left `review` cannot be driven through it, so attempting
+# them can only fail -- and a failed action parks every later action in its
+# chain, which is how 129 chains and 1,389 actions became permanently
+# unreservable here. ``needfix_close`` is deliberately absent: it is
+# bookkeeping that stays meaningful after the review ended.
+REVIEW_DRIVING_ACTIONS = frozenset({
+    "launch", "accept", "archive", "target_accept", "target_archive",
+})
+# Statuses a target can still be driven through review from. Anything else is
+# a decided outcome, and fail-closed means an UNREADABLE card counts as still
+# reviewable -- never retire an action on a card we could not read.
+REVIEWABLE_TARGET_STATUSES = frozenset({"review", "processing", "pending"})
 MAX_RECEIPT_BYTES = 16 * 1024
 
 
@@ -361,6 +375,17 @@ class ReviewOrchestrator:
         target_request = str(identity["target_request_id"])
         reviewer_task = self._reviewer_task_id(identity, action.lens)
         prior = self._receipts(action.chain_id)
+        if action.action_type in REVIEW_DRIVING_ACTIONS:
+            decided = self._target_left_review(target_task)
+            if decided:
+                # Retiring an obsolete action is a real terminal outcome, not a
+                # failure: there was nothing left to do. Failing it instead
+                # parked the rest of its chain forever.
+                return self._receipt(
+                    action,
+                    obsolete_reason=f"target_left_review:{decided}",
+                    result={"ok": True, "state": "obsolete", "task_id": target_task},
+                )
         if action.action_type == "launch":
             readiness = self._launch_readiness(action)
             if readiness["outcome"] == "deferred":
@@ -427,17 +452,26 @@ class ReviewOrchestrator:
                 action, reviewer_task_id=reviewer_task,
                 reviewer_request_id=str(accepted["reviewer_request_id"]), result=result,
             )
-        reviewer_ids = [
-            str(self._lens_receipt(prior, lens, "accept")["reviewer_request_id"])
-            for lens in LENSES
-        ]
+        # Computed per branch, not up front: only the two target actions carry
+        # reviewer identities into their effect. needfix_close never used them,
+        # and hoisting the lookup made it fail with KeyError on a chain whose
+        # reviewer actions had been retired as obsolete -- bookkeeping dying of
+        # a dependency it did not have.
+        def _reviewer_ids() -> list[str]:
+            return [
+                str(self._lens_receipt(prior, lens, "accept")["reviewer_request_id"])
+                for lens in LENSES
+            ]
+
         if action.action_type == "target_accept":
+            reviewer_ids = _reviewer_ids()
             result = self.manager.accept_review(
                 target_request, target_task, reviewer_request_ids=reviewer_ids
             )
             self._require_ok(result, "target_accept_failed")
             return self._receipt(action, reviewer_request_ids=reviewer_ids, result=result)
         if action.action_type == "target_archive":
+            reviewer_ids = _reviewer_ids()
             result = task_engine.archive_task(
                 self.manager.repo, target_task, actor="system",
                 reason=f"automatic review chain complete:{target_request}",
@@ -709,6 +743,25 @@ class ReviewOrchestrator:
         if result.get("ok") is not True:
             detail = result.get("error") or result.get("stderr") or "unknown"
             raise RuntimeError(prefix + ":" + str(detail))
+
+    def _target_left_review(self, task_id: str) -> str:
+        """Canonical status once the target is no longer a review surface.
+
+        Returns "" when the target can still be driven through review AND when
+        the card cannot be read at all -- an unreadable card must never cause
+        an action to be retired, only a card that is readably decided.
+        """
+        try:
+            status = task_engine.show_task(self.manager.repo, task_id)
+            if status.get("returncode") != 0:
+                return ""
+            card = json.loads(str(status.get("stdout") or ""))
+        except Exception:
+            return ""
+        if not isinstance(card, dict):
+            return ""
+        canonical = task_store.canonical_status(card)
+        return "" if canonical in REVIEWABLE_TARGET_STATUSES else str(canonical)
 
     def _is_archived(self, task_id: str) -> bool:
         try:
