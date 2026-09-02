@@ -61,6 +61,10 @@ _PACKAGE_FILES = (
     "_version.py",
     "repository_state.py",
     "semantic_edit.py",
+    # The applier layer semantic_edit deliberately excludes: one definition
+    # shared by the worker session and the manager CLI, so a synthetic layout
+    # that omits it cannot import worker_ai_tools_mcp at all.
+    "semantic_edit_applier.py",
     "worker_ai_tools_mcp.py",
     "quality_reviewer.py",
     "evidence_levels.py",
