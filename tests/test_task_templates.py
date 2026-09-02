@@ -1265,3 +1265,74 @@ def test_bounded_text_still_accepts_multiline_objectives():
 
     text = "first line\nsecond line"
     assert _bounded_text(text, "objective", MAX_OBJECTIVE_LENGTH) == text
+
+
+# --- package gates are the template's job, not the card author's -------------
+
+
+PACKAGE_GATE = "tests/test_module_size_ratchet.py"
+
+
+def _expanded(production, tests):
+    return task_templates_module.expand_template(
+        "implementation_with_tests", production_paths=production, test_paths=tests
+    )
+
+
+def test_a_package_change_carries_its_repository_gates_without_being_asked():
+    """Which gates a change trips is mechanical; a card author must not recall it.
+
+    Two cards in a row got this wrong by hand. AIWORKHUB_01078 omitted the
+    ratchets, so a new sqlite connection surfaced only in the full suite AFTER
+    acceptance. AIWORKHUB_01079 then included one the sandbox cannot run and
+    failed a correct candidate. Both are facts about the repository, so the
+    template derives them.
+    """
+    expanded = _expanded(["src/aiworkhub/skill_registry.py"], ["tests/test_skill_registry.py"])
+    gate = [c for c in expanded["validation"] if PACKAGE_GATE in c]
+    assert len(gate) == 1
+    for name in task_templates_module.PACKAGE_GATE_TESTS:
+        assert name in gate[0]
+    assert len(expanded["validation_roles"]) == len(expanded["validation"])
+
+
+@pytest.mark.parametrize(
+    ("production", "tests"),
+    [
+        (["scripts/foo.py"], ["tests/test_foo.py"]),
+        (["vscode-extension/src/a.ts"], ["vscode-extension/src/a.test.js"]),
+    ],
+)
+def test_a_change_outside_the_package_carries_no_package_gate(production, tests):
+    """The gates measure the package; nothing else should pay for them."""
+    expanded = _expanded(production, tests)
+    assert not any(PACKAGE_GATE in c for c in expanded["validation"])
+
+
+def test_one_package_path_among_others_is_enough():
+    expanded = _expanded(
+        ["scripts/foo.py", "src/aiworkhub/core.py"], ["tests/test_foo.py"]
+    )
+    assert any(PACKAGE_GATE in c for c in expanded["validation"])
+
+
+def test_the_gate_set_excludes_every_test_a_worktree_cannot_run():
+    """A worker worktree is a sparse checkout with no scripts/ directory.
+
+    tests/test_os_dependency_boundary.py imports check_os_dependency_boundary
+    from scripts/, so declaring it kills the run at collection with
+    ModuleNotFoundError however correct the work is. It is the manager's gate,
+    on the canonical tree.
+    """
+    assert "tests/test_os_dependency_boundary.py" not in task_templates_module.PACKAGE_GATE_TESTS
+    src = Path(task_templates_module.__file__).resolve().parents[2] / "src"
+    for name in task_templates_module.PACKAGE_GATE_TESTS:
+        body = (src.parent / name).read_text(encoding="utf-8")
+        assert "scripts" not in body.split('"""')[0], name
+
+
+def test_the_gate_is_appended_once_even_for_many_package_paths():
+    expanded = _expanded(
+        ["src/aiworkhub/a.py", "src/aiworkhub/b.py"], ["tests/test_a.py"]
+    )
+    assert sum(1 for c in expanded["validation"] if PACKAGE_GATE in c) == 1

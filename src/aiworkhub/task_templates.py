@@ -536,6 +536,30 @@ def _looks_like_test_path(path: str) -> bool:
 
 
 
+# Repository gates that ANY change under the package trips, appended by the
+# template so a card author never has to remember them. Both read only `src/`
+# and `tests/`, so a worker's sparse-checkout worktree can actually run them.
+#
+# tests/test_os_dependency_boundary.py is deliberately ABSENT: it imports
+# check_os_dependency_boundary from scripts/, which no worker worktree
+# contains, so declaring it fails a card at collection with ModuleNotFoundError
+# no matter how correct the work is. That gate belongs to the manager on the
+# canonical tree. Measured: it cost AIWORKHUB_01079 a full rerun after 227 of
+# its own tests had passed.
+PACKAGE_ROOT = "src/aiworkhub/"
+PACKAGE_GATE_TESTS: tuple[str, ...] = (
+    "tests/test_module_size_ratchet.py",
+    "tests/test_declared_invariants.py",
+)
+
+
+def _package_gate_command(production: Sequence[str]) -> str | None:
+    """One pytest command for the gates a package change always trips."""
+    if not any(str(path).startswith(PACKAGE_ROOT) for path in production):
+        return None
+    return " ".join([COMMAND_PYTHON, "-m", "pytest", "-q", *PACKAGE_GATE_TESTS])
+
+
 def _validation_commands_for(
     spec: TaskTemplateSpec, production: list[str], tests: list[str]
 ) -> list[str]:
@@ -570,6 +594,9 @@ def _validation_commands_for(
         validation.append(" ".join([COMMAND_NODE, "--test", *node_tests]))
     if spec.generates_diff_check:
         validation.append(DIFF_CHECK_COMMAND)
+    gate = _package_gate_command(production)
+    if gate is not None and gate not in validation:
+        validation.append(gate)
     return validation
 
 
