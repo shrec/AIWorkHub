@@ -689,11 +689,6 @@
         "count": 1
       },
       {
-        "path": "src/aiworkhub/development_rules.py",
-        "pattern": "creationflags",
-        "count": 1
-      },
-      {
         "path": "src/aiworkhub/fresh_task_store.py",
         "pattern": "def_atomic",
         "count": 1
@@ -719,12 +714,7 @@
         "count": 1
       },
       {
-        "path": "src/aiworkhub/process_launcher.py",
-        "pattern": "os_killpg",
-        "count": 1
-      },
-      {
-        "path": "src/aiworkhub/process_launcher.py",
+        "path": "src/aiworkhub/process_identity.py",
         "pattern": "os_name_eq",
         "count": 1
       },
@@ -815,13 +805,8 @@
       },
       {
         "path": "src/aiworkhub/source_graph_daemon.py",
-        "pattern": "creationflags",
-        "count": 1
-      },
-      {
-        "path": "src/aiworkhub/source_graph_daemon.py",
         "pattern": "os_killpg",
-        "count": 2
+        "count": 1
       },
       {
         "path": "src/aiworkhub/source_graph_daemon.py",
@@ -846,7 +831,7 @@
       {
         "path": "src/aiworkhub/sqlite_readonly.py",
         "pattern": "sqlite_connect",
-        "count": 3
+        "count": 1
       },
       {
         "path": "src/aiworkhub/storage_retention.py",
@@ -915,11 +900,6 @@
       },
       {
         "path": "src/aiworkhub/worker_supervisor.py",
-        "pattern": "creationflags",
-        "count": 1
-      },
-      {
-        "path": "src/aiworkhub/worker_supervisor.py",
         "pattern": "import_msvcrt",
         "count": 1
       },
@@ -941,11 +921,6 @@
       {
         "path": "src/aiworkhub/worker_supervisor.py",
         "pattern": "sys_platform",
-        "count": 1
-      },
-      {
-        "path": "src/aiworkhub/worker_workspace.py",
-        "pattern": "creationflags",
         "count": 1
       },
       {
@@ -997,8 +972,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 153,
-      "accepted_predecessor_delta": -8
+      "current_total": 145,
+      "accepted_predecessor_delta": -16
     }
   }
 }

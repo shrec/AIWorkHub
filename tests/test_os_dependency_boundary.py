@@ -79,7 +79,12 @@ def test_current_tree_passes_and_baseline_is_sorted():
     assert boundary is not None
     keys = [(entry.path, entry.pattern) for entry in boundary.baseline]
     assert keys == sorted(keys)
-    assert sum(entry.count for entry in boundary.baseline) == 153
+    # 153 -> 145: the scanner used to match its patterns against raw source, so
+    # a docstring DESCRIBING an OS dependency was counted as one. Twelve of the
+    # recorded matches were prose, including development_rules.py -- the file
+    # that declares the rule -- recorded as violating it. The boundary now
+    # measures code only, so the number finally means what it says.
+    assert sum(entry.count for entry in boundary.baseline) == 145
 
 
 def test_new_identity_and_same_identity_growth_fail(tmp_path):
@@ -186,3 +191,33 @@ def test_exemption_widening_is_rejected():
     from aiworkhub.development_rules import ManifestValidationError, parse_manifest
     with pytest.raises(ManifestValidationError):
         parse_manifest(copy.deepcopy(raw))
+
+
+def test_prose_that_describes_a_dependency_is_not_a_dependency(tmp_path):
+    """A docstring naming a pattern must not be counted as using it."""
+    source = (
+        '"""This module explains why os.name == "nt" branches are avoided."""\n'
+        "# also mentioned in a comment: sys.platform\n"
+        "VALUE = 1\n"
+    )
+    root, config = _fixture(tmp_path, {"prose.py": source}, [])
+    assert checker.scan_repository(root, checker.load_manifest(config)) == {}
+
+
+def test_real_code_beside_prose_is_still_counted(tmp_path):
+    """Stripping prose must not become stripping evidence."""
+    source = (
+        '"""Explains os.name == "nt" at length."""\n'
+        "import os\n"
+        "IS_WINDOWS = os.name == 'nt'\n"
+    )
+    root, config = _fixture(tmp_path, {"mixed.py": source}, [])
+    counts = checker.scan_repository(root, checker.load_manifest(config))
+    assert counts[("src/aiworkhub/mixed.py", "os_name_eq")] == 1
+
+
+def test_an_untokenizable_file_fails_closed(tmp_path):
+    """Never fall back to scanning raw text -- that restores the phantom counts."""
+    root, config = _fixture(tmp_path, {"broken.py": 'x = "unterminated\n'}, [])
+    with pytest.raises(ValueError, match="invalid Python syntax in scan input"):
+        checker.scan_repository(root, checker.load_manifest(config))

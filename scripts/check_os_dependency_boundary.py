@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import io
 import json
 import re
 import sys
+import tokenize
 from collections import Counter
 from pathlib import Path
 
@@ -35,6 +37,42 @@ PATTERNS: dict[str, re.Pattern[str]] = {
 
 AST_IMPORT_MODULES = ("fcntl", "msvcrt")
 AST_IMPORT_IDENTITIES = tuple(f"import_{module}" for module in AST_IMPORT_MODULES)
+
+
+def _code_only(source: str, relative: str) -> str:
+    """Blank comments and string literals, preserving every offset.
+
+    These patterns are regexes over source text, so a docstring that DESCRIBES
+    an OS dependency was counted as one. Measured across src/aiworkhub: 12
+    phantom matches in 10 baseline entries, including development_rules.py --
+    the file that declares the rule -- recorded as violating it, and this
+    script's own vocabulary counted wherever it was quoted.
+
+    A boundary that cannot tell a description of a thing from the thing is not
+    measuring the boundary. Offsets are preserved rather than the text deleted
+    so line and column numbers stay usable for anything that reports them.
+    """
+
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+        # Fail closed exactly as the AST scanner does: an unreadable file is
+        # never silently scanned raw, which would restore the phantom counts.
+        raise ValueError(f"invalid Python syntax in scan input: {relative}: {exc}") from None
+    grid = [list(line) for line in source.split("\n")]
+    for token in tokens:
+        if token.type not in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        (start_row, start_col), (end_row, end_col) = token.start, token.end
+        for row in range(start_row - 1, end_row):
+            if row >= len(grid):
+                break
+            line = grid[row]
+            first = start_col if row == start_row - 1 else 0
+            last = end_col if row == end_row - 1 else len(line)
+            for column in range(first, min(last, len(line))):
+                line[column] = " "
+    return "\n".join("".join(row) for row in grid)
 
 
 def _ast_import_counts(source: str, relative: str) -> Counter[str]:
@@ -106,8 +144,9 @@ def scan_repository(root: Path, manifest: DevelopmentRulesManifest) -> dict[tupl
         source = path.read_text(encoding="utf-8")
         for identity, count in _ast_import_counts(source, relative).items():
             counts[(relative, identity)] = count
+        code = _code_only(source, relative)
         for identity, regex in PATTERNS.items():
-            count = len(regex.findall(source))
+            count = len(regex.findall(code))
             if count:
                 counts[(relative, identity)] = count
     return dict(sorted(counts.items()))

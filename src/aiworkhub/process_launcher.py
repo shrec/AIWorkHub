@@ -4736,10 +4736,9 @@ class ProcessManager:
             "timestamp": _utcnow(),
             **event,
         }
-        # Return what the ledger actually wrote, not what we asked it to write.
-        # A failure-terminal row gains a canonical terminal_reason on the way
-        # in, so returning ``clean`` gave the finalizing caller an event whose
-        # own replay from the ledger would not compare equal to it.
+        # Return what the ledger actually wrote: a failure-terminal row gains a
+        # canonical terminal_reason on the way in, so returning ``clean`` gave
+        # the caller an event its own replay would not compare equal to.
         return process_event_ledger.append_event(self.process_log_path, clean)
 
     def _events(self) -> list[dict[str, Any]]:
@@ -9750,6 +9749,21 @@ class ProcessManager:
 
     _REQUEST_EVENT_CACHE_LIMIT = 64
 
+    def _request_pid_identity(
+        self, events: list[dict[str, Any]]
+    ) -> PidIdentityEvidence:
+        """PID identity from the merged request history, never the tail row.
+
+        An advisory runtime notice carries ``pid`` without ``pid_start_ticks``,
+        so reading ``events[-1]`` alone downgraded a decidable MISMATCH to
+        UNKNOWN -- and UNKNOWN defers, forever, for any worker quiet enough to
+        have earned a notice.
+        """
+        merged = self._event_identity(events)
+        return _pid_identity_evidence(
+            merged.get("pid"), merged.get("pid_start_ticks")
+        )
+
     def _request_events(self, request_id: str) -> list[dict[str, Any]]:
         """Return exact request history without replaying an unchanged ledger.
 
@@ -10216,17 +10230,7 @@ class ProcessManager:
                 deferred = self._request_events(request_id)
                 if deferred:
                     latest = deferred[-1]
-                    # PID identity comes from the merged request identity, not
-                    # from whichever row happens to be last. Advisory rows --
-                    # a runtime notice, for instance -- carry `pid` but no
-                    # `pid_start_ticks`, so reading the tail alone turned a
-                    # decidable MISMATCH into UNKNOWN and deferred a finished
-                    # worker forever: the quieter the worker, the more certain
-                    # the notice, and the more permanent the deferral.
-                    merged = self._event_identity(deferred)
-                    identity = _pid_identity_evidence(
-                        merged.get("pid"), merged.get("pid_start_ticks")
-                    )
+                    identity = self._request_pid_identity(deferred)
                     if identity.verdict is PidIdentityVerdict.MATCH:
                         return latest
                     if identity.verdict is PidIdentityVerdict.UNKNOWN:
@@ -10600,18 +10604,10 @@ class ProcessManager:
             if request_id in self._active_request_ids():
                 return None
         with self._request_lock(request_id):
-            # Re-read under the lock, through the SAME append-aware projection
-            # the sweep's prefilter used. This was a full _request_events
-            # replay per request: 686 candidates x 3.34 s of re-parsing the
-            # same 558 MB ledger to read one row, a 38-minute sweep inside a
-            # 30-second loop, for 132 workspaces that still existed. The
-            # projection is invalidated by any ledger change, so it is fresh
-            # exactly when freshness matters and free when nothing moved.
-            #
-            # Using one fold for the prefilter and another for the re-read also
-            # made the two disagree: an advisory runtime-notice row is the last
-            # raw row but carries no lifecycle state, so the prefilter called a
-            # request collectable and the re-read silently called it not.
+            # Re-read under the lock through the SAME projection the prefilter
+            # used. A full _request_events replay per request cost 686 x 3.34 s
+            # -- a 38-minute sweep inside a 30-second loop -- to read one row.
+            # Any ledger change invalidates it, so it stays fresh for free.
             latest = self._latest_by_request().get(request_id)
             if latest is None:
                 return None
@@ -10897,16 +10893,8 @@ class ProcessManager:
                 return latest
             with self._lock:
                 live = self._live.get(request_id)
-            # Identity is a property of the REQUEST, assembled from every row
-            # that ever named it -- not of whichever row is last. An advisory
-            # row (a runtime notice) carries `pid` without `pid_start_ticks`,
-            # and reading the tail alone downgraded a decidable MISMATCH to
-            # UNKNOWN, which defers. A worker quiet enough to earn a notice
-            # could therefore never be finalized.
             merged_identity = self._event_identity(events)
-            identity = _pid_identity_evidence(
-                merged_identity.get("pid"), merged_identity.get("pid_start_ticks")
-            )
+            identity = self._request_pid_identity(events)
             status_hint_path = Path(
                 str(latest.get("supervisor_status_path") or "")
             )
@@ -14373,282 +14361,17 @@ class ProcessManager:
 _pid_alive = process_is_alive
 
 
-def _pid_start_ticks(pid: int) -> int | None:
-    """Read the canonical creation timestamp; ``None`` means unknown."""
-    return runtime_temp.process_start_ticks(pid)
-
-
-def _pid_matches(pid: int, expected_start_ticks: Any) -> bool:
-    if not _pid_alive(pid):
-        return False
-    if expected_start_ticks in (None, ""):
-        return True
-    try:
-        expected = int(expected_start_ticks)
-    except (TypeError, ValueError):
-        return False
-    return _pid_start_ticks(pid) == expected
-
-
-class PidIdentityVerdict(Enum):
-    """Truthful result of an exact PID plus creation-time identity probe."""
-
-    MATCH = "match"
-    MISMATCH = "mismatch"
-    UNKNOWN = "unknown"
-
-
-@dataclass(frozen=True)
-class PidIdentityEvidence:
-    """Immutable evidence captured at the process-identity boundary."""
-
-    verdict: PidIdentityVerdict
-    pid: int | None
-    expected_start_ticks: int | None
-    observed_start_ticks: int | None
-    attempts: int
-    operation: str
-    winerror: int | None = None
-    exception: str = ""
-
-
-_PID_IDENTITY_MAX_ATTEMPTS = 3
-_PID_IDENTITY_RETRY_DELAY_SECONDS = 0.01
-_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_WINDOWS_ERROR_INVALID_PARAMETER = 87
-
-
-def _windows_pid_identity_once(
-    pid: int,
-    expected_start_ticks: int,
-    *,
-    attempt: int,
-) -> PidIdentityEvidence:
-    """Perform one Windows identity probe and capture failure provenance."""
-
-    class _FileTime(ctypes.Structure):
-        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
-
-    try:
-        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        kernel32.CloseHandle.restype = ctypes.c_int
-        kernel32.GetProcessTimes.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(_FileTime),
-            ctypes.POINTER(_FileTime),
-            ctypes.POINTER(_FileTime),
-            ctypes.POINTER(_FileTime),
-        ]
-        kernel32.GetProcessTimes.restype = ctypes.c_int
-        getattr(ctypes, "set_last_error")(0)
-        handle = kernel32.OpenProcess(
-            _WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION,
-            False,
-            pid,
-        )
-    except OSError as exc:
-        winerror = getattr(exc, "winerror", None)
-        if winerror is None:
-            winerror = int(getattr(ctypes, "get_last_error")()) or None
-        return PidIdentityEvidence(
-            verdict=PidIdentityVerdict.UNKNOWN,
-            pid=pid,
-            expected_start_ticks=expected_start_ticks,
-            observed_start_ticks=None,
-            attempts=attempt,
-            operation="OpenProcess",
-            winerror=winerror,
-            exception=type(exc).__name__,
-        )
-
-    if not handle:
-        winerror = int(getattr(ctypes, "get_last_error")()) or None
-        absent = winerror == _WINDOWS_ERROR_INVALID_PARAMETER
-        return PidIdentityEvidence(
-            verdict=(
-                PidIdentityVerdict.MISMATCH
-                if absent
-                else PidIdentityVerdict.UNKNOWN
-            ),
-            pid=pid,
-            expected_start_ticks=expected_start_ticks,
-            observed_start_ticks=None,
-            attempts=attempt,
-            operation="OpenProcess",
-            winerror=winerror,
-            exception="ProcessAbsent" if absent else "OpenProcessFailed",
-        )
-
-    creation = _FileTime()
-    exit_time = _FileTime()
-    kernel = _FileTime()
-    user = _FileTime()
-    try:
-        try:
-            getattr(ctypes, "set_last_error")(0)
-            ok = kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(creation),
-                ctypes.byref(exit_time),
-                ctypes.byref(kernel),
-                ctypes.byref(user),
-            )
-        except OSError as exc:
-            winerror = getattr(exc, "winerror", None)
-            if winerror is None:
-                winerror = int(getattr(ctypes, "get_last_error")()) or None
-            return PidIdentityEvidence(
-                verdict=PidIdentityVerdict.UNKNOWN,
-                pid=pid,
-                expected_start_ticks=expected_start_ticks,
-                observed_start_ticks=None,
-                attempts=attempt,
-                operation="GetProcessTimes",
-                winerror=winerror,
-                exception=type(exc).__name__,
-            )
-        if not ok:
-            winerror = int(getattr(ctypes, "get_last_error")()) or None
-            return PidIdentityEvidence(
-                verdict=PidIdentityVerdict.UNKNOWN,
-                pid=pid,
-                expected_start_ticks=expected_start_ticks,
-                observed_start_ticks=None,
-                attempts=attempt,
-                operation="GetProcessTimes",
-                winerror=winerror,
-                exception="GetProcessTimesFailed",
-            )
-        observed = (int(creation.high) << 32) | int(creation.low)
-        return PidIdentityEvidence(
-            verdict=(
-                PidIdentityVerdict.MATCH
-                if observed == expected_start_ticks
-                else PidIdentityVerdict.MISMATCH
-            ),
-            pid=pid,
-            expected_start_ticks=expected_start_ticks,
-            observed_start_ticks=observed,
-            attempts=attempt,
-            operation="GetProcessTimes",
-        )
-    finally:
-        kernel32.CloseHandle(handle)
-
-
-def _pid_identity_evidence(pid: Any, expected_start_ticks: Any) -> PidIdentityEvidence:
-    """Return bounded, fail-closed PID identity evidence on every platform."""
-
-    try:
-        numeric_pid = int(pid or 0)
-    except (TypeError, ValueError) as exc:
-        return PidIdentityEvidence(
-            verdict=PidIdentityVerdict.UNKNOWN,
-            pid=None,
-            expected_start_ticks=None,
-            observed_start_ticks=None,
-            attempts=0,
-            operation="parse_pid",
-            exception=type(exc).__name__,
-        )
-    if numeric_pid <= 0:
-        return PidIdentityEvidence(
-            verdict=PidIdentityVerdict.MISMATCH,
-            pid=numeric_pid,
-            expected_start_ticks=None,
-            observed_start_ticks=None,
-            attempts=0,
-            operation="pid_absent",
-            exception="NonPositivePid",
-        )
-    if expected_start_ticks in (None, ""):
-        return PidIdentityEvidence(
-            verdict=PidIdentityVerdict.UNKNOWN,
-            pid=numeric_pid,
-            expected_start_ticks=None,
-            observed_start_ticks=None,
-            attempts=0,
-            operation="parse_expected_start_ticks",
-            exception="ExpectedStartTicksMissing",
-        )
-    try:
-        expected = int(expected_start_ticks)
-    except (TypeError, ValueError) as exc:
-        return PidIdentityEvidence(
-            verdict=PidIdentityVerdict.UNKNOWN,
-            pid=numeric_pid,
-            expected_start_ticks=None,
-            observed_start_ticks=None,
-            attempts=0,
-            operation="parse_expected_start_ticks",
-            exception=type(exc).__name__,
-        )
-
-    if os.name == "nt":
-        evidence: PidIdentityEvidence | None = None
-        for attempt in range(1, _PID_IDENTITY_MAX_ATTEMPTS + 1):
-            evidence = _windows_pid_identity_once(
-                numeric_pid,
-                expected,
-                attempt=attempt,
-            )
-            if evidence.verdict is not PidIdentityVerdict.UNKNOWN:
-                return evidence
-            if attempt < _PID_IDENTITY_MAX_ATTEMPTS:
-                time.sleep(_PID_IDENTITY_RETRY_DELAY_SECONDS)
-        assert evidence is not None
-        return evidence
-
-    try:
-        os.kill(numeric_pid, 0)
-    except ProcessLookupError as exc:
-        return PidIdentityEvidence(
-            verdict=PidIdentityVerdict.MISMATCH,
-            pid=numeric_pid,
-            expected_start_ticks=expected,
-            observed_start_ticks=None,
-            attempts=1,
-            operation="kill_zero",
-            exception=type(exc).__name__,
-        )
-    except PermissionError as exc:
-        return PidIdentityEvidence(
-            verdict=PidIdentityVerdict.UNKNOWN,
-            pid=numeric_pid,
-            expected_start_ticks=expected,
-            observed_start_ticks=None,
-            attempts=1,
-            operation="kill_zero",
-            exception=type(exc).__name__,
-        )
-    observed = _pid_start_ticks(numeric_pid)
-    if observed is None:
-        return PidIdentityEvidence(
-            verdict=PidIdentityVerdict.UNKNOWN,
-            pid=numeric_pid,
-            expected_start_ticks=expected,
-            observed_start_ticks=None,
-            attempts=1,
-            operation="_pid_start_ticks",
-            exception="StartTicksUnavailable",
-        )
-    return PidIdentityEvidence(
-        verdict=(
-            PidIdentityVerdict.MATCH
-            if observed == expected
-            else PidIdentityVerdict.MISMATCH
-        ),
-        pid=numeric_pid,
-        expected_start_ticks=expected,
-        observed_start_ticks=observed,
-        attempts=1,
-        operation="_pid_start_ticks",
-    )
-
-
+# Exact process identity (PID reuse refusal) lives in ``process_identity``:
+# one subject, one module, and the size ratchet is descending by design.
+# Re-exported here because callers and tests reach for these launcher names.
+from .process_identity import (  # noqa: E402
+    PidIdentityEvidence,
+    PidIdentityVerdict,
+    _pid_alive,
+    _pid_identity_evidence,
+    _pid_matches,
+    _pid_start_ticks,
+)
 def _identity_verified_pid(pid: Any, ticks: Any) -> int:
     """Return ``pid`` only when its creation timestamp still matches.
 
