@@ -1637,6 +1637,35 @@ class SkillRegistry:
         self._digest_index[digest] = key
         return record
 
+    def adopt(self, record: SkillRecord) -> SkillRecord:
+        """Adopt an already-validated record from a trusted reconstruction.
+
+        Unlike :meth:`propose` -- which admits only an evidence-free ``proposed``
+        record from a worker -- ``adopt`` re-materializes a record in any
+        lifecycle state, with its evidence and counters intact. It is the load
+        path for :mod:`aiworkhub.skill_registry_store`, which reconstructs and
+        digest-verifies each persisted row before handing it here.
+
+        It still fails closed on the registry's own invariants: the record must
+        pass :func:`validate_record`; an existing ``(identity, version)`` is
+        never overwritten; and a content digest already bound to a *different*
+        identity/version is never rebound.
+        """
+        record = validate_record(record)
+        key = (record.identity, record.version)
+        if key in self._entries:
+            _fail(
+                "skill_registry.immutable_identity",
+                f"identity/version {record.identity!r}@{record.version!r} is already registered",
+            )
+        digest = skill_digest(record)
+        bound = self._digest_index.get(digest)
+        if bound is not None and bound != key:
+            _fail("skill_registry.immutable_digest", f"digest {digest} is already registered")
+        self._entries[key] = record
+        self._digest_index[digest] = key
+        return record
+
     def add_evidence(
         self,
         identity: str,

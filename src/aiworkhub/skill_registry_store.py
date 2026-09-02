@@ -19,14 +19,21 @@ SQLite shape as the other stores in this package (see ``roadmap_store``):
   index, so the same digest can never be bound to a second identity/version.
 * Fail-closed reads: a stored record whose recomputed content digest does not
   match its persisted digest is rejected on read and never silently repaired.
-* Fail-closed on forged authority: ``skill_registry.skill_digest`` deliberately
+* What the digests do and do not provide: ``skill_registry.skill_digest``
   hashes only the content fields and excludes the runtime authorization state
   (evidence, ``lifecycle_state``, ``accepted_count``, ``negative_count``), so a
-  tamper that promotes a proposed record to active leaves the content digest
-  unchanged. A second ``state_digest`` computed over the *full* persisted
-  payload closes that gap: any change to the persisted runtime state is detected
-  on read and the record is rejected, never served as a silently granted
-  authority.
+  content digest alone cannot see a tamper that only rewrites runtime state. A
+  second ``state_digest`` computed over the *full* persisted payload covers
+  every field, so rewriting any one column without the digest that spans it is
+  caught. Both digests are unkeyed SHA-256 values living in the SAME row as the
+  payload they cover, so they are DETECTION, not authentication: they catch
+  accidental corruption, a truncated or partial write, and naive hand-editing of
+  a single column. They do NOT resist an adversary who can already write the
+  row -- such a writer sets ``state_digest =
+  sha256(canonical_payload_json(forged_record))`` and both checks pass, so a
+  forged ``active`` record with forged evidence loads as authoritative. No keyed
+  MAC is added to shut that door: the key would have to live in the same
+  repository as the data, so it would buy nothing here.
 
 Persistence preserves the full record -- content fields plus runtime state
 (evidence, lifecycle, counters) -- through :func:`skill_registry.normalize`, so a
@@ -354,10 +361,9 @@ def load_registry(
     """
     registry = SkillRegistry(min_accepted_evidence=min_accepted_evidence)
     for record in list_records(repo_root, limit=limit):
-        # These records were reconstructed and digest-verified on read; load them
-        # directly rather than through ``propose`` (which admits only evidence-free
-        # proposed records and would reject a persisted active/evidenced version).
-        key = (record.identity, record.version)
-        registry._entries[key] = record
-        registry._digest_index[skill_registry.skill_digest(record)] = key
+        # These records were reconstructed and digest-verified on read; adopt them
+        # through the public API rather than ``propose`` (which admits only
+        # evidence-free proposed records and would reject a persisted
+        # active/evidenced version).
+        registry.adopt(record)
     return registry

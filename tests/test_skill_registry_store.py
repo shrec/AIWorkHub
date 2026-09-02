@@ -10,6 +10,7 @@ or unreadable.
 
 from __future__ import annotations
 
+import inspect
 import json
 import sqlite3
 
@@ -242,3 +243,59 @@ def test_dashboard_projection_input_unreadable_store_is_empty(tmp_path):
     registry = provider.get_skills_projection_input()
     assert type(registry).__name__ == "SkillRegistry"
     assert len(registry) == 0
+
+
+def test_module_docstring_scopes_digests_to_detection():
+    # The docstring must describe the digests as DETECTION of corruption and
+    # naive tampering, and must NOT claim they close the forged-authority gap
+    # against a writer who can already rewrite the row.
+    doc = store.__doc__ or ""
+    lowered = doc.lower()
+    assert "detection" in lowered
+    assert "do not resist" in lowered
+    # It is explicit about how a writer defeats both unkeyed digests.
+    assert "sha256(canonical_payload_json" in doc
+    # The superseded claim -- that a second digest "closes that gap" -- is gone.
+    assert "closes that gap" not in lowered
+
+
+def test_adopt_refuses_invalid_record():
+    registry = sr.SkillRegistry(min_accepted_evidence=2)
+    with pytest.raises(sr.SkillRegistryError):
+        registry.adopt("not a skill record")
+
+
+def test_adopt_refuses_overwriting_existing_identity_version():
+    registry = sr.SkillRegistry(min_accepted_evidence=2)
+    registry.adopt(active_record())
+    with pytest.raises(sr.SkillRegistryError) as excinfo:
+        registry.adopt(active_record())
+    assert excinfo.value.code == "skill_registry.immutable_identity"
+
+
+def test_adopt_refuses_rebinding_a_digest(monkeypatch):
+    # A content digest embeds identity/version, so a genuine rebind is only
+    # reachable under a digest collision; force one to exercise the guard.
+    registry = sr.SkillRegistry(min_accepted_evidence=2)
+    monkeypatch.setattr(sr, "skill_digest", lambda record: "f" * 64)
+    registry.adopt(active_record(identity="skill-a", version="1.0.0"))
+    with pytest.raises(sr.SkillRegistryError) as excinfo:
+        registry.adopt(active_record(identity="skill-b", version="1.0.0"))
+    assert excinfo.value.code == "skill_registry.immutable_digest"
+
+
+def test_load_registry_uses_only_public_registry_api():
+    source = inspect.getsource(store.load_registry)
+    assert "_entries" not in source
+    assert "_digest_index" not in source
+
+
+def test_load_registry_round_trips_active_record_via_public_api(tmp_path):
+    record = active_record()
+    store.put_record(tmp_path, record)
+    registry = store.load_registry(tmp_path)
+    loaded = registry.get(record.identity, record.version)
+    assert loaded == record
+    assert loaded.lifecycle_state is sr.LifecycleState.ACTIVE
+    assert loaded.accepted_count == 2
+    assert len(loaded.evidence) == 2
