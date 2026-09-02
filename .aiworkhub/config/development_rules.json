@@ -16,6 +16,29 @@
   ],
   "rules": [
     {
+      "id": "cache_discipline",
+      "topic": "cache_discipline",
+      "kind": "forbidden_pattern",
+      "applicability": {},
+      "allow": [
+        "bounded_cache",
+        "generation_invalidation",
+        "lru_eviction",
+        "measured_hit_rate",
+        "ttl_eviction"
+      ],
+      "forbid": [
+        "authority_cached_with_result",
+        "cache_without_bound",
+        "stale_generation_retention",
+        "unmeasured_cache"
+      ],
+      "payload": {
+        "severity": "error",
+        "rationale_id": "bounded_memory"
+      }
+    },
+    {
       "id": "coding_baseline",
       "topic": "coding_baseline",
       "kind": "coding_convention",
@@ -25,12 +48,14 @@
         "deterministic_output",
         "explicit_authority",
         "incremental_default",
+        "named_failure_cause",
         "structured_errors"
       ],
       "forbid": [
         "ambient_authority",
         "silent_fallback",
-        "unbounded_work"
+        "unbounded_work",
+        "unnamed_refusal"
       ],
       "payload": {
         "guideline_ids": [
@@ -38,37 +63,119 @@
           "canonical_state",
           "deterministic_results",
           "explicit_cleanup",
+          "refusal_names_cause_and_limit",
           "stable_error_taxonomy"
         ],
         "severity": "error"
       }
     },
     {
-      "id": "self_hosting_break_glass",
-      "topic": "self_hosting_break_glass",
+      "id": "cross_platform_contract",
+      "topic": "cross_platform_contract",
       "kind": "coding_convention",
       "applicability": {},
       "allow": [
-        "independent_manager_validation",
-        "measured_task_system_blocker",
-        "minimal_intermediate_fix",
-        "replacement_artifact_install",
-        "return_to_canonical_task_flow"
+        "capability_probed_not_assumed",
+        "linux_contract",
+        "macos_contract",
+        "offset_and_content_contract",
+        "remote_ssh_contract",
+        "windows_contract"
       ],
       "forbid": [
-        "continued_use_of_known_broken_plugin",
-        "scope_expansion_during_break_glass",
-        "silent_task_system_bypass",
-        "unmeasured_break_glass"
+        "platform_only_side_effect",
+        "posix_only_assumption",
+        "shell_string_command",
+        "untestable_platform_branch",
+        "windows_path_guess"
       ],
       "payload": {
         "guideline_ids": [
-          "record_blocker_evidence",
-          "preserve_unrelated_work",
-          "restore_task_system_only",
-          "validate_replacement_independently"
+          "argv_subprocess",
+          "capability_probe_tests",
+          "identical_observable_contract",
+          "pathlib_paths",
+          "platform_contract_tests",
+          "process_tree_cleanup"
         ],
         "severity": "error"
+      }
+    },
+    {
+      "id": "detector_evidence",
+      "topic": "detector_evidence",
+      "kind": "evidence",
+      "applicability": {
+        "tasks": [
+          "audit",
+          "review"
+        ]
+      },
+      "allow": [
+        "measured_against_known_instance",
+        "precision_measured_repo_wide",
+        "recall_measured_on_real_defect"
+      ],
+      "forbid": [
+        "fixture_only_validation"
+      ],
+      "payload": {
+        "required_evidence_types": [
+          "false_positive_scan",
+          "known_instance_recall"
+        ],
+        "min_count": 2
+      }
+    },
+    {
+      "id": "fail_closed_default",
+      "topic": "fail_closed_default",
+      "kind": "forbidden_pattern",
+      "applicability": {},
+      "allow": [
+        "absent_evidence_is_not_pass",
+        "error_state_rechecked_not_cached",
+        "unknown_input_refused",
+        "unreadable_input_blocks_not_skips"
+      ],
+      "forbid": [
+        "unknown_maps_to_success",
+        "unreadable_input_disables_check",
+        "vacuous_pass_on_empty_evidence"
+      ],
+      "payload": {
+        "severity": "error",
+        "rationale_id": "unknown_is_never_success"
+      }
+    },
+    {
+      "id": "graph_cpu_parallelism",
+      "topic": "parallelism_model",
+      "kind": "concurrency",
+      "applicability": {
+        "languages": [
+          "python",
+          "rust"
+        ],
+        "paths": [
+          "src/aiworkhub/source_graph*.py",
+          "src/aiworkhub/source_graph_rs/**"
+        ]
+      },
+      "allow": [
+        "content_hash_delta",
+        "deterministic_partition",
+        "process_pool",
+        "stable_merge"
+      ],
+      "forbid": [
+        "hardcoded_worker_count",
+        "single_core_full_rebuild",
+        "shared_mutable_partition_state"
+      ],
+      "payload": {
+        "model": "processes_cpu_bound",
+        "min_headroom_fraction": 0.25
       }
     },
     {
@@ -76,7 +183,9 @@
       "topic": "hot_path_allocation",
       "kind": "performance",
       "applicability": {
-        "languages": ["python"],
+        "languages": [
+          "python"
+        ],
         "paths": [
           "src/aiworkhub/dashboard.py",
           "src/aiworkhub/process_event_ledger.py",
@@ -110,83 +219,6 @@
       }
     },
     {
-      "id": "graph_cpu_parallelism",
-      "topic": "parallelism_model",
-      "kind": "concurrency",
-      "applicability": {
-        "languages": ["python", "rust"],
-        "paths": [
-          "src/aiworkhub/source_graph*.py",
-          "src/aiworkhub/source_graph_rs/**"
-        ]
-      },
-      "allow": [
-        "content_hash_delta",
-        "deterministic_partition",
-        "process_pool",
-        "stable_merge"
-      ],
-      "forbid": [
-        "hardcoded_worker_count",
-        "single_core_full_rebuild",
-        "shared_mutable_partition_state"
-      ],
-      "payload": {
-        "model": "processes_cpu_bound",
-        "min_headroom_fraction": 0.25
-      }
-    },
-    {
-      "id": "runtime_io_parallelism",
-      "topic": "parallelism_model",
-      "kind": "concurrency",
-      "applicability": {
-        "languages": ["python", "javascript", "typescript"],
-        "paths": [
-          "src/aiworkhub/dashboard*.py",
-          "src/aiworkhub/process_launcher.py",
-          "src/aiworkhub/server.py",
-          "src/aiworkhub/task_store.py",
-          "src/aiworkhub/worker_workspace.py",
-          "vscode-extension/**"
-        ]
-      },
-      "allow": [
-        "bounded_batching",
-        "concurrent_readers",
-        "single_writer_queue",
-        "thread_pool"
-      ],
-      "forbid": [
-        "global_lock_during_io",
-        "serial_independent_io",
-        "unbounded_thread_creation"
-      ],
-      "payload": {
-        "model": "threads_io_bound",
-        "min_headroom_fraction": 0.25
-      }
-    },
-    {
-      "id": "parallelism_fallback",
-      "topic": "parallelism_model",
-      "kind": "concurrency",
-      "applicability": {},
-      "allow": [
-        "core_count_derived_workers",
-        "deterministic_parallel_output",
-        "measured_sequential_exception"
-      ],
-      "forbid": [
-        "hardcoded_worker_count",
-        "unmeasured_sequential_hot_path"
-      ],
-      "payload": {
-        "model": "threads_io_bound",
-        "min_headroom_fraction": 0.25
-      }
-    },
-    {
       "id": "incremental_state",
       "topic": "incremental_state",
       "kind": "forbidden_pattern",
@@ -216,12 +248,265 @@
       }
     },
     {
+      "id": "mechanical_work_off_model",
+      "topic": "mechanical_work_off_model",
+      "kind": "coding_convention",
+      "applicability": {
+        "tasks": [
+          "review"
+        ]
+      },
+      "allow": [
+        "deterministic_step_in_code",
+        "receipts_handed_to_model",
+        "symbol_level_edit"
+      ],
+      "forbid": [
+        "model_recomputes_recorded_evidence",
+        "model_retypes_relocated_text"
+      ],
+      "payload": {
+        "guideline_ids": [
+          "packet_states_what_is_settled",
+          "static_step_over_model_turn"
+        ],
+        "severity": "warning"
+      }
+    },
+    {
+      "id": "model_execution_policy",
+      "topic": "model_execution_policy",
+      "kind": "forbidden_pattern",
+      "applicability": {},
+      "allow": [
+        "provider_terminal_response",
+        "response_based_liveness",
+        "uncapped_model_execution"
+      ],
+      "forbid": [
+        "elapsed_time_model_kill",
+        "implicit_output_budget",
+        "implicit_token_budget",
+        "silent_provider_fallback"
+      ],
+      "payload": {
+        "severity": "error",
+        "rationale_id": "preserve_model_work"
+      }
+    },
+    {
+      "id": "native_ownership",
+      "topic": "native_ownership",
+      "kind": "ownership_lifetime",
+      "applicability": {
+        "languages": [
+          "c",
+          "cpp",
+          "cuda",
+          "rust"
+        ]
+      },
+      "allow": [
+        "borrowed_view",
+        "raii_guard",
+        "smart_pointer",
+        "value_semantics"
+      ],
+      "forbid": [
+        "manual_lifetime_pair",
+        "owning_raw_pointer",
+        "unbounded_stack_buffer"
+      ],
+      "payload": {
+        "requires_raii": true,
+        "requires_context_manager": false,
+        "requires_explicit_cleanup": true,
+        "forbidden_raw_ownership_patterns": [
+          "manual_delete",
+          "manual_free",
+          "owning_raw_pointer"
+        ]
+      }
+    },
+    {
+      "id": "parallelism_fallback",
+      "topic": "parallelism_model",
+      "kind": "concurrency",
+      "applicability": {},
+      "allow": [
+        "core_count_derived_workers",
+        "deterministic_parallel_output",
+        "measured_sequential_exception"
+      ],
+      "forbid": [
+        "hardcoded_worker_count",
+        "unmeasured_sequential_hot_path"
+      ],
+      "payload": {
+        "model": "threads_io_bound",
+        "min_headroom_fraction": 0.25
+      }
+    },
+    {
+      "id": "performance_evidence",
+      "topic": "performance_evidence",
+      "kind": "evidence",
+      "applicability": {
+        "tasks": [
+          "optimize",
+          "performance",
+          "release"
+        ]
+      },
+      "allow": [
+        "before_after_measurement",
+        "cross_platform_sample",
+        "resource_profile"
+      ],
+      "forbid": [
+        "performance_claim_without_measurement"
+      ],
+      "payload": {
+        "required_evidence_types": [
+          "benchmark_report",
+          "profile_report",
+          "regression_test"
+        ],
+        "min_count": 3
+      }
+    },
+    {
+      "id": "release_evidence",
+      "topic": "release_evidence",
+      "kind": "evidence",
+      "applicability": {
+        "tasks": [
+          "release"
+        ]
+      },
+      "allow": [
+        "artifact_checksum",
+        "fresh_install",
+        "full_ci_matrix",
+        "version_parity"
+      ],
+      "forbid": [
+        "release_with_red_ci",
+        "release_without_artifact_verification"
+      ],
+      "payload": {
+        "required_evidence_types": [
+          "artifact_checksum",
+          "ci_report",
+          "fresh_install_report",
+          "version_report"
+        ],
+        "min_count": 4
+      }
+    },
+    {
+      "id": "runtime_io_parallelism",
+      "topic": "parallelism_model",
+      "kind": "concurrency",
+      "applicability": {
+        "languages": [
+          "python",
+          "javascript",
+          "typescript"
+        ],
+        "paths": [
+          "src/aiworkhub/dashboard*.py",
+          "src/aiworkhub/process_launcher.py",
+          "src/aiworkhub/server.py",
+          "src/aiworkhub/task_store.py",
+          "src/aiworkhub/worker_workspace.py",
+          "vscode-extension/**"
+        ]
+      },
+      "allow": [
+        "bounded_batching",
+        "concurrent_readers",
+        "single_writer_queue",
+        "thread_pool"
+      ],
+      "forbid": [
+        "global_lock_during_io",
+        "serial_independent_io",
+        "unbounded_thread_creation"
+      ],
+      "payload": {
+        "model": "threads_io_bound",
+        "min_headroom_fraction": 0.25
+      }
+    },
+    {
+      "id": "self_hosting_break_glass",
+      "topic": "self_hosting_break_glass",
+      "kind": "coding_convention",
+      "applicability": {},
+      "allow": [
+        "independent_manager_validation",
+        "measured_task_system_blocker",
+        "minimal_intermediate_fix",
+        "replacement_artifact_install",
+        "return_to_canonical_task_flow"
+      ],
+      "forbid": [
+        "continued_use_of_known_broken_plugin",
+        "scope_expansion_during_break_glass",
+        "silent_task_system_bypass",
+        "unmeasured_break_glass"
+      ],
+      "payload": {
+        "guideline_ids": [
+          "record_blocker_evidence",
+          "preserve_unrelated_work",
+          "restore_task_system_only",
+          "validate_replacement_independently"
+        ],
+        "severity": "error"
+      }
+    },
+    {
+      "id": "single_definition",
+      "topic": "single_definition",
+      "kind": "forbidden_pattern",
+      "applicability": {
+        "languages": [
+          "python",
+          "javascript",
+          "typescript"
+        ]
+      },
+      "allow": [
+        "identity_asserted_by_test",
+        "import_the_owner",
+        "named_subset_of_owner",
+        "parameterised_variant",
+        "single_owner_module"
+      ],
+      "forbid": [
+        "copied_helper",
+        "parallel_implementation",
+        "restated_vocabulary",
+        "two_predicates_one_policy"
+      ],
+      "payload": {
+        "severity": "error",
+        "rationale_id": "one_concept_one_definition"
+      }
+    },
+    {
       "id": "sqlite_concurrency",
       "topic": "sqlite_concurrency",
       "kind": "coding_convention",
       "applicability": {
-        "languages": ["python"],
-        "paths": ["src/aiworkhub/*.py"]
+        "languages": [
+          "python"
+        ],
+        "paths": [
+          "src/aiworkhub/*.py"
+        ]
       },
       "allow": [
         "busy_timeout",
@@ -246,33 +531,15 @@
       }
     },
     {
-      "id": "cache_discipline",
-      "topic": "cache_discipline",
-      "kind": "forbidden_pattern",
-      "applicability": {},
-      "allow": [
-        "bounded_cache",
-        "generation_invalidation",
-        "lru_eviction",
-        "measured_hit_rate",
-        "ttl_eviction"
-      ],
-      "forbid": [
-        "cache_without_bound",
-        "stale_generation_retention",
-        "unmeasured_cache"
-      ],
-      "payload": {
-        "severity": "error",
-        "rationale_id": "bounded_memory"
-      }
-    },
-    {
       "id": "subprocess_lifecycle",
       "topic": "subprocess_lifecycle",
       "kind": "ownership_lifetime",
       "applicability": {
-        "languages": ["python", "javascript", "typescript"]
+        "languages": [
+          "python",
+          "javascript",
+          "typescript"
+        ]
       },
       "allow": [
         "pid_start_tick_fencing",
@@ -295,35 +562,6 @@
           "detached_child",
           "unowned_lock",
           "unscoped_temp"
-        ]
-      }
-    },
-    {
-      "id": "native_ownership",
-      "topic": "native_ownership",
-      "kind": "ownership_lifetime",
-      "applicability": {
-        "languages": ["c", "cpp", "cuda", "rust"]
-      },
-      "allow": [
-        "borrowed_view",
-        "raii_guard",
-        "smart_pointer",
-        "value_semantics"
-      ],
-      "forbid": [
-        "manual_lifetime_pair",
-        "owning_raw_pointer",
-        "unbounded_stack_buffer"
-      ],
-      "payload": {
-        "requires_raii": true,
-        "requires_context_manager": false,
-        "requires_explicit_cleanup": true,
-        "forbidden_raw_ownership_patterns": [
-          "manual_delete",
-          "manual_free",
-          "owning_raw_pointer"
         ]
       }
     },
@@ -352,104 +590,6 @@
         ],
         "severity": "error"
       }
-    },
-    {
-      "id": "model_execution_policy",
-      "topic": "model_execution_policy",
-      "kind": "forbidden_pattern",
-      "applicability": {},
-      "allow": [
-        "provider_terminal_response",
-        "response_based_liveness",
-        "uncapped_model_execution"
-      ],
-      "forbid": [
-        "elapsed_time_model_kill",
-        "implicit_output_budget",
-        "implicit_token_budget",
-        "silent_provider_fallback"
-      ],
-      "payload": {
-        "severity": "error",
-        "rationale_id": "preserve_model_work"
-      }
-    },
-    {
-      "id": "performance_evidence",
-      "topic": "performance_evidence",
-      "kind": "evidence",
-      "applicability": {
-        "tasks": ["optimize", "performance", "release"]
-      },
-      "allow": [
-        "before_after_measurement",
-        "cross_platform_sample",
-        "resource_profile"
-      ],
-      "forbid": [
-        "performance_claim_without_measurement"
-      ],
-      "payload": {
-        "required_evidence_types": [
-          "benchmark_report",
-          "profile_report",
-          "regression_test"
-        ],
-        "min_count": 3
-      }
-    },
-    {
-      "id": "release_evidence",
-      "topic": "release_evidence",
-      "kind": "evidence",
-      "applicability": {
-        "tasks": ["release"]
-      },
-      "allow": [
-        "artifact_checksum",
-        "fresh_install",
-        "full_ci_matrix",
-        "version_parity"
-      ],
-      "forbid": [
-        "release_with_red_ci",
-        "release_without_artifact_verification"
-      ],
-      "payload": {
-        "required_evidence_types": [
-          "artifact_checksum",
-          "ci_report",
-          "fresh_install_report",
-          "version_report"
-        ],
-        "min_count": 4
-      }
-    },
-    {
-      "id": "cross_platform_contract",
-      "topic": "cross_platform_contract",
-      "kind": "coding_convention",
-      "applicability": {},
-      "allow": [
-        "linux_contract",
-        "macos_contract",
-        "remote_ssh_contract",
-        "windows_contract"
-      ],
-      "forbid": [
-        "posix_only_assumption",
-        "shell_string_command",
-        "windows_path_guess"
-      ],
-      "payload": {
-        "guideline_ids": [
-          "argv_subprocess",
-          "pathlib_paths",
-          "platform_contract_tests",
-          "process_tree_cleanup"
-        ],
-        "severity": "error"
-      }
     }
   ],
   "os_dependency_boundary": {
@@ -473,21 +613,21 @@
       "sys_platform"
     ],
     "baseline": [
-          {
-                "path": "src/aiworkhub/app_server_mux.py",
-                "pattern": "os_name_eq",
-                "count": 4
-          },
-          {
-                "path": "src/aiworkhub/app_server_mux.py",
-                "pattern": "os_name_ne",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/callback_bridge.py",
-                "pattern": "os_name_eq",
-                "count": 2
-          },
+      {
+        "path": "src/aiworkhub/app_server_mux.py",
+        "pattern": "os_name_eq",
+        "count": 4
+      },
+      {
+        "path": "src/aiworkhub/app_server_mux.py",
+        "pattern": "os_name_ne",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/callback_bridge.py",
+        "pattern": "os_name_eq",
+        "count": 2
+      },
       {
         "path": "src/aiworkhub/callback_store.py",
         "pattern": "sqlite_connect",
@@ -513,41 +653,41 @@
         "pattern": "sqlite_connect",
         "count": 1
       },
-          {
-                "path": "src/aiworkhub/context_write_intents.py",
-                "pattern": "sqlite_connect",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/context_writes.py",
-                "pattern": "sqlite_connect",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/core.py",
-                "pattern": "os_name_eq",
-                "count": 4
-          },
-          {
-                "path": "src/aiworkhub/core.py",
-                "pattern": "os_name_ne",
-                "count": 3
-          },
-          {
-                "path": "src/aiworkhub/core.py",
-                "pattern": "sqlite_connect",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/deepseek_credentials.py",
-                "pattern": "os_name_ne",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/dependency_autolaunch.py",
-                "pattern": "sqlite_connect",
-                "count": 1
-          },
+      {
+        "path": "src/aiworkhub/context_write_intents.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/context_writes.py",
+        "pattern": "sqlite_connect",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/core.py",
+        "pattern": "os_name_eq",
+        "count": 4
+      },
+      {
+        "path": "src/aiworkhub/core.py",
+        "pattern": "os_name_ne",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/core.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/deepseek_credentials.py",
+        "pattern": "os_name_ne",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/dependency_autolaunch.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
       {
         "path": "src/aiworkhub/development_rules.py",
         "pattern": "creationflags",
@@ -563,126 +703,126 @@
         "pattern": "sqlite_connect",
         "count": 1
       },
-          {
-                "path": "src/aiworkhub/glm_credentials.py",
-                "pattern": "os_name_ne",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/kilo_auth.py",
-                "pattern": "os_name_eq",
-                "count": 4
-          },
-          {
-                "path": "src/aiworkhub/needfix_store.py",
-                "pattern": "sqlite_connect",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/process_launcher.py",
-                "pattern": "os_killpg",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/process_launcher.py",
-                "pattern": "os_name_eq",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/process_launcher.py",
-                "pattern": "os_name_ne",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/process_launcher.py",
-                "pattern": "sqlite_connect",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/provider_tool_guards.py",
-                "pattern": "def_atomic",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/quality_evidence.py",
-                "pattern": "os_name_eq",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/repo_policy.py",
-                "pattern": "os_name_eq",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/repository_state.py",
-                "pattern": "def_atomic",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/review_lifecycle.py",
-                "pattern": "sqlite_connect",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/review_orchestrator.py",
-                "pattern": "sqlite_connect",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/roadmap_store.py",
-                "pattern": "sqlite_connect",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/runtime_adapters.py",
-                "pattern": "os_name_eq",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/runtime_temp.py",
-                "pattern": "def_atomic",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/runtime_temp.py",
-                "pattern": "import_msvcrt",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/runtime_temp.py",
-                "pattern": "os_name_eq",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/runtime_temp.py",
-                "pattern": "sys_platform",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/source_graph.py",
-                "pattern": "import_fcntl",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/source_graph.py",
-                "pattern": "import_msvcrt",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/source_graph.py",
-                "pattern": "sqlite_connect",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/source_graph_daemon.py",
-                "pattern": "creationflags",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/source_graph_daemon.py",
-                "pattern": "os_killpg",
-                "count": 2
-          },
+      {
+        "path": "src/aiworkhub/glm_credentials.py",
+        "pattern": "os_name_ne",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/kilo_auth.py",
+        "pattern": "os_name_eq",
+        "count": 4
+      },
+      {
+        "path": "src/aiworkhub/needfix_store.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/process_launcher.py",
+        "pattern": "os_killpg",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/process_launcher.py",
+        "pattern": "os_name_eq",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/process_launcher.py",
+        "pattern": "os_name_ne",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/process_launcher.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/provider_tool_guards.py",
+        "pattern": "def_atomic",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/quality_evidence.py",
+        "pattern": "os_name_eq",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/repo_policy.py",
+        "pattern": "os_name_eq",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/repository_state.py",
+        "pattern": "def_atomic",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/review_lifecycle.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/review_orchestrator.py",
+        "pattern": "sqlite_connect",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/roadmap_store.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/runtime_adapters.py",
+        "pattern": "os_name_eq",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/runtime_temp.py",
+        "pattern": "def_atomic",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/runtime_temp.py",
+        "pattern": "import_msvcrt",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/runtime_temp.py",
+        "pattern": "os_name_eq",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/runtime_temp.py",
+        "pattern": "sys_platform",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/source_graph.py",
+        "pattern": "import_fcntl",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/source_graph.py",
+        "pattern": "import_msvcrt",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/source_graph.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/source_graph_daemon.py",
+        "pattern": "creationflags",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/source_graph_daemon.py",
+        "pattern": "os_killpg",
+        "count": 2
+      },
       {
         "path": "src/aiworkhub/source_graph_daemon.py",
         "pattern": "os_name_eq",
@@ -698,11 +838,11 @@
         "pattern": "sqlite_connect",
         "count": 3
       },
-          {
-                "path": "src/aiworkhub/source_graph_partition.py",
-                "pattern": "sqlite_connect",
-                "count": 3
-          },
+      {
+        "path": "src/aiworkhub/source_graph_partition.py",
+        "pattern": "sqlite_connect",
+        "count": 3
+      },
       {
         "path": "src/aiworkhub/sqlite_readonly.py",
         "pattern": "sqlite_connect",
@@ -731,8 +871,8 @@
       {
         "path": "src/aiworkhub/task_store.py",
         "pattern": "def_atomic",
-                "count": 2
-          },
+        "count": 2
+      },
       {
         "path": "src/aiworkhub/task_store.py",
         "pattern": "sqlite_connect",
@@ -753,21 +893,21 @@
         "pattern": "def_atomic",
         "count": 1
       },
-          {
-                "path": "src/aiworkhub/vscode_lm_bridge.py",
-                "pattern": "def_atomic",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/vscode_lm_bridge.py",
-                "pattern": "os_name_ne",
-                "count": 2
-          },
-          {
-                "path": "src/aiworkhub/worker_ai_tools_mcp.py",
-                "pattern": "os_name_eq",
-                "count": 2
-          },
+      {
+        "path": "src/aiworkhub/vscode_lm_bridge.py",
+        "pattern": "def_atomic",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/vscode_lm_bridge.py",
+        "pattern": "os_name_ne",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/worker_ai_tools_mcp.py",
+        "pattern": "os_name_eq",
+        "count": 2
+      },
       {
         "path": "src/aiworkhub/worker_ai_tools_mcp.py",
         "pattern": "sqlite_connect",
@@ -803,56 +943,56 @@
         "pattern": "sys_platform",
         "count": 1
       },
-          {
-                "path": "src/aiworkhub/worker_workspace.py",
-                "pattern": "creationflags",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/worker_workspace.py",
-                "pattern": "os_killpg",
-                "count": 3
-          },
-          {
-                "path": "src/aiworkhub/worker_workspace.py",
-                "pattern": "os_name_eq",
-                "count": 10
-          },
-          {
-                "path": "src/aiworkhub/worker_workspace.py",
-                "pattern": "os_name_ne",
-                "count": 9
-          },
-          {
-                "path": "src/aiworkhub/worker_workspace.py",
-                "pattern": "sys_platform",
-                "count": 6
-          },
-          {
-                "path": "src/aiworkhub/workforce_catalog.py",
-                "pattern": "def_atomic",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/workspace_hygiene.py",
-                "pattern": "def_atomic",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/workspace_hygiene.py",
-                "pattern": "import_fcntl",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/workspace_hygiene.py",
-                "pattern": "import_msvcrt",
-                "count": 1
-          },
-          {
-                "path": "src/aiworkhub/workspace_hygiene.py",
-                "pattern": "os_name_eq",
-                "count": 1
-          }
+      {
+        "path": "src/aiworkhub/worker_workspace.py",
+        "pattern": "creationflags",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/worker_workspace.py",
+        "pattern": "os_killpg",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/worker_workspace.py",
+        "pattern": "os_name_eq",
+        "count": 10
+      },
+      {
+        "path": "src/aiworkhub/worker_workspace.py",
+        "pattern": "os_name_ne",
+        "count": 9
+      },
+      {
+        "path": "src/aiworkhub/worker_workspace.py",
+        "pattern": "sys_platform",
+        "count": 6
+      },
+      {
+        "path": "src/aiworkhub/workforce_catalog.py",
+        "pattern": "def_atomic",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/workspace_hygiene.py",
+        "pattern": "def_atomic",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/workspace_hygiene.py",
+        "pattern": "import_fcntl",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/workspace_hygiene.py",
+        "pattern": "import_msvcrt",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/workspace_hygiene.py",
+        "pattern": "os_name_eq",
+        "count": 1
+      }
     ],
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
