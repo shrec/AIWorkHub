@@ -179,3 +179,57 @@ def test_the_durable_record_says_whether_a_pass_swept(tmp_path: Path, monkeypatc
     assert record["gc_included"] is True
     assert record["gc_cleaned"] == 3
     assert record["finalized"] == 1
+
+
+def test_a_pass_announces_itself_before_it_runs(tmp_path: Path, monkeypatch):
+    """A long sweep must not make the loop look absent while it works.
+
+    The record was written only on completion, so during the minutes a sweep
+    takes -- exactly when a reader most wants to know a reconciler is alive --
+    there was nothing to read.
+    """
+    seen: list[dict] = []
+    svc = _service(tmp_path, None)
+
+    def _scan(*_a, **_k):
+        seen.append(tr.read_status(tmp_path))   # what a reader sees mid-pass
+        svc._stop_event.set()
+        return {"ok": True, "finalized": 0, "watched": 0}
+
+    monkeypatch.setattr(tr, "run_scan", _scan)
+    svc._loop()
+
+    (during,) = seen
+    assert during["scan_in_progress"] is True
+    assert during["scan_finished_epoch"] is None
+    assert isinstance(during["scan_started_epoch"], float)
+
+    after = tr.read_status(tmp_path)
+    assert after["scan_in_progress"] is False
+    assert isinstance(after["scan_finished_epoch"], float)
+
+
+def test_a_running_pass_is_healthy_not_stale(tmp_path: Path):
+    """Measure an in-progress pass from when it started, not from never."""
+    tr.write_status(tmp_path, {
+        "scan_started_epoch": time.time(),
+        "scan_finished_epoch": None,
+        "scan_in_progress": True,
+        "scan_interval_seconds": 30.0,
+        "last_error": "",
+    })
+    health = tr.reconciler_health(tmp_path)
+    assert health["durable_scan_stale"] is False
+    assert health["ok"] is True
+
+
+def test_a_pass_that_started_hours_ago_is_still_stale(tmp_path: Path):
+    """In-progress is not a licence to look alive forever."""
+    tr.write_status(tmp_path, {
+        "scan_started_epoch": time.time() - 86400,
+        "scan_finished_epoch": None,
+        "scan_in_progress": True,
+        "scan_interval_seconds": 30.0,
+        "last_error": "",
+    })
+    assert tr.reconciler_health(tmp_path)["durable_scan_stale"] is True

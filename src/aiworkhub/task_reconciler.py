@@ -155,9 +155,16 @@ def read_status(repo: Path | str) -> dict[str, Any]:
 
 
 def _staleness(record: dict[str, Any]) -> tuple[bool, float | None]:
-    """Return (stale, age_seconds) for a durable scan record."""
+    """Return (stale, age_seconds) for a durable scan record.
+
+    A pass that is still running is measured from when it STARTED: it is
+    evidence of a live reconciler, and calling it stale the moment it begins
+    would report every long sweep as a dead loop.
+    """
 
     at = record.get("scan_finished_epoch")
+    if record.get("scan_in_progress") and not isinstance(at, (int, float)):
+        at = record.get("scan_started_epoch")
     if not isinstance(at, (int, float)) or isinstance(at, bool):
         return True, None
     age = max(0.0, time.time() - float(at))
@@ -226,6 +233,20 @@ class ReconcilerService:
             # reclaims immediately; after that housekeeping is periodic.
             include_gc = self._pass_index % GC_SCAN_EVERY_N_PASSES == 0
             self._pass_index += 1
+            # Announce the pass BEFORE running it. The record is the only way to
+            # tell "no reconciler" from "a reconciler mid-pass", and a sweep can
+            # run for minutes -- writing only on completion left the loop
+            # invisible for exactly as long as it was busiest.
+            write_status(self.repo, {
+                "pid": os.getpid(),
+                "repo": str(self.repo),
+                "scan_started_epoch": started,
+                "scan_finished_epoch": None,
+                "scan_in_progress": True,
+                "scan_interval_seconds": self.scan_interval_seconds,
+                "gc_included": include_gc,
+                "last_error": "",
+            })
             try:
                 result = run_scan(self._manager, repo=self.repo, include_gc=include_gc)
                 with self._state_lock:
@@ -244,6 +265,7 @@ class ReconcilerService:
                 "repo": str(self.repo),
                 "scan_started_epoch": started,
                 "scan_finished_epoch": time.time(),
+                "scan_in_progress": False,
                 "scan_duration_seconds": round(time.time() - started, 3),
                 "scan_interval_seconds": self.scan_interval_seconds,
                 "last_error": error,
