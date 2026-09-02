@@ -6,7 +6,7 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
-## [0.10.79] - 2026-09-02
+## [0.10.80] - 2026-09-02
 
 The release where the surfaces stopped saying "unknown" about things they had
 never looked at. Five defects landed in one wave, and four of them are the same
@@ -38,7 +38,14 @@ shape: a fact existed, and the reader looked somewhere else.
   and "read raised" all reported as `task_state: unknown` with an empty card.
   `task_card_read` now says which, and carries through `collect()`, the surface
   a manager actually calls.
-- Workspace GC keeps the workspace `retry_finalization` exists to use.
+- Workspace GC keeps the workspace `retry_finalization` exists to use, bounded
+  by whether a retry can still act. A `finalize_failed` process state retains a
+  `blocked` or `pending` card's workspace -- `blocked` is the measured race the
+  rule exists for, nine seconds between a failed finalization and the sweep that
+  removed its only recovery path -- but a `finished` or `archived` card
+  completed by another route, so its workspace is collected. The first form of
+  this rule ignored the card entirely and contradicted a canonical test that had
+  asserted the opposite since B863; CI caught the pair on the 0.10.79 tag.
 
 ### Added
 

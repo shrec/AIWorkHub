@@ -12,7 +12,7 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.79 — 2026-09-02
+## What's new in 0.10.80 — 2026-09-02
 
 - The cost panel reports the repository it is bound to. The cost ledger tool was
   the only caller that did not pass a repository root, so it fell back to a text

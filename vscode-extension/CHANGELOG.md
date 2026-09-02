@@ -1,6 +1,6 @@
 # AIWorkHub for VS Code — Changelog
 
-## 0.10.79 — 2026-09-02
+## 0.10.80 — 2026-09-02
 
 ### Fixed
 
@@ -17,7 +17,9 @@
 - Process status says why it did not read a task card. A card that was never
   read no longer looks identical to a card that does not exist, or to a read
   that failed.
-- Workspace cleanup keeps the workspace that finalization retry exists to use.
+- Workspace cleanup keeps the workspace that finalization retry exists to use,
+  for exactly as long as a retry can still act on it: a blocked or pending
+  card's workspace is kept, a finished or archived one is collected.
 
 ### Added
 
