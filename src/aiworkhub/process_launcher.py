@@ -12088,17 +12088,16 @@ class ProcessManager:
                 )
         task_id = str(latest.get("task_id") or events[0].get("task_id") or "")
         card: dict[str, Any] | None = None
-        if latest.get("state") != "starting" or int(latest.get("pid") or 0):
-            # A pid-null starting reservation is still under preparation; the
-            # reviewer task card may not exist yet and reading it can contend
-            # with the preparation owner's own store access. Keep status reads
-            # bounded by deriving the card only once a real process identity
-            # exists. Preparation progress is still observable via the latest
-            # event's preparation_phase/heartbeat fields below.
+        card_read = "read"
+        if latest.get("state") == "starting" and not int(latest.get("pid") or 0):
+            # Still under preparation: reading the card contends with the
+            # preparation owner, so stay bounded -- but bounded is not absent.
+            card_read = "deferred_pid_null_starting_reservation"
+        else:
             try:
                 card = _parse_card(self._show_task(task_id), task_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                card_read = f"read_failed:{type(exc).__name__}"  # not absent
         return {
             "ok": True,
             "request_id": request_id,
@@ -12117,6 +12116,7 @@ class ProcessManager:
             "model": latest.get("model"),
             "task_state": core._lifecycle_state(card) if card else "unknown",
             "task_card": card,
+            "task_card_read": card_read,
             "event_count": len(events),
             # A JS consumer reads pid_start_ticks off latest_event; carry it as
             # a lossless string so a >2**53 counter is not silently rounded.

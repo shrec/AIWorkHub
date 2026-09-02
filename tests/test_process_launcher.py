@@ -10391,3 +10391,89 @@ def test_worker_runtime_policy_names_sandbox_validation_facts():
     assert "$AIWORKHUB_CANONICAL_PYTHON" in policy
     assert "validation_unsupported_in_sandbox:" in policy
     assert "never stub a denied call" in policy
+
+
+def test_status_names_why_the_task_card_was_not_read(monkeypatch, tmp_path):
+    """A card that was never read must not report as a card that is absent.
+
+    Measured 2026-09-02 on AIWORKHUB_01082_REVIEW_CORRECTNESS_V1: the reservation
+    landed at 22:17:24, the store claimed the card at 22:17:39, and this surface
+    still answered ``task_state="unknown"`` with an empty ``task_card`` -- the
+    same verdict it gives for a card that genuinely does not exist. Keeping the
+    read bounded during preparation is right; reporting it as ignorance is not.
+    """
+
+    reads: list[str] = []
+
+    def show(task_id):
+        reads.append(task_id)
+        return _show(
+            lambda: _card(task_id="TASK_CARD_READ", state="processing")
+        )(task_id)
+
+    manager = _manager(
+        tmp_path,
+        show_task=show,
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event({
+        "request_id": "status-card-read",
+        "task_id": "TASK_CARD_READ",
+        "runner": "claude_worker_b1",
+        "topic": "quality_review",
+        "adapter_id": "claude_cli",
+        "state": "starting",
+    })
+
+    deferred = manager.status("status-card-read")
+
+    # The bounded read is preserved: the store is not touched at all.
+    assert reads == []
+    assert deferred["task_card"] is None
+    assert deferred["task_state"] == "unknown"
+    assert deferred["task_card_read"] == "deferred_pid_null_starting_reservation"
+
+    manager._append_event({
+        "request_id": "status-card-read",
+        "task_id": "TASK_CARD_READ",
+        "runner": "claude_worker_b1",
+        "state": "running",
+        "pid": 4321,
+        "pid_start_ticks": 99,
+    })
+
+    live = manager.status("status-card-read")
+
+    assert reads == ["TASK_CARD_READ"]
+    assert live["task_card_read"] == "read"
+    assert live["task_state"] != "unknown"
+
+
+def test_status_distinguishes_a_failed_card_read_from_an_absent_card(
+    monkeypatch,
+    tmp_path,
+):
+    """``read_failed`` and ``no card`` are different facts; the bare except hid both."""
+
+    def show(_task_id):
+        raise RuntimeError("store unavailable")
+
+    manager = _manager(
+        tmp_path,
+        show_task=show,
+        argv=[sys.executable, "-c", "pass"],
+    )
+    manager._append_event({
+        "request_id": "status-card-failed",
+        "task_id": "TASK_CARD_FAILED",
+        "runner": "claude_worker_b1",
+        "state": "running",
+        "pid": 4322,
+        "pid_start_ticks": 98,
+    })
+
+    result = manager.status("status-card-failed")
+
+    assert result["task_card"] is None
+    assert result["task_state"] == "unknown"
+    assert result["task_card_read"] == "read_failed:RuntimeError"
