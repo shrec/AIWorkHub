@@ -83,21 +83,30 @@ _C_FAMILY_SUFFIXES: frozenset[str] = frozenset({
 })
 _PYTHON_SUFFIXES: frozenset[str] = frozenset({".py", ".pyi"})
 
-# Only the C family exposes the lexical shapes these detectors match: an
-# always-true C ``while``/``for`` header, an arrow dereference, raw pointer
-# declarations, and C++ casts.  ``crashes`` (division / explicit termination)
-# is meaningful in Python too once its guard and operand handling are
-# language-aware, so it is applicable to both.  Modes absent from this map
-# (``deadmethods``, ``duplicates``) are graph/normalisation based and apply to
-# every language.
+# ``leaks`` and ``nullrisks`` are now applicable to Python: the resource and
+# possibly-None shapes below (``with sqlite3.connect``, an unclosed ``open``/
+# socket handle, an unchecked ``.get``/``re.match`` result, an ``or 0``/``or {}``
+# coercion) are all lexically present in Python and were found by hand in this
+# repo.  ``crashes`` (division / explicit termination) is likewise meaningful in
+# Python once guard and operand handling are language-aware.
+#
+# ``rawptrs``, ``casts`` and ``looprisks`` stay C-only on purpose: their shapes
+# have no Python analogue — Python has no raw pointer declarations, no
+# ``reinterpret_cast``/``const_cast``/C-cast syntax, and no always-true C
+# ``while (1)``/``for (;;)`` header (a Python ``while True:`` bounded by an
+# indented ``break`` is not the same lexical construct).  Firing them on Python
+# would manufacture noise, not findings, so they honestly report
+# ``not_applicable``.  Modes absent from this map (``deadmethods``,
+# ``duplicates``) are graph/normalisation based and apply to every language.
 _C_ONLY: frozenset[str] = frozenset({"c_family"})
+_C_AND_PYTHON: frozenset[str] = frozenset({"c_family", "python"})
 _RISK_MODE_LANGUAGES: dict[str, frozenset[str]] = {
-    "leaks": _C_ONLY,
+    "leaks": _C_AND_PYTHON,
     "rawptrs": _C_ONLY,
     "casts": _C_ONLY,
     "looprisks": _C_ONLY,
-    "nullrisks": _C_ONLY,
-    "crashes": frozenset({"c_family", "python"}),
+    "nullrisks": _C_AND_PYTHON,
+    "crashes": _C_AND_PYTHON,
 }
 
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
@@ -183,6 +192,118 @@ def _is_guarded(source: str, name: str) -> bool:
     if re.search(rf"\bassert\b[^\n]*\b{escaped}\b", source):
         return True
     return False
+
+
+# Python resource-leak shapes.  ``with sqlite3.connect(...) as c`` leaks the
+# connection because ``Connection.__exit__`` commits but never closes it; an
+# ``open()``/``socket`` handle bound to a name is a leak unless that name is
+# ``.close()``-d on the path.  ``with open(...) as f`` binds no name here and is
+# correctly ignored.
+_PY_SQLITE_CONNECT_RE = re.compile(r"\bsqlite3\s*\.\s*connect\s*\(")
+_PY_WITH_HEADER_RE = re.compile(r"^[ \t]*(?:async[ \t]+)?with[ \t]+([^\n:]*)", re.MULTILINE)
+_PY_DEF_RE = re.compile(r"^[ \t]*def[ \t]+([A-Za-z_]\w*)[ \t]*\(", re.MULTILINE)
+_PY_CLOSING_RE = re.compile(r"\bclosing\s*\(")
+_PY_RESOURCE_BIND_RE = re.compile(
+    r"\b([A-Za-z_]\w*)\s*=\s*"
+    r"(?:open|socket\s*\.\s*socket|socket\s*\.\s*create_connection)\s*\("
+)
+
+
+def _strip_closing_wrappers(text: str) -> str:
+    """Remove balanced ``closing(...)`` regions from ``text``.
+
+    ``contextlib.closing`` is the correct spelling for exactly this defect and
+    the one already used in this repository, so an acquisition wrapped in it is
+    not a leak.  Matching the acquisition alone reported properly closed code --
+    ``with closing(sqlite3.connect(p)) as c`` -- as leaking, which is the kind
+    of noise that gets a detector switched off.
+    """
+
+    out: list[str] = []
+    index = 0
+    while True:
+        match = _PY_CLOSING_RE.search(text, index)
+        if match is None:
+            out.append(text[index:])
+            return "".join(out)
+        out.append(text[index : match.start()])
+        depth = 1
+        cursor = match.end()
+        while cursor < len(text) and depth:
+            if text[cursor] == "(":
+                depth += 1
+            elif text[cursor] == ")":
+                depth -= 1
+            cursor += 1
+        index = cursor
+
+
+def _python_sqlite_factory_names(masked: str) -> set[str]:
+    """Module-local functions whose body constructs a sqlite3 connection.
+
+    Seven of the nine real leak sites in this repository spelled the factory as
+    a local helper -- ``with _connect(source, readonly=True) as src`` -- so
+    matching only the literal ``sqlite3.connect`` call saw two of nine. One
+    level of resolution covers all of them.
+    """
+
+    names: set[str] = set()
+    definitions = list(_PY_DEF_RE.finditer(masked))
+    for position, match in enumerate(definitions):
+        end = (
+            definitions[position + 1].start()
+            if position + 1 < len(definitions)
+            else len(masked)
+        )
+        if _PY_SQLITE_CONNECT_RE.search(masked[match.end() : end]):
+            names.add(match.group(1))
+    return names
+
+# Python possibly-None shapes.  A name bound from ``.get(...)`` or a regex
+# ``match``/``search``/``fullmatch`` is possibly ``None``; using it as an
+# attribute, subscript, or arithmetic operand without a guard is a candidate.
+# ``or 0`` / ``or {}`` / ``or []`` coerce an unproven absence into a concrete
+# value, hiding the same bug.
+_PY_MAYBE_NONE_BIND_RE = re.compile(
+    r"\b([A-Za-z_]\w*)\s*=\s*[^\n=]*?"
+    r"(?:\.\s*get\s*\(|\bre\s*\.\s*(?:match|search|fullmatch)\s*\()"
+)
+_PY_NONE_COERCE_RE = re.compile(r"\bor\s+(?:0(?!\.)\b|\{\s*\}|\[\s*\])")
+
+
+def _python_leak_reasons(masked: str) -> list[str]:
+    """Lexical resource-leak candidates for masked Python source."""
+
+    reasons: list[str] = []
+    acquisitions = [_PY_SQLITE_CONNECT_RE.pattern] + [
+        rf"\b{re.escape(name)}\s*\(" for name in sorted(_python_sqlite_factory_names(masked))
+    ]
+    acquires_connection = re.compile("|".join(acquisitions))
+    for header in _PY_WITH_HEADER_RE.findall(masked):
+        if acquires_connection.search(_strip_closing_wrappers(header)):
+            reasons.append("sqlite3_connect_context_manager_leaks_connection")
+            break
+    for name in sorted(set(_PY_RESOURCE_BIND_RE.findall(masked))):
+        if not re.search(rf"\b{re.escape(name)}\s*\.\s*close\s*\(", masked):
+            reasons.append(f"resource_not_closed_on_all_paths:{name}")
+    return reasons
+
+
+def _python_nullrisk_reasons(masked: str) -> list[str]:
+    """Lexical possibly-None candidates for masked Python source."""
+
+    reasons: list[str] = []
+    if _PY_NONE_COERCE_RE.search(masked):
+        reasons.append("none_coalescing_masks_absence")
+    for name in sorted(set(_PY_MAYBE_NONE_BIND_RE.findall(masked))):
+        escaped = re.escape(name)
+        used = re.search(rf"\b{escaped}\s*(?:\.\s*[A-Za-z_]|\[)", masked) or re.search(
+            rf"\b{escaped}\s*[+\-*/%]", masked
+        )
+        if used and not _is_guarded(masked, name):
+            reasons.append(f"unchecked_possibly_none_use:{name}")
+            break
+    return reasons
 
 
 def _entity_rows(conn: sqlite3.Connection, *, limit: int) -> list[dict[str, Any]]:
@@ -359,8 +480,11 @@ def _risk_views(
         scanned += 1
         masked = _mask_literals_and_comments(source, language)
         reasons: list[str] = []
-        if mode == "leaks" and len(_ALLOC_RE.findall(masked)) > len(_FREE_RE.findall(masked)):
-            reasons.append("allocation_release_imbalance")
+        if mode == "leaks":
+            if language == "python":
+                reasons.extend(_python_leak_reasons(masked))
+            elif len(_ALLOC_RE.findall(masked)) > len(_FREE_RE.findall(masked)):
+                reasons.append("allocation_release_imbalance")
         elif mode == "rawptrs" and _RAW_PTR_RE.search(masked):
             reasons.append("raw_pointer_declaration")
         elif mode == "casts" and _UNSAFE_CAST_RE.search(masked):
@@ -374,11 +498,14 @@ def _risk_views(
                     reasons.append("unbounded_loop_without_lexical_exit")
                     break
         elif mode == "nullrisks":
-            dereferenced = set(_NULL_DEREF_RE.findall(masked))
-            for name in sorted(dereferenced):
-                if not _is_guarded(masked, name):
-                    reasons.append(f"unguarded_pointer_dereference:{name}")
-                    break
+            if language == "python":
+                reasons.extend(_python_nullrisk_reasons(masked))
+            else:
+                dereferenced = set(_NULL_DEREF_RE.findall(masked))
+                for name in sorted(dereferenced):
+                    if not _is_guarded(masked, name):
+                        reasons.append(f"unguarded_pointer_dereference:{name}")
+                        break
         elif mode == "crashes":
             divisors = set(_DIVISION_RE.findall(masked))
             for name in sorted(divisors):
