@@ -18,7 +18,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, cast
 
-from . import context_graph, context_writes, core, evidence_levels, feature_settings, task_store
+from . import (
+    context_graph,
+    context_writes,
+    core,
+    evidence_levels,
+    feature_settings,
+    sqlite_readonly,
+    task_store,
+)
 from .learning_commit import LearningCommit, Outcome, learning_commit_from_dict, validate_repo_match
 
 
@@ -303,7 +311,7 @@ def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> di
     cutoff = (
         datetime.now(timezone.utc) - timedelta(days=max(1, int(window_days)))
     ).isoformat()
-    with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+    with closing(sqlite_readonly.connect_readonly(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         # The table is created lazily by the first commit, so a repository that
         # has never recorded a lesson has none. That is a true measurement --
