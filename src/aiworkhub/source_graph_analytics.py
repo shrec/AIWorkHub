@@ -11,6 +11,7 @@ or call edges: when no imported runtime evidence exists it is reported as
 
 from __future__ import annotations
 
+import builtins as _builtins
 import hashlib
 import re
 import sqlite3
@@ -129,6 +130,17 @@ _GAPS_BUILTIN_CALLEES: frozenset[str] = frozenset({
     "hash", "ord", "chr", "vars", "dir", "callable", "staticmethod",
     "classmethod", "property", "sizeof", "memcpy", "memset", "printf",
 })
+
+# The language's own names, derived rather than maintained. dir(builtins) covers
+# every exception type and callable Python defines, so the set cannot fall
+# behind the interpreter the way a hand-written list did -- ValueError,
+# AttributeError and SystemExit were all missing from the curated one and
+# together crowded out every real row in a `gaps` page.
+_PYTHON_BUILTIN_NAMES: frozenset[str] = frozenset(dir(_builtins))
+
+# What `gaps` never reports as missing repository evidence: the language itself,
+# plus the C-shaped names above that are not Python builtins.
+_GAPS_EXCLUDED_CALLEES: frozenset[str] = _GAPS_BUILTIN_CALLEES | _PYTHON_BUILTIN_NAMES
 
 
 def _language_family(file_path: Any) -> str:
@@ -853,11 +865,25 @@ def query(
             placeholders = ",".join("?" for _ in files)
             clauses.append(f"file_path IN ({placeholders})")
             params.extend(files)
-        builtin_placeholders = ",".join("?" for _ in _GAPS_BUILTIN_CALLEES)
+        # A dangling call to a name nothing defines is the canonical gap, so it
+        # must stay reportable. What has to be excluded is the LANGUAGE: builtins
+        # carry the extractor's lowest confidence (0.4) and this query orders by
+        # confidence ascending, so they win the LIMIT and crowd out real rows.
+        # Measured on the canonical index before widening the set, `gaps` over
+        # src/aiworkhub returned 20 rows of which 20 named builtins --
+        # AttributeError, SystemExit, ValueError -- none of which the curated
+        # 53-name list contained.
+        #
+        # The set is now derived from the interpreter rather than maintained by
+        # hand, so it cannot fall behind: dir(builtins) is 157 names and covers
+        # every exception type and callable the language defines. The curated
+        # names that are not builtins (memcpy, memset, printf, sizeof -- C
+        # shapes) stay, which is why the two are unioned rather than replaced.
+        builtin_placeholders = ",".join("?" for _ in _GAPS_EXCLUDED_CALLEES)
         clauses.append(
             f"(dst_name IS NULL OR dst_name NOT IN ({builtin_placeholders}))"
         )
-        params.extend(sorted(_GAPS_BUILTIN_CALLEES))
+        params.extend(sorted(_GAPS_EXCLUDED_CALLEES))
         params.append(budget)
         low_confidence = [
             dict(row) for row in conn.execute(

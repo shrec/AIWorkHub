@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import tempfile
 import subprocess
 import sys
 from pathlib import Path
@@ -482,3 +483,56 @@ def test_deadmethods_states_incoming_edge_evidence_is_incomplete(tmp_path: Path)
         ]
     finally:
         conn.close()
+
+
+def test_gaps_excludes_every_language_builtin_not_just_a_curated_list() -> None:
+    """The exclusion set is derived from the interpreter, not maintained by hand.
+
+    Measured on the canonical index before this change, `gaps` over
+    src/aiworkhub returned 20 rows of which 20 named builtins -- AttributeError,
+    SystemExit, ValueError -- none of which the curated 53-name list contained.
+    Builtins carry the extractor's lowest confidence (0.4) and the query orders
+    by confidence ascending, so they won the LIMIT and crowded out every real
+    row. A list that has to be extended by hand will always fall behind the
+    interpreter; dir(builtins) cannot.
+    """
+    import builtins
+
+    from aiworkhub.source_graph_analytics import (
+        _GAPS_BUILTIN_CALLEES,
+        _GAPS_EXCLUDED_CALLEES,
+    )
+
+    for missing in ("ValueError", "AttributeError", "SystemExit", "RuntimeError"):
+        assert missing not in _GAPS_BUILTIN_CALLEES, "fixture assumption changed"
+        assert missing in _GAPS_EXCLUDED_CALLEES, f"{missing} must be excluded"
+
+    assert frozenset(dir(builtins)) <= _GAPS_EXCLUDED_CALLEES
+    # The C-shaped curated names are not builtins and must survive the union.
+    for c_name in ("memcpy", "memset", "printf", "sizeof"):
+        assert c_name in _GAPS_EXCLUDED_CALLEES
+
+
+def test_gaps_still_reports_a_dangling_call_to_a_name_nothing_defines() -> None:
+    """A call to something the repository never defines IS the canonical gap.
+
+    Excluding every unresolved-and-undefined name would have been an
+    overcorrection: it makes the mode precise and useless at the same time,
+    because a dangling reference is exactly the evidence a caller wants.
+    """
+    conn = _gaps_conn()
+    repo = Path(tempfile.mkdtemp()) / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "pkg" / "in_scope.py").write_text(
+        "def caller():\n    return 1\n", encoding="utf-8"
+    )
+    matches = [{
+        "file_path": "pkg/in_scope.py", "kind": "function", "name": "caller",
+        "qualname": "pkg/in_scope.py::caller", "line_start": 1, "line_end": 40,
+        "signature": "", "evidence_label": "EXTRACTED", "confidence": 1.0,
+    }]
+    payload = analytics.query(
+        conn, repo, mode="gaps", query_text="caller", matches=matches, budget=3
+    )
+    names = [row["dst_name"] for row in payload["low_confidence_edges"]]
+    assert "real_missing_target" in names
