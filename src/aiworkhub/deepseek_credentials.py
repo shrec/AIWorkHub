@@ -57,6 +57,13 @@ DEEPSEEK_PROVIDER_TYPE = "openai"
 DEEPSEEK_ALLOWED_ENDPOINT_HOSTS = frozenset({"api.deepseek.com"})
 
 CREDENTIAL_PATH_ENV = "AIWORKHUB_DEEPSEEK_CREDENTIAL"
+# Parity with glm_credentials, which gained this and DeepSeek never did. An
+# unrecognised key in a credential file is refused rather than ignored, so a
+# typo'd or injected field cannot ride along unnoticed beside the real ones.
+_ALLOWED_CREDENTIAL_FIELDS = frozenset({"provider", "provider_type", "base_url", "api_key"})
+# The only base_url paths this provider serves. DEEPSEEK_BASE_URL ends in /v1;
+# the empty string covers a bare host with no path.
+_ALLOWED_BASE_URL_PATHS = frozenset({"", "/v1"})
 _DEFAULT_CREDENTIAL_REL = Path(".config") / "aiworkhub" / "deepseek_copilot_credential.json"
 
 MAX_CREDENTIAL_FILE_BYTES = 64 * 1024
@@ -146,15 +153,28 @@ def _within(repo: Path, candidate: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def _validate_endpoint(base_url: Any) -> str:
+    """Validate and normalise the DeepSeek endpoint.
+
+    Parity with ``glm_credentials._validate_endpoint``, which gained a path
+    allow-list and trailing-slash normalisation that this one never did. An
+    allowed host alone was not enough: any path on that host was accepted, so
+    a credential could redirect requests to an arbitrary endpoint under a
+    trusted hostname, and ``https://host/v1`` and ``https://host/v1/`` were two
+    different recorded endpoints.
+    """
+
     if not isinstance(base_url, str) or not base_url.strip():
         raise CredentialError("credential_missing_base_url")
-    parsed = urlsplit(base_url.strip())
+    value = base_url.strip().rstrip("/")
+    parsed = urlsplit(value)
     if parsed.scheme != "https":
         raise CredentialError("credential_non_https_endpoint")
     host = (parsed.hostname or "").lower()
     if host not in DEEPSEEK_ALLOWED_ENDPOINT_HOSTS:
         raise CredentialError(f"credential_non_deepseek_endpoint:{host or 'none'}")
-    return base_url.strip()
+    if parsed.path not in _ALLOWED_BASE_URL_PATHS:
+        raise CredentialError("credential_unsupported_base_url_path")
+    return value
 
 
 def load_credential(
@@ -223,6 +243,9 @@ def load_credential(
         raise CredentialError("credential_invalid_json") from None
     if not isinstance(payload, dict):
         raise CredentialError("credential_invalid_object")
+    unknown = sorted(str(key) for key in payload if key not in _ALLOWED_CREDENTIAL_FIELDS)
+    if unknown:
+        raise CredentialError("credential_unsupported_fields:" + "|".join(unknown[:8]))
 
     api_key = payload.get("api_key")
     if not isinstance(api_key, str) or not api_key.strip():
