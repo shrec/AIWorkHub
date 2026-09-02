@@ -477,11 +477,30 @@ def _active_complete_offset(path: Path, *, size: int) -> int:
 
 
 def _merge_latest_row(
-    latest: dict[str, dict[str, Any]], row: dict[str, Any], key_field: str
+    latest: dict[str, dict[str, Any]],
+    row: dict[str, Any],
+    key_field: str,
+    *,
+    skip_event_kinds: tuple[str, ...] = (),
+    replace: bool = False,
 ) -> None:
+    """Fold one row into the latest-per-key map.
+
+    ``replace`` selects the launcher's semantics, where the newest row for a
+    request IS the state rather than an overlay on the previous one, and
+    ``skip_event_kinds`` drops observation rows that are appended alongside the
+    lifecycle rows and must never overwrite them. Both are parameters rather
+    than a second copy of this projection: the launcher previously reimplemented
+    the fold over an uncached full ledger pass, which is how it ended up paying
+    1.87 s where the cached projection costs 21 ms.
+    """
+
+    if skip_event_kinds and str(row.get("event_kind") or "") in skip_event_kinds:
+        return
     key = str(row.get(key_field) or "")
-    if key:
-        latest[key] = {**latest.get(key, {}), **row}
+    if not key:
+        return
+    latest[key] = dict(row) if replace else {**latest.get(key, {}), **row}
 
 
 def _parse_complete_jsonl(payload: bytes) -> Iterator[dict[str, Any]]:
@@ -495,7 +514,7 @@ def _parse_complete_jsonl(payload: bytes) -> Iterator[dict[str, Any]]:
 
 
 def _cache_projection(
-    cache_key: tuple[str, str], projection: _LatestEventProjection
+    cache_key: tuple[Any, ...], projection: _LatestEventProjection
 ) -> None:
     with _LATEST_EVENT_CACHE_LOCK:
         _LATEST_EVENT_CACHE[cache_key] = projection
@@ -508,12 +527,16 @@ def _rebuild_latest_events(
     path: Path,
     *,
     key_field: str,
-    cache_key: tuple[str, str],
+    cache_key: tuple[Any, ...],
+    skip_event_kinds: tuple[str, ...] = (),
+    replace: bool = False,
 ) -> dict[str, dict[str, Any]]:
     before = _ledger_signatures(path)
     latest: dict[str, dict[str, Any]] = {}
     for row in iter_events(path):
-        _merge_latest_row(latest, row, key_field)
+        _merge_latest_row(
+            latest, row, key_field, skip_event_kinds=skip_event_kinds, replace=replace
+        )
     after = _ledger_signatures(path)
 
     # Cache only a stable read. A concurrent rotation/append still returns the
@@ -539,6 +562,8 @@ def latest_events(
     path: Path,
     *,
     key_field: str = "request_id",
+    skip_event_kinds: tuple[str, ...] = (),
+    replace: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Return the latest merged row per key using an append-aware projection.
 
@@ -550,7 +575,11 @@ def latest_events(
     """
 
     resolved_path = str(path.resolve(strict=False))
-    cache_key = (resolved_path, key_field)
+    skip_event_kinds = tuple(sorted(skip_event_kinds))
+    # The fold options are part of the identity: a replace-fold that drops
+    # notices is a different projection from a merge-fold that keeps them, and
+    # serving one for the other would be a silent wrong answer.
+    cache_key = (resolved_path, key_field, skip_event_kinds, bool(replace))
     current = _ledger_signatures(path)
     with _LATEST_EVENT_CACHE_LOCK:
         cached = _LATEST_EVENT_CACHE.get(cache_key)
@@ -592,14 +621,24 @@ def latest_events(
                     payload = handle.read(observed_size - start)
             except OSError:
                 return _rebuild_latest_events(
-                    path, key_field=key_field, cache_key=cache_key
+                    path,
+                    key_field=key_field,
+                    cache_key=cache_key,
+                    skip_event_kinds=skip_event_kinds,
+                    replace=replace,
                 )
 
             complete_length = payload.rfind(b"\n") + 1
             latest = {key: dict(value) for key, value in cached.latest.items()}
             if complete_length:
                 for row in _parse_complete_jsonl(payload[:complete_length]):
-                    _merge_latest_row(latest, row, key_field)
+                    _merge_latest_row(
+                        latest,
+                        row,
+                        key_field,
+                        skip_event_kinds=skip_event_kinds,
+                        replace=replace,
+                    )
             if _ledger_signatures(path) == current:
                 _cache_projection(
                     cache_key,
@@ -611,4 +650,10 @@ def latest_events(
                 )
                 return {key: dict(value) for key, value in latest.items()}
 
-    return _rebuild_latest_events(path, key_field=key_field, cache_key=cache_key)
+    return _rebuild_latest_events(
+        path,
+        key_field=key_field,
+        cache_key=cache_key,
+        skip_event_kinds=skip_event_kinds,
+        replace=replace,
+    )

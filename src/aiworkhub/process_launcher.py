@@ -4810,18 +4810,26 @@ class ProcessManager:
         number rather than a false verdict.
         """
 
-        latest: dict[str, dict[str, Any]] = {}
-        for event in self._events():
-            # A runtime notice is an observation appended alongside the
-            # lifecycle rows, never one of them.  This map REPLACES the row
-            # per request, so letting a notice land here would erase the
-            # ``state`` every reconciler and reporter reads.
-            if str(event.get("event_kind") or "") == RUNTIME_NOTICE_EVENT_KIND:
-                continue
-            request_id = str(event.get("request_id") or "")
-            if request_id:
-                latest[request_id] = event
-        return latest
+        # A runtime notice is an observation appended alongside the lifecycle
+        # rows, never one of them.  This map REPLACES the row per request, so
+        # letting a notice land here would erase the ``state`` every reconciler
+        # and reporter reads -- hence ``replace`` and ``skip_event_kinds``.
+        #
+        # This used to fold a raw ``iter_events`` pass, which re-parsed the
+        # whole ledger every call. Measured on this host: 12 segments, 557.7 MB,
+        # 56459 rows -- 1.87 s per pass, against 21 ms for the cached
+        # append-aware projection, which re-reads only the bytes appended since
+        # the previous call and never touches the 11 immutable rotations. With
+        # roughly twenty call sites reaching this method, and a reconciler
+        # sweeping every 30 s, that difference was most of the idle CPU
+        # (NF-2026-00561). The projection is keyed by the fold options, so this
+        # replace-and-skip view can never be served a merge-fold answer.
+        return process_event_ledger.latest_events(
+            self.process_log_path,
+            key_field="request_id",
+            skip_event_kinds=(RUNTIME_NOTICE_EVENT_KIND,),
+            replace=True,
+        )
 
     def _latest_by_request_stable(
         self,
