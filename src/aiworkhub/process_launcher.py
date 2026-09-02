@@ -10423,9 +10423,8 @@ class ProcessManager:
         """One pass; ``include_gc`` controls the housekeeping half.
 
         Finalizing exited workers is correctness (0.01 s measured) and runs
-        every pass. The sweep is housekeeping dominated by re-proving ~100
-        pinned rework predecessors at ~3 s each, so bundling them made a card's
-        time-to-review hostage to garbage collection.
+        every pass. The sweep re-proves ~100 pinned predecessors at ~3 s each,
+        so bundling them made time-to-review hostage to garbage collection.
         """
         result = self._reconcile_persisted_requests()
         gc_result: dict[str, int] = (
@@ -10503,15 +10502,19 @@ class ProcessManager:
             if isinstance(predecessor, dict)
             else ""
         )
-        # A failed successor moves the task from pending/processing to
-        # blocked, but the predecessor remains the only hash-pinned reviewed
-        # candidate that a manager can recover or retry.  Its retention is an
-        # identity invariant, not a pending-status convenience.
+        # A failed successor moves the task to blocked, but the predecessor
+        # remains the only hash-pinned reviewed candidate a manager can recover
+        # -- an identity invariant, not a pending-status convenience. It holds
+        # only while that recovery is POSSIBLE: recovery fails closed on
+        # non-blocked tasks, so an archived card's pin protects a path nobody
+        # can take. Measured: 30 of 153 retained worktrees were held that way.
         if pinned_request_id == request_id:
             if repo is not None and _worker_workspace.has_verified_rework_delta(
                 predecessor, authority_repo=repo
             ):
                 return True, "sealed_rework_delta"
+            if canonical_status not in task_fsm.REWORK_RECOVERABLE_STATUSES:
+                return True, f"pin_unrecoverable_task_status:{canonical_status}"
             return False, "pinned_rework_predecessor"
         if canonical_status in GC_DISPOSED_CANONICAL_STATUSES:
             return True, f"disposed_task_status:{canonical_status}"
@@ -14363,15 +14366,6 @@ class ProcessManager:
             "total_requests": len(latest),
             "processes": rows,
         }
-
-
-# Liveness is one function, imported -- never a private copy. The launcher's
-# old POSIX branch read EPERM as DEAD, so a worker under another uid was
-# declared dead and terminalized while its Windows branch read access-denied as
-# ALIVE. ``platform_io.process_is_alive`` gives every entry point the one honest
-# answer (EPERM == alive). Kept bound to ``_pid_alive`` so callers and tests
-# that reference the launcher's name resolve to the shared implementation.
-_pid_alive = process_is_alive
 
 
 # Exact process identity (PID reuse refusal) lives in ``process_identity``:

@@ -45,6 +45,19 @@ from typing import Mapping
 # worker that succeeded, leaving a ledger that recorded only failures.
 # Forgery is prevented by claim identity (launch_request_id plus claim_epoch,
 # which a re-claim increments), never by the card's current status.
+# The statuses from which a hash-pinned rework predecessor can still be
+# recovered. ``task_store.recover_blocked_rework`` fails closed on non-blocked
+# tasks, so retaining a predecessor workspace for any other status protects a
+# path nobody can take -- it only holds disk. ``blocked`` is the case the pin
+# exists for; ``pending``/``processing`` cover an episode already recovered and
+# in flight.
+REWORK_RECOVERABLE_STATUSES: frozenset[str] = frozenset({
+    "blocked",
+    "pending",
+    "processing",
+})
+
+
 CLAIM_ATTEMPT_ACCOUNTABLE_STATUSES: frozenset[str] = frozenset({
     "processing",
     "review",

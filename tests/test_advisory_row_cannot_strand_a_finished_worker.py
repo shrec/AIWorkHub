@@ -216,3 +216,46 @@ def test_a_genuinely_ambiguous_identity_still_defers(tmp_path):
         merged.get("pid"), merged.get("pid_start_ticks")
     ).verdict
     assert verdict is process_launcher.PidIdentityVerdict.UNKNOWN
+
+
+def test_an_archived_cards_pinned_predecessor_is_collectable():
+    """A pin is an invariant only while the recovery it protects is possible.
+
+    task_store.recover_blocked_rework fails closed on non-blocked tasks, so an
+    archived card's hash-pinned predecessor workspace protects a path nobody
+    can take. Measured on this repository: 30 of 153 retained worktrees, on a
+    disk that fills up.
+    """
+    card = {
+        "task_id": "T",
+        "status": "archived",
+        "archived_at": "2026-09-02T00:00:00+00:00",
+        "rework_predecessor": {"request_id": REQUEST_ID},
+    }
+    eligible, reason = process_launcher.ProcessManager._gc_disposition(
+        card, REQUEST_ID, repo=None
+    )
+    assert eligible is True
+    assert reason.startswith("pin_unrecoverable_task_status")
+
+
+def test_a_blocked_cards_pin_still_holds():
+    """The case the invariant exists for is untouched."""
+    card = {
+        "task_id": "T",
+        "status": "blocked",
+        "rework_predecessor": {"request_id": REQUEST_ID},
+    }
+    eligible, reason = process_launcher.ProcessManager._gc_disposition(
+        card, REQUEST_ID, repo=None
+    )
+    assert eligible is False
+    assert reason == "pinned_rework_predecessor"
+
+
+def test_the_recoverable_vocabulary_lives_with_the_lifecycle():
+    from aiworkhub import task_fsm
+
+    assert "blocked" in task_fsm.REWORK_RECOVERABLE_STATUSES
+    assert "archived" not in task_fsm.REWORK_RECOVERABLE_STATUSES
+    assert "superseded" not in task_fsm.REWORK_RECOVERABLE_STATUSES
