@@ -33,6 +33,7 @@ from . import task_retention
 from . import callback_store
 from . import task_plan
 from . import dependency_autolaunch
+from . import learning_commit
 from .learning_commit import FailureCategory, classify_failure_category
 
 
@@ -5105,6 +5106,19 @@ def reject_review(
             "predecessor_request_id": pred_request_id,
         }
     result["reviewer_finalization"] = _finalize_bound_reviewers()
+    # A rejection teaches at least as much as an acceptance, and the duty is
+    # cheapest here -- the findings that caused it are still in hand. Naming it
+    # writes nothing: the lesson stays a manager judgement.
+    result["learning_commit_owed"] = learning_commit.commit_owed(
+        task_id=task_id,
+        request_id=str(pred_request_id or ""),
+        outcome="rejected",
+        changed_paths=[
+            str(entry.get("path") or "")
+            for entry in (residual_identities or [])
+            if isinstance(entry, dict)
+        ],
+    )
     return result
 
 

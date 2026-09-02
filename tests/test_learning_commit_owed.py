@@ -90,3 +90,22 @@ def test_the_idempotency_key_is_stable_per_decision():
     rejected = commit_owed(task_id="TASK", request_id="r" * 32, outcome="rejected")
     assert rejected["idempotency_key"] != commit_owed(**args)["idempotency_key"]
     assert rejected["provenance"] == "manager_rejected_review"
+
+
+def test_both_decisions_name_the_duty_and_they_do_not_collide():
+    """Accept and reject each owe a lesson, and they are different lessons."""
+    accept = commit_owed(task_id="T", request_id="r" * 32, outcome="accepted")
+    reject = commit_owed(task_id="T", request_id="r" * 32, outcome="rejected")
+    assert accept["owed"] is reject["owed"] is True
+    assert accept["outcome"] == "accepted"
+    assert reject["outcome"] == "rejected"
+    assert accept["idempotency_key"] != reject["idempotency_key"]
+    assert accept["tool"] == reject["tool"] == "aiworkhub_manager_learning_commit"
+
+
+def test_a_rejection_with_no_request_identity_still_names_the_duty():
+    """A reject may have no predecessor request; the lesson is owed anyway."""
+    owed = commit_owed(task_id="T", request_id="", outcome="rejected")
+    assert owed["owed"] is True
+    assert owed["task_id"] == "T"
+    assert owed["provenance"] == "manager_rejected_review"
