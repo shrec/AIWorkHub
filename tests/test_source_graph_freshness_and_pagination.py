@@ -88,6 +88,12 @@ def test_clean_first_page_still_issues_cursor_and_reaches_later_finding(tmp_path
     the first page -- was unreachable by any caller.
     After: the cursor follows from unexamined eligible rows alone, so paging
     reaches the last eligible symbol.
+
+    The analytic now also examines the whole scoped corpus rather than one
+    budget-sized slice of it, so this fixture's finding is no longer past a page
+    boundary at all -- a filter mode cannot hide a finding behind pagination
+    (NF-2026-00564 / NF-2026-00566). Both properties are asserted: the finding
+    is reached, and a cursor is still minted while eligible rows remain.
     """
 
     repo = _new_repo(tmp_path, "pageone")
@@ -97,9 +103,11 @@ def test_clean_first_page_still_issues_cursor_and_reaches_later_finding(tmp_path
     sg.build_index(repo, incremental=False)
 
     first = sg.analytics_query(repo, "deadmethods", "", budget=10)
-    assert _analytics_result_row_count("deadmethods", first) == 0
     assert first["coverage"]["eligible"] >= 31
-    # The clean page must still hand back a cursor into the rest of the corpus.
+    # The page bounds the answer, not the examination: a finding beyond the
+    # first budget of rows is now surfaced on the first page.
+    assert _analytics_result_row_count("deadmethods", first) >= 1
+    # And a page that has not exhausted the eligible rows still pages forward.
     assert first["next_cursor"]
 
     found: list[str] = []
@@ -251,12 +259,20 @@ def test_eligible_capped_false_when_corpus_fits(tmp_path):
 
 
 def test_coverage_scanned_equals_examined_not_whole_corpus(tmp_path):
-    """coverage.scanned must equal what the analytic examined, not len(corpus).
+    """coverage.scanned must equal what the analytic examined.
 
-    Before: ``coverage.scanned`` was ``len(corpus)`` while only ``corpus[:budget]``
-    reached the analytic, so a response could carry ``scanned`` far larger than
-    ``analysis.symbols_scanned``.
-    After: ``coverage.scanned`` equals the rows handed to the analytic.
+    The pillar is unchanged and is the last assertion: ``coverage.scanned``
+    tracks ``analysis.symbols_scanned``, so a response can never claim to have
+    examined more than it did.
+
+    What the analytic examines did change. It used to receive ``corpus[:budget]``,
+    so ``scanned`` was the page and was necessarily smaller than ``eligible``.
+    Slicing the input that way made ``budget`` decide the population rather than
+    the response size -- a ranked mode answered a different question at every
+    budget, and a filter mode could hide a finding behind a page boundary
+    (NF-2026-00564 / NF-2026-00566). The analytic now receives the whole scoped
+    corpus, so ``scanned`` equals ``eligible`` here: the page bounds the answer,
+    not the examination.
     """
 
     repo = _new_repo(tmp_path, "scanned")
@@ -266,9 +282,10 @@ def test_coverage_scanned_equals_examined_not_whole_corpus(tmp_path):
     sg.build_index(repo, incremental=False)
 
     res = sg.analytics_query(repo, "deadmethods", "", budget=10)
-    assert res["coverage"]["scanned"] == 10
     assert res["coverage"]["eligible"] >= 31
-    assert res["coverage"]["scanned"] != res["coverage"]["eligible"]
+    assert res["coverage"]["scanned"] == res["coverage"]["eligible"], (
+        "the analytic examines the whole scoped corpus, not one page of it"
+    )
     # The truthful pillar: coverage.scanned tracks analysis.symbols_scanned.
     assert res["coverage"]["scanned"] == res["analysis"]["symbols_scanned"]
 

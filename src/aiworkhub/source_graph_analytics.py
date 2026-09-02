@@ -382,6 +382,26 @@ def _file_rows(conn: sqlite3.Connection, files: list[str], *, limit: int) -> lis
     )]
 
 
+# The population a ranked mode considers is a CONSTANT, never a function of
+# budget. Deriving it from budget meant "the most complex symbol here" changed
+# with the number of rows the caller asked for: measured on complexity over
+# source_graph.py, budget 5 answered resolve_db_path (2 branches), budget 20
+# answered index_write_lease (16), budget 60 answered bodygrep_query (39).
+# A ranking whose population moves with the page size is not a ranking.
+#
+# 400 is the ceiling this module already declared for the match window, so the
+# two narrowings now agree instead of one silently overriding the other.
+# Measured worst case (whole src/aiworkhub, 4000-row corpus): scoring 400
+# symbols costs 273 ms against 28 ms for 80. That is the price of an answer
+# that does not change when the caller changes the page size, and it is bounded
+# and constant rather than surprising (NF-2026-00566).
+RANKED_POPULATION_ROWS = 400
+
+# The modes whose result IS a ranking of the scope, rather than a bounded
+# listing that happens to carry metrics.
+_RANKED_SYMBOL_MODES = frozenset({"hotspots", "complexity", "bottlenecks"})
+
+
 def _scope_matches(
     conn: sqlite3.Connection,
     matches: list[dict[str, Any]],
@@ -389,8 +409,8 @@ def _scope_matches(
     budget: int,
 ) -> list[dict[str, Any]]:
     if matches:
-        return matches[: max(1, min(budget * 4, 400))]
-    return _entity_rows(conn, limit=max(16, min(budget * 4, 400)))
+        return matches[:RANKED_POPULATION_ROWS]
+    return _entity_rows(conn, limit=RANKED_POPULATION_ROWS)
 
 
 def _scope_files(
@@ -675,8 +695,16 @@ def query(
     budget = max(1, min(int(budget), 200))
     scoped_matches = _scope_matches(conn, matches, budget=budget)
     files = _scope_files(conn, matches, budget=budget)
+    # A ranked mode sorts these, so its population cannot be a slice sized by
+    # the caller's page. Every other mode reads symbol_metrics as a bounded
+    # detail list where the smaller, budget-shaped limit is the right cost.
+    _metrics_limit = (
+        RANKED_POPULATION_ROWS
+        if mode in _RANKED_SYMBOL_MODES
+        else max(1, min(budget, 80))
+    )
     symbol_metrics = insights.symbol_metrics(
-        conn, repo_root, scoped_matches, limit=max(1, min(budget, 80)),
+        conn, repo_root, scoped_matches, limit=_metrics_limit,
     )
 
     base: dict[str, Any] = {

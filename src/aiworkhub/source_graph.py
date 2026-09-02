@@ -3771,6 +3771,38 @@ def _scrub_analytics_repo_wide_counts(
             _scrub_analytics_repo_wide_counts(item, corpus, aggregates)
 
 
+def _drop_analytics_result_prefix(
+    payload: dict[str, Any], mode: str, offset: int
+) -> dict[str, Any]:
+    """Take the requested page out of the analytic's own ranked output.
+
+    Paging used to slice the analytic's INPUT, so page two was a fresh ranking
+    of the next arbitrary corpus rows rather than the next rows of one ranking.
+    The analytic is now asked for ``offset + budget`` rows of a single ranking
+    and this drops the rows already served, walking the same registered result
+    keys ``_enforce_analytics_target_scope`` uses so the two cannot disagree
+    about where a mode's rows live.
+    """
+
+    if offset <= 0:
+        return payload
+    for key_path in _ANALYTICS_RESULT_KEYS.get(mode, ()):
+        parts = key_path.split(".")
+        node: Any = payload
+        for part in parts[:-1]:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(part)
+        if not isinstance(node, dict):
+            continue
+        last = parts[-1]
+        value = node.get(last)
+        if isinstance(value, list):
+            node[last] = value[offset:]
+    return payload
+
+
 def _enforce_analytics_target_scope(
     payload: dict[str, Any], mode: str, corpus: list[dict[str, Any]], scope: str,
     conn: sqlite3.Connection,
@@ -3857,34 +3889,70 @@ def analytics_query(
             # snapshot, not a row page), so a nonzero offset can only come
             # from a forged or stale cursor.
             raise SourceGraphError("invalid_cursor")
-        # ``find`` re-clamps its own limit to MAX_BUDGET_ROWS, so a find-backed
-        # corpus is really bounded there, not at MAX_ANALYTICS_CORPUS_ROWS. Track
-        # the cap that actually bounded this corpus so ``eligible_capped`` reports
-        # whether the retrieval was truncated, whatever the effective clamp was --
-        # not a MAX_ANALYTICS_CORPUS_ROWS threshold that find() can never reach.
-        find_rows = find(conn, query, limit=MAX_ANALYTICS_CORPUS_ROWS)
-        corpus_cap = min(MAX_ANALYTICS_CORPUS_ROWS, MAX_BUDGET_ROWS)
-        corpus_capped = len(find_rows) >= corpus_cap
+        # An explicit target is a SCOPE, not a filter. The corpus was previously
+        # built the other way round -- ``find(query)`` decided membership and the
+        # target then filtered what that query happened to match -- so a lens saw
+        # only the symbols whose names matched the caller's words, and a caller
+        # who described the scope accurately got the narrowest answer. Measured
+        # on this repository, ``complexity`` over src/aiworkhub/source_graph.py:
+        #
+        #   query "source_graph"  -> eligible 7    top symbol 3 branches
+        #   query "zzqqxx"        -> eligible 159  top symbol 16 branches
+        #
+        # The nonsense query found index_write_lease, the genuinely most complex
+        # function in that file; the accurate one never saw it. A mode whose job
+        # is "rank this scope" cannot have its membership decided by name match
+        # (NF-2026-00564).
+        #
+        # The scoped corpus also escapes find's tighter clamp. ``find`` re-clamps
+        # to MAX_BUDGET_ROWS, so a find-backed corpus could never exceed 200 rows
+        # -- 0.9% of this repository -- whatever MAX_ANALYTICS_CORPUS_ROWS said.
+        #
+        # The query is not discarded: it still reaches every per-mode analytic as
+        # ``query_text``, so a mode that ranks by relevance still can. What it no
+        # longer does is decide who is in scope.
         if normalized_target:
-            corpus = [
-                row for row in find_rows
-                if _path_in_analytics_scope(str(row.get("file_path") or ""), normalized_target)
-            ]
-        else:
-            corpus = find_rows
-        if not corpus:
             corpus = _scoped_entity_rows(
                 conn, normalized_target, limit=MAX_ANALYTICS_CORPUS_ROWS,
             )
-            # The scoped-entity fallback honours the full MAX_ANALYTICS_CORPUS_ROWS
-            # limit (it does not route through find's tighter clamp).
             corpus_cap = MAX_ANALYTICS_CORPUS_ROWS
-            corpus_capped = len(corpus) >= corpus_cap
+        else:
+            corpus = find(conn, query, limit=MAX_ANALYTICS_CORPUS_ROWS)
+            corpus_cap = min(MAX_ANALYTICS_CORPUS_ROWS, MAX_BUDGET_ROWS)
+            if not corpus:
+                # No scope and nothing matched: the repository itself is the
+                # corpus, which is what the per-mode analytic reports as
+                # ``repository_fallback``. Only the UNSCOPED case falls back --
+                # an explicit target with no rows stays empty below, so a scope
+                # can never be widened back out to the whole repository.
+                corpus = _scoped_entity_rows(
+                    conn, normalized_target, limit=MAX_ANALYTICS_CORPUS_ROWS,
+                )
+                corpus_cap = MAX_ANALYTICS_CORPUS_ROWS
+        corpus_capped = len(corpus) >= corpus_cap
         total_eligible = len(corpus)
         if offset and offset >= total_eligible:
             raise SourceGraphError("invalid_cursor")
-        page = corpus[offset:offset + budget] if is_pageable_mode else corpus[:budget]
-        page_len = len(page)
+        # The analytic sees the WHOLE scoped corpus, never a pre-sliced window.
+        # Slicing the input first made ``budget`` decide the population instead
+        # of the response size, so a ranked mode answered a different question
+        # at every budget. Measured on complexity over source_graph.py:
+        #
+        #   budget 5   -> top resolve_db_path    (2 branches)
+        #   budget 20  -> top index_write_lease  (16 branches)
+        #   budget 60  -> top bodygrep_query     (39 branches)
+        #
+        # "The most complex symbol here" cannot depend on how many rows the
+        # caller asked for. Ranking the full corpus costs 18 ms for this file
+        # and 5 ms for all of src/, so the pre-slice bought nothing either.
+        #
+        # Paging then applies to the analytic's RANKED OUTPUT rather than to the
+        # input order: the mode is asked for ``offset + budget`` rows of one
+        # consistent ranking and the window is taken from that, so page two is
+        # the next rows of the same ranking instead of a fresh ranking of the
+        # next arbitrary input rows (NF-2026-00564 / NF-2026-00566).
+        analytic_budget = offset + budget if is_pageable_mode else budget
+        page_len = max(0, min(budget, total_eligible - offset))
         pending_next_offset = offset + page_len
         if normalized_target and not corpus:
             # An explicit scope with zero eligible rows must stay empty --
@@ -3897,8 +3965,10 @@ def analytics_query(
         else:
             payload = sganalytics.query(
                 conn, repo_root, mode=mode, query_text=query,
-                matches=page, budget=budget,
+                matches=corpus, budget=analytic_budget,
             )
+            if offset:
+                payload = _drop_analytics_result_prefix(payload, mode, offset)
             payload = _enforce_analytics_target_scope(payload, mode, corpus, normalized_target, conn)
         payload["target"] = normalized_target or None
         # Reserve room for the coverage/cursor block BEFORE fitting content
