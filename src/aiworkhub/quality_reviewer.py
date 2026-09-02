@@ -469,6 +469,18 @@ def build_review_prompt(
         if use_file_transport
         else f"QUALITY_REVIEW_PACKET: {encoded}\n"
     )
+    # Reconciliation of a real contradiction: runtime_adapters grants the
+    # reviewer ``aiworkhub_worker_quality_review_submit`` in its allowedTools,
+    # yet this prompt bans invoking any submission tool.  The prompt ban is
+    # authoritative -- the reviewer emits exactly one JSON report as its final
+    # text and the SUPERVISOR (quality_review_ingest.supervisor_ingest) derives
+    # all task/request/claim/target/reviewer/packet identity and submits it.
+    # The allowedTools grant is retained only as a tolerated fallback: if a
+    # reviewer self-submits despite the ban, that payload lands in the audit
+    # ledger and supervisor_ingest's explicit-receipt path reconciles it (dedup
+    # or conflict), never letting reviewer-asserted identity through.  The tool
+    # name is deliberately kept out of the returned prompt so the reviewer is
+    # not nudged toward it.
     return (
         "You are an independent, strictly read-only quality reviewer.\n"
         f"Review lens: {lens}.\n"

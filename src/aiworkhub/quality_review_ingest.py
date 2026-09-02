@@ -27,6 +27,7 @@ class IngestResult:
     report: dict[str, Any] | None
     submitted: bool = False
     deduplicated: bool = False
+    final_excerpt: str = ""
 
 
 def provider_final_text(event: Mapping[str, Any]) -> str:
@@ -55,15 +56,15 @@ def provider_final_text(event: Mapping[str, Any]) -> str:
     return ""
 
 
-def _report_from_text(text: str) -> dict[str, Any] | None:
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        if text.lstrip().startswith(("{", "[")):
-            raise ReviewProtocolError("malformed_structured_output") from None
-        return None
+MAX_FINAL_EXCERPT_CHARS = 500
+
+
+def _report_from_value(value: Any) -> dict[str, Any] | None:
+    """Validate one already-parsed JSON value as a single review report."""
     if not isinstance(value, dict):
-        raise ReviewProtocolError("multiple_report_objects" if isinstance(value, list) else "malformed_structured_output")
+        raise ReviewProtocolError(
+            "multiple_report_objects" if isinstance(value, list) else "malformed_structured_output"
+        )
     report: Any = value.get("report", value)
     if not isinstance(report, dict) or not REPORT_KEYS <= report.keys():
         return None
@@ -77,10 +78,93 @@ def _report_from_text(text: str) -> dict[str, Any] | None:
     return dict(report)
 
 
+def _iter_balanced_objects(text: str) -> Iterable[str]:
+    """Yield each top-level balanced ``{...}`` region, string-aware.
+
+    Braces are balanced only once inside an object, so quotes and braces in the
+    surrounding prose -- including a lone unmatched quote -- never derail the
+    scan.  This locates the report whether it is bare, wrapped in prose, or
+    fenced inside a ```json block.
+    """
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if depth == 0:
+            if char == "{":
+                depth = 1
+                start = index
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                yield text[start : index + 1]
+                start = -1
+
+
+def _last_report_object(text: str) -> dict[str, Any] | None:
+    """Return the last balanced JSON object in ``text`` that is a report."""
+    found: dict[str, Any] | None = None
+    for candidate in _iter_balanced_objects(text):
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        report = _report_from_value(value)
+        if report is not None:
+            found = report
+    return found
+
+
+def _bounded_final_excerpt(text: str) -> str:
+    """Collapse whitespace and cap the reviewer's final text for a reason."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) > MAX_FINAL_EXCERPT_CHARS:
+        return collapsed[:MAX_FINAL_EXCERPT_CHARS] + "..."
+    return collapsed
+
+
+def _report_from_text(text: str) -> dict[str, Any] | None:
+    """Extract one review report from a provider final message.
+
+    The reviewer prompt asks for exactly one bare JSON object, so a strict
+    whole-message parse runs first and preserves the exact multiple/malformed
+    diagnostics for a well-behaved reviewer.  A capable reviewer instead often
+    ends with helpful prose and wraps the report in a fenced ```json block or
+    inline braces; that final is now accepted by taking the last balanced JSON
+    object carrying the report keys rather than being silently dropped.
+    """
+    stripped = text.strip()
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        report = _last_report_object(stripped)
+        if report is not None:
+            return report
+        if stripped.startswith(("{", "[")):
+            raise ReviewProtocolError("malformed_structured_output") from None
+        return None
+    return _report_from_value(value)
+
+
 def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> IngestResult:
     """Extract exactly one report from bounded JSONL provider events."""
     reports: list[dict[str, Any]] = []
     final_count = 0
+    last_final_text = ""
     for count, raw in enumerate(events, 1):
         if count > MAX_EVENTS or len(raw.encode("utf-8")) > MAX_EVENT_BYTES:
             raise ReviewProtocolError("provider_events_oversized")
@@ -94,13 +178,18 @@ def extract_structured_final(events: Iterable[str], *, expected_lens: str) -> In
         if not text:
             continue
         final_count += 1
+        last_final_text = text
         report = _report_from_text(text)
         if report is not None:
             reports.append(report)
     if len(reports) > 1:
         raise ReviewProtocolError("multiple_structured_finals")
     if not reports:
-        return IngestResult("unstructured_final" if final_count else "missing_final", None)
+        return IngestResult(
+            "unstructured_final" if final_count else "missing_final",
+            None,
+            final_excerpt=_bounded_final_excerpt(last_final_text),
+        )
     report = reports[0]
     if report["lens"] != expected_lens:
         raise ReviewProtocolError("lens_mismatch")
@@ -126,11 +215,24 @@ def ingest_structured_final(
             raise ReviewProtocolError("explicit_submission_conflict")
         return IngestResult("deduplicated", report, deduplicated=True)
     if report is None:
-        return result
+        # Fail closed with the reviewer's actual final output, never a bare
+        # submission count.  The SUPERVISOR -- never the reviewer -- derives
+        # identity and submits, so a missing report here means nothing durable
+        # was produced; the finalizer must see WHY (an unparseable prose final
+        # or a genuinely absent final), not just "submission_count:0".
+        raise ReviewProtocolError(_no_report_reason(result))
     if submit is None:
         return IngestResult(result.status, report)
     submit(report)
     return IngestResult("submitted", report, submitted=True)
+
+
+def _no_report_reason(result: IngestResult) -> str:
+    """Explain an empty ingest with a bounded excerpt of the reviewer output."""
+    if result.status == "unstructured_final":
+        excerpt = result.final_excerpt or "(empty final message)"
+        return f"no_report_in_final:{excerpt}"
+    return "no_provider_final"
 
 
 def _normalize_review_finding_aliases(report: Mapping[str, Any]) -> dict[str, Any]:
