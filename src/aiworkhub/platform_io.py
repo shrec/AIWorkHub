@@ -115,7 +115,13 @@ def available_memory_bytes(platform_name: str | None = None) -> int | None:
         try:
             status = _MemoryStatus()
             status.length = ctypes.sizeof(status)
-            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            # argtypes/restype are set explicitly, as every other ctypes entry
+            # point in this module does: without them ctypes guesses a 32-bit
+            # int for both the pointer argument and the BOOL return.
+            global_memory_status = ctypes.windll.kernel32.GlobalMemoryStatusEx
+            global_memory_status.argtypes = (ctypes.POINTER(_MemoryStatus),)
+            global_memory_status.restype = ctypes.c_int
+            if not global_memory_status(ctypes.byref(status)):
                 return None
             return int(status.available_physical)
         except (AttributeError, OSError, ValueError):
@@ -901,14 +907,24 @@ def process_is_alive(pid: int) -> bool:
     return _platform_process_backend.process_is_alive(pid)
 
 
-def chmod_fd(fd: int, mode: int) -> None:
+def chmod_fd(fd: int, mode: int, *, platform_name: str | None = None) -> None:
     """Apply a POSIX descriptor mode where the host supports it.
 
     Windows ACLs are not represented by POSIX mode bits and Python does not
     expose ``os.fchmod`` there, so the secure creation flags remain the
     authority and this operation intentionally becomes a no-op.
+
+    Applicability is decided by :func:`posix_path_modes_supported` -- the same
+    predicate :func:`chmod_path` uses. Deciding it here with a bare
+    ``getattr(os, "fchmod")`` capability probe answered one policy question by
+    two different rules, and because only ``chmod_path`` accepted a
+    ``platform_name`` override the Windows behaviour of this function could not
+    be tested at all. The ``fchmod`` absence check survives as a defensive
+    fallback for a POSIX-named host that genuinely lacks it.
     """
 
+    if not posix_path_modes_supported(platform_name):
+        return
     fchmod = getattr(os, "fchmod", None)
     if fchmod is not None:
         fchmod(fd, mode)
@@ -968,7 +984,17 @@ class _MsvcrtLocking(Protocol):
 
 
 def _prepare_windows_lock_byte(fd: int) -> None:
-    """Ensure byte zero exists and select it for ``msvcrt.locking``."""
+    """Ensure byte zero exists and select it for ``msvcrt.locking``.
+
+    This REQUIRES A WRITABLE descriptor. ``msvcrt.locking`` locks a byte range
+    that has to exist, so an empty lock file gets one byte written into it.
+    POSIX ``flock`` needs neither a writable fd nor any file content, so a lock
+    file that both branches may open must always be opened for writing -- the
+    read-only descriptor POSIX accepts fails here with ``EBADF``.
+
+    Restoring the caller's file offset is not this helper's job; ``lock_fd`` and
+    ``unlock_fd`` save and restore it around the whole Windows operation.
+    """
 
     if os.fstat(fd).st_size == 0:
         os.lseek(fd, 0, os.SEEK_SET)
@@ -976,45 +1002,67 @@ def _prepare_windows_lock_byte(fd: int) -> None:
     os.lseek(fd, 0, os.SEEK_SET)
 
 
+def _lock_fd_windows(
+    fd: int, windows_locking: _MsvcrtLocking, *, blocking: bool
+) -> None:
+    """Acquire the Windows byte-range lock; the caller restores the offset."""
+
+    _prepare_windows_lock_byte(fd)
+    if not blocking:
+        windows_locking.locking(fd, windows_locking.LK_NBLCK, 1)
+        return
+    # ``msvcrt.LK_LOCK`` is NOT the Windows equivalent of ``flock(LOCK_EX)``.
+    # It retries ten times at one-second intervals and then raises ``OSError``,
+    # so a lock genuinely held by someone else fails on Windows where a POSIX
+    # caller would simply wait.  Poll the non-blocking primitive instead, but
+    # bound the wait: unlike ``flock``, a Windows byte-range lock can be blocked
+    # by this very process holding another handle, which no amount of waiting
+    # can clear. Waiting forever there would hang the caller outright.
+    deadline = time.monotonic() + ADVISORY_LOCK_MAX_WAIT_SECONDS
+    # Track the LAST contended errno so the timeout can report whether the wait
+    # ended on the deadlock spelling or a permission-shaped EACCES -- both are
+    # retried, but the outcome must say which one it was.
+    last_errno: int | None = None
+    while True:
+        try:
+            windows_locking.locking(fd, windows_locking.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if exc.errno not in _WINDOWS_LOCK_CONTENDED_ERRNOS:
+                raise
+            last_errno = exc.errno
+            if time.monotonic() >= deadline:
+                raise _advisory_lock_timeout("windows", last_errno) from exc
+            time.sleep(ADVISORY_LOCK_POLL_SECONDS)
+            # locking() leaves the file pointer where it found it, but a failed
+            # attempt must still start from the same lock byte.
+            os.lseek(fd, 0, os.SEEK_SET)
+
+
 def lock_fd(fd: int, *, blocking: bool) -> None:
-    """Acquire an exclusive advisory lock for an open file descriptor."""
+    """Acquire an exclusive advisory lock for an open file descriptor.
+
+    The caller's file offset is preserved on every platform. On Windows the
+    lock byte is addressed by seeking, so the offset is saved and restored
+    around the operation; POSIX ``flock`` never moves it.
+    """
 
     if os.name == "nt":
         import msvcrt
 
         windows_locking = cast(_MsvcrtLocking, msvcrt)
-        _prepare_windows_lock_byte(fd)
-        if not blocking:
-            windows_locking.locking(fd, windows_locking.LK_NBLCK, 1)
-            return
-        # ``msvcrt.LK_LOCK`` is NOT the Windows equivalent of
-        # ``flock(LOCK_EX)``.  It retries ten times at one-second intervals
-        # and then raises ``OSError``, so a lock genuinely held by someone
-        # else fails on Windows where a POSIX caller would simply wait.  Poll
-        # the non-blocking primitive instead, but bound the wait: unlike
-        # ``flock``, a Windows byte-range lock can be blocked by this very
-        # process holding another handle, which no amount of waiting can
-        # clear. Waiting forever there would hang the caller outright.
-        deadline = time.monotonic() + ADVISORY_LOCK_MAX_WAIT_SECONDS
-        # Track the LAST contended errno so the timeout can report whether the
-        # wait ended on the deadlock spelling or a permission-shaped EACCES --
-        # both are retried, but the outcome must say which one it was.
-        last_errno: int | None = None
-        while True:
-            try:
-                windows_locking.locking(fd, windows_locking.LK_NBLCK, 1)
-                return
-            except OSError as exc:
-                if exc.errno not in _WINDOWS_LOCK_CONTENDED_ERRNOS:
-                    raise
-                last_errno = exc.errno
-                if time.monotonic() >= deadline:
-                    raise _advisory_lock_timeout("windows", last_errno) from exc
-                time.sleep(ADVISORY_LOCK_POLL_SECONDS)
-                # locking() leaves the file pointer where it found it, but a
-                # failed attempt must still start from the same lock byte.
-                os.lseek(fd, 0, os.SEEK_SET)
-
+        # POSIX ``flock`` leaves the caller's file offset untouched. The Windows
+        # primitive locks the byte range at the CURRENT position, so this branch
+        # has to seek to zero -- and has to put the offset back, or ``lock_fd``
+        # would silently rewind the caller's file on one platform only. Saving
+        # and restoring it here makes the observable offset contract identical
+        # on both platforms, which is the entire point of this module.
+        saved_offset = os.lseek(fd, 0, os.SEEK_CUR)
+        try:
+            _lock_fd_windows(fd, windows_locking, blocking=blocking)
+        finally:
+            os.lseek(fd, saved_offset, os.SEEK_SET)
+        return
     import fcntl
 
     if not blocking:
@@ -1044,14 +1092,22 @@ def lock_fd(fd: int, *, blocking: bool) -> None:
 
 
 def unlock_fd(fd: int) -> None:
-    """Release a lock acquired by :func:`lock_fd`."""
+    """Release a lock acquired by :func:`lock_fd`.
+
+    Like :func:`lock_fd`, this leaves the caller's file offset exactly where it
+    found it on every platform.
+    """
 
     if os.name == "nt":
         import msvcrt
 
         windows_locking = cast(_MsvcrtLocking, msvcrt)
-        os.lseek(fd, 0, os.SEEK_SET)
-        windows_locking.locking(fd, windows_locking.LK_UNLCK, 1)
+        saved_offset = os.lseek(fd, 0, os.SEEK_CUR)
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            windows_locking.locking(fd, windows_locking.LK_UNLCK, 1)
+        finally:
+            os.lseek(fd, saved_offset, os.SEEK_SET)
         return
 
     import fcntl
