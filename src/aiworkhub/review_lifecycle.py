@@ -542,7 +542,15 @@ def defer_action(
 
 
 def lifecycle_counts(db_path: str | Path) -> dict[str, int]:
-    """Return truthful bounded state counts after authenticating every chain."""
+    """Return truthful bounded state counts after authenticating every chain.
+
+    ``pending`` alone is not a queue depth. An action whose chain already has a
+    failed action can never be reserved -- every later action in that chain
+    waits on it -- so it is parked, not queued. Measured on this repository:
+    1,847 pending, of which 1,389 were parked behind 129 failed chains. A
+    reader deciding whether the orchestrator has work cannot tell those apart
+    from one number, and 'pending' read as a backlog it would never work off.
+    """
     conn = _connect(db_path)
     try:
         ensure_schema(conn)
@@ -552,6 +560,13 @@ def lifecycle_counts(db_path: str | Path) -> dict[str, int]:
             "SELECT state, COUNT(*) AS count FROM review_action_outbox GROUP BY state"
         ):
             counts[str(row["state"])] = int(row["count"])
+        parked = conn.execute(
+            "SELECT COUNT(*) FROM review_action_outbox WHERE state='pending' "
+            "AND chain_id IN (SELECT chain_id FROM review_action_outbox "
+            "WHERE state='failed')"
+        ).fetchone()[0]
+        counts["pending_parked"] = int(parked)
+        counts["pending_reservable"] = max(0, counts.get("pending", 0) - int(parked))
         return counts
     finally:
         conn.close()

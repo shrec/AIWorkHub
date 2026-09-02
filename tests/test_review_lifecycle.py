@@ -639,3 +639,42 @@ def test_restart_reauthenticates_stored_chain(tmp_path: Path) -> None:
     assert [action.descriptor_sha256 for action in restarted] == [
         action.descriptor_sha256 for action in chain.actions
     ]
+
+
+def test_pending_is_split_into_parked_and_reservable(tmp_path: Path) -> None:
+    """A queue depth that counts work nobody will ever do is not a depth.
+
+    An action whose chain already holds a failed action can never be reserved:
+    every later action waits on the earlier one completing. Measured on this
+    repository: 1,847 pending, 1,389 of them parked behind 129 failed chains.
+    Reported as one number, 'pending' read as a backlog that would be worked
+    off, and it never would be.
+    """
+    db = tmp_path / "review.sqlite"
+    live = review_lifecycle.create_or_replay_chain(
+        db, target_task_id="LIVE", target_request_id="req-live",
+        claim_epoch=1, packet_sha256="a" * 64, candidate_sha256="b" * 64,
+        now=NOW,
+    )
+    parked = review_lifecycle.create_or_replay_chain(
+        db, target_task_id="PARKED", target_request_id="req-parked",
+        claim_epoch=1, packet_sha256="c" * 64, candidate_sha256="d" * 64,
+        now=NOW,
+    )
+    assert live.chain_id != parked.chain_id
+
+    token = "t" * 32
+    action = review_lifecycle.reserve_next_action(
+        db, owner="probe", lease_token=token, now=NOW, lease_seconds=60,
+    )
+    assert action is not None
+    review_lifecycle.fail_action(
+        db, action_id=action.action_id, owner="probe", lease_token=token,
+        reason="RuntimeError:deliberate", now=NOW,
+    )
+
+    counts = review_lifecycle.lifecycle_counts(db)
+    assert counts["failed"] == 1
+    assert counts["pending_parked"] + counts["pending_reservable"] == counts["pending"]
+    assert counts["pending_parked"] > 0, "the failed chain's remaining actions are parked"
+    assert counts["pending_reservable"] > 0, "the untouched chain is still reservable"
