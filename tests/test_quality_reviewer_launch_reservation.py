@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from aiworkhub import process_event_ledger
 from aiworkhub import process_launcher
 
 
@@ -2046,33 +2047,58 @@ def test_latest_by_request_lookup_stays_bounded_for_hot_path_callers(tmp_path):
         )
     )
 
+    # The seam moved and the bound got tighter. This used to count
+    # ``_events`` -- a raw full pass -- because that is what the fold did. The
+    # fold now goes through the append-aware projection, which replays only the
+    # bytes appended since the previous call, so a repeated read costs no full
+    # pass at all. Counting the projection instead of ``_events`` keeps the
+    # property being asserted (how many times the hot path traverses the
+    # ledger) and states the stronger bound the change actually bought.
     generations = 0
-    scans = 0
+    folds = 0
+    rebuilds = 0
     exact_generation = manager._ledger_generation
-    exact_events = manager._events
+    exact_latest = manager._latest_by_request
+    exact_rebuild = process_event_ledger._rebuild_latest_events
 
     def counted_generation():
         nonlocal generations
         generations += 1
         return exact_generation()
 
-    def counted_events():
-        nonlocal scans
-        scans += 1
-        return exact_events()
+    def counted_latest():
+        nonlocal folds
+        folds += 1
+        return exact_latest()
+
+    def counted_rebuild(*args, **kwargs):
+        nonlocal rebuilds
+        rebuilds += 1
+        return exact_rebuild(*args, **kwargs)
 
     manager._ledger_generation = counted_generation
-    manager._events = counted_events
+    manager._latest_by_request = counted_latest
+    monkeypatch_target = process_event_ledger
+    original_rebuild = monkeypatch_target._rebuild_latest_events
+    monkeypatch_target._rebuild_latest_events = counted_rebuild
+    try:
+        assert "review-bounded-1" in manager._latest_by_request()
+        assert generations == 0, "the hot path must not describe the ledger at all"
+        assert folds == 1, "the hot path must fold the ledger exactly once"
+        first_rebuilds = rebuilds
+        assert first_rebuilds <= 1, "a cold fold is at most one full pass"
 
-    assert "review-bounded-1" in manager._latest_by_request()
-    assert generations == 0, "the hot path must not describe the ledger at all"
-    assert scans == 1, "the hot path must read the ledger exactly once"
+        assert "review-bounded-1" in manager._latest_by_request()
+        assert rebuilds == first_rebuilds, (
+            "a repeated hot-path read must add no full pass at all"
+        )
 
-    latest, generation = manager._latest_by_request_stable()
-    assert "review-bounded-1" in latest
-    assert generation is not None
-    assert generations == 2, "a terminalizing read is bracketed before and after"
-    assert scans == 2
+        latest, generation = manager._latest_by_request_stable()
+        assert "review-bounded-1" in latest
+        assert generation is not None
+        assert generations == 2, "a terminalizing read is bracketed before and after"
+    finally:
+        monkeypatch_target._rebuild_latest_events = original_rebuild
 
 
 def test_blocked_card_read_never_delays_a_disjoint_reservation(
@@ -2193,8 +2219,28 @@ class _LedgerWork:
                 self.sweeps_locked += 1
             return exact_generation()
 
+        exact_latest_by_request = manager._latest_by_request
+
+        def counted_latest_by_request():
+            # ``_latest_by_request`` used to fold a raw ``_events`` pass, so
+            # counting ``_events`` counted the hot path. It now folds through
+            # the append-aware projection in ``process_event_ledger``, which
+            # re-reads only bytes appended since the previous call. That is the
+            # improvement this suite exists to protect, but it moved the seam:
+            # instrumenting ``_events`` alone would have counted zero and every
+            # bound below would have passed vacuously. Both seams are counted,
+            # and they no longer nest, so nothing is double counted.
+            self.parses += 1
+            if self.depth:
+                self.parses_locked += 1
+            result = exact_latest_by_request()
+            if self.on_parse is not None:
+                self.on_parse()
+            return result
+
         manager._registry_lock = counting_registry_lock
         manager._events = counted_events
+        manager._latest_by_request = counted_latest_by_request
         manager._ledger_generation = counted_generation
 
     def reset(self) -> None:
