@@ -62,6 +62,13 @@ STATUS_REL_PATH = Path(".aiworkhub/runtime/task_reconciler_status.json")
 # that last ran hours ago is indistinguishable from no reconciler at all.
 STALE_SCAN_INTERVALS = 4.0
 MIN_STALE_SCAN_SECONDS = 300.0
+# Finalizing exited workers is correctness and runs every pass (0.01 s
+# measured). Sweeping retained workspaces is housekeeping whose cost is
+# dominated by re-proving that pinned rework predecessors are still pinned --
+# ~100 of them at ~3 s each on this repository. Running both on one cadence
+# made a finished card's time-to-review hostage to garbage collection, so the
+# sweep runs on every Nth pass instead.
+GC_SCAN_EVERY_N_PASSES = 20
 
 
 def _utcnow() -> str:
@@ -164,6 +171,7 @@ def run_scan(
     manager: process_launcher.ProcessManager | None = None,
     *,
     repo: Path | None = None,
+    include_gc: bool = True,
 ) -> dict[str, Any]:
     """Run one idempotent, bounded reconciliation scan.
 
@@ -178,16 +186,21 @@ def run_scan(
     DeepSeek/chat endpoint.
     """
     mgr = manager or process_launcher.ProcessManager(repo=repo)
-    result = mgr.reconcile()
+    result = mgr.reconcile(include_gc=include_gc)
     return {
         "ok": True,
         "scanned_at": _utcnow(),
+        "gc_included": bool(include_gc),
         **result,
     }
 
 
 class ReconcilerService:
     """Repo-bound in-process reconciler lifecycle for an MCP child."""
+
+    # Class-level default so the counter exists on any instance, including one
+    # built for a test without running __init__.
+    _pass_index = 0
 
     def __init__(self, repo: Path, *, scan_interval_seconds: float | None = None) -> None:
         self.repo = repo.resolve()
@@ -201,6 +214,7 @@ class ReconcilerService:
         self._state_lock = threading.Lock()
         self._last_scan: dict[str, Any] = {}
         self._last_error = ""
+        self._pass_index = 0
 
     def is_running(self) -> bool:
         return bool(self._thread is not None and self._thread.is_alive())
@@ -208,8 +222,12 @@ class ReconcilerService:
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             started = time.time()
+            # The first pass sweeps, so a freshly started reconciler still
+            # reclaims immediately; after that housekeeping is periodic.
+            include_gc = self._pass_index % GC_SCAN_EVERY_N_PASSES == 0
+            self._pass_index += 1
             try:
-                result = run_scan(self._manager, repo=self.repo)
+                result = run_scan(self._manager, repo=self.repo, include_gc=include_gc)
                 with self._state_lock:
                     self._last_scan = result
                     self._last_error = ""
@@ -231,6 +249,8 @@ class ReconcilerService:
                 "last_error": error,
                 "finalized": result.get("finalized", 0),
                 "watched": result.get("watched", 0),
+                "gc_included": bool(result.get("gc_included")),
+                "gc_cleaned": result.get("gc_cleaned", 0),
                 "scanned_at": result.get("scanned_at", ""),
             })
             if self._stop_event.wait(self.scan_interval_seconds):

@@ -10420,9 +10420,21 @@ class ProcessManager:
                     finalized += 1
         return {"watched": watched, "finalized": finalized}
 
-    def reconcile(self) -> dict[str, Any]:
+    def reconcile(self, *, include_gc: bool = True) -> dict[str, Any]:
+        """One reconciliation pass; ``include_gc`` controls the housekeeping half.
+
+        Finalizing exited workers is correctness and must run on every pass:
+        measured at 0.01 s here. Sweeping retained workspaces is housekeeping
+        and is dominated by re-proving that ~100 pinned rework predecessors are
+        still pinned, ~3 s each, every time. Bundling them made a card's
+        time-to-review hostage to garbage collection.
+        """
         result = self._reconcile_persisted_requests()
-        gc_result = self._gc_finalized_workspaces()
+        gc_result: dict[str, int] = (
+            self._gc_finalized_workspaces()
+            if include_gc
+            else {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0}
+        )
         review_result: dict[str, Any] = dict(attempted=0, completed=0, failed=0, pending=0, review_actions={})
         review_db = review_orchestrator.canonical_review_db(self)
         if review_db is None:

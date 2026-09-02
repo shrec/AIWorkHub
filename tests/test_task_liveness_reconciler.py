@@ -1040,7 +1040,7 @@ def test_repo_bound_reconciler_service_is_idempotent_and_stoppable(tmp_path, mon
     monkeypatch.setattr(
         task_reconciler,
         "run_scan",
-        lambda manager=None, repo=None: scans.append(str(repo)) or {"ok": True},
+        lambda manager=None, repo=None, include_gc=True: scans.append(str(repo)) or {"ok": True},
     )
     service = task_reconciler.ensure_started(repo)
     again = task_reconciler.ensure_started(repo)

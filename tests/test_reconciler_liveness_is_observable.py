@@ -134,3 +134,48 @@ def test_a_corrupt_record_reads_as_absent_not_as_healthy(tmp_path: Path):
     path.write_text("{not json", encoding="utf-8")
     assert tr.read_status(tmp_path) == {}
     assert tr.reconciler_health(tmp_path)["ok"] is False
+
+
+def test_finalization_runs_every_pass_and_housekeeping_does_not(tmp_path: Path, monkeypatch):
+    """A finished card's time-to-review must not depend on garbage collection.
+
+    Finalizing exited workers is correctness (0.01 s measured); sweeping
+    retained workspaces is housekeeping dominated by re-proving that ~100
+    pinned rework predecessors are still pinned, ~3 s each. Bundled on one
+    cadence, the sweep is what the loop spends its interval on.
+    """
+    passes: list[bool] = []
+    svc = _service(tmp_path, None)
+
+    def _scan(_mgr=None, *, repo=None, include_gc=True):
+        passes.append(include_gc)
+        if len(passes) >= tr.GC_SCAN_EVERY_N_PASSES + 1:
+            svc._stop_event.set()
+        return {"ok": True, "finalized": 0, "watched": 0, "gc_included": include_gc}
+
+    monkeypatch.setattr(tr, "run_scan", _scan)
+    svc.scan_interval_seconds = 0.0
+    svc._loop()
+
+    # The first pass sweeps so a fresh reconciler still reclaims immediately,
+    # then housekeeping is periodic -- never every pass.
+    assert passes[0] is True
+    assert passes[1:tr.GC_SCAN_EVERY_N_PASSES] == [False] * (tr.GC_SCAN_EVERY_N_PASSES - 1)
+    assert passes[tr.GC_SCAN_EVERY_N_PASSES] is True
+
+
+def test_the_durable_record_says_whether_a_pass_swept(tmp_path: Path, monkeypatch):
+    """'No workspaces cleaned' and 'no sweep ran' are different facts."""
+    svc = _service(tmp_path, None)
+
+    def _scan(_mgr=None, *, repo=None, include_gc=True):
+        svc._stop_event.set()
+        return {"ok": True, "finalized": 1, "watched": 0,
+                "gc_included": include_gc, "gc_cleaned": 3}
+
+    monkeypatch.setattr(tr, "run_scan", _scan)
+    svc._loop()
+    record = tr.read_status(tmp_path)
+    assert record["gc_included"] is True
+    assert record["gc_cleaned"] == 3
+    assert record["finalized"] == 1
