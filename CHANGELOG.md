@@ -6,6 +6,49 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.79] - 2026-09-02
+
+The release where the surfaces stopped saying "unknown" about things they had
+never looked at. Five defects landed in one wave, and four of them are the same
+shape: a fact existed, and the reader looked somewhere else.
+
+### Fixed
+
+- The cost ledger reports the repository it is bound to. `aiworkhub_task_cost_ledger`
+  was the only caller of `build_cost_ledger` that omitted `repo_root`, so it
+  parsed the human-readable usage report -- whose lines carry no model, no
+  provider and no timestamp -- and every dimension its docstring promises read
+  `unknown`. Measured on the same data at the same moment: 590 rows / 1 model /
+  1 provider / 1 day / 0 usage-observed / 0 routes, against 3,509 / 28 / 8 / 36 /
+  2,267 / 13. Nothing had to be built; the attribution already existed and was
+  unreachable from the one tool that needs it. Routing by cost and difficulty
+  now has a measurement behind it.
+- A rejection that asks for rework can be learned from. `_request_matches_candidate`
+  read only `accepted_request_id` and `terminal_review`, and `reject_review --to
+  pending` stamps neither -- so only a rejection that *terminated* a card was
+  ever committable, and the common case, feedback to a worker, was not. The
+  adjudicated request id was on the card twice, in `rework_predecessor` (pinned
+  with the predecessor's changed-path hashes) and in `review_feedback` (carried
+  with the reason's sha256). Both are written by `reject_review` itself, never
+  supplied by a model, so the lesson stays bound to exactly the request that was
+  judged.
+- Process status names why it did not read a task card. During a pid-null
+  starting reservation the read is deliberately skipped to avoid contending
+  with the preparation owner -- correct -- but "not read", "read and absent"
+  and "read raised" all reported as `task_state: unknown` with an empty card.
+  `task_card_read` now says which, and carries through `collect()`, the surface
+  a manager actually calls.
+- Workspace GC keeps the workspace `retry_finalization` exists to use.
+
+### Added
+
+- The skill registry has durable storage and a lifecycle: `skill_registry_store`
+  persists proposed and active skills with a compare-and-swap advance, and the
+  manager tools can propose, add evidence and activate. Activation requires
+  independent accepted evidence from distinct identities, so no single actor can
+  certify its own skill.
+
+
 ## [0.10.78] - 2026-09-02
 
 The release that made the task loop close by itself. A card now goes from

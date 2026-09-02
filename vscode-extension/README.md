@@ -12,6 +12,23 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.79 — 2026-09-02
+
+- The cost panel reports the repository it is bound to. The cost ledger tool was
+  the only caller that did not pass a repository root, so it fell back to a text
+  report carrying no model, provider or date, and every breakdown read
+  "unknown". Measured on the same data at the same moment: 590 rows, 1 model, 1
+  provider, 1 day and no routes, against 3,509 rows, 28 models, 8 providers, 36
+  days and 13 cost-per-accepted-outcome routes. Routing by cost and difficulty
+  now has a measurement behind it.
+- A rejection that asks for rework can be learned from. Previously only a
+  rejection that closed a card could become a lesson, so the feedback the loop
+  gives a worker was never learned from.
+- Process status says why it did not read a task card, so a card that was never
+  read no longer looks the same as a card that does not exist.
+- Skills are durable: the registry persists them, and activation requires
+  independent evidence from distinct identities.
+
 ## What's new in 0.10.78 — 2026-09-02
 
 - The task loop closes by itself: a card goes from worker to accepted without a

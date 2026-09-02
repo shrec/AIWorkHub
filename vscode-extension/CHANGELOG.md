@@ -1,5 +1,31 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.79 — 2026-09-02
+
+### Fixed
+
+- The cost panel reports the repository it is bound to. The cost ledger tool was
+  the only caller that did not pass a repository root, so it fell back to parsing
+  a text report whose lines carry no model, no provider and no date -- and every
+  breakdown read "unknown". Measured on the same data at the same moment: 590
+  rows, 1 model, 1 provider, 1 day and no routes, against 3,509 rows, 28 models,
+  8 providers, 36 days and 13 cost-per-accepted-outcome routes. The attribution
+  already existed; only the tool that needs it could not see it.
+- A rejection that sends work back for rework can now be learned from. Until now
+  only a rejection that closed a card could be committed as a lesson, so the
+  feedback the loop gives a worker -- the common case -- was never learned from.
+- Process status says why it did not read a task card. A card that was never
+  read no longer looks identical to a card that does not exist, or to a read
+  that failed.
+- Workspace cleanup keeps the workspace that finalization retry exists to use.
+
+### Added
+
+- Skills are durable. The registry persists proposed and active skills and the
+  manager can propose one, attach evidence and activate it. Activation needs
+  independent accepted evidence from distinct identities, so no single actor can
+  certify its own skill.
+
 ## 0.10.78 — 2026-09-02
 
 ### Fixed
