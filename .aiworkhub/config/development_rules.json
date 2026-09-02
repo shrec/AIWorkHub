@@ -789,6 +789,11 @@
         "count": 1
       },
       {
+        "path": "src/aiworkhub/skill_registry_store.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
         "path": "src/aiworkhub/source_graph.py",
         "pattern": "import_fcntl",
         "count": 2
@@ -972,8 +977,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 145,
-      "accepted_predecessor_delta": -16
+      "current_total": 146,
+      "accepted_predecessor_delta": -15
     }
   }
 }
