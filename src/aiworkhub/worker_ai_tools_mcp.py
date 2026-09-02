@@ -103,6 +103,7 @@ except ImportError:  # minimal copied worker package / direct-script mode
 from .repository_state import RepositoryStateError
 from . import quality_reviewer
 from . import semantic_edit
+from . import semantic_edit_applier
 from .sqlite_readonly import connect_readonly
 
 
@@ -5637,62 +5638,12 @@ class WorkerSemanticEditSession:
         if target is None:
             return _violation(self.ctx, tool, "semantic_edit_target_unknown")
         try:
-            current = semantic_edit.prepare_line_target(
+            next_text, metrics = semantic_edit_applier.replace_prepared_range(
                 self.ctx.repo,
-                path=target.path,
-                start_line=target.start_line,
-                end_line=target.end_line,
+                target,
+                new,
                 allowed_writes=self.ctx.allowed_writes,
             )
-            if current.current_sha256 != target.current_sha256:
-                raise semantic_edit.SemanticEditError(
-                    f"semantic_edit_stale_file:{target.path}"
-                )
-            if current.fragment_sha256 != target.fragment_sha256:
-                raise semantic_edit.SemanticEditError(
-                    f"semantic_edit_stale_fragment:{target.path}"
-                )
-            file_path = semantic_edit.resolve_existing_file(self.ctx.repo, target.path)
-            # ``mkstemp`` creates the temp file 0600 and ``os.replace`` carries
-            # that mode onto the destination, so capture the file's real mode
-            # first and restore it after the swap -- otherwise every apply
-            # silently rewrites e.g. an executable 0755 script down to 0600.
-            original_mode = os.stat(file_path).st_mode & 0o7777
-            _data, current_text = semantic_edit.read_utf8_file(file_path, target.path)
-            next_text, metrics = semantic_edit.apply_line_ranges(
-                current_text,
-                [{
-                    "start_line": target.start_line,
-                    "end_line": target.end_line,
-                    "new": new,
-                    "fragment_sha256": target.fragment_sha256,
-                }],
-            )
-            fd, temp_name = tempfile.mkstemp(prefix=f".{file_path.name}.aiworkhub-", dir=file_path.parent)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8", newline="", closefd=False) as handle:
-                    handle.write(next_text)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.close(fd)
-                fd = -1
-                if original_mode != 0o600:
-                    # Restore the destination's real mode (mkstemp made the
-                    # temp 0600).  Best effort: some sandboxed filesystems
-                    # forbid chmod, and the content edit must still land
-                    # atomically even when the mode cannot be carried across.
-                    try:
-                        os.chmod(temp_name, original_mode)
-                    except OSError:
-                        pass
-                os.replace(temp_name, file_path)
-            finally:
-                if fd >= 0:
-                    os.close(fd)
-                try:
-                    os.unlink(temp_name)
-                except FileNotFoundError:
-                    pass
         except (OSError, semantic_edit.SemanticEditError) as exc:
             return _violation(self.ctx, tool, str(exc))
         next_bytes = next_text.encode("utf-8")

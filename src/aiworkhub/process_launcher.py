@@ -8360,9 +8360,7 @@ class ProcessManager:
                         outer_sandbox_backend=sandbox_backend,
                         additional_readonly_dirs=external_readonly_dirs,
                         include_partial_messages=include_partial_messages,
-                        # A read-only card gets a read-only toolset. The
-                        # sandbox already refuses the writes; withholding the
-                        # tools stops a reviewer spending a turn finding out.
+                        # A read-only card gets a read-only toolset.
                         read_only=bool(card.get("read_only")),
                     )
                 if not getattr(plan, "launchable", False):
@@ -9753,9 +9751,7 @@ class ProcessManager:
 
     _REQUEST_EVENT_CACHE_LIMIT = 64
 
-    def _request_pid_identity(
-        self, events: list[dict[str, Any]]
-    ) -> PidIdentityEvidence:
+    def _request_pid_identity(self, events: list[dict[str, Any]]) -> PidIdentityEvidence:
         """PID identity from the merged request history, never the tail row.
 
         An advisory runtime notice carries ``pid`` without ``pid_start_ticks``,
@@ -9763,9 +9759,7 @@ class ProcessManager:
         and UNKNOWN defers, forever, for any worker quiet enough to earn one.
         """
         merged = self._event_identity(events)
-        return _pid_identity_evidence(
-            merged.get("pid"), merged.get("pid_start_ticks")
-        )
+        return _pid_identity_evidence(merged.get("pid"), merged.get("pid_start_ticks"))
 
     def _request_events(self, request_id: str) -> list[dict[str, Any]]:
         """Return exact request history without replaying an unchanged ledger.
