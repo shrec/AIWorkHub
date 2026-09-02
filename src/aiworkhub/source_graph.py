@@ -1056,6 +1056,38 @@ def _extract_source_graph_candidate(
     return extraction, rel, file_size, mtime_ns
 
 
+# How far below the best ratio ever observed counts as degraded. Same width as
+# the build-over-build rule, so one step of decay is tolerated and a drift away
+# from the best is not.
+_RESOLVED_RATIO_FLOOR_TOLERANCE = 0.05
+_RESOLVED_RATIO_BEST_KEY = "resolved_ratio_best_observed"
+
+
+def _resolved_ratio_high_water_mark(
+    previous: dict[str, Any] | None, current: float | None
+) -> float | None:
+    """Return the best resolved ratio observed, raised if this build beat it.
+
+    Pure: the mark rides in the scorecard record that is already persisted and
+    already handed back as ``previous``, so nothing new is stored and this
+    function stays a measurement rather than a write.
+
+    The mark only ever rises. A build that resolves less than before must not
+    quietly redefine what "before" was -- that is precisely how a ratchet
+    stops ratcheting.
+    """
+
+    recorded: float | None = None
+    raw = ((previous or {}).get("edges") or {}).get(_RESOLVED_RATIO_BEST_KEY)
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        recorded = float(raw)
+    if current is None:
+        return recorded
+    if recorded is None or current > recorded:
+        return current
+    return recorded
+
+
 def _index_quality_scorecard(
     conn: sqlite3.Connection,
     db_path: Path,
@@ -1182,6 +1214,21 @@ def _index_quality_scorecard(
         if resolved_ratio_delta < -0.05:
             degraded_reasons.append("resolved_edge_ratio_dropped_over_5_points")
 
+    # The delta rule alone is blind twice over: a decay of four points per
+    # build never trips it however far it travels, and a FIRST build has no
+    # previous at all, so an index that comes up at two percent resolution
+    # reports healthy. The floor closes both, and it is observed rather than
+    # invented -- the best ratio this repository has ever reached, recorded as
+    # a high-water mark and never lowered. Nothing is bounded here that was not
+    # first measured.
+    resolved_ratio_best = _resolved_ratio_high_water_mark(previous, resolved_ratio)
+    if (
+        resolved_ratio is not None
+        and resolved_ratio_best is not None
+        and resolved_ratio < resolved_ratio_best - _RESOLVED_RATIO_FLOOR_TOLERANCE
+    ):
+        degraded_reasons.append("resolved_edge_ratio_below_observed_floor")
+
     density_regressions: list[dict[str, Any]] = []
     previous_languages = (previous or {}).get("by_language") or {}
     for language, row in by_language.items():
@@ -1236,6 +1283,10 @@ def _index_quality_scorecard(
             "resolved": resolved_edges,
             "unresolved": max(0, total_edges - resolved_edges),
             "resolved_ratio": round(resolved_ratio, 6) if resolved_ratio is not None else None,
+            "resolved_ratio_best_observed": (
+                round(resolved_ratio_best, 6)
+                if resolved_ratio_best is not None else None
+            ),
             "cross_language": cross_language_edges,
             "junk_destination": junk_destination_edges,
         },
