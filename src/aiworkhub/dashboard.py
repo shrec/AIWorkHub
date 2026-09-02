@@ -1996,7 +1996,16 @@ class DashboardProvider:
         api = _load_skill_registry_api()
         if api is None:
             raise RuntimeError("skill_registry_unavailable")
-        return api.SkillRegistry()
+        store = _load_skill_registry_store()
+        if store is None:
+            return api.SkillRegistry()
+        # Load the durable store, but never let an absent, empty or unreadable
+        # skills database fail a dashboard refresh: degrade to an empty registry
+        # so a repository with no skills renders a clean, empty panel.
+        try:
+            return store.load_registry(self.repo_root)
+        except Exception:  # noqa: BLE001 - a bad store must never break the dashboard
+            return api.SkillRegistry()
 
     def get_tool_recipes_projection_input(self) -> Any | None:
         api = _load_tool_recipes_api()
@@ -2601,6 +2610,14 @@ def _load_development_rules_api() -> Any | None:
 def _load_skill_registry_api() -> Any | None:
     try:
         from aiworkhub import skill_registry as module
+    except ImportError:
+        return None
+    return module
+
+
+def _load_skill_registry_store() -> Any | None:
+    try:
+        from aiworkhub import skill_registry_store as module
     except ImportError:
         return None
     return module
