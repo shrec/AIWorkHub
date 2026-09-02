@@ -4429,8 +4429,12 @@ def append_live_usage_event(
     conn = _connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # archived_at is part of the lifecycle: canonical_status reads it FIRST
+        # and it was never selected, so an archived card could not be
+        # recognised as archived here at all. The check that excluded closed
+        # records was unreachable for the main closed state.
         row = conn.execute(
-            "SELECT runner, status, worker_status, claimed_by, card_json "
+            "SELECT runner, status, worker_status, claimed_by, archived_at, card_json "
             "FROM tasks WHERE task_id=?",
             (task_id,),
         ).fetchone()

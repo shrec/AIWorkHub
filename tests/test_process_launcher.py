@@ -3796,10 +3796,18 @@ def test_append_live_usage_event_requires_exact_current_claim(tmp_path):
         ),
         ({"payload": {"source": "terminal_log_backfill"}}, "usage_live_source_spoof"),
         ({"payload": {"note": "task_mcp_request:" + "d" * 32}}, "usage_live_note_spoof"),
-        ({"sql": "UPDATE tasks SET status='review'"}, "lifecycle_mismatch:review"),
+        # `review` and the other states one claim reaches after its attempt ran
+        # are now accountable -- refusing them discarded the cost of every
+        # worker that succeeded. A CLOSED record still refuses: those are not
+        # states this claim can be in, they are records a coordinator finished
+        # with. See tests/test_spend_is_recorded_for_work_that_succeeded.py.
         (
-            {"sql": "UPDATE tasks SET worker_status='in_progress'"},
-            "worker_status_mismatch",
+            {"sql": "UPDATE tasks SET archived_at='2026-09-02T00:00:00+00:00'"},
+            "lifecycle_mismatch:archived",
+        ),
+        (
+            {"sql": "UPDATE tasks SET status='superseded', worker_status='superseded'"},
+            "lifecycle_mismatch:superseded",
         ),
     ],
 )

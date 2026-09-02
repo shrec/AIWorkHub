@@ -10600,10 +10600,21 @@ class ProcessManager:
             if request_id in self._active_request_ids():
                 return None
         with self._request_lock(request_id):
-            events = self._request_events(request_id)
-            if not events:
+            # Re-read under the lock, through the SAME append-aware projection
+            # the sweep's prefilter used. This was a full _request_events
+            # replay per request: 686 candidates x 3.34 s of re-parsing the
+            # same 558 MB ledger to read one row, a 38-minute sweep inside a
+            # 30-second loop, for 132 workspaces that still existed. The
+            # projection is invalidated by any ledger change, so it is fresh
+            # exactly when freshness matters and free when nothing moved.
+            #
+            # Using one fold for the prefilter and another for the re-read also
+            # made the two disagree: an advisory runtime-notice row is the last
+            # raw row but carries no lifecycle state, so the prefilter called a
+            # request collectable and the re-read silently called it not.
+            latest = self._latest_by_request().get(request_id)
+            if latest is None:
                 return None
-            latest = events[-1]
             if (
                 latest.get("state") not in GC_CANDIDATE_PROCESS_STATES
                 or not latest.get("workspace_retained")
