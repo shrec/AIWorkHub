@@ -415,6 +415,32 @@ def verify_reviewer_receipt(
     }
 
 
+# Work the system has already done deterministically, which reviewers were
+# nonetheless redoing by hand. Measured on one real review (request fb150636):
+# 38 model turns and 17 tool calls, of which only 4 were reading the candidate.
+# The other 13 were scaffolding -- ``sha256sum`` over paths whose digests were
+# already in the packet, and four consecutive attempts to re-run a pytest
+# command whose exact argv, returncode and output the packet already carried,
+# three of them failing only because the reviewer was hunting for an interpreter.
+#
+# Naming what is settled moves that work off the model without weakening the
+# review: the reviewer still reads the candidate and still judges it, but it
+# stops re-deriving facts the supervisor established and recorded.
+_ALREADY_ESTABLISHED_MECHANICALLY = (
+    "The packet is deterministic evidence the supervisor already produced. Do "
+    "NOT re-derive any of it:\n"
+    "- candidate file digests are recorded per changed path; do not run "
+    "sha256sum or any hashing command to confirm them.\n"
+    "- every declared validation was already executed; the packet carries its "
+    "exact argv, returncode and bounded stdout/stderr under terminal_validation "
+    "and mechanical_checks. Do not re-run pytest, lint or any validation "
+    "command, and do not go looking for an interpreter.\n"
+    "- combined-tree checks are recorded the same way.\n"
+    "Read the candidate and judge it. Spend your turns on the code, not on "
+    "reproducing receipts you were handed.\n"
+)
+
+
 def build_review_prompt(
     packet: Mapping[str, Any],
     *,
@@ -488,6 +514,7 @@ def build_review_prompt(
         "You are intentionally not given the worker's rationale, self-verdict, or final answer. "
         "Do not write, edit, format, or delete repository files.\n"
         f"{scope_instruction}"
+        f"{_ALREADY_ESTABLISHED_MECHANICALLY}"
         "Report only concrete items supported by file/line or check evidence. "
         f"{QUALITY_REVIEW_FINDING_SCHEMA_DOC}\n"
         "Finish with exactly one JSON object and no surrounding prose, using "

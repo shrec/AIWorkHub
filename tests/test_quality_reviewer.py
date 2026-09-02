@@ -65,6 +65,24 @@ class TestBuildReviewPrompt:
         assert "exactly one JSON object" in prompt
         assert '"lens":"correctness","findings":[...]' in prompt
 
+    def test_prompt_names_the_receipts_the_supervisor_already_produced(self):
+        """Reviewers were re-deriving evidence the packet already carried.
+
+        Measured on request fb150636: 38 model turns, 17 tool calls, only 4 of
+        them reading the candidate. The rest were scaffolding -- sha256sum over
+        paths whose digests were in the packet, and four attempts to re-run a
+        pytest command whose exact argv, returncode and output the packet
+        already carried, three of them lost hunting for an interpreter.
+        """
+        prompt = quality_reviewer.build_review_prompt(
+            _packet_with_findings(), lens="correctness"
+        )
+        assert "sha256sum" in prompt, "digests must be named as already recorded"
+        assert "terminal_validation" in prompt
+        assert "mechanical_checks" in prompt
+        assert "Do not re-run pytest" in prompt
+        assert "do not go looking for an interpreter" in prompt
+
     def test_file_transport_references_file(self, tmp_path: Path):
         large_body = {
             "candidate": {
