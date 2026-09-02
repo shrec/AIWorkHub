@@ -1471,6 +1471,42 @@ def test_restart_waits_for_write_gate_before_promotion_and_review(
     assert workspace.path.exists()
 
 
+def _claimed_card(card: dict, request_id: str) -> dict:
+    """A card as it exists once its launch has claimed it.
+
+    Usage recording is gated on exact claim authority -- launch_request_id plus
+    claim_epoch, which a re-claim increments -- so a test that records usage
+    against an unclaimed card is testing a state no real attempt is ever in.
+    """
+    return {
+        **card,
+        "status": "processing",
+        "worker_status": "claimed",
+        "claimed_by": card["runner"],
+        "launch_request_id": request_id,
+        "claim_epoch": 1,
+    }
+
+
+def _capture_usage(monkeypatch, captured: list[dict]):
+    """Capture what the launcher hands the canonical store.
+
+    These assertions used to read the argv of a `taskctl usage` subprocess.
+    Recording moved into task_store.append_live_usage_event and the argv checks
+    kept passing against a captured list nothing appended to -- so they were
+    asserting a mechanism that no longer existed.
+    """
+
+    def _append(_root, task_id, runner, *, request_id, claimed_by, claim_epoch, payload):
+        captured.append({
+            "task_id": task_id, "runner": runner, "request_id": request_id,
+            "claimed_by": claimed_by, "claim_epoch": claim_epoch, **dict(payload),
+        })
+        return True, ""
+
+    monkeypatch.setattr(process_launcher.task_store, "append_live_usage_event", _append)
+
+
 @pytest.mark.parametrize(
     ("adapter_id", "expected_input"),
     [("codex_cli", 120), ("claude_cli", 225)],
@@ -1493,14 +1529,10 @@ def test_cached_token_accounting_matches_provider_semantics(
             "cache_write_input_tokens": 7,
         },
     }), encoding="utf-8")
-    card = _card()
-    captured: list[list[str]] = []
-
-    def run_taskctl(args: list[str], **_kwargs):
-        captured.append(args)
-        return SimpleNamespace(returncode=0, stderr="")
-
-    monkeypatch.setattr(process_launcher.core, "run_taskctl", run_taskctl)
+    request_id = f"request-{adapter_id}"
+    card = _claimed_card(_card(), request_id)
+    captured: list[dict] = []
+    _capture_usage(monkeypatch, captured)
     manager = process_launcher.ProcessManager(
         repo=tmp_path,
         process_log_path=tmp_path / "events.jsonl",
@@ -1511,24 +1543,29 @@ def test_cached_token_accounting_matches_provider_semantics(
         isolation_enabled=False,
     )
     usage, recorded, error = manager._record_usage(
-        f"request-{adapter_id}",
+        request_id,
         card["task_id"],
         card["runner"],
         adapter_id,
         adapter_id,
         output,
+        claim_authority={
+            "request_id": request_id,
+            "claimed_by": card["runner"],
+            "claim_epoch": 1,
+        },
     )
     assert recorded is True
     assert error == ""
     assert usage["recorded_input_tokens"] == expected_input
-    args = captured[0]
-    assert args[args.index("--input-tokens") + 1] == str(expected_input)
-    assert args[args.index("--total-tokens") + 1] == str(expected_input + 45)
-    assert args[args.index("--cached-input-tokens") + 1] == "80"
-    assert args[args.index("--cache-creation-input-tokens") + 1] == "25"
-    assert args[args.index("--cache-write-input-tokens") + 1] == "7"
-    assert args[args.index("--role") + 1] == "worker"
-    assert "--cache-metrics-observed" in args
+    row = captured[0]
+    assert row["input_tokens"] == expected_input
+    assert row["total_tokens"] == expected_input + 45
+    assert row["cached_input_tokens"] == 80
+    assert row["cache_creation_input_tokens"] == 25
+    assert row["cache_write_input_tokens"] == 7
+    assert row["role"] == "worker"
+    assert row["cache_metrics_observed"] is True
 
 
 def test_readonly_quality_review_usage_is_attributed_to_reviewer(
@@ -1543,21 +1580,16 @@ def test_readonly_quality_review_usage_is_attributed_to_reviewer(
         }),
         encoding="utf-8",
     )
-    card = {
+    card = _claimed_card({
         **_card(),
         "topic": "quality_review",
         "read_only": True,
         "allowed_writes": [],
         "required_outputs": [],
         "project_context": {"task_type": "research"},
-    }
-    captured: list[list[str]] = []
-
-    def run_taskctl(args: list[str], **_kwargs):
-        captured.append(args)
-        return SimpleNamespace(returncode=0, stderr="")
-
-    monkeypatch.setattr(process_launcher.core, "run_taskctl", run_taskctl)
+    }, "request-reviewer")
+    captured: list[dict] = []
+    _capture_usage(monkeypatch, captured)
     manager = process_launcher.ProcessManager(
         repo=tmp_path,
         process_log_path=tmp_path / "events.jsonl",
@@ -1575,12 +1607,17 @@ def test_readonly_quality_review_usage_is_attributed_to_reviewer(
         "claude_cli",
         "claude-sonnet-5",
         output,
+        claim_authority={
+            "request_id": "request-reviewer",
+            "claimed_by": card["runner"],
+            "claim_epoch": 1,
+        },
     )
 
     assert recorded is True
     assert error == ""
     assert usage["role"] == "reviewer"
-    assert captured[0][captured[0].index("--role") + 1] == "reviewer"
+    assert captured[0]["role"] == "reviewer"
 
 
 def test_unobserved_provider_usage_still_records_one_truthful_attempt(
@@ -1589,14 +1626,9 @@ def test_unobserved_provider_usage_still_records_one_truthful_attempt(
 ) -> None:
     output = tmp_path / "vscode-lm.json"
     output.write_text('{"type":"result","content":"ok"}\n', encoding="utf-8")
-    card = _card()
-    captured: list[list[str]] = []
-
-    def run_taskctl(args: list[str], **_kwargs):
-        captured.append(args)
-        return SimpleNamespace(returncode=0, stderr="")
-
-    monkeypatch.setattr(process_launcher.core, "run_taskctl", run_taskctl)
+    card = _claimed_card(_card(), "request-unobserved")
+    captured: list[dict] = []
+    _capture_usage(monkeypatch, captured)
     manager = process_launcher.ProcessManager(
         repo=tmp_path,
         process_log_path=tmp_path / "events.jsonl",
@@ -1614,6 +1646,11 @@ def test_unobserved_provider_usage_still_records_one_truthful_attempt(
         "vscode_lm",
         "glm-5.2",
         output,
+        claim_authority={
+            "request_id": "request-unobserved",
+            "claimed_by": card["runner"],
+            "claim_epoch": 1,
+        },
     )
 
     assert recorded is True
@@ -1622,11 +1659,15 @@ def test_unobserved_provider_usage_still_records_one_truthful_attempt(
     assert usage["cost_observed"] is False
     assert usage["cost_usd"] is None
     assert len(captured) == 1
-    args = captured[0]
-    assert "--usage-observed" not in args
-    assert "--cost-observed" not in args
-    assert args[args.index("--total-tokens") + 1] == "0"
-    assert args[args.index("--note") + 1] == "task_mcp_request:request-unobserved"
+    row = captured[0]
+    # An unobserved provider still owes one truthful attempt record: absent
+    # metrics are unknown, never zero-cost, and the request identity is what
+    # makes the row attributable.
+    assert row["usage_observed"] is False
+    assert row["cost_observed"] is False
+    assert row["total_tokens"] == 0
+    assert row["request_id"] == "request-unobserved"
+    assert row["claim_epoch"] == 1
 
 
 # ── B561: gitignored required-output promotion in full finalize flow ──────
@@ -1935,7 +1976,14 @@ def test_monitor_does_not_enforce_legacy_provider_timeout(
         isolated=True,
     )
     manager._monitor(live)
-    assert waits == [None]
+    # The contract is that the monitor never enforces the card's timeout, not
+    # that it blocks forever: it now waits in fixed poll slices so it can
+    # observe the workspace it supervises and append a zero-delta notice. Pin
+    # the contract itself -- no wait may be derived from timeout_seconds, and
+    # the monitor never signals the process.
+    assert waits, "the monitor must actually wait on the process"
+    assert live.timeout_seconds not in waits
+    assert set(waits) <= {None, process_launcher.ZERO_DELTA_POLL_SECONDS}
 
 
 def test_quality_reviewer_preflight_rejects_foreign_launch_request_id(

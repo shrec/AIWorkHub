@@ -4444,12 +4444,17 @@ def append_live_usage_event(
             conn.rollback()
             return False, "claimed_by_mismatch"
         status = canonical_status(dict(row))
-        if status != "processing":
+        # Spend is a fact about an attempt that already ran. Requiring the card
+        # to still be `processing` meant the review transition -- which the
+        # finalizer performs moments before recording usage -- discarded the
+        # cost of every worker that SUCCEEDED, so the ledger accumulated
+        # failures only and every by-model and by-provider dimension read
+        # "unknown". Identity is what prevents forgery here: launch_request_id
+        # and claim_epoch below name this exact attempt, a re-claim increments
+        # the epoch, and the note uniqueness check makes the write idempotent.
+        if status not in task_fsm.CLAIM_ATTEMPT_ACCOUNTABLE_STATUSES:
             conn.rollback()
             return False, f"lifecycle_mismatch:{status}"
-        if str(row["worker_status"] or "") != "claimed":
-            conn.rollback()
-            return False, "worker_status_mismatch"
         try:
             card = json.loads(str(row["card_json"] or "{}"))
         except json.JSONDecodeError:

@@ -38,6 +38,21 @@ from typing import Mapping
 # or the accept/reject/archive APIs. So ``blocked`` is legal to enter AND has a
 # defined transition out; it is simply a different transition than the one this
 # pure function guards.
+# The lifecycle states one claim can legitimately be observed in AFTER its
+# attempt has run. Provider spend is a fact about an attempt that already
+# happened, so the ledger must still accept it once the card has advanced --
+# refusing on "status != processing" silently discarded the cost of every
+# worker that succeeded, leaving a ledger that recorded only failures.
+# Forgery is prevented by claim identity (launch_request_id plus claim_epoch,
+# which a re-claim increments), never by the card's current status.
+CLAIM_ATTEMPT_ACCOUNTABLE_STATUSES: frozenset[str] = frozenset({
+    "processing",
+    "review",
+    "blocked",
+    "finished",
+})
+
+
 LEGAL_SOURCE_STATUSES_FOR_TERMINAL_REVIEW: frozenset[str] = frozenset({"pending", "processing"})
 
 # The single, authoritative terminal-substatus vocabulary for AIWorkHub. This
