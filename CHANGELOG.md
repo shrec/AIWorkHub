@@ -6,6 +6,84 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.78] - 2026-09-02
+
+The release that made the task loop close by itself. A card now goes from
+worker to accepted without a human driving each step, and the nine tests that
+stood red in canonical are green.
+
+### Fixed
+
+- A worker that went quiet could never be finalized. The launcher appends an
+  advisory runtime notice after ten minutes without output, and that row
+  carries `pid` but no `pid_start_ticks`; both finalizers read PID identity
+  from the last row, so identity became UNKNOWN and UNKNOWN defers. The longer
+  a worker worked quietly, the more permanent its deferral. Identity now comes
+  from the merged request history. Cancellation had the same defect and the
+  same fix -- and there the tail row was about to receive SIGTERM.
+- The reconciler is the only component that finalizes an exited worker, and its
+  health lived in one process's memory behind a silent `except: pass`. A
+  reconciler that never started and one working normally were indistinguishable
+  from every surface. Each scan now writes a durable record, on success and on
+  failure, announced before the pass runs and reported stale when too old.
+- Usage recording required the card to still be `processing`, but the finalizer
+  moves a successful worker to `review` first -- so every worker that SUCCEEDED
+  had its cost measured and discarded. The ledger held failures only, and every
+  by-model and by-provider dimension read "unknown". Spend is now accountable
+  to the claim, not to the card's current status.
+- The review orchestrator attempted and failed one lifecycle action per pass
+  for cards that had already left review, and a failed action parks every later
+  action in its chain: 129 chains and 1,389 actions permanently unreservable.
+  An action whose target is decided now retires as finished, because there was
+  nothing to do.
+- `append_event` canonicalised a failure-terminal row on a private copy and
+  returned nothing, so a finalization and its own replay disagreed about why a
+  worker died.
+
+### Added
+
+- `declared_invariants` executes four rules `development_rules.json` only
+  stated in prose -- one owner for the terminal vocabulary, one predicate per
+  policy, bounded module caches, sqlite context managers that close. Run
+  against this session's starting commit it reports 11 real violations; against
+  the current tree, zero. Wired into `quality.json`.
+- A durable skill registry store. The lifecycle was complete and tested and had
+  nowhere to keep a record, so evidence could never accumulate toward
+  activation and the dashboard panel was structurally empty. Records persist
+  with immutable `(identity, version)`, a content digest that cannot be
+  rebound, and a state digest over the runtime fields the content digest
+  deliberately excludes.
+- `accept_review` and `reject_review` return `learning_commit_owed`, naming the
+  lesson a decision owes with the arguments the commit tool requires. Coverage
+  is reported on `aiworkhub_task_health`: it read 1 percent.
+- Card templates derive the repository gates a package change trips, instead of
+  asking an author to recall them -- and exclude the one gate a worker's sparse
+  checkout cannot execute.
+
+### Performance
+
+- Retained-workspace GC stopped replaying a 558 MB ledger once per candidate to
+  read a single row: 38.2 minutes to 13.5 seconds. Finalization and that sweep
+  now run on separate cadences, so a finished card's time-to-review no longer
+  waits on garbage collection.
+- Storage readiness caches its integrity scan and never its authority: 94 calls
+  fell from 11.0 s to 0.219 s.
+- The 90-day git walk left the Source Graph index write transaction, where it
+  had been holding the writer lock for 93.8 percent of a build.
+
+### Notes
+
+- Source Graph resolution rose from 33.3 to 41.8 percent, and `gaps` stopped
+  reporting Python builtins as missing repository work.
+- Two detectors were measuring the wrong thing and now do not: the
+  OS-dependency boundary counted prose (12 of 153 matches were docstrings,
+  including the file that declares the rule), and five test fixtures patched
+  `os.read`/`os.replace` process-wide while counting calls, racing every
+  background thread.
+- `process_launcher` shed exact process identity into its own module,
+  14,675 to 14,413 lines; both ratchets descend with it.
+
+
 ## [0.10.77] - 2026-09-01
 
 ### Added
