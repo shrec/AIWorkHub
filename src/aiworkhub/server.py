@@ -473,6 +473,7 @@ from . import launch_queue_persist
 from . import known_bug_scanner
 from . import learning_commit_store
 from . import manager_ai_tools
+from . import manager_skill_tools
 from . import process_launcher
 from . import review_summarizer
 from . import stale_recovery
@@ -950,6 +951,82 @@ def aiworkhub_manager_context_write_intent_dispose(
     return process_launcher.default_manager().dispose_context_write_intent(
         request_id, intent_id, decision=decision, reason=reason,
     )
+
+
+@mcp.tool()
+def aiworkhub_manager_skill_propose(
+    identity: str,
+    version: str,
+    scope: str,
+    task_family: str,
+    path_or_symbol: str,
+    risk: str,
+    stage: str,
+    triggers: list[str],
+    confidence: float,
+    applicability: list[str] | None = None,
+    procedure_steps: list[str] | None = None,
+    avoid_rules: list[str] | None = None,
+    preferred_tools: list[str] | None = None,
+) -> dict[str, Any]:
+    """MANAGER WRITE: register and persist one caller-defined proposed skill.
+
+    Every field is the caller's; no skill field is inferred or generated. The
+    proposal is evidence-free and a duplicate identity/version is refused without
+    overwriting the stored record.
+    """
+
+    return manager_skill_tools.propose(
+        identity=identity,
+        version=version,
+        scope=scope,
+        task_family=task_family,
+        path_or_symbol=path_or_symbol,
+        risk=risk,
+        stage=stage,
+        triggers=triggers,
+        confidence=confidence,
+        applicability=applicability,
+        procedure_steps=procedure_steps,
+        avoid_rules=avoid_rules,
+        preferred_tools=preferred_tools,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_skill_add_evidence(
+    identity: str,
+    version: str,
+    source: str,
+    outcome: str,
+    actor_id: str,
+    note: str = "",
+) -> dict[str, Any]:
+    """MANAGER WRITE: append one caller-supplied evidence entry to a skill version.
+
+    Provenance is the caller's ``actor_id``, bound by the registry, so two
+    entries from distinct actors count as two independent accepted contributions.
+    """
+
+    return manager_skill_tools.add_evidence(
+        identity=identity,
+        version=version,
+        source=source,
+        outcome=outcome,
+        actor_id=actor_id,
+        note=note,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_skill_activate(identity: str, version: str) -> dict[str, Any]:
+    """MANAGER WRITE: activate a proposed skill, evidence-gated and fail-closed.
+
+    The registry's activation threshold is enforced unchanged; when it is unmet
+    the registry's own reason is returned and the stored record is left as it was.
+    """
+
+    return manager_skill_tools.activate(identity=identity, version=version)
 
 
 @mcp.tool()

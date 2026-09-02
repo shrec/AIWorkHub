@@ -296,6 +296,98 @@ def put_record(
             conn.close()
 
 
+def state_digest(record: SkillRecord) -> str:
+    """Return the compare-and-swap token for a runtime advance of ``record``.
+
+    This is the full-payload ``state_digest`` a caller reads from the record it
+    loaded and passes back to :func:`advance_record` as ``expected_state_digest``.
+    A read-modify-write lifecycle step (``add_evidence``/``activate``) is not
+    serialized across processes, so a stale reader could otherwise advance from an
+    out-of-date runtime state and silently overwrite a newer advance -- losing,
+    for example, one of two independent accepted evidence entries. Binding the
+    token the caller actually read turns that lost update into an explicit
+    refusal instead.
+    """
+    _identity, _version, _digest, sd, _payload_json = _serialize(record)
+    return sd
+
+
+def advance_record(
+    repo_root: str | Path,
+    record: SkillRecord,
+    *,
+    expected_state_digest: str | None = None,
+    _connection: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    """Persist a runtime-state advance of an already-stored ``(identity, version)``.
+
+    The lifecycle -- ``add_evidence``, ``activate``, ``retire`` -- evolves a
+    record's evidence, counters and ``lifecycle_state`` while leaving every
+    content field, and therefore the content digest, unchanged. A row is
+    immutable per ``(identity, version)``, so an advance cannot be a delete plus a
+    re-``put_record``: that path commits the delete, then raises in ``put_record``
+    validation, and the record is lost rather than left at its prior state.
+
+    This updates ONLY the two runtime columns -- ``payload_json`` and the
+    full-payload ``state_digest`` -- of the SAME row, inside one transaction, and
+    refuses unless the stored row's ``identity``, ``version`` AND immutable
+    content ``digest`` all match the advanced record. Content immutability and
+    the unique digest binding are therefore never touched.
+
+    ``expected_state_digest`` is an optional compare-and-swap precondition: when
+    supplied (via :func:`state_digest` of the record the caller loaded), the
+    advance is refused unless the stored row's runtime ``state_digest`` still
+    equals it. The content digest alone cannot catch this, because a runtime
+    advance leaves it unchanged, so a stale read-modify-write would pass the
+    content check and overwrite a newer advance. The token is the cross-process
+    authority a per-server lock cannot provide. Any refusal raises a
+    :class:`SkillStoreConflictError` and leaves the stored row exactly as it was.
+    """
+    identity, version, digest, state_digest_value, payload_json = _serialize(record)
+    conn = _connection or _connect(repo_root)
+    try:
+        ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT digest, state_digest FROM skill_records WHERE identity=? AND version=?",
+            (identity, version),
+        ).fetchone()
+        if row is None:
+            raise SkillStoreConflictError(
+                f"skill {identity!r}@{version!r} is not stored and cannot be advanced"
+            )
+        if row["digest"] != digest:
+            raise SkillStoreConflictError(
+                f"content digest for {identity!r}@{version!r} does not match the stored "
+                "row; an advance may evolve only runtime state, never content"
+            )
+        if expected_state_digest is not None and row["state_digest"] != expected_state_digest:
+            raise SkillStoreConflictError(
+                f"runtime state for {identity!r}@{version!r} changed under this advance; "
+                "the compare-and-swap precondition no longer holds and a stale advance "
+                "may not overwrite a newer one"
+            )
+        conn.execute(
+            "UPDATE skill_records SET state_digest=?, payload_json=? "
+            "WHERE identity=? AND version=?",
+            (state_digest_value, payload_json, identity, version),
+        )
+        conn.commit()
+        return {
+            "identity": identity,
+            "version": version,
+            "digest": digest,
+            "state_digest": state_digest_value,
+        }
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        if _connection is None:
+            conn.close()
+
+
 def get_record(
     repo_root: str | Path, identity: str, version: str
 ) -> SkillRecord | None:

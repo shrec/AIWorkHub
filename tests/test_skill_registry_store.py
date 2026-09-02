@@ -299,3 +299,119 @@ def test_load_registry_round_trips_active_record_via_public_api(tmp_path):
     assert loaded.lifecycle_state is sr.LifecycleState.ACTIVE
     assert loaded.accepted_count == 2
     assert len(loaded.evidence) == 2
+
+
+def _raw_row(repo_root, identity, version):
+    conn = sqlite3.connect(str(store._db_path(repo_root)))
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT digest, state_digest, payload_json FROM skill_records "
+            "WHERE identity=? AND version=?",
+            (identity, version),
+        ).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else dict(row)
+
+
+def test_advance_record_persists_a_runtime_advance_in_place(tmp_path):
+    # The same content fields advance from an evidence-free PROPOSED row to an
+    # ACTIVE row carrying two accepted evidence entries -- the content digest is
+    # unchanged, so it is a runtime advance of the SAME immutable identity/version.
+    proposed = base_record()
+    store.put_record(tmp_path, proposed)
+    advanced = active_record()
+    assert sr.skill_digest(advanced) == sr.skill_digest(proposed)
+
+    result = store.advance_record(tmp_path, advanced)
+
+    assert result["digest"] == sr.skill_digest(proposed)
+    loaded = store.get_record(tmp_path, proposed.identity, proposed.version)
+    assert loaded == advanced
+    assert loaded.lifecycle_state is sr.LifecycleState.ACTIVE
+    assert loaded.accepted_count == 2
+    # The immutable row count and identity are untouched: still exactly one row.
+    assert len(store.list_records(tmp_path)) == 1
+
+
+def test_advance_record_rejects_a_mismatched_content_digest(tmp_path):
+    store.put_record(tmp_path, base_record())
+    # Same identity/version, but a changed content field, so the content digest
+    # no longer matches the stored row and the advance is refused.
+    with pytest.raises(store.SkillStoreConflictError):
+        store.advance_record(tmp_path, base_record(confidence=0.5))
+
+
+def test_advance_record_rejects_a_missing_row(tmp_path):
+    with pytest.raises(store.SkillStoreConflictError):
+        store.advance_record(tmp_path, active_record())
+
+
+def test_advance_record_rejects_a_changed_version(tmp_path):
+    store.put_record(tmp_path, active_record(version="1.0.0"))
+    # A different version is a different immutable row that was never stored, so
+    # there is nothing to advance -- it is refused rather than inserted.
+    with pytest.raises(store.SkillStoreConflictError):
+        store.advance_record(tmp_path, active_record(version="2.0.0"))
+
+
+def test_a_failed_advance_leaves_the_stored_row_exactly_as_it_was(tmp_path):
+    proposed = base_record()
+    store.put_record(tmp_path, proposed)
+    before = _raw_row(tmp_path, proposed.identity, proposed.version)
+
+    with pytest.raises(store.SkillStoreConflictError):
+        store.advance_record(tmp_path, base_record(confidence=0.5))
+
+    after = _raw_row(tmp_path, proposed.identity, proposed.version)
+    assert after == before
+    # The record still reads back as the untouched, evidence-free proposal.
+    loaded = store.get_record(tmp_path, proposed.identity, proposed.version)
+    assert loaded == proposed
+    assert loaded.lifecycle_state is sr.LifecycleState.PROPOSED
+
+
+def test_advance_record_compare_and_swap_refuses_a_stale_writer(tmp_path):
+    # Two writers load the SAME evidence-free prior state and each read its
+    # compare-and-swap token, then diverge -- writer A adds actor-a's accepted
+    # evidence, writer B adds actor-b's. Without a compare-and-swap both pass the
+    # content-digest guard (a runtime advance leaves content unchanged) and the
+    # second silently overwrites the first, losing one of two independent accepts.
+    store.put_record(tmp_path, base_record())
+    identity, version = BASE_DATA["identity"], BASE_DATA["version"]
+    prior = store.get_record(tmp_path, identity, version)
+    expected = store.state_digest(prior)
+
+    def advance_from_prior(actor_id):
+        registry = store.load_registry(tmp_path)
+        actor = sr.Authority(
+            sr.AuthorityRole.WORKER, actor_id=actor_id, token=f"tok-{actor_id}"
+        )
+        return registry.add_evidence(
+            identity,
+            version,
+            {"source": f"src-{actor_id}", "outcome": "accepted"},
+            actor,
+        )
+
+    writer_a = advance_from_prior("actor-a")
+    writer_b = advance_from_prior("actor-b")
+
+    # The first writer wins the compare-and-swap against the shared prior token.
+    store.advance_record(tmp_path, writer_a, expected_state_digest=expected)
+    # The second read the same stale prior; its advance is refused, not merged.
+    with pytest.raises(store.SkillStoreConflictError):
+        store.advance_record(tmp_path, writer_b, expected_state_digest=expected)
+
+    # The row is exactly what the first writer wrote: one accepted entry, actor-a.
+    loaded = store.get_record(tmp_path, identity, version)
+    assert loaded == writer_a
+    assert [item.actor_id for item in loaded.evidence] == ["actor-a"]
+    assert loaded.accepted_count == 1
+
+
+def test_advance_record_uses_only_public_registry_api():
+    source = inspect.getsource(store.advance_record)
+    assert "_entries" not in source
+    assert "DELETE" not in source
