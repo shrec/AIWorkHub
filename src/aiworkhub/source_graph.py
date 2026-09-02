@@ -2070,6 +2070,21 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 )
             )
 
+        # Recompute the bounded 90-day git history for the changed corpus
+        # BEFORE opening the write transaction. The walk shells out to
+        # ``git log`` over the whole repository (measured multi-second) and must
+        # never run while the index write transaction holds the connection --
+        # that is 90%+ of a build spent under the writer lock. The recorded HEAD
+        # oid is the generation key, so an unchanged HEAD does no walk at all;
+        # the resulting plan is applied with SQLite-only work once the write
+        # transaction is open (``persist_git_metrics`` below).
+        git_metrics_started = time.monotonic()
+        git_metrics_plan = sginsights.compute_git_metrics(
+            conn, repo_root, sorted(seen_rel), limit=10000,
+        )
+        phase_seconds["git_metrics"] = max(
+            0.0, time.monotonic() - git_metrics_started
+        )
         merge_started = time.monotonic()
         with conn:
             if pending_stat_updates:
@@ -2155,13 +2170,9 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             phase_seconds["resolution"] = max(
                 0.0, time.monotonic() - resolution_started
             )
-            git_metrics_started = time.monotonic()
-            sginsights.materialize_git_metrics(
-                conn, repo_root, sorted(seen_rel), limit=10000,
-            )
-            phase_seconds["git_metrics"] = max(
-                0.0, time.monotonic() - git_metrics_started
-            )
+            # SQLite-only apply of the plan computed above; no subprocess runs
+            # while this write transaction holds the connection.
+            sginsights.persist_git_metrics(conn, git_metrics_plan)
             finished_at = _now_iso()
             skipped_files = [
                 entry["file"] for entry in errors

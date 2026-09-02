@@ -180,34 +180,61 @@ def test_candidates(
     return _test_candidates(conn, files, matches, limit=limit)
 
 
-def materialize_git_metrics(
+def compute_git_metrics(
     conn: sqlite3.Connection,
     repo_root: Path,
     files: list[str],
     *,
     limit: int = 10000,
 ) -> dict[str, Any]:
-    """Refresh bounded 90-day history during indexing, never during a query."""
+    """Run the bounded 90-day git walk OUTSIDE any held write transaction.
+
+    The git subprocess -- ``rev-parse`` and, only on a changed HEAD, the
+    ``git log --numstat`` walk -- happens here and nowhere else, so it never
+    executes while the index write transaction holds the connection. The
+    recorded HEAD oid is the generation key: an unchanged HEAD returns a
+    ``cached`` plan that does no walk and touches no history. The returned plan
+    is pure data; :func:`persist_git_metrics` applies it with SQLite-only work.
+    Only reads run against ``conn`` here, never a write, so no writer lock is
+    taken across the subprocess.
+    """
 
     selected = files[: max(1, min(limit, 10000))]
     selected_set = set(selected)
     if not selected:
-        return {"available": True, "window": "90d", "files": []}
+        return {
+            "action": "noop", "delete_history": False, "rows": [], "head": "",
+            "result": {"available": True, "window": "90d", "files": []},
+        }
     if not (repo_root / ".git").exists():
-        return {"available": False, "window": "90d", "reason": "not_git_repo", "files": []}
+        return {
+            "action": "noop", "delete_history": False, "rows": [], "head": "",
+            "result": {
+                "available": False, "window": "90d",
+                "reason": "not_git_repo", "files": [],
+            },
+        }
     try:
         head_result = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True,
             text=True, encoding="utf-8", errors="replace", timeout=2, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"available": False, "window": "90d", "reason": type(exc).__name__, "files": []}
+        return {
+            "action": "noop", "delete_history": False, "rows": [], "head": "",
+            "result": {
+                "available": False, "window": "90d",
+                "reason": type(exc).__name__, "files": [],
+            },
+        }
     head = head_result.stdout.strip() if head_result.returncode == 0 else ""
     prior = conn.execute("SELECT value FROM meta WHERE key='git_history_head'").fetchone()
     history_count = int(conn.execute("SELECT COUNT(*) FROM file_history").fetchone()[0])
     if head and prior is not None and prior["value"] == head and history_count:
-        return {"available": True, "window": "90d", "cached": True, "files": []}
-    conn.execute("DELETE FROM file_history")
+        return {
+            "action": "cached", "delete_history": False, "rows": [], "head": head,
+            "result": {"available": True, "window": "90d", "cached": True, "files": []},
+        }
     try:
         result = subprocess.run(
             [
@@ -223,13 +250,25 @@ def materialize_git_metrics(
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"available": False, "window": "90d", "reason": type(exc).__name__, "files": []}
+        # A cache miss already committed us to a rewrite; a failed walk must
+        # empty the stale history so metrics degrade to absent, matching the
+        # pre-split behaviour where DELETE ran before the walk.
+        return {
+            "action": "clear", "delete_history": True, "rows": [], "head": "",
+            "result": {
+                "available": False, "window": "90d",
+                "reason": type(exc).__name__, "files": [],
+            },
+        }
     if result.returncode != 0:
         return {
-            "available": False,
-            "window": "90d",
-            "reason": f"git_exit_{result.returncode}",
-            "files": [],
+            "action": "clear", "delete_history": True, "rows": [], "head": "",
+            "result": {
+                "available": False,
+                "window": "90d",
+                "reason": f"git_exit_{result.returncode}",
+                "files": [],
+            },
         }
 
     commits: Counter[str] = Counter()
@@ -257,7 +296,7 @@ def materialize_git_metrics(
     rows: list[dict[str, Any]] = []
     for path in selected:
         primary = authors[path].most_common(1)
-        row = {
+        rows.append({
             "file_path": path,
             "commit_file_touches_90d": commits[path],
             "lines_added_90d": additions[path],
@@ -266,25 +305,68 @@ def materialize_git_metrics(
             "authors_90d": len(authors[path]),
             "primary_author_90d": primary[0][0] if primary else None,
             "ownership_evidence": "git_commit_file_touches",
-        }
-        rows.append(row)
+        })
+    return {
+        "action": "write", "delete_history": True, "rows": rows, "head": head,
+        "result": {"available": True, "window": "90d", "files": rows},
+    }
+
+
+def persist_git_metrics(
+    conn: sqlite3.Connection, plan: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply a :func:`compute_git_metrics` plan inside the held write txn.
+
+    Pure SQLite work -- no subprocess. Rewriting ``file_history`` and the HEAD
+    generation marker is fast, so this is the only git-metrics step that runs
+    while the index write transaction owns the connection. A ``cached``/``noop``
+    plan leaves history untouched; a ``clear`` plan empties it (a git failure
+    degrades to absent metrics, never a failed build); a ``write`` plan
+    rematerialises byte-identical rows and records the new HEAD generation key.
+    """
+
+    if plan.get("delete_history"):
+        conn.execute("DELETE FROM file_history")
+    for row in plan.get("rows", ()):  # type: ignore[assignment]
         conn.execute(
             "INSERT INTO file_history "
             "(file_path, commit_touches_90d, lines_added_90d, lines_deleted_90d, "
             "authors_90d, primary_author_90d, evidence) VALUES (?,?,?,?,?,?,?)",
             (
-                path, row["commit_file_touches_90d"], row["lines_added_90d"],
-                row["lines_deleted_90d"], row["authors_90d"],
-                row["primary_author_90d"], row["ownership_evidence"],
+                row["file_path"], row["commit_file_touches_90d"],
+                row["lines_added_90d"], row["lines_deleted_90d"],
+                row["authors_90d"], row["primary_author_90d"],
+                row["ownership_evidence"],
             ),
         )
-    if head:
+    if plan.get("action") == "write" and plan.get("head"):
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('git_history_head', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (head,),
+            (plan["head"],),
         )
-    return {"available": True, "window": "90d", "files": rows}
+    return plan["result"]
+
+
+def materialize_git_metrics(
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    files: list[str],
+    *,
+    limit: int = 10000,
+) -> dict[str, Any]:
+    """Refresh bounded 90-day history during indexing, never during a query.
+
+    Retained as the single-call form for callers outside the index build. The
+    build path splits this into :func:`compute_git_metrics` (the git walk, run
+    with no write transaction held) and :func:`persist_git_metrics` (the
+    SQLite-only apply). Calling both here in one connection is byte-identical to
+    the prior monolithic behaviour.
+    """
+
+    return persist_git_metrics(
+        conn, compute_git_metrics(conn, repo_root, files, limit=limit)
+    )
 
 
 def _git_metrics(conn: sqlite3.Connection, files: list[str], *, limit: int) -> dict[str, Any]:
