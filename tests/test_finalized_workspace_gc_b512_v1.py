@@ -332,7 +332,7 @@ def test_archived_task_with_dead_process_is_gc_cleaned(tmp_path, monkeypatch):
 # terminal states, its workspace stays recoverable through
 # ``retry_finalization`` and must survive the sweep whatever the card says
 # (see test_finalize_failed_last_state_survives_sweep_and_retry_finds_it and
-# test_finalize_failed_last_state_is_retained_even_when_card_finished).
+# test_finalize_failed_retention_ends_when_the_card_is_already_finished).
 @pytest.mark.parametrize(
     "state", ["worker_failed", "scope_rejected", "promotion_conflict", "timed_out"]
 )
@@ -452,10 +452,27 @@ def test_finalize_failed_last_state_survives_sweep_and_retry_finds_it(tmp_path, 
     assert retry["error"] != "finalization_retry_workspace_missing"
 
 
-def test_finalize_failed_last_state_is_retained_even_when_card_finished(tmp_path, monkeypatch):
-    """The process state decides finalize_failed retention whatever the card's
-    canonical status says: even a finished card's finalize_failed attempt is
-    kept, because the retention decision reads the last process state too."""
+def test_finalize_failed_retention_ends_when_the_card_is_already_finished(
+    tmp_path, monkeypatch
+):
+    """``finalize_failed`` is retained for retry_finalization -- and only for it.
+
+    The measured race this rule exists for is a BLOCKED card whose retained
+    workspace was swept nine seconds after its finalization failed, leaving
+    retry_finalization with finalization_retry_workspace_missing. A blocked or
+    pending card still has a review to recover; a finished or archived one
+    completed by another route, so there is nothing left for a retry to
+    produce and holding the workspace is a leak, not a recovery path.
+
+    The first version of this rule ignored the card entirely and kept every
+    finalize_failed workspace forever. That contradicted
+    test_gc_still_waits_for_confirmed_canonical_terminal_status_after_retain,
+    which had asserted since B863 that a confirmed-finished card's retained
+    workspace is collected -- two rules each correct alone, and CI caught the
+    pair on the v0.10.79 tag. Retention is now bounded by whether a retry can
+    still do anything.
+    """
+
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
     request_id = "req-finalize-failed-finished"
     card = _card()
@@ -470,10 +487,39 @@ def test_finalize_failed_last_state_is_retained_even_when_card_finished(tmp_path
 
     result = manager._gc_finalized_workspaces()
 
+    assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
+    assert not path.exists() and not home.exists()
+    assert (
+        manager._request_events(request_id)[-1]["workspace_gc_reason"]
+        == "disposed_task_status:finished"
+    )
+
+
+def test_finalize_failed_retention_survives_a_pending_card(tmp_path, monkeypatch):
+    """``pending`` is a disposed status too, and a retry can still recover it.
+
+    Narrowing the rule to exempt finished/archived must not narrow it past the
+    cards a retry can actually serve. ``pending`` is in
+    GC_DISPOSED_CANONICAL_STATUSES exactly like ``blocked``, so without the
+    process-state check its workspace would be swept.
+    """
+
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    request_id = "req-finalize-failed-pending"
+    card = _card()
+    card.update({"status": "pending", "worker_status": "unclaimed", "claimed_by": ""})
+    manager = _build_manager(tmp_path, card)
+    path, home, _ = _seed_gc_candidate(
+        manager, tmp_path, card,
+        request_id=request_id,
+        pid=2_147_483_083, pid_start_ticks=999_999_933,
+        state="finalize_failed",
+    )
+
+    result = manager._gc_finalized_workspaces()
+
     assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
     assert path.exists() and home.exists()
-    assert "workspace_gc" not in manager._request_events(request_id)[-1]
-
 
 def test_blocked_card_with_successful_terminal_last_state_is_still_collected(tmp_path, monkeypatch):
     """The fix is scoped to finalize_failed only: a blocked card whose

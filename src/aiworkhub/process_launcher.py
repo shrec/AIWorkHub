@@ -10515,8 +10515,8 @@ class ProcessManager:
             if canonical_status not in task_fsm.REWORK_RECOVERABLE_STATUSES:
                 return True, f"pin_unrecoverable_task_status:{canonical_status}"
             return False, "pinned_rework_predecessor"
-        if process_state == "finalize_failed":  # retained for retry_finalization
-            return False, "retryable_finalize_failed"
+        if process_state == "finalize_failed" and canonical_status not in {"finished", "archived"}:
+            return False, "retryable_finalize_failed"  # a retry can still recover it
         if canonical_status in GC_DISPOSED_CANONICAL_STATUSES:
             return True, f"disposed_task_status:{canonical_status}"
         if canonical_status != "review":
