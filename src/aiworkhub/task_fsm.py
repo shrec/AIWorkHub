@@ -45,16 +45,24 @@ from typing import Mapping
 # worker that succeeded, leaving a ledger that recorded only failures.
 # Forgery is prevented by claim identity (launch_request_id plus claim_epoch,
 # which a re-claim increments), never by the card's current status.
-# The statuses from which a hash-pinned rework predecessor can still be
-# recovered. ``task_store.recover_blocked_rework`` fails closed on non-blocked
-# tasks, so retaining a predecessor workspace for any other status protects a
-# path nobody can take -- it only holds disk. ``blocked`` is the case the pin
-# exists for; ``pending``/``processing`` cover an episode already recovered and
-# in flight.
+# The statuses in which a hash-pinned rework predecessor must still be kept.
+#
+# The pin exists for two different readers and an earlier version of this set
+# saw only one of them. ``task_store.recover_blocked_rework`` reads it to
+# recover a ``blocked`` card, and ``pending``/``processing`` cover an episode
+# already recovered and in flight -- that much was right. But ``accept_review``
+# ALSO revalidates the successor against the predecessor workspace, so a card
+# sitting in ``review`` needs the pin most of all.
+#
+# Measured the hard way: omitting ``review`` purged the predecessor of
+# AIWORKHUB_01078 the moment its rework reached review_ready, and the accept
+# that followed failed with rework_predecessor_workspace_missing. A pin is held
+# until the episode is DECIDED, not until the successor stops being in flight.
 REWORK_RECOVERABLE_STATUSES: frozenset[str] = frozenset({
     "blocked",
     "pending",
     "processing",
+    "review",
 })
 
 

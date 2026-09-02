@@ -259,3 +259,28 @@ def test_the_recoverable_vocabulary_lives_with_the_lifecycle():
     assert "blocked" in task_fsm.REWORK_RECOVERABLE_STATUSES
     assert "archived" not in task_fsm.REWORK_RECOVERABLE_STATUSES
     assert "superseded" not in task_fsm.REWORK_RECOVERABLE_STATUSES
+
+
+def test_a_card_in_review_still_holds_its_predecessor_pin():
+    """accept_review revalidates against the predecessor workspace.
+
+    An earlier version of this set saw only recover_blocked_rework as the pin's
+    reader and left `review` out. The predecessor of AIWORKHUB_01078 was purged
+    the moment its rework reached review_ready -- audit reason
+    pin_unrecoverable_task_status:review -- and the accept that followed failed
+    with rework_predecessor_workspace_missing. `review` is when the pin matters
+    most, not when it stops mattering.
+    """
+    from aiworkhub import task_fsm
+
+    assert "review" in task_fsm.REWORK_RECOVERABLE_STATUSES
+    card = {
+        "task_id": "T",
+        "status": "review",
+        "rework_predecessor": {"request_id": REQUEST_ID},
+    }
+    eligible, reason = process_launcher.ProcessManager._gc_disposition(
+        card, REQUEST_ID, repo=None
+    )
+    assert eligible is False
+    assert reason == "pinned_rework_predecessor"
