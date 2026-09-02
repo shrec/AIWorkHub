@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import shutil
 import subprocess
 import sys
@@ -187,8 +188,12 @@ def test_atomic_json_retries_repo_spool_cleanup_once(
     real_replace = os.replace
     replace_calls = 0
 
+    caller = threading.get_ident()
+
     def cleanup_before_first_publish(src, dst):
         nonlocal replace_calls
+        if threading.get_ident() != caller:
+            return real_replace(src, dst)
         replace_calls += 1
         if replace_calls == 1:
             Path(src).unlink()
@@ -211,9 +216,12 @@ def test_atomic_json_accepts_immediate_owner_only_request_claim(
     claim = Path(f"{target}.claim-window_test")
     real_replace = os.replace
 
+    caller = threading.get_ident()
+
     def claim_immediately(src, dst):
         real_replace(src, dst)
-        real_replace(dst, claim)
+        if threading.get_ident() == caller:
+            real_replace(dst, claim)
 
     monkeypatch.setattr(vscode_lm_bridge.os, "replace", claim_immediately)
 

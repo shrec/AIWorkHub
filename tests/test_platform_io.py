@@ -4,6 +4,7 @@ import errno
 import io
 import importlib.util
 import os
+import threading
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -811,8 +812,15 @@ def test_chmod_path_applies_posix_mode(monkeypatch, tmp_path):
 
 def test_atomic_replace_retries_transient_windows_sharing_violation(monkeypatch):
     calls: list[tuple[object, object]] = []
+    # platform_io.os IS the os module, so this patch is process-wide. Only this
+    # thread's replaces are the subject: a background thread writing atomically
+    # would otherwise consume the one call that is supposed to fail.
+    caller = threading.get_ident()
+    real_replace = os.replace
 
     def transient_replace(source, destination):
+        if threading.get_ident() != caller:
+            return real_replace(source, destination)
         calls.append((source, destination))
         if len(calls) == 1:
             raise PermissionError(32, "file is being used by another process")
