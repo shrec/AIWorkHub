@@ -10216,8 +10216,16 @@ class ProcessManager:
                 deferred = self._request_events(request_id)
                 if deferred:
                     latest = deferred[-1]
+                    # PID identity comes from the merged request identity, not
+                    # from whichever row happens to be last. Advisory rows --
+                    # a runtime notice, for instance -- carry `pid` but no
+                    # `pid_start_ticks`, so reading the tail alone turned a
+                    # decidable MISMATCH into UNKNOWN and deferred a finished
+                    # worker forever: the quieter the worker, the more certain
+                    # the notice, and the more permanent the deferral.
+                    merged = self._event_identity(deferred)
                     identity = _pid_identity_evidence(
-                        latest.get("pid"), latest.get("pid_start_ticks")
+                        merged.get("pid"), merged.get("pid_start_ticks")
                     )
                     if identity.verdict is PidIdentityVerdict.MATCH:
                         return latest
@@ -10878,8 +10886,15 @@ class ProcessManager:
                 return latest
             with self._lock:
                 live = self._live.get(request_id)
+            # Identity is a property of the REQUEST, assembled from every row
+            # that ever named it -- not of whichever row is last. An advisory
+            # row (a runtime notice) carries `pid` without `pid_start_ticks`,
+            # and reading the tail alone downgraded a decidable MISMATCH to
+            # UNKNOWN, which defers. A worker quiet enough to earn a notice
+            # could therefore never be finalized.
+            merged_identity = self._event_identity(events)
             identity = _pid_identity_evidence(
-                latest.get("pid"), latest.get("pid_start_ticks")
+                merged_identity.get("pid"), merged_identity.get("pid_start_ticks")
             )
             status_hint_path = Path(
                 str(latest.get("supervisor_status_path") or "")
@@ -10919,8 +10934,8 @@ class ProcessManager:
 
             status_path = Path(str(metadata["supervisor_status_path"]))
             supervisor_status = self._read_supervisor_status(status_path)
-            supervisor_pid = int(latest.get("pid") or 0)
-            supervisor_ticks = latest.get("pid_start_ticks")
+            supervisor_pid = int(merged_identity.get("pid") or 0)
+            supervisor_ticks = merged_identity.get("pid_start_ticks")
             supervisor_state = str(supervisor_status.get("state") or "")
             terminal_status_artifact = bool(
                 supervisor_status and supervisor_state not in {"starting", "running"}
