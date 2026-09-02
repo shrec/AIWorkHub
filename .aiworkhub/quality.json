@@ -43,6 +43,20 @@
       ]
     },
     {
+      "id": "declared-invariants",
+      "kind": "lint",
+      "command": [
+        "{python}",
+        "-m",
+        "aiworkhub.declared_invariants"
+      ],
+      "paths": [
+        "src/aiworkhub/*.py",
+        "src/aiworkhub/**/*.py",
+        ".aiworkhub/config/development_rules.json"
+      ]
+    },
+    {
       "id": "typed-kernel",
       "kind": "typecheck",
       "command": [
@@ -50,7 +64,10 @@
         "-m",
         "mypy"
       ],
-      "paths": ["src/aiworkhub/*.py", "src/aiworkhub/**/*.py"]
+      "paths": [
+        "src/aiworkhub/*.py",
+        "src/aiworkhub/**/*.py"
+      ]
     },
     {
       "id": "extension-regression",
@@ -61,7 +78,9 @@
         "vscode-extension",
         "test"
       ],
-      "paths": ["vscode-extension/**"]
+      "paths": [
+        "vscode-extension/**"
+      ]
     },
     {
       "id": "release-metadata",

@@ -35,9 +35,15 @@ class _LatestEventProjection:
     latest: dict[str, dict[str, Any]]
 
 
+# A projection's identity is the ledger plus every fold option that changes
+# what it produces. The key was once the path and key field alone, so widening
+# the fold with skip/replace would have served one projection's answer to a
+# different projection's question.
+_ProjectionKey = tuple[str, str, tuple[str, ...], bool]
+
 _LATEST_EVENT_CACHE_LOCK = threading.RLock()
 _LATEST_EVENT_CACHE: OrderedDict[
-    tuple[str, str], _LatestEventProjection
+    _ProjectionKey, _LatestEventProjection
 ] = OrderedDict()
 
 
@@ -514,7 +520,7 @@ def _parse_complete_jsonl(payload: bytes) -> Iterator[dict[str, Any]]:
 
 
 def _cache_projection(
-    cache_key: tuple[Any, ...], projection: _LatestEventProjection
+    cache_key: _ProjectionKey, projection: _LatestEventProjection
 ) -> None:
     with _LATEST_EVENT_CACHE_LOCK:
         _LATEST_EVENT_CACHE[cache_key] = projection
@@ -527,7 +533,7 @@ def _rebuild_latest_events(
     path: Path,
     *,
     key_field: str,
-    cache_key: tuple[Any, ...],
+    cache_key: _ProjectionKey,
     skip_event_kinds: tuple[str, ...] = (),
     replace: bool = False,
 ) -> dict[str, dict[str, Any]]:
