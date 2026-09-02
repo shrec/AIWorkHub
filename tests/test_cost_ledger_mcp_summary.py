@@ -50,3 +50,26 @@ def test_cost_ledger_mcp_full_and_task_flags_are_independent(monkeypatch):
     assert "by_runner" in full_without_tasks["aggregates"]
     assert "by_topic" in full_without_tasks["aggregates"]
     assert "by_role" in full_without_tasks["aggregates"]
+
+
+def test_cost_ledger_mcp_binds_the_repository_it_reports_on(monkeypatch):
+    """The tool must hand ``build_cost_ledger`` a root, not the global fallback.
+
+    Without ``repo_root`` the builder parses the text usage report, whose lines
+    carry no model, provider or day, so every aggregate the docstring promises
+    reads ``unknown`` while looking authoritative.  The stub above answers the
+    same either way, which is exactly why nothing caught it (NF-2026-00542).
+    """
+
+    seen: dict[str, object] = {}
+
+    def _capture(**kwargs):
+        seen.update(kwargs)
+        return _ledger(**kwargs)
+
+    monkeypatch.setattr(server.cost_ledger, "build_cost_ledger", _capture)
+    monkeypatch.setattr(server.core, "repo_root", lambda: "/repo/under/test")
+
+    server.aiworkhub_task_cost_ledger()
+
+    assert seen["repo_root"] == "/repo/under/test"

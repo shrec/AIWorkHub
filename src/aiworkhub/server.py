@@ -2163,9 +2163,23 @@ def aiworkhub_task_cost_ledger(
     aggregates.  Per-runner and per-topic maps are available with
     ``full=true``; task rows remain independently opt-in through
     ``include_tasks``.
+
+    The repository binding is what makes those aggregates answerable.
+    ``build_cost_ledger`` reads canonical usage events only when it is given a
+    root; without one it parses the human-readable usage report, whose lines
+    carry no model, provider or timestamp, so every dimension this docstring
+    promises collapsed to ``unknown``.  Measured 2026-09-02 on this repository:
+    unbound 590 rows / 1 model / 1 provider / 1 day / 0 usage-observed / 0
+    cache-observed / 0 routes; bound 3,509 rows / 28 models / 8 providers / 36
+    days / 2,267 usage-observed / 1,869 cache-observed / 13 routes.  Every
+    other caller (dashboard, manager tools, evidence instruments) already
+    passed a root; this tool -- the manager's own cost surface -- did not, so
+    routing by cost and difficulty had no measurement to steer by
+    (NF-2026-00542).
     """
 
     result = cost_ledger.build_cost_ledger(
+        repo_root=core.repo_root(),
         runner=runner,
         topic=topic,
         status=status,
