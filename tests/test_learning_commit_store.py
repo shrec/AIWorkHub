@@ -459,3 +459,42 @@ def test_core_classify_terminal_disposition_falls_back_to_top_level_worker_statu
     assert core.classify_terminal_disposition(
         {"terminal_substatus": "", "worker_status": "cancelled"}
     ) is learning_commit.FailureCategory.CANCELLATION_OR_TIMEOUT
+
+
+def test_rework_rejection_is_a_committable_adjudicated_outcome():
+    """A rejection that sends work back is still a decision worth learning from.
+
+    Measured 2026-09-02 on AIWORKHUB_01082: reject_review to ``pending`` writes
+    the adjudicated request id into ``rework_predecessor`` (pinned with the
+    predecessor's changed-path hashes) and into ``review_feedback`` (carrying
+    the reason's sha256), and stamps no ``terminal_review``. The identity
+    predicate read only ``accepted_request_id`` and ``terminal_review``, so the
+    commit failed ``learning_commit_request_identity_mismatch`` -- meaning only
+    a rejection that TERMINATED a card could ever be learned from, and the
+    common case, rework, could not.
+    """
+
+    request_id = "b51ab62da9744b689bb023fe6d536815"
+
+    rework = {
+        "status": "pending",
+        "rework_predecessor": {"request_id": request_id},
+        "review_feedback": {"predecessor_request_id": request_id},
+    }
+    assert learning_commit_store._request_matches_candidate(rework, request_id)
+
+    feedback_only = {"review_feedback": {"predecessor_request_id": request_id}}
+    assert learning_commit_store._request_matches_candidate(
+        feedback_only, request_id
+    )
+
+    # Binding stays exact: a different request on the same card is still a
+    # mismatch, which is the whole point of the predicate.
+    assert not learning_commit_store._request_matches_candidate(
+        rework, "0000000000000000000000000000dead"
+    )
+    assert not learning_commit_store._request_matches_candidate({}, request_id)
+    # A non-mapping section must not raise or match.
+    assert not learning_commit_store._request_matches_candidate(
+        {"rework_predecessor": "not-a-mapping"}, request_id
+    )

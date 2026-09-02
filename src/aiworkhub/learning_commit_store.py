@@ -139,7 +139,29 @@ def _request_matches_candidate(card: dict[str, Any], request_id: str) -> bool:
         ((card.get("terminal_review") or {}).get("evidence") or {}).get("request_identity")
         or {}
     )
-    return str(identity.get("request_id") or "") == request_id
+    if str(identity.get("request_id") or "") == request_id:
+        return True
+    # A rejection that sends the card back for rework is still an adjudicated
+    # outcome, and it is the COMMON one -- but it never stamps terminal_review,
+    # so until now only a rejection that TERMINATED a card could be learned
+    # from. Measured 2026-09-02 on AIWORKHUB_01082: after reject_review the
+    # card carried the adjudicated request id twice, in review_feedback and in
+    # rework_predecessor, and this predicate looked at neither, so the commit
+    # failed learning_commit_request_identity_mismatch.
+    #
+    # Both are written by reject_review itself, not supplied by a model:
+    # rework_predecessor pins the predecessor's changed-path hashes and
+    # review_feedback carries the reason's sha256. Accepting them binds the
+    # lesson to the exact request that was judged, which is what this predicate
+    # exists to guarantee.
+    for section in ("rework_predecessor", "review_feedback"):
+        block = card.get(section)
+        if not isinstance(block, dict):
+            continue
+        for key in ("request_id", "predecessor_request_id"):
+            if str(block.get(key) or "") == request_id:
+                return True
+    return False
 
 
 def _open(repo: Path) -> sqlite3.Connection:
