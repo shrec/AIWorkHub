@@ -1233,3 +1233,35 @@ def test_mandatory_changed_outputs_partially_out_of_scope_fails_closed():
             test_paths=["tests/test_a.py"],
             mandatory_changed_outputs=["src/a.py", "src/not_in_scope.py"],
         )
+
+
+def test_bounded_text_names_the_cause_and_the_limit():
+    """A one-word refusal made composing a card a bisection against the API.
+
+    Three different causes -- wrong type, empty, over the limit -- all raised a
+    bare ``invalid_objective``, and the limit itself was never stated. The path
+    validator in the same module already names its cause; this pins that the
+    text validator does too.
+    """
+    from aiworkhub.task_templates import MAX_OBJECTIVE_LENGTH, _bounded_text
+
+    with pytest.raises(TaskTemplateError) as too_long:
+        _bounded_text("x" * (MAX_OBJECTIVE_LENGTH + 1), "objective", MAX_OBJECTIVE_LENGTH)
+    message = str(too_long.value)
+    assert "too_long" in message
+    assert str(MAX_OBJECTIVE_LENGTH) in message
+    assert str(MAX_OBJECTIVE_LENGTH + 1) in message
+
+    with pytest.raises(TaskTemplateError, match="invalid_objective:empty"):
+        _bounded_text("   ", "objective", MAX_OBJECTIVE_LENGTH)
+
+    with pytest.raises(TaskTemplateError, match="invalid_objective:not_a_string:int"):
+        _bounded_text(123, "objective", MAX_OBJECTIVE_LENGTH)
+
+
+def test_bounded_text_still_accepts_multiline_objectives():
+    """Newlines are legal here; only paths reject control characters."""
+    from aiworkhub.task_templates import MAX_OBJECTIVE_LENGTH, _bounded_text
+
+    text = "first line\nsecond line"
+    assert _bounded_text(text, "objective", MAX_OBJECTIVE_LENGTH) == text

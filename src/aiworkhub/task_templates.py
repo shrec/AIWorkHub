@@ -374,11 +374,24 @@ def _bounded_paths(value: Any, field: str) -> list[str]:
 
 
 def _bounded_text(value: Any, field: str, limit: int) -> str:
+    """Return the stripped text, naming exactly why it was refused.
+
+    A bare ``invalid_<field>`` collapsed three different causes -- wrong type,
+    empty, and over the limit -- into one word, and never stated the limit. A
+    caller composing a card could only find the boundary by bisecting against
+    the API. ``_validate_path`` a few lines above already names its cause
+    (``_path_too_long``, ``_path_control_character``); this now matches it.
+    """
+
     if not isinstance(value, str):
-        raise TaskTemplateError(f"invalid_{field}")
+        raise TaskTemplateError(f"invalid_{field}:not_a_string:{type(value).__name__}")
     text = value.strip()
-    if not text or len(text) > limit:
-        raise TaskTemplateError(f"invalid_{field}")
+    if not text:
+        raise TaskTemplateError(f"invalid_{field}:empty")
+    if len(text) > limit:
+        raise TaskTemplateError(
+            f"invalid_{field}:too_long:{len(text)}_chars_exceeds_limit_{limit}"
+        )
     return text
 
 
