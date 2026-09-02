@@ -29,6 +29,9 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -572,6 +575,67 @@ def quick_check(path: Path) -> str:
     return str(row[0] if row else "")
 
 
+# ``storage_readiness`` runs on every one of the 33 ``_require_ready`` call
+# sites, so every task operation pays for it. Measured on this repository's
+# 222.9 MB canonical database, one readiness call is 61.6 ms and ``quick_check``
+# alone is 59.1 ms of it -- 96%. The authority checks it guards (manifest
+# identity, registry repo_id, canonical_active/live_cutover, database existence,
+# schema) together cost 2.1 ms.
+#
+# So only the integrity scan is cached, never the authority. Every call still
+# re-verifies who owns the database and whether it is the canonical one; what is
+# not repeated is re-scanning 222 MB of pages that our own writes cannot corrupt.
+# One roadmap snapshot made 94 readiness calls and spent 11.03 s of its 11.22 s
+# wall time inside them (NF-2026-00560).
+#
+# The cache is keyed by database identity (path plus device/inode), so a cutover
+# or a replaced file is a miss rather than a stale answer, and it is bounded in
+# both entries and age. A NON-ok result is never cached: a corrupt database must
+# be re-checked every time so a repair is noticed immediately, which keeps the
+# gate fail-closed in the direction that matters.
+_QUICK_CHECK_TTL_SECONDS = 300.0
+_QUICK_CHECK_CACHE_MAX_ENTRIES = 32
+_QUICK_CHECK_LOCK = threading.RLock()
+_QUICK_CHECK_CACHE: "OrderedDict[tuple[str, int, int], tuple[float, str]]" = OrderedDict()
+
+
+def reset_storage_readiness_cache() -> None:
+    """Drop the cached integrity results.
+
+    Call after any operation that replaces or rebuilds the canonical database
+    in place, and from tests that corrupt a database and expect the next
+    readiness call to see it.
+    """
+
+    with _QUICK_CHECK_LOCK:
+        _QUICK_CHECK_CACHE.clear()
+
+
+def _cached_quick_check(path: Path) -> str:
+    """``quick_check`` bounded by database identity and age."""
+
+    try:
+        info = path.stat()
+    except OSError:
+        return quick_check(path)
+    key = (str(path), info.st_dev, info.st_ino)
+    now = time.monotonic()
+    with _QUICK_CHECK_LOCK:
+        cached = _QUICK_CHECK_CACHE.get(key)
+        if cached is not None and now - cached[0] <= _QUICK_CHECK_TTL_SECONDS:
+            _QUICK_CHECK_CACHE.move_to_end(key)
+            return cached[1]
+    result = quick_check(path)
+    if result != "ok":
+        return result
+    with _QUICK_CHECK_LOCK:
+        _QUICK_CHECK_CACHE[key] = (now, result)
+        _QUICK_CHECK_CACHE.move_to_end(key)
+        while len(_QUICK_CHECK_CACHE) > _QUICK_CHECK_CACHE_MAX_ENTRIES:
+            _QUICK_CHECK_CACHE.popitem(last=False)
+    return result
+
+
 def _schema_ok(path: Path) -> bool:
     try:
         conn = _connect(path, readonly=True)
@@ -742,7 +806,7 @@ def storage_readiness(root: str | Path) -> StorageReadiness:
         return StorageReadiness(False, "canonical_schema_incomplete", repo.manifest.repo_id, str(canonical_db))
 
     try:
-        qc = quick_check(canonical_db)
+        qc = _cached_quick_check(canonical_db)
     except sqlite3.DatabaseError:
         return StorageReadiness(False, "canonical_db_corrupt", repo.manifest.repo_id, str(canonical_db))
     if qc != "ok":
