@@ -10448,6 +10448,10 @@ def test_status_names_why_the_task_card_was_not_read(monkeypatch, tmp_path):
     assert live["task_card_read"] == "read"
     assert live["task_state"] != "unknown"
 
+    # collect() is the surface a manager actually reads. A reason that stops at
+    # status() is a reason nobody sees -- which is how the confusion happened.
+    assert manager.collect("status-card-read")["task_card_read"] == "read"
+
 
 def test_status_distinguishes_a_failed_card_read_from_an_absent_card(
     monkeypatch,

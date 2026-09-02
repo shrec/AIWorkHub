@@ -12090,8 +12090,7 @@ class ProcessManager:
         card: dict[str, Any] | None = None
         card_read = "read"
         if latest.get("state") == "starting" and not int(latest.get("pid") or 0):
-            # Still under preparation: reading the card contends with the
-            # preparation owner, so stay bounded -- but bounded is not absent.
+            # Bounded during preparation (owner contention) -- but not absent.
             card_read = "deferred_pid_null_starting_reservation"
         else:
             try:
@@ -12645,6 +12644,7 @@ class ProcessManager:
             "liveness": status.get("liveness"),
             "task_card": card_summary,
             "task_card_sha256": card_sha256,
+            "task_card_read": status.get("task_card_read"),
             "latest_event": event_summary,
             "latest_event_sha256": event_sha256,
             "stdout_tail": stdout_tail,
