@@ -793,9 +793,15 @@ def test_index_file_rejects_oversized_fstat_before_read(tmp_path, monkeypatch):
     monkeypatch.setattr(sg, "SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT", 4)
     read_calls = []
     real_read = sg.os.read
+    # sg.os IS the os module, so this patch is process-wide. Only this thread's
+    # reads are the subject: a background thread's os.read would otherwise be
+    # counted as the code under test reading, which is how the sibling test
+    # below became flaky under the full suite.
+    caller = threading.get_ident()
 
     def record_read(fd: int, size: int) -> bytes:
-        read_calls.append((fd, size))
+        if threading.get_ident() == caller:
+            read_calls.append((fd, size))
         return real_read(fd, size)
 
     monkeypatch.setattr(sg.os, "read", record_read)
@@ -1188,9 +1194,16 @@ def test_index_file_read_error_fails_closed_without_partial_mutation(
     _write(target, updated)
     real_read = sg.os.read
     read_calls = 0
+    # Count and fail only for the calling thread: this patch replaces os.read
+    # for the whole process, and under the full suite a background thread
+    # consumed call #1, so the synthetic failure landed on a read this test was
+    # not exercising and index_file completed normally -- DID NOT RAISE.
+    caller = threading.get_ident()
 
     def failing_read(fd: int, length: int) -> bytes:
         nonlocal read_calls
+        if threading.get_ident() != caller:
+            return real_read(fd, length)
         read_calls += 1
         if read_calls == fail_on_read_call:
             raise OSError(errno.EIO, "synthetic read failure")
