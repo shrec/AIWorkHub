@@ -1198,6 +1198,29 @@ def _index_quality_scorecard(
     page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
     freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
     resolved_ratio = resolved_edges / total_edges if total_edges else None
+
+    # A call to a language builtin can never resolve to repository code, and no
+    # lens uses one: deadmethods counts only RESOLVED incoming calls, and gaps
+    # has to filter them out explicitly. Measured here, 47,046 of 212,603 call
+    # edges name a Python builtin -- str 11,970, isinstance 4,834, setattr
+    # 4,512, len 4,382 -- so resolved_ratio was reporting a fifth of the graph
+    # as unresolved work when it was never work at all.
+    #
+    # They are reported out of the denominator, not deleted: an edge saying
+    # "this function calls str" is true, and destroying true rows to improve a
+    # number is how a metric starts steering the data instead of describing it.
+    # resolved_ratio itself is left exactly as it was, so history stays
+    # comparable and the floor keeps guarding the same series.
+    builtin_names = sorted(sganalytics._PYTHON_BUILTIN_NAMES)
+    unresolvable_edges = int(conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE kind='calls' AND dst_qualname IS NULL "
+        f"AND dst_name IN ({','.join('?' * len(builtin_names))})",
+        builtin_names,
+    ).fetchone()[0]) if builtin_names else 0
+    resolvable_edges = max(0, total_edges - unresolvable_edges)
+    resolved_ratio_resolvable = (
+        resolved_edges / resolvable_edges if resolvable_edges else None
+    )
     artifact_ratio = artifact_entities / entity_count if entity_count else None
     degraded_reasons: list[str] = []
     if total_edges and resolved_edges == 0:
@@ -1282,6 +1305,12 @@ def _index_quality_scorecard(
             "total": total_edges,
             "resolved": resolved_edges,
             "unresolved": max(0, total_edges - resolved_edges),
+            "language_builtin_targets": unresolvable_edges,
+            "resolvable": resolvable_edges,
+            "resolved_ratio_resolvable": (
+                round(resolved_ratio_resolvable, 6)
+                if resolved_ratio_resolvable is not None else None
+            ),
             "resolved_ratio": round(resolved_ratio, 6) if resolved_ratio is not None else None,
             "resolved_ratio_best_observed": (
                 round(resolved_ratio_best, 6)
