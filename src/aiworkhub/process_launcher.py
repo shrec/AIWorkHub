@@ -4736,8 +4736,11 @@ class ProcessManager:
             "timestamp": _utcnow(),
             **event,
         }
-        process_event_ledger.append_event(self.process_log_path, clean)
-        return clean
+        # Return what the ledger actually wrote, not what we asked it to write.
+        # A failure-terminal row gains a canonical terminal_reason on the way
+        # in, so returning ``clean`` gave the finalizing caller an event whose
+        # own replay from the ledger would not compare equal to it.
+        return process_event_ledger.append_event(self.process_log_path, clean)
 
     def _events(self) -> list[dict[str, Any]]:
         return list(process_event_ledger.iter_events(self.process_log_path))

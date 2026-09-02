@@ -324,8 +324,16 @@ def append_event(
     event: dict[str, Any],
     *,
     max_active_bytes: int = ACTIVE_LEDGER_MAX_BYTES,
-) -> None:
-    """Append one JSON row, rotating the active file before the size bound."""
+) -> dict[str, Any]:
+    """Append one JSON row, rotating the active file before the size bound.
+
+    Returns the row as it was actually persisted. A failure-terminal event is
+    canonicalised here -- ``terminal_reason`` is built from server-side
+    constants -- so the caller's own dict and the durable record are not the
+    same object. Handing the persisted row back keeps one event with one
+    representation: a caller that finalizes and a caller that replays the
+    ledger afterwards must not disagree about what happened.
+    """
 
     if max_active_bytes < 1024:
         raise ValueError("process_ledger_max_bytes_too_small")
@@ -379,6 +387,7 @@ def append_event(
                 os.close(fd)
     except TimeoutError:
         _write_immutable_spill(path, payload)
+    return persisted_event
 
 
 def _iter_ledger_file(path: Path) -> Iterator[dict[str, Any]]:
