@@ -23,6 +23,38 @@ from aiworkhub import worker_workspace  # noqa: E402
 from aiworkhub import platform_io  # noqa: E402
 
 
+def _fchmod_permitted() -> bool:
+    """Whether this environment can actually execute an ``fchmod``.
+
+    The worker sandbox denies chmod with seccomp, so any case that exercises the
+    real ``fchmod`` branch fails there with ``PermissionError`` no matter what
+    the code under test does. That made ``worker_workspace.py`` effectively
+    un-cardable: a task whose validation ran this file died at
+    ``validation_failed`` for a reason unrelated to its change, and the failure
+    named an assertion rather than the missing capability.
+
+    Probing the capability and skipping states the truth -- this host cannot
+    exercise the branch -- the same way the ``openat2`` guards below already do.
+    Outside the sandbox the probe succeeds and every case still runs.
+    """
+
+    import tempfile
+
+    descriptor, name = tempfile.mkstemp()
+    try:
+        os.fchmod(descriptor, 0o600)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+        os.unlink(name)
+
+
+_FCHMOD_PERMITTED = _fchmod_permitted()
+_FCHMOD_DENIED_REASON = "fchmod is denied here (worker sandbox seccomp policy)"
+
+
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
@@ -6516,6 +6548,7 @@ def test_verify_target_any_hardlink_same_mode_noop_accepted_different_mode_denie
     not worker_workspace._openat2_available(),
     reason="openat2(2) unavailable on this kernel",
 )
+@pytest.mark.skipif(not _FCHMOD_PERMITTED, reason=_FCHMOD_DENIED_REASON)
 def test_fchmod_hardlink_noop_unlink_race_uses_authenticated_descriptor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
