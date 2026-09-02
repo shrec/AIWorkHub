@@ -1384,6 +1384,17 @@ def aiworkhub_task_health() -> dict[str, Any]:
 
     result = core.health()
     result["server_version"] = __version__
+    # A queue that accepts writes but never finalizes exited workers is not
+    # healthy, and until now nothing on this surface could tell the two apart:
+    # the reconciler's state lived in one process's memory. Report the durable
+    # scan record so "cards are stuck" has an answer instead of a guess.
+    try:
+        result["reconciler"] = task_reconciler.reconciler_health(core.repo_root())
+    except Exception as exc:  # noqa: BLE001 -- health must never fail closed
+        result["reconciler"] = {
+            "ok": False,
+            "last_error": f"reconciler_health_unavailable:{type(exc).__name__}",
+        }
     return result
 
 
@@ -2939,8 +2950,17 @@ def _start_task_reconciler_safely(root: Path) -> None:
     """
     try:
         task_reconciler.ensure_started(root)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 -- MCP must stay available
+        # The reconciler is the only thing that finalizes an exited worker.
+        # Swallowing this silently was indistinguishable from success: cards
+        # sat in `processing` while every health surface answered "fine".
+        # MCP still starts, but the failure is now on the record it reads.
+        task_reconciler.write_status(root, {
+            "pid": os.getpid(),
+            "repo": str(root),
+            "startup_error": f"{type(exc).__name__}:{exc}"[:500],
+            "scan_finished_epoch": None,
+        })
 
 def main() -> None:
     root = core.repo_root()

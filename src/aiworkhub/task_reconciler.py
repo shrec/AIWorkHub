@@ -50,6 +50,18 @@ SCAN_INTERVAL_ENV = "AIWORKHUB_RECONCILER_SCAN_INTERVAL_SECONDS"
 # Repository-local, non-durable runtime tree (never the historical
 # any package-install/monorepo lock path): .aiworkhub/runtime/locks/.
 LOCK_REL_PATH = Path(".aiworkhub/runtime/locks/task_reconciler.lock")
+# The reconciler is the only thing that finalizes an exited worker, and its
+# health used to live in one process's memory: if the thread never started or
+# died, every surface still answered "fine" and cards sat in `processing`
+# forever. The scan record is written to disk so any process -- a manager chat,
+# the dashboard, a later server -- can ask when the loop last closed and get an
+# answer that outlives the process that produced it.
+STATUS_REL_PATH = Path(".aiworkhub/runtime/task_reconciler_status.json")
+# A heartbeat is only evidence while it is recent. Past this many missed
+# intervals the record is reported stale rather than healthy, because a scan
+# that last ran hours ago is indistinguishable from no reconciler at all.
+STALE_SCAN_INTERVALS = 4.0
+MIN_STALE_SCAN_SECONDS = 300.0
 
 
 def _utcnow() -> str:
@@ -101,6 +113,53 @@ def single_instance_lock(lock_path: Path):
         os.close(fd)
 
 
+def status_path(repo: Path | str) -> Path:
+    return Path(repo).resolve() / STATUS_REL_PATH
+
+
+def write_status(repo: Path | str, payload: dict[str, Any]) -> None:
+    """Record the scan outcome durably; never let bookkeeping break the loop."""
+
+    target = status_path(repo)
+    record = {"schema_id": "aiworkhub.task_reconciler_status.v1", **payload}
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(record, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+        )
+        os.replace(tmp, target)
+    except OSError:
+        # A reconciler that cannot write its own heartbeat must still
+        # reconcile; the missing record is itself reported as unknown health.
+        return
+
+
+def read_status(repo: Path | str) -> dict[str, Any]:
+    try:
+        raw = status_path(repo).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        record = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _staleness(record: dict[str, Any]) -> tuple[bool, float | None]:
+    """Return (stale, age_seconds) for a durable scan record."""
+
+    at = record.get("scan_finished_epoch")
+    if not isinstance(at, (int, float)) or isinstance(at, bool):
+        return True, None
+    age = max(0.0, time.time() - float(at))
+    interval = record.get("scan_interval_seconds")
+    interval = float(interval) if isinstance(interval, (int, float)) and not isinstance(interval, bool) else DEFAULT_SCAN_INTERVAL_SECONDS
+    budget = max(MIN_STALE_SCAN_SECONDS, interval * STALE_SCAN_INTERVALS)
+    return age > budget, age
+
+
 def run_scan(
     manager: process_launcher.ProcessManager | None = None,
     *,
@@ -148,14 +207,32 @@ class ReconcilerService:
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
+            started = time.time()
             try:
                 result = run_scan(self._manager, repo=self.repo)
                 with self._state_lock:
                     self._last_scan = result
                     self._last_error = ""
+                error = ""
             except Exception as exc:  # noqa: BLE001 -- lifecycle safety net
+                result = {}
+                error = f"{type(exc).__name__}:{exc}"[:500]
                 with self._state_lock:
-                    self._last_error = f"{type(exc).__name__}:{exc}"[:500]
+                    self._last_error = error
+            # Written on success AND on failure: a loop that is running but
+            # failing every scan must not look the same as one that is working.
+            write_status(self.repo, {
+                "pid": os.getpid(),
+                "repo": str(self.repo),
+                "scan_started_epoch": started,
+                "scan_finished_epoch": time.time(),
+                "scan_duration_seconds": round(time.time() - started, 3),
+                "scan_interval_seconds": self.scan_interval_seconds,
+                "last_error": error,
+                "finalized": result.get("finalized", 0),
+                "watched": result.get("watched", 0),
+                "scanned_at": result.get("scanned_at", ""),
+            })
             if self._stop_event.wait(self.scan_interval_seconds):
                 break
 
@@ -222,15 +299,40 @@ def stop_reconciler(repo: Path | str) -> bool:
 
 
 def reconciler_health(repo: Path | str) -> dict[str, Any]:
+    """Report reconciler health, in-process first and durably otherwise.
+
+    "This process has no reconciler registered" is not the same claim as "no
+    reconciler has run against this repository". A manager chat asking whether
+    exited workers are being finalized needs the second answer, so the durable
+    record answers when the in-process service is absent -- and a record too old
+    to still be evidence is reported stale rather than healthy.
+    """
+
     key = str(Path(repo).resolve())
     with _SERVICES_LOCK:
         service = _SERVICES.get(key)
+    record = read_status(key)
+    stale, age = _staleness(record) if record else (True, None)
+    durable = {
+        "durable_status_present": bool(record),
+        "durable_scan_stale": stale,
+        "durable_scan_age_seconds": round(age, 1) if age is not None else None,
+        "durable_last_scan": record,
+    }
     if service is None:
         return {
-            "ok": False, "running": False, "repo": key,
-            "last_scan": {}, "last_error": "reconciler_unregistered",
+            "ok": bool(record) and not stale,
+            "running": False,
+            "repo": key,
+            "last_scan": record,
+            "last_error": (
+                "" if record and not stale
+                else "reconciler_unregistered_and_no_recent_scan"
+            ),
+            "startup_error": str(record.get("startup_error") or ""),
+            **durable,
         }
-    return service.health()
+    return {**service.health(), **durable}
 
 
 def _install_stop_handler(stop_flag: dict[str, bool]) -> None:
