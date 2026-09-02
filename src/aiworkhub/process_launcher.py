@@ -4736,9 +4736,9 @@ class ProcessManager:
             "timestamp": _utcnow(),
             **event,
         }
-        # Return what the ledger actually wrote: a failure-terminal row gains a
-        # canonical terminal_reason on the way in, so returning ``clean`` gave
-        # the caller an event its own replay would not compare equal to.
+        # Return what the ledger wrote: a failure-terminal row gains a canonical
+        # terminal_reason on the way in, so ``clean`` was an event whose own
+        # replay would not compare equal to it.
         return process_event_ledger.append_event(self.process_log_path, clean)
 
     def _events(self) -> list[dict[str, Any]]:
@@ -9755,9 +9755,8 @@ class ProcessManager:
         """PID identity from the merged request history, never the tail row.
 
         An advisory runtime notice carries ``pid`` without ``pid_start_ticks``,
-        so reading ``events[-1]`` alone downgraded a decidable MISMATCH to
-        UNKNOWN -- and UNKNOWN defers, forever, for any worker quiet enough to
-        have earned a notice.
+        so ``events[-1]`` alone downgraded a decidable MISMATCH to UNKNOWN --
+        and UNKNOWN defers, forever, for any worker quiet enough to earn one.
         """
         merged = self._event_identity(events)
         return _pid_identity_evidence(
@@ -10421,12 +10420,11 @@ class ProcessManager:
         return {"watched": watched, "finalized": finalized}
 
     def reconcile(self, *, include_gc: bool = True) -> dict[str, Any]:
-        """One reconciliation pass; ``include_gc`` controls the housekeeping half.
+        """One pass; ``include_gc`` controls the housekeeping half.
 
-        Finalizing exited workers is correctness and must run on every pass:
-        measured at 0.01 s here. Sweeping retained workspaces is housekeeping
-        and is dominated by re-proving that ~100 pinned rework predecessors are
-        still pinned, ~3 s each, every time. Bundling them made a card's
+        Finalizing exited workers is correctness (0.01 s measured) and runs
+        every pass. The sweep is housekeeping dominated by re-proving ~100
+        pinned rework predecessors at ~3 s each, so bundling them made a card's
         time-to-review hostage to garbage collection.
         """
         result = self._reconcile_persisted_requests()
@@ -10617,9 +10615,8 @@ class ProcessManager:
                 return None
         with self._request_lock(request_id):
             # Re-read under the lock through the SAME projection the prefilter
-            # used. A full _request_events replay per request cost 686 x 3.34 s
+            # used: a full _request_events replay per request cost 686 x 3.34 s
             # -- a 38-minute sweep inside a 30-second loop -- to read one row.
-            # Any ledger change invalidates it, so it stays fresh for free.
             latest = self._latest_by_request().get(request_id)
             if latest is None:
                 return None
@@ -12752,9 +12749,13 @@ class ProcessManager:
                     "state": latest.get("state"),
                     "idempotent_noop": True,
                 }
-            pid = int(latest.get("pid") or 0)
-            ticks = latest.get("pid_start_ticks")
-            identity = _pid_identity_evidence(pid, ticks)
+            # Merged, because this pid also gets SIGTERM: an advisory notice
+            # carries `pid` with no ticks, so the tail row would signal a pid
+            # nothing had verified.
+            merged_identity = self._event_identity(events)
+            pid = int(merged_identity.get("pid") or 0)
+            ticks = merged_identity.get("pid_start_ticks")
+            identity = self._request_pid_identity(events)
             if identity.verdict is PidIdentityVerdict.UNKNOWN:
                 return {
                     "ok": False,
@@ -14379,25 +14380,13 @@ _pid_alive = process_is_alive
 from .process_identity import (  # noqa: E402
     PidIdentityEvidence,
     PidIdentityVerdict,
+    _identity_verified_pid,
     _pid_alive,
     _pid_identity_evidence,
     _pid_matches,
     _pid_start_ticks,
+    _process_proven_dead,
 )
-def _identity_verified_pid(pid: Any, ticks: Any) -> int:
-    """Return ``pid`` only when its creation timestamp still matches.
-
-    Termination requires full identity because a recycled Windows PID could
-    otherwise destroy an unrelated process tree.
-    """
-
-    evidence = _pid_identity_evidence(pid, ticks)
-    return (
-        int(evidence.pid)
-        if evidence.verdict is PidIdentityVerdict.MATCH
-        and evidence.pid is not None
-        else 0
-    )
 
 
 def _canonical_task_status(card: dict[str, Any]) -> str:
@@ -14405,12 +14394,6 @@ def _canonical_task_status(card: dict[str, Any]) -> str:
     if str(card.get("archived_at") or "").strip():
         return "archived"
     return core._lifecycle_state(card)
-
-
-def _process_proven_dead(pid: int, ticks: Any) -> bool:
-    """Fail closed: a live PID with unknown start ticks is not proven dead."""
-    evidence = _pid_identity_evidence(pid, ticks)
-    return evidence.verdict is PidIdentityVerdict.MISMATCH
 
 
 def _process_group_alive(pgid: int) -> bool:

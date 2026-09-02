@@ -7,7 +7,7 @@ from typing import Any, Callable, TypeVar
 
 import pytest
 
-from aiworkhub import process_launcher
+from aiworkhub import process_identity, process_launcher
 
 
 _T = TypeVar("_T")
@@ -94,7 +94,7 @@ def _install_windows_probe(
         times_results=times_results or [],
         set_error=set_last_error,
     )
-    monkeypatch.setattr(process_launcher.os, "name", "nt")
+    monkeypatch.setattr(process_identity.os, "name", "nt")
     monkeypatch.setattr(
         process_launcher.ctypes,
         "WinDLL",
@@ -119,13 +119,13 @@ def _install_windows_probe(
 
 
 def test_verdict_is_exact_tri_state_and_evidence_is_immutable() -> None:
-    assert [item.name for item in process_launcher.PidIdentityVerdict] == [
+    assert [item.name for item in process_identity.PidIdentityVerdict] == [
         "MATCH",
         "MISMATCH",
         "UNKNOWN",
     ]
-    evidence = process_launcher.PidIdentityEvidence(
-        verdict=process_launcher.PidIdentityVerdict.UNKNOWN,
+    evidence = process_identity.PidIdentityEvidence(
+        verdict=process_identity.PidIdentityVerdict.UNKNOWN,
         pid=1,
         expected_start_ticks=2,
         observed_start_ticks=None,
@@ -148,7 +148,7 @@ def test_equal_creation_time_is_match_and_handle_is_closed(
 
     evidence = process_launcher._pid_identity_evidence(44, ticks)
 
-    assert evidence.verdict is process_launcher.PidIdentityVerdict.MATCH
+    assert evidence.verdict is process_identity.PidIdentityVerdict.MATCH
     assert evidence.observed_start_ticks == ticks
     assert evidence.operation == "GetProcessTimes"
     assert evidence.attempts == 1
@@ -168,7 +168,7 @@ def test_unequal_creation_time_is_mismatch(
 
     evidence = process_launcher._pid_identity_evidence(44, 111)
 
-    assert evidence.verdict is process_launcher.PidIdentityVerdict.MISMATCH
+    assert evidence.verdict is process_identity.PidIdentityVerdict.MISMATCH
     assert evidence.observed_start_ticks == 222
     assert evidence.attempts == 1
     assert kernel32.closed_handles == [102]
@@ -179,14 +179,14 @@ def test_explicit_absence_is_mismatch_without_retry(
 ) -> None:
     kernel32, sleeps = _install_windows_probe(
         monkeypatch,
-        open_results=[(0, process_launcher._WINDOWS_ERROR_INVALID_PARAMETER)],
+        open_results=[(0, process_identity._WINDOWS_ERROR_INVALID_PARAMETER)],
     )
 
     evidence = process_launcher._pid_identity_evidence(44, 111)
 
-    assert evidence.verdict is process_launcher.PidIdentityVerdict.MISMATCH
+    assert evidence.verdict is process_identity.PidIdentityVerdict.MISMATCH
     assert evidence.operation == "OpenProcess"
-    assert evidence.winerror == process_launcher._WINDOWS_ERROR_INVALID_PARAMETER
+    assert evidence.winerror == process_identity._WINDOWS_ERROR_INVALID_PARAMETER
     assert evidence.exception == "ProcessAbsent"
     assert evidence.attempts == 1
     assert kernel32.closed_handles == []
@@ -205,14 +205,14 @@ def test_access_denied_resource_and_unclassified_open_errors_are_unknown(
 
     evidence = process_launcher._pid_identity_evidence(44, 111)
 
-    assert evidence.verdict is process_launcher.PidIdentityVerdict.UNKNOWN
+    assert evidence.verdict is process_identity.PidIdentityVerdict.UNKNOWN
     assert evidence.operation == "OpenProcess"
     assert evidence.winerror == winerror
     assert evidence.exception == "OpenProcessFailed"
-    assert evidence.attempts == process_launcher._PID_IDENTITY_MAX_ATTEMPTS
-    assert kernel32.open_calls == process_launcher._PID_IDENTITY_MAX_ATTEMPTS
+    assert evidence.attempts == process_identity._PID_IDENTITY_MAX_ATTEMPTS
+    assert kernel32.open_calls == process_identity._PID_IDENTITY_MAX_ATTEMPTS
     assert kernel32.closed_handles == []
-    assert len(sleeps) == process_launcher._PID_IDENTITY_MAX_ATTEMPTS - 1
+    assert len(sleeps) == process_identity._PID_IDENTITY_MAX_ATTEMPTS - 1
 
 
 def test_get_process_times_failure_is_unknown_and_closes_every_handle(
@@ -226,23 +226,23 @@ def test_get_process_times_failure_is_unknown_and_closes_every_handle(
 
     evidence = process_launcher._pid_identity_evidence(44, 111)
 
-    assert evidence.verdict is process_launcher.PidIdentityVerdict.UNKNOWN
+    assert evidence.verdict is process_identity.PidIdentityVerdict.UNKNOWN
     assert evidence.operation == "GetProcessTimes"
     assert evidence.winerror == 6
     assert evidence.exception == "GetProcessTimesFailed"
-    assert evidence.attempts == process_launcher._PID_IDENTITY_MAX_ATTEMPTS
+    assert evidence.attempts == process_identity._PID_IDENTITY_MAX_ATTEMPTS
     assert kernel32.closed_handles == [103, 103, 103]
-    assert len(sleeps) == process_launcher._PID_IDENTITY_MAX_ATTEMPTS - 1
+    assert len(sleeps) == process_identity._PID_IDENTITY_MAX_ATTEMPTS - 1
 
 
 def test_missing_and_malformed_expected_ticks_are_unknown() -> None:
     missing = process_launcher._pid_identity_evidence(44, None)
     malformed = process_launcher._pid_identity_evidence(44, "not-an-integer")
 
-    assert missing.verdict is process_launcher.PidIdentityVerdict.UNKNOWN
+    assert missing.verdict is process_identity.PidIdentityVerdict.UNKNOWN
     assert missing.operation == "parse_expected_start_ticks"
     assert missing.attempts == 0
-    assert malformed.verdict is process_launcher.PidIdentityVerdict.UNKNOWN
+    assert malformed.verdict is process_identity.PidIdentityVerdict.UNKNOWN
     assert malformed.operation == "parse_expected_start_ticks"
     assert malformed.exception == "ValueError"
 
@@ -259,18 +259,18 @@ def test_transient_open_failure_then_match_uses_bounded_retry(
 
     evidence = process_launcher._pid_identity_evidence(44, ticks)
 
-    assert evidence.verdict is process_launcher.PidIdentityVerdict.MATCH
+    assert evidence.verdict is process_identity.PidIdentityVerdict.MATCH
     assert evidence.attempts == 2
     assert kernel32.open_calls == 2
     assert kernel32.closed_handles == [104]
-    assert sleeps == [process_launcher._PID_IDENTITY_RETRY_DELAY_SECONDS]
+    assert sleeps == [process_identity._PID_IDENTITY_RETRY_DELAY_SECONDS]
 
 
 def test_only_verified_and_proven_dead_helpers_route_through_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def result(verdict: process_launcher.PidIdentityVerdict):
-        return process_launcher.PidIdentityEvidence(
+    def result(verdict: process_identity.PidIdentityVerdict):
+        return process_identity.PidIdentityEvidence(
             verdict=verdict,
             pid=44,
             expected_start_ticks=111,
@@ -280,25 +280,25 @@ def test_only_verified_and_proven_dead_helpers_route_through_evidence(
         )
 
     monkeypatch.setattr(
-        process_launcher,
+        process_identity,
         "_pid_identity_evidence",
-        lambda _pid, _ticks: result(process_launcher.PidIdentityVerdict.MATCH),
+        lambda _pid, _ticks: result(process_identity.PidIdentityVerdict.MATCH),
     )
     assert process_launcher._identity_verified_pid(44, 111) == 44
     assert process_launcher._process_proven_dead(44, 111) is False
 
     monkeypatch.setattr(
-        process_launcher,
+        process_identity,
         "_pid_identity_evidence",
-        lambda _pid, _ticks: result(process_launcher.PidIdentityVerdict.UNKNOWN),
+        lambda _pid, _ticks: result(process_identity.PidIdentityVerdict.UNKNOWN),
     )
     assert process_launcher._identity_verified_pid(44, 111) == 0
     assert process_launcher._process_proven_dead(44, 111) is False
 
     monkeypatch.setattr(
-        process_launcher,
+        process_identity,
         "_pid_identity_evidence",
-        lambda _pid, _ticks: result(process_launcher.PidIdentityVerdict.MISMATCH),
+        lambda _pid, _ticks: result(process_identity.PidIdentityVerdict.MISMATCH),
     )
     assert process_launcher._identity_verified_pid(44, 111) == 0
     assert process_launcher._process_proven_dead(44, 111) is True
@@ -307,12 +307,32 @@ def test_only_verified_and_proven_dead_helpers_route_through_evidence(
 def test_legacy_pid_matches_behavior_is_preserved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(process_launcher, "_pid_alive", lambda _pid: True)
-    monkeypatch.setattr(process_launcher, "_pid_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(process_identity, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(process_identity, "_pid_start_ticks", lambda _pid: 111)
 
     assert process_launcher._pid_matches(44, 111) is True
     assert process_launcher._pid_matches(44, None) is True
     assert process_launcher._pid_matches(44, "malformed") is False
 
-    monkeypatch.setattr(process_launcher, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(process_identity, "_pid_alive", lambda _pid: False)
     assert process_launcher._pid_matches(44, 111) is False
+
+
+def test_the_launcher_re_exports_the_same_objects_identity_lives_in() -> None:
+    """The extraction must be transparent to every existing caller.
+
+    Re-export is not a copy: these must be the SAME objects, or a monkeypatch
+    applied to one module would silently miss the code the other runs -- which
+    is exactly how eight tests broke when the extraction first landed.
+    """
+    for name in (
+        "PidIdentityEvidence",
+        "PidIdentityVerdict",
+        "_identity_verified_pid",
+        "_pid_alive",
+        "_pid_identity_evidence",
+        "_pid_matches",
+        "_pid_start_ticks",
+        "_process_proven_dead",
+    ):
+        assert getattr(process_launcher, name) is getattr(process_identity, name), name

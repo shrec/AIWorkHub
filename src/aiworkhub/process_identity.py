@@ -310,3 +310,25 @@ def _pid_identity_evidence(pid: Any, expected_start_ticks: Any) -> PidIdentityEv
         attempts=1,
         operation="_pid_start_ticks",
     )
+
+
+def _identity_verified_pid(pid: Any, ticks: Any) -> int:
+    """Return ``pid`` only when its creation timestamp still matches.
+
+    Termination requires full identity because a recycled Windows PID could
+    otherwise destroy an unrelated process tree.
+    """
+
+    evidence = _pid_identity_evidence(pid, ticks)
+    return (
+        int(evidence.pid)
+        if evidence.verdict is PidIdentityVerdict.MATCH
+        and evidence.pid is not None
+        else 0
+    )
+
+
+def _process_proven_dead(pid: int, ticks: Any) -> bool:
+    """Fail closed: a live PID with unknown start ticks is not proven dead."""
+    evidence = _pid_identity_evidence(pid, ticks)
+    return evidence.verdict is PidIdentityVerdict.MISMATCH

@@ -2,11 +2,11 @@ from pathlib import Path
 
 
 # Literal descending ratchet: future decomposition work may lower, never raise it.
-# 14675 -> 14427 when exact process identity (PID reuse refusal) moved out of
+# 14675 -> 14422 when exact process identity (PID reuse refusal) moved out of
 # process_launcher into its own module. The ratchet is what forced it: the
 # module had been sitting exactly ON its own ceiling, so every fix that needed
 # a line of explanation had to either shed one elsewhere or take a subject out.
-MAX_AIWORKHUB_MODULE_LINES = 14427
+MAX_AIWORKHUB_MODULE_LINES = 14422
 
 
 def test_aiworkhub_python_modules_stay_below_size_ratchet():
