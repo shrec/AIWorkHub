@@ -27,6 +27,34 @@ def changelog_versions(root: Path) -> set[str]:
     return set(re.findall(r"^## \[([^]]+)\]", text, re.MULTILINE))
 
 
+# Release-gating documents the extension's own static test asserts, and this
+# check did not. v0.10.78 was tagged with `check` reporting ok and CI then
+# failed extension-static.test.js on all four platforms, twice over: the
+# extension README had no "What's new in <version>" heading and the extension
+# CHANGELOG had no "## <version> —" section. A local gate that passes while the
+# release gate fails is worse than no local gate, because it is trusted.
+NARRATIVE_PROJECTIONS: tuple[tuple[str, str], ...] = (
+    ("vscode-extension/README.md", "What's new in {version}"),
+    ("vscode-extension/CHANGELOG.md", "## {version} \u2014"),
+)
+
+
+def narrative_mismatches(root: Path, version: str) -> dict[str, str]:
+    """Report every release document that does not yet name this version."""
+    missing: dict[str, str] = {}
+    for relative, template in NARRATIVE_PROJECTIONS:
+        needle = template.format(version=version)
+        path = root / relative
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            missing[relative] = f"unreadable: {relative}"
+            continue
+        if needle not in text:
+            missing[relative] = f"missing {needle!r}"
+    return missing
+
+
 def canonical_version(root: Path) -> str:
     source = (root / "src" / "aiworkhub" / "_version.py").read_text(encoding="utf-8")
     match = VERSION_LITERAL.search(source)
@@ -64,6 +92,7 @@ def check(root: Path, *, tag: str = "") -> dict[str, object]:
         mismatches["release-tag"] = normalized_tag
     if canonical not in changelog_versions(root):
         mismatches["CHANGELOG.md"] = f"missing [{canonical}] section"
+    mismatches.update(narrative_mismatches(root, canonical))
     return {
         "ok": not mismatches,
         "canonical_source": "src/aiworkhub/_version.py",

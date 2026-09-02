@@ -28,6 +28,7 @@ from aiworkhub import (  # noqa: E402
     task_store,
     task_templates,
     worker_ai_tools_mcp,
+    worker_workspace,
 )
 
 
@@ -10297,6 +10298,16 @@ def test_worker_launch_env_exposes_canonical_validation_affordances(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     _fake_canonical_venv(repo)
+    # worker_validation_affordance_env swallows every verification failure by
+    # design -- a missing or untrusted tool is simply not advertised, never a
+    # launch failure. That makes this test mute: it reported KeyError and never
+    # why. Verify first, so a host where the interpreter is refused says which
+    # guard refused it. CI failed here for a day saying only KeyError.
+    worker_workspace._verify_validation_interpreter(
+        repo / ".venv" / "bin" / "python",
+        repo,
+        authenticated_external_endpoint=Path(sys.executable).resolve(strict=True),
+    )
     env = process_launcher.worker_launch_env(
         "claude_cli", repo=repo, request_id="req-affordance"
     )

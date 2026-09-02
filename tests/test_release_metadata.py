@@ -43,6 +43,16 @@ def _fixture(root: Path, *, canonical: str = "1.2.3", projected: str = "0.0.1") 
         f"# Changelog\n\n## [{canonical}] - 2026-01-01\n",
         encoding="utf-8",
     )
+    # The release documents the extension's own static test gates on. `sync`
+    # propagates version LITERALS; this prose is written deliberately, so a
+    # releasable fixture already names the canonical version here.
+    (root / "vscode-extension" / "README.md").write_text(
+        f"# AIWorkHub\n\n## What's new in {canonical} \u2014 2026-01-01\n",
+        encoding="utf-8",
+    )
+    (root / "vscode-extension" / "CHANGELOG.md").write_text(
+        f"# Changelog\n\n## {canonical} \u2014 2026-01-01\n", encoding="utf-8"
+    )
 
 
 def test_live_release_metadata_projections_match_canonical_version() -> None:
@@ -132,3 +142,38 @@ def test_ci_and_release_enforce_metadata_reproducibility_and_checksums() -> None
     assert "python -m twine check dist/*" in release
     assert "Verify reproducible VSIX bytes" in release
     assert "release-assets/SHA256SUMS" in release
+
+
+def test_check_covers_the_documents_the_extension_test_gates_on(tmp_path):
+    """A local gate that passes while the release gate fails is worse than none.
+
+    v0.10.78 was tagged with release_metadata check reporting ok, and CI then
+    failed extension-static.test.js on all four platforms -- twice, once for the
+    extension README's missing "What's new in <version>" heading and once for
+    the extension CHANGELOG's missing "## <version> —" section. Neither was in
+    the check, so the one instrument whose job is to make a release safe said it
+    was.
+    """
+    root = Path(__file__).resolve().parents[1]
+    version = release_metadata.canonical_version(root)
+
+    assert release_metadata.narrative_mismatches(root, version) == {}
+
+    unreleased = "99.99.99"
+    gaps = release_metadata.narrative_mismatches(root, unreleased)
+    assert set(gaps) == {
+        "vscode-extension/README.md",
+        "vscode-extension/CHANGELOG.md",
+    }
+    for relative, _template in release_metadata.NARRATIVE_PROJECTIONS:
+        assert relative in gaps
+
+
+def test_an_unreadable_release_document_is_a_mismatch_not_a_pass(tmp_path):
+    """Fail closed: a document that cannot be read has not named the version."""
+    gaps = release_metadata.narrative_mismatches(tmp_path, "1.2.3")
+    assert set(gaps) == {
+        "vscode-extension/README.md",
+        "vscode-extension/CHANGELOG.md",
+    }
+    assert all("unreadable" in reason for reason in gaps.values())

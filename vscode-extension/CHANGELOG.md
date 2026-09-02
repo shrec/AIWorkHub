@@ -1,5 +1,47 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.78 — 2026-09-02
+
+### Fixed
+
+- The task loop closes by itself. A worker that went quiet could never be
+  finalized: the launcher appends an advisory notice after ten minutes without
+  output, that row carries a pid but no start ticks, and both finalizers read
+  identity from the last row -- so identity became UNKNOWN, and UNKNOWN defers.
+  The longer a worker worked quietly, the more permanent its deferral.
+  Cancellation had the same defect, where the tail row's pid was about to
+  receive SIGTERM.
+- The reconciler reports whether it is running. Its health lived in one
+  process's memory behind a silent exception handler, so a reconciler that
+  never started and one working normally were indistinguishable from every
+  surface a manager can reach.
+- Provider spend is recorded for work that SUCCEEDED. Usage recording required
+  the card to still be processing while the finalizer moves a successful worker
+  to review first, so every success was measured and discarded and the ledger
+  accumulated failures only.
+- The review orchestrator retires actions whose target card is already decided
+  instead of failing them; a failed action parks every later action in its
+  chain.
+
+### Added
+
+- Repository invariants that had only ever been prose now execute as a quality
+  gate, and card templates derive the gates a package change trips instead of
+  asking an author to recall them.
+- A durable skill registry store: immutable (identity, version), a content
+  digest that can never be rebound, and a state digest over the runtime fields
+  the content digest deliberately excludes.
+- Accept and reject name the lesson the decision owes, with the arguments the
+  commit tool requires.
+
+### Performance
+
+- Retained-workspace GC no longer replays a 558 MB ledger once per candidate to
+  read a single row: 38.2 minutes to 13.5 seconds, and finalization runs on its
+  own cadence so a finished card does not wait on garbage collection.
+- The 90-day git walk left the Source Graph index write transaction, where it
+  had held the writer lock for 93.8 percent of a build.
+
 ## 0.10.77 — 2026-09-01
 
 ### Added

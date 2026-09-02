@@ -12,6 +12,30 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.78 — 2026-09-02
+
+- The task loop closes by itself: a card goes from worker to accepted without a
+  human driving each step. A worker that went quiet could never be finalized,
+  because the advisory notice appended after ten minutes without output carries
+  a pid but no start ticks, and both finalizers read identity from the last
+  row. Cancellation had the same defect, where that pid was about to receive
+  SIGTERM.
+- The reconciler can say whether it is running. Its health lived in one
+  process's memory behind a silent exception handler, so a reconciler that
+  never started and one working normally looked identical from every surface.
+- Provider spend is recorded for work that SUCCEEDED. Usage recording required
+  the card to still be processing, but the finalizer moves a successful worker
+  to review first, so every success was measured and discarded and the ledger
+  held only failures.
+- The review orchestrator retires actions for cards that are already decided
+  instead of failing them and parking every later action in the same chain.
+- Repository invariants that had only ever been prose now execute as a gate,
+  and card templates derive the gates a package change trips instead of asking
+  an author to recall them.
+- Skills have somewhere to live: a durable registry store with immutable
+  (identity, version), a content digest that cannot be rebound, and a state
+  digest over the runtime fields the content digest excludes.
+
 ## What's new in 0.10.77 — 2026-09-01
 
 - No terminal failure is mute: ledger records persist a bounded fixed-key
