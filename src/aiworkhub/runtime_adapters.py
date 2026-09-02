@@ -680,6 +680,61 @@ def _resolve_additional_readonly_dirs(
     return resolved, None
 
 
+_WORKER = "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_"
+
+# Tools any worker may hold, whatever its role.
+CLAUDE_READ_TOOLS: tuple[str, ...] = (
+    "Read",
+    "Bash",
+    f"{_WORKER}source_graph_query",
+    f"{_WORKER}session_current_state",
+    f"{_WORKER}ai_memory_search",
+    f"{_WORKER}ai_memory_get",
+    f"{_WORKER}ai_memory_related",
+    f"{_WORKER}kb_search",
+    f"{_WORKER}kb_get",
+    f"{_WORKER}kb_related",
+)
+
+# Tools that change something. A read-only reviewer must not be handed one:
+# its card says read_only with an empty allowed_writes and repository_write
+# forbidden, and the sandbox enforces that -- so offering Write, Edit and
+# semantic_edit_apply could only ever produce a denial. Measured on reviewer
+# request 5415654189de: seven write tools offered, zero used, and the
+# candidate-review turn budget spent partly on being refused.
+CLAUDE_WRITE_TOOLS: tuple[str, ...] = (
+    "Write",
+    "Edit",
+    f"{_WORKER}semantic_edit_prepare",
+    f"{_WORKER}semantic_edit_apply",
+    f"{_WORKER}session_write_intent",
+    f"{_WORKER}ai_memory_write_intent",
+    f"{_WORKER}kb_write_intent",
+)
+
+# The reviewer's own submission channel. A build worker has nothing to submit
+# through it, and holding it invites a worker to file a review of itself.
+CLAUDE_REVIEW_TOOLS: tuple[str, ...] = (
+    f"{_WORKER}quality_review_packet_read",
+    f"{_WORKER}quality_review_submit",
+)
+
+
+def claude_allowed_tools(*, read_only: bool) -> tuple[str, ...]:
+    """Tools this role can actually use -- never the union of every role.
+
+    Every worker used to receive one flat list: a strictly read-only reviewer
+    got Write, Edit and semantic_edit_apply, and a build worker got the
+    reviewer's submit channel. Each tool's schema is prompt text the model
+    pays for on every turn, and a tool the sandbox will refuse is worse than
+    absent -- it is an invitation to spend a turn discovering that.
+    """
+
+    if read_only:
+        return (*CLAUDE_READ_TOOLS, *CLAUDE_REVIEW_TOOLS)
+    return (*CLAUDE_READ_TOOLS, *CLAUDE_WRITE_TOOLS)
+
+
 def build_runtime_command(
     adapter_id: str,
     prompt: str,
@@ -690,6 +745,7 @@ def build_runtime_command(
     outer_sandbox_backend: str | None = None,
     additional_readonly_dirs: Sequence[PathValue] | None = None,
     include_partial_messages: bool = False,
+    read_only: bool = False,
 ) -> RuntimeAdapterPlan:
     """Build a validated argv/cwd plan for one supported adapter.
 
@@ -779,24 +835,7 @@ def build_runtime_command(
             "--permission-mode",
             "dontAsk",
             "--allowedTools",
-            "Read",
-            "Write",
-            "Edit",
-            "Bash",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_source_graph_query",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_semantic_edit_prepare",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_semantic_edit_apply",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_session_current_state",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_search",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_get",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_related",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_search",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_get",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_related",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_session_write_intent",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_write_intent",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_write_intent",
-            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_quality_review_submit",
+            *claude_allowed_tools(read_only=read_only),
             "--no-session-persistence",
             "--disallowedTools",
             *CLAUDE_RAW_DISCOVERY_DENIES,
@@ -970,6 +1009,7 @@ def build_adapter_command(
     outer_sandbox_backend: str | None = None,
     additional_readonly_dirs: Sequence[PathValue] | None = None,
     include_partial_messages: bool = False,
+    read_only: bool = False,
 ) -> RuntimeAdapterPlan:
     """Compatibility name for callers that describe commands by adapter."""
 
@@ -982,6 +1022,7 @@ def build_adapter_command(
         outer_sandbox_backend=outer_sandbox_backend,
         additional_readonly_dirs=additional_readonly_dirs,
         include_partial_messages=include_partial_messages,
+        read_only=read_only,
     )
 
 

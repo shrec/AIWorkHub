@@ -8360,6 +8360,10 @@ class ProcessManager:
                         outer_sandbox_backend=sandbox_backend,
                         additional_readonly_dirs=external_readonly_dirs,
                         include_partial_messages=include_partial_messages,
+                        # A read-only card gets a read-only toolset. The
+                        # sandbox already refuses the writes; withholding the
+                        # tools stops a reviewer spending a turn finding out.
+                        read_only=bool(card.get("read_only")),
                     )
                 if not getattr(plan, "launchable", False):
                     reason = getattr(plan, "reason", "adapter_not_launchable")

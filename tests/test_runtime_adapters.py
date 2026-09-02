@@ -59,24 +59,7 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
         "--permission-mode",
         "dontAsk",
         "--allowedTools",
-        "Read",
-        "Write",
-        "Edit",
-        "Bash",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_source_graph_query",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_semantic_edit_prepare",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_semantic_edit_apply",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_session_current_state",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_search",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_get",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_related",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_search",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_get",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_related",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_session_write_intent",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_write_intent",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_write_intent",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_quality_review_submit",
+        *runtime_adapters.claude_allowed_tools(read_only=False),
         "--no-session-persistence",
         "--disallowedTools",
         *runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES,
@@ -130,28 +113,37 @@ def test_claude_omits_model_when_not_requested(monkeypatch, tmp_path):
         "--permission-mode",
         "dontAsk",
         "--allowedTools",
-        "Read",
-        "Write",
-        "Edit",
-        "Bash",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_source_graph_query",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_semantic_edit_prepare",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_semantic_edit_apply",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_session_current_state",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_search",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_get",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_related",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_search",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_get",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_related",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_session_write_intent",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_write_intent",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_write_intent",
-        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_quality_review_submit",
+        *runtime_adapters.claude_allowed_tools(read_only=False),
         "--no-session-persistence",
         "--disallowedTools",
         *runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES,
     ]
+
+
+def test_a_read_only_role_gets_a_read_only_argv(monkeypatch, tmp_path):
+    """The same builder, the other role.
+
+    The literal these tests used to pin was one flat list for every worker, so
+    a card marked read_only still received Write, Edit, semantic_edit_apply and
+    three write-intent tools. Pinning the role's own set keeps that from being
+    re-frozen by the next person who updates the literal.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, "claude")
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: str(executable))
+
+    plan = runtime_adapters.build_runtime_command(
+        "claude_cli", "Prompt", repo, read_only=True
+    )
+
+    allowed = plan.argv[plan.argv.index("--allowedTools") + 1:]
+    allowed = allowed[: allowed.index("--no-session-persistence")]
+    assert tuple(allowed) == runtime_adapters.claude_allowed_tools(read_only=True)
+    assert "Write" not in allowed
+    assert "Edit" not in allowed
+    assert not any("write_intent" in tool for tool in allowed)
+    assert not any("semantic_edit" in tool for tool in allowed)
 
 
 def test_claude_raw_discovery_is_provider_denied(monkeypatch, tmp_path):
