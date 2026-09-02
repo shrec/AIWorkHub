@@ -2652,25 +2652,56 @@ def bodygrep_query(
     matches: list[dict[str, Any]] = []
     files_scanned = 0
     bytes_scanned = 0
+    # Files skipped because a single one exceeds the whole byte cap. Reported
+    # rather than silently dropped: a caller must be able to tell "not present"
+    # from "not looked at".
+    oversized_skipped: list[str] = []
     last_scanned_file: str | None = None
     next_cursor: str | None = None
     for file_path in paths:
         candidate = (repo_root / file_path).resolve()
         if not candidate.is_relative_to(repo_root):
             continue
+        # Decide on SIZE before paying for the read. Reading first meant an
+        # 8.68 MB data artifact was fully loaded only to be rejected, and the
+        # walk is ORDER BY file_path, so data/ is reached before src/.
         try:
-            raw = candidate.read_bytes()
+            file_size = candidate.stat().st_size
         except OSError:
             continue
-        # Always scan at least one file per page, even one larger than the byte
-        # cap, so a cursor can still advance past it -- otherwise a single
-        # oversized file would trap the scan on the same offset forever.
-        if files_scanned > 0 and bytes_scanned + len(raw) > scan_byte_cap:
+        if file_size > scan_byte_cap:
+            # A file larger than the ENTIRE byte cap can never fit on any page,
+            # at any position, so neither scanning it nor stopping on it can
+            # help: one discards the page's whole budget, the other discards the
+            # rest of the repository. It is skipped and named instead.
+            #
+            # The walk is ORDER BY file_path, so data/ is reached before src/.
+            # Measured before this fix: bodygrep for "looprisks" -- present in
+            # three files -- returned 0 matches at budget 20 unscoped, having
+            # stopped 37 files in, because one 8.68 MB artifact under data/
+            # exhausted the 5.24 MB budget alone. The same term returned 15
+            # matches at budget 64 and 7 with target=src. A literal that exists
+            # must never come back as a confident zero (NF-2026-00567).
+            #
+            # Skipping keeps the "always make progress" property the previous
+            # scan-at-least-one rule was reaching for: the walk continues past
+            # this file rather than ending on it, so a cursor still advances.
+            oversized_skipped.append(file_path)
+            scan_truncated = True
+            continue
+        # A file that would merely overflow the REMAINING budget is ordinary
+        # paging: mint a cursor and let the caller continue from it. At least
+        # one in-budget file is always scanned per page, so the cursor moves.
+        if files_scanned > 0 and bytes_scanned + file_size > scan_byte_cap:
             scan_truncated = True
             next_cursor = _encode_bodygrep_cursor(
                 file_path, 0, term=term, target=normalized_target, budget=budget,
             )
             break
+        try:
+            raw = candidate.read_bytes()
+        except OSError:
+            continue
         bytes_scanned += len(raw)
         files_scanned += 1
         last_scanned_file = file_path
@@ -2744,6 +2775,10 @@ def bodygrep_query(
         "scan_file_cap": scan_file_cap,
         "scan_byte_cap": scan_byte_cap,
         "scan_truncated": scan_truncated,
+        # Named, not silent: a caller can tell "the literal is not there"
+        # from "these files were never opened".
+        "oversized_files_skipped": len(oversized_skipped),
+        "oversized_files": oversized_skipped[:8],
         "target": normalized_target or None,
         "cursor": cursor,
         "next_cursor": next_cursor,

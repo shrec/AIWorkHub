@@ -3812,20 +3812,32 @@ def test_bodygrep_invalid_utf8_file_is_skipped_but_counted(tmp_path):
 
 
 def test_bodygrep_oversized_file_cursor_advances_forward(tmp_path):
-    """A file larger than the byte cap must still let the cursor move on."""
+    """A file larger than the byte cap must never trap the scan behind it.
+
+    The property is unchanged; the mechanism got stronger. A file bigger than
+    the whole byte cap used to be scanned anyway -- spending the page's entire
+    budget on bytes that could not fit -- so the page returned nothing and the
+    caller needed a second request to reach the file after it. Since
+    NF-2026-00567 such a file is skipped and named instead, so the walk gets
+    past it within the same page and the hit behind it is found immediately.
+
+    That mattered on this repository: the walk is ORDER BY file_path, an 8.68 MB
+    artifact sits under data/, and a literal present in three files under src/
+    came back as a confident zero at budget 20.
+    """
     repo = _new_repo(tmp_path, "bodygrep_oversized_cursor")
     (repo / "000-oversized.md").write_text("x" * (1024 * 1024 + 128), encoding="utf-8")
     _write(repo / "001-hit.md", "the needle is here\n")
     sg.build_index(repo, incremental=False)
 
     first = sg.bodygrep_query(repo, "needle", budget=2)
-    assert first["files_scanned"] == 1
+    # The oversized file is reported rather than silently dropped, so a caller
+    # can tell "not present" from "never opened".
     assert first["scan_truncated"] is True
-    assert first["matches"] == []
-    assert first["next_cursor"]
-
-    second = sg.bodygrep_query(repo, "needle", budget=2, cursor=first["next_cursor"])
-    assert [m["file_path"] for m in second["matches"]] == ["001-hit.md"]
+    assert first["oversized_files_skipped"] == 1
+    assert first["oversized_files"] == ["000-oversized.md"]
+    # And the file behind it is reached on this same page.
+    assert [m["file_path"] for m in first["matches"]] == ["001-hit.md"]
 
 
 def test_bodygrep_cursor_rejects_unicode_digit_line_fields(tmp_path):
