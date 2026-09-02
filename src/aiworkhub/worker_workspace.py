@@ -33,6 +33,7 @@ import threading
 import time
 import types
 import uuid
+from collections import OrderedDict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -295,11 +296,24 @@ DEFAULT_FINALIZATION_GIT_TIMEOUT_SECONDS = 5.0
 MIN_FINALIZATION_GIT_TIMEOUT_SECONDS = 0.25
 MAX_FINALIZATION_GIT_TIMEOUT_SECONDS = 120.0
 _FINALIZATION_PROBE_CACHE_SECONDS = 300.0
+# Both probe caches are keyed by ``_finalization_probe_key`` whose third
+# component is the git HEAD OID, so inside a long-lived MCP server each new
+# commit would otherwise add one permanent entry (the freshness window alone was
+# consulted only on read and never evicted a stale key).  Each cache therefore
+# carries an explicit max-entry bound enforced oldest-first on every insert --
+# the same bounded-cache shape as
+# ``process_event_ledger._LATEST_EVENT_CACHE`` /
+# ``_LATEST_EVENT_CACHE_MAX_ENTRIES`` -- and entries past the freshness window
+# are purged at write time rather than merely ignored on read.
+_FINALIZATION_PROBE_CACHE_MAX_ENTRIES = 32
+_FINALIZATION_PROBE_FAILURES_MAX_ENTRIES = 32
 _FINALIZATION_PROBE_LOCK = threading.Lock()
-_FINALIZATION_PROBE_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
-_FINALIZATION_PROBE_FAILURES: dict[
+_FINALIZATION_PROBE_CACHE: OrderedDict[
     tuple[str, str, str], tuple[float, dict[str, Any]]
-] = {}
+] = OrderedDict()
+_FINALIZATION_PROBE_FAILURES: OrderedDict[
+    tuple[str, str, str], tuple[float, dict[str, Any]]
+] = OrderedDict()
 _FINALIZATION_PROBE_ACTIVE: dict[
     tuple[str, str, str], tuple[float, threading.Thread]
 ] = {}
@@ -3810,6 +3824,37 @@ def _finalization_probe_key(repo: Path, adapter_id: str) -> tuple[str, str, str]
     return str(repo), str(adapter_id), head_oid
 
 
+def _bounded_probe_cache_insert(
+    cache: OrderedDict[tuple[str, str, str], tuple[float, dict[str, Any]]],
+    key: tuple[str, str, str],
+    value: dict[str, Any],
+    *,
+    now: float,
+    window_seconds: float,
+    max_entries: int,
+) -> None:
+    """Insert one probe entry with a freshness purge and a hard size bound.
+
+    The single write path for both finalization probe caches.  The caller MUST
+    already hold ``_FINALIZATION_PROBE_LOCK``.  Mirrors the bounded-cache shape
+    of ``process_event_ledger._cache_projection``: entries older than the
+    freshness window are dropped at write time (not merely ignored on read), the
+    new entry is appended as most-recent, and the oldest survivors are evicted
+    until the explicit per-cache ``max_entries`` bound holds.
+    """
+    stale = [
+        entry_key
+        for entry_key, (inserted, _payload) in cache.items()
+        if now - inserted > window_seconds
+    ]
+    for entry_key in stale:
+        cache.pop(entry_key, None)
+    cache[key] = (now, value)
+    cache.move_to_end(key)
+    while len(cache) > max_entries:
+        cache.popitem(last=False)
+
+
 def finalization_preflight_probe(
     repo: Path,
     adapter_id: str,
@@ -3902,7 +3947,14 @@ def finalization_preflight_probe(
     }
     if result.get("ok") is True and head_oid != "unresolved":
         with _FINALIZATION_PROBE_LOCK:
-            _FINALIZATION_PROBE_CACHE[key] = (time.monotonic(), dict(result))
+            _bounded_probe_cache_insert(
+                _FINALIZATION_PROBE_CACHE,
+                key,
+                dict(result),
+                now=time.monotonic(),
+                window_seconds=cache_seconds,
+                max_entries=_FINALIZATION_PROBE_CACHE_MAX_ENTRIES,
+            )
     return result
 
 
@@ -3952,15 +4004,23 @@ def finalization_preflight_probe_nonblocking(
             with _FINALIZATION_PROBE_LOCK:
                 _FINALIZATION_PROBE_ACTIVE.pop(key, None)
                 if result.get("ok") is True and key[2] != "unresolved":
-                    _FINALIZATION_PROBE_CACHE[key] = (
-                        time.monotonic(),
+                    _bounded_probe_cache_insert(
+                        _FINALIZATION_PROBE_CACHE,
+                        key,
                         dict(result),
+                        now=time.monotonic(),
+                        window_seconds=cache_seconds,
+                        max_entries=_FINALIZATION_PROBE_CACHE_MAX_ENTRIES,
                     )
                     _FINALIZATION_PROBE_FAILURES.pop(key, None)
                 else:
-                    _FINALIZATION_PROBE_FAILURES[key] = (
-                        time.monotonic(),
+                    _bounded_probe_cache_insert(
+                        _FINALIZATION_PROBE_FAILURES,
+                        key,
                         dict(result),
+                        now=time.monotonic(),
+                        window_seconds=failure_cache_seconds,
+                        max_entries=_FINALIZATION_PROBE_FAILURES_MAX_ENTRIES,
                     )
 
         thread = threading.Thread(

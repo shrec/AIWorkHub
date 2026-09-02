@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -266,7 +267,7 @@ class ReviewOrchestrator:
 
     def _repair_expected_workspace(self, chain_id: int, workspace_identity: str) -> None:
         """Bind a later verified workspace only while the retained binding is empty."""
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS review_orchestrator_workspace_bindings "
                 "(chain_id INTEGER PRIMARY KEY, workspace_identity TEXT NOT NULL)"
@@ -284,7 +285,7 @@ class ReviewOrchestrator:
                 )
 
     def _expected_workspace_identity(self, chain_id: int) -> str:
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn:
             row = conn.execute(
                 "SELECT workspace_identity FROM review_orchestrator_workspace_bindings "
                 "WHERE chain_id=?",

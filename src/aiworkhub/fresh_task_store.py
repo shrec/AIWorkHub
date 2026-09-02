@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import tempfile
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -216,7 +217,7 @@ def sqlite_online_backup(source: Path, destination: Path) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent))
     os.close(fd)
     try:
-        with _connect(source, readonly=True) as src, _connect(Path(tmp_name)) as dst:
+        with closing(_connect(source, readonly=True)) as src, closing(_connect(Path(tmp_name))) as dst:
             src.backup(dst, pages=128)
             dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             dst.commit()
@@ -229,13 +230,13 @@ def sqlite_online_backup(source: Path, destination: Path) -> None:
 
 
 def quick_check(path: Path) -> str:
-    with _connect(path, readonly=True) as conn:
+    with closing(_connect(path, readonly=True)) as conn:
         row = conn.execute("PRAGMA quick_check").fetchone()
     return str(row[0] if row else "")
 
 
 def schema_fingerprint(path: Path) -> str:
-    with _connect(path, readonly=True) as conn:
+    with closing(_connect(path, readonly=True)) as conn:
         rows = [
             dict(row)
             for row in conn.execute(
@@ -254,7 +255,7 @@ def schema_fingerprint(path: Path) -> str:
 
 def table_counts(path: Path) -> dict[str, int]:
     """Logical inventory used to prove that an online archive matches source."""
-    with _connect(path, readonly=True) as conn:
+    with closing(_connect(path, readonly=True)) as conn:
         names = [
             str(row[0])
             for row in conn.execute(
@@ -273,7 +274,7 @@ def _table_count(conn: sqlite3.Connection, table: str) -> int:
 
 
 def empty_counts(path: Path) -> dict[str, int]:
-    with _connect(path, readonly=True) as conn:
+    with closing(_connect(path, readonly=True)) as conn:
         return {table: _table_count(conn, table) for table in EMPTY_TABLES}
 
 
@@ -342,7 +343,7 @@ def preflight(repo_root: str | Path, *, legacy_db: str | Path | None = None) -> 
     paths = resolve_paths(repo_root, legacy_db=legacy_db)
     if not paths.legacy_db.is_file():
         raise FreshTaskStoreError(f"legacy_db_missing:{paths.legacy_db}")
-    with _connect(paths.legacy_db, readonly=True) as conn:
+    with closing(_connect(paths.legacy_db, readonly=True)) as conn:
         active_blockers = _active_blockers(conn)
         inflight_leases = _inflight_callback_leases(conn)
     refused = bool(active_blockers or inflight_leases["callback_outbox"] or inflight_leases["callback_batches"])
@@ -377,7 +378,7 @@ def _create_fresh_empty_db(destination: Path) -> None:
     os.close(fd)
     tmp = Path(tmp_name)
     try:
-        with _connect(tmp) as conn:
+        with closing(_connect(tmp)) as conn:
             conn.executescript(_FRESH_SCHEMA)
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.commit()

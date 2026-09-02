@@ -17,6 +17,7 @@ import tempfile
 import textwrap
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -113,6 +114,38 @@ def test_non_blocking_lock_makes_exactly_one_attempt(monkeypatch):
         finally:
             os.close(fd)
     assert calls == [msvcrt.LK_NBLCK]
+
+
+def test_blocking_lock_timeout_names_the_errno_that_ended_the_wait(
+    tmp_path, monkeypatch
+):
+    """A permission-shaped EACCES retried to the deadline must yield a timeout
+    that both exposes ``.errno`` and names it symbolically -- so the launcher's
+    ``except AdvisoryLockTimeout`` recovery, the operator and the audit ledger
+    can read "not permitted" instead of blindly "someone else holds the lock".
+
+    Uses a fake ``msvcrt`` so the Windows lock path is exercised on any host."""
+
+    def contended(fd, mode, nbytes):
+        raise OSError(errno.EACCES, "permission denied on the lock byte")
+
+    fake_msvcrt = SimpleNamespace(
+        LK_LOCK=1, LK_NBLCK=2, LK_UNLCK=3, locking=contended
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(platform_io.os, "name", "nt")
+    monkeypatch.setattr(platform_io, "ADVISORY_LOCK_MAX_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(platform_io.time, "monotonic", lambda: 10.0)
+
+    fd = os.open(tmp_path / "named.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(platform_io.AdvisoryLockTimeout) as excinfo:
+            platform_io.lock_fd(fd, blocking=True)
+    finally:
+        os.close(fd)
+
+    assert excinfo.value.errno == errno.EACCES
+    assert "EACCES" in str(excinfo.value)
 
 
 def test_blocking_lock_waits_for_a_real_cross_process_holder(tmp_path):

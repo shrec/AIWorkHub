@@ -831,7 +831,46 @@ _POSIX_LOCK_CONTENDED_ERRNOS = frozenset({errno.EAGAIN, errno.EWOULDBLOCK})
 
 
 class AdvisoryLockTimeout(TimeoutError):
-    """A recognized advisory-lock conflict outlived its bounded wait."""
+    """A recognized advisory-lock conflict outlived its bounded wait.
+
+    The last errno observed while polling is carried on :attr:`errno` -- a
+    structured attribute a caller reads without parsing prose -- and named
+    symbolically in the message. ``EACCES`` and the deadlock errno are merged
+    in the Windows contended set on purpose: the errno alone cannot decide a
+    permission failure from real contention, so the honest outcome is to report
+    *which* errno timed out rather than guess. ``errno`` is ``None`` only when
+    no contended attempt was ever recorded.
+    """
+
+    def __init__(self, message: str, *, errno: int | None = None) -> None:
+        super().__init__(message)
+        self.errno = errno
+
+
+def _advisory_lock_errno_symbol(observed_errno: int | None) -> str:
+    """Return the symbolic spelling of an errno for a timeout message."""
+
+    if observed_errno is None:
+        return "unknown"
+    return errno.errorcode.get(observed_errno, str(observed_errno))
+
+
+def _advisory_lock_timeout(
+    platform_label: str, observed_errno: int | None
+) -> AdvisoryLockTimeout:
+    """Build the one shared timeout shape for both platform lock paths.
+
+    Both the POSIX and Windows paths raise through here, so they expose the same
+    ``errno`` attribute and the same message shape; a Windows-only diagnostic
+    would recreate the asymmetry NF-2026-00350 just closed.
+    """
+
+    return AdvisoryLockTimeout(
+        f"{platform_label}_advisory_lock_timeout after "
+        f"{ADVISORY_LOCK_MAX_WAIT_SECONDS:g}s "
+        f"(last errno {_advisory_lock_errno_symbol(observed_errno)})",
+        errno=observed_errno,
+    )
 
 
 def windows_pid_is_alive(pid: int) -> bool:
@@ -957,6 +996,10 @@ def lock_fd(fd: int, *, blocking: bool) -> None:
         # process holding another handle, which no amount of waiting can
         # clear. Waiting forever there would hang the caller outright.
         deadline = time.monotonic() + ADVISORY_LOCK_MAX_WAIT_SECONDS
+        # Track the LAST contended errno so the timeout can report whether the
+        # wait ended on the deadlock spelling or a permission-shaped EACCES --
+        # both are retried, but the outcome must say which one it was.
+        last_errno: int | None = None
         while True:
             try:
                 windows_locking.locking(fd, windows_locking.LK_NBLCK, 1)
@@ -964,11 +1007,9 @@ def lock_fd(fd: int, *, blocking: bool) -> None:
             except OSError as exc:
                 if exc.errno not in _WINDOWS_LOCK_CONTENDED_ERRNOS:
                     raise
+                last_errno = exc.errno
                 if time.monotonic() >= deadline:
-                    raise AdvisoryLockTimeout(
-                        "windows_advisory_lock_timeout after "
-                        f"{ADVISORY_LOCK_MAX_WAIT_SECONDS:g}s"
-                    ) from exc
+                    raise _advisory_lock_timeout("windows", last_errno) from exc
                 time.sleep(ADVISORY_LOCK_POLL_SECONDS)
                 # locking() leaves the file pointer where it found it, but a
                 # failed attempt must still start from the same lock byte.
@@ -987,6 +1028,8 @@ def lock_fd(fd: int, *, blocking: bool) -> None:
     # ``AdvisoryLockTimeout`` -- the same recognized signal the Windows branch
     # raises and the launcher already recovers from.
     deadline = time.monotonic() + ADVISORY_LOCK_MAX_WAIT_SECONDS
+    # Track the LAST contended errno so both platforms report the same shape.
+    last_errno = None
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -994,11 +1037,9 @@ def lock_fd(fd: int, *, blocking: bool) -> None:
         except OSError as exc:
             if exc.errno not in _POSIX_LOCK_CONTENDED_ERRNOS:
                 raise
+            last_errno = exc.errno
             if time.monotonic() >= deadline:
-                raise AdvisoryLockTimeout(
-                    "posix_advisory_lock_timeout after "
-                    f"{ADVISORY_LOCK_MAX_WAIT_SECONDS:g}s"
-                ) from exc
+                raise _advisory_lock_timeout("posix", last_errno) from exc
             time.sleep(ADVISORY_LOCK_POLL_SECONDS)
 
 

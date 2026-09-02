@@ -22,12 +22,14 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import textwrap
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -109,6 +111,108 @@ def test_posix_blocking_lock_times_out_instead_of_waiting_forever(tmp_path, monk
     finally:
         holder.terminate()
         holder.wait(timeout=10)
+
+
+# --- A1 truthfulness: the timeout reports WHICH errno ended the wait ---------
+
+
+def _drive_posix_lock_timeout(tmp_path, monkeypatch, contended_errno):
+    """Drive the POSIX blocking-lock path to timeout on one contended errno."""
+    import fcntl
+
+    def contended(_fd, _operation):
+        raise OSError(contended_errno, "contended flock")
+
+    monkeypatch.setattr(platform_io.os, "name", "posix")
+    monkeypatch.setattr(fcntl, "flock", contended)
+    monkeypatch.setattr(platform_io, "ADVISORY_LOCK_MAX_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(platform_io.time, "monotonic", lambda: 10.0)
+
+    fd = os.open(tmp_path / "posix-contended.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(platform_io.AdvisoryLockTimeout) as raised:
+            platform_io.lock_fd(fd, blocking=True)
+    finally:
+        os.close(fd)
+    return raised.value
+
+
+def test_posix_lock_timeout_exposes_last_observed_errno(tmp_path, monkeypatch):
+    """REPRODUCTION (POSIX side): a bounded wait driven to timeout must carry the
+    last observed contended errno as a structured attribute and name it
+    symbolically. Before the fix the timeout said only that it timed out, so the
+    errno that ended the wait could not be read back."""
+    value = _drive_posix_lock_timeout(tmp_path, monkeypatch, errno.EAGAIN)
+
+    assert value.errno == errno.EAGAIN
+    assert "posix_advisory_lock_timeout" in str(value)
+    assert "EAGAIN" in str(value)
+
+
+def test_posix_unrecognized_errno_propagates_immediately_without_retry(
+    tmp_path, monkeypatch
+):
+    """A non-contended errno (a real EACCES permission failure on POSIX is NOT in
+    the contended set) propagates immediately as ``OSError``: never retried,
+    never reshaped into an ``AdvisoryLockTimeout``."""
+    import fcntl
+
+    def denied(_fd, _operation):
+        raise OSError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(platform_io.os, "name", "posix")
+    monkeypatch.setattr(fcntl, "flock", denied)
+    monkeypatch.setattr(
+        platform_io.time,
+        "sleep",
+        lambda _s: pytest.fail("unrecognized errno must not be retried"),
+    )
+
+    fd = os.open(tmp_path / "posix-denied.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(OSError) as raised:
+            platform_io.lock_fd(fd, blocking=True)
+    finally:
+        os.close(fd)
+
+    assert raised.value.errno == errno.EACCES
+    assert not isinstance(raised.value, platform_io.AdvisoryLockTimeout)
+
+
+def test_posix_and_windows_timeouts_share_attribute_and_message_shape(
+    tmp_path, monkeypatch
+):
+    """Both platform timeout paths expose the SAME attribute name (``errno``) and
+    the SAME message shape, so a Windows-only diagnostic cannot re-open the
+    asymmetry NF-2026-00350 closed."""
+    posix_timeout = _drive_posix_lock_timeout(tmp_path, monkeypatch, errno.EAGAIN)
+
+    def contended(_fd, _mode, _count):
+        raise OSError(errno.EACCES, "contended byte range")
+
+    fake_msvcrt = SimpleNamespace(
+        LK_LOCK=1, LK_NBLCK=2, LK_UNLCK=3, locking=contended
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(platform_io.os, "name", "nt")
+    monkeypatch.setattr(platform_io, "ADVISORY_LOCK_MAX_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(platform_io.time, "monotonic", lambda: 10.0)
+
+    fd = os.open(tmp_path / "windows-contended.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(platform_io.AdvisoryLockTimeout) as raised:
+            platform_io.lock_fd(fd, blocking=True)
+    finally:
+        os.close(fd)
+    windows_timeout = raised.value
+
+    shape = re.compile(r"^\w+_advisory_lock_timeout after \S+s \(last errno \w+\)$")
+    for timeout in (posix_timeout, windows_timeout):
+        assert hasattr(timeout, "errno")
+        assert timeout.errno is not None
+        assert shape.match(str(timeout)), str(timeout)
+    assert posix_timeout.errno == errno.EAGAIN
+    assert windows_timeout.errno == errno.EACCES
 
 
 def _minimal_manager(tmp_path: Path) -> process_launcher.ProcessManager:

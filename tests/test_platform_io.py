@@ -912,6 +912,94 @@ def test_windows_blocking_lock_preserves_unexpected_os_error(tmp_path, monkeypat
     assert not isinstance(raised.value, platform_io.AdvisoryLockTimeout)
 
 
+def _drive_windows_lock_timeout(tmp_path, monkeypatch, contended_errno):
+    """Drive the Windows blocking-lock path to timeout on one contended errno."""
+
+    def contended(fd, mode, count):
+        raise OSError(contended_errno, "contended byte range")
+
+    fake_msvcrt = SimpleNamespace(
+        LK_LOCK=1, LK_NBLCK=2, LK_UNLCK=3, locking=contended
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(platform_io.os, "name", "nt")
+    monkeypatch.setattr(platform_io, "ADVISORY_LOCK_MAX_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(platform_io.time, "monotonic", lambda: 10.0)
+
+    path = tmp_path / "contended-windows.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(platform_io.AdvisoryLockTimeout) as raised:
+            platform_io.lock_fd(fd, blocking=True)
+    finally:
+        os.close(fd)
+    return raised.value
+
+
+def test_windows_lock_timeout_distinguishes_permission_from_contention(
+    tmp_path, monkeypatch
+):
+    """REPRODUCTION: EACCES (permission-shaped) and the deadlock errno both time
+    out through the merged Windows contended set. Before the fix both raise an
+    ``AdvisoryLockTimeout`` that only says it timed out, so the two outcomes are
+    indistinguishable; the timeout must now report which errno ended the wait."""
+    permission = _drive_windows_lock_timeout(tmp_path, monkeypatch, errno.EACCES)
+    contention = _drive_windows_lock_timeout(
+        tmp_path, monkeypatch, platform_io._deadlock_errno()
+    )
+
+    assert permission.errno == errno.EACCES
+    assert contention.errno == platform_io._deadlock_errno()
+    assert permission.errno != contention.errno
+    assert "EACCES" in str(permission)
+
+
+def test_windows_lock_timeout_exposes_last_observed_errno(tmp_path, monkeypatch):
+    """A timed-out wait exposes the last observed errno as a structured attribute
+    and names it symbolically, not only in prose."""
+    value = _drive_windows_lock_timeout(tmp_path, monkeypatch, errno.EACCES)
+
+    assert isinstance(value, platform_io.AdvisoryLockTimeout)
+    assert value.errno == errno.EACCES
+    assert "windows_advisory_lock_timeout" in str(value)
+    assert "EACCES" in str(value)
+
+
+def test_windows_unrecognized_errno_propagates_immediately_without_retry(
+    tmp_path, monkeypatch
+):
+    """An unrecognized errno still propagates immediately as ``OSError`` -- never
+    retried, never reshaped into an ``AdvisoryLockTimeout``."""
+    attempts: list[int] = []
+
+    def failing(fd, mode, count):
+        attempts.append(mode)
+        raise OSError(errno.EIO, "device failure")
+
+    fake_msvcrt = SimpleNamespace(
+        LK_LOCK=1, LK_NBLCK=2, LK_UNLCK=3, locking=failing
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(platform_io.os, "name", "nt")
+    monkeypatch.setattr(
+        platform_io.time,
+        "sleep",
+        lambda _s: pytest.fail("unrecognized errno must not be retried"),
+    )
+
+    path = tmp_path / "io-error-windows.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(OSError) as raised:
+            platform_io.lock_fd(fd, blocking=True)
+    finally:
+        os.close(fd)
+
+    assert raised.value.errno == errno.EIO
+    assert not isinstance(raised.value, platform_io.AdvisoryLockTimeout)
+    assert attempts == [fake_msvcrt.LK_NBLCK]
+
+
 @pytest.mark.parametrize(
     ("name", "windows", "linux", "macos"),
     [

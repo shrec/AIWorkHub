@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import hashlib
+import sqlite3
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -456,6 +457,42 @@ def test_default_route_uses_canonical_workforce_contract(monkeypatch, tmp_path: 
     assert captured[0].kinds == frozenset({"review"})
     assert captured[0].risk == "critical"
     assert "session-manager" in captured[0].tool_needs
+
+
+def test_workspace_binding_commits_and_closes_its_connection(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The two workspace-binding sites must close their connection at block exit
+    while still committing the binding (the write site relied on ``__exit__``
+    to commit, so the transaction boundary has to be preserved)."""
+    manager = _Manager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "bindings.sqlite", route_selector=_route
+    )
+
+    real_connect = sqlite3.connect
+    open_conns: list[sqlite3.Connection] = []
+
+    class _Tracked(sqlite3.Connection):
+        def close(self) -> None:
+            if self in open_conns:
+                open_conns.remove(self)
+            super().close()
+
+    def _tracking_connect(*args, **kwargs):
+        kwargs["factory"] = _Tracked
+        conn = real_connect(*args, **kwargs)
+        open_conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(review_orchestrator.sqlite3, "connect", _tracking_connect)
+
+    driver._repair_expected_workspace(7, "workspace-xyz")
+    assert open_conns == [], "write site left a sqlite connection open"
+
+    # Commit was preserved: the just-written binding is durably readable.
+    assert driver._expected_workspace_identity(7) == "workspace-xyz"
+    assert open_conns == [], "read site left a sqlite connection open"
 
 
 def test_archive_status_uses_canonical_task_envelope(monkeypatch, tmp_path: Path) -> None:
