@@ -176,7 +176,12 @@ def test_high_risk_same_provider_review_records_fresh_context_rung() -> None:
         b.startswith("independent_reviewer_missing")
         for b in verdict["blocking_evidence"]
     )
-    for lens in sorted(qe.JUDGMENT_LENSES):
+    # A rung is recorded for the lenses THIS tier requires. `high` requires
+    # correctness and security; only `critical` also requires code_quality, so
+    # iterating every judgment lens here asserted a different tier's contract.
+    required = tuple(profile.get("required_reviewer_lenses") or ())
+    assert required == ("correctness", "security")
+    for lens in required:
         assert (
             verdict["independence_rungs"][lens]["rung"]
             == qe.quality_review.RUNG_SAME_MODEL_FRESH_CONTEXT
@@ -186,6 +191,28 @@ def test_high_risk_same_provider_review_records_fresh_context_rung() -> None:
             row["independence_rung"]
             == qe.quality_review.RUNG_SAME_MODEL_FRESH_CONTEXT
         )
+    # A lens this tier does not require is not silently promoted into the
+    # independence record just because a report for it was supplied.
+    assert "code_quality" not in verdict["independence_rungs"]
+
+
+def test_critical_requires_every_judgment_lens_and_rungs_them_all() -> None:
+    """The tier that DOES require all three still records all three."""
+    profile = qe.resolve_risk_profile("critical")
+    assert tuple(profile.get("required_reviewer_lenses") or ()) == (
+        "correctness", "security", "code_quality",
+    )
+    verdict = qe.fold_quality_verdict(
+        [_check()],
+        risk_profile=profile,
+        reviewer_reports=[
+            _report(lens, provider="worker-a") for lens in sorted(qe.JUDGMENT_LENSES)
+        ],
+        combined_tree_checks=[_check("union-tests")],
+        worker_provider="worker-a",
+        human_approval=True,
+    )
+    assert set(verdict["independence_rungs"]) == set(qe.JUDGMENT_LENSES)
 
 
 def test_high_risk_cross_provider_clean_reports_are_verified() -> None:
