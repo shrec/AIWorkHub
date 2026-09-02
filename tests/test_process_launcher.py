@@ -7,6 +7,7 @@ import os
 import signal
 import sqlite3
 import subprocess
+import stat
 import sys
 import threading
 import time
@@ -10281,6 +10282,17 @@ def test_bounded_error_hash_is_whitespace_stable_and_bounded() -> None:
 # ── worker validation affordances (sandbox parity) ────────────────────────
 
 
+def _host_interpreter_is_advertisable() -> str:
+    """Why this host's own interpreter cannot back the affordance, or ""."""
+    resolved = Path(sys.executable).resolve(strict=True)
+    info = resolved.stat()
+    if platform_io.posix_path_modes_supported(os.name) and stat.S_IMODE(info.st_mode) & 0o002:
+        return f"host interpreter {resolved} is world-writable"
+    if os.name != "nt" and info.st_uid != os.getuid() and info.st_uid != 0:
+        return f"host interpreter {resolved} is owned by uid {info.st_uid}"
+    return ""
+
+
 def _fake_canonical_venv(repo: Path) -> None:
     venv_bin = repo / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
@@ -10295,14 +10307,19 @@ def _fake_canonical_venv(repo: Path) -> None:
 
 @pytest.mark.skipif(os.name == "nt", reason="posix venv layout")
 def test_worker_launch_env_exposes_canonical_validation_affordances(tmp_path):
+    # The affordance is only exposed when the interpreter behind it passes the
+    # same verification the finalization validator applies. A GitHub-hosted
+    # runner installs a WORLD-WRITABLE Python, which that verification refuses
+    # on purpose, so this contract cannot be demonstrated there -- and the test
+    # asserted it anyway, failing in CI for a day with nothing but KeyError
+    # because worker_validation_affordance_env swallows the reason by design.
+    unusable = _host_interpreter_is_advertisable()
+    if unusable:
+        pytest.skip(f"affordance cannot be demonstrated here: {unusable}")
     repo = tmp_path / "repo"
     repo.mkdir()
     _fake_canonical_venv(repo)
-    # worker_validation_affordance_env swallows every verification failure by
-    # design -- a missing or untrusted tool is simply not advertised, never a
-    # launch failure. That makes this test mute: it reported KeyError and never
-    # why. Verify first, so a host where the interpreter is refused says which
-    # guard refused it. CI failed here for a day saying only KeyError.
+    # Verify first, so a host that refuses names the guard instead of a KeyError.
     worker_workspace._verify_validation_interpreter(
         repo / ".venv" / "bin" / "python",
         repo,
@@ -10325,6 +10342,9 @@ def test_worker_launch_env_exposes_canonical_validation_affordances(tmp_path):
 
 @pytest.mark.skipif(os.name == "nt", reason="posix venv layout")
 def test_worker_launch_env_spells_affordances_for_bubblewrap_alias(tmp_path):
+    unusable = _host_interpreter_is_advertisable()
+    if unusable:
+        pytest.skip(f"affordance cannot be demonstrated here: {unusable}")
     repo = tmp_path / "repo"
     repo.mkdir()
     _fake_canonical_venv(repo)
