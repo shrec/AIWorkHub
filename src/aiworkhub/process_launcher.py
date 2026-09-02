@@ -10485,7 +10485,7 @@ class ProcessManager:
         card: dict[str, Any],
         request_id: str,
         *,
-        repo: Path | None = None,
+        repo: Path | None = None, process_state: str | None = None,
     ) -> tuple[bool, str]:
         """Return whether ``request_id`` is no longer a live review surface.
 
@@ -10515,6 +10515,8 @@ class ProcessManager:
             if canonical_status not in task_fsm.REWORK_RECOVERABLE_STATUSES:
                 return True, f"pin_unrecoverable_task_status:{canonical_status}"
             return False, "pinned_rework_predecessor"
+        if process_state == "finalize_failed":  # retained for retry_finalization
+            return False, "retryable_finalize_failed"
         if canonical_status in GC_DISPOSED_CANONICAL_STATUSES:
             return True, f"disposed_task_status:{canonical_status}"
         if canonical_status != "review":
@@ -10659,8 +10661,7 @@ class ProcessManager:
                     "reason": f"task_lookup_failed:{exc}"[:200],
                 }
             eligible, disposition = self._gc_disposition(
-                card, request_id, repo=self.repo
-            )
+                card, request_id, repo=self.repo, process_state=str(latest.get("state") or ""))
             if not eligible:
                 if disposition != "current_review_request":
                     return {

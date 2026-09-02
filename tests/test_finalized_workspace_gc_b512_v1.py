@@ -328,8 +328,13 @@ def test_archived_task_with_dead_process_is_gc_cleaned(tmp_path, monkeypatch):
     )
 
 
+# ``finalize_failed`` is deliberately absent: unlike the other retained
+# terminal states, its workspace stays recoverable through
+# ``retry_finalization`` and must survive the sweep whatever the card says
+# (see test_finalize_failed_last_state_survives_sweep_and_retry_finds_it and
+# test_finalize_failed_last_state_is_retained_even_when_card_finished).
 @pytest.mark.parametrize(
-    "state", ["worker_failed", "scope_rejected", "promotion_conflict", "finalize_failed", "timed_out"]
+    "state", ["worker_failed", "scope_rejected", "promotion_conflict", "timed_out"]
 )
 def test_every_retained_terminal_state_is_gc_eligible_once_finished(tmp_path, monkeypatch, state):
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
@@ -400,6 +405,99 @@ def test_coordinator_disposed_attempt_is_gc_cleaned(tmp_path, monkeypatch, statu
     assert not path.exists() and not home.exists()
     latest = manager._request_events(f"req-disposed-{status}")[-1]
     assert latest["workspace_gc_reason"] == f"disposed_task_status:{status}"
+
+
+# --- B512+: finalize_failed is retryable, its workspace outlives the card ------
+#
+# Measured race: a finalization failed (quality_review_submission_count:0), the
+# card moved to blocked, and nine seconds later the sweep purged the retained
+# workspace with reason disposed_task_status:blocked.  retry_finalization then
+# refused with finalization_retry_workspace_missing even though the reviewer's
+# report was on disk and parseable.  ``blocked`` IS a disposed canonical status
+# and a ``finalize_failed`` process state IS retained for diagnosis: both rules
+# are individually correct, and together they destroy the only recovery path.
+
+
+def test_finalize_failed_last_state_survives_sweep_and_retry_finds_it(tmp_path, monkeypatch):
+    """Reproduction: a blocked card whose LAST process state is finalize_failed
+    must survive a full sweep, and retry_finalization must still find its
+    workspace.  On the pre-fix code the sweep collects it (blocked is a disposed
+    status) and retry_finalization then fails with workspace_missing."""
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    # retry_finalization refuses up front when the write gate is closed; open it
+    # so the reproduction reaches the workspace-existence check it is about.
+    monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda *a, **k: True)
+    request_id = "req-finalize-failed-blocked"
+    card = _card()
+    card.update({"status": "blocked", "worker_status": "finalize_failed", "claimed_by": ""})
+    manager = _build_manager(tmp_path, card)
+    path, home, _ = _seed_gc_candidate(
+        manager, tmp_path, card,
+        request_id=request_id,
+        pid=2_147_483_081, pid_start_ticks=999_999_931,
+        state="finalize_failed",
+    )
+
+    result = manager._gc_finalized_workspaces()
+
+    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
+    assert path.exists() and home.exists()
+    # A routine "not yet eligible" skip appends no audit event.
+    assert "workspace_gc" not in manager._request_events(request_id)[-1]
+
+    # retry_finalization now gets PAST the workspace check (the workspace is
+    # still on disk) and fails at a later gate -- never workspace_missing.
+    retry = manager.retry_finalization(request_id, card["task_id"])
+    assert retry["ok"] is False
+    assert retry["error"] != "finalization_retry_workspace_missing"
+
+
+def test_finalize_failed_last_state_is_retained_even_when_card_finished(tmp_path, monkeypatch):
+    """The process state decides finalize_failed retention whatever the card's
+    canonical status says: even a finished card's finalize_failed attempt is
+    kept, because the retention decision reads the last process state too."""
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    request_id = "req-finalize-failed-finished"
+    card = _card()
+    card.update({"status": "finished", "worker_status": "done", "claimed_by": ""})
+    manager = _build_manager(tmp_path, card)
+    path, home, _ = _seed_gc_candidate(
+        manager, tmp_path, card,
+        request_id=request_id,
+        pid=2_147_483_082, pid_start_ticks=999_999_932,
+        state="finalize_failed",
+    )
+
+    result = manager._gc_finalized_workspaces()
+
+    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
+    assert path.exists() and home.exists()
+    assert "workspace_gc" not in manager._request_events(request_id)[-1]
+
+
+def test_blocked_card_with_successful_terminal_last_state_is_still_collected(tmp_path, monkeypatch):
+    """The fix is scoped to finalize_failed only: a blocked card whose
+    finalization SUCCEEDED (a non-finalize_failed terminal state) is still the
+    common, collectable case -- disposed_task_status:blocked is unchanged."""
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    request_id = "req-blocked-success-terminal"
+    card = _card()
+    card.update({"status": "blocked", "worker_status": "blocked", "claimed_by": ""})
+    manager = _build_manager(tmp_path, card)
+    path, home, _ = _seed_gc_candidate(
+        manager, tmp_path, card,
+        request_id=request_id,
+        pid=2_147_483_083, pid_start_ticks=999_999_933,
+        state="review_ready",
+    )
+
+    result = manager._gc_finalized_workspaces()
+
+    assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
+    assert not path.exists() and not home.exists()
+    assert manager._request_events(request_id)[-1]["workspace_gc_reason"] == (
+        "disposed_task_status:blocked"
+    )
 
 
 def test_pending_rework_predecessor_is_pinned_until_successor_claim(tmp_path, monkeypatch):
