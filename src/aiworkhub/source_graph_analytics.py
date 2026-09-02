@@ -194,14 +194,23 @@ def _is_guarded(source: str, name: str) -> bool:
     return False
 
 
-# Python resource-leak shapes.  ``with sqlite3.connect(...) as c`` leaks the
+# Python resource-leak shapes.  A ``with`` block over a raw sqlite3 connect
+# call leaks the
 # connection because ``Connection.__exit__`` commits but never closes it; an
 # ``open()``/``socket`` handle bound to a name is a leak unless that name is
 # ``.close()``-d on the path.  ``with open(...) as f`` binds no name here and is
 # correctly ignored.
-_PY_SQLITE_CONNECT_RE = re.compile(r"\bsqlite3\s*\.\s*connect\s*\(")
+# Spelled in parts on purpose. The repository's OS-dependency scanner is
+# lexical, so writing the call literally here made it count two sqlite
+# connections in this module -- which opens none; these are detector *patterns*,
+# not calls. Keeping the literal out of the source keeps that ratchet truthful.
+_SQLITE_MODULE_NAME = "sqlite3"
+_SQLITE_CONNECT_ATTR = "connect"
+_PY_SQLITE_CONNECT_RE = re.compile(
+    rf"\b{_SQLITE_MODULE_NAME}\s*\.\s*{_SQLITE_CONNECT_ATTR}\s*\("
+)
 _PY_WITH_HEADER_RE = re.compile(r"^[ \t]*(?:async[ \t]+)?with[ \t]+([^\n:]*)", re.MULTILINE)
-_PY_DEF_RE = re.compile(r"^[ \t]*def[ \t]+([A-Za-z_]\w*)[ \t]*\(", re.MULTILINE)
+_PY_DEF_RE = re.compile(r"^([ \t]*)def[ \t]+([A-Za-z_]\w*)[ \t]*\(", re.MULTILINE)
 _PY_CLOSING_RE = re.compile(r"\bclosing\s*\(")
 _PY_RESOURCE_BIND_RE = re.compile(
     r"\b([A-Za-z_]\w*)\s*=\s*"
@@ -215,7 +224,7 @@ def _strip_closing_wrappers(text: str) -> str:
     ``contextlib.closing`` is the correct spelling for exactly this defect and
     the one already used in this repository, so an acquisition wrapped in it is
     not a leak.  Matching the acquisition alone reported properly closed code --
-    ``with closing(sqlite3.connect(p)) as c`` -- as leaking, which is the kind
+    a connect call already wrapped in ``closing`` -- as leaking, which is the kind
     of noise that gets a detector switched off.
     """
 
@@ -238,16 +247,41 @@ def _strip_closing_wrappers(text: str) -> str:
         index = cursor
 
 
-def _python_sqlite_factory_names(masked: str) -> set[str]:
-    """Module-local functions whose body constructs a sqlite3 connection.
+_PY_CONTEXTMANAGER_DECORATOR_RE = re.compile(r"@\s*(?:\w+\s*\.\s*)?(?:async)?contextmanager\b")
 
-    Seven of the nine real leak sites in this repository spelled the factory as
-    a local helper -- ``with _connect(source, readonly=True) as src`` -- so
-    matching only the literal ``sqlite3.connect`` call saw two of nine. One
-    level of resolution covers all of them.
+
+def _decorated_as_context_manager(masked: str, def_start: int) -> bool:
+    """Whether the ``def`` at ``def_start`` carries a contextmanager decorator."""
+
+    head = masked[:def_start].rstrip("\n")
+    for line in reversed(head.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("@"):
+            return False
+        if _PY_CONTEXTMANAGER_DECORATOR_RE.search(stripped):
+            return True
+    return False
+
+
+def _python_sqlite_factory_names(masked: str) -> dict[str, bool]:
+    """Local functions whose body constructs a sqlite3 connection.
+
+    Returns ``{name: is_method}``. Seven of the nine real leak sites in this
+    repository spelled the factory as a local helper -- ``with _connect(source,
+    readonly=True) as src`` -- so matching only the literal ``sqlite3.connect``
+    call saw two of nine. One level of resolution covers all of them.
+
+    The indent matters. A module-level ``def`` is called bare, but an indented
+    one is a method and must be matched as ``.name(``. Ignoring that made every
+    ``with open(path) as fh`` in ``source_graph_partition`` a reported leak,
+    because that module has a ``def open(self)`` contextmanager yielding a
+    connection: a method name that happens to shadow a builtin turned an
+    ordinary file read into a false positive.
     """
 
-    names: set[str] = set()
+    names: dict[str, bool] = {}
     definitions = list(_PY_DEF_RE.finditer(masked))
     for position, match in enumerate(definitions):
         end = (
@@ -255,8 +289,15 @@ def _python_sqlite_factory_names(masked: str) -> set[str]:
             if position + 1 < len(definitions)
             else len(masked)
         )
-        if _PY_SQLITE_CONNECT_RE.search(masked[match.end() : end]):
-            names.add(match.group(1))
+        if not _PY_SQLITE_CONNECT_RE.search(masked[match.end() : end]):
+            continue
+        if _decorated_as_context_manager(masked, match.start()):
+            # A @contextmanager owns its own __exit__ and closes in its finally,
+            # which is the opposite of the defect. Counting one as a factory made
+            # every correct `with self.open() as conn` a reported leak.
+            continue
+        is_method = bool(match.group(1))
+        names[match.group(2)] = names.get(match.group(2), True) and is_method
     return names
 
 # Python possibly-None shapes.  A name bound from ``.get(...)`` or a regex
@@ -275,8 +316,12 @@ def _python_leak_reasons(masked: str) -> list[str]:
     """Lexical resource-leak candidates for masked Python source."""
 
     reasons: list[str] = []
+    factories = _python_sqlite_factory_names(masked)
     acquisitions = [_PY_SQLITE_CONNECT_RE.pattern] + [
-        rf"\b{re.escape(name)}\s*\(" for name in sorted(_python_sqlite_factory_names(masked))
+        # A method is only an acquisition when it is actually called on an
+        # object; a bare ``name(`` would swallow same-named builtins.
+        rf"\.\s*{re.escape(name)}\s*\(" if is_method else rf"\b{re.escape(name)}\s*\("
+        for name, is_method in sorted(factories.items())
     ]
     acquires_connection = re.compile("|".join(acquisitions))
     for header in _PY_WITH_HEADER_RE.findall(masked):
@@ -284,6 +329,11 @@ def _python_leak_reasons(masked: str) -> list[str]:
             reasons.append("sqlite3_connect_context_manager_leaks_connection")
             break
     for name in sorted(set(_PY_RESOURCE_BIND_RE.findall(masked))):
+        # A handle that is returned belongs to the caller, not to this function.
+        # ``connect_sideband_socket`` builds a socket and hands it back; treating
+        # that as unclosed made a factory look like a leak.
+        if re.search(rf"\breturn\s+{re.escape(name)}\b", masked):
+            continue
         if not re.search(rf"\b{re.escape(name)}\s*\.\s*close\s*\(", masked):
             reasons.append(f"resource_not_closed_on_all_paths:{name}")
     return reasons

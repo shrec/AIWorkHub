@@ -50,7 +50,14 @@ _AIWORKHUB_PKG = Path(aiworkhub.__file__).resolve().parent
 _AIWORKHUB_IMPORT_ROOT = _AIWORKHUB_PKG.parent
 
 
-C_ONLY_MODES = ("leaks", "rawptrs", "casts", "looprisks", "nullrisks")
+# ``leaks`` and ``nullrisks`` gained Python rules, so they are no longer
+# C-only: on a Python scope they now analyse rather than decline. The three
+# below stay C-only because Python has no raw pointers or casts, and looprisks
+# has no Python rule worth trusting yet. Every one of the five still analyses C,
+# which is what ``C_DETECTOR_MODES`` covers.
+C_ONLY_MODES = ("rawptrs", "casts", "looprisks")
+C_AND_PYTHON_MODES = ("leaks", "nullrisks")
+C_DETECTOR_MODES = C_ONLY_MODES + C_AND_PYTHON_MODES
 
 _EXPECTED_C_REASON = {
     "leaks": "allocation_release_imbalance",
@@ -149,12 +156,35 @@ def test_c_only_detectors_report_not_applicable_on_python(tmp_path: Path) -> Non
         conn.close()
 
 
+def test_python_aware_detectors_analyse_python_rather_than_decline(
+    tmp_path: Path,
+) -> None:
+    """leaks and nullrisks gained Python rules, so they must not decline here.
+
+    They previously returned not_applicable on a Python scope, which left ~97%
+    of this repository unscanned by half the bug-detection surface. Declining is
+    honest but useless; this pins that they now analyse.
+    """
+
+    repo, conn = _indexed(tmp_path, "pkg/service.py", _PYTHON_CORPUS)
+    try:
+        rows = _entities(conn, "pkg/service.py")
+        assert rows, "python corpus must index at least one function"
+        for mode in C_AND_PYTHON_MODES:
+            analysis = _analysis(conn, repo, mode, rows)
+            assert analysis["status"] == "available", mode
+            assert "python" in analysis["applicable_languages"], mode
+            assert analysis["symbols_scanned"] >= 1, mode
+    finally:
+        conn.close()
+
+
 def test_c_only_detectors_are_available_and_fire_on_c(tmp_path: Path) -> None:
     repo, conn = _indexed(tmp_path, "native/engine.cpp", _C_CORPUS)
     try:
         rows = _entities(conn, "native/engine.cpp")
         assert rows, "C corpus must index at least one function"
-        for mode in C_ONLY_MODES:
+        for mode in C_DETECTOR_MODES:
             analysis = _analysis(conn, repo, mode, rows)
             # After: the detector can see this language, so it truly reports.
             assert analysis["status"] == "available", mode

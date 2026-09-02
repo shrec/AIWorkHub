@@ -377,3 +377,97 @@ def test_strip_closing_wrappers_removes_only_the_balanced_region():
     )
     assert "other(sqlite3.connect(q))" in stripped
     assert "closing(" not in stripped
+
+
+# --- precision: three shapes that are NOT leaks ----------------------------
+#
+# Found by pointing the detector at this repository. Each of these was reported
+# as a leak by an earlier version, and each is correct code. A detector that
+# cries wolf on 137 modules gets switched off, so these are pinned.
+
+_CONTEXTMANAGER_FACTORY = """import sqlite3
+from contextlib import contextmanager
+
+
+class View:
+    @contextmanager
+    def open(self):
+        conn = sqlite3.connect("file::memory:", uri=True)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def find(self, term):
+        with self.open() as conn:
+            return conn.execute("SELECT 1").fetchone()
+
+    def read(self, path):
+        with open(path) as handle:
+            return handle.read()
+"""
+
+_RETURNED_SOCKET = """import socket
+
+
+def connect_sideband_socket(path, *, timeout=None):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    if timeout is not None:
+        sock.settimeout(timeout)
+    return sock
+"""
+
+_UNCLOSED_SOCKET = """import socket
+
+
+def ping():
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.send(b"x")
+"""
+
+
+def test_contextmanager_factory_is_not_a_leak():
+    """A @contextmanager closes in its own finally -- the opposite of the bug.
+
+    Counting one as a connection factory made every `with self.open() as conn`
+    a reported leak, and because the method was named ``open`` it also made
+    every ordinary `with open(path) as handle` one.
+    """
+    assert source_graph_analytics._python_leak_reasons(_CONTEXTMANAGER_FACTORY) == []
+
+
+def test_method_factory_requires_an_attribute_call():
+    """A method name that shadows a builtin must not match the bare builtin."""
+    factories = source_graph_analytics._python_sqlite_factory_names(
+        """import sqlite3
+
+
+class View:
+    def open(self):
+        return sqlite3.connect(":memory:")
+"""
+    )
+    assert factories == {"open": True}
+
+
+def test_module_level_factory_is_matched_bare():
+    factories = source_graph_analytics._python_sqlite_factory_names(
+        """import sqlite3
+
+
+def _connect(path):
+    return sqlite3.connect(path)
+"""
+    )
+    assert factories == {"_connect": False}
+
+
+def test_returned_handle_belongs_to_the_caller():
+    """A factory hands ownership back; not closing it here is correct."""
+    assert source_graph_analytics._python_leak_reasons(_RETURNED_SOCKET) == []
+
+
+def test_unreturned_unclosed_handle_is_still_a_leak():
+    assert source_graph_analytics._python_leak_reasons(_UNCLOSED_SOCKET) == [
+        "resource_not_closed_on_all_paths:sock"
+    ]

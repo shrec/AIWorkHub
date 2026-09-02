@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from check_os_dependency_boundary import load_manifest, scan_repository
+# Run directly, this script's sibling module is not importable either. Add its
+# own directory, and let the sibling add `src` for the package it imports.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from check_os_dependency_boundary import load_manifest, scan_repository  # noqa: E402
 
 
 def generated_baseline(root: Path, config: Path) -> tuple[list[dict[str, object]], int]:

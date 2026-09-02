@@ -6,10 +6,21 @@ import argparse
 import ast
 import json
 import re
+import sys
 from collections import Counter
 from pathlib import Path
 
-from aiworkhub.development_rules import DevelopmentRulesManifest, parse_manifest_bytes
+# Run directly -- `python3 scripts/check_os_dependency_boundary.py` -- this file's
+# own package is not importable unless the caller happens to have exported
+# PYTHONPATH. That made the CLI unusable standalone and left two of this script's
+# own tests failing on a ModuleNotFoundError rather than on the exit codes they
+# assert. The repository root is two levels up from here, so derive `src` from
+# __file__ rather than depending on the environment.
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from aiworkhub.development_rules import DevelopmentRulesManifest, parse_manifest_bytes  # noqa: E402
 
 PATTERNS: dict[str, re.Pattern[str]] = {
     "os_name_eq": re.compile(r"os\.name\s*=="),
