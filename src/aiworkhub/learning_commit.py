@@ -11,7 +11,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+from pathlib import PurePosixPath
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from .evidence_levels import (
     InvalidReferenceSchemeError,
@@ -428,3 +429,81 @@ def learning_commit_from_dict(data: Dict[str, Any]) -> LearningCommit:
         promotion_eligible_context_graph=data.get("promotion_eligible_context_graph", False),
         promotion_eligible_kb=data.get("promotion_eligible_kb", False),
     )
+
+def commit_owed(
+    *,
+    task_id: str,
+    request_id: str,
+    outcome: str,
+    changed_paths: Sequence[str] = (),
+    evidence_reference: str = "",
+) -> dict[str, Any]:
+    """Name the lesson a decision owes, with what is needed to file it.
+
+    A learning commit is a manager judgement -- root cause and invariant are
+    not derivable -- so it is deliberately not an automatic side effect of
+    accepting or rejecting. But the duty was invisible at the one moment it is
+    cheap to perform: right after the decision, while the evidence is still in
+    hand. Measured on this repository: 198 decided cards in 14 days, 2 with a
+    lesson, 1 percent coverage.
+
+    This does not write anything. It returns the exact arguments the manager
+    would otherwise have to reassemble by hand -- including the evidence id in
+    the ``file:`` form the store accepts, since a ``sha256:`` receipt id is
+    rejected by :func:`_validate_evidence_id` and that is a mistake worth
+    making once, not every time.
+    """
+
+    evidence_ids: list[str] = []
+    if evidence_reference:
+        try:
+            _validate_evidence_id(evidence_reference)
+        except Exception:  # noqa: BLE001 - an unusable id is simply not offered
+            evidence_ids = []
+        else:
+            evidence_ids = [evidence_reference]
+    return {
+        "schema_id": "aiworkhub.learning_commit_owed.v1",
+        "owed": True,
+        "task_id": task_id,
+        "request_id": request_id,
+        "outcome": outcome,
+        "repo_area": _repo_area(changed_paths),
+        "evidence_ids": evidence_ids,
+        "idempotency_key": f"{task_id}:{request_id}:{outcome}"[:200],
+        "provenance": f"manager_{outcome}_review",
+        "tool": "aiworkhub_manager_learning_commit",
+    }
+
+
+def _repo_area(paths: Sequence[str]) -> str:
+    """The narrowest directory containing the production paths that changed.
+
+    Test paths are excluded first: a fix in src/aiworkhub/source_graph.py with
+    its regression in tests/ has no common prefix at all, and reporting "" for
+    the area of an obviously-located change is worse than useless. Tests are
+    kept only when nothing else changed, which is a real and different case.
+    """
+    production = [p for p in paths if p and not _is_test_path(p)]
+    directories = [
+        str(PurePosixPath(p).parent) for p in (production or [p for p in paths if p])
+    ]
+    if not directories:
+        return ""
+    common = directories[0].split("/")
+    for directory in directories[1:]:
+        parts = directory.split("/")
+        keep = 0
+        for left, right in zip(common, parts):
+            if left != right:
+                break
+            keep += 1
+        common = common[:keep]
+        if not common:
+            return ""
+    return "/".join(common)
+
+
+def _is_test_path(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    return bool(parts) and (parts[0] == "tests" or "tests" in parts[:-1])

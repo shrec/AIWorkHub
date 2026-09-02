@@ -44,6 +44,7 @@ from . import context_write_intents
 from . import context_writes
 from . import evidence_levels
 from . import kilo_auth
+from . import learning_commit
 from . import needfix_store
 from .platform_io import (
     AdvisoryLockTimeout,
@@ -14287,6 +14288,21 @@ class ProcessManager:
                     row["cleanup_error"] = str(exc)[:300]
                 reviewer_finalization.append(row)
 
+            # One reply definition, so the cleanup-failed path cannot drift.
+            learning_owed = learning_commit.commit_owed(
+                task_id=task_id, request_id=request_id, outcome="accepted",
+                changed_paths=list(promoted), evidence_reference=str(
+                    (acceptance_evidence_record or {}).get("reference") or ""),
+            )
+            accepted_reply = {
+                "ok": True, "request_id": request_id, "task_id": task_id,
+                "promoted_paths": promoted,
+                "reviewer_finalization": reviewer_finalization,
+                "acceptance_evidence_record": acceptance_evidence_record,
+                "accepted_outcome_receipt": accepted_outcome_receipt,
+                "needfix_closure": needfix_closure,
+                "learning_commit_owed": learning_owed,
+            }
             try:
                 cleanup_workspace(workspace.repo, workspace.path, workspace.home)
             except WorkspaceError as exc:
@@ -14305,19 +14321,10 @@ class ProcessManager:
                     "acceptance_evidence_record": acceptance_evidence_record,
                     "accepted_outcome_receipt": accepted_outcome_receipt,
                     "needfix_closure": needfix_closure,
+                    "learning_commit_owed": learning_owed,
                     "finished_at": _utcnow(),
                 })
-                return {
-                    "ok": True,
-                    "request_id": request_id,
-                    "task_id": task_id,
-                    "promoted_paths": promoted,
-                    "cleanup_error": str(exc)[:500],
-                    "reviewer_finalization": reviewer_finalization,
-                    "acceptance_evidence_record": acceptance_evidence_record,
-                    "accepted_outcome_receipt": accepted_outcome_receipt,
-                    "needfix_closure": needfix_closure,
-                }
+                return {**accepted_reply, "cleanup_error": str(exc)[:500]}
 
             self._append_event({
                 "request_id": request_id,
@@ -14329,22 +14336,14 @@ class ProcessManager:
                 "accepted": True,
                 "promoted_paths": promoted,
                 "workspace_retained": False,
+                "learning_commit_owed": learning_owed,
                 "reviewer_finalization": reviewer_finalization,
                 "acceptance_evidence_record": acceptance_evidence_record,
                 "accepted_outcome_receipt": accepted_outcome_receipt,
                 "needfix_closure": needfix_closure,
                 "finished_at": _utcnow(),
             })
-            return {
-                "ok": True,
-                "request_id": request_id,
-                "task_id": task_id,
-                "promoted_paths": promoted,
-                "reviewer_finalization": reviewer_finalization,
-                "acceptance_evidence_record": acceptance_evidence_record,
-                "accepted_outcome_receipt": accepted_outcome_receipt,
-                "needfix_closure": needfix_closure,
-            }
+            return accepted_reply
 
     def list_processes(self, limit: int = 100) -> dict[str, Any]:
         self._reconcile_persisted_requests()
