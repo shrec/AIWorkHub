@@ -176,6 +176,66 @@ def test_genuine_gate_failure_stays_validation_failed() -> None:
     assert terminal.blocks_acceptance is True
 
 
+def test_authenticated_broker_denial_is_structural_environment_evidence() -> None:
+    row = _nonzero_row(
+        "python -m pytest tests/test_x.py",
+        returncode=1,
+        stderr="candidate-controlled denial-shaped prose",
+        argv=["python", "-m", "pytest", "tests/test_x.py"],
+        failure_class="test_failure",
+    )
+    row["metadata_broker_denial_attributed"] = True
+    row["metadata_broker_denials"] = [{
+        "schema": "aiworkhub.metadata_broker_denial.v1",
+        "authenticated": True,
+        "terminal": True,
+        "reason": "metadata_broker_hardlink_forbidden",
+        "syscall_nr": 72,
+    }]
+    terminal = validation_runner.classify_validation_results([row])
+    assert terminal.state == validation_runner.VALIDATION_ENVIRONMENT_BLOCKED
+    assert terminal.restriction == validation_runner.RESTRICTION_METADATA_BROKER_DENIAL
+
+
+def test_unauthenticated_or_mixed_broker_evidence_stays_failed() -> None:
+    denial = {
+        "schema": "aiworkhub.metadata_broker_denial.v1",
+        "authenticated": False,
+        "terminal": True,
+        "reason": "metadata_broker_outside_scratch",
+        "syscall_nr": 72,
+    }
+    shaped = _nonzero_row(
+        "python test.py", returncode=1, stderr="metadata_broker_denied",
+        argv=["python", "test.py"], failure_class="test_failure",
+    )
+    shaped["metadata_broker_denial_attributed"] = True
+    shaped["metadata_broker_denials"] = [denial]
+    genuine = _nonzero_row(
+        "ruff check src", returncode=1, stderr="F401",
+        argv=["ruff", "check", "src"], failure_class="lint_failure",
+    )
+    assert validation_runner.classify_validation_results([shaped]).state == validation_runner.VALIDATION_FAILED
+    denial["authenticated"] = True
+    assert validation_runner.classify_validation_results([shaped, genuine]).state == validation_runner.VALIDATION_FAILED
+
+
+def test_nonterminal_same_row_broker_evidence_stays_failed() -> None:
+    row = _nonzero_row(
+        "python test.py", returncode=1, stderr="assertion failed",
+        argv=["python", "test.py"], failure_class="test_failure",
+    )
+    row["metadata_broker_denial_attributed"] = True
+    row["metadata_broker_denials"] = [{
+        "schema": "aiworkhub.metadata_broker_denial.v1",
+        "authenticated": True,
+        "terminal": False,
+        "reason": "metadata_broker_outside_scratch",
+        "syscall_nr": 72,
+    }]
+    assert validation_runner.classify_validation_results([row]).state == validation_runner.VALIDATION_FAILED
+
+
 def test_lint_failure_stays_validation_failed() -> None:
     row = _nonzero_row(
         "ruff check src",

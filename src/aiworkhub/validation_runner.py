@@ -45,6 +45,7 @@ RESTRICTION_FORBIDDEN_SPAWN = "forbidden_spawn"
 RESTRICTION_REFUSED_CHMOD = "refused_chmod"
 RESTRICTION_ABSENT_INTERPRETER = "absent_interpreter"
 RESTRICTION_MISSING_PACKAGE = "missing_package"
+RESTRICTION_METADATA_BROKER_DENIAL = "metadata_broker_denial"
 # create-time-only restrictions (a card that declares such a command can never
 # succeed inside a worker sandbox and is rejected before a worker spends tokens)
 RESTRICTION_FULL_REPOSITORY_SUITE = "full_repository_suite"
@@ -201,6 +202,24 @@ def row_restriction(row: Mapping[str, Any]) -> str | None:
     already-established structural signal (a ``PermissionError`` at spawn); it
     never establishes a restriction on its own.
     """
+
+    # The validation launcher receives these records over a private inherited
+    # pipe which is deliberately not inherited by the validator.  Require the
+    # complete structural envelope; candidate-authored lookalikes in output or
+    # arbitrary row fields have no authority.
+    denials = row.get("metadata_broker_denials")
+    if row.get("metadata_broker_denial_attributed") is True and isinstance(
+        denials, (list, tuple)
+    ) and denials and all(
+        isinstance(item, Mapping)
+        and item.get("schema") == "aiworkhub.metadata_broker_denial.v1"
+        and item.get("authenticated") is True
+        and item.get("terminal") is True
+        and isinstance(item.get("reason"), str)
+        and isinstance(item.get("syscall_nr"), int)
+        for item in denials
+    ):
+        return RESTRICTION_METADATA_BROKER_DENIAL
 
     diagnostic = _row_diagnostic(row)
     launch_error = row.get("launch_error")

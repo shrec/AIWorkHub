@@ -6597,6 +6597,9 @@ _METADATA_BROKER_SYSCALLS = ("chmod", "fchmod", "fchmodat", "fchmodat2")
 _METADATA_BROKER_POLL_MS = 200
 _METADATA_BROKER_HANDSHAKE_SECONDS = 30.0
 _METADATA_BROKER_PATH_LIMIT = 4096
+_METADATA_BROKER_EVIDENCE_ENV = "AIWORKHUB_METADATA_BROKER_EVIDENCE_FD"
+_metadata_broker_evidence_fd: int | None = None
+_metadata_broker_denial_count = 0
 _AT_FDCWD = -100
 # Defensive upper bound on the whole broker loop so a wedged poll/waitpid can
 # never hang the trusted parent; the outer subprocess timeout is the primary
@@ -7354,7 +7357,18 @@ def _metadata_broker_denial_reason(exc: BaseException) -> str:
     return type(exc).__name__
 
 
-def _record_metadata_broker_denial(exc: BaseException, request: _SeccompNotif) -> None:
+_METADATA_BROKER_TERMINAL_DENIAL_REASONS = frozenset(
+    {
+        "metadata_broker_hardlink_forbidden",
+        "metadata_broker_deleted_fd",
+        "oserror_EPERM",
+    }
+)
+
+
+def _record_metadata_broker_denial(
+    exc: BaseException, request: _SeccompNotif
+) -> bool:
     """Retain one bounded, structured, path-free denial record (NF430).
 
     Replaces the previous silent collapse of every ``WorkspaceError``/
@@ -7365,15 +7379,32 @@ def _record_metadata_broker_denial(exc: BaseException, request: _SeccompNotif) -
     invisible.  Best-effort and never raises -- telemetry must not perturb the
     fail-closed ``EPERM`` response already set by the caller.
     """
+    terminal = False
     try:
         reason = _metadata_broker_denial_reason(exc)
+        terminal = reason in _METADATA_BROKER_TERMINAL_DENIAL_REASONS
         line = (
             f"metadata_broker_denied reason={reason} "
             f"syscall_nr={int(request.data.nr)}\n"
         )
         os.write(2, line.encode("ascii", "replace")[:256])
+        global _metadata_broker_denial_count
+        if _metadata_broker_evidence_fd is not None and _metadata_broker_denial_count < 32:
+            record = {
+                "schema": "aiworkhub.metadata_broker_denial.v1",
+                "authenticated": True,
+                "terminal": terminal,
+                "reason": reason,
+                "syscall_nr": int(request.data.nr),
+            }
+            os.write(
+                _metadata_broker_evidence_fd,
+                (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+            )
+            _metadata_broker_denial_count += 1
     except BaseException:  # noqa: BLE001 - telemetry is strictly best-effort
         pass
+    return terminal
 
 
 def _open_broker_scratch_root(scratch: Path) -> "tuple[int, PurePosixPath]":
@@ -7506,13 +7537,14 @@ def _run_metadata_broker(
                     )
                     response.val = 0
                     response.error = 0
+                    terminal_denial = False
                 except (WorkspaceError, OSError, ValueError) as exc:
                     # Fail closed with EPERM, but never swallow the cause: retain
                     # a bounded, path-free denial record so a real rejection is
                     # diagnosable instead of an opaque generic EPERM (NF430).
                     response.val = 0
                     response.error = -errno.EPERM
-                    _record_metadata_broker_denial(exc, request)
+                    terminal_denial = _record_metadata_broker_denial(exc, request)
                 if library.seccomp_notify_respond(listener_fd, response_ptr) != 0:
                     # A respond failure for a no-longer-valid notification (the
                     # caller died or was killed mid-request) is benign; a
@@ -7522,6 +7554,14 @@ def _run_metadata_broker(
                         == 0
                     ):
                         raise WorkspaceError("metadata_broker_respond_failed")
+                if terminal_denial:
+                    # The authenticated record is authoritative only because
+                    # this trusted parent makes the denial structurally
+                    # terminal for the command.  It can therefore never mask
+                    # an unrelated candidate failure from the same process.
+                    _kill_validator_group(child_pid)
+                    _reap_validator(child_pid)
+                    return 126
             finally:
                 library.seccomp_notify_free(request_ptr, response_ptr)
     except BaseException:
@@ -7769,6 +7809,17 @@ def _seccomp_notify_runtime_supported() -> bool:
 def _landlock_exec(argv: list[str]) -> int:
     import socket
 
+    global _metadata_broker_evidence_fd
+    raw_evidence_fd = os.environ.pop(_METADATA_BROKER_EVIDENCE_ENV, "")
+    if raw_evidence_fd:
+        try:
+            _metadata_broker_evidence_fd = int(raw_evidence_fd)
+            os.set_inheritable(_metadata_broker_evidence_fd, False)
+        except ValueError as exc:
+            raise WorkspaceError("metadata_broker_evidence_fd_invalid") from exc
+        except OSError as exc:
+            raise WorkspaceError("metadata_broker_evidence_fd_unusable") from exc
+
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--landlock-exec", action="store_true", required=True)
     parser.add_argument("--workspace", required=True)
@@ -7866,6 +7917,9 @@ def _landlock_exec(argv: list[str]) -> int:
             )
         finally:
             os.close(listener_fd)
+    if _metadata_broker_evidence_fd is not None:
+        os.close(_metadata_broker_evidence_fd)
+        _metadata_broker_evidence_fd = None
     _apply_metadata_seccomp()
     os.execvpe(command[0], command, os.environ.copy())
     return 126
@@ -9041,6 +9095,12 @@ def run_validations(
                     "value": tmpdir_override,
                 }
             started = time.monotonic()
+            broker_read_fd: int | None = None
+            broker_write_fd: int | None = None
+            broker_evidence: list[dict[str, Any]] = []
+            if selected_backend == "landlock":
+                broker_read_fd, broker_write_fd = os.pipe()
+                env[_METADATA_BROKER_EVIDENCE_ENV] = str(broker_write_fd)
             try:
                 result = subprocess.run(
                     wrapped,
@@ -9053,6 +9113,7 @@ def run_validations(
                     timeout=bounded_timeout,
                     check=False,
                     shell=False,
+                    pass_fds=(broker_write_fd,) if broker_write_fd is not None else (),
                 )
             except subprocess.TimeoutExpired as exc:
                 stdout = (
@@ -9131,6 +9192,20 @@ def run_validations(
                 )
                 results.append(launch_record)
                 continue
+            finally:
+                if broker_write_fd is not None:
+                    os.close(broker_write_fd)
+                    env.pop(_METADATA_BROKER_EVIDENCE_ENV, None)
+                if broker_read_fd is not None:
+                    raw_evidence = os.read(broker_read_fd, 16_384)
+                    os.close(broker_read_fd)
+                    for raw_line in raw_evidence.splitlines():
+                        try:
+                            item = json.loads(raw_line)
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        if isinstance(item, dict):
+                            broker_evidence.append(item)
             stdout = result.stdout or ""
             stderr = result.stderr or ""
             record = {
@@ -9156,6 +9231,11 @@ def run_validations(
                 "stderr_tail": stderr[-4_096:],
                 "stderr_truncated": len(stderr) > 8_192,
             }
+            if broker_evidence:
+                record["metadata_broker_denials"] = broker_evidence
+                # This attribution is launcher-authored from the private pipe;
+                # candidate stdout/stderr and pytest/provider prose are ignored.
+                record["metadata_broker_denial_attributed"] = True
             if result.returncode != 0:
                 # NF-WAVE-SANDBOX-TRUTH: prove any missing *validator* module by
                 # importing it in the SAME interpreter that ran the command, so

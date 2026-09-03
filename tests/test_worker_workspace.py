@@ -6631,6 +6631,83 @@ def test_fchmod_hardlink_noop_unlink_race_uses_authenticated_descriptor(
             os.close(spec_fd)
 
 
+def test_metadata_broker_denial_uses_private_structural_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    request = worker_workspace._SeccompNotif()
+    request.data.nr = 72
+    monkeypatch.setattr(worker_workspace, "_metadata_broker_evidence_fd", write_fd)
+    monkeypatch.setattr(worker_workspace, "_metadata_broker_denial_count", 0)
+    monkeypatch.setattr(
+        worker_workspace,
+        "_metadata_broker_denial_reason",
+        lambda _exc: "metadata_broker_deleted_fd",
+    )
+    try:
+        worker_workspace._record_metadata_broker_denial(RuntimeError(), request)
+    finally:
+        os.close(write_fd)
+    evidence = json.loads(os.read(read_fd, 4096))
+    os.close(read_fd)
+    assert evidence == {
+        "authenticated": True,
+        "reason": "metadata_broker_deleted_fd",
+        "schema": "aiworkhub.metadata_broker_denial.v1",
+        "syscall_nr": 72,
+        "terminal": True,
+    }
+
+
+def test_metadata_broker_outside_scratch_denial_is_nonterminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    request = worker_workspace._SeccompNotif()
+    request.data.nr = 71
+    monkeypatch.setattr(worker_workspace, "_metadata_broker_evidence_fd", write_fd)
+    monkeypatch.setattr(worker_workspace, "_metadata_broker_denial_count", 0)
+    try:
+        terminal = worker_workspace._record_metadata_broker_denial(
+            worker_workspace.WorkspaceError(
+                "metadata_broker_outside_scratch:/canonical/data"
+            ),
+            request,
+        )
+    finally:
+        os.close(write_fd)
+    evidence = json.loads(os.read(read_fd, 4096))
+    os.close(read_fd)
+    assert terminal is False
+    assert evidence["reason"] == "metadata_broker_outside_scratch"
+    assert evidence["terminal"] is False
+
+
+def test_landlock_exec_closes_broker_evidence_fd_before_direct_exec(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setenv(worker_workspace._METADATA_BROKER_EVIDENCE_ENV, str(write_fd))
+    monkeypatch.setattr(worker_workspace, "_apply_landlock", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_workspace, "_seccomp_notify_supported", lambda: False)
+    monkeypatch.setattr(worker_workspace, "_apply_metadata_seccomp", lambda: None)
+    monkeypatch.setattr(os, "chdir", lambda _path: None)
+
+    def execvpe(_file: str, _argv: list[str], env: dict[str, str]) -> None:
+        with pytest.raises(OSError):
+            os.fstat(write_fd)
+        assert worker_workspace._METADATA_BROKER_EVIDENCE_ENV not in env
+        raise RuntimeError("exec intercepted")
+
+    monkeypatch.setattr(os, "execvpe", execvpe)
+    with pytest.raises(RuntimeError, match="exec intercepted"):
+        worker_workspace._landlock_exec([
+            "--landlock-exec", "--workspace", str(tmp_path),
+            "--home", str(tmp_path), "--", "validator",
+        ])
+    os.close(read_fd)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="openat2 target acquisition is POSIX")
 @pytest.mark.skipif(
     not worker_workspace._openat2_available(),
