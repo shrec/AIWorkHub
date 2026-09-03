@@ -3103,12 +3103,18 @@ def create_task(
     coordinator_worker_runner = runner == CODEX_RUNNER
     if not title or len(title) > 300 or not objective or len(objective) > 4000:
         return _lifecycle_error("invalid_title_or_objective", 2)
-    if priority not in ("low", "normal", "high", "critical"):
-        return _lifecycle_error("invalid_priority", 2)
-    if risk_tier is not None and risk_tier not in (
-        "low", "medium", "high", "critical"
-    ):
-        return _lifecycle_error("invalid_risk_tier", 2)
+    allowed_priorities = ("low", "normal", "high", "critical")
+    if priority not in allowed_priorities:
+        result = _lifecycle_error("invalid_priority", 2)
+        result["allowed_priorities"] = list(allowed_priorities)
+        result["received_priority"] = priority[:80]
+        return result
+    allowed_risk_tiers = ("low", "medium", "high", "critical")
+    if risk_tier is not None and risk_tier not in allowed_risk_tiers:
+        result = _lifecycle_error("invalid_risk_tier", 2)
+        result["allowed_risk_tiers"] = list(allowed_risk_tiers)
+        result["received_risk_tier"] = risk_tier[:80]
+        return result
     allowed_task_types = ("code", "data_classification", "research")
     if task_type not in allowed_task_types:
         result = _lifecycle_error("invalid_task_type", 2)

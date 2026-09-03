@@ -727,6 +727,44 @@ def test_task_create_rejects_invalid_explicit_risk_tier(tmp_path, monkeypatch):
 
     assert result["ok"] is False
     assert result["stderr"] == "invalid_risk_tier"
+    assert result["allowed_risk_tiers"] == ["low", "medium", "high", "critical"]
+    assert result["received_risk_tier"] == "probably-safe"
+
+
+def test_task_create_rejects_invalid_priority_with_supported_values(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: {
+        "provider": "codex",
+        "session_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+        "thread_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+    })
+    monkeypatch.setattr(
+        core, "_verify_coordinator_capability", lambda runner: (True, "ok")
+    )
+
+    result = core.create_task(
+        task_id="TASK_INVALID_PRIORITY",
+        title="Invalid priority",
+        runner="codex_gpt-5.6-sol",
+        topic="task_mcp",
+        objective="Reject invented priority categories with a complete hint.",
+        acceptance=["Rejected."],
+        allowed_writes=[],
+        read_only=True,
+        priority="p0",
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"] == "invalid_priority"
+    assert result["allowed_priorities"] == ["low", "normal", "high", "critical"]
+    assert result["received_priority"] == "p0"
 
 
 def test_callback_origin_requires_real_uuid_not_window_alias():
