@@ -38,6 +38,25 @@ def test_normalize_depends_on_dedupes_and_bounds():
         task_plan.normalize_depends_on(list(range(65)))
 
 
+def test_superseded_reviewer_uses_canonical_status_and_is_not_actionable():
+    card = _card(
+        "QR-superseded",
+        status="superseded",
+        worker_status="superseded",
+        quality_review={"target_task_id": "T-old", "status": "pending"},
+        allowed_writes=["src/shared.py"],
+    )
+
+    snapshot = task_plan.build_snapshot([card])
+
+    assert task_plan.lifecycle_state(card) == "superseded"
+    assert snapshot["lifecycle"] == {"QR-superseded": "superseded"}
+    assert snapshot["ready"] == []
+    assert snapshot["active_count"] == 0
+    assert snapshot["ready_capacity"] == 0
+    assert snapshot["critical_path"] == []
+
+
 def test_validate_new_dependency_edge_rejects_self_dependency():
     with pytest.raises(task_plan.TaskPlanError, match="self_dependency_forbidden"):
         task_plan.validate_new_dependency_edge("t1", ["t1"], {"t1": []})

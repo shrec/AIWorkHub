@@ -131,6 +131,29 @@ def test_task_plan_summary_projection_retains_collision_truth():
     assert "task_ids" not in summary
 
 
+def test_summary_excludes_superseded_reviewer_from_actionable_surfaces():
+    cards = [
+        {
+            "task_id": "QR-superseded",
+            "status": "superseded",
+            "worker_status": "superseded",
+            "quality_review": {"target_task_id": "T-old", "status": "pending"},
+            "allowed_writes": ["src/shared.py"],
+            "depends_on": [],
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+    ]
+
+    full = task_plan.build_snapshot(cards)
+    summary = task_plan.summarize_task_plan_snapshot(full)
+
+    assert summary["actionable_lifecycle"] == {}
+    assert summary["ready"] == []
+    assert summary["active_count"] == 0
+    assert summary["ready_capacity"] == 0
+    assert summary["critical_path"] == []
+
+
 def test_summary_exposes_terminal_artifacts_excluded_and_agrees_with_full():
     cards = [
         {

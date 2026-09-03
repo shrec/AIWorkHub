@@ -23,7 +23,7 @@ def _init_repo(tmp_path: Path) -> Path:
 
 def _insert_card(repo: Path, task_id, *, runner="codex_a", topic="coding", status="pending",
                   worker_status="unclaimed", allowed_writes=None, depends_on=None,
-                  created_at="2026-01-01T00:00:00+00:00", archived_at=""):
+                  created_at="2026-01-01T00:00:00+00:00", archived_at="", **extra):
     _readiness, db_path = task_store._require_ready(repo)
     card = {
         "task_id": task_id,
@@ -33,6 +33,7 @@ def _insert_card(repo: Path, task_id, *, runner="codex_a", topic="coding", statu
         "depends_on": depends_on or [],
         "status": status,
         "worker_status": worker_status,
+        **extra,
     }
     conn = sqlite3.connect(db_path)
     try:
@@ -69,6 +70,30 @@ def test_task_plan_snapshot_reports_blockers_and_ready(tmp_path):
     assert snapshot["blockers"]["t2"] == ["t1"]
     assert "t1" in snapshot["ready"]
     assert "t2" not in snapshot["ready"]
+
+
+def test_task_plan_snapshot_matches_exact_superseded_reviewer_status():
+    repo = core.repo_root()
+    _insert_card(
+        repo,
+        "QR-superseded",
+        status="superseded",
+        worker_status="superseded",
+        quality_review={"target_task_id": "T-old", "status": "pending"},
+        allowed_writes=["src/shared.py"],
+    )
+
+    exact = task_store.get_task(repo, "QR-superseded")
+    snapshot = core.task_plan_snapshot()
+
+    assert exact is not None
+    assert exact["status"] == "superseded"
+    assert exact["worker_status"] == "superseded"
+    assert snapshot["lifecycle"]["QR-superseded"] == exact["status"]
+    assert "QR-superseded" not in snapshot["ready"]
+    assert snapshot["active_count"] == 0
+    assert snapshot["ready_capacity"] == 0
+    assert snapshot["critical_path"] == []
 
 
 def test_task_plan_snapshot_uses_one_bounded_card_read(monkeypatch):

@@ -556,6 +556,8 @@ def lifecycle_state(card: dict[str, Any]) -> str:
     worker_status = str(card.get("worker_status") or "").strip().lower()
     if status == "archived":
         return "archived"
+    if status == "superseded":
+        return "superseded"
     if status in {"finished", "completed", "stale_already_done"} or worker_status == "done":
         return "finished"
     if status.startswith("blocked") or worker_status.startswith(("blocked", "deferred")):
@@ -918,7 +920,7 @@ def summarize_task_plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     actionable_lifecycle = {
         str(task_id): str(state)
         for task_id, state in lifecycle_map.items()
-        if str(state).strip().lower() not in {"finished", "archived"}
+        if str(state).strip().lower() not in {"finished", "archived", "superseded"}
     }
     task_ids = snapshot.get("task_ids")
     task_count = len(task_ids) if isinstance(task_ids, list) else len(lifecycle_map)
