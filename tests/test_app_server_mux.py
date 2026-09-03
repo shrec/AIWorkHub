@@ -1171,6 +1171,29 @@ def test_wait_returns_child_exit_code_and_cleans_up(tmp_path):
     assert not h.mux.socket_path.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signal exit-code regression")
+def test_wait_wakes_blocked_extension_reader_and_preserves_sigkill(tmp_path):
+    h = _MuxHarness(tmp_path)
+    h.mux._real_executable = [
+        sys.executable,
+        "-c",
+        "import time; time.sleep(60)",
+    ]
+    h.start()
+    assert h.mux._child is not None
+    h.mux._child.kill()
+
+    try:
+        returncode = h.mux.wait()
+    finally:
+        h._closed = True
+        h._to_mux.close()
+        h._from_mux.close()
+
+    assert returncode == -9
+    assert all(not thread.is_alive() for thread in h.mux._threads)
+
+
 # ---------------------------------------------------------------------------
 # install_vscode_app_server_mux.py -- dry-run/check/print-config only
 # ---------------------------------------------------------------------------

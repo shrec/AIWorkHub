@@ -98,6 +98,7 @@ import json
 import os
 import re
 import secrets
+import select
 import socket
 import stat
 import struct
@@ -110,7 +111,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Iterator
 
 if os.name == "nt":  # pragma: no cover - imported only on Windows hosts
     import ctypes.wintypes as wintypes
@@ -1371,6 +1372,8 @@ class AppServerMux:
         self._threads: list[threading.Thread] = []
         self._threads_lock = threading.Lock()
         self._repo_binding_lock = threading.Lock()
+        self._reader_native_id: int | None = None
+        self._reader_wake_fds: tuple[int, int] | None = None
 
         self._capability_token = secrets.token_hex(CAPABILITY_TOKEN_BYTES)
         self._instances_dir = sideband_instances_dir(self._sideband_dir)
@@ -1469,6 +1472,8 @@ class AppServerMux:
             if child_start is not None
             else f"{self._generation_id}-{self._child.pid}"
         )
+        if os.name != "nt":
+            self._reader_wake_fds = os.pipe()
         self._start_thread(self._pump_extension_to_child)
         self._start_thread(self._pump_child_to_extension)
         if self._repo_id:
@@ -1566,16 +1571,13 @@ class AppServerMux:
         assert self._child is not None
         returncode = self._child.wait()
         self.shutdown()
-        with self._threads_lock:
-            threads = list(self._threads)
-        for t in threads:
-            t.join(timeout=2)
         return returncode
 
     def shutdown(self) -> None:
         if self._transcript_capture is not None:
             self._transcript_capture.close()
         self._stop_event.set()
+        self._wake_extension_reader()
         self._fail_all_pending("mux_shutdown")
         if self._server_socket is not None:
             with contextlib.suppress(OSError):
@@ -1598,6 +1600,44 @@ class AppServerMux:
                     self._child.wait(timeout=2)
         _close_windows_handle(self._child_job_handle)
         self._child_job_handle = None
+        deadline = time.monotonic() + 2.0
+        current = threading.current_thread()
+        with self._threads_lock:
+            threads = list(self._threads)
+        for thread in threads:
+            if thread is current:
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        wake_fds = self._reader_wake_fds
+        self._reader_wake_fds = None
+        if wake_fds is not None:
+            for fd in wake_fds:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+    def _wake_extension_reader(self) -> None:
+        """Wake the mux-owned stdin poller without closing process-global stdin."""
+
+        wake_fds = self._reader_wake_fds
+        if wake_fds is not None:
+            with contextlib.suppress(OSError, BlockingIOError):
+                os.write(wake_fds[1], b"x")
+            return
+        if os.name == "nt" and self._reader_native_id is not None:
+            # readline() on a Windows anonymous pipe ultimately blocks in
+            # ReadFile. Cancel only this mux thread's synchronous I/O; never
+            # close or replace the process-global stdin descriptor.
+            kernel32 = ctypes.windll.kernel32  # pragma: no cover - Windows only
+            kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenThread.restype = wintypes.HANDLE
+            kernel32.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
+            kernel32.CancelSynchronousIo.restype = wintypes.BOOL
+            handle = kernel32.OpenThread(0x0001, False, self._reader_native_id)
+            if handle:
+                try:
+                    kernel32.CancelSynchronousIo(handle)
+                finally:
+                    kernel32.CloseHandle(handle)
 
     def _fail_all_pending(self, reason: str) -> None:
         with self._pending_lock:
@@ -1610,11 +1650,9 @@ class AppServerMux:
     # --- extension <-> child transparent proxy ---
 
     def _pump_extension_to_child(self) -> None:
+        self._reader_native_id = threading.get_native_id()
         try:
-            while not self._stop_event.is_set():
-                raw_line = self._extension_stdin.readline()
-                if not raw_line:
-                    break
+            for raw_line in self._extension_lines():
                 if self._repo_root is None:
                     repo_id = self._repo_id or resolve_repo_id_for_mux()
                     if repo_id:
@@ -1626,6 +1664,46 @@ class AppServerMux:
             pass
         finally:
             self._shutdown_child_stdin()
+
+    def _extension_lines(self) -> Iterator[bytes]:
+        """Yield stdin frames while allowing shutdown to interrupt an idle pipe."""
+
+        wake_fds = self._reader_wake_fds
+        if wake_fds is None:
+            while not self._stop_event.is_set():
+                raw_line = self._extension_stdin.readline()
+                if not raw_line:
+                    return
+                yield raw_line
+            return
+
+        try:
+            input_fd = self._extension_stdin.fileno()
+        except (AttributeError, OSError, ValueError):
+            while not self._stop_event.is_set():
+                raw_line = self._extension_stdin.readline()
+                if not raw_line:
+                    return
+                yield raw_line
+            return
+
+        buffered = bytearray()
+        while not self._stop_event.is_set():
+            readable, _, _ = select.select([input_fd, wake_fds[0]], [], [])
+            if wake_fds[0] in readable:
+                return
+            chunk = os.read(input_fd, 64 * 1024)
+            if not chunk:
+                if buffered:
+                    yield bytes(buffered)
+                return
+            buffered.extend(chunk)
+            while True:
+                newline = buffered.find(b"\n")
+                if newline < 0:
+                    break
+                yield bytes(buffered[: newline + 1])
+                del buffered[: newline + 1]
 
     def _pump_child_to_extension(self) -> None:
         try:
