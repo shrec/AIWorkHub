@@ -38,7 +38,10 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
+
+if TYPE_CHECKING:
+    from .toolchain_authority import AuthoritySnapshot
 
 
 # ``VALIDATION_FAILED`` / ``VALIDATION_ENVIRONMENT_BLOCKED`` name the two terminal
@@ -3494,6 +3497,21 @@ def preflight_validation_capabilities(
         except WorkspaceError as exc:
             missing.add(f"repository_input:{exc}")
     return tuple(sorted(missing))
+
+
+def validation_toolchain_authority(
+    repo: Path, card: Mapping[str, Any]
+) -> "AuthoritySnapshot":
+    """Build the system-owned snapshot through this module's trusted boundary.
+
+    The import is deliberately local because this file must remain executable
+    as the standalone Landlock wrapper.  ``toolchain_authority`` calls the
+    parser and normalizer above rather than maintaining a second resolver.
+    """
+    from .toolchain_authority import AuthoritySnapshot, build_authority_snapshot
+
+    snapshot: AuthoritySnapshot = build_authority_snapshot(repo, card)
+    return snapshot
 
 
 def create_workspace(

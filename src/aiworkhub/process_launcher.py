@@ -111,6 +111,7 @@ from . import task_engine
 from . import task_fsm
 from . import task_store
 from . import task_templates
+from . import toolchain_authority as _toolchain_authority
 try:
     from . import project_context
 except ImportError:
@@ -4486,6 +4487,7 @@ class ProcessManager:
         adapter_builder: Callable[..., Any] | None = None,
         popen_factory: Callable[..., subprocess.Popen[bytes]] | None = None,
         isolation_enabled: bool = True,
+        toolchain_authority: _toolchain_authority.ToolchainAuthority | None = None,
     ) -> None:
         self.repo = (repo or core.repo_root()).resolve()
         self.process_log_path = process_log_path or Path(
@@ -4505,6 +4507,9 @@ class ProcessManager:
         self._adapter_builder = adapter_builder
         self._popen = popen_factory or subprocess.Popen
         self.isolation_enabled = isolation_enabled
+        self._toolchain_authority = toolchain_authority or (
+            _toolchain_authority.ToolchainAuthority(self.repo)
+        )
         self._lock = threading.RLock()
         self._live: dict[str, _LiveProcess] = {}
         self._cancelled: set[str] = set()
@@ -5995,12 +6000,13 @@ class ProcessManager:
         policy_result = repo_policy.validate_launch(self.repo, card, adapter_id)
         if not policy_result.get("ok"):
             raise LaunchRejected(str(policy_result.get("reason") or "repo_policy_rejected"))
-        missing_capabilities = _worker_workspace.preflight_validation_capabilities(
-            self.repo, card
-        )
-        if missing_capabilities:
+        authority_snapshot = self._toolchain_authority.evaluate(card)
+        self._toolchain_authority.repair(authority_snapshot)
+        if not authority_snapshot.available:
             detail = json.dumps(
-                missing_capabilities, ensure_ascii=False, separators=(",", ":")
+                [f"{fact.kind}:{fact.value}" for fact in authority_snapshot.missing],
+                ensure_ascii=False,
+                separators=(",", ":"),
             )
             raise LaunchRejected(f"task_contract_unwinnable:{detail}")
         # NF-2026-00548 (audit M3): refuse a relaunch that is byte-identical to

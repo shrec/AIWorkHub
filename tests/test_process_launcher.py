@@ -28,9 +28,32 @@ from aiworkhub import (  # noqa: E402
     process_launcher_acceptance,
     task_store,
     task_templates,
+    toolchain_authority,
     worker_ai_tools_mcp,
     worker_workspace,
 )
+
+
+class _RejectingToolchainAuthority:
+    def __init__(self) -> None:
+        self.repairs = 0
+
+    def evaluate(self, _card):
+        missing = (toolchain_authority.MissingRequirement("module", "pytest"),)
+        return toolchain_authority.AuthoritySnapshot(
+            schema_id=toolchain_authority.SCHEMA_ID,
+            repository="/repo",
+            path="",
+            executables=(),
+            modules=(),
+            repository_fingerprint="0" * 64,
+            missing=missing,
+            digest="1" * 64,
+        )
+
+    def repair(self, _snapshot):
+        self.repairs += 1
+        return False
 
 
 def _linked_needfix(repo: Path, task_id: str) -> str:
@@ -10534,6 +10557,37 @@ def test_validation_capability_preflight_rejects_before_launch_side_effects(
     assert card["worker_status"] == "unclaimed"
     assert not manager.process_log_path.exists()
     assert not manager.process_dir.exists()
+
+
+def test_process_manager_consumes_authority_before_collision_or_provider_launch(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    authority = _RejectingToolchainAuthority()
+    side_effects: list[str] = []
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(lambda: _card()),
+        collision_guard=lambda **_kwargs: side_effects.append("collision") or {},
+        adapter_builder=lambda **_kwargs: side_effects.append("provider"),
+        isolation_enabled=False,
+        toolchain_authority=authority,
+    )
+
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match=r'^task_contract_unwinnable:\["module:pytest"\]$',
+    ):
+        manager._preflight_card(
+            "TASK_B1", "claude_worker_b1", "task_mcp", "claude_cli"
+        )
+
+    assert authority.repairs == 1
+    assert side_effects == []
+    assert not (tmp_path / "events.jsonl").exists()
 
 
 @pytest.mark.parametrize(

@@ -486,6 +486,7 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "_platform_process.py",
         "platform_io.py",
         "runtime_temp.py",
+        "toolchain_authority.py",
         "validation_runner.py",
         "worker_workspace.py",
     ):
