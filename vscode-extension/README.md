@@ -12,6 +12,16 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.84 — 2026-09-03
+
+- Python attributes, member definitions and qualified accesses are now
+  addressable through Source Graph with stable receiver and source-position
+  identity.
+- Exact resolution respects lexical scope, shadowing and existing member
+  entities; uncertain inherited accesses remain honestly unresolved.
+- Secondary Python reparsing is authenticated and bounded by character, token,
+  node and depth limits before it can affect the manager process.
+
 ## What's new in 0.10.83 — 2026-09-03
 
 - Validation tool and interpreter discovery now comes from one system-owned

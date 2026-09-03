@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.84] - 2026-09-03
+
+This release closes the Python Source Graph attribute and member-identity blind
+spot while keeping exact destinations honest and bounded.
+
+### Fixed
+
+- Python attributes, member writes, reads, calls, decorators and annotations
+  now retain stable receiver and source-position identity, including distinct
+  accesses on the same line.
+- Exact member and imported-call resolution now respects lexical scope,
+  shadowing, evaluation order and direct entity existence; unsupported
+  inheritance remains honestly unresolved instead of fabricating a target.
+- Imported-member reparsing uses authenticated indexed bytes plus pre-parse
+  character/token ceilings, post-parse node/depth ceilings and linear
+  control-flow traversal.
+
 ## [0.10.83] - 2026-09-03
 
 This release makes validation capability recovery and rework retry authority

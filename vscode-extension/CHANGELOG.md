@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.84 — 2026-09-03
+
+### Fixed
+
+- Source Graph now indexes Python attribute/member definitions, writes, reads,
+  calls, decorators and annotations with stable receiver/source-position
+  identity.
+- Lexical shadowing, direct imports and exact member existence are enforced
+  before an edge is labeled exact; unsupported inheritance stays unresolved.
+- Authenticated imported-member reparsing is bounded before and after parsing,
+  and nested control-flow analysis no longer repeats subtrees exponentially.
+
 ## 0.10.83 — 2026-09-03
 
 ### Fixed

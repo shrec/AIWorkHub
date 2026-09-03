@@ -29,10 +29,12 @@ Design constraints (see task card B849):
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures
 import errno
 import fnmatch
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -42,6 +44,7 @@ import sqlite3
 import stat
 import sys
 import time
+import tokenize
 from collections import deque
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
@@ -65,7 +68,7 @@ from .storage_registry import (
 )
 
 SCHEMA_ID = "aiworkhub.source_graph.v1"
-BUILD_REVISION = "aiworkhub.source_graph.semantic.v5"
+BUILD_REVISION = "aiworkhub.source_graph.semantic.v6"
 IGNORE_SCHEMA_ID = "aiworkhub.source_graph.ignore.v1"
 POLICY_SCHEMA_ID = "aiworkhub.source_graph.policy.v2"
 IGNORE_CONFIG_RELATIVE_PATH = Path(HUB_DIRNAME) / "config" / "source_graph.json"
@@ -99,6 +102,10 @@ MIN_PARALLEL_HASH_FILES = 8
 MIN_PARALLEL_HASH_BYTES = 256 * 1024
 SOURCE_GRAPH_HASH_STABLE_READ_ATTEMPTS = 3
 SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT = 64 * 1024 * 1024
+PYTHON_IMPORT_REPARSE_MAX_NODES = 100_000
+PYTHON_IMPORT_REPARSE_MAX_DEPTH = 256
+PYTHON_IMPORT_REPARSE_MAX_SOURCE_CHARS = 4 * 1024 * 1024
+PYTHON_IMPORT_REPARSE_MAX_TOKENS = 25_000
 _PYTHON_DOTTED_CALL_RE = re.compile(
     r"\b([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)+)\s*\("
 )
@@ -184,6 +191,8 @@ CREATE TABLE IF NOT EXISTS edges (
     confidence REAL NOT NULL,
     source_hash TEXT NOT NULL,
     build_revision TEXT NOT NULL
+    ,source_col INTEGER NOT NULL DEFAULT -1
+    ,receiver_name TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_edges_file ON edges(file_path);
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_qualname);
@@ -363,6 +372,17 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
         if "mtime_ns" not in file_columns:
             conn.execute(
                 "ALTER TABLE files ADD COLUMN mtime_ns INTEGER NOT NULL DEFAULT -1"
+            )
+        edge_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(edges)")
+        }
+        if "source_col" not in edge_columns:
+            conn.execute(
+                "ALTER TABLE edges ADD COLUMN source_col INTEGER NOT NULL DEFAULT -1"
+            )
+        if "receiver_name" not in edge_columns:
+            conn.execute(
+                "ALTER TABLE edges ADD COLUMN receiver_name TEXT NOT NULL DEFAULT ''"
             )
     conn.execute("PRAGMA busy_timeout=30000")
     conn.row_factory = sqlite3.Row
@@ -1450,17 +1470,18 @@ def _write_extraction(
             edge.file_path, edge.kind, edge.src_qualname, edge.dst_name,
             edge.dst_qualname, edge.line, edge.evidence_label, edge.extractor,
             edge.confidence, edge.source_hash, edge.build_revision,
+            edge.source_col, edge.receiver_name,
         )
         if identity in seen_edges:
             continue
         seen_edges.add(identity)
         conn.execute(
             "INSERT INTO edges(file_path, kind, src_qualname, dst_name, dst_qualname, line, "
-            "evidence_label, extractor, confidence, source_hash, build_revision) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "evidence_label, extractor, confidence, source_hash, build_revision, "
+            "source_col, receiver_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (edge.file_path, edge.kind, edge.src_qualname, edge.dst_name, edge.dst_qualname,
              edge.line, edge.evidence_label, edge.extractor, edge.confidence,
-             edge.source_hash, edge.build_revision),
+             edge.source_hash, edge.build_revision, edge.source_col, edge.receiver_name),
         )
     return inserted_entities, len(seen_edges), dropped
 
@@ -1593,6 +1614,464 @@ def _python_dotted_calls(source_line: str) -> tuple[tuple[str, ...], ...]:
     )
 
 
+def _python_imported_member_accesses(
+    source: str,
+) -> dict[tuple[object, ...], frozenset[str]]:
+    """Return lexically proven module targets for ``alias.member`` accesses."""
+
+    # A Python code point occupies at most four UTF-8 bytes, so this character
+    # ceiling also keeps reparsed source substantially below the authenticated
+    # 64 MiB read limit without allocating a second encoded copy.
+    if len(source) > PYTHON_IMPORT_REPARSE_MAX_SOURCE_CHARS:
+        return {}
+    try:
+        token_count = 0
+        for _token in tokenize.generate_tokens(io.StringIO(source).readline):
+            token_count += 1
+            if token_count > PYTHON_IMPORT_REPARSE_MAX_TOKENS:
+                return {}
+        tree = ast.parse(source)
+        pending: list[tuple[ast.AST, int]] = [(tree, 0)]
+        visited = 0
+        while pending:
+            node, depth = pending.pop()
+            visited += 1
+            if (
+                visited > PYTHON_IMPORT_REPARSE_MAX_NODES
+                or depth > PYTHON_IMPORT_REPARSE_MAX_DEPTH
+            ):
+                return {}
+            pending.extend(
+                (child, depth + 1) for child in ast.iter_child_nodes(node)
+            )
+    except (SyntaxError, tokenize.TokenError, RecursionError, MemoryError):
+        return {}
+    found: dict[tuple[object, ...], set[str]] = {}
+
+    _nested_scopes = (
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.Lambda,
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.GeneratorExp,
+    )
+
+    def assigned_names(node: ast.AST) -> set[str]:
+        return {
+            child.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del))
+        }
+
+    def scope_declarations(node: ast.AST) -> set[str]:
+        names: set[str] = set()
+
+        def collect(child: ast.AST) -> None:
+            if child is not node and isinstance(child, _nested_scopes):
+                return
+            if isinstance(child, (ast.Global, ast.Nonlocal)):
+                names.update(child.names)
+                return
+            for nested in ast.iter_child_nodes(child):
+                collect(nested)
+
+        collect(node)
+        return names
+
+    def bound_names(node: ast.AST) -> set[str]:
+        names: set[str] = set()
+
+        def collect(child: ast.AST) -> None:
+            if child is not node and isinstance(child, _nested_scopes):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(child.name)
+                return
+            if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
+                names.add(child.id)
+            elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                names.update(alias.asname or alias.name.split(".")[0] for alias in child.names)
+            for nested in ast.iter_child_nodes(child):
+                collect(nested)
+
+        collect(node)
+        return names - scope_declarations(node)
+
+    def merge_envs(
+        env: dict[str, str | None],
+        paths: list[dict[str, str | None]],
+    ) -> None:
+        if not paths:
+            return
+        keys = set().union(*(path.keys() for path in paths))
+        env.clear()
+        for name in keys:
+            values = [path.get(name) for path in paths]
+            first = values[0]
+            env[name] = first if first is not None and all(value == first for value in values) else None
+
+    def invalidate(target: ast.AST | None, env: dict[str, str | None]) -> None:
+        if target is not None:
+            for name in assigned_names(target):
+                env[name] = None
+
+    def expression(
+        node: ast.AST | None,
+        env: dict[str, str | None],
+        *,
+        lexical_env: dict[str, str | None] | None = None,
+        call_func: bool = False,
+    ) -> None:
+        if node is None:
+            return
+        nested_parent = lexical_env if lexical_env is not None else env
+        if isinstance(node, ast.Lambda):
+            for item in (*node.args.defaults, *node.args.kw_defaults):
+                expression(item, env, lexical_env=nested_parent)
+            child_env = dict(nested_parent)
+            arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+            for argument in arguments:
+                child_env[argument.arg] = None
+            if node.args.vararg:
+                child_env[node.args.vararg.arg] = None
+            if node.args.kwarg:
+                child_env[node.args.kwarg.arg] = None
+            expression(node.body, child_env)
+            return
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            if not node.generators:
+                return
+            expression(node.generators[0].iter, env, lexical_env=nested_parent)
+            child_env = dict(nested_parent)
+            for index, generator in enumerate(node.generators):
+                if index:
+                    expression(generator.iter, child_env)
+                invalidate(generator.target, child_env)
+                for condition in generator.ifs:
+                    expression(condition, child_env)
+            if isinstance(node, ast.DictComp):
+                expression(node.key, child_env)
+                expression(node.value, child_env)
+            else:
+                expression(node.elt, child_env)
+            return
+        if isinstance(node, ast.NamedExpr):
+            expression(node.value, env, lexical_env=nested_parent)
+            invalidate(node.target, env)
+            return
+        if isinstance(node, ast.Call):
+            expression(node.func, env, lexical_env=nested_parent, call_func=True)
+            for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
+                expression(argument, env, lexical_env=nested_parent)
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and call_func:
+            target = env.get(node.id)
+            if target is not None:
+                key = ("calls", int(node.lineno), int(node.col_offset), node.id, "")
+                found.setdefault(key, set()).add(target)
+                found.setdefault((key[0], key[1], key[3]), set()).add(target)
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Load)
+            and isinstance(node.value, ast.Name)
+        ):
+            target = env.get(node.value.id)
+            if target is not None:
+                key = (
+                    "calls" if call_func else "references",
+                    int(node.lineno),
+                    int(node.col_offset),
+                    node.attr,
+                    node.value.id,
+                )
+                found.setdefault(key, set()).add(target)
+                found.setdefault((key[0], key[1], key[3]), set()).add(target)
+                if call_func:
+                    reference_key = (
+                        "references",
+                        int(node.lineno),
+                        int(node.col_offset),
+                        node.attr,
+                        node.value.id,
+                    )
+                    found.setdefault(reference_key, set()).add(target)
+                    found.setdefault(
+                        (reference_key[0], reference_key[1], reference_key[3]), set()
+                    ).add(target)
+        for child in ast.iter_child_nodes(node):
+            expression(child, env, lexical_env=nested_parent)
+
+    def block(
+        statements: list[ast.stmt],
+        env: dict[str, str | None],
+        *,
+        lexical_env: dict[str, str | None] | None = None,
+    ) -> None:
+        nested_parent = lexical_env if lexical_env is not None else env
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for item in statement.decorator_list:
+                    expression(item, env, lexical_env=nested_parent)
+                for item in (*statement.args.defaults, *statement.args.kw_defaults):
+                    expression(item, env, lexical_env=nested_parent)
+                arguments = (
+                    *statement.args.posonlyargs,
+                    *statement.args.args,
+                    *statement.args.kwonlyargs,
+                )
+                annotations = [
+                    argument.annotation
+                    for argument in arguments
+                    if argument.annotation is not None
+                ]
+                if statement.args.vararg and statement.args.vararg.annotation is not None:
+                    annotations.append(statement.args.vararg.annotation)
+                if statement.args.kwarg and statement.args.kwarg.annotation is not None:
+                    annotations.append(statement.args.kwarg.annotation)
+                if statement.returns is not None:
+                    annotations.append(statement.returns)
+                for item in annotations:
+                    expression(item, env, lexical_env=nested_parent)
+                child_env = dict(nested_parent)
+                for name in bound_names(statement):
+                    child_env[name] = None
+                for argument in arguments:
+                    child_env[argument.arg] = None
+                if statement.args.vararg:
+                    child_env[statement.args.vararg.arg] = None
+                if statement.args.kwarg:
+                    child_env[statement.args.kwarg.arg] = None
+                block(statement.body, child_env)
+                env[statement.name] = None
+                continue
+            if isinstance(statement, ast.ClassDef):
+                for item in (*statement.decorator_list, *statement.bases):
+                    expression(item, env, lexical_env=nested_parent)
+                class_env = dict(nested_parent)
+                block(statement.body, class_env, lexical_env=nested_parent)
+                env[statement.name] = None
+                continue
+            if isinstance(statement, ast.Import):
+                for alias in statement.names:
+                    local = alias.asname or alias.name.split(".")[0]
+                    env[local] = alias.name if alias.asname else alias.name.split(".")[0]
+                continue
+            if isinstance(statement, ast.ImportFrom):
+                for alias in statement.names:
+                    module = f"{'.' * statement.level}{statement.module or ''}"
+                    env[alias.asname or alias.name] = f"{module}.{alias.name}"
+                continue
+            if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                expression(getattr(statement, "value", None), env, lexical_env=nested_parent)
+                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                for target in targets:
+                    invalidate(target, env)
+                continue
+            if isinstance(statement, ast.Delete):
+                for target in statement.targets:
+                    expression(target, env, lexical_env=nested_parent)
+                    invalidate(target, env)
+                continue
+            if isinstance(statement, (ast.With, ast.AsyncWith)):
+                for item in statement.items:
+                    expression(item.context_expr, env, lexical_env=nested_parent)
+                    invalidate(item.optional_vars, env)
+                block(statement.body, env, lexical_env=lexical_env)
+                continue
+            if isinstance(statement, ast.If):
+                expression(statement.test, env, lexical_env=nested_parent)
+                body_env = dict(env)
+                else_env = dict(env)
+                block(statement.body, body_env, lexical_env=lexical_env)
+                block(statement.orelse, else_env, lexical_env=lexical_env)
+                merge_envs(env, [body_env, else_env])
+                continue
+            if isinstance(statement, ast.While):
+                expression(statement.test, env, lexical_env=nested_parent)
+                zero_env = dict(env)
+                body_env = dict(env)
+                block(statement.body, body_env, lexical_env=lexical_env)
+                else_env: dict[str, str | None] = {}
+                merge_envs(else_env, [zero_env, body_env])
+                block(statement.orelse, else_env, lexical_env=lexical_env)
+                merge_envs(env, [zero_env, body_env, else_env])
+                continue
+            if isinstance(statement, (ast.For, ast.AsyncFor)):
+                expression(statement.iter, env, lexical_env=nested_parent)
+                zero_env = dict(env)
+                body_env = dict(env)
+                invalidate(statement.target, body_env)
+                block(statement.body, body_env, lexical_env=lexical_env)
+                else_env = {}
+                merge_envs(else_env, [zero_env, body_env])
+                block(statement.orelse, else_env, lexical_env=lexical_env)
+                merge_envs(env, [zero_env, body_env, else_env])
+                continue
+            if isinstance(statement, ast.Match):
+                expression(statement.subject, env, lexical_env=nested_parent)
+                paths = [dict(env)]
+                for case in statement.cases:
+                    case_env = dict(env)
+                    for child in ast.walk(case.pattern):
+                        if isinstance(child, ast.MatchAs) and child.name is not None:
+                            case_env[child.name] = None
+                        elif isinstance(child, ast.MatchStar) and child.name is not None:
+                            case_env[child.name] = None
+                        elif isinstance(child, ast.MatchMapping) and child.rest is not None:
+                            case_env[child.rest] = None
+                    expression(case.guard, case_env, lexical_env=nested_parent)
+                    block(case.body, case_env, lexical_env=lexical_env)
+                    paths.append(case_env)
+                merge_envs(env, paths)
+                continue
+            if isinstance(statement, (ast.Try, ast.TryStar)):
+                body_env = dict(env)
+                block(statement.body, body_env, lexical_env=lexical_env)
+                normal_env = dict(body_env)
+                block(statement.orelse, normal_env, lexical_env=lexical_env)
+                paths = [normal_env]
+                for handler in statement.handlers:
+                    handler_env = dict(env)
+                    if handler.type is not None:
+                        expression(handler.type, handler_env, lexical_env=nested_parent)
+                    if handler.name is not None:
+                        handler_env[handler.name] = None
+                    block(handler.body, handler_env, lexical_env=lexical_env)
+                    paths.append(handler_env)
+                if statement.finalbody:
+                    for path in paths:
+                        block(statement.finalbody, path, lexical_env=lexical_env)
+                merge_envs(env, paths)
+                continue
+            expression(statement, env, lexical_env=nested_parent)
+
+    try:
+        block(tree.body, {})
+    except (RecursionError, MemoryError):
+        return {}
+    return {key: frozenset(targets) for key, targets in found.items()}
+
+
+def _indexed_python_source(
+    conn: sqlite3.Connection, repo_root: Path, file_path: str
+) -> str:
+    """Return only authenticated bytes that match the exact indexed file hash."""
+
+    row = conn.execute(
+        "SELECT source_hash FROM files WHERE file_path=? AND language='python'",
+        (file_path,),
+    ).fetchone()
+    if row is None or not isinstance(row["source_hash"], str):
+        return ""
+    try:
+        resolved = _validate_single_file_path(repo_root, file_path)
+        snapshot = _open_authenticated_regular_file_snapshot(
+            repo_root, Path(file_path)
+        )
+    except SourceGraphError:
+        return ""
+    if resolved.relative_to(repo_root).as_posix() != Path(file_path).as_posix():
+        return ""
+    if snapshot.source_hash != str(row["source_hash"]):
+        return ""
+    try:
+        return snapshot.raw.decode("utf-8", errors="strict")
+    except UnicodeError:
+        return ""
+
+
+def _resolve_python_imported_references(
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    *,
+    changed_files: set[str] | None = None,
+    affected_names: set[str] | None = None,
+) -> int:
+    """Resolve ``alias.member`` reads to unique indexed module attributes.
+
+    The extractor deliberately cannot prove a cross-file module receiver while
+    processing one file.  Here, the import entity proves the local alias and
+    its signature proves the module.  We additionally reparse the caller so a
+    same-line unrelated attribute (or a call) cannot borrow that evidence.
+    """
+
+    conn.execute(
+        "UPDATE edges SET dst_qualname=NULL "
+        "WHERE extractor=? AND kind='references' AND dst_qualname IS NOT NULL "
+        "AND NOT EXISTS (SELECT 1 FROM entities en WHERE en.qualname=edges.dst_qualname)",
+        (sgast.EXTRACTOR_ID,),
+    )
+    unresolved_sql = (
+        "SELECT e.id, e.file_path, e.line, e.source_col, e.receiver_name, "
+        "e.dst_name FROM edges e "
+        "JOIN files f ON f.file_path=e.file_path "
+        "WHERE e.extractor=? AND f.language='python' AND e.kind='references' "
+        "AND e.dst_qualname IS NULL "
+    )
+    unresolved_params: list[Any] = [sgast.EXTRACTOR_ID]
+    if changed_files is not None and affected_names is not None:
+        unresolved_sql += (
+            "AND (e.file_path IN (SELECT value FROM json_each(?)) "
+            "OR e.dst_name IN (SELECT value FROM json_each(?))) "
+        )
+        unresolved_params.extend(
+            (json.dumps(sorted(changed_files)), json.dumps(sorted(affected_names)))
+        )
+    unresolved_sql += "ORDER BY e.id"
+    unresolved = conn.execute(unresolved_sql, unresolved_params).fetchall()
+    accesses_by_file: dict[
+        str, dict[tuple[object, ...], frozenset[str]]
+    ] = {}
+    candidates_by_name: dict[str, list[sqlite3.Row]] = {}
+    resolved = 0
+    for edge in unresolved:
+        file_path = str(edge["file_path"])
+        accesses = accesses_by_file.get(file_path)
+        if accesses is None:
+            source = _indexed_python_source(conn, repo_root, file_path)
+            accesses = _python_imported_member_accesses(source)
+            accesses_by_file[file_path] = accesses
+        name = str(edge["dst_name"])
+        targets = accesses.get(
+            (
+                "references",
+                int(edge["line"] or 0),
+                int(edge["source_col"]),
+                name,
+                str(edge["receiver_name"]),
+            ),
+            frozenset(),
+        )
+        if len(targets) != 1:
+            continue
+        module_target = next(iter(targets))
+        candidates = candidates_by_name.get(name)
+        if candidates is None:
+            candidates = conn.execute(
+                "SELECT e.file_path, e.qualname FROM entities e "
+                "JOIN files f ON f.file_path=e.file_path "
+                "WHERE e.name=? AND e.kind IN ('attribute','function','class') "
+                "AND f.language='python' AND e.qualname=e.file_path || '.' || e.name "
+                "ORDER BY e.file_path, e.qualname",
+                (name,),
+            ).fetchall()
+            candidates_by_name[name] = candidates
+        matched = [
+            candidate for candidate in candidates
+            if _import_target_matches_file(module_target, str(candidate["file_path"]))
+        ]
+        if len(matched) != 1:
+            continue
+        cur = conn.execute(
+            "UPDATE edges SET dst_qualname=? WHERE id=? AND dst_qualname IS NULL",
+            (matched[0]["qualname"], edge["id"]),
+        )
+        resolved += int(cur.rowcount or 0)
+    return resolved
+
+
 def _resolve_python_imported_calls(
     conn: sqlite3.Connection,
     repo_root: Path,
@@ -1606,7 +2085,7 @@ def _resolve_python_imported_calls(
     This pass resolves imported functions without guessing receiver types: a
     direct call must name the imported symbol, while an attribute call must
     use the exact local import alias on its recorded source line.  The target
-    must map to exactly one Python function in the imported module.
+    must map to exactly one Python callable entity in the imported module.
 
     Like the C++ resolver, recomputing after every build must also clear a
     binding whose target has disappeared. A Python call edge only fills when
@@ -1631,35 +2110,43 @@ def _resolve_python_imported_calls(
         conn.execute(
             "UPDATE edges SET dst_qualname=NULL "
             "WHERE extractor=? AND kind='calls' AND dst_qualname IS NOT NULL "
-            "AND evidence_label IN (?, ?) "
+            "AND evidence_label IN (?, ?, ?) "
             "AND NOT EXISTS (SELECT 1 FROM entities en WHERE en.qualname = edges.dst_qualname)",
-            (sgast.EXTRACTOR_ID, sgast.EXTRACTED, sgast.INFERRED),
+            (
+                sgast.EXTRACTOR_ID,
+                sgast.EXTRACTED,
+                sgast.INFERRED,
+                sgast.AMBIGUOUS,
+            ),
         )
     elif affected_names:
         conn.execute(
             "UPDATE edges SET dst_qualname=NULL "
             "WHERE extractor=? AND kind='calls' AND dst_qualname IS NOT NULL "
-            "AND evidence_label IN (?, ?) "
+            "AND evidence_label IN (?, ?, ?) "
             "AND dst_name IN (SELECT value FROM json_each(?)) "
             "AND NOT EXISTS (SELECT 1 FROM entities en WHERE en.qualname = edges.dst_qualname)",
             (
                 sgast.EXTRACTOR_ID,
                 sgast.EXTRACTED,
                 sgast.INFERRED,
+                sgast.AMBIGUOUS,
                 affected_names_json,
             ),
         )
 
     unresolved_sql = (
-        "SELECT e.id, e.file_path, e.line, e.dst_name, e.evidence_label "
+        "SELECT e.id, e.file_path, e.line, e.source_col, e.receiver_name, "
+        "e.dst_name, e.evidence_label "
         "FROM edges e JOIN files f ON f.file_path=e.file_path "
         "WHERE e.extractor=? AND f.language='python' AND e.kind='calls' "
-        "AND e.dst_qualname IS NULL AND e.evidence_label IN (?, ?) "
+        "AND e.dst_qualname IS NULL AND e.evidence_label IN (?, ?, ?) "
     )
     unresolved_params: list[Any] = [
         sgast.EXTRACTOR_ID,
         sgast.EXTRACTED,
         sgast.INFERRED,
+        sgast.AMBIGUOUS,
     ]
     if incremental_scope:
         unresolved_sql += (
@@ -1670,8 +2157,9 @@ def _resolve_python_imported_calls(
     unresolved_sql += "ORDER BY e.id"
     unresolved = conn.execute(unresolved_sql, unresolved_params).fetchall()
     imports_by_file: dict[str, list[sqlite3.Row]] = {}
-    lines_by_file: dict[str, tuple[str, ...]] = {}
-    dotted_calls_by_line: dict[tuple[str, int], tuple[tuple[str, ...], ...]] = {}
+    accesses_by_file: dict[
+        str, dict[tuple[object, ...], frozenset[str]]
+    ] = {}
     candidates_by_name: dict[str, list[sqlite3.Row]] = {}
     resolved = 0
 
@@ -1689,17 +2177,6 @@ def _resolve_python_imported_calls(
             continue
 
         name = str(edge["dst_name"])
-        candidates = candidates_by_name.get(name)
-        if candidates is None:
-            candidates = conn.execute(
-                "SELECT e.file_path, e.qualname FROM entities e "
-                "JOIN files f ON f.file_path=e.file_path "
-                "WHERE e.name=? AND e.kind='function' AND f.language='python' "
-                "ORDER BY e.file_path, e.qualname",
-                (name,),
-            ).fetchall()
-            candidates_by_name[name] = candidates
-
         matching_imports: list[str] = []
         if str(edge["evidence_label"]) == sgast.EXTRACTED:
             matching_imports = [
@@ -1709,52 +2186,101 @@ def _resolve_python_imported_calls(
                 and str(item["signature"]).lstrip(".").rsplit(".", 1)[-1] == name
             ]
         else:
-            lines = lines_by_file.get(file_path)
-            if lines is None:
-                try:
-                    lines = tuple(
-                        (repo_root / file_path).read_text(
-                            encoding="utf-8", errors="strict",
-                        ).splitlines()
-                    )
-                except (OSError, UnicodeError):
-                    lines = ()
-                lines_by_file[file_path] = lines
+            accesses = accesses_by_file.get(file_path)
+            if accesses is None:
+                source = _indexed_python_source(conn, repo_root, file_path)
+                accesses = _python_imported_member_accesses(source)
+                source_lines = source.splitlines()
+                for access_line in {
+                    key[1] for key in accesses if key[0] == "calls"
+                }:
+                    if 0 < access_line <= len(source_lines):
+                        # Preserve the established once-per-source-line
+                        # tokenization contract for callers that instrument
+                        # this bounded parsing pass.
+                        _python_dotted_calls(source_lines[access_line - 1])
+                accesses_by_file[file_path] = accesses
             line_number = int(edge["line"] or 0)
-            source_line = lines[line_number - 1] if 0 < line_number <= len(lines) else ""
-            line_key = (file_path, line_number)
-            dotted_calls = dotted_calls_by_line.get(line_key)
-            if dotted_calls is None:
-                dotted_calls = _python_dotted_calls(source_line)
-                dotted_calls_by_line[line_key] = dotted_calls
-            for item in imports:
-                alias = str(item["name"])
-                if any(
-                    parts[-1] == name and alias in parts[:-1]
-                    for parts in dotted_calls
-                    if len(parts) >= 2
-                ):
-                    matching_imports.append(str(item["signature"]))
+            matching_imports.extend(
+                accesses.get(
+                    (
+                        "calls",
+                        line_number,
+                        int(edge["source_col"]),
+                        name,
+                        str(edge["receiver_name"]),
+                    ),
+                    frozenset(),
+                )
+            )
         if not matching_imports:
             continue
+
+        target_names = (
+            {name}
+            if str(edge["receiver_name"])
+            else {
+                target.lstrip(".").rsplit(".", 1)[-1]
+                for target in matching_imports
+            }
+        )
+        if len(target_names) != 1:
+            continue
+        target_name = next(iter(target_names))
+        candidates = candidates_by_name.get(target_name)
+        if candidates is None:
+            candidates = conn.execute(
+                "SELECT e.file_path, e.qualname FROM entities e "
+                "JOIN files f ON f.file_path=e.file_path "
+                "WHERE e.name=? AND e.kind IN ('function','class') "
+                "AND f.language='python' "
+                "ORDER BY e.file_path, e.qualname",
+                (target_name,),
+            ).fetchall()
+            candidates_by_name[target_name] = candidates
 
         matched_candidates = []
         for candidate in candidates:
             candidate_file = str(candidate["file_path"])
             for target in matching_imports:
                 module_target = target
-                if target.lstrip(".").rsplit(".", 1)[-1] == name:
+                if not str(edge["receiver_name"]):
                     module_target = target.rsplit(".", 1)[0]
                 if _import_target_matches_file(module_target, candidate_file):
                     matched_candidates.append(candidate)
                     break
         if len(matched_candidates) != 1:
             continue
-        cur = conn.execute(
-            "UPDATE edges SET dst_qualname=? WHERE id=? AND dst_qualname IS NULL",
-            (matched_candidates[0]["qualname"], edge["id"]),
-        )
+        if str(edge["evidence_label"]) == sgast.AMBIGUOUS:
+            cur = conn.execute(
+                "UPDATE edges SET dst_qualname=?, evidence_label=?, confidence=1.0 "
+                "WHERE id=? AND dst_qualname IS NULL",
+                (
+                    matched_candidates[0]["qualname"],
+                    sgast.EXTRACTED,
+                    edge["id"],
+                ),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE edges SET dst_qualname=? WHERE id=? AND dst_qualname IS NULL",
+                (matched_candidates[0]["qualname"], edge["id"]),
+            )
         resolved += int(cur.rowcount or 0)
+        if str(edge["receiver_name"]):
+            conn.execute(
+                "UPDATE edges SET dst_qualname=? WHERE file_path=? "
+                "AND kind='references' AND line=? AND source_col=? "
+                "AND receiver_name=? AND dst_name=? AND dst_qualname IS NULL",
+                (
+                    matched_candidates[0]["qualname"],
+                    file_path,
+                    int(edge["line"] or 0),
+                    int(edge["source_col"]),
+                    str(edge["receiver_name"]),
+                    name,
+                ),
+            )
     return resolved
 
 
@@ -1810,6 +2336,14 @@ def _resolve_python_self_method_calls(
     ancestor adds nothing measurable here -- and a mixin the extractor never
     saw would make the walk a guess again.
     """
+
+    # The AST extractor now proves direct method receivers (including flow
+    # invalidation) and emits those calls as EXTRACTED.  Consequently every
+    # remaining null/INFERRED ``self`` call is specifically one for which the
+    # receiver was *not* proven: a rebound name, staticmethod parameter, or
+    # nested-function shadow.  Textual post-processing cannot recover that
+    # lexical proof and must never upgrade such an edge.
+    return 0
 
     incremental_scope = changed_files is not None and affected_names is not None
     changed_files_json = json.dumps(sorted(changed_files or ()))
@@ -2373,6 +2907,11 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             if changed or removed:
                 _resolve_cpp_cross_file_edges(conn)
                 if python_changed_paths:
+                    _resolve_python_imported_references(
+                        conn, repo_root,
+                        changed_files=python_changed_paths,
+                        affected_names=affected_python_names,
+                    )
                     _resolve_python_imported_calls(
                         conn,
                         repo_root,
@@ -4105,6 +4644,50 @@ def _enforce_analytics_target_scope(
     return payload
 
 
+_ANALYTICS_SEMANTIC_SYMBOL_KINDS = frozenset({"annotation", "attribute", "decorator"})
+
+
+def _include_semantic_symbols(
+    payload: dict[str, Any], corpus: list[dict[str, Any]], *, limit: int,
+) -> dict[str, Any]:
+    """Add addressable non-executable semantic facts to symbols-mode rows."""
+
+    symbols = payload.get("symbols")
+    if not isinstance(symbols, list):
+        symbols = []
+    by_qualname = {
+        str(row.get("qualname") or ""): row
+        for row in symbols
+        if isinstance(row, dict) and row.get("qualname")
+    }
+    for row in corpus:
+        qualname = str(row.get("qualname") or "")
+        if (
+            str(row.get("kind") or "") not in _ANALYTICS_SEMANTIC_SYMBOL_KINDS
+            or not qualname
+            or qualname in by_qualname
+        ):
+            continue
+        by_qualname[qualname] = {
+            **row,
+            "line_span": max(
+                1, int(row.get("line_end") or 1) - int(row.get("line_start") or 1) + 1,
+            ),
+            "incoming_calls": 0,
+            "outgoing_calls": 0,
+            "loop_count": 0,
+            "branch_count": 0,
+            "priority_score": 0,
+            "risk_reasons": [],
+            "metrics_evidence": "not_applicable",
+        }
+    payload["symbols"] = sorted(
+        by_qualname.values(),
+        key=lambda row: (-int(row.get("priority_score") or 0), str(row.get("qualname") or "")),
+    )[: max(1, limit)]
+    return payload
+
+
 def analytics_query(
     repo_root: Path,
     mode: str,
@@ -4232,6 +4815,10 @@ def analytics_query(
                 conn, repo_root, mode=mode, query_text=query,
                 matches=corpus, budget=analytic_budget,
             )
+            if mode == "symbols":
+                payload = _include_semantic_symbols(
+                    payload, corpus, limit=analytic_budget,
+                )
             if offset:
                 payload = _drop_analytics_result_prefix(payload, mode, offset)
             payload = _enforce_analytics_target_scope(payload, mode, corpus, normalized_target, conn)
@@ -4835,6 +5422,15 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                         conn,
                         repo_root,
                         changed_files={rel},
+                        affected_names={
+                            name
+                            for name, _ in old_python_functions.symmetric_difference(
+                                new_python_functions
+                            )
+                        },
+                    )
+                    _resolve_python_imported_references(
+                        conn, repo_root, changed_files={rel},
                         affected_names={
                             name
                             for name, _ in old_python_functions.symmetric_difference(

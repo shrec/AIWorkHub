@@ -122,6 +122,82 @@ def test_entity_qualname_join_has_a_dedicated_index(tmp_path):
     assert any("idx_entities_qualname" in str(row["detail"]) for row in plan)
 
 
+def test_python_local_class_rebind_invalidates_exact_member_destination(tmp_path):
+    repo = _new_repo(tmp_path, "python_local_class_rebind")
+    target = repo / "local_rebind.py"
+    _write(
+        target,
+        "def run():\n"
+        "    class Worker:\n"
+        "        def noinline(self):\n"
+        "            return None\n"
+        "    Worker.noinline()\n"
+        "    Worker = unknown\n"
+        "    Worker.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-local-rebind")
+    calls = [
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    ]
+    assert {edge.line: edge.dst_qualname for edge in calls} == {
+        5: "local_rebind.py.run.Worker.noinline",
+        7: None,
+    }
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    ["def Worker():\n    return None\n", "import unknown as Worker\n"],
+)
+def test_python_module_rebind_invalidates_class_member_destination(
+    tmp_path, replacement,
+):
+    repo = _new_repo(tmp_path, "python_module_class_rebind")
+    target = repo / "module_rebind.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n"
+        + replacement
+        + "Worker.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-module-rebind")
+    call = next(
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    )
+    assert call.dst_qualname is None
+    assert call.evidence_label == sgast.INFERRED
+
+
+def test_python_many_predeclaration_member_accesses_stay_bounded(tmp_path):
+    repo = _new_repo(tmp_path, "python_predeclaration_scaling")
+    target = repo / "many_before.py"
+    accesses = "".join("Worker.noinline()\n" for _ in range(2000))
+    _write(
+        target,
+        accesses
+        + "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n",
+    )
+
+    clock = __import__("time").perf_counter
+    started = clock()
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-predecl-scale")
+    elapsed = clock() - started
+    calls = [
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    ]
+    assert len(calls) == 2000
+    assert all(edge.dst_qualname is None for edge in calls)
+    assert elapsed < 2.0
+
 def test_db_path_requires_manifest_never_falls_back_to_cwd(tmp_path, monkeypatch):
     unmanaged = tmp_path / "no_manifest"
     unmanaged.mkdir()
@@ -4691,3 +4767,1460 @@ def test_source_graph_continuation_zero_hit_remains_ok(tmp_path):
     assert result["ok"] is True
     assert result["hit_count"] == 0
     assert result["truncated"] is False
+
+
+def test_python_attribute_members_have_exact_or_honestly_unresolved_identity(tmp_path):
+    repo = _new_repo(tmp_path, "python_members")
+    target = repo / "pkg" / "members.py"
+    _write(
+        target,
+        "import helpers as module\n\n"
+        "noinline = lambda: None\n\n"
+        "class Worker:\n"
+        "    noinline = staticmethod(lambda: None)\n\n"
+        "    def configure(self, cls):\n"
+        "        self.noinline = lambda: None\n"
+        "        cls.noinline = lambda: None\n"
+        "        self.noinline()\n\n"
+        "obj = Worker()\n"
+        "obj.noinline()\n"
+        "Worker.noinline()\n"
+        "module.noinline()\n"
+        "unknown.noinline()\n\n"
+        "@module.noinline\n"
+        "def decorated(value: module.noinline) -> module.noinline:\n"
+        "    return value\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590")
+    members = {entity.qualname for entity in extraction.entities if entity.kind == "attribute"}
+    assert "pkg/members.py.noinline" in members
+    assert "pkg/members.py.Worker.noinline" in members
+
+    calls = [edge for edge in extraction.edges if edge.kind == "calls" and edge.dst_name == "noinline"]
+    assert {edge.dst_qualname for edge in calls} >= {
+        "pkg/members.py.Worker.noinline", None,
+    }
+    unresolved = [edge for edge in calls if edge.dst_qualname is None]
+    assert unresolved and all(edge.evidence_label == sgast.INFERRED for edge in unresolved)
+
+    roles = {(edge.kind, edge.dst_name) for edge in extraction.edges}
+    assert ("decorates", "noinline") in roles
+    assert ("annotates", "noinline") in roles
+    assert len({
+        (
+            edge.kind,
+            edge.src_qualname,
+            edge.dst_qualname,
+            edge.line,
+            edge.source_col,
+            edge.receiver_name,
+        )
+        for edge in extraction.edges
+    }) == len(extraction.edges)
+
+
+def test_python_instance_member_resolution_is_scope_and_flow_safe(tmp_path):
+    repo = _new_repo(tmp_path, "python_member_receiver_safety")
+    target = repo / "members.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n\n"
+        "def first():\n"
+        "    obj = Worker()\n"
+        "    obj.noinline()\n\n"
+        "def second(obj):\n"
+        "    obj.noinline()\n\n"
+        "obj = Worker()\n"
+        "obj = untrusted\n"
+        "obj.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-scope-flow")
+    calls = [
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    ]
+
+    exact = next(edge for edge in calls if edge.src_qualname == "members.py.first")
+    assert exact.dst_qualname == "members.py.Worker.noinline"
+    assert exact.evidence_label == sgast.EXTRACTED
+
+    unsafe = [
+        edge for edge in calls
+        if edge.src_qualname in {"members.py.second", "members.py"}
+    ]
+    assert len(unsafe) == 2
+    assert all(edge.dst_qualname is None for edge in unsafe)
+    assert all(edge.evidence_label == sgast.INFERRED for edge in unsafe)
+
+
+def test_python_class_member_resolution_respects_receiver_shadowing(tmp_path):
+    repo = _new_repo(tmp_path, "python_member_receiver_shadowing")
+    target = repo / "members.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n\n"
+        "def parameter_shadow(Worker):\n"
+        "    Worker.noinline()\n\n"
+        "def local_shadow():\n"
+        "    Worker = unknown\n"
+        "    Worker.noinline()\n\n"
+        "def later_local_shadow():\n"
+        "    Worker.noinline()\n"
+        "    Worker = unknown\n\n"
+        "Worker = unknown\n"
+        "Worker.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-shadowing")
+    calls = [
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    ]
+
+    assert len(calls) == 4
+    assert all(edge.dst_qualname is None for edge in calls)
+    assert all(edge.evidence_label == sgast.INFERRED for edge in calls)
+
+
+def test_python_factory_result_is_not_constructor_type_proof(tmp_path):
+    repo = _new_repo(tmp_path, "python_factory_member")
+    target = repo / "factory.py"
+    _write(
+        target,
+        "def make():\n"
+        "    return unknown\n\n"
+        "obj = make()\n"
+        "obj.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-factory")
+    call = next(
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    )
+    assert call.dst_qualname is None
+    assert call.evidence_label == sgast.INFERRED
+
+
+def test_python_nested_sibling_class_is_not_lexically_visible(tmp_path):
+    repo = _new_repo(tmp_path, "python_nested_member")
+    target = repo / "nested.py"
+    _write(
+        target,
+        "def owner():\n"
+        "    class Worker:\n"
+        "        def noinline(self):\n"
+        "            return None\n\n"
+        "def unrelated():\n"
+        "    Worker.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-lexical")
+    call = next(
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    )
+    assert call.dst_qualname is None
+    assert call.evidence_label == sgast.INFERRED
+
+
+def test_python_large_scope_member_analysis_is_bounded(tmp_path):
+    repo = _new_repo(tmp_path, "python_large_member_scope")
+    target = repo / "large.py"
+    accesses = "".join("    obj.noinline()\n" for _ in range(1500))
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n\n"
+        "def run():\n"
+        "    obj = Worker()\n"
+        + accesses,
+    )
+
+    started = time.monotonic()
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-bounded")
+    elapsed = time.monotonic() - started
+    calls = [
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    ]
+    assert len(calls) == 1500
+    assert all(edge.dst_qualname == "large.py.Worker.noinline" for edge in calls)
+    assert elapsed < 3.0
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "    Worker = unknown\n",
+        "    del Worker\n",
+        "    import unknown as Worker\n",
+        "    def Worker():\n        return None\n",
+    ],
+)
+def test_python_global_with_actual_binding_does_not_fabricate_member_identity(
+    tmp_path, binding,
+):
+    repo = _new_repo(tmp_path, "python_global_member_rebinding")
+    target = repo / "global_before.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n\n"
+        "def rebound():\n"
+        "    global Worker\n"
+        "    Worker.noinline()\n"
+        + binding,
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-global-binding")
+    call = next(
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    )
+
+    assert call.dst_qualname is None
+    assert call.evidence_label == sgast.INFERRED
+
+
+def test_python_global_without_binding_keeps_module_member_resolution(tmp_path):
+    repo = _new_repo(tmp_path, "python_global_member_reference")
+    target = repo / "global_reference.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n\n"
+        "def reference():\n"
+        "    global Worker\n"
+        "    Worker.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-global-reference")
+    call = next(
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    )
+
+    assert call.dst_qualname == "global_reference.py.Worker.noinline"
+    assert call.evidence_label == sgast.EXTRACTED
+
+
+def test_python_later_structural_pattern_captures_shadow_class_receiver(tmp_path):
+    repo = _new_repo(tmp_path, "python_pattern_member_shadowing")
+    target = repo / "patterns.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n\n"
+        "def match_as(value):\n"
+        "    Worker.noinline()\n"
+        "    match value:\n"
+        "        case Worker:\n"
+        "            return Worker\n\n"
+        "def nested_match(value):\n"
+        "    Worker.noinline()\n"
+        "    match value:\n"
+        "        case {'items': [*Worker], **remaining}:\n"
+        "            return Worker, remaining\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-pattern-binding")
+    calls = [
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    ]
+
+    assert len(calls) == 2
+    assert all(edge.dst_qualname is None for edge in calls)
+    assert all(edge.evidence_label == sgast.INFERRED for edge in calls)
+
+
+def test_python_nested_semantic_roles_keep_terminal_names_and_lexical_owner(tmp_path):
+    repo = _new_repo(tmp_path, "python_nested_roles")
+    target = repo / "x.py"
+    _write(
+        target,
+        "import types\n\n"
+        "def outer(value):\n"
+        "    return value\n\n"
+        "@outer(types.noinline)\n"
+        "def decorated(x: list[types.noinline]):\n"
+        "    local: types.noinline = x\n"
+        "    return local\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590")
+    roles = {
+        (entity.kind, entity.name, entity.qualname)
+        for entity in extraction.entities
+        if entity.kind in {"annotation", "decorator"}
+    }
+
+    owner = "x.py.decorated"
+    assert ("decorator", "outer", f"{owner}::decorator::outer::6") in roles
+    assert ("decorator", "noinline", f"{owner}::decorator::noinline::6") in roles
+    assert ("annotation", "noinline", f"{owner}::annotation::noinline::7") in roles
+    assert ("annotation", "noinline", f"{owner}::annotation::noinline::8") in roles
+    assert not any(
+        qualname.startswith("x.py::annotation::") or name == "list"
+        for kind, name, qualname in roles
+        if kind == "annotation"
+    )
+
+
+def test_python_member_entities_are_searchable_and_bounded(tmp_path):
+    repo = _new_repo(tmp_path, "python_member_index")
+    _write(repo / "pkg" / "helpers.py", "def noinline():\n    return 1\n")
+    _write(
+        repo / "pkg" / "members.py",
+        "import pkg.helpers as module\n\n"
+        "class Worker:\n"
+        "    def set_value(self):\n"
+        "        self.noinline = 1\n"
+        "        return self.noinline\n\n"
+        "module.noinline()\n\n"
+        "@module.noinline\n"
+        "def decorated(value: module.noinline) -> module.noinline:\n"
+        "    return value\n",
+    )
+    sg.build_index(repo, incremental=False)
+
+    payload = sg.focus(repo, "noinline", budget=8)
+    assert any(row["kind"] == "attribute" for row in payload["matches"])
+
+    symbols = sg.analytics_query(repo, "symbols", "noinline", budget=8)
+    semantic_rows = [
+        row for row in symbols["symbols"]
+        if row["kind"] in {"annotation", "attribute", "decorator"}
+    ]
+    assert {row["kind"] for row in semantic_rows} == {
+        "annotation", "attribute", "decorator",
+    }
+    assert len(symbols["symbols"]) <= 8
+    assert symbols["coverage"]["returned"] == len(symbols["symbols"])
+    assert all(row["qualname"] for row in semantic_rows)
+    assert all(
+        row["metrics_evidence"] == "not_applicable"
+        and row["incoming_calls"] == row["outgoing_calls"] == 0
+        and row["priority_score"] == 0
+        for row in semantic_rows
+    )
+
+    impact = sg.impact(repo, "noinline", budget=8)
+    assert any(row["file_path"] == "pkg/members.py" for row in impact["impacted_files"])
+    assert any(
+        edge.get("dst_qualname") == "pkg/helpers.py.noinline"
+        for edge in impact["incoming_calls"]
+    )
+
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM entities WHERE kind='attribute' AND name='noinline'"
+        ).fetchone()[0] == 1
+        target = conn.execute(
+            "SELECT dst_qualname FROM edges WHERE file_path='pkg/members.py' "
+            "AND kind='calls' AND dst_name='noinline' AND line=8"
+        ).fetchone()[0]
+        assert target == "pkg/helpers.py.noinline"
+    finally:
+        conn.close()
+
+
+def test_python_method_receiver_identity_requires_unshadowed_direct_receiver(tmp_path):
+    repo = _new_repo(tmp_path, "python_method_receiver_proof")
+    target = repo / "receivers.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n\n"
+        "    def rebound_self(self):\n"
+        "        self = unknown\n"
+        "        self.noinline()\n\n"
+        "    @classmethod\n"
+        "    def rebound_cls(cls):\n"
+        "        del cls\n"
+        "        cls.noinline()\n\n"
+        "    @staticmethod\n"
+        "    def spoofed(self):\n"
+        "        self.noinline()\n\n"
+        "    def outer(self):\n"
+        "        def nested(self):\n"
+        "            self.noinline()\n"
+        "        return nested\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-receiver-proof")
+    calls = [
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    ]
+    assert len(calls) == 4
+    assert all(edge.dst_qualname is None for edge in calls)
+    assert all(edge.evidence_label == sgast.INFERRED for edge in calls)
+    assert {edge.src_qualname for edge in calls} == {
+        "receivers.py.Worker.rebound_self",
+        "receivers.py.Worker.rebound_cls",
+        "receivers.py.Worker.spoofed",
+        "receivers.py.Worker.outer.nested",
+    }
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        indexed = conn.execute(
+            "SELECT dst_qualname, evidence_label FROM edges "
+            "WHERE kind='calls' AND dst_name='noinline' ORDER BY line"
+        ).fetchall()
+        assert len(indexed) == 4
+        assert all(row["dst_qualname"] is None for row in indexed)
+        assert all(row["evidence_label"] == sgast.INFERRED for row in indexed)
+    finally:
+        conn.close()
+
+
+def test_python_local_class_predeclaration_shadows_same_named_module_class(tmp_path):
+    repo = _new_repo(tmp_path, "python_local_class_predeclaration")
+    target = repo / "case.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n\n"
+        "def run():\n"
+        "    Worker.noinline()\n"
+        "    class Worker:\n"
+        "        def noinline(self):\n"
+        "            return None\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-local-class-before")
+    call = next(
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    )
+    assert call.dst_qualname is None
+    assert call.evidence_label == sgast.INFERRED
+
+
+def test_python_method_does_not_inherit_containing_class_nested_class(tmp_path):
+    repo = _new_repo(tmp_path, "python_method_class_namespace")
+    target = repo / "case.py"
+    _write(
+        target,
+        "class Outer:\n"
+        "    class Worker:\n"
+        "        def noinline(self):\n"
+        "            return None\n\n"
+        "    def run(self):\n"
+        "        Worker.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-method-class-scope")
+    call = next(
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    )
+    assert call.dst_qualname is None
+    assert call.evidence_label == sgast.INFERRED
+
+
+def test_python_method_unqualified_class_name_resolves_global_not_nested(tmp_path):
+    repo = _new_repo(tmp_path, "python_method_global_namespace")
+    target = repo / "case.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n\n"
+        "class Outer:\n"
+        "    class Worker:\n"
+        "        def noinline(self):\n"
+        "            return None\n\n"
+        "    def run(self):\n"
+        "        Worker.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-method-global")
+    call = next(
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    )
+    assert call.dst_qualname == "case.py.Worker.noinline"
+    assert call.dst_qualname != "case.py.Outer.Worker.noinline"
+    assert call.evidence_label == sgast.EXTRACTED
+
+
+@pytest.mark.parametrize("compound", ["if flag:\n", "try:\n"])
+def test_python_nested_instance_rebind_precedes_member_call(tmp_path, compound):
+    repo = _new_repo(tmp_path, "python_nested_instance_rebind")
+    target = repo / "case.py"
+    suffix = "except Exception:\n    pass\n" if compound.startswith("try") else ""
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n\n"
+        "obj = Worker()\n"
+        + compound
+        + "    obj = unknown\n"
+        + "    obj.noinline()\n"
+        + suffix,
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-nested-rebind")
+    call = next(
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    )
+    assert call.dst_qualname is None
+    assert call.evidence_label == sgast.INFERRED
+
+
+def test_python_nested_self_rebind_precedes_member_call(tmp_path):
+    repo = _new_repo(tmp_path, "python_nested_self_rebind")
+    target = repo / "case.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n\n"
+        "    def run(self, flag):\n"
+        "        if flag:\n"
+        "            self = unknown\n"
+        "            self.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="nf590-nested-self")
+    call = next(
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    )
+    assert call.dst_qualname is None
+    assert call.evidence_label == sgast.INFERRED
+def test_python_member_receiver_flow_handles_namedexpr_match_and_comprehensions(tmp_path):
+    repo = tmp_path / "repo"
+    target = repo / "fixture.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self):\n"
+        "        return None\n"
+        "\n"
+        "def run(unknown, value, values):\n"
+        "    obj = Worker()\n"
+        "    if (obj := unknown):\n"
+        "        obj.noinline()\n"
+        "    obj = Worker()\n"
+        "    match value:\n"
+        "        case obj:\n"
+        "            obj.noinline()\n"
+        "    obj = Worker()\n"
+        "    [obj.noinline() for obj in values]\n"
+        "    obj.noinline()\n"
+        "    [obj.noinline() for item in values]\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+    calls = {
+        edge.line: edge
+        for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    }
+
+    for line in (8, 12, 14):
+        assert calls[line].dst_qualname is None
+        assert calls[line].evidence_label == sgast.INFERRED
+    for line in (15, 16):
+        assert calls[line].dst_qualname == "fixture.py.Worker.noinline"
+        assert calls[line].evidence_label == sgast.EXTRACTED
+
+
+def test_imported_direct_call_is_resolved_only_by_the_cross_file_index(tmp_path):
+    repo = _new_repo(tmp_path, "imported_direct_call")
+    _write(
+        repo / "pkg.py",
+        "class Worker:\n"
+        "    pass\n"
+        "value = 1\n",
+    )
+    consumer = repo / "consumer.py"
+    _write(
+        consumer,
+        "from pkg import Worker, value\n"
+        "import pkg\n"
+        "Worker()\n"
+        "value()\n"
+        "pkg()\n",
+    )
+
+    extraction = sgast.extract_file(repo, consumer, build_revision="test")
+    extracted_calls = {
+        edge.dst_name: edge
+        for edge in extraction.edges
+        if edge.kind == "calls"
+    }
+    assert extracted_calls["Worker"].dst_qualname is None
+    assert extracted_calls["value"].dst_qualname is None
+    assert extracted_calls["pkg"].dst_qualname is None
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        indexed_calls = {
+            row["dst_name"]: row["dst_qualname"]
+            for row in conn.execute(
+                "SELECT dst_name, dst_qualname FROM edges "
+                "WHERE file_path='consumer.py' AND kind='calls'"
+            )
+        }
+    finally:
+        conn.close()
+    assert indexed_calls["Worker"] == "pkg.py.Worker"
+    assert indexed_calls["value"] is None
+    assert indexed_calls["pkg"] is None
+
+
+def test_nested_loop_else_flow_walk_is_bounded(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    target = repo / "fixture.py"
+    depth = 14
+    lines = ["class Worker:", "    def noinline(self): pass", "obj = Worker()"]
+    indent = ""
+    for index in range(depth):
+        lines.append(f"{indent}for item_{index} in values:")
+        indent += "    "
+    lines.append(f"{indent}obj.noinline()")
+    for _ in range(depth):
+        indent = indent[:-4]
+        lines.append(f"{indent}else:")
+        lines.append(f"{indent}    obj.noinline()")
+    _write(target, "\n".join(lines) + "\n")
+
+    walked = 0
+    real_walk = sgast.ast.walk
+
+    def counted_walk(node):
+        nonlocal walked
+        for child in real_walk(node):
+            walked += 1
+            yield child
+
+    monkeypatch.setattr(sgast.ast, "walk", counted_walk)
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+
+    assert sum(
+        edge.kind == "calls" and edge.dst_name == "noinline"
+        for edge in extraction.edges
+    ) == depth + 1
+    assert walked < 20_000
+
+
+def test_python_class_namespace_is_evaluation_context_but_not_lexical_parent(tmp_path):
+    repo = tmp_path / "repo"
+    target = repo / "fixture.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self): pass\n"
+        "class Outer:\n"
+        "    class Worker:\n"
+        "        def noinline(self): pass\n"
+        "    direct = Worker.noinline()\n"
+        "    function = lambda: Worker.noinline()\n"
+        "    values = [Worker.noinline() for item in Worker.noinline()]\n"
+        "    class Nested:\n"
+        "        value = Worker.noinline()\n"
+        "    def method(self, value=Worker.noinline()):\n"
+        "        return Worker.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+    calls = {
+        line: {
+            edge.dst_qualname
+            for edge in extraction.edges
+            if edge.kind == "calls" and edge.dst_name == "noinline" and edge.line == line
+        }
+        for line in (6, 7, 8, 10, 11, 12)
+    }
+    assert calls[6] == {"fixture.py.Outer.Worker.noinline"}
+    assert calls[7] == {"fixture.py.Worker.noinline"}
+    # A comprehension's first iterable is evaluated in the class namespace;
+    # its result expression runs in the implicit function scope.
+    assert calls[8] == {
+        "fixture.py.Outer.Worker.noinline",
+        "fixture.py.Worker.noinline",
+    }
+    assert calls[10] == {"fixture.py.Worker.noinline"}
+    assert calls[11] == {"fixture.py.Outer.Worker.noinline"}
+    assert calls[12] == {"fixture.py.Worker.noinline"}
+
+
+def test_python_inherited_member_never_fabricates_child_identity(tmp_path):
+    repo = tmp_path / "repo"
+    target = repo / "fixture.py"
+    _write(
+        target,
+        "class Base:\n"
+        "    def noinline(self): pass\n"
+        "class Child(Base):\n"
+        "    pass\n"
+        "Base.noinline()\n"
+        "base = Base()\n"
+        "base.noinline()\n"
+        "Child.noinline()\n"
+        "child = Child()\n"
+        "child.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+    entity_qualnames = {entity.qualname for entity in extraction.entities}
+    member_edges = [
+        edge
+        for edge in extraction.edges
+        if edge.kind in {"calls", "references"} and edge.dst_name == "noinline"
+    ]
+
+    assert "fixture.py.Base.noinline" in entity_qualnames
+    assert "fixture.py.Child.noinline" not in entity_qualnames
+    assert {
+        edge.dst_qualname for edge in member_edges if edge.line in {5, 7}
+    } == {"fixture.py.Base.noinline"}
+    assert all(
+        edge.dst_qualname is None for edge in member_edges if edge.line in {8, 10}
+    )
+    assert all(
+        edge.dst_qualname is None or edge.dst_qualname in entity_qualnames
+        for edge in member_edges
+    )
+
+
+def test_python_definition_time_calls_belong_to_enclosing_lexical_owner(tmp_path):
+    repo = tmp_path / "repo"
+    target = repo / "fixture.py"
+    _write(
+        target,
+        "def marker(value=None): return value\n"
+        "@marker()\n"
+        "def function(\n"
+        "    positional=marker(),\n"
+        "    *, keyword=marker(),\n"
+        "    annotated: marker() = None,\n"
+        ") -> marker():\n"
+        "    marker()\n"
+        "@marker()\n"
+        "class Child(\n"
+        "    marker(),\n"
+        "    metaclass=marker(),\n"
+        "):\n"
+        "    marker()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+    owners_by_line = {
+        edge.line: edge.src_qualname
+        for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "marker"
+    }
+
+    assert owners_by_line == {
+        2: "fixture.py",
+        4: "fixture.py",
+        5: "fixture.py",
+        6: "fixture.py",
+        7: "fixture.py",
+        8: "fixture.py.function",
+        9: "fixture.py",
+        11: "fixture.py",
+        12: "fixture.py",
+        14: "fixture.py.Child",
+    }
+
+
+def test_python_loop_and_with_headers_precede_target_invalidation(tmp_path):
+    repo = tmp_path / "repo"
+    target = repo / "fixture.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self): pass\n"
+        "def run(values, manager):\n"
+        "    obj = Worker()\n"
+        "    for obj in obj.noinline():\n"
+        "        obj.noinline()\n"
+        "    obj = Worker()\n"
+        "    with obj.noinline() as obj:\n"
+        "        obj.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+    calls = [
+        edge for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    ]
+    calls_by_line = {edge.line: edge for edge in calls}
+    assert calls_by_line[5].dst_qualname == "fixture.py.Worker.noinline"
+    assert calls_by_line[6].dst_qualname is None
+    assert calls_by_line[8].dst_qualname == "fixture.py.Worker.noinline"
+    assert calls_by_line[9].dst_qualname is None
+
+
+def test_python_multi_item_with_applies_bindings_between_contexts(tmp_path):
+    repo = tmp_path / "repo"
+    target = repo / "fixture.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    def noinline(self): pass\n"
+        "def run():\n"
+        "    obj = Worker()\n"
+        "    with (\n"
+        "        obj.noinline() as obj,\n"
+        "        obj.noinline(),\n"
+        "    ):\n"
+        "        obj.noinline()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+    calls_by_line = {
+        edge.line: edge
+        for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "noinline"
+    }
+    assert calls_by_line[6].dst_qualname == "fixture.py.Worker.noinline"
+    for line in (7, 9):
+        assert calls_by_line[line].dst_qualname is None
+        assert calls_by_line[line].evidence_label == sgast.INFERRED
+
+
+def test_python_augassign_member_writes_preserve_receiver_honesty(tmp_path):
+    repo = tmp_path / "repo"
+    target = repo / "fixture.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    noinline = 0\n"
+        "    def update(self, other):\n"
+        "        self.noinline += 1\n"
+        "        other.noinline += 1\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+    writes = [
+        edge for edge in extraction.edges
+        if edge.kind == "writes" and edge.dst_name == "noinline"
+    ]
+    assert sorted(
+        (edge.line, edge.dst_qualname, edge.evidence_label) for edge in writes
+    ) == [
+        (2, "fixture.py.Worker.noinline", sgast.EXTRACTED),
+        (4, "fixture.py.Worker.noinline", sgast.EXTRACTED),
+        (5, None, sgast.INFERRED),
+    ]
+
+
+def test_python_import_alias_non_call_reference_resolves_only_proven_module(tmp_path):
+    repo = _new_repo(tmp_path, "imported_member_reference")
+    _write(repo / "pkg" / "helpers.py", "noinline = object()\n")
+    _write(
+        repo / "consumer.py",
+        "import pkg.helpers as module\n"
+        "value = module.noinline\n"
+        "other_value = unknown.noinline\n"
+        "module = unknown\n"
+        "rebound_value = module.noinline\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT line, dst_qualname FROM edges "
+            "WHERE file_path='consumer.py' AND kind='references' "
+            "AND dst_name='noinline' ORDER BY line"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [(int(row["line"]), row["dst_qualname"]) for row in rows] == [
+        (2, "pkg/helpers.py.noinline"),
+        (3, None),
+        (5, None),
+    ]
+
+
+def test_python_import_alias_non_call_reference_resolves_top_level_function_and_class(
+    tmp_path,
+):
+    repo = _new_repo(tmp_path, "imported_top_level_reference")
+    _write(
+        repo / "pkg" / "helpers.py",
+        "def helper():\n"
+        "    return None\n\n"
+        "class Worker:\n"
+        "    pass\n",
+    )
+    _write(
+        repo / "consumer.py",
+        "import pkg.helpers as module\n"
+        "function_value = module.helper\n"
+        "class_value = module.Worker\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT line, dst_name, dst_qualname FROM edges "
+            "WHERE file_path='consumer.py' AND kind='references' ORDER BY line"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [
+        (int(row["line"]), row["dst_name"], row["dst_qualname"]) for row in rows
+    ] == [
+        (2, "helper", "pkg/helpers.py.helper"),
+        (3, "Worker", "pkg/helpers.py.Worker"),
+    ]
+
+
+def test_python_import_alias_non_call_reference_never_borrows_nested_only_member(
+    tmp_path,
+):
+    repo = _new_repo(tmp_path, "imported_nested_reference")
+    _write(
+        repo / "pkg" / "helpers.py",
+        "class Worker:\n"
+        "    def helper(self):\n"
+        "        return None\n",
+    )
+    _write(
+        repo / "consumer.py",
+        "import pkg.helpers as module\n"
+        "value = module.helper\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        row = conn.execute(
+            "SELECT dst_qualname FROM edges WHERE file_path='consumer.py' "
+            "AND kind='references' AND dst_name='helper'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+    assert row["dst_qualname"] is None
+
+
+def test_python_import_alias_parameter_shadowing_stays_unresolved(tmp_path):
+    repo = _new_repo(tmp_path, "import_alias_parameter_shadow")
+    _write(repo / "pkg" / "helpers.py", "def noinline():\n    return None\n")
+    _write(
+        repo / "consumer.py",
+        "import pkg.helpers as module\n"
+        "top = module.noinline\n"
+        "def run(module):\n"
+        "    value = module.noinline\n"
+        "    module.noinline()\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT kind, line, dst_qualname FROM edges "
+            "WHERE file_path='consumer.py' AND dst_name='noinline' "
+            "AND kind IN ('calls', 'references') ORDER BY kind, line"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    destinations = {(row["kind"], int(row["line"])): row["dst_qualname"] for row in rows}
+    assert destinations[("references", 2)] == "pkg/helpers.py.noinline"
+    assert destinations[("references", 4)] is None
+    assert destinations[("calls", 5)] is None
+
+
+def test_python_import_alias_later_local_binding_shadows_entire_function(tmp_path):
+    repo = _new_repo(tmp_path, "import_alias_later_local")
+    _write(repo / "pkg" / "helpers.py", "def noinline():\n    return None\n")
+    _write(
+        repo / "consumer.py",
+        "import pkg.helpers as module\n"
+        "def run():\n"
+        "    value = module.noinline\n"
+        "    module.noinline()\n"
+        "    module = unknown\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT dst_qualname FROM edges WHERE file_path='consumer.py' "
+            "AND dst_name='noinline' AND kind IN ('calls', 'references')"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert rows
+    assert all(row["dst_qualname"] is None for row in rows)
+
+
+def test_python_nested_scope_uses_only_its_own_local_import_alias(tmp_path):
+    repo = _new_repo(tmp_path, "import_alias_nested_local")
+    _write(repo / "pkg" / "outer.py", "def noinline():\n    return None\n")
+    _write(repo / "pkg" / "inner.py", "def noinline():\n    return None\n")
+    _write(
+        repo / "consumer.py",
+        "import pkg.outer as module\n"
+        "def outer():\n"
+        "    def parameter_shadow(module):\n"
+        "        return module.noinline\n"
+        "    def local_import():\n"
+        "        import pkg.inner as module\n"
+        "        return module.noinline\n"
+        "    return module.noinline\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT line, dst_qualname FROM edges WHERE file_path='consumer.py' "
+            "AND kind='references' AND dst_name='noinline' ORDER BY line"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [(int(row["line"]), row["dst_qualname"]) for row in rows] == [
+        (4, None),
+        (7, "pkg/inner.py.noinline"),
+        (8, "pkg/outer.py.noinline"),
+    ]
+
+
+def test_python_import_alias_class_namespace_is_not_a_method_closure(tmp_path):
+    repo = _new_repo(tmp_path, "import_alias_class_namespace")
+    _write(repo / "pkg" / "helpers.py", "def noinline():\n    return None\n")
+    _write(
+        repo / "consumer.py",
+        "import pkg.helpers as module\n"
+        "class Scope:\n"
+        "    before = module.noinline\n"
+        "    module = unknown\n"
+        "    after = module.noinline\n"
+        "    def run(self):\n"
+        "        module.noinline()\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT kind, line, dst_qualname FROM edges "
+            "WHERE file_path='consumer.py' AND dst_name='noinline' "
+            "AND kind IN ('calls', 'references') ORDER BY line"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    destinations = {
+        (row["kind"], int(row["line"])): row["dst_qualname"] for row in rows
+    }
+    assert destinations[("references", 3)] == "pkg/helpers.py.noinline"
+    assert destinations[("references", 5)] is None
+    assert destinations[("calls", 7)] == "pkg/helpers.py.noinline"
+
+
+def test_python_import_alias_class_evaluation_does_not_leak_into_nested_scopes(
+    tmp_path,
+):
+    repo = _new_repo(tmp_path, "import_alias_class_evaluation_scope")
+    _write(repo / "pkg" / "outer.py", "noinline = object()\n")
+    _write(repo / "pkg" / "inner.py", "noinline = object()\n")
+    _write(
+        repo / "consumer.py",
+        "import pkg.outer as module\n"
+        "class Scope:\n"
+        "    import pkg.inner as module\n"
+        "    direct = module.noinline\n"
+        "    class Nested:\n"
+        "        value = module.noinline\n"
+        "    deferred = lambda: module.noinline\n"
+        "    result = [module.noinline for item in values]\n"
+        "    filtered = [item for item in values if module.noinline]\n"
+        "    first_iterable = [item for item in module.noinline]\n"
+        "    def method(self):\n"
+        "        return module.noinline\n"
+        "top = module.noinline\n",
+    )
+    _write(
+        repo / "absent_outer.py",
+        "class Scope:\n"
+        "    import pkg.inner as module\n"
+        "    direct = module.noinline\n"
+        "    class Nested:\n"
+        "        value = module.noinline\n"
+        "    deferred = lambda: module.noinline\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        consumer_rows = conn.execute(
+            "SELECT line, dst_qualname FROM edges WHERE file_path='consumer.py' "
+            "AND kind='references' AND dst_name='noinline' ORDER BY line"
+        ).fetchall()
+        absent_rows = conn.execute(
+            "SELECT line, dst_qualname FROM edges WHERE file_path='absent_outer.py' "
+            "AND kind='references' AND dst_name='noinline' ORDER BY line"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [(int(row["line"]), row["dst_qualname"]) for row in consumer_rows] == [
+        (4, "pkg/inner.py.noinline"),
+        (6, "pkg/outer.py.noinline"),
+        (7, "pkg/outer.py.noinline"),
+        (8, "pkg/outer.py.noinline"),
+        (9, "pkg/outer.py.noinline"),
+        (10, "pkg/inner.py.noinline"),
+        (12, "pkg/outer.py.noinline"),
+        (13, "pkg/outer.py.noinline"),
+    ]
+    assert [(int(row["line"]), row["dst_qualname"]) for row in absent_rows] == [
+        (3, "pkg/inner.py.noinline"),
+        (5, None),
+        (6, None),
+    ]
+
+
+def test_python_import_member_flow_ignores_nested_global_nonlocal_declarations():
+    accesses = sg._python_imported_member_accesses(
+        "import pkg.helpers as module\n"
+        "def outer():\n"
+        "    value = module.noinline\n"
+        "    def nested():\n"
+        "        global module\n"
+        "        return module.noinline\n"
+        "    return module.noinline\n"
+    )
+
+    assert accesses[("references", 3, "noinline")] == frozenset({"pkg.helpers"})
+    assert accesses[("references", 6, "noinline")] == frozenset({"pkg.helpers"})
+    assert accesses[("references", 7, "noinline")] == frozenset({"pkg.helpers"})
+
+
+def test_python_import_member_flow_invalidates_explicit_binding_statements():
+    snippets = [
+        "import pkg.helpers as module\ndel module\nmodule.noinline()\n",
+        "import pkg.helpers as module\nwith resource() as module:\n    pass\nmodule.noinline()\n",
+        "import pkg.helpers as module\ntry:\n    pass\nexcept Error as module:\n    pass\nmodule.noinline()\n",
+        "import pkg.helpers as module\ntry:\n    module = unknown\nexcept Error:\n    pass\nmodule.noinline()\n",
+    ]
+
+    for source in snippets:
+        accesses = sg._python_imported_member_accesses(source)
+        call_line = source.count("\n")
+        assert ("calls", call_line, "noinline") not in accesses
+
+
+def test_python_import_member_flow_intersects_branch_loop_match_and_try_states():
+    sources = [
+        "import pkg.helpers as module\nif flag:\n    module = unknown\nmodule.noinline()\n",
+        "import pkg.helpers as module\nwhile flag:\n    module = unknown\nmodule.noinline()\n",
+        "import pkg.helpers as module\nfor module in values:\n    pass\nmodule.noinline()\n",
+        "import pkg.helpers as module\nmatch value:\n    case module:\n        pass\nmodule.noinline()\n",
+        "import pkg.helpers as module\ntry:\n    pass\nexcept Error:\n    module = unknown\nmodule.noinline()\n",
+    ]
+
+    for source in sources:
+        accesses = sg._python_imported_member_accesses(source)
+        call_line = source.count("\n")
+        assert ("calls", call_line, "noinline") not in accesses
+
+
+def test_python_import_member_expression_scopes_never_borrow_outer_exact_alias():
+    accesses = sg._python_imported_member_accesses(
+        "import pkg.helpers as module\n"
+        "if (module := unknown):\n"
+        "    module.noinline()\n"
+        "import pkg.helpers as module\n"
+        "match value:\n"
+        "    case module:\n"
+        "        module.noinline()\n"
+        "import pkg.helpers as module\n"
+        "[module.noinline() for module in values]\n"
+        "[module.noinline() for item in values]\n"
+        "module.noinline()\n"
+    )
+
+    assert ("calls", 3, "noinline") not in accesses
+    assert ("calls", 7, "noinline") not in accesses
+    assert ("calls", 9, "noinline") not in accesses
+    assert accesses[("calls", 10, "noinline")] == frozenset({"pkg.helpers"})
+    assert accesses[("calls", 11, "noinline")] == frozenset({"pkg.helpers"})
+
+
+def test_python_augassign_reads_and_recursive_member_targets(tmp_path):
+    repo = tmp_path / "repo"
+    target = repo / "fixture.py"
+    _write(
+        target,
+        "class Worker:\n"
+        "    noinline = 0\n"
+        "    def update(self, other, values):\n"
+        "        self.noinline += 1\n"
+        "        other.noinline += 1\n"
+        "        self.noinline, [other.noinline, *self.more] = values\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+    relevant = [
+        (edge.kind, edge.dst_name, edge.line, edge.dst_qualname, edge.evidence_label)
+        for edge in extraction.edges
+        if edge.dst_name in {"noinline", "more"}
+        and edge.kind in {"references", "writes"}
+    ]
+
+    assert ("references", "noinline", 4, "fixture.py.Worker.noinline", sgast.EXTRACTED) in relevant
+    assert ("references", "noinline", 5, None, sgast.INFERRED) in relevant
+    assert ("writes", "noinline", 6, "fixture.py.Worker.noinline", sgast.EXTRACTED) in relevant
+    assert ("writes", "noinline", 6, None, sgast.INFERRED) in relevant
+    assert ("writes", "more", 6, "fixture.py.Worker.more", sgast.EXTRACTED) in relevant
+
+
+def test_python_import_reparser_requires_indexed_authenticated_bytes(tmp_path):
+    repo = _new_repo(tmp_path, "authenticated_reparse")
+    caller = repo / "consumer.py"
+    _write(caller, "import pkg.helpers as module\nvalue = module.noinline\n")
+    _write(repo / "pkg" / "helpers.py", "noinline = object()\n")
+    sg.build_index(repo, incremental=False)
+
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        assert "module.noinline" in sg._indexed_python_source(
+            conn, repo, "consumer.py"
+        )
+        _write(caller, "import pkg.helpers as module\nvalue = module.changed\n")
+        assert sg._indexed_python_source(conn, repo, "consumer.py") == ""
+        assert sg._indexed_python_source(conn, repo, "../outside.py") == ""
+    finally:
+        conn.close()
+
+
+def test_python_imported_member_same_line_receiver_identity_is_exact(tmp_path):
+    repo = _new_repo(tmp_path, "same_line_imported_member_identity")
+    _write(repo / "pkg" / "helpers.py", "def noinline():\n    return None\n")
+    _write(
+        repo / "consumer.py",
+        "import pkg.helpers as module\n"
+        "module.noinline(); unknown.noinline()\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT kind, receiver_name, dst_qualname FROM edges "
+            "WHERE file_path='consumer.py' AND line=2 AND dst_name='noinline' "
+            "AND kind IN ('calls', 'references') ORDER BY kind, source_col"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [
+        (row["kind"], row["receiver_name"], row["dst_qualname"]) for row in rows
+    ] == [
+        ("calls", "module", "pkg/helpers.py.noinline"),
+        ("calls", "unknown", None),
+        ("references", "module", "pkg/helpers.py.noinline"),
+        ("references", "unknown", None),
+    ]
+
+
+def test_python_import_member_reparser_fails_closed_on_parser_recursion(monkeypatch):
+    def recursive_parse(_source):
+        raise RecursionError
+
+    monkeypatch.setattr(sg.ast, "parse", recursive_parse)
+    assert sg._python_imported_member_accesses("import pkg.helpers as module") == {}
+
+
+def test_python_imported_member_signature_annotations_resolve_at_index_level(tmp_path):
+    repo = _new_repo(tmp_path, "imported_member_signature_annotations")
+    _write(repo / "pkg" / "helpers.py", "noinline = object()\n")
+    _write(
+        repo / "consumer.py",
+        "import pkg.helpers as module\n\n"
+        "def decorated(value: module.noinline) -> module.noinline:\n"
+        "    return value\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT kind, source_col, dst_qualname FROM edges "
+            "WHERE file_path='consumer.py' AND line=3 AND dst_name='noinline' "
+            "AND kind IN ('annotates', 'references') ORDER BY kind, source_col"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    references = [row for row in rows if row["kind"] == "references"]
+    assert len(references) == 2
+    assert len({int(row["source_col"]) for row in references}) == 2
+    assert {row["dst_qualname"] for row in references} == {
+        "pkg/helpers.py.noinline"
+    }
+    assert len([row for row in rows if row["kind"] == "annotates"]) == 2
+
+
+def test_python_import_member_reparser_fails_closed_on_node_budget(monkeypatch):
+    monkeypatch.setattr(sg, "PYTHON_IMPORT_REPARSE_MAX_NODES", 1)
+    assert sg._python_imported_member_accesses(
+        "import pkg.helpers as module\nmodule.noinline()\n"
+    ) == {}
+
+
+def test_python_direct_import_calls_respect_lexical_binding_scope(tmp_path):
+    repo = _new_repo(tmp_path, "python_direct_import_lexical_scope")
+    _write(repo / "pkg" / "__init__.py", "")
+    _write(repo / "pkg" / "helpers.py", "def noinline():\n    return None\n")
+    _write(
+        repo / "consumer.py",
+        "from pkg.helpers import noinline as module_noinline\n\n"
+        "def local():\n"
+        "    from pkg.helpers import noinline\n"
+        "    noinline()\n\n"
+        "def unrelated():\n"
+        "    noinline()\n\n"
+        "def nested():\n"
+        "    module_noinline()\n\n"
+        "def shadowed(module_noinline):\n"
+        "    module_noinline()\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT src_qualname, dst_qualname, evidence_label FROM edges "
+            "WHERE file_path='consumer.py' AND kind='calls' "
+            "AND dst_name IN ('noinline', 'module_noinline') "
+            "ORDER BY line"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [tuple(row) for row in rows] == [
+        ("consumer.py.local", "pkg/helpers.py.noinline", sgast.EXTRACTED),
+        ("consumer.py.unrelated", None, sgast.AMBIGUOUS),
+        ("consumer.py.nested", "pkg/helpers.py.noinline", sgast.EXTRACTED),
+        ("consumer.py.shadowed", None, sgast.AMBIGUOUS),
+    ]
+
+
+def test_python_nested_import_alias_does_not_suppress_other_call_scopes(tmp_path):
+    repo = _new_repo(tmp_path, "python_nested_import_alias_scope")
+    target = repo / "consumer.py"
+    _write(
+        target,
+        "def f():\n"
+        "    return None\n\n"
+        "f()\n\n"
+        "def importing():\n"
+        "    import pkg.helpers as f\n"
+        "    f()\n\n"
+        "def sibling():\n"
+        "    f()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+    calls = [
+        (edge.src_qualname, edge.line, edge.dst_qualname, edge.evidence_label)
+        for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "f"
+    ]
+
+    assert calls == [
+        ("consumer.py", 4, "consumer.py.f", sgast.EXTRACTED),
+        ("consumer.py.importing", 8, None, sgast.AMBIGUOUS),
+        ("consumer.py.sibling", 11, "consumer.py.f", sgast.EXTRACTED),
+    ]
+
+
+def test_python_import_reparser_rejects_oversize_before_parse(monkeypatch):
+    parse_calls: list[str] = []
+
+    def tracked_parse(source):
+        parse_calls.append(source)
+        raise AssertionError("oversize source must not be parsed")
+
+    monkeypatch.setattr(sg.ast, "parse", tracked_parse)
+    source = "x" * (sg.PYTHON_IMPORT_REPARSE_MAX_SOURCE_CHARS + 1)
+
+    assert sg._python_imported_member_accesses(source) == {}
+    assert parse_calls == []
+
+
+def test_python_direct_call_fallback_respects_parameter_shadowing(tmp_path):
+    repo = tmp_path / "repo"
+    target = repo / "consumer.py"
+    _write(
+        target,
+        "def target():\n"
+        "    return None\n\n"
+        "target()\n\n"
+        "def run(target):\n"
+        "    target()\n\n"
+        "def local():\n"
+        "    def target():\n"
+        "        return None\n"
+        "    target()\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+    calls = [
+        (edge.src_qualname, edge.line, edge.dst_qualname, edge.evidence_label)
+        for edge in extraction.edges
+        if edge.kind == "calls" and edge.dst_name == "target"
+    ]
+
+    assert calls == [
+        ("consumer.py", 4, "consumer.py.target", sgast.EXTRACTED),
+        ("consumer.py.local", 12, "consumer.py.local.target", sgast.EXTRACTED),
+        ("consumer.py.run", 7, None, sgast.AMBIGUOUS),
+    ]
+
+
+def test_python_import_reparser_rejects_token_oversize_before_parse(monkeypatch):
+    parse_calls: list[str] = []
+
+    def tracked_parse(source):
+        parse_calls.append(source)
+        raise AssertionError("token-oversize source must not be parsed")
+
+    monkeypatch.setattr(sg.ast, "parse", tracked_parse)
+    source = "a\n" * (sg.PYTHON_IMPORT_REPARSE_MAX_TOKENS // 2 + 1)
+
+    assert len(source) < sg.PYTHON_IMPORT_REPARSE_MAX_SOURCE_CHARS
+    assert sg._python_imported_member_accesses(source) == {}
+    assert parse_calls == []

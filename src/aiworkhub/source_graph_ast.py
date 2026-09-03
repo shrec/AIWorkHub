@@ -62,9 +62,12 @@ FILE_EVIDENCE = "FILE_EVIDENCE"
 
 ENTITY_KINDS = (
     "module", "namespace", "class", "struct", "enum", "macro",
-    "function", "method", "import", "file",
+    "function", "method", "import", "file", "attribute", "decorator", "annotation",
 )
-EDGE_KINDS = ("imports", "calls", "defines", "inherits")
+EDGE_KINDS = (
+    "imports", "calls", "defines", "inherits", "writes", "references",
+    "decorates", "annotates",
+)
 
 PYTHON_EXTENSIONS = tuple(languages.LANGUAGE_BY_ID["python"].extensions)
 PHP_EXTENSIONS = (".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".php8")
@@ -142,6 +145,8 @@ class Edge:
     confidence: float
     source_hash: str
     build_revision: str
+    source_col: int = -1
+    receiver_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1312,11 +1317,74 @@ def _dedupe_qualname(qualname_counts: dict[str, int], base_qualname: str) -> str
     return base_qualname if seen == 1 else f"{base_qualname}~{seen}"
 
 
+def _walk_lexical_scope(scope_node: ast.AST):
+    """Yield nodes owned by one lexical scope, excluding nested scopes."""
+
+    yield scope_node
+    children = (
+        scope_node.body
+        if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        else ast.iter_child_nodes(scope_node)
+    )
+    for child in children:
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # Definition-time expressions execute in the enclosing lexical
+            # scope.  The definition body itself belongs to the child scope.
+            expressions: list[ast.AST] = list(child.decorator_list)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                expressions.extend(child.args.defaults)
+                expressions.extend(
+                    default for default in child.args.kw_defaults if default is not None
+                )
+                expressions.extend(
+                    arg.annotation
+                    for arg in (
+                        *child.args.posonlyargs,
+                        *child.args.args,
+                        *child.args.kwonlyargs,
+                    )
+                    if arg.annotation is not None
+                )
+                if child.args.vararg and child.args.vararg.annotation is not None:
+                    expressions.append(child.args.vararg.annotation)
+                if child.args.kwarg and child.args.kwarg.annotation is not None:
+                    expressions.append(child.args.kwarg.annotation)
+                if child.returns is not None:
+                    expressions.append(child.returns)
+            else:
+                expressions.extend(child.bases)
+                expressions.extend(keyword.value for keyword in child.keywords)
+            for expression in expressions:
+                yield from _walk_lexical_scope(expression)
+            continue
+        yield from _walk_lexical_scope(child)
+
+
+def _walk_enclosing_bindings(scope_node: ast.AST):
+    """Yield enclosing-scope nodes without comprehension-local targets."""
+
+    yield scope_node
+    if isinstance(scope_node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        for generator in scope_node.generators:
+            yield from _walk_enclosing_bindings(generator.iter)
+            for condition in generator.ifs:
+                yield from _walk_enclosing_bindings(condition)
+        if isinstance(scope_node, ast.DictComp):
+            yield from _walk_enclosing_bindings(scope_node.key)
+            yield from _walk_enclosing_bindings(scope_node.value)
+        else:
+            yield from _walk_enclosing_bindings(scope_node.elt)
+        return
+    for child in ast.iter_child_nodes(scope_node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield from _walk_enclosing_bindings(child)
+
+
 def _extract_python_ast(rel: str, tree: ast.Module, source_hash: str, build_revision: str) -> FileExtraction:
     entities: list[Entity] = []
     edges: list[Edge] = []
     module_qualname = rel
-
     entities.append(Entity(
         kind="module", name=rel, qualname=module_qualname, file_path=rel,
         line_start=1, line_end=_end_line(tree) or 1, signature="",
@@ -1324,122 +1392,713 @@ def _extract_python_ast(rel: str, tree: ast.Module, source_hash: str, build_revi
         source_hash=source_hash, build_revision=build_revision,
     ))
 
-    # Module-wide bound-name table (flat, non-lexically-scoped by design):
-    # collected in a first pass over the WHOLE file before any call is
-    # resolved, so a function may call another defined later in the same
-    # file (a forward reference) and still resolve as EXTRACTED. Calls
-    # classify as EXTRACTED (name literally defined/imported in this
-    # module -- ``bound_qualnames`` gives the exact internal target when
-    # the name is a local def/class), INFERRED (attribute call on an
-    # unresolved receiver), or AMBIGUOUS (bare name never bound in this
-    # module, e.g. only reachable via `from x import *`).
     bound_names: set[str] = set()
     bound_qualnames: dict[str, str] = {}
-    scopes: list[tuple[ast.AST, str]] = []  # (scope_node, owner_qualname) needing call extraction
+    import_targets: dict[str, str] = {}
+    scopes: list[tuple[ast.AST, str, str | None]] = []
     qualname_counts: dict[str, int] = {}
+    node_qualnames: dict[ast.AST, str] = {}
+    method_receivers: dict[ast.AST, str] = {}
 
-    def _collect(node: ast.AST, owner_qualname: str, kind_for_children: str) -> None:
-        scopes.append((node, owner_qualname))
+    def _entity(kind: str, name: str, qualname: str, node: ast.AST, signature: str = "") -> None:
+        entities.append(Entity(
+            kind=kind, name=name, qualname=qualname, file_path=rel,
+            line_start=getattr(node, "lineno", 1), line_end=_end_line(node),
+            signature=signature, evidence_label=EXTRACTED, extractor=EXTRACTOR_ID,
+            confidence=1.0, source_hash=source_hash, build_revision=build_revision,
+        ))
+
+    def _edge(kind: str, owner: str, name: str, qualname: str | None, node: ast.AST,
+              label: str = EXTRACTED, confidence: float = 1.0) -> None:
+        receiver_name = (
+            node.value.id
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+            else ""
+        )
+        edges.append(Edge(
+            kind=kind, src_qualname=owner, dst_name=name, dst_qualname=qualname,
+            file_path=rel, line=getattr(node, "lineno", 1), evidence_label=label,
+            extractor=EXTRACTOR_ID, confidence=confidence, source_hash=source_hash,
+            build_revision=build_revision,
+            source_col=int(getattr(node, "col_offset", -1)),
+            receiver_name=receiver_name,
+        ))
+
+    def _collect(node: ast.AST, owner: str, child_kind: str, class_owner: str | None) -> None:
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            scopes.append((node, owner, class_owner))
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                qualname = _dedupe_qualname(qualname_counts, f"{owner_qualname}.{child.name}")
+                qualname = _dedupe_qualname(qualname_counts, f"{owner}.{child.name}")
+                node_qualnames[child] = qualname
                 bound_names.add(child.name)
                 bound_qualnames[child.name] = qualname
-                entities.append(Entity(
-                    kind=kind_for_children, name=child.name, qualname=qualname,
-                    file_path=rel, line_start=child.lineno, line_end=_end_line(child),
-                    signature=_sig_of(child), evidence_label=EXTRACTED,
-                    extractor=EXTRACTOR_ID, confidence=1.0, source_hash=source_hash,
-                    build_revision=build_revision,
-                ))
-                edges.append(Edge(
-                    kind="defines", src_qualname=owner_qualname, dst_name=child.name,
-                    dst_qualname=qualname, file_path=rel, line=child.lineno,
-                    evidence_label=EXTRACTED, extractor=EXTRACTOR_ID, confidence=1.0,
-                    source_hash=source_hash, build_revision=build_revision,
-                ))
-                _collect(child, qualname, "method")
+                direct_method = isinstance(node, ast.ClassDef)
+                kind = "method" if direct_method else "function"
+                _entity(kind, child.name, qualname, child, _sig_of(child))
+                _edge("defines", owner, child.name, qualname, child)
+                decorator_nodes = (
+                    decorator.func if isinstance(decorator, ast.Call) else decorator
+                    for decorator in child.decorator_list
+                )
+                decorators = {
+                    decorator.id if isinstance(decorator, ast.Name) else decorator.attr
+                    for decorator in decorator_nodes
+                    if isinstance(decorator, (ast.Name, ast.Attribute))
+                }
+                positional = (*child.args.posonlyargs, *child.args.args)
+                if direct_method and "staticmethod" not in decorators and positional:
+                    receiver = positional[0].arg
+                    if receiver in {"self", "cls"}:
+                        method_receivers[child] = receiver
+                _collect(child, qualname, "function", class_owner if direct_method else None)
             elif isinstance(child, ast.ClassDef):
-                qualname = _dedupe_qualname(qualname_counts, f"{owner_qualname}.{child.name}")
+                qualname = _dedupe_qualname(qualname_counts, f"{owner}.{child.name}")
+                node_qualnames[child] = qualname
                 bound_names.add(child.name)
                 bound_qualnames[child.name] = qualname
-                entities.append(Entity(
-                    kind="class", name=child.name, qualname=qualname, file_path=rel,
-                    line_start=child.lineno, line_end=_end_line(child),
-                    signature=_sig_of(child), evidence_label=EXTRACTED,
-                    extractor=EXTRACTOR_ID, confidence=1.0, source_hash=source_hash,
-                    build_revision=build_revision,
-                ))
-                edges.append(Edge(
-                    kind="defines", src_qualname=owner_qualname, dst_name=child.name,
-                    dst_qualname=qualname, file_path=rel, line=child.lineno,
-                    evidence_label=EXTRACTED, extractor=EXTRACTOR_ID, confidence=1.0,
-                    source_hash=source_hash, build_revision=build_revision,
-                ))
-                _collect(child, qualname, "method")
+                _entity("class", child.name, qualname, child, _sig_of(child))
+                _edge("defines", owner, child.name, qualname, child)
+                _collect(child, qualname, "method", qualname)
             elif isinstance(child, (ast.Import, ast.ImportFrom)):
                 for alias in child.names:
-                    dst = alias.name if isinstance(child, ast.Import) else f"{'.' * (child.level or 0)}{child.module or ''}.{alias.name}"
+                    dst = (alias.name if isinstance(child, ast.Import)
+                           else f"{'.' * (child.level or 0)}{child.module or ''}.{alias.name}")
                     local_name = alias.asname or alias.name.split(".")[0]
                     bound_names.add(local_name)
-                    import_qualname = _dedupe_qualname(
-                        qualname_counts,
-                        f"{module_qualname}::import::{local_name}::{child.lineno}",
+                    import_targets[local_name] = dst
+                    qualname = _dedupe_qualname(
+                        qualname_counts, f"{module_qualname}::import::{local_name}::{child.lineno}"
                     )
-                    entities.append(Entity(
-                        kind="import", name=local_name,
-                        qualname=import_qualname,
-                        file_path=rel, line_start=child.lineno, line_end=child.lineno,
-                        signature=dst, evidence_label=EXTRACTED, extractor=EXTRACTOR_ID,
-                        confidence=1.0, source_hash=source_hash, build_revision=build_revision,
-                    ))
-                    edges.append(Edge(
-                        kind="imports", src_qualname=owner_qualname, dst_name=dst,
-                        dst_qualname=None, file_path=rel, line=child.lineno,
-                        evidence_label=EXTRACTED, extractor=EXTRACTOR_ID, confidence=1.0,
-                        source_hash=source_hash, build_revision=build_revision,
-                    ))
+                    _entity("import", local_name, qualname, child, dst)
+                    _edge("imports", owner, dst, None, child)
             elif isinstance(child, (ast.Assign, ast.AnnAssign)):
                 targets = child.targets if isinstance(child, ast.Assign) else [child.target]
                 for target in targets:
                     if isinstance(target, ast.Name):
                         bound_names.add(target.id)
+                _collect(child, owner, child_kind, class_owner)
             else:
-                _collect(child, owner_qualname, kind_for_children)
+                _collect(child, owner, child_kind, class_owner)
 
-    _collect(tree, module_qualname, "function")
+    _collect(tree, module_qualname, "function", None)
 
-    # Second pass: bound_names/bound_qualnames now cover the WHOLE file, so
-    # resolve calls (and class bases) per collected scope with forward
-    # references visible.
-    for scope_node, owner_qualname in scopes:
-        _extract_calls(scope_node, owner_qualname, edges, rel, source_hash, build_revision, bound_names, bound_qualnames)
+    member_entities: dict[str, Entity] = {}
+    exact_member_destinations: dict[ast.Attribute, str] = {}
+    direct_member_identities: set[str] | None = None
 
-    def _resolve_inherits(node: ast.AST) -> None:
-        for child in ast.walk(node):
-            if isinstance(child, ast.ClassDef):
-                qualname = bound_qualnames.get(child.name)
-                if qualname is None:
+    def _member_destination(
+        attribute: ast.Attribute, class_owner: str | None, scope_node: ast.AST
+    ) -> tuple[str | None, bool]:
+        destination = exact_member_destinations.get(attribute)
+        if (
+            destination is not None
+            and direct_member_identities is not None
+            and destination not in direct_member_identities
+        ):
+            destination = None
+        return destination, destination is not None
+
+    def _define_member(
+        owner: str, class_owner: str | None, scope_node: ast.AST, target: ast.AST
+    ) -> None:
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                _define_member(owner, class_owner, scope_node, element)
+            return
+        if isinstance(target, ast.Starred):
+            _define_member(owner, class_owner, scope_node, target.value)
+            return
+        if isinstance(target, ast.Name):
+            destination = f"{owner}.{target.id}" if owner == module_qualname or class_owner == owner else None
+            name = target.id
+        elif isinstance(target, ast.Attribute):
+            destination, exact = _member_destination(target, class_owner, scope_node)
+            destination = destination if exact else None
+            name = target.attr
+        else:
+            return
+        if destination is not None:
+            member_entities.setdefault(destination, Entity(
+                kind="attribute", name=name, qualname=destination, file_path=rel,
+                line_start=getattr(target, "lineno", 1), line_end=_end_line(target),
+                signature="definition", evidence_label=EXTRACTED, extractor=EXTRACTOR_ID,
+                confidence=1.0, source_hash=source_hash, build_revision=build_revision,
+            ))
+        _edge(
+            "writes", owner, name, destination, target,
+            EXTRACTED if destination else INFERRED, 1.0 if destination else 0.5,
+        )
+        if destination is not None:
+            _edge("defines", owner, name, destination, target)
+
+    shadowed_receivers: dict[ast.Attribute, bool] = {}
+    exact_direct_destinations: dict[ast.Name, str] = {}
+    shadowed_direct_calls: set[ast.Name] = set()
+    inherited_bindings: dict[ast.AST, dict[str, str]] = {tree: {}}
+    class_owner_by_scope = {scope_node: class_owner for scope_node, _, class_owner in scopes}
+
+    def _analyze_scope(scope_node: ast.AST) -> None:
+        current_types = dict(inherited_bindings.get(scope_node, {}))
+        rebound_names: set[str] = set()
+        if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = scope_node.args
+            parameter_names = {
+                arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)
+            }
+            if args.vararg:
+                parameter_names.add(args.vararg.arg)
+            if args.kwarg:
+                parameter_names.add(args.kwarg.arg)
+            # Python decides function locals for the whole body. A later
+            # binding, including a class statement, therefore prevents an
+            # earlier access from borrowing a same-named outer class. The
+            # forward pass makes the local class authoritative only after its
+            # statement executes.
+            for statement in scope_node.body:
+                if isinstance(
+                    statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    parameter_names.add(statement.name)
                     continue
-                for base in child.bases:
-                    base_name = ast.unparse(base)
-                    if not base_name:
-                        continue
-                    edges.append(Edge(
-                        kind="inherits", src_qualname=qualname, dst_name=base_name,
-                        dst_qualname=bound_qualnames.get(base_name), file_path=rel,
-                        line=child.lineno,
-                        evidence_label=EXTRACTED if base_name in bound_names else AMBIGUOUS,
-                        extractor=EXTRACTOR_ID,
-                        confidence=1.0 if base_name in bound_names else 0.5,
-                        source_hash=source_hash, build_revision=build_revision,
-                    ))
+                parameter_names.update(
+                    child.id for child in _walk_enclosing_bindings(statement)
+                    if isinstance(child, ast.Name)
+                    and isinstance(child.ctx, (ast.Store, ast.Del))
+                )
+                parameter_names.update(
+                    child.name for child in _walk_lexical_scope(statement)
+                    if isinstance(child, (ast.MatchAs, ast.MatchStar)) and child.name
+                )
+                parameter_names.update(
+                    child.rest for child in _walk_lexical_scope(statement)
+                    if isinstance(child, ast.MatchMapping) and child.rest
+                )
+                parameter_names.update(
+                    child.name for child in _walk_lexical_scope(statement)
+                    if isinstance(child, ast.ExceptHandler) and child.name
+                )
+                if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                    parameter_names.update(
+                        alias.asname or alias.name.split(".")[0]
+                        for alias in statement.names
+                    )
+            for name in parameter_names:
+                current_types.pop(name, None)
+                rebound_names.add(name)
+            class_owner = class_owner_by_scope.get(scope_node)
+            receiver = method_receivers.get(scope_node)
+            if class_owner and receiver:
+                current_types[receiver] = class_owner
+                rebound_names.discard(receiver)
 
-    _resolve_inherits(tree)
+        def _invalidate(
+            nodes: list[ast.AST], types: dict[str, str], rebound: set[str]
+        ) -> None:
+            names = {
+                child.id for node in nodes for child in ast.walk(node)
+                if isinstance(child, ast.Name)
+                and isinstance(child.ctx, (ast.Store, ast.Del))
+            }
+            for name in names:
+                types.pop(name, None)
+                rebound.add(name)
 
+        def _bind_expression_target(
+            target: ast.AST,
+            value: ast.AST,
+            types: dict[str, str],
+            rebound: set[str],
+        ) -> None:
+            _invalidate([target], types, rebound)
+            if (
+                isinstance(target, ast.Name)
+                and isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and (class_qualname := types.get(value.func.id))
+                and not class_qualname.startswith("::")
+            ):
+                types[target.id] = class_qualname
+                rebound.discard(target.id)
+
+        def _observe(node: ast.AST, types: dict[str, str], rebound: set[str]) -> None:
+            """Observe expressions in evaluation order, applying local bindings."""
+
+            if isinstance(node, ast.Lambda):
+                # Lambdas are implicit function scopes.  In particular, a lambda
+                # created in a class body does not close over that class namespace.
+                parent_types = (
+                    inherited_bindings.get(scope_node, {})
+                    if isinstance(scope_node, ast.ClassDef)
+                    else types
+                )
+                local_types, local_rebound = dict(parent_types), set(rebound)
+                arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+                argument_names = {argument.arg for argument in arguments}
+                if node.args.vararg:
+                    argument_names.add(node.args.vararg.arg)
+                if node.args.kwarg:
+                    argument_names.add(node.args.kwarg.arg)
+                for name in argument_names:
+                    local_types.pop(name, None)
+                    local_rebound.add(name)
+                _observe(node.body, local_types, local_rebound)
+                return
+            if isinstance(node, ast.NamedExpr):
+                _observe(node.value, types, rebound)
+                _bind_expression_target(node.target, node.value, types, rebound)
+                return
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                generators = node.generators
+                if not generators:
+                    return
+                # The first iterable belongs to the surrounding scope. Everything
+                # after it executes in the comprehension's implicit child scope.
+                _observe(generators[0].iter, types, rebound)
+                parent_types = (
+                    inherited_bindings.get(scope_node, {})
+                    if isinstance(scope_node, ast.ClassDef)
+                    else types
+                )
+                local_types, local_rebound = dict(parent_types), set(rebound)
+                for index, generator in enumerate(generators):
+                    if index:
+                        _observe(generator.iter, local_types, local_rebound)
+                    _invalidate([generator.target], local_types, local_rebound)
+                    for condition in generator.ifs:
+                        _observe(condition, local_types, local_rebound)
+                if isinstance(node, ast.DictComp):
+                    _observe(node.key, local_types, local_rebound)
+                    _observe(node.value, local_types, local_rebound)
+                else:
+                    _observe(node.elt, local_types, local_rebound)
+                return
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+            ):
+                destination = types.get(node.func.id)
+                if destination is not None and destination.startswith("::callable::"):
+                    exact_direct_destinations[node.func] = destination.removeprefix(
+                        "::callable::"
+                    )
+                elif destination is not None and not destination.startswith("::"):
+                    exact_direct_destinations[node.func] = destination
+                elif node.func.id in rebound:
+                    shadowed_direct_calls.add(node.func)
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                receiver_name = node.value.id
+                destination = types.get(receiver_name)
+                if destination is not None and not destination.startswith("::"):
+                    exact_member_destinations[node] = f"{destination}.{node.attr}"
+                shadowed_receivers[node] = receiver_name in rebound
+            for child in ast.iter_child_nodes(node):
+                _observe(child, types, rebound)
+
+        def _process_block(
+            statements: list[ast.stmt], types: dict[str, str], rebound: set[str]
+        ) -> None:
+            for statement in statements:
+                _process_statement(statement, types, rebound)
+
+        def _merge_flow_states(
+            states: list[tuple[dict[str, str], set[str]]],
+        ) -> tuple[dict[str, str], set[str]]:
+            """Keep only type facts that agree on every reachable loop path."""
+
+            if not states:
+                return {}, set()
+            common = dict(states[0][0])
+            for name, destination in list(common.items()):
+                if any(types.get(name) != destination for types, _ in states[1:]):
+                    common.pop(name)
+            rebound = set().union(*(names for _, names in states))
+            rebound.update(
+                name
+                for types, _ in states
+                for name in types
+                if name not in common
+            )
+            return common, rebound
+
+        def _process_statement(
+            statement: ast.stmt, types: dict[str, str], rebound: set[str]
+        ) -> None:
+            # Nested scope bodies are analyzed exactly once in their own state.
+            # Walking a definition as a statement would otherwise stamp its
+            # body with the parent's receiver bindings before that child scope
+            # gets a chance to apply parameters and local rebinding.
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                definition_expressions: list[ast.AST] = list(statement.decorator_list)
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    definition_expressions.extend(statement.args.defaults)
+                    definition_expressions.extend(
+                        default
+                        for default in statement.args.kw_defaults
+                        if default is not None
+                    )
+                    definition_expressions.extend(
+                        argument.annotation
+                        for argument in (
+                            *statement.args.posonlyargs,
+                            *statement.args.args,
+                            *statement.args.kwonlyargs,
+                        )
+                        if argument.annotation is not None
+                    )
+                    if statement.args.vararg and statement.args.vararg.annotation:
+                        definition_expressions.append(statement.args.vararg.annotation)
+                    if statement.args.kwarg and statement.args.kwarg.annotation:
+                        definition_expressions.append(statement.args.kwarg.annotation)
+                    if statement.returns is not None:
+                        definition_expressions.append(statement.returns)
+                else:
+                    definition_expressions.extend(statement.bases)
+                    definition_expressions.extend(
+                        keyword.value for keyword in statement.keywords
+                    )
+                for expression in definition_expressions:
+                    _observe(expression, types, rebound)
+                child_bindings = types
+                if isinstance(scope_node, ast.ClassDef):
+                    # Nested function and class bodies both skip their containing
+                    # class namespace. Preserve only bindings that entered the
+                    # class from its lexical parent; self/cls is seeded separately.
+                    child_bindings = inherited_bindings.get(scope_node, {})
+                inherited_bindings[statement] = dict(child_bindings)
+
+            compound_blocks: list[list[ast.stmt]] = []
+            header_nodes: list[ast.AST] = []
+            body_targets: list[ast.AST] = []
+            if isinstance(statement, ast.While):
+                _observe(statement.test, types, rebound)
+                zero_state = (dict(types), set(rebound))
+                body_state = (dict(types), set(rebound))
+                _process_block(statement.body, *body_state)
+                else_types, else_rebound = _merge_flow_states(
+                    [zero_state, body_state]
+                )
+                _process_block(statement.orelse, else_types, else_rebound)
+                merged_types, merged_rebound = _merge_flow_states(
+                    [zero_state, body_state, (else_types, else_rebound)]
+                )
+                types.clear()
+                types.update(merged_types)
+                rebound.clear()
+                rebound.update(merged_rebound)
+                return
+            if isinstance(statement, (ast.For, ast.AsyncFor)):
+                _observe(statement.iter, types, rebound)
+                zero_state = (dict(types), set(rebound))
+                body_types, body_rebound = dict(types), set(rebound)
+                _invalidate([statement.target], body_types, body_rebound)
+                _process_block(statement.body, body_types, body_rebound)
+                body_state = (body_types, body_rebound)
+                else_types, else_rebound = _merge_flow_states(
+                    [zero_state, body_state]
+                )
+                _process_block(statement.orelse, else_types, else_rebound)
+                merged_types, merged_rebound = _merge_flow_states(
+                    [zero_state, body_state, (else_types, else_rebound)]
+                )
+                types.clear()
+                types.update(merged_types)
+                rebound.clear()
+                rebound.update(merged_rebound)
+                return
+            if isinstance(statement, ast.If):
+                header_nodes = [statement.test]
+                compound_blocks = [statement.body, statement.orelse]
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                # With-items execute left to right: each context expression is
+                # evaluated before that item's optional target is bound.
+                for item in statement.items:
+                    _observe(item.context_expr, types, rebound)
+                    if item.optional_vars is not None:
+                        _invalidate([item.optional_vars], types, rebound)
+                _process_block(statement.body, dict(types), set(rebound))
+                _invalidate([statement], types, rebound)
+                return
+            elif isinstance(statement, ast.Try):
+                compound_blocks = [statement.body, statement.orelse]
+                for handler in statement.handlers:
+                    handler_types, handler_rebound = dict(types), set(rebound)
+                    if handler.name:
+                        handler_types.pop(handler.name, None)
+                        handler_rebound.add(handler.name)
+                    _observe(handler.type, handler_types, handler_rebound) if handler.type else None
+                    _process_block(handler.body, handler_types, handler_rebound)
+                compound_blocks.append(statement.finalbody)
+            elif isinstance(statement, ast.Match):
+                _observe(statement.subject, types, rebound)
+                for case in statement.cases:
+                    case_types, case_rebound = dict(types), set(rebound)
+                    captured = [
+                        child
+                        for child in ast.walk(case.pattern)
+                        if (
+                            isinstance(child, (ast.MatchAs, ast.MatchStar))
+                            and child.name
+                        )
+                        or (isinstance(child, ast.MatchMapping) and child.rest)
+                    ]
+                    for capture in captured:
+                        name = capture.rest if isinstance(capture, ast.MatchMapping) else capture.name
+                        case_types.pop(name, None)
+                        case_rebound.add(name)
+                    if case.guard is not None:
+                        _observe(case.guard, case_types, case_rebound)
+                    _process_block(case.body, case_types, case_rebound)
+                _invalidate([statement], types, rebound)
+                return
+
+            if compound_blocks:
+                for node in header_nodes:
+                    _observe(node, types, rebound)
+                if body_targets:
+                    _invalidate(body_targets, types, rebound)
+                for block in compound_blocks:
+                    _process_block(block, dict(types), set(rebound))
+                # A compound statement can take multiple paths.  Unless all
+                # exits are proven equal, retaining an incoming exact type is
+                # unsafe; invalidate every name any nested path may bind.
+                _invalidate([statement], types, rebound)
+                return
+
+            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                _observe(statement, types, rebound)
+
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                assigned = {
+                    child.id
+                    for target in targets
+                    for child in ast.walk(target)
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+                }
+                for name in assigned:
+                    types.pop(name, None)
+                    rebound.add(name)
+                value = statement.value
+                if (
+                    len(assigned) == 1
+                    and isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and (class_qualname := types.get(value.func.id))
+                    and not class_qualname.startswith("::")
+                ):
+                    assigned_name = next(iter(assigned))
+                    types[assigned_name] = class_qualname
+                    rebound.discard(assigned_name)
+            elif isinstance(statement, ast.ClassDef):
+                types[statement.name] = node_qualnames[statement]
+                rebound.discard(statement.name)
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # The definition makes direct calls exact from this point on,
+                # but a function result is not constructor/type evidence.
+                types[statement.name] = f"::callable::{node_qualnames[statement]}"
+                rebound.discard(statement.name)
+            elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                for alias in statement.names:
+                    local_name = alias.asname or alias.name.split(".")[0]
+                    destination = (
+                        alias.name
+                        if isinstance(statement, ast.Import)
+                        else f"{'.' * (statement.level or 0)}"
+                        f"{statement.module or ''}.{alias.name}"
+                    )
+                    # Keep imports in the lexical flow state for direct-name
+                    # calls, but do not mistake module aliases for proven
+                    # class receivers. Qualified import members are resolved
+                    # by the bounded import reparser in source_graph.py.
+                    types[local_name] = f"::import::{destination}"
+                    rebound.discard(local_name)
+            else:
+                stored = {
+                    child.id for child in _walk_enclosing_bindings(statement)
+                    if isinstance(child, ast.Name)
+                    and isinstance(child.ctx, (ast.Store, ast.Del))
+                }
+                if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                    stored.update(
+                        alias.asname or alias.name.split(".")[0]
+                        for alias in statement.names
+                    )
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    stored.add(statement.name)
+                stored.update(
+                    child.name for child in _walk_lexical_scope(statement)
+                    if isinstance(child, (ast.MatchAs, ast.MatchStar)) and child.name
+                )
+                stored.update(
+                    child.rest for child in _walk_lexical_scope(statement)
+                    if isinstance(child, ast.MatchMapping) and child.rest
+                )
+                stored.update(
+                    child.name for child in _walk_lexical_scope(statement)
+                    if isinstance(child, ast.ExceptHandler) and child.name
+                )
+                for name in stored:
+                    types.pop(name, None)
+                    rebound.add(name)
+
+        _process_block(list(getattr(scope_node, "body", ())), current_types, rebound_names)
+
+    for scope_node, _, _ in scopes:
+        _analyze_scope(scope_node)
+
+    # A proven receiver does not prove that an arbitrary member is defined
+    # directly on that type.  Keep exact destinations only for identities
+    # already extracted (methods/class attributes), or for exact member writes
+    # that will themselves produce an attribute entity below.
+    direct_member_identities = {entity.qualname for entity in entities}
+    direct_member_identities.update(
+        destination
+        for attribute, destination in exact_member_destinations.items()
+        if isinstance(attribute.ctx, (ast.Store, ast.Del))
+    )
+
+    for scope_node, owner, class_owner in scopes:
+        instance_types_by_line: dict[int, dict[str, str]] = {}
+        shadowed_names_by_line = {
+            node.lineno: {node.func.value.id}
+            for node in _walk_lexical_scope(scope_node)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and shadowed_receivers.get(node.func, False)
+            )
+        }
+        _extract_calls(
+            scope_node, owner, edges, rel, source_hash, build_revision,
+            bound_names, bound_qualnames, class_owner, import_targets,
+            instance_types_by_line, shadowed_names_by_line,
+            {
+                node: destination
+                for node in _walk_lexical_scope(scope_node)
+                if isinstance(node, ast.Attribute)
+                for destination, exact in [_member_destination(node, class_owner, scope_node)]
+                if exact and destination is not None
+            },
+            exact_direct_destinations,
+            shadowed_direct_calls,
+        )
+        for node in _walk_lexical_scope(scope_node):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    _define_member(owner, class_owner, scope_node, target)
+                if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Attribute):
+                    destination, exact = _member_destination(
+                        node.target, class_owner, scope_node
+                    )
+                    _edge(
+                        "references", owner, node.target.attr, destination, node.target,
+                        EXTRACTED if exact else INFERRED, 1.0 if exact else 0.5,
+                    )
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                destination, exact = _member_destination(node, class_owner, scope_node)
+                _edge(
+                    "references", owner, node.attr, destination, node,
+                    EXTRACTED if exact else INFERRED, 1.0 if exact else 0.5,
+                )
+
+    entities.extend(member_entities.values())
+
+    def _semantic_roles(node: ast.AST, lexical_owner: str) -> None:
+        owner = node_qualnames.get(node, lexical_owner)
+
+        def _role_names(expression: ast.AST, *, include_root: bool) -> list[tuple[str, ast.AST]]:
+            attributes = [
+                child for child in ast.walk(expression) if isinstance(child, ast.Attribute)
+            ]
+            facts = [(child.attr, child) for child in attributes]
+            root = expression.func if isinstance(expression, ast.Call) else expression
+            if include_root and isinstance(root, ast.Name):
+                facts.insert(0, (root.id, root))
+            elif not facts:
+                if isinstance(root, ast.Attribute):
+                    facts.append((root.attr, root))
+                elif isinstance(root, ast.Name):
+                    facts.append((root.id, root))
+            return facts
+
+        def _emit_role(kind: str, edge_kind: str, expression: ast.AST,
+                       *, include_root: bool = False) -> None:
+            for name, fact_node in _role_names(expression, include_root=include_root):
+                line = getattr(fact_node, "lineno", getattr(expression, "lineno", 1))
+                _edge(edge_kind, owner, name, None, fact_node, EXTRACTED, 1.0)
+                _entity(
+                    kind, name, f"{owner}::{kind}::{name}::{line}", fact_node,
+                )
+
+        for decorator in getattr(node, "decorator_list", ()):
+            _emit_role("decorator", "decorates", decorator, include_root=True)
+
+        annotations: list[ast.AST] = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.returns is not None:
+                annotations.append(node.returns)
+            args = node.args
+            annotations.extend(
+                arg.annotation
+                for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)
+                if arg.annotation is not None
+            )
+            if args.vararg and args.vararg.annotation:
+                annotations.append(args.vararg.annotation)
+            if args.kwarg and args.kwarg.annotation:
+                annotations.append(args.kwarg.annotation)
+        elif isinstance(node, ast.AnnAssign):
+            annotations.append(node.annotation)
+
+        for annotation in annotations:
+            _emit_role("annotation", "annotates", annotation)
+
+        for child in ast.iter_child_nodes(node):
+            _semantic_roles(child, owner)
+
+    _semantic_roles(tree, module_qualname)
+
+    for child in ast.walk(tree):
+        if isinstance(child, ast.ClassDef):
+            qualname = node_qualnames.get(child)
+            if qualname is None:
+                continue
+            for base in child.bases:
+                base_name = ast.unparse(base)
+                if base_name:
+                    _edge(
+                        "inherits", qualname, base_name, bound_qualnames.get(base_name), child,
+                        EXTRACTED if base_name in bound_names else AMBIGUOUS,
+                        1.0 if base_name in bound_names else 0.5,
+                    )
+
+    unique_entities = {entity.qualname: entity for entity in entities}
+    unique_edges = {
+        (
+            edge.kind,
+            edge.src_qualname,
+            edge.dst_name,
+            edge.dst_qualname,
+            edge.line,
+            edge.source_col,
+            edge.receiver_name,
+        ): edge
+        for edge in edges
+    }
     return FileExtraction(
         file_path=rel, language="python", status="ok", source_hash=source_hash,
-        entities=tuple(entities), edges=tuple(edges),
+        entities=tuple(unique_entities[key] for key in sorted(unique_entities)),
+        edges=tuple(unique_edges[key] for key in sorted(
+            unique_edges,
+            key=lambda item: (
+                item[0], item[1], item[2], item[3] or "", item[4], item[5], item[6]
+            ),
+        )),
     )
 
 
@@ -1452,31 +2111,68 @@ def _extract_calls(
     build_revision: str,
     bound_names: set[str],
     bound_qualnames: dict[str, str],
+    class_owner: str | None = None,
+    import_targets: dict[str, str] | None = None,
+    instance_types_by_line: dict[int, dict[str, str]] | None = None,
+    shadowed_names_by_line: dict[int, set[str]] | None = None,
+    exact_member_destinations: dict[ast.Attribute, str] | None = None,
+    exact_direct_destinations: dict[ast.Name, str] | None = None,
+    shadowed_direct_calls: set[ast.Name] | None = None,
 ) -> None:
-    """Record direct calls made in ``scope_node``'s own body (not nested defs)."""
+    """Record direct calls, resolving members only when receiver identity is proven."""
 
-    for node in ast.walk(scope_node):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node is not scope_node:
-            continue
+    import_targets = import_targets or {}
+    instance_types_by_line = instance_types_by_line or {}
+    shadowed_names_by_line = shadowed_names_by_line or {}
+    exact_member_destinations = exact_member_destinations or {}
+    exact_direct_destinations = exact_direct_destinations or {}
+    shadowed_direct_calls = shadowed_direct_calls or set()
+    lexical_import_names = {
+        alias.asname or alias.name.split(".")[0]
+        for statement in _walk_lexical_scope(scope_node)
+        if isinstance(statement, (ast.Import, ast.ImportFrom))
+        for alias in statement.names
+    }
+    for node in _walk_lexical_scope(scope_node):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
         dst_qualname: str | None = None
         if isinstance(func, ast.Name):
             dst_name = func.id
-            label = EXTRACTED if dst_name in bound_names else AMBIGUOUS
-            confidence = 1.0 if dst_name in bound_names else 0.4
-            dst_qualname = bound_qualnames.get(dst_name)
+            dst_qualname = exact_direct_destinations.get(func)
+            if (
+                dst_qualname is None
+                and func not in shadowed_direct_calls
+                and dst_name not in lexical_import_names
+            ):
+                dst_qualname = bound_qualnames.get(dst_name)
+            exact = dst_qualname is not None
+            label = EXTRACTED if exact else AMBIGUOUS
+            confidence = 1.0 if exact else 0.4
         elif isinstance(func, ast.Attribute):
             dst_name = func.attr
-            label = INFERRED
-            confidence = 0.6
+            receiver = func.value
+            dst_qualname = exact_member_destinations.get(func)
+            if dst_qualname is None and isinstance(receiver, ast.Name):
+                instance_type = instance_types_by_line.get(node.lineno, {}).get(receiver.id)
+                if instance_type:
+                    dst_qualname = f"{instance_type}.{dst_name}"
+            label = EXTRACTED if dst_qualname else INFERRED
+            confidence = 1.0 if dst_qualname else 0.6
         else:
             continue
         edges.append(Edge(
-            kind="calls", src_qualname=owner_qualname, dst_name=dst_name, dst_qualname=dst_qualname,
-            file_path=rel, line=node.lineno, evidence_label=label, extractor=EXTRACTOR_ID,
-            confidence=confidence, source_hash=source_hash, build_revision=build_revision,
+            kind="calls", src_qualname=owner_qualname, dst_name=dst_name,
+            dst_qualname=dst_qualname, file_path=rel, line=node.lineno,
+            evidence_label=label, extractor=EXTRACTOR_ID, confidence=confidence,
+            source_hash=source_hash, build_revision=build_revision,
+            source_col=int(getattr(func, "col_offset", -1)),
+            receiver_name=(
+                func.value.id
+                if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+                else ""
+            ),
         ))
 
 
