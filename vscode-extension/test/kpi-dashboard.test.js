@@ -128,8 +128,12 @@ test("KPI renderer separates worker outcomes from explicit manager decisions", (
 });
 
 test("dashboard labels queue, canonical outcomes, bounded failures, and effectiveness honestly", () => {
-  assert.match(extensionSource, /Current queue/);
-  assert.match(extensionSource, /Accepted and rejected are all-time manager ledger decisions/);
+  assert.match(extensionSource, /<section aria-label="Live tasks">/);
+  assert.match(extensionSource, /<section aria-label="Task outcomes">/);
+  assert.doesNotMatch(extensionSource, /<h2[^>]*>Live tasks<\/h2>/);
+  assert.doesNotMatch(extensionSource, /<h2[^>]*>Task outcomes<\/h2>/);
+  assert.doesNotMatch(extensionSource, /Current canonical task states/);
+  assert.doesNotMatch(extensionSource, /Accepted and rejected are all-time manager ledger decisions/);
   assert.match(extensionSource, /metric-accepted/);
   assert.match(extensionSource, /metric-rejected/);
   assert.match(appSource, /Actionable review-ready/);

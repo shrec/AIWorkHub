@@ -9093,10 +9093,8 @@ function getHtmlForWebview(webview, extensionUri) {
   </header>
 
   <main>
-    <section aria-labelledby="current-queue-heading">
-      <h2 id="current-queue-heading">Current queue</h2>
-      <p>Current canonical task states; stale is an observability flag.</p>
-    <div class="summary-strip" aria-label="Current queue counts">
+    <section aria-label="Live tasks">
+    <div class="summary-strip" aria-label="Live task counts">
       <div class="summary-item status-all">
         <span class="summary-label">Active</span>
         <strong id="metric-active">0</strong>
@@ -9124,15 +9122,13 @@ function getHtmlForWebview(webview, extensionUri) {
     </div>
     </section>
 
-    <section aria-labelledby="canonical-outcomes-heading">
-      <h2 id="canonical-outcomes-heading">Canonical decisions and task outcomes</h2>
-      <p>Accepted and rejected are all-time manager ledger decisions; archived, superseded, and finished are current task states.</p>
-    <div class="summary-strip" aria-label="Canonical decision and outcome counts">
-      <div class="summary-item"><span class="summary-label">Accepted decisions</span><strong id="metric-accepted">0</strong></div>
-      <div class="summary-item"><span class="summary-label">Rejected decisions</span><strong id="metric-rejected">0</strong></div>
-      <div class="summary-item"><span class="summary-label">Archived tasks</span><strong id="metric-archived">0</strong></div>
-      <div class="summary-item"><span class="summary-label">Superseded tasks</span><strong id="metric-superseded">0</strong></div>
-      <div class="summary-item status-finished"><span class="summary-label">Finished tasks</span><strong id="metric-finished">0</strong></div>
+    <section aria-label="Task outcomes">
+    <div class="summary-strip" aria-label="Task outcome counts">
+      <div class="summary-item"><span class="summary-label">Accepted</span><strong id="metric-accepted">0</strong></div>
+      <div class="summary-item"><span class="summary-label">Rejected</span><strong id="metric-rejected">0</strong></div>
+      <div class="summary-item"><span class="summary-label">Archived</span><strong id="metric-archived">0</strong></div>
+      <div class="summary-item"><span class="summary-label">Superseded</span><strong id="metric-superseded">0</strong></div>
+      <div class="summary-item status-finished"><span class="summary-label">Finished</span><strong id="metric-finished">0</strong></div>
       <div class="summary-item usage-total">
         <span class="summary-label">Usage</span>
         <strong id="metric-tokens">0</strong>
