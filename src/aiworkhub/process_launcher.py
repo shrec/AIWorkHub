@@ -4742,6 +4742,20 @@ class ProcessManager:
         # replay would not compare equal to it.
         return process_event_ledger.append_event(self.process_log_path, clean)
 
+    def _retention_event(self, event: dict[str, Any], *, disposition: str) -> dict[str, Any]:
+        """Single door for a terminal event's retention story: ``disposition``
+        is required and DERIVES ``workspace_retained`` so they cannot disagree
+        (``retained_in_place``/``quarantined`` keep the bytes, ``removed`` does
+        not).  An unknown value raises here, so a branch that forgets the
+        vocabulary fails to construct instead of silently omitting it.
+        """
+        retained = {"retained_in_place": True, "quarantined": True,
+                    "removed": False}[disposition]
+        return self._append_event({
+            **event, "workspace_disposition": disposition,
+            "workspace_retained": retained,
+        })
+
     def _events(self) -> list[dict[str, Any]]:
         return list(process_event_ledger.iter_events(self.process_log_path))
 
@@ -9382,7 +9396,7 @@ class ProcessManager:
                 )
 
         error = "bridge_cancel_publication_failed:" + "|".join(errors)
-        self._append_event({
+        self._retention_event({
             **lineage,
             "request_id": request_id,
             "state": "reconcile_pending",
@@ -9390,12 +9404,11 @@ class ProcessManager:
             "pid_start_ticks": latest.get("pid_start_ticks"),
             "metadata_path": latest.get("metadata_path"),
             "supervisor_status_path": latest.get("supervisor_status_path"),
-            "workspace_retained": True,
             "bridge_provider_may_be_active": True,
             "bridge_cancel_status": "failed",
             "reconciliation_deferred": "bridge_cancel_publication_failed",
             "error": error[:500],
-        })
+        }, disposition="retained_in_place")
         raise _BridgeCancellationDeferred(error[:500])
 
     def _monitor_direct_for_tests(self, live: _LiveProcess) -> None:
@@ -10319,7 +10332,7 @@ class ProcessManager:
         else:
             terminal_state = "reconcile_pending"
             error_detail = error + ":terminal_transition_failed:" + transition_reason
-        return self._append_event({
+        return self._retention_event({
             **event_identity,
             "request_id": request_id,
             "state": terminal_state,
@@ -10330,7 +10343,6 @@ class ProcessManager:
             ),
             "exit_code": supervisor_returncode,
             "finished_at": _utcnow(),
-            "workspace_retained": True,
             "finalizer_abandoned": terminal_state == "finalize_abandoned",
             "release_transition_ok": bool(release_result.get("ok")),
             "callback_enqueued": bool(release_result.get("callback_enqueued")),
@@ -10338,7 +10350,7 @@ class ProcessManager:
                 (time.monotonic() - finalization_started) * 1000.0, 3
             ),
             "error": error_detail[:500],
-        })
+        }, disposition="retained_in_place")
 
     def _reconcile_persisted_requests(self) -> dict[str, int]:
         watched = 0
@@ -10612,21 +10624,19 @@ class ProcessManager:
         """Delete only a finalized task's retained, proven-dead workspace."""
         if event.get("state") not in GC_CANDIDATE_PROCESS_STATES:
             return None
-        if not event.get("workspace_retained"):
+        if not event.get("workspace_retained") or event.get("workspace_quarantined"):
             return None
         with self._lock:
             if request_id in self._active_request_ids():
                 return None
         with self._request_lock(request_id):
-            # Re-read under the lock through the SAME projection the prefilter
-            # used: a full _request_events replay per request cost 686 x 3.34 s
-            # -- a 38-minute sweep inside a 30-second loop -- to read one row.
+            # Re-read under the lock through the SAME projection the prefilter used; a full _request_events replay per request is a 38-min sweep.
             latest = self._latest_by_request().get(request_id)
             if latest is None:
                 return None
             if (
                 latest.get("state") not in GC_CANDIDATE_PROCESS_STATES
-                or not latest.get("workspace_retained")
+                or not latest.get("workspace_retained") or latest.get("workspace_quarantined")
             ):
                 return None
 
@@ -10713,26 +10723,21 @@ class ProcessManager:
                             + str(transition.get("stderr") or "unknown")
                         )[:200],
                     }
-                # The "still in review" guard protects verified bytes that
-                # EXIST; a workspace that is already gone has nothing to
-                # preserve and must not stay unreclaimable forever.  The card is
-                # now blocked, so reclaim the retained record through the
-                # ordinary idempotent cleanup path.  A cleanup failure stays
-                # truthfully retained for a later retry instead of reporting a
-                # phantom success, and the removal is recorded in the audit.
+                prior_state = str(latest.get("state") or "")
+                retention_state = "finalize_failed" if prior_state in {"review_ready", "exited", "exited_without_review"} else prior_state
+                # The "still in review" guard protects bytes that EXIST; bytes already gone have nothing to preserve, so reclaim the retained record through the ordinary idempotent cleanup path (audited).
                 if integrity_reason == "review_workspace_missing":
                     try:
                         cleanup_workspace(repo, path, home)
                     except WorkspaceError as exc:
-                        self._append_event({
+                        self._retention_event({
                             "request_id": request_id,
                             "task_id": task_id,
                             "runner": runner,
                             "topic": latest.get("topic"),
                             "adapter_id": latest.get("adapter_id"),
-                            "state": "finalize_failed",
+                            "state": retention_state,
                             "error": f"retained_workspace_cleanup_failed:{exc}"[:500],
-                            "workspace_retained": True,
                             "workspace_gc": False,
                             "workspace_gc_at": _utcnow(),
                             "workspace_gc_reason": integrity_reason,
@@ -10740,7 +10745,7 @@ class ProcessManager:
                             "callback_enqueued": bool(
                                 transition.get("callback_enqueued")
                             ),
-                        })
+                        }, disposition="retained_in_place")
                         return {
                             "request_id": request_id,
                             "gc": False,
@@ -10754,15 +10759,15 @@ class ProcessManager:
                         reason=integrity_reason,
                         action="purge",
                     )
-                    self._append_event({
+                    # Bytes already gone: this branch removes (disposition "removed").  GC runs only on a card already in a terminal GC-candidate state, so an adjudicated outcome always exists here -- keep it like the quarantine branch, never mask it.
+                    self._retention_event({
                         "request_id": request_id,
                         "task_id": task_id,
                         "runner": runner,
                         "topic": latest.get("topic"),
                         "adapter_id": latest.get("adapter_id"),
-                        "state": "finalize_failed",
+                        "state": retention_state,
                         "error": f"retained_workspace_missing_reclaimed:{integrity_reason}"[:500],
-                        "workspace_retained": False,
                         "workspace_gc": True,
                         "workspace_gc_at": _utcnow(),
                         "workspace_gc_reason": integrity_reason,
@@ -10770,17 +10775,13 @@ class ProcessManager:
                         "callback_enqueued": bool(
                             transition.get("callback_enqueued")
                         ),
-                    })
+                    }, disposition="removed")
                     return {
                         "request_id": request_id,
                         "gc": True,
                         "reason": integrity_reason,
                     }
-                # A failed integrity check on bytes that still EXIST is not
-                # authority to destroy verified work.  Quarantine the workspace
-                # so a manager can diff it against the sealed hashes and decide;
-                # the card is already blocked with this reason.  Every removal
-                # from the live tree is recorded in the retention audit.
+                # A failed integrity check on bytes that still EXIST is not authority to destroy work: quarantine them for a manager (audited).
                 try:
                     quarantine_dir = quarantine_review_workspace(
                         self.process_log_path,
@@ -10789,7 +10790,7 @@ class ProcessManager:
                         home=home,
                     )
                 except (OSError, WorkspaceError) as exc:
-                    self._append_event({
+                    self._retention_event({
                         "request_id": request_id,
                         "task_id": task_id,
                         "runner": runner,
@@ -10797,7 +10798,6 @@ class ProcessManager:
                         "adapter_id": latest.get("adapter_id"),
                         "state": "finalize_failed",
                         "error": f"review_workspace_quarantine_failed:{exc}"[:500],
-                        "workspace_retained": True,
                         "workspace_gc": False,
                         "workspace_gc_at": _utcnow(),
                         "workspace_gc_reason": integrity_reason,
@@ -10805,7 +10805,7 @@ class ProcessManager:
                         "callback_enqueued": bool(
                             transition.get("callback_enqueued")
                         ),
-                    })
+                    }, disposition="retained_in_place")
                     return {
                         "request_id": request_id,
                         "gc": False,
@@ -10820,15 +10820,14 @@ class ProcessManager:
                     action="quarantine",
                     moved_to=str(quarantine_dir),
                 )
-                self._append_event({
+                self._retention_event({
                     "request_id": request_id,
                     "task_id": task_id,
                     "runner": runner,
                     "topic": latest.get("topic"),
                     "adapter_id": latest.get("adapter_id"),
-                    "state": "finalize_failed",
+                    "state": retention_state,
                     "error": f"retained_workspace_quarantined:{integrity_reason}"[:500],
-                    "workspace_retained": False,
                     "workspace_gc": False,
                     "workspace_quarantined": True,
                     "workspace_quarantine_path": str(quarantine_dir),
@@ -10836,7 +10835,7 @@ class ProcessManager:
                     "workspace_gc_reason": integrity_reason,
                     "review_transition_ok": True,
                     "callback_enqueued": bool(transition.get("callback_enqueued")),
-                })
+                }, disposition="quarantined")
                 return {
                     "request_id": request_id,
                     "gc": False,
@@ -10859,6 +10858,13 @@ class ProcessManager:
             try:
                 cleanup_workspace(repo, path, home)
             except WorkspaceError as exc:
+                self._retention_event({
+                    "request_id": request_id, "task_id": task_id,
+                    "runner": runner, "topic": latest.get("topic"),
+                    "adapter_id": latest.get("adapter_id"), "state": latest.get("state"),
+                    "error": f"cleanup_failed:{exc}"[:500], "workspace_gc": False,
+                    "workspace_gc_at": _utcnow(), "workspace_gc_reason": disposition,
+                }, disposition="retained_in_place")
                 return {
                     "request_id": request_id,
                     "gc": False,
@@ -10873,18 +10879,17 @@ class ProcessManager:
                 reason=disposition,
                 action="purge",
             )
-            self._append_event({
+            self._retention_event({
                 "request_id": request_id,
                 "task_id": task_id,
                 "runner": runner,
                 "topic": latest.get("topic"),
                 "adapter_id": latest.get("adapter_id"),
                 "state": latest.get("state"),
-                "workspace_retained": False,
                 "workspace_gc": True,
                 "workspace_gc_at": _utcnow(),
                 "workspace_gc_reason": disposition,
-            })
+            }, disposition="removed")
             return {"request_id": request_id, "gc": True, "reason": disposition}
 
     def _finalize_isolated_request(
@@ -10960,11 +10965,9 @@ class ProcessManager:
                 ):
                     return None
             supervisor_alive = identity.verdict is PidIdentityVerdict.MATCH
-            # The supervisor process is spawned before its first atomic status
-            # write.  A concurrent reconciler can therefore observe the exact
-            # live PID while the status file is still absent for a few
-            # milliseconds.  That launch window is active work, not evidence
-            # of failure; the PID watcher will call us again after exit.
+            # The supervisor is spawned before its first atomic status write, so
+            # a concurrent reconciler can see the exact live PID while the status
+            # file is briefly absent: that launch window is active work.
             liveness_lost = False
             stall_detected = False
             stall_idle_seconds: float | None = None
@@ -11122,9 +11125,8 @@ class ProcessManager:
                     if retry_event is not None:
                         return retry_event
                     # The auth-readiness circuit is a claim about the credential,
-                    # so it only trips on an exact authentication-shaped Claude
-                    # runtime receipt. A rate/quota refusal is not evidence of a
-                    # bad key and must not re-authenticate the route.
+                    # so it only trips on an authentication-shaped Claude receipt:
+                    # a rate/quota refusal must not re-authenticate the route.
                     if (
                         str(metadata.get("adapter_id") or "") == "claude_cli"
                         and claude_auth.record_runtime_auth_failure(
@@ -11194,16 +11196,13 @@ class ProcessManager:
 
             try:
                 if terminal_state != "exited":
-                    # A worker that timed out, crashed, or was cancelled did
-                    # not produce actionable review work. Preserve its exact
-                    # evidence/worktree, but close it in the blocked terminal
-                    # bucket so the review queue remains truthful.
+                    # A worker that timed out, crashed, or was cancelled produced
+                    # no review work: keep its worktree, close it in the blocked
+                    # terminal bucket so the review queue remains truthful.
                     cleanup = terminal_state == "launch_failed"
-                    # A non-exited terminal outcome never promotes/writes and
-                    # so never needs the one-task authority grant -- remove
-                    # it now so it cannot linger as a stale, unconsumed
-                    # artifact for a request that will never reach the
-                    # success branch below.
+                    # A non-exited terminal outcome never promotes/writes, so it
+                    # never needs the one-task authority grant -- remove it now so
+                    # it cannot linger as a stale artifact past this dead request.
                     unlink_if_regular(self._terminal_authority_grant_path(request_id))
                     if terminal_state == "launch_failed":
                         release_result = task_engine.mark_launch_failed(
@@ -11796,12 +11795,9 @@ class ProcessManager:
                     usage_recorded = True
                     usage_error = "finalization_retry_reused_prior_usage"
                 else:
-                    # A release_pending predecessor is a finalization-pending
-                    # state, so it never recorded provider spend: the provider
-                    # already ran and spent tokens, but usage recording was
-                    # deferred with the release transition. Record it now --
-                    # ``_record_usage`` is idempotent per request_id, so this
-                    # can never double-count -- rather than lose the spend.
+                    # A release_pending predecessor deferred usage recording with
+                    # its release transition. Record the spend now -- _record_usage
+                    # is idempotent per request_id, so this can never double-count.
                     usage, usage_recorded, usage_error = self._record_usage(
                         request_id,
                         str(metadata["task_id"]),
@@ -11858,7 +11854,22 @@ class ProcessManager:
                 ),
                 3,
             )
-            event = self._append_event({
+            cleanup_error = ""
+            if cleanup:
+                # Record the purge intent BEFORE the delete: the disposition on
+                # the terminal event must be a FACT, not an intention, so it is
+                # written delete-then-append -- this durable audit row is then
+                # the surviving trace if that later append is ever lost.
+                record_review_workspace_retention_audit(
+                    self.process_log_path, request_id=request_id,
+                    task_id=str(metadata["task_id"]), card_status=terminal_state,
+                    reason="finalization_purge", action="purge",
+                )
+                try:
+                    cleanup_workspace(workspace.repo, workspace.path, workspace.home)
+                except WorkspaceError as exc:
+                    cleanup_error = f"cleanup_failed:{exc}"[:500]
+            event = self._retention_event({
                 "request_id": request_id,
                 "task_id": metadata["task_id"],
                 "runner": metadata["runner"],
@@ -11882,7 +11893,6 @@ class ProcessManager:
                 "supervisor_status_path": str(status_path),
                 "cancel_path": metadata.get("cancel_path"),
                 "workspace_isolated": True,
-                "workspace_retained": not cleanup,
                 "sandbox_backend": metadata.get("sandbox_backend"),
                 "execution_mode": metadata.get("execution_mode") or "provider_worker",
                 "provider_launched": metadata.get("provider_launched") is not False,
@@ -11941,17 +11951,11 @@ class ProcessManager:
                     "validation": validation_duration_ms,
                     "evidence_and_transition": evidence_transition_duration_ms,
                 },
-            })
-            if cleanup:
-                try:
-                    cleanup_workspace(workspace.repo, workspace.path, workspace.home)
-                except WorkspaceError as exc:
-                    self._append_event({
-                        **self._event_identity(events + [event]),
-                        "state": terminal_state,
-                        "finished_at": _utcnow(),
-                        "error": f"cleanup_failed:{exc}"[:500],
-                    })
+                "cleanup_error": cleanup_error,
+            }, disposition=(
+                "removed" if cleanup and not cleanup_error
+                else "retained_in_place"
+            ))
             return event
 
     @staticmethod
@@ -12589,7 +12593,7 @@ class ProcessManager:
             "pid", "exit_code", "runner", "topic", "adapter_id", "model", "error",
             # Stable public lifecycle evidence used by coordinator/security
             # consumers.  These are scalar paths, not recursive payloads.
-            "metadata_path", "workspace_retained",
+            "metadata_path", "workspace_retained", "workspace_disposition",
         )
         card_summary = {key: card.get(key) for key in card_fields if key in card}
         event_summary = {key: latest.get(key) for key in event_fields if key in latest}
@@ -13713,7 +13717,7 @@ class ProcessManager:
                     cleanup_workspace(workspace.repo, workspace.path, workspace.home)
                 except WorkspaceError as exc:
                     cleanup_error = str(exc)[:500]
-                self._append_event({
+                self._retention_event({
                     "request_id": request_id,
                     "task_id": task_id,
                     "runner": runner,
@@ -13722,7 +13726,6 @@ class ProcessManager:
                     "state": "accepted",
                     "accepted": True,
                     "promoted_paths": [],
-                    "workspace_retained": bool(cleanup_error),
                     "cleanup_error": cleanup_error,
                     "quality_review_receipt": verified_receipt,
                     "acceptance_evidence_record": acceptance_evidence_record,
@@ -13730,7 +13733,7 @@ class ProcessManager:
                     "acceptance_lock_scope": "request",
                     "needfix_closure": needfix_closure,
                     "finished_at": _utcnow(),
-                })
+                }, disposition="retained_in_place" if cleanup_error else "removed")
                 return {
                     "ok": True,
                     "request_id": request_id,
@@ -13882,7 +13885,7 @@ class ProcessManager:
                     cleanup_workspace(workspace.repo, workspace.path, workspace.home)
                 except WorkspaceError as exc:
                     cleanup_error = str(exc)[:500]
-                self._append_event({
+                self._retention_event({
                     "request_id": request_id,
                     "task_id": task_id,
                     "runner": runner,
@@ -13891,14 +13894,13 @@ class ProcessManager:
                     "state": "accepted",
                     "accepted": True,
                     "promoted_paths": [],
-                    "workspace_retained": bool(cleanup_error),
                     "cleanup_error": cleanup_error,
                     "research_result": current_result,
                     "acceptance_evidence_record": acceptance_evidence_record,
                     "reviewer_finalization": [],
                     "needfix_closure": needfix_closure,
                     "finished_at": _utcnow(),
-                })
+                }, disposition="retained_in_place" if cleanup_error else "removed")
                 return {
                     "ok": True,
                     "request_id": request_id,
@@ -14307,7 +14309,7 @@ class ProcessManager:
             try:
                 cleanup_workspace(workspace.repo, workspace.path, workspace.home)
             except WorkspaceError as exc:
-                self._append_event({
+                self._retention_event({
                     "request_id": request_id,
                     "task_id": task_id,
                     "runner": runner,
@@ -14316,7 +14318,6 @@ class ProcessManager:
                     "state": "accepted",
                     "accepted": True,
                     "promoted_paths": promoted,
-                    "workspace_retained": True,
                     "cleanup_error": str(exc)[:500],
                     "reviewer_finalization": reviewer_finalization,
                     "acceptance_evidence_record": acceptance_evidence_record,
@@ -14324,10 +14325,10 @@ class ProcessManager:
                     "needfix_closure": needfix_closure,
                     "learning_commit_owed": learning_owed,
                     "finished_at": _utcnow(),
-                })
+                }, disposition="retained_in_place")
                 return {**accepted_reply, "cleanup_error": str(exc)[:500]}
 
-            self._append_event({
+            self._retention_event({
                 "request_id": request_id,
                 "task_id": task_id,
                 "runner": runner,
@@ -14336,14 +14337,13 @@ class ProcessManager:
                 "state": "accepted",
                 "accepted": True,
                 "promoted_paths": promoted,
-                "workspace_retained": False,
                 "learning_commit_owed": learning_owed,
                 "reviewer_finalization": reviewer_finalization,
                 "acceptance_evidence_record": acceptance_evidence_record,
                 "accepted_outcome_receipt": accepted_outcome_receipt,
                 "needfix_closure": needfix_closure,
                 "finished_at": _utcnow(),
-            })
+            }, disposition="removed")
             return accepted_reply
 
     def list_processes(self, limit: int = 100) -> dict[str, Any]:
