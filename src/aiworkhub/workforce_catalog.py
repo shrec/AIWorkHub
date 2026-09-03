@@ -1083,7 +1083,9 @@ def build_catalog(
 
 def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *, catalog: Mapping[str, Any] | None = None) -> dict[str, Any]:
     snapshot = dict(catalog or build_catalog(repo_root))
-    workers: list[workforce_router.WorkerCapability] = []
+    workers_prior: list[workforce_router.WorkerCapability] = []
+    workers_measured: list[workforce_router.WorkerCapability] = []
+    outcome_evidence_by_worker: dict[str, dict[str, Any]] = {}
     requested_families = [
         family
         for family in ("code", "research", "linguistic", "review", "mechanical")
@@ -1105,29 +1107,81 @@ def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *,
         economics = economics.get(task.risk)
         if not isinstance(economics, Mapping):
             economics = {}
-        workers.append(workforce_router.WorkerCapability.build(
+        # The measured cost_per_accepted_outcome partition already joins matched
+        # decided tasks on the SAME task family and risk tier resolved here, so
+        # its acceptance rate is the outcome evidence for this exact population.
+        # A partition with a matched population is scored on its measured rate;
+        # one with none keeps the labelled conservative prior, so a caller can
+        # always tell a ranked-on-evidence decision from a ranked-on-nothing one.
+        prior_accepted_rate = outcomes.get("accepted_rate")
+        matched_decided_tasks = int(economics.get("matched_decided_tasks") or 0)
+        accepted_outcomes = int(economics.get("accepted_outcomes") or 0)
+        measured_acceptance_rate = economics.get("acceptance_rate")
+        if measured_acceptance_rate is None and matched_decided_tasks > 0:
+            measured_acceptance_rate = accepted_outcomes / matched_decided_tasks
+        if matched_decided_tasks > 0 and measured_acceptance_rate is not None:
+            reported_accepted_rate: float | None = round(float(measured_acceptance_rate), 6)
+            accepted_rate_source = "measured_cost_per_accepted_outcome_partition"
+            evidence_sample_count = matched_decided_tasks
+        else:
+            reported_accepted_rate = prior_accepted_rate
+            accepted_rate_source = "conservative_prior"
+            evidence_sample_count = 0
+        shared_evidence = dict(
+            review_ready_rate=outcomes.get("review_ready_rate"),
+            validation_failure_rate=outcomes.get("validation_failure_rate"),
+            p50_latency_seconds=outcomes.get("p50_latency_seconds"),
+            p95_latency_seconds=outcomes.get("p95_latency_seconds"),
+            cost_usd_per_1k_tokens=outcomes.get("cost_usd_per_1k_tokens"),
+            estimated_tokens=outcomes.get("estimated_tokens_per_attempt"),
+            tool_discipline_score=outcomes.get("tool_discipline_score"),
+            cost_per_accepted_outcome_usd=economics.get("cost_per_accepted_outcome_usd"),
+            economic_evidence_state=str(economics.get("state") or "UNMEASURED"),
+            economic_matched_tasks=matched_decided_tasks,
+            economic_accepted_outcomes=accepted_outcomes,
+            economic_cost_coverage=economics.get("cost_coverage"),
+        )
+        common = dict(
             worker_id=item["worker_id"], adapter_id=item.get("effective_adapter_id") or item["adapter_id"], model=item["model"], provider=item["provider"],
             supports=item["supports"], tools=item["tools"], max_context_tokens=item["max_context_tokens"],
             max_risk=item["max_risk"], quality_ceiling=item["quality_ceiling"],
             available=bool(item["available"]), credential_ok=bool(item["available"]), quota_available=None,
             manager_score_adjustment=float(item.get("manager_score_adjustment") or 0.0),
-            evidence=workforce_router.OutcomeEvidence(
-                accepted_rate=outcomes.get("accepted_rate"), review_ready_rate=outcomes.get("review_ready_rate"),
-                validation_failure_rate=outcomes.get("validation_failure_rate"), p50_latency_seconds=outcomes.get("p50_latency_seconds"),
-                p95_latency_seconds=outcomes.get("p95_latency_seconds"), cost_usd_per_1k_tokens=outcomes.get("cost_usd_per_1k_tokens"),
-                estimated_tokens=outcomes.get("estimated_tokens_per_attempt"),
-                tool_discipline_score=outcomes.get("tool_discipline_score"),
-                cost_per_accepted_outcome_usd=economics.get("cost_per_accepted_outcome_usd"),
-                economic_evidence_state=str(economics.get("state") or "UNMEASURED"),
-                economic_matched_tasks=int(economics.get("matched_decided_tasks") or 0),
-                economic_accepted_outcomes=int(economics.get("accepted_outcomes") or 0),
-                economic_cost_coverage=economics.get("cost_coverage"),
-                sample_count=int(outcomes.get("sample_count") or 0),
-            ),
+        )
+        # The prior keeps its own reported sample_count; the measured candidate
+        # carries the matched-population count so its score_components can never
+        # show a measured accepted_rate beside a zero sample_count (NF-2026-00585).
+        prior_sample_count = int(outcomes.get("sample_count") or 0)
+        workers_prior.append(workforce_router.WorkerCapability.build(
+            **common,
+            evidence=workforce_router.OutcomeEvidence(accepted_rate=prior_accepted_rate, sample_count=prior_sample_count, **shared_evidence),
         ))
-    raw_decision = workforce_router.rank_workforce(task, workers)
-    decision = raw_decision.as_dict()
-    decision["economic_advisory"] = workforce_router.economic_advisory(raw_decision)
+        workers_measured.append(workforce_router.WorkerCapability.build(
+            **common,
+            evidence=workforce_router.OutcomeEvidence(accepted_rate=reported_accepted_rate, sample_count=evidence_sample_count, **shared_evidence),
+        ))
+        outcome_evidence_by_worker[str(item.get("worker_id") or "")] = {
+            "accepted_rate": reported_accepted_rate,
+            "accepted_rate_source": accepted_rate_source,
+            "task_family": requested_family,
+            "risk_tier": task.risk,
+            "sample_count": evidence_sample_count,
+            "matched_decided_tasks": matched_decided_tasks,
+            "accepted_outcomes": accepted_outcomes,
+            "economic_evidence_state": str(economics.get("state") or "UNMEASURED"),
+        }
+    # Which worker policy selects is computed only from the conservative-prior
+    # evidence, so this card changes what the score reports -- never selection.
+    # Reading the measured acceptance rate into the reported score is "use your
+    # own data"; letting it drive selection is a separate, still-gated routing
+    # decision (economic_routing_is_advisory_only stays true).
+    prior_decision = workforce_router.rank_workforce(task, workers_prior)
+    decision = prior_decision.as_dict()
+    measured_components = {
+        (candidate.worker_id, candidate.adapter_id, candidate.model): candidate.score_components
+        for candidate in workforce_router.rank_workforce(task, workers_measured).candidates
+    }
+    decision["economic_advisory"] = workforce_router.economic_advisory(prior_decision)
     decision["economic_advisory"]["task_family"] = requested_family
     decision["economic_advisory"]["risk_tier"] = task.risk
     by_worker = {
@@ -1137,8 +1191,21 @@ def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *,
     }
     for candidate in decision.get("candidates") or []:
         item = by_worker.get(str(candidate.get("worker_id") or ""), {})
+        worker_id = str(candidate.get("worker_id") or "")
+        measured = measured_components.get(
+            (worker_id, str(candidate.get("adapter_id") or ""), str(candidate.get("model") or ""))
+        )
+        if isinstance(measured, Mapping):
+            components = dict(measured)
+            outcome_evidence = outcome_evidence_by_worker.get(worker_id, {})
+            evidence_sources = dict(components.get("evidence_sources") or {})
+            if outcome_evidence.get("accepted_rate_source") == "measured_cost_per_accepted_outcome_partition":
+                evidence_sources["accepted_rate"] = "measured_cost_per_accepted_outcome_partition"
+            components["evidence_sources"] = evidence_sources
+            components["outcome_evidence"] = outcome_evidence
+            candidate["score_components"] = components
         candidate["execution_runner"] = execution_runner(
-            str(candidate.get("worker_id") or ""),
+            worker_id,
             str(candidate.get("adapter_id") or item.get("effective_adapter_id") or item.get("adapter_id") or ""),
         )
     selected_worker_id = str(decision.get("selected_worker_id") or "")
