@@ -3742,7 +3742,7 @@ def test_python_module_mypy_rewrite_is_exact_and_preserves_existing_rules(
         ) == ([sys.executable, *declared[1:]], ())
 
 
-def test_bare_python_module_mypy_requires_trusted_executable(
+def test_bare_python_module_mypy_falls_back_without_trusted_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(
@@ -3750,13 +3750,9 @@ def test_bare_python_module_mypy_requires_trusted_executable(
         "_trusted_validation_runtime_roots",
         lambda _repo: (tmp_path / "missing-venv",),
     )
-    with pytest.raises(
-        worker_workspace.WorkspaceError,
-        match="validation_executable_unavailable:mypy",
-    ):
-        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
-            ["python3", "-m", "mypy", "src"], tmp_path
-        )
+    assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+        ["python3", "-m", "mypy", "src"], tmp_path
+    ) == ([sys.executable, "-P", "-m", "mypy", "src"], ())
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
