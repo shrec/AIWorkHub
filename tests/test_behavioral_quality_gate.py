@@ -67,6 +67,21 @@ def test_specialized_contract_fails_before_execution_when_role_is_missing():
         )
 
 
+def test_role_count_mismatch_reports_full_required_contract():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "validation_roles_length_mismatch:expected=2:supplied=1:"
+            "required=reproduction,regression"
+        ),
+    ):
+        quality_evidence.normalize_behavioral_contract(
+            "bugfix",
+            ["python checks/reproduce.py", "python checks/regression.py"],
+            ["regression"],
+        )
+
+
 def test_behavioral_gate_rejects_command_or_role_identity_drift():
     gate = quality_evidence.evaluate_behavioral_gate(
         {

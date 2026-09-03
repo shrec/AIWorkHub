@@ -195,7 +195,12 @@ def normalize_behavioral_contract(
         roles = [VALIDATION_ROLE_GENERIC for _ in commands]
     else:
         if len(raw_roles) != len(commands):
-            raise ValueError("validation_roles_length_mismatch")
+            required = _REQUIRED_BEHAVIORAL_ROLES.get(kind, ())
+            raise ValueError(
+                "validation_roles_length_mismatch:"
+                f"expected={len(commands)}:supplied={len(raw_roles)}:"
+                f"required={','.join(required) or 'none'}"
+            )
         roles = []
         for value in raw_roles:
             role = str(value or "").strip().lower()

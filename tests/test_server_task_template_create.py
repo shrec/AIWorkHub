@@ -340,7 +340,10 @@ def test_from_template_validation_override_is_authenticated_and_idempotent(
                 "validation": ["git diff --check", "git status --short"],
                 "validation_roles": ["generic"],
             },
-            "validation_roles_length_mismatch",
+            (
+                "validation_roles_length_mismatch:expected=2:supplied=1:"
+                "required=reproduction,regression"
+            ),
         ),
         (
             {
