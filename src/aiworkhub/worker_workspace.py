@@ -5282,6 +5282,23 @@ def _validation_executable_relative_path(name: str) -> PurePosixPath:
     return PurePosixPath("bin") / name
 
 
+def _python_interpreter_relative_paths() -> tuple[PurePosixPath, ...]:
+    """Interpreter spellings a trusted runtime root may expose, most-specific first.
+
+    A venv normally symlinks ``bin/python`` -> ``bin/python3`` -> ``bin/python3.NN``,
+    but a console-script-only layout (a ``--without-pip``/relocated tree, some
+    packaging tools) can carry ``bin/python3`` WITHOUT ``bin/python``. The ``-m``
+    interpreter route must accept that root through its own ``bin/python3`` rather
+    than silently downgrading to ``sys.executable`` while the bare console-script
+    form resolves the same root -- the exact NF-2026-00582 asymmetry (rework
+    finding two). ``python`` is tried first so a root that has both keeps executing
+    the canonical venv activation symlink.
+    """
+    if os.name == "nt":
+        return (PurePosixPath("Scripts") / "python.exe",)
+    return (PurePosixPath("bin") / "python", PurePosixPath("bin") / "python3")
+
+
 def _trusted_validation_runtime_roots(repo: Path | None = None) -> tuple[Path, ...]:
     roots: list[Path] = []
     if repo is None:
@@ -5624,36 +5641,571 @@ def _normalize_trusted_validation_executable_argv(
     return normalized
 
 
-_BARE_PYTHON_INTERPRETER_RE = re.compile(r"^python(3(\.[0-9]+)?)?$")
+# The optional ``.exe`` suffix (that suffix only, case-insensitively) accepts the
+# Windows interpreter spelling so ``python.exe -m mypy`` resolves through the same
+# trusted runtime root as the POSIX ``python -m mypy`` -- an extension-hosted
+# Windows server that lacks the module otherwise falls through to the untrusted
+# head (NF-2026-00582). The stem stays lowercase; ``python2``/``pythonic`` and a
+# stray ``.exe`` on a non-python stem still never match.
+_BARE_PYTHON_INTERPRETER_RE = re.compile(r"^python(3(\.[0-9]+)?)?(\.[eE][xX][eE])?$")
+
+
+def _is_module_validator_invocation(argv: list[str]) -> bool:
+    """True iff ``argv`` is ``<python> -m <declared-validator> ...``.
+
+    The head may be spelled bare (``python``/``python3``/``python3.NN``, with an
+    optional Windows ``.exe`` suffix) OR as an absolute/relative path whose
+    basename is one of those (``/usr/bin/python3.12``, ``.venv/bin/python3``,
+    ``...\\Scripts\\python.exe``): ``.aiworkhub/quality.json`` may substitute
+    ``{python}`` with whichever interpreter started the MCP server, and neither
+    that interpreter's spelling nor its platform may change which runtime supplies
+    the validator. ``python2``/``pythonic`` and any non-``-m`` head never match,
+    and the validator name must already be one the repository trusts.
+    """
+    return (
+        len(argv) >= 3
+        and argv[1] == "-m"
+        and argv[2] in _TRUSTED_VALIDATION_BARE_EXECUTABLES
+        and bool(_BARE_PYTHON_INTERPRETER_RE.match(Path(argv[0]).name))
+    )
+
+
+def _pyvenv_base_prefixes(root: Path) -> tuple[Path, ...]:
+    """Base prefixes the root's own ``pyvenv.cfg`` records, if any.
+
+    A venv records where its base interpreter lives: ``base-prefix`` /
+    ``base-exec-prefix`` (the base ``sys.prefix``) on modern CPython, and
+    ``home`` (the directory holding the base interpreter, e.g. ``/usr/bin``) on
+    every version. ``base-executable``'s parent is the same directory. These are
+    the only locations outside the venv a legitimate ``bin/python`` symlink may
+    point at, so they -- together with ``sys.base_prefix`` -- bound which
+    root-owned targets the ``-m`` interpreter route may accept.
+    """
+    try:
+        text = (root / "pyvenv.cfg").read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    bases: list[Path] = []
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip().lower()
+        value = value.strip()
+        if not value:
+            continue
+        if key in {"base-prefix", "base-exec-prefix"}:
+            bases.append(Path(value))
+        elif key == "base-executable":
+            bases.append(Path(value).parent)
+        elif key == "home":
+            bases.append(Path(value))
+            bases.append(Path(value).parent)
+    return tuple(bases)
+
+
+def _resolved_target_within_system_prefix(root: Path, resolved: Path) -> bool:
+    """True iff ``resolved`` lies inside a system prefix trusted for ``root``.
+
+    A legitimate venv's ``bin/python`` symlinks to the root-owned base
+    interpreter, which always lives under the running interpreter's own
+    ``sys.base_prefix`` or under the base prefix the venv records in its
+    ``pyvenv.cfg``. A root-owned target ANYWHERE ELSE on the host is not a base
+    interpreter, so ``st_uid == 0`` is honoured only for targets contained here;
+    this is what keeps the ``-m`` owner refusal identical to the bare form's.
+    """
+    prefixes: list[Path] = [Path(getattr(sys, "base_prefix", sys.prefix))]
+    prefixes.extend(_pyvenv_base_prefixes(root))
+    for prefix in prefixes:
+        try:
+            resolved.relative_to(prefix.resolve(strict=False))
+        except (ValueError, OSError):
+            continue
+        return True
+    return False
+
+
+def _resolve_trusted_validation_root_interpreter(
+    preferred_root: Path | None, repo: Path | None = None
+) -> TrustedValidationExecutable | None:
+    """Resolve a trusted runtime root's OWN ``python`` for the ``-m`` validator form.
+
+    Mirrors the root-trust discipline of ``_resolve_trusted_validation_executable``
+    -- the interpreter's directory must stay contained in the root, and an
+    untrusted owner or world-writable root is RAISED, never silently downgraded --
+    but it resolves the runtime's interpreter instead of a validator console
+    script. A root whose validator module is importable yet whose console entry
+    point is absent (a missing entry point, a ``--no-scripts`` wheel) therefore
+    still yields that root's python with the module form, never ``sys.executable``.
+
+    A venv interpreter legitimately symlinks to a root-owned base python OUTSIDE
+    the root, so target CONTAINMENT is deliberately not re-applied here: the
+    enclosing root's trust is the boundary, exactly as it is for the bare form.
+    But the RESOLVED target's own owner and mode are still gated -- a python the
+    current user does not own (and that is not a ROOT-OWNED base interpreter the
+    venv may legitimately point at, meaning one contained in a system prefix:
+    ``sys.base_prefix`` or the base prefix the root's own ``pyvenv.cfg`` records --
+    a root-owned executable anywhere else is refused) or one that is world-writable
+    is an escalation on any real venv layout -- so those two checks run on the
+    resolved file, exactly as ``_trusted_validation_executable_from_resolved`` runs
+    them, and the owner refusal thereby matches the bare form's. Security
+    is decided by what the symlink POINTS AT (the resolved target, checked here);
+    BEHAVIOUR is decided by what is EXECUTED, so the UNRESOLVED ``candidate`` is
+    what is returned: a venv is activated only by executing its own ``bin/python``,
+    and resolving to the base interpreter would discard the venv and make the
+    declared validator unimportable (NF-2026-00582). ``preferred_root`` pins
+    resolution to the root the bare form already chose so both spellings agree on
+    one root; when it is ``None`` the trusted roots are walked in the same order.
+    Returns ``None`` when no trusted root supplies a usable interpreter.
+    """
+    spellings = _python_interpreter_relative_paths()
+    if preferred_root is not None:
+        roots: tuple[Path, ...] = (preferred_root,)
+    else:
+        roots = _trusted_validation_runtime_roots(repo)
+    for raw_root in roots:
+        root = raw_root.resolve(strict=False)
+        # A trusted root may spell its interpreter ``bin/python`` OR only
+        # ``bin/python3`` (rework finding two): try each in order and take the
+        # first that resolves to an executable file contained in the root. A
+        # spelling that resolves but escapes the root is still RAISED, never
+        # skipped -- the containment discipline is per-spelling, not per-root.
+        candidate: Path | None = None
+        resolved: Path | None = None
+        for relative in spellings:
+            probe = raw_root / relative
+            try:
+                probe_parent = probe.parent.resolve(strict=True)
+                probe_resolved = probe.resolve(strict=True)
+            except OSError:
+                continue
+            try:
+                probe_parent.relative_to(root)
+            except ValueError as exc:
+                raise WorkspaceError(
+                    f"validation_executable_untrusted_runtime_root:{probe}"
+                ) from exc
+            if not probe_resolved.is_file() or not os.access(probe_resolved, os.X_OK):
+                continue
+            candidate, resolved = probe, probe_resolved
+            break
+        if candidate is None or resolved is None:
+            continue
+        try:
+            root_info = root.stat()
+        except OSError:
+            continue
+        if os.name != "nt" and root_info.st_uid != os.getuid():
+            raise WorkspaceError(
+                f"validation_executable_runtime_root_untrusted_owner:{root}"
+            )
+        if posix_path_modes_supported(os.name) and stat.S_IMODE(root_info.st_mode) & 0o002:
+            raise WorkspaceError(
+                f"validation_executable_runtime_root_world_writable:{root}"
+            )
+        try:
+            target_info = resolved.stat()
+        except OSError:
+            continue
+        # A root-owned target (``st_uid == 0``) is accepted ONLY when the resolved
+        # interpreter lies inside a system prefix -- ``sys.base_prefix`` or the base
+        # prefix the root's own ``pyvenv.cfg`` records. A legitimate venv's
+        # ``bin/python`` symlinks to the root-owned system base interpreter
+        # (``/usr/bin/python3.12`` is root-owned on this host), which ALWAYS lives
+        # under one of those prefixes, so requiring current-user ownership of the
+        # resolved target would refuse every real venv layout. A root-owned
+        # executable ANYWHERE ELSE on the host is not that base interpreter: it is
+        # refused, so the ``-m`` form's owner refusal now matches the bare form's,
+        # which requires current-user ownership contained in the trusted root (AC3).
+        # Any OTHER foreign owner is still an escalation and is refused.
+        if (
+            os.name != "nt"
+            and target_info.st_uid != os.getuid()
+            and not (
+                target_info.st_uid == 0
+                and _resolved_target_within_system_prefix(root, resolved)
+            )
+        ):
+            raise WorkspaceError(
+                f"validation_executable_untrusted_owner:{resolved}"
+            )
+        if posix_path_modes_supported(os.name) and stat.S_IMODE(target_info.st_mode) & 0o002:
+            raise WorkspaceError(
+                f"validation_executable_world_writable:{resolved}"
+            )
+        # Security is decided by what the symlink POINTS AT -- the RESOLVED target,
+        # gated for owner and mode just above; BEHAVIOUR is decided by what we
+        # EXECUTE. A venv is activated only by executing its OWN ``bin/python``:
+        # that unresolved path is what sets ``sys.prefix`` and puts the venv's
+        # site-packages on ``sys.path``. Resolving the symlink and running the base
+        # interpreter would throw the venv away and make the declared validator
+        # unimportable (NF-2026-00582), so the UNRESOLVED ``candidate`` is returned
+        # even though every check above ran against the resolved target.
+        return TrustedValidationExecutable(path=candidate, root=root)
+    return None
+
+
+# A positive-presence probe distinct from ``_VALIDATOR_MODULE_PROBE`` (which is
+# shared with ``_probe_absent_validator_modules`` and must not change): it prints
+# a fixed interpreter marker BEFORE the module verdict so a bin/python that is not
+# actually a Python -- a stub that exits 0 and prints nothing -- cannot be read as
+# supplying the validator. A genuine interpreter running this script always emits
+# the marker; anything else "runs" but answers meaninglessly (NF-2026-00586).
+_TRUSTED_MODULE_SUPPLY_PROBE = (
+    "import importlib.util, sys\n"
+    "sys.stdout.write('AIWORKHUB_TRUSTED_INTERPRETER\\n')\n"
+    "sys.stdout.write("
+    "'PRESENT\\n' if importlib.util.find_spec(sys.argv[1]) is not None else 'ABSENT\\n')\n"
+)
+_TRUSTED_MODULE_SUPPLY_MARKER = "AIWORKHUB_TRUSTED_INTERPRETER"
+
+
+def _trusted_root_supplies_validator_module(interpreter: Path, module: str) -> bool:
+    """True unless the trusted root's OWN python PROVES ``module`` absent.
+
+    Runs an ``importlib.util.find_spec`` probe through the trusted root's own
+    ``bin/python`` with ``-P`` so no cwd entry can shadow it. Having an
+    interpreter is not the same as carrying the declared validator, so this is
+    what lets the ``-m`` selection prefer a later root that actually supplies the
+    module over an earlier one that only supplies a python (AC4).
+
+    The probe PROVES presence positively (NF-2026-00586 finding two): the child
+    prints ``_TRUSTED_MODULE_SUPPLY_MARKER`` before the module verdict, so an
+    executable at ``bin/python`` that merely exits 0 without printing -- something
+    that is not a usable Python -- yields no marker and is treated as NOT supplying
+    the module, never as "the module is present". Only a probe whose stdout
+    carries the marker is a meaningful verdict; ``PRESENT`` then means importable.
+
+    Fails OPEN toward keeping the root ONLY for a probe that cannot RUN (OSError,
+    timeout) or exits nonzero: those never downgrade a usable root -- the same
+    fail-closed-toward-strict discipline ``_probe_absent_validator_modules``
+    applies -- so a mere probe malfunction can never bounce resolution to
+    ``sys.executable`` and mis-report a present validator as missing. A probe that
+    RAN but answered meaninglessly (no marker) is a different case and is refused.
+    """
+    probe_env = {
+        key: os.environ[key]
+        for key in ("PATH", "SYSTEMROOT", "SystemRoot", "WINDIR", "LANG", "LC_ALL")
+        if key in os.environ
+    }
+    # Mirror the real validation run: it executes with an isolated HOME and no
+    # ``~/.local`` user site, so suppress the user site here too -- a validator
+    # only reachable through the coordinator user's ~/.local (which the sandboxed
+    # command could never import) must not count as present. ``-P``/PYTHONSAFEPATH
+    # drops the implicit cwd entry without ignoring the venv's own site-packages,
+    # matching the run, whose trusted site-packages shadow every PYTHONPATH
+    # component so ``import <module>`` binds the trusted copy in both.
+    probe_env["PYTHONNOUSERSITE"] = "1"
+    probe_env["PYTHONSAFEPATH"] = "1"
+    try:
+        probe = subprocess.run(
+            [str(interpreter), "-P", "-c", _TRUSTED_MODULE_SUPPLY_PROBE, module],
+            env=probe_env,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if probe.returncode != 0:
+        return True
+    lines = {line.strip() for line in probe.stdout.splitlines() if line.strip()}
+    if _TRUSTED_MODULE_SUPPLY_MARKER not in lines:
+        # Ran, but not a usable Python: no positive interpreter marker. This root
+        # does not supply the module -- a bare ``exit 0`` must not masquerade as
+        # supplying the validator.
+        return False
+    return "PRESENT" in lines
+
+
+def _select_module_validator_interpreter(
+    name: str, repo: Path | None = None
+) -> tuple[TrustedValidationExecutable | None, str]:
+    """Pick the first trusted root whose ``name`` MODULE is importable.
+
+    Only reached when NO trusted root carries the validator console script. The
+    trusted roots are walked in their canonical order and, for each that yields a
+    usable interpreter (an untrusted/world-writable root is still RAISED here,
+    never skipped), the root's own python is asked whether ``name`` imports. The
+    first root that says yes wins; a root with an interpreter but WITHOUT the
+    module is passed over so a later root that has both can supply the gate (AC4).
+    Returns ``(None, reason)`` -- naming why for the receipt -- when no trusted
+    root supplies the module: either none yielded an interpreter, or one or more
+    did but the module was importable in none of them.
+    """
+    saw_interpreter = False
+    for raw_root in _trusted_validation_runtime_roots(repo):
+        interpreter = _resolve_trusted_validation_root_interpreter(raw_root, repo)
+        if interpreter is None:
+            continue
+        saw_interpreter = True
+        if _trusted_root_supplies_validator_module(interpreter.path, name):
+            return interpreter, "module_validator_trusted_runtime_root_module_present"
+    if saw_interpreter:
+        return None, f"validation_executable_module_absent_in_all_trusted_roots:{name}"
+    return None, f"validation_executable_no_trusted_interpreter:{name}"
+
+
+def _resolve_module_validator_argv(
+    argv: list[str], repo: Path | None = None
+) -> tuple[list[str], tuple[Path, ...], dict[str, Any] | None]:
+    """Resolve ``<python> -m <declared-validator>`` through the SAME trusted
+    runtime root that backs the bare ``<validator>`` form (NF-2026-00452).
+
+    ``python -m mypy`` must not inherit whatever modules the interpreter that
+    started the MCP server happens to carry: it is resolved to the trusted
+    runtime root's OWN python running the identical ``-m`` module form, applying
+    the same containment, owner and world-writable refusals the bare form applies
+    -- a root that fails any of them is refused (raised), never silently accepted.
+    The module form (not the validator console script) is preserved so the trusted
+    root's site-packages -- not a cwd-relative or absent console entry point --
+    supply the validator. When a trusted root carries the validator CONSOLE
+    SCRIPT, that root definitively has the validator and backs the ``-m`` form
+    directly. When NONE does, a root whose module imports without a console script
+    is still honoured -- but ONLY a root that actually SUPPLIES THE MODULE is
+    chosen: the trusted roots are probed in order and the first whose ``name``
+    importlib-resolves wins, so a root with a python but without the module never
+    beats a later root that has both. Only when no trusted root supplies the
+    module does the command fall back to ``sys.executable`` (never a PATH search
+    -- NF-2026-00448), keeping the ``-m`` form so the import probe still decides
+    ``missing_package`` structurally. The chosen root -- or the fallback and its
+    reason (no interpreter, or the module importable in none of the trusted roots)
+    -- is named in the interpreter authority receipt so the resolution is
+    auditable rather than implicit (AC4).
+
+    Every command this resolver builds carries ``-P`` immediately after the
+    interpreter. ``-m`` puts the CURRENT DIRECTORY at the front of ``sys.path``,
+    and validation runs from the candidate's own worktree, so a candidate that
+    writes ``mypy.py``/``ruff.py`` beside its code would otherwise have that file
+    imported and executed by the validation command with host user rights. ``-P``
+    (PYTHONSAFEPATH, 3.11+; both trusted roots here are 3.12) drops that implicit
+    cwd entry. It sits before ``-m`` -- the shared pytest argument model skips
+    leading interpreter flags -- so ``dash_m_validator_modules`` and
+    ``_validator_probe_interpreter`` still read the module and the interpreter.
+
+    ``-P`` closes ONLY the cwd half: it does NOT ignore ``PYTHONPATH``, a supported
+    validation env assignment whose components may be candidate-writable. Shadowing
+    those components is done at run time, not here, by prepending the trusted root's
+    own ``site-packages`` (``_trusted_validator_pythonpath_prefix``) ahead of every
+    declared ``PYTHONPATH`` component so ``import <validator>`` binds the trusted
+    copy; the ``(interpreter.root,)`` returned here is exactly the root that prefix
+    is derived from, and the bare console-script form shares that same shadow.
+    """
+    name = argv[2]
+    unavailable: str | None = None
+    try:
+        preferred_root: Path | None = _resolve_trusted_validation_executable(
+            name, repo
+        ).root
+    except WorkspaceError as exc:
+        if not str(exc).startswith("validation_executable_unavailable:"):
+            # A trusted root exists but failed a containment/owner/world-writable
+            # check: refuse exactly as the bare form does, never fall back.
+            raise
+        # No trusted root carries the validator CONSOLE SCRIPT, but its module may
+        # still be importable in a trusted root, so keep resolving to a trusted
+        # root's own python before conceding to sys.executable.
+        preferred_root = None
+        unavailable = str(exc)
+    if preferred_root is not None:
+        interpreter = _resolve_trusted_validation_root_interpreter(preferred_root, repo)
+        selection_reason = f"validation_executable_no_trusted_interpreter:{name}"
+        source = "module_validator_trusted_runtime_root"
+    else:
+        interpreter, selection_reason = _select_module_validator_interpreter(name, repo)
+        source = "module_validator_trusted_runtime_root_module_present"
+    if interpreter is None:
+        reason = ";".join(
+            dict.fromkeys(part for part in (unavailable, selection_reason) if part)
+        )
+        receipt = _interpreter_authority_receipt(
+            declared=argv[0],
+            source=f"module_validator_no_trusted_root:{reason}",
+            execution_path=Path(sys.executable),
+            endpoint=Path(sys.executable),
+        )
+        return [sys.executable, "-P", *argv[1:]], (), receipt
+    receipt = _interpreter_authority_receipt(
+        declared=argv[0],
+        source=source,
+        execution_path=interpreter.path,
+        endpoint=interpreter.root,
+    )
+    return (
+        [str(interpreter.path), "-P", "-m", name, *argv[3:]],
+        (interpreter.root,),
+        receipt,
+    )
+
+
+def _module_validator_fallback_authority(
+    authority: dict[str, Any] | None,
+) -> bool:
+    """True iff ``authority`` records the ``<python> -m <validator>`` resolver
+    falling back to ``sys.executable`` because NO trusted runtime root supplied
+    the validator.
+
+    In that fallback there is no trusted root whose ``site-packages`` could shadow
+    a candidate-writable ``PYTHONPATH`` component, so ``run_validations`` must
+    instead SUPPRESS the candidate PYTHONPATH: otherwise a candidate
+    ``mypy.py``/``ruff.py`` on a declared ``.``/``src`` component would be imported
+    by the fallback command and false-green the gate -- ``-P`` drops only the
+    implicit cwd entry, never ``PYTHONPATH``. The two trusted-root sources
+    (``module_validator_trusted_runtime_root`` and ``...root_module_present``) are
+    deliberately NOT matched: those carry a trusted ``site-packages`` shadow
+    instead, so their candidate PYTHONPATH stays available behind the shadow.
+    """
+    return bool(authority) and str(authority.get("source", "")).startswith(
+        "module_validator_no_trusted_root"
+    )
+
+
+def _trusted_runtime_site_packages(root: Path) -> tuple[Path, ...]:
+    """The trusted runtime ``root``'s own ``site-packages`` directories.
+
+    A POSIX venv keeps the installed validator (``mypy``/``ruff``) under
+    ``<root>/lib/pythonX.Y/site-packages`` (``lib64`` is usually a symlink to
+    ``lib``); a Windows layout uses ``<root>/Lib/site-packages``. These dirs are
+    already INSIDE the trusted root that owner/mode/containment checks admitted,
+    so returning them adds no new trust. Deduplicated by resolved identity and
+    ordered deterministically so the caller can prepend a stable prefix. Empty
+    when the root exposes no such directory (a non-venv root, or a probe-only
+    fallback), in which case the caller simply prepends nothing.
+    """
+    resolved_root = root.resolve(strict=False)
+    found: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(candidate: Path) -> None:
+        try:
+            if not candidate.is_dir():
+                return
+            # NF-2026-00586 finding two (rework): this prefix is PREPENDED ahead of
+            # every candidate ``PYTHONPATH`` component, so a ``site-packages`` that
+            # is a symlink ESCAPING the trusted root would hand a target outside the
+            # owner/mode/containment-checked root top import precedence. Refuse any
+            # entry whose RESOLVED path is not contained under the resolved trusted
+            # root; only genuinely in-root directories survive (an in-root
+            # ``lib64`` -> ``lib`` symlink still resolves inside and is kept).
+            resolved = candidate.resolve(strict=False)
+            resolved.relative_to(resolved_root)
+        except (OSError, ValueError):
+            return
+        key = str(resolved)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(candidate)
+
+    for libdir in ("lib", "lib64"):
+        base = resolved_root / libdir
+        try:
+            children = sorted(base.glob("python*"))
+        except OSError:
+            children = []
+        for py in children:
+            _add(py / "site-packages")
+    _add(resolved_root / "Lib" / "site-packages")
+    return tuple(found)
+
+
+def _trusted_validator_pythonpath_prefix(
+    root: Path, backend: str, executable_root_index: int = 0
+) -> tuple[str, ...]:
+    """Child-visible ``site-packages`` prefix that shadows candidate PYTHONPATH.
+
+    NF-2026-00586 finding one: ``-P`` drops only the implicit cwd entry, NOT
+    ``PYTHONPATH`` -- a supported validation env assignment whose components may be
+    candidate-writable (``.``/``src``/a declared relative dir). A candidate that
+    writes ``mypy.py``/``ruff.py`` (or a ``mypy``/``ruff`` package) into such a
+    component would otherwise have ``import <validator>`` bind THAT file, because
+    ``PYTHONPATH`` precedes the interpreter's own site-packages on ``sys.path``.
+    Prepending the trusted root's own ``site-packages`` ahead of every declared
+    component makes the trusted copy win the import instead -- for the bare console
+    script and the ``-m`` module form alike -- rather than relying on the absence
+    of a candidate file. The console-script route consults ``PYTHONPATH`` too, so
+    the shadow, not the invocation shape, is what closes the hole.
+
+    The paths are spelled the way the SANDBOXED command sees them: under
+    bubblewrap the trusted root is bound read-only at
+    ``{SANDBOX_VALIDATION_EXECUTABLE_ROOT}/{index}`` (the same bind the resolved
+    interpreter argv already uses), so ``site-packages`` needs no new bind; under
+    landlock/in-process the real host path is already readable. Empty when the
+    root exposes no ``site-packages``.
+    """
+    resolved_root = root.resolve(strict=False)
+    prefix: list[str] = []
+    for site_packages in _trusted_runtime_site_packages(resolved_root):
+        if backend == "bubblewrap":
+            relative = site_packages.relative_to(resolved_root).as_posix()
+            prefix.append(
+                f"{SANDBOX_VALIDATION_EXECUTABLE_ROOT}/{executable_root_index}/{relative}"
+            )
+        else:
+            prefix.append(str(site_packages))
+    return tuple(prefix)
+
+
+def _validator_run_pythonpath_components(components: tuple[str, ...]) -> tuple[str, ...]:
+    """Candidate-safe PYTHONPATH components for a trusted ruff/mypy validator run.
+
+    Rework finding one: ``-P`` drops only the implicit cwd entry, and the trusted
+    ``site-packages`` shadow only wins imports for names that EXIST in that
+    ``site-packages``. Neither stops a candidate-writable (workspace-relative)
+    ``PYTHONPATH`` component from shadowing the validator's STARTUP or DEPENDENCY
+    imports -- most sharply a ``sitecustomize.py``, which CPython imports during
+    site initialisation from ANY ``sys.path`` entry regardless of order, but also
+    any stdlib name (``tokenize``/``tomllib``) or dependency the shadow does not
+    cover, or the validator module itself when the root exposes no discoverable
+    ``site-packages`` and the shadow is empty. ``ruff``/``mypy`` never IMPORT the
+    candidate's code -- they analyse it as file targets -- so a candidate-writable
+    component confers no legitimate import behaviour on them and is pure hijack
+    surface. Keep ONLY the trusted, host-absolute components (the identity-checked
+    user-site / pytest runtime root -- the explicit safe channel), dropping every
+    candidate-writable one, exactly as ``_host_probe_pythonpath`` does for the host
+    probe. Candidate code that genuinely needs importing (pytest) never reaches
+    this branch: pytest is not a trusted bare executable, carries no
+    ``validation_executable_roots``, and keeps its PYTHONPATH unchanged.
+    """
+    return tuple(
+        component
+        for component in components
+        if component != "." and os.path.isabs(component)
+    )
 
 
 def _normalize_trusted_validation_executable_argv_with_roots(
     argv: list[str], repo: Path | None = None
 ) -> tuple[list[str], tuple[Path, ...]]:
+    tokens, roots, _authority = (
+        _normalize_trusted_validation_executable_argv_with_authority(argv, repo)
+    )
+    return tokens, roots
+
+
+def _normalize_trusted_validation_executable_argv_with_authority(
+    argv: list[str], repo: Path | None = None
+) -> tuple[list[str], tuple[Path, ...], dict[str, Any] | None]:
     if not argv:
-        return [], ()
+        return [], (), None
     head = argv[0]
-    if (
-        len(argv) >= 3
-        and Path(head).name.startswith("python")
-        and argv[1:3] == ["-m", "ruff"]
-    ):
-        executable = _resolve_trusted_validation_executable("ruff", repo)
-        return [str(executable.path), *argv[3:]], (executable.root,)
+    # A ``<python> -m <declared-validator>`` command -- for a bare OR an
+    # absolute/path python head alike -- resolves through the trusted runtime
+    # root that backs the bare validator form, so both spellings agree on one
+    # root regardless of which interpreter the head names (NF-2026-00452).
+    if _is_module_validator_invocation(argv):
+        return _resolve_module_validator_argv(argv, repo)
     if Path(head).is_absolute():
-        return list(argv), ()
+        return list(argv), (), None
     if "/" in head or "\\" in head:
         repo_relative = _resolve_repo_relative_trusted_validation_executable(head, repo)
         if repo_relative is None:
-            return list(argv), ()
-        return [str(repo_relative.path), *argv[1:]], (repo_relative.root,)
-    if (
-        len(argv) >= 3
-        and _BARE_PYTHON_INTERPRETER_RE.match(head)
-        and argv[1:3] == ["-m", "mypy"]
-    ):
-        executable = _resolve_trusted_validation_executable("mypy", repo)
-        return [str(executable.path), *argv[3:]], (executable.root,)
+            return list(argv), (), None
+        return [str(repo_relative.path), *argv[1:]], (repo_relative.root,), None
     # NF-2026-00448: a bare ``python``/``python3``/``python3.NN`` head is
     # resolved directly to the trusted coordinator interpreter instead of
     # trusting execvpe's PATH search -- the credential-free validation PATH
@@ -5664,11 +6216,11 @@ def _normalize_trusted_validation_executable_argv_with_roots(
     # function runs) and absolute interpreter declarations are never touched
     # here, preserving their existing fail-closed rules.
     if _BARE_PYTHON_INTERPRETER_RE.match(head):
-        return [sys.executable, *argv[1:]], ()
+        return [sys.executable, *argv[1:]], (), None
     if head not in _TRUSTED_VALIDATION_BARE_EXECUTABLES:
-        return list(argv), ()
+        return list(argv), (), None
     executable = _resolve_trusted_validation_executable(head, repo)
-    return [str(executable.path), *argv[1:]], (executable.root,)
+    return [str(executable.path), *argv[1:]], (executable.root,), None
 
 
 def _node_install_root(executable: str) -> Path | None:
@@ -8244,11 +8796,22 @@ def run_validations(
                 effective_components = _candidate_pythonpath_components(
                     workspace, effective_components
                 )
-            tokens, validation_executable_roots = (
-                _normalize_trusted_validation_executable_argv_with_roots(
+            tokens, validation_executable_roots, module_interpreter_authority = (
+                _normalize_trusted_validation_executable_argv_with_authority(
                     tokens, workspace.repo
                 )
             )
+            if module_interpreter_authority is not None:
+                # NF-2026-00452: a ``<python> -m <validator>`` command records the
+                # chosen trusted runtime root -- or the ``sys.executable`` fallback
+                # and its reason -- in the interpreter authority receipt. This is
+                # the final argv resolver, so its authority must replace any
+                # earlier workspace-interpreter receipt while retaining the
+                # originally declared command head.
+                interpreter_authority = {
+                    **module_interpreter_authority,
+                    "declared": declared_argv[0],
+                }
             if selected_backend == VSCODE_LM_IN_PROCESS_BACKEND:
                 # The editor-hosted provider has already stopped.  This is a
                 # trusted-manager finalization step, not a second model or a
@@ -8336,13 +8899,80 @@ def run_validations(
                 env["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
             env_override_evidence: dict[str, Any] | None = None
             if effective_components:
-                env["PYTHONPATH"] = resolve_validation_pythonpath(
+                resolved_pythonpath = resolve_validation_pythonpath(
                     workspace, selected_backend, effective_components
                 )
-                env_override_evidence = {
-                    "variable": "PYTHONPATH",
-                    "components": list(effective_components),
-                }
+                if validation_executable_roots:
+                    # NF-2026-00586 finding one: when a ruff/mypy validator resolved
+                    # through a trusted runtime root (the ``-m`` module form or the
+                    # bare console script alike), prepend that root's own
+                    # site-packages ahead of every trusted PYTHONPATH component so
+                    # ``import <validator>`` binds the trusted copy -- ``-P`` drops
+                    # only the implicit cwd entry, not PYTHONPATH. No new bind: the
+                    # prefix points inside the executable root already bound for the
+                    # argv.
+                    #
+                    # Rework finding one: the site-packages shadow only wins names
+                    # that EXIST in it, so it cannot stop a candidate-writable
+                    # (workspace-relative) component from shadowing the validator's
+                    # STARTUP/DEPENDENCY imports -- a ``sitecustomize`` executed at
+                    # site init from ANY sys.path entry, a stdlib/dependency name the
+                    # shadow lacks, or the validator itself when the root exposes no
+                    # discoverable site-packages. ruff/mypy never import candidate
+                    # code, so drop every candidate-writable component and keep only
+                    # the trusted host-absolute ones (the explicit safe channel),
+                    # mirroring ``_host_probe_pythonpath``.
+                    safe_components = _validator_run_pythonpath_components(
+                        effective_components
+                    )
+                    shadow_prefix = _trusted_validator_pythonpath_prefix(
+                        validation_executable_roots[0], selected_backend
+                    )
+                    parts = list(shadow_prefix)
+                    if safe_components:
+                        parts.append(
+                            resolve_validation_pythonpath(
+                                workspace, selected_backend, safe_components
+                            )
+                        )
+                    if parts:
+                        env["PYTHONPATH"] = os.pathsep.join(parts)
+                    else:
+                        env.pop("PYTHONPATH", None)
+                    env_override_evidence = {
+                        "variable": "PYTHONPATH",
+                        "components": list(safe_components),
+                        "dropped_candidate_components": [
+                            component
+                            for component in effective_components
+                            if component not in safe_components
+                        ],
+                    }
+                elif _module_validator_fallback_authority(module_interpreter_authority):
+                    # NF-2026-00586 finding one (rework HIGH): a ``<python> -m
+                    # <validator>`` command that found NO trusted runtime root falls
+                    # back to ``sys.executable``, which carries no
+                    # ``validation_executable_roots`` -- so there is no trusted
+                    # site-packages to shadow the candidate PYTHONPATH with. ``-P``
+                    # drops only the cwd, so a candidate ``mypy.py``/``ruff.py`` on a
+                    # declared ``.``/``src`` component would still be imported and
+                    # false-green the gate. Suppress the candidate PYTHONPATH
+                    # entirely: ``import <validator>`` may then bind ONLY the trusted
+                    # running interpreter's own site-packages, and a genuinely absent
+                    # validator surfaces as ``missing_package`` structurally instead
+                    # of executing candidate-authored code.
+                    env.pop("PYTHONPATH", None)
+                    env_override_evidence = {
+                        "variable": "PYTHONPATH",
+                        "suppressed_for": "module_validator_no_trusted_root",
+                        "components": [],
+                    }
+                else:
+                    env["PYTHONPATH"] = resolved_pythonpath
+                    env_override_evidence = {
+                        "variable": "PYTHONPATH",
+                        "components": list(effective_components),
+                    }
             elif tmpdir_override is not None:
                 env_override_evidence = {
                     "variable": "TMPDIR",
