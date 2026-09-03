@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.82] - 2026-09-03
+
+This release removes another self-hosting validation loop before returning to
+the broader capability-admission work.
+
+### Fixed
+
+- Worker launch preflight verifies the declared interpreter, modules, working
+  directory and repository inputs before model time is spent, so absent tools
+  and sparse-workspace omissions become structural launch evidence.
+- Landlock metadata-broker denials travel over a private, non-inheritable
+  structural channel. Only measured hardlink, deleted-descriptor and OS-level
+  metadata restrictions can terminate a validation as environment-blocked;
+  expected policy denials still reach the validator as ordinary `EPERM`.
+- Task creation reports the complete validation-role contract and rejects
+  invalid priority values with the canonical enum instead of emitting partial
+  or misleading guidance.
+- NeedFix conversion preserves the quality contract needed by executable cards
+  rather than discarding it during normalization.
+
 ## [0.10.81] - 2026-09-03
 
 This release makes queue state, terminal outcomes and validation authority

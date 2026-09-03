@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.82 — 2026-09-03
+
+### Fixed
+
+- Worker launch preflight checks interpreter, module, working-directory and
+  repository-input capabilities before provider work starts.
+- Metadata-broker denials use a private non-inheritable structural channel;
+  measured hardlink/deleted-fd environment restrictions are separated from
+  normal policy denials without widening Landlock or seccomp.
+- Task creation returns complete validation-role and priority diagnostics, and
+  NeedFix conversion preserves its quality contract.
+
 ## 0.10.81 — 2026-09-03
 
 ### Fixed

@@ -12,6 +12,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.82 — 2026-09-03
+
+- Validation prerequisites are checked before a worker is launched, so missing
+  interpreters, modules, working directories and repository inputs do not burn
+  model time and then fail mechanically.
+- Landlock metadata-broker denials now use a private structural receipt. The
+  receipt cannot leak into candidate code, expected policy denials remain
+  catchable `EPERM`, and measured hardlink/deleted-fd restrictions no longer
+  masquerade as candidate test failures.
+- Task-card diagnostics now expose the full validation-role and priority
+  contracts, while NeedFix conversion retains its quality requirements.
+
 ## What's new in 0.10.81 — 2026-09-03
 
 - The dashboard separates the current queue from canonical decisions and task
