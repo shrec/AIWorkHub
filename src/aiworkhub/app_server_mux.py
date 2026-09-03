@@ -117,9 +117,9 @@ if os.name == "nt":  # pragma: no cover - imported only on Windows hosts
     import ctypes.wintypes as wintypes
 
 try:
-    from .platform_io import background_process_launch_kwargs, chmod_fd
+    from .platform_io import background_process_launch_kwargs, chmod_fd, is_windows
 except ImportError:  # direct-script Codex mux entrypoint
-    from platform_io import background_process_launch_kwargs, chmod_fd
+    from platform_io import background_process_launch_kwargs, chmod_fd, is_windows
 
 if __package__:
     from . import shared_router
@@ -1472,7 +1472,7 @@ class AppServerMux:
             if child_start is not None
             else f"{self._generation_id}-{self._child.pid}"
         )
-        if os.name != "nt":
+        if not is_windows():
             self._reader_wake_fds = os.pipe()
         self._start_thread(self._pump_extension_to_child)
         self._start_thread(self._pump_child_to_extension)
@@ -1623,7 +1623,7 @@ class AppServerMux:
             with contextlib.suppress(OSError, BlockingIOError):
                 os.write(wake_fds[1], b"x")
             return
-        if os.name == "nt" and self._reader_native_id is not None:
+        if is_windows() and self._reader_native_id is not None:
             # readline() on a Windows anonymous pipe ultimately blocks in
             # ReadFile. Cancel only this mux thread's synchronous I/O; never
             # close or replace the process-global stdin descriptor.
