@@ -10481,3 +10481,91 @@ def test_status_distinguishes_a_failed_card_read_from_an_absent_card(
     assert result["task_card"] is None
     assert result["task_state"] == "unknown"
     assert result["task_card_read"] == "read_failed:RuntimeError"
+
+
+def test_validation_capability_preflight_is_complete_sorted_and_read_only(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        worker_workspace,
+        "_normalize_trusted_validation_executable_argv_with_roots",
+        lambda argv, repo: (["/definitely/missing-validator", *argv[1:]], ()),
+    )
+    card = {
+        "allowed_writes": [],
+        "validation": ["tool --version", "cd missing-cwd && tool check"],
+    }
+
+    observed = worker_workspace.preflight_validation_capabilities(tmp_path, card)
+
+    assert observed == tuple(sorted(observed))
+    assert observed == (
+        "cwd:missing-cwd",
+        "executable:/definitely/missing-validator",
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_validation_capability_preflight_rejects_before_launch_side_effects(
+    monkeypatch, tmp_path
+):
+    card = _card()
+    card["validation"] = ["missing-validator check"]
+    monkeypatch.setattr(
+        worker_workspace,
+        "preflight_validation_capabilities",
+        lambda repo, observed: ("executable:/missing-validator",),
+    )
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match=r'^task_contract_unwinnable:\["executable:/missing-validator"\]$',
+    ):
+        manager._preflight_card(
+            card["task_id"], card["runner"], card["topic"], "claude_cli"
+        )
+
+    assert card["status"] == "pending"
+    assert card["worker_status"] == "unclaimed"
+    assert not manager.process_log_path.exists()
+    assert not manager.process_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_module"),
+    [
+        ("python3 -m pytest -q tests/test_process_launcher.py", "pytest"),
+        ("python3 -m ruff check src", "ruff"),
+        ("python3 -m mypy src", "mypy"),
+        ("python3 -m coverage run -m pytest", "coverage"),
+        ("node tools/check.js", None),
+        ("npm test", None),
+    ],
+)
+def test_validation_capability_preflight_accepts_supported_command_forms(
+    monkeypatch, tmp_path, command, expected_module
+):
+    probed_modules = []
+    monkeypatch.setattr(
+        worker_workspace,
+        "_normalize_trusted_validation_executable_argv_with_roots",
+        lambda argv, repo: ([sys.executable, *argv[1:]], ()),
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "_trusted_root_supplies_validator_module",
+        lambda executable, module: probed_modules.append(module) or True,
+    )
+    monkeypatch.setattr(
+        worker_workspace, "_declared_workspace_seed_closure", lambda *args: ((), (), ())
+    )
+
+    assert worker_workspace.preflight_validation_capabilities(
+        tmp_path, {"allowed_writes": [], "validation": [command]}
+    ) == ()
+    assert probed_modules == ([] if expected_module is None else [expected_module])

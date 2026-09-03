@@ -3435,6 +3435,67 @@ def _declared_workspace_seed_closure(
     return live_seeded, support_seeded, seeded
 
 
+def preflight_validation_capabilities(
+    repo: Path, card: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """Return every statically provable missing validation capability.
+
+    This deliberately composes the command parser, trusted-runtime normalizer,
+    validator-recognition authority, and sparse dependency resolver used by the
+    real validation path.  It does not execute a validation command and therefore
+    cannot turn a candidate import/test failure into an infrastructure failure.
+    """
+    from . import validation_runner
+
+    missing: set[str] = set()
+    allowed = tuple(
+        _relative_repo_path(value) for value in (card.get("allowed_writes") or [])
+    )
+    rows = tuple(
+        value
+        for value in (card.get("validation") or [])
+        if isinstance(value, str) and value.strip()
+    )
+    for command in rows:
+        try:
+            argv, _components, _tmpdir, cwd_relative = (
+                _parse_validation_command_detailed(command)
+            )
+        except (ValueError, WorkspaceError) as exc:
+            missing.add(f"command:{exc}")
+            continue
+        if cwd_relative is not None:
+            cwd = repo / cwd_relative
+            if not cwd.exists():
+                missing.add(f"cwd:{cwd_relative}")
+            elif not cwd.is_dir():
+                missing.add(f"cwd_not_directory:{cwd_relative}")
+        try:
+            normalized, _roots = (
+                _normalize_trusted_validation_executable_argv_with_roots(argv, repo)
+            )
+        except WorkspaceError as exc:
+            missing.add(f"executable:{exc}")
+            normalized = []
+        if normalized:
+            executable = Path(normalized[0])
+            if not executable.is_file() or not os.access(executable, os.X_OK):
+                missing.add(f"executable:{normalized[0]}")
+            for module in validation_runner.dash_m_validator_modules(normalized):
+                if not (
+                    executable.is_file()
+                    and _trusted_root_supplies_validator_module(executable, module)
+                ):
+                    missing.add(f"module:{module}")
+        try:
+            _declared_workspace_seed_closure(
+                repo, {**card, "validation": [command]}, allowed
+            )
+        except WorkspaceError as exc:
+            missing.add(f"repository_input:{exc}")
+    return tuple(sorted(missing))
+
+
 def create_workspace(
     repo: Path,
     request_id: str,

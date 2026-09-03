@@ -504,11 +504,10 @@ def _python_module_selection(tokens: list[str]) -> tuple[str | None, list[str]]:
 def dash_m_validator_modules(tokens: list[str]) -> tuple[str, ...]:
     """Known validator modules invoked via a python interpreter's ``-m <module>``.
 
-    The single authority for "which ``-m`` is python's module selector", reused
-    by ``worker_workspace``'s validator-import probe. pytest's OWN ``-m
-    <marker>`` (``pytest -m slow`` / ``pytest -m coverage``) is never python's
-    module selector, so it is never probed as an importable module -- the
-    two-meanings-of-``-m`` defect (finding THREE) resolved in one place.
+    This is the single recognition authority shared by execution classification
+    and launch-time capability preflight. pytest's own ``-m <marker>`` (including
+    ``pytest -m coverage``) is not python's module selector and is therefore never
+    probed as an importable validator module.
     """
 
     module, _ = _python_module_selection(list(tokens))

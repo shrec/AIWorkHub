@@ -5955,21 +5955,6 @@ class ProcessManager:
         adapter_id: str,
         reserved_request_id: str | None = None,
     ) -> dict[str, Any]:
-        # B314_F006 (reviewed, accepted-by-design): there is a TOCTOU window
-        # between this preflight read and the atomic core.claim_start_exact()
-        # call made later in _launch_isolated -- a second MCP server process
-        # could observe the same "pending" card here. That race can only
-        # ever produce a clean rejection, never a double-claim: taskctl's
-        # claim-start uses its own fcntl-serialized atomic guard
-        # (AITools/taskctl.py::_task_queue_lock), so the loser's later
-        # claim_start_exact() call simply fails and this launch is rejected
-        # (see the except branch below, which releases/cleans up on any
-        # LaunchRejected). The cost of losing the race is a wasted workspace
-        # creation + git worktree add, not a safety violation, so this is
-        # accepted as a bounded inefficiency rather than restructured to move
-        # the claim before workspace creation (which would then require
-        # releasing a successful claim on a later workspace-creation
-        # failure -- a strictly worse trade for a correctness-neutral race).
         for label, value in (("task_id", task_id), ("runner", runner), ("topic", topic)):
             reason = core._is_malformed_identity_token(value)
             if reason:
@@ -6010,6 +5995,14 @@ class ProcessManager:
         policy_result = repo_policy.validate_launch(self.repo, card, adapter_id)
         if not policy_result.get("ok"):
             raise LaunchRejected(str(policy_result.get("reason") or "repo_policy_rejected"))
+        missing_capabilities = _worker_workspace.preflight_validation_capabilities(
+            self.repo, card
+        )
+        if missing_capabilities:
+            detail = json.dumps(
+                missing_capabilities, ensure_ascii=False, separators=(",", ":")
+            )
+            raise LaunchRejected(f"task_contract_unwinnable:{detail}")
         # NF-2026-00548 (audit M3): refuse a relaunch that is byte-identical to
         # a recorded terminal failure BEFORE anything is claimed or
         # provisioned, so the identical attempt is never burned.  Every
