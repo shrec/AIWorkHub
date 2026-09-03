@@ -774,7 +774,8 @@ def test_trusted_site_packages_shadows_pythonpath_validator_hijack(
     root = tmp_path / ".venv"
     (root / "bin").mkdir(parents=True)
     venv_python = root / "bin" / "python"
-    os.symlink(sys.executable, venv_python)  # a REAL interpreter to import with
+    shutil.copyfile(sys.executable, venv_python)  # a REAL interpreter to import with
+    venv_python.chmod(0o755)
     version = f"python{sys.version_info.major}.{sys.version_info.minor}"
     site_packages = root / "lib" / version / "site-packages"
     site_packages.mkdir(parents=True)
