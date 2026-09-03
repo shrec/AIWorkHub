@@ -12,6 +12,16 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.83 — 2026-09-03
+
+- Validation tool and interpreter discovery now comes from one system-owned
+  authority with an auditable capability receipt.
+- The coordinator can safely replay authenticated environment-only validation
+  denials without weakening the worker sandbox.
+- Recovered blocked rework cards can relaunch immediately; their original
+  terminal failure remains preserved instead of trapping the card in an
+  identical-relaunch loop.
+
 ## What's new in 0.10.82 — 2026-09-03
 
 - Validation prerequisites are checked before a worker is launched, so missing

@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.83] - 2026-09-03
+
+This release makes validation capability recovery and rework retry authority
+system-owned, removing another class of self-hosting task loops.
+
+### Fixed
+
+- A central system toolchain authority resolves declared interpreters and
+  tools once and records the capability receipt used by validation.
+- The coordinator can structurally replay authenticated hardlink,
+  deleted-descriptor and operating-system denial cases without broadening the
+  worker sandbox or duplicating a completed replay.
+- A coordinator-authorized blocked-rework recovery now supersedes the exact
+  failed launch episode in the identical-relaunch guard. The audited terminal
+  record remains intact while the recovered card can actually run again.
+
 ## [0.10.82] - 2026-09-03
 
 This release removes another self-hosting validation loop before returning to

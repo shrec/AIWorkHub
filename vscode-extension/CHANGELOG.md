@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.83 — 2026-09-03
+
+### Fixed
+
+- Validation resolves declared interpreters and tools through one central
+  system authority and records the capability receipt used for execution.
+- Authenticated hardlink, deleted-descriptor and operating-system denial cases
+  can be replayed by the coordinator without widening the worker sandbox.
+- Coordinator-authorized blocked-rework recovery now permits the exact card to
+  relaunch while retaining its failed terminal episode as audit evidence.
+
 ## 0.10.82 — 2026-09-03
 
 ### Fixed
