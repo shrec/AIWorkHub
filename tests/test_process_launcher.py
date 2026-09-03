@@ -1524,6 +1524,158 @@ def test_run_declared_validations_preserves_environment_blocked_subtype(monkeypa
     assert exc.results[0]["failure_receipt"]["failure_class"] == "absent_validator_module"
 
 
+def test_run_declared_validations_replays_authenticated_structural_denial_once(
+    monkeypatch, tmp_path
+):
+    from aiworkhub import worker_workspace
+
+    workspace = SimpleNamespace(
+        request_id="req-structural",
+        path=tmp_path / "worktree",
+        repo=tmp_path / "repo",
+    )
+    metadata = {
+        "adapter_id": "codex_cli",
+        "request_id": workspace.request_id,
+        "task_id": "task-structural",
+        "workspace": {
+            "request_id": workspace.request_id,
+            "path": str(workspace.path),
+            "repo": str(workspace.repo),
+        },
+    }
+    denied_row = {
+        "command": "pytest",
+        "returncode": 1,
+        "metadata_broker_denial_attributed": True,
+        "metadata_broker_denials": [{
+            "schema": "aiworkhub.metadata_broker_denial.v1",
+            "authenticated": True,
+            "terminal": True,
+            "reason": "metadata_broker_hardlink_forbidden",
+            "syscall_nr": 90,
+        }],
+    }
+    raised = worker_workspace.ValidationEnvironmentBlocked(
+        "validation_environment_blocked:metadata_broker_denial",
+        [denied_row],
+        restriction="metadata_broker_denial",
+        restrictions=("metadata_broker_denial",),
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        process_launcher.quality_evidence,
+        "normalize_behavioral_contract",
+        lambda work_kind, commands, roles: ("code", ["gate"]),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_validation_route_kwargs",
+        lambda _meta: {"backend": "landlock"},
+    )
+
+    def _run(candidate_workspace, commands, **route):
+        calls.append((candidate_workspace, list(commands), dict(route)))
+        if len(calls) == 1:
+            raise raised
+        return [{"command": "pytest", "returncode": 0}]
+
+    monkeypatch.setattr(process_launcher, "run_validations", _run)
+
+    rows = process_launcher._run_declared_validations(
+        workspace,
+        {"validation": ["pytest"], "work_kind": "code"},
+        metadata,
+    )
+
+    assert len(calls) == 2
+    assert calls[0][0] is calls[1][0] is workspace
+    assert calls[0][1] == calls[1][1] == ["pytest"]
+    assert calls[0][2] == {"backend": "landlock"}
+    assert calls[1][2] == {
+        "backend": "landlock",
+        "outer_validation_authority": True,
+    }
+    assert rows[0]["behavioral_role"] == "gate"
+    receipt = rows[0]["validation_capability_replay"]
+    assert receipt["attempt"] == 1
+    assert receipt["profile"] == "metadata_isolated_v1"
+    assert receipt["capabilities"] == ["hardlink"]
+    assert receipt["request_identity"]["request_id"] == workspace.request_id
+    assert receipt["original_denial"][0]["metadata_broker_denial_attributed"] is True
+
+
+def test_validation_capability_replay_rejects_workspace_identity_mismatch(
+    monkeypatch, tmp_path
+):
+    from aiworkhub import worker_workspace
+
+    workspace = SimpleNamespace(
+        request_id="req-identity",
+        path=tmp_path / "worktree",
+        repo=tmp_path / "repo",
+    )
+    row = {
+        "command": "pytest",
+        "returncode": 1,
+        "metadata_broker_denial_attributed": True,
+        "metadata_broker_denials": [{
+            "schema": "aiworkhub.metadata_broker_denial.v1",
+            "authenticated": True,
+            "terminal": True,
+            "reason": "fchmodat denied",
+            "syscall_nr": 268,
+        }],
+    }
+    raised = worker_workspace.ValidationEnvironmentBlocked(
+        "validation_environment_blocked:metadata_broker_denial",
+        [row],
+        restriction="metadata_broker_denial",
+        restrictions=("metadata_broker_denial",),
+    )
+    calls = 0
+
+    monkeypatch.setattr(
+        process_launcher.quality_evidence,
+        "normalize_behavioral_contract",
+        lambda work_kind, commands, roles: ("code", ["gate"]),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_validation_route_kwargs",
+        lambda _meta: {"backend": "landlock"},
+    )
+
+    def _run(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise raised
+
+    monkeypatch.setattr(process_launcher, "run_validations", _run)
+
+    with pytest.raises(worker_workspace.ValidationRunError) as caught:
+        process_launcher._run_declared_validations(
+            workspace,
+            {"validation": ["pytest"], "work_kind": "code"},
+            {
+                "adapter_id": "codex_cli",
+                "request_id": workspace.request_id,
+                "task_id": "task-identity",
+                "workspace": {
+                    "request_id": workspace.request_id,
+                    "path": str(tmp_path / "wrong-worktree"),
+                    "repo": str(workspace.repo),
+                },
+            },
+        )
+
+    assert calls == 1
+    assert str(caught.value) == (
+        "validation_failed:validation_capability_replay_identity_mismatch"
+    )
+
+
 def test_run_declared_validations_keeps_genuine_failure_as_validation_run_error(monkeypatch):
     """A real gate failure must stay ``ValidationRunError``/``validation_failed``
     through the finalizer seam -- it is never weakened into an environment

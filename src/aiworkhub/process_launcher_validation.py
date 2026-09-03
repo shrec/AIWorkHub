@@ -8,9 +8,10 @@ import re
 import uuid
 from collections import Counter
 from pathlib import Path, PurePosixPath
+from threading import Lock
 from typing import Any, Callable, Iterable, Mapping
 
-from . import quality_evidence
+from . import quality_evidence, validation_runner
 from . import worker_workspace as _worker_workspace
 from .worker_workspace import (
     ValidationEnvironmentBlocked,
@@ -23,6 +24,9 @@ ValidationRunner = Callable[..., list[dict[str, Any]]]
 WorkspaceCreator = Callable[..., WorkerWorkspace]
 WorkspaceCleanup = Callable[..., None]
 RouteResolver = Callable[[Mapping[str, Any]], dict[str, Any]]
+
+_VALIDATION_REPLAY_LOCK = Lock()
+_VALIDATION_REPLAYS_IN_FLIGHT: set[tuple[str, str, str]] = set()
 
 
 def validation_route_kwargs(
@@ -299,13 +303,98 @@ def run_declared_validations(
             row["behavioral_role"] = role
         return materialized
 
+    route = route_resolver(route_metadata)
     try:
-        results = run_validations(workspace, commands, **route_resolver(route_metadata))
+        results = run_validations(workspace, commands, **route)
     except ValidationRunError as exc:
         rows = with_roles(exc.results)
         if isinstance(exc, ValidationEnvironmentBlocked):
-            exc.results = rows
-            raise
+            decision = validation_runner.plan_validation_capability_replay(
+                commands,
+                rows,
+                backend=str(route.get("backend") or ""),
+                already_replayed=bool(route_metadata.get("validation_capability_replayed")),
+            )
+            if not decision.replay or decision.profile is None:
+                exc.results = rows
+                if decision.reason.startswith("compatible_validation_lane_unavailable"):
+                    raise ValidationEnvironmentBlocked(
+                        f"validation_environment_blocked:{decision.reason}",
+                        rows,
+                        restriction=decision.reason,
+                    ) from exc
+                raise
+            recorded_workspace = route_metadata.get("workspace")
+            recorded_workspace = (
+                recorded_workspace if isinstance(recorded_workspace, Mapping) else {}
+            )
+            if (
+                str(route_metadata.get("request_id") or "") != workspace.request_id
+                or str(recorded_workspace.get("request_id") or "") != workspace.request_id
+                or str(recorded_workspace.get("path") or "") != str(workspace.path)
+                or str(recorded_workspace.get("repo") or "") != str(workspace.repo)
+            ):
+                raise ValidationRunError(
+                    "validation_failed:validation_capability_replay_identity_mismatch",
+                    rows,
+                ) from exc
+            replay_identity = (
+                workspace.request_id,
+                str(workspace.path),
+                str(workspace.repo),
+            )
+            with _VALIDATION_REPLAY_LOCK:
+                if replay_identity in _VALIDATION_REPLAYS_IN_FLIGHT:
+                    restriction = "validation_capability_replay_in_flight"
+                    raise ValidationEnvironmentBlocked(
+                        f"validation_environment_blocked:{restriction}",
+                        rows,
+                        restriction=restriction,
+                        restrictions=(restriction,),
+                    ) from exc
+                _VALIDATION_REPLAYS_IN_FLIGHT.add(replay_identity)
+            try:
+                replay_route = dict(route)
+                replay_route["outer_validation_authority"] = True
+                try:
+                    replayed = run_validations(workspace, commands, **replay_route)
+                except ValidationRunError as replay_exc:
+                    replay_rows = with_roles(replay_exc.results)
+                    for row in replay_rows:
+                        row["validation_capability_replay"] = {
+                            "attempt": 1,
+                            "backend": decision.profile.backend,
+                            "profile": decision.profile.profile,
+                            "capabilities": list(decision.profile.capabilities),
+                            "original_denial": rows,
+                            "request_identity": {
+                                "request_id": str(route_metadata.get("request_id") or ""),
+                                "task_id": str(route_metadata.get("task_id") or ""),
+                                "workspace": str(workspace.path),
+                                "repository": str(workspace.repo),
+                            },
+                        }
+                    replay_exc.results = replay_rows
+                    raise
+                results = with_roles(replayed)
+                for row in results:
+                    row["validation_capability_replay"] = {
+                        "attempt": 1,
+                        "backend": decision.profile.backend,
+                        "profile": decision.profile.profile,
+                        "capabilities": list(decision.profile.capabilities),
+                        "original_denial": rows,
+                        "request_identity": {
+                            "request_id": str(route_metadata.get("request_id") or ""),
+                            "task_id": str(route_metadata.get("task_id") or ""),
+                            "workspace": str(workspace.path),
+                            "repository": str(workspace.repo),
+                        },
+                    }
+                return results
+            finally:
+                with _VALIDATION_REPLAY_LOCK:
+                    _VALIDATION_REPLAYS_IN_FLIGHT.discard(replay_identity)
         try:
             return baseline_comparer(workspace, authority, route_metadata, rows)
         except WorkspaceError as baseline_exc:

@@ -114,6 +114,108 @@ class TerminalState:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class ValidationCapabilityProfile:
+    """Mechanically derived requirements for one coordinator validation lane."""
+
+    capabilities: tuple[str, ...]
+    backend: str
+    profile: str = "metadata_isolated_v1"
+
+
+@dataclass(frozen=True)
+class ValidationReplayDecision:
+    replay: bool
+    reason: str
+    profile: ValidationCapabilityProfile | None = None
+
+
+_STRUCTURAL_CAPABILITIES = frozenset(
+    {"chmod", "hardlink", "deleted_fd", "git_metadata", "nested_landlock"}
+)
+
+
+def derive_validation_capability_profile(
+    commands: Iterable[str], results: Iterable[Mapping[str, Any]], *, backend: str
+) -> ValidationCapabilityProfile | None:
+    """Derive replay needs only from declarations and authenticated broker facts."""
+
+    declared = tuple(command for command in commands if isinstance(command, str))
+    if not declared:
+        return None
+    capabilities: set[str] = set()
+    for row in results:
+        denials = row.get("metadata_broker_denials")
+        if row.get("metadata_broker_denial_attributed") is not True or not isinstance(
+            denials, (list, tuple)
+        ):
+            continue
+        for denial in denials:
+            if not isinstance(denial, Mapping) or not (
+                denial.get("schema") == "aiworkhub.metadata_broker_denial.v1"
+                and denial.get("authenticated") is True
+                and denial.get("terminal") is True
+                and isinstance(denial.get("syscall_nr"), int)
+            ):
+                continue
+            reason = str(denial.get("reason") or "").lower()
+            if "deleted" in reason or "unlinked" in reason:
+                capabilities.add("deleted_fd")
+            elif "link" in reason:
+                capabilities.add("hardlink")
+            elif "git" in reason or "config.lock" in reason:
+                capabilities.add("git_metadata")
+            elif "landlock" in reason or "nested" in reason:
+                capabilities.add("nested_landlock")
+            elif any(token in reason for token in _CHMOD_TOKENS):
+                capabilities.add("chmod")
+            elif reason == "oserror_eperm":
+                # The broker intentionally emits a path-free errno for kernel
+                # denials. Resolve that authenticated fact with authoritative
+                # declared test metadata, never candidate stderr.
+                declaration = " ".join(declared).lower()
+                if "hardlink" in declaration or "hard_link" in declaration:
+                    capabilities.add("hardlink")
+                elif "deleted_fd" in declaration or "deleted-fd" in declaration:
+                    capabilities.add("deleted_fd")
+                elif "landlock" in declaration:
+                    capabilities.add("nested_landlock")
+                elif "git" in declaration or "config.lock" in declaration:
+                    capabilities.add("git_metadata")
+                elif any(token in declaration for token in _CHMOD_TOKENS):
+                    capabilities.add("chmod")
+    if not capabilities:
+        return None
+    return ValidationCapabilityProfile(tuple(sorted(capabilities)), backend)
+
+
+def plan_validation_capability_replay(
+    commands: Iterable[str],
+    results: Iterable[Mapping[str, Any]],
+    *,
+    backend: str,
+    already_replayed: bool = False,
+) -> ValidationReplayDecision:
+    """Authorize at most one least-privilege replay; fail closed otherwise."""
+
+    if already_replayed:
+        return ValidationReplayDecision(False, "validation_capability_replay_exhausted")
+    rows = list(results)
+    terminal = classify_validation_results(rows)
+    if terminal.state != VALIDATION_ENVIRONMENT_BLOCKED or terminal.restrictions != (
+        RESTRICTION_METADATA_BROKER_DENIAL,
+    ):
+        return ValidationReplayDecision(False, "failure_not_authenticated_structural_denial")
+    profile = derive_validation_capability_profile(commands, rows, backend=backend)
+    if profile is None:
+        return ValidationReplayDecision(False, "authenticated_capability_unresolved")
+    if backend != "landlock" or not set(profile.capabilities) <= _STRUCTURAL_CAPABILITIES:
+        return ValidationReplayDecision(
+            False, f"compatible_validation_lane_unavailable:backend={backend}", profile
+        )
+    return ValidationReplayDecision(True, "authenticated_structural_denial", profile)
+
+
 def _row_diagnostic(row: Mapping[str, Any]) -> str:
     return (
         str(row.get("stderr_tail") or "")

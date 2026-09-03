@@ -277,6 +277,85 @@ def test_passing_batch_is_not_blocked() -> None:
     assert terminal.blocks_acceptance is False
 
 
+def _authenticated_metadata_denial(reason: str) -> dict:
+    return {
+        "schema": "aiworkhub.metadata_broker_denial.v1",
+        "authenticated": True,
+        "terminal": True,
+        "reason": reason,
+        "syscall_nr": 268,
+    }
+
+
+@pytest.mark.parametrize(
+    ("reason", "capability"),
+    [
+        ("fchmodat denied", "chmod"),
+        ("hardlink target denied", "hardlink"),
+        ("deleted descriptor denied", "deleted_fd"),
+        ("git config.lock metadata denied", "git_metadata"),
+        ("nested landlock restriction", "nested_landlock"),
+    ],
+)
+def test_authenticated_structural_denial_derives_replay_capability(
+    reason: str, capability: str
+) -> None:
+    row = _nonzero_row(
+        "python -m pytest tests/test_x.py", returncode=1, stderr="",
+        argv=["python", "-m", "pytest", "tests/test_x.py"], failure_class="nonzero_exit"
+    )
+    row["metadata_broker_denial_attributed"] = True
+    row["metadata_broker_denials"] = [_authenticated_metadata_denial(reason)]
+    decision = validation_runner.plan_validation_capability_replay(
+        [row["command"]], [row], backend="landlock"
+    )
+    assert decision.replay is True
+    assert decision.profile is not None
+    assert decision.profile.capabilities == (capability,)
+
+
+def test_validation_capability_replay_fails_closed_and_is_single_attempt() -> None:
+    row = _nonzero_row(
+        "python -m pytest tests/test_x.py", returncode=1, stderr="",
+        argv=["python", "-m", "pytest", "tests/test_x.py"], failure_class="nonzero_exit"
+    )
+    row["metadata_broker_denial_attributed"] = True
+    row["metadata_broker_denials"] = [_authenticated_metadata_denial("fchmodat denied")]
+    unavailable = validation_runner.plan_validation_capability_replay(
+        [row["command"]], [row], backend="bubblewrap"
+    )
+    exhausted = validation_runner.plan_validation_capability_replay(
+        [row["command"]], [row], backend="landlock", already_replayed=True
+    )
+    assert unavailable.replay is False
+    assert unavailable.reason == "compatible_validation_lane_unavailable:backend=bubblewrap"
+    assert exhausted.reason == "validation_capability_replay_exhausted"
+
+
+def test_unauthenticated_or_mixed_failure_never_replays() -> None:
+    structural = _nonzero_row(
+        "python -m pytest tests/test_x.py", returncode=1, stderr="",
+        argv=["python", "-m", "pytest", "tests/test_x.py"], failure_class="nonzero_exit"
+    )
+    structural["metadata_broker_denial_attributed"] = True
+    structural["metadata_broker_denials"] = [
+        {**_authenticated_metadata_denial("fchmodat denied"), "authenticated": False}
+    ]
+    assert not validation_runner.plan_validation_capability_replay(
+        [structural["command"]], [structural], backend="landlock"
+    ).replay
+    structural["metadata_broker_denials"][0]["authenticated"] = True
+    genuine = _nonzero_row(
+        "ruff check src", returncode=1, stderr="error", argv=["ruff", "check", "src"],
+        failure_class="nonzero_exit"
+    )
+    assert not validation_runner.plan_validation_capability_replay(
+        [structural["command"], genuine["command"]],
+        [structural, genuine],
+        backend="landlock",
+    ).replay
+
+
 # ── FOUR: reject an unrunnable validation command at card creation (NF-267) ──
 
 
