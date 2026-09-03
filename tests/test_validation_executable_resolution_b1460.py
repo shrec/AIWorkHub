@@ -344,6 +344,13 @@ def test_pytest_console_script_normalization_is_preserved() -> None:
     assert worker_workspace._normalize_pytest_validation_argv(explicit) == explicit
 
 
+def test_pytest_uses_the_trusted_module_validator_authority() -> None:
+    assert "pytest" in worker_workspace._TRUSTED_VALIDATION_BARE_EXECUTABLES
+    assert worker_workspace._is_module_validator_invocation(
+        ["python", "-m", "pytest", "tests/test_x.py"]
+    )
+
+
 def test_repo_venv_mypy_preferred_over_system(tmp_path, monkeypatch) -> None:
     repo_mypy = _runtime_executable(tmp_path / ".venv", "mypy")
 
@@ -474,7 +481,7 @@ def test_run_validations_bare_pytest_executes_trusted_repo_interpreter(
 
     result = worker_workspace.run_validations(workspace, ["pytest -q"])
 
-    expected = [worker_workspace.sys.executable, "-m", "pytest", "-q"]
+    expected = [worker_workspace.sys.executable, "-P", "-m", "pytest", "-q"]
     assert result[0]["executed_argv"] == expected
     assert result[0]["argv"] == expected
     assert result[0]["argv_rewritten"] is True

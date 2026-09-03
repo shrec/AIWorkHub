@@ -5352,7 +5352,12 @@ def select_sandbox_backend() -> str:
     raise WorkspaceError(f"secure_sandbox_unavailable:bubblewrap_unusable:{detail}")
 
 
-_TRUSTED_VALIDATION_BARE_EXECUTABLES = frozenset({"ruff", "mypy"})
+# Keep every coordinator-owned Python validator on the same runtime-root
+# authority path.  Excluding pytest made ``python -m pytest`` fall through to
+# the MCP server's interpreter even when the repository .venv supplied pytest;
+# a packaged server therefore reported ``module:pytest`` and rejected otherwise
+# runnable cards before launch.
+_TRUSTED_VALIDATION_BARE_EXECUTABLES = frozenset({"pytest", "ruff", "mypy"})
 SANDBOX_VALIDATION_EXECUTABLE_ROOT = "/validation-executable-root"
 
 
