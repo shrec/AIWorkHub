@@ -63,7 +63,7 @@ def test_bare_approved_ruff_resolves_to_arbitrary_repo_venv(
     ) == [str(ruff.resolve()), "check", "src"]
 
 
-def test_python_module_ruff_resolves_to_trusted_console_executable(
+def test_python_module_ruff_preserves_safe_module_form_without_runtime_interpreter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     repo = tmp_path / "project"
@@ -81,8 +81,9 @@ def test_python_module_ruff_resolves_to_trusted_console_executable(
         )
     )
 
-    assert argv == [str(ruff.resolve()), "check", "src"]
-    assert roots == (runtime_root.resolve(strict=False),)
+    assert ruff.is_file()
+    assert argv == [sys.executable, "-P", "-m", "ruff", "check", "src"]
+    assert roots == ()
 
 
 def test_bare_python_validation_uses_portable_python3_alias() -> None:
