@@ -3682,6 +3682,9 @@ def test_bare_python_module_mypy_uses_trusted_executable_and_preserves_args(
 ) -> None:
     bin_dir = tmp_path / ".venv" / "bin"
     bin_dir.mkdir(parents=True)
+    venv_python = bin_dir / "python"
+    shutil.copyfile(sys.executable, venv_python)
+    venv_python.chmod(0o755)
     mypy = bin_dir / "mypy"
     mypy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     os.chmod(mypy, 0o755)
@@ -3693,23 +3696,44 @@ def test_bare_python_module_mypy_uses_trusted_executable_and_preserves_args(
         )
     )
 
-    assert executed == [str(mypy.resolve()), "--strict", "src/example.py"]
+    assert executed == [
+        str(venv_python),
+        "-P",
+        "-m",
+        "mypy",
+        "--strict",
+        "src/example.py",
+    ]
     assert roots == ((tmp_path / ".venv").resolve(),)
-    assert executed[1:] == declared[3:]
+    assert executed[4:] == declared[3:]
 
 
 def test_python_module_mypy_rewrite_is_exact_and_preserves_existing_rules(
     tmp_path: Path,
 ) -> None:
-    unchanged = (
+    root = tmp_path / ".venv"
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True)
+    venv_python = bin_dir / "python"
+    shutil.copyfile(sys.executable, venv_python)
+    venv_python.chmod(0o755)
+    mypy = bin_dir / "mypy"
+    mypy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    mypy.chmod(0o755)
+
+    resolved = (
         ["/usr/bin/python3", "-m", "mypy", "src"],
         [".venv/bin/python3", "-m", "mypy", "src"],
-        ["python2", "-m", "mypy", "src"],
     )
-    for declared in unchanged:
+    for declared in resolved:
         assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
             list(declared), tmp_path
-        ) == (list(declared), ())
+        ) == ([str(venv_python), "-P", "-m", "mypy", "src"], (root.resolve(),))
+
+    unsupported = ["python2", "-m", "mypy", "src"]
+    assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+        unsupported, tmp_path
+    ) == (unsupported, ())
 
     for tail in (("-m", "pytest", "src"), ("-m", "mypy.api", "src"), ("-mypy", "src")):
         declared = ["python3", *tail]
