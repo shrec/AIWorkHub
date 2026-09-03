@@ -12,6 +12,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.81 — 2026-09-03
+
+- The dashboard separates the current queue from canonical decisions and task
+  outcomes. Accepted, rejected, archived, superseded and finished are distinct,
+  with bounded effectiveness rates instead of one ambiguous Finished count.
+- Archived NeedFix entries whose linked task was never accepted can reopen
+  atomically, preserving audit history without hiding unfinished work.
+- Validator commands use one interpreter authority whose receipt matches the
+  executed argv, with safe module loading and cross-platform parity tests.
+- App-server mux shutdown now wakes blocked input cooperatively and routes
+  platform checks through the shared facade.
+
 ## What's new in 0.10.80 — 2026-09-02
 
 - The cost panel reports the repository it is bound to. The cost ledger tool was

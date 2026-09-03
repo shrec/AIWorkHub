@@ -6,6 +6,31 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.81] - 2026-09-03
+
+This release makes queue state, terminal outcomes and validation authority
+measurable rather than inferred, while closing four recurring self-hosting
+failure paths.
+
+### Fixed
+
+- The dashboard separates the current queue from canonical manager decisions
+  and terminal task outcomes. Accepted, rejected, archived, superseded and
+  finished are now reported as distinct authoritative counts, with bounded
+  effectiveness rates instead of one ambiguous "Finished" number.
+- An archived NeedFix whose linked task never produced an accepted outcome can
+  reopen atomically. Historical archive state remains audited, while unfinished
+  work no longer disappears behind a stale task link.
+- Declared Python validator commands resolve through one interpreter authority.
+  The executed argv and the authority receipt now agree, module validators use
+  the safe `-P -m` form, escaping runtime symlinks fail closed, and Windows,
+  macOS and Linux share the same tested contract.
+- App-server mux shutdown no longer depends on raw platform probes or a blocked
+  stdin reader. Cooperative wake-up and shutdown checks now go through the
+  platform facade.
+- Retention preserves adjudicated outcomes, and workforce routing scores routes
+  from measured accepted results rather than ungrounded availability alone.
+
 ## [0.10.80] - 2026-09-02
 
 The release where the surfaces stopped saying "unknown" about things they had

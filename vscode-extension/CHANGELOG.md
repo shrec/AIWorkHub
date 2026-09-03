@@ -1,5 +1,24 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.81 — 2026-09-03
+
+### Fixed
+
+- The dashboard now separates the live queue from canonical decisions and task
+  outcomes. Accepted, rejected, archived, superseded and finished counts are
+  shown independently, alongside bounded acceptance, review-readiness,
+  validation-failure, callback-delivery and skill-lifecycle measurements.
+- Archived NeedFix entries can reopen atomically when their linked task never
+  reached an accepted outcome, so unfinished work is not hidden by stale links.
+- Python validator declarations now resolve through one auditable interpreter
+  authority. The receipt matches the executed argv, module validators retain
+  the safe `-P -m` form, and cross-platform regressions cover Linux, macOS and
+  Windows.
+- App-server mux shutdown uses the platform facade and cooperatively wakes a
+  blocked stdin reader instead of leaving shutdown work stranded.
+- Retention keeps adjudicated outcome truth, and routing scores providers from
+  measured accepted outcomes.
+
 ## 0.10.80 — 2026-09-02
 
 ### Fixed
