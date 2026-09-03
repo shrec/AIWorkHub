@@ -7778,6 +7778,8 @@ def needfix_convert(
     original conversion and ``needfix-{NF-ID}-rN`` after the Nth verified
     reopen of an archived superseded task link.
     """
+    from . import task_templates
+
     ns = _needfix_store_module()
 
     def _create_task_fn(card: dict[str, Any]) -> dict[str, Any]:
@@ -7807,7 +7809,10 @@ def needfix_convert(
             allow_empty_required_outputs=card.get("allow_empty_required_outputs"),
             allow_unchanged_required_outputs=card.get("allow_unchanged_required_outputs"),
             validation=card.get("validation"),
+            validation_roles=card.get("validation_roles"),
             priority=card.get("priority", "normal"),
+            work_kind=card.get("work_kind", "generic"),
+            risk_tier=card.get("risk_tier"),
             callback_required=card.get("callback_required", True),
             task_type=card.get("task_type", "code"),
             depends_on=card.get("depends_on"),
@@ -7815,6 +7820,7 @@ def needfix_convert(
             immutable_inputs=card.get("immutable_inputs"),
             read_only=card.get("read_only", False),
             max_live_tokens=card.get("max_live_tokens"),
+            custom_template_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
         )
 
     def _task_card_builder(needfix_snapshot: dict[str, Any]) -> dict[str, Any]:

@@ -700,6 +700,48 @@ class TestNeedFixConversionPublicPlanContract:
             assert committed[field] == value
         assert committed["task_id"] == f"needfix-{r['id']}"
 
+    def test_core_conversion_bridge_preserves_quality_contract(self, init_store, monkeypatch):
+        from aiworkhub import core, task_templates
+
+        r = self._accepted_with_scope(
+            init_store,
+            ["src/aiworkhub/foo.py", "tests/test_foo.py"],
+        )
+        plan = {
+            "runner": "codex_gpt-5.6-sol",
+            "topic": "needfix_fix",
+            "required_outputs": ["src/aiworkhub/foo.py"],
+            "validation": [
+                "python3 -m pytest -q tests/test_foo.py",
+                "git diff --check",
+            ],
+            "validation_roles": ["reproduction", "regression"],
+            "work_kind": "bugfix",
+            "risk_tier": "critical",
+        }
+        preview = needfix_store.preview_convert(init_store, r["id"], plan)
+        captured = {}
+
+        def fake_create_task(**kwargs):
+            captured.update(kwargs)
+            return {"ok": True, "task_id": f"needfix-{r['id']}"}
+
+        monkeypatch.setattr(core, "repo_root", lambda: init_store)
+        monkeypatch.setattr(core, "create_task", fake_create_task)
+        result = core.needfix_convert(
+            r["id"],
+            task_plan=plan,
+            plan_digest=preview["plan_digest"],
+        )
+
+        assert result["converted_task_id"] == f"needfix-{r['id']}"
+        assert captured["validation_roles"] == ["reproduction", "regression"]
+        assert captured["work_kind"] == "bugfix"
+        assert captured["risk_tier"] == "critical"
+        assert captured["custom_template_escape"] == (
+            task_templates.AUDITED_CUSTOM_ESCAPE
+        )
+
     def test_malformed_plan_unknown_field_fails_closed_without_mutation(self, init_store: Path):
         r = self._accepted_with_scope(init_store)
         with pytest.raises(needfix_store.NeedFixValidationError, match="unsupported"):

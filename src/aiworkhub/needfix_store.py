@@ -1753,6 +1753,7 @@ _TASK_PLAN_STR_FIELDS: tuple[str, ...] = (
     "task_type",
     "priority",
     "work_kind",
+    "risk_tier",
 )
 _TASK_PLAN_BOOL_FIELDS: tuple[str, ...] = ("callback_required", "read_only")
 _TASK_PLAN_INT_FIELDS: tuple[str, ...] = ("max_live_tokens",)
