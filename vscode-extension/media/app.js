@@ -402,10 +402,16 @@ function setConnection(mode, label) {
 
 function renderSummary(snapshot) {
   const counts = snapshot.status_counts || {};
-  for (const metric of ["active", "pending", "processing", "review", "blocked", "finished", "stale"]) {
+  for (const metric of ["active", "pending", "processing", "review", "blocked", "stale"]) {
     const target = document.querySelector(`#metric-${metric}`);
     target.textContent = formatCount(counts[metric]);
     target.title = String(numberValue(counts[metric]));
+  }
+  const outcomes = snapshot.outcome_counts || {};
+  for (const metric of ["accepted", "rejected", "archived", "superseded", "finished"]) {
+    const target = document.querySelector(`#metric-${metric}`);
+    target.textContent = formatCount(outcomes[metric]);
+    target.title = String(numberValue(outcomes[metric]));
   }
   const totals = snapshot.cost_usage && snapshot.cost_usage.totals ? snapshot.cost_usage.totals : {};
   elements.lastSync.textContent = `Synced ${formatRelativeTime(snapshot.generated_at)}`;
@@ -1281,7 +1287,7 @@ function renderKpis(snapshot) {
   const header = createElement("div", "kpi-heading");
   const headingText = createElement("div");
   headingText.append(
-    createElement("h3", "kpi-title", "Repository performance"),
+    createElement("h3", "kpi-title", "Effectiveness (bounded process evidence)"),
     createElement(
       "p",
       "kpi-subtitle",
@@ -1292,10 +1298,22 @@ function renderKpis(snapshot) {
   fragment.appendChild(header);
 
   const cards = createElement("div", "kpi-grid");
+  const skills = snapshot && snapshot.skills && typeof snapshot.skills === "object" ? snapshot.skills : {};
+  const skillSelection = skills.selection && typeof skills.selection === "object" ? skills.selection : {};
+  const skillInvocation = skills.invocation && typeof skills.invocation === "object" ? skills.invocation : {};
+  const skillOutcome = skills.outcome && typeof skills.outcome === "object" ? skills.outcome : {};
+  const skillLifecycle = skills.lifecycle && typeof skills.lifecycle === "object" ? skills.lifecycle : {};
+  const skillSelections = numberValue(skillSelection.count === "unknown" ? skillSelection.returned_count : skillSelection.count);
+  const skillInvocations = numberValue(skillInvocation.count === "unknown" ? skillInvocation.returned_count : skillInvocation.count);
+  const skillOutcomes = numberValue(skillOutcome.count === "unknown" ? skillOutcome.returned_count : skillOutcome.count);
+  const skillSample = skillInvocation.state === "measured" && skillInvocations > 0;
+  const skillLifecycleDetail = `${formatCount(skillLifecycle.proposed)} proposed · ${formatCount(skillLifecycle.active)} active · ${formatCount(skillLifecycle.retired)} retired`;
   const cardValues = [
-    ["Manager accepted", kpiPercent(headline.manager_acceptance_rate), `${formatCount(headline.accepted_runs)}/${formatCount(headline.manager_decisions)} explicit decisions`, "good"],
-    ["Review-ready", kpiPercent(headline.review_ready_rate), `${formatCount(headline.review_ready_runs)}/${formatCount(headline.terminal_runs)} terminal worker outcomes`, "good"],
-    ["Validation failed", kpiPercent(headline.validation_failed_rate), `${formatCount(headline.validation_failed_runs)} terminal outcomes`, numberValue(headline.validation_failed_runs) ? "bad" : "good"],
+    ["Manager acceptance rate", kpiPercent(headline.manager_acceptance_rate), `${formatCount(headline.accepted_decisions)}/${formatCount(headline.manager_decisions)} all-time explicit manager decisions accepted`, "good"],
+    ["Actionable review-ready", kpiPercent(headline.actionable_review_ready_rate), `${formatCount(headline.actionable_review_ready_runs)}/${formatCount(headline.terminal_runs)} terminal outcomes in ${windowInfo.label || "bounded process window"}`, "good"],
+    ["Validation failure (recent window)", kpiPercent(headline.validation_failed_rate), `${formatCount(headline.validation_failed_runs)}/${formatCount(headline.terminal_runs)} terminal outcomes in ${windowInfo.label || "bounded process window"}`, numberValue(headline.validation_failed_runs) ? "bad" : "good"],
+    ["Callback delivery / backlog", kpiPercent(headline.callback_delivery_rate), `${formatCount(headline.callback_backlog)} current backlog · ${formatCount(headline.callback_dead_letters)} dead letters`, numberValue(headline.callback_dead_letters) ? "bad" : "good"],
+    ["Skill lifecycle", skillSample ? formatCount(skillInvocations) : "No sample", skillSample ? `${skillLifecycleDetail} · ${formatCount(skillSelections)} selections · ${formatCount(skillInvocations)} invocations · ${formatCount(skillOutcomes)} outcomes` : `${skillLifecycleDetail} · ${formatCount(skillSelections)} selections · no invocation evidence; efficacy unavailable`, skillSample ? "accent" : "neutral"],
     ["Source Graph live", kpiPercent(headline.source_graph_live_rate), "authenticated live-task rate", "accent"],
     ["SG call success", kpiPercent(headline.source_graph_useful_call_rate), "calls without a recorded failure", "accent"],
     ["SG workflow stages", kpiPercent(headline.source_graph_stage_attribution_rate), "calls carrying authenticated workflow-stage metadata", "accent"],
@@ -1328,7 +1346,6 @@ function renderKpis(snapshot) {
     ["Envelope overhead", headline.envelope_overhead_rate == null ? "—" : kpiPercent(headline.envelope_overhead_rate), `${formatCount(headline.envelope_bytes_added)} serialization bytes added`, numberValue(headline.envelope_bytes_added) ? "neutral" : "good"],
     ["Provider cache hit", kpiPercent(headline.provider_cache_hit_rate), `${formatCount(headline.provider_measured_tasks)} provider-measured tasks`, "accent"],
     ["Cost / review-ready", headline.cost_per_review_ready_usd == null ? "—" : `$${Number(headline.cost_per_review_ready_usd).toFixed(4)}`, "provider-reported cost only", "neutral"],
-    ["Callback delivery", kpiPercent(headline.callback_delivery_rate), `${formatCount(headline.callback_backlog)} backlog · ${formatCount(headline.callback_dead_letters)} dead`, numberValue(headline.callback_dead_letters) ? "bad" : "good"],
     ["Observed cost", `$${Number(headline.cost_usd || 0).toFixed(2)}`, `${formatCount(headline.total_tokens)} recorded tokens`, "neutral"],
   ];
   for (const [label, value, detail, tone] of cardValues) {

@@ -142,6 +142,8 @@ def test_kpis_prefer_exact_canonical_manager_decisions_over_process_states():
     assert result["headline"]["manager_decisions"] == 5
     assert result["headline"]["accepted_runs"] == 2
     assert result["headline"]["rejected_runs"] == 3
+    assert result["headline"]["accepted_decisions"] == 2
+    assert result["headline"]["rejected_decisions"] == 3
     assert result["headline"]["manager_acceptance_rate"] == 40.0
     assert "canonical_task_event_ledger" in result["data_quality"]["acceptance_rate_reason"]
 

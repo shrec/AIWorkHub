@@ -42,8 +42,8 @@ try {
     callTool: async (_name, args, timeoutMs) => {
       calls.push({ args, timeoutMs });
       return args.full
-        ? { snapshot_mode: "full", status_counts: { active: 2 }, tasks: { pending: [{ task_id: "T1" }] } }
-        : { snapshot_mode: "summary", status_counts: { active: 2 } };
+        ? { snapshot_mode: "full", status_counts: { active: 2 }, outcome_counts: { accepted: 3, rejected: 1 }, tasks: { pending: [{ task_id: "T1" }] } }
+        : { snapshot_mode: "summary", status_counts: { active: 2 }, outcome_counts: { accepted: 3, rejected: 1 } };
     },
     _convergeBackgroundServices: () => { convergenceCalls += 1; },
   };
@@ -68,6 +68,7 @@ try {
     [["snapshotSummary", "summary"], ["snapshot", "full"]],
   );
   assert.strictEqual(convergenceCalls, 1);
+  assert.deepStrictEqual(messages[0].payload.outcome_counts, { accepted: 3, rejected: 1 });
 
   console.log("dashboard progressive snapshot: ok");
 })().catch((err) => {

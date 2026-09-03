@@ -339,6 +339,10 @@ class FakeProvider:
             },
         }
 
+    def get_manager_decision_counts(self):
+        self.calls.append(("get_manager_decision_counts", None))
+        return {"accepted": 7, "rejected": 2, "total": 9}
+
 
 class PartiallyFailingProvider(FakeProvider):
     def list_tasks(self, status: str):
@@ -369,6 +373,13 @@ def test_build_snapshot_combines_read_sources_and_operational_summaries():
         "archived": 0,
         "stale": 1,
         "active": 3,
+    }
+    assert snapshot["outcome_counts"] == {
+        "accepted": 7,
+        "rejected": 2,
+        "archived": 0,
+        "superseded": 0,
+        "finished": 0,
     }
     assert snapshot["tasks"]["processing"][0]["stale"] is True
     assert snapshot["tasks"]["processing"][0]["validation_status"] == "FAIL"
@@ -405,6 +416,7 @@ def test_summary_snapshot_skips_full_webview_reads_without_changing_counts():
     summary = dashboard.build_snapshot(summary_provider, summary_only=True)
 
     assert summary["status_counts"] == full["status_counts"]
+    assert summary["outcome_counts"] == full["outcome_counts"]
     assert summary["row_counts"] == full["row_counts"]
     assert summary["warnings"] == full["warnings"]
     assert summary["health"] == full["health"]

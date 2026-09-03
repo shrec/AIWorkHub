@@ -9093,7 +9093,10 @@ function getHtmlForWebview(webview, extensionUri) {
   </header>
 
   <main>
-    <section class="summary-strip" aria-label="Queue summary">
+    <section aria-labelledby="current-queue-heading">
+      <h2 id="current-queue-heading">Current queue</h2>
+      <p>Current canonical task states; stale is an observability flag.</p>
+    <div class="summary-strip" aria-label="Current queue counts">
       <div class="summary-item status-all">
         <span class="summary-label">Active</span>
         <strong id="metric-active">0</strong>
@@ -9114,19 +9117,28 @@ function getHtmlForWebview(webview, extensionUri) {
         <span class="summary-label">Blocked</span>
         <strong id="metric-blocked">0</strong>
       </div>
-      <div class="summary-item status-finished">
-        <span class="summary-label">Finished</span>
-        <strong id="metric-finished">0</strong>
-      </div>
       <div class="summary-item status-stale">
         <span class="summary-label">Stale</span>
         <strong id="metric-stale">0</strong>
       </div>
+    </div>
+    </section>
+
+    <section aria-labelledby="canonical-outcomes-heading">
+      <h2 id="canonical-outcomes-heading">Canonical decisions and task outcomes</h2>
+      <p>Accepted and rejected are all-time manager ledger decisions; archived, superseded, and finished are current task states.</p>
+    <div class="summary-strip" aria-label="Canonical decision and outcome counts">
+      <div class="summary-item"><span class="summary-label">Accepted decisions</span><strong id="metric-accepted">0</strong></div>
+      <div class="summary-item"><span class="summary-label">Rejected decisions</span><strong id="metric-rejected">0</strong></div>
+      <div class="summary-item"><span class="summary-label">Archived tasks</span><strong id="metric-archived">0</strong></div>
+      <div class="summary-item"><span class="summary-label">Superseded tasks</span><strong id="metric-superseded">0</strong></div>
+      <div class="summary-item status-finished"><span class="summary-label">Finished tasks</span><strong id="metric-finished">0</strong></div>
       <div class="summary-item usage-total">
         <span class="summary-label">Usage</span>
         <strong id="metric-tokens">0</strong>
         <span class="summary-note" id="metric-cost">$0.00</span>
       </div>
+    </div>
     </section>
 
     <section class="source-alert" id="source-alert" aria-live="polite" hidden>

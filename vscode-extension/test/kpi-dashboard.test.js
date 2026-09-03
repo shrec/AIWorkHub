@@ -127,6 +127,17 @@ test("KPI renderer separates worker outcomes from explicit manager decisions", (
   assert.match(appSource, /renderKpis\(snapshot\)/);
 });
 
+test("dashboard labels queue, canonical outcomes, bounded failures, and effectiveness honestly", () => {
+  assert.match(extensionSource, /Current queue/);
+  assert.match(extensionSource, /Accepted and rejected are all-time manager ledger decisions/);
+  assert.match(extensionSource, /metric-accepted/);
+  assert.match(extensionSource, /metric-rejected/);
+  assert.match(appSource, /Actionable review-ready/);
+  assert.match(appSource, /Validation failure \(recent window\)/);
+  assert.match(appSource, /Callback delivery \/ backlog/);
+  assert.match(appSource, /no invocation evidence; efficacy unavailable/);
+});
+
 test("KPI visualizations include responsive chart and bar primitives", () => {
   assert.match(cssSource, /\.kpi-chart-grid/);
   assert.match(cssSource, /\.kpi-daily-chart/);

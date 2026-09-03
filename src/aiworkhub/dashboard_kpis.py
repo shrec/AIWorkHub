@@ -634,6 +634,7 @@ def build_kpi_snapshot(
         "measurement": "bounded_worker_outcomes_and_explicit_manager_decisions",
         "window": {
             "label": f"latest {process_limit} process runs",
+            "population": "latest process run per task within the bounded process history",
             "limit": process_limit,
             "observed_runs": observed,
             "total_requests": total_requests,
@@ -644,6 +645,8 @@ def build_kpi_snapshot(
             "manager_decisions": manager_decisions,
             "accepted_runs": accepted,
             "rejected_runs": rejected,
+            "accepted_decisions": accepted,
+            "rejected_decisions": rejected,
             "manager_acceptance_rate": _rate(accepted, manager_decisions),
             "manager_rejection_latency_p50_seconds": (
                 (manager_decision_totals.get("rejected_latency") or {}).get("p50_seconds")
@@ -662,6 +665,7 @@ def build_kpi_snapshot(
             "reviewer_receipt_rate": _rate(reviewer_receipt, terminal_runs),
             "validation_failed_runs": validation_failed,
             "validation_failed_rate": _rate(validation_failed, terminal_runs),
+            "process_failure_population": f"latest {process_limit} process runs",
             "other_non_green_runs": max(0, non_green - validation_failed),
             "source_graph_live_rate": source_graph.get("live_rate"),
             "source_graph_gate_satisfaction_rate": source_graph.get("gate_satisfaction_rate"),

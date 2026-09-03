@@ -3113,6 +3113,19 @@ def _build_summary_snapshot(
             "message": "collision guard returned a non-object",
         })
         collision_report = {}
+    manager_decision_totals = _safe_read(
+        "manager_decision_counts",
+        getattr(data_provider, "get_manager_decision_counts", lambda: {}),
+        errors,
+        {},
+    )
+    if not isinstance(manager_decision_totals, Mapping):
+        errors.append({
+            "source": "manager_decision_counts",
+            "kind": "DashboardReadError",
+            "message": "manager decision counts provider returned a non-object",
+        })
+        manager_decision_totals = {}
 
     stale_tasks = [
         dict(item)
@@ -3162,6 +3175,13 @@ def _build_summary_snapshot(
     status_counts["active"] = sum(
         status_counts[status] for status in ACTIVE_STATUSES
     )
+    outcome_counts = {
+        "accepted": _bounded_int(manager_decision_totals.get("accepted")),
+        "rejected": _bounded_int(manager_decision_totals.get("rejected")),
+        "archived": status_counts.get("archived", 0),
+        "superseded": status_counts.get("superseded", 0),
+        "finished": status_counts.get("finished", 0),
+    }
 
     row_counts: dict[str, dict[str, Any]] = {}
     for status in ACTIVE_STATUSES:
@@ -3203,6 +3223,7 @@ def _build_summary_snapshot(
             "provider_error_count": len(errors),
         },
         "status_counts": status_counts,
+        "outcome_counts": outcome_counts,
         "row_counts": row_counts,
         "warnings": {
             "stale": stale_tasks,
@@ -3269,6 +3290,10 @@ def build_snapshot(
         zero_counts = {status: 0 for status in ALL_CANONICAL_STATUSES}
         zero_counts["stale"] = 0
         zero_counts["active"] = 0
+        zero_outcomes = {
+            "accepted": 0, "rejected": 0, "archived": 0,
+            "superseded": 0, "finished": 0,
+        }
         empty_tasks = {status: [] for status in (*ACTIVE_STATUSES, "blocked", "finished", "archived", "stale")}
         storage_not_ready = {
             key: _storage_not_ready_projection(key, "full")
@@ -3283,6 +3308,7 @@ def build_snapshot(
             "storage_usage": storage_usage,
             "health": {"ok": False, "degraded": True, "provider_error_count": 0},
             "status_counts": zero_counts,
+            "outcome_counts": zero_outcomes,
             "row_counts": {
                 status: {"returned": 0, "exact": 0, "truncated": False} for status in ALL_CANONICAL_STATUSES
             },
@@ -3614,6 +3640,16 @@ def build_snapshot(
     status_counts["active"] = (
         status_counts["pending"] + status_counts["processing"] + status_counts["review"]
     )
+    manager_decision_counts = reads["manager_decision_counts"]
+    if not isinstance(manager_decision_counts, Mapping):
+        manager_decision_counts = {}
+    outcome_counts = {
+        "accepted": _bounded_int(manager_decision_counts.get("accepted")),
+        "rejected": _bounded_int(manager_decision_counts.get("rejected")),
+        "archived": status_counts.get("archived", 0),
+        "superseded": status_counts.get("superseded", 0),
+        "finished": status_counts.get("finished", 0),
+    }
 
     # Bounded-row-list truncation metadata: how many rows the returned
     # snapshot actually carries per status vs. the exact authoritative
@@ -3660,7 +3696,7 @@ def build_snapshot(
         callback_health=callback_bridge_health,
         cost_totals=cost_totals,
         process_limit=kpi_process_limit,
-        manager_decision_totals=reads["manager_decision_counts"],
+        manager_decision_totals=manager_decision_counts,
     )
     needfix_snapshot = reads["needfix"]
     roadmap_snapshot = reads["roadmap"]
@@ -3679,6 +3715,7 @@ def build_snapshot(
             "provider_error_count": len(errors),
         },
         "status_counts": status_counts,
+        "outcome_counts": outcome_counts,
         "row_counts": row_counts,
         "tasks": {
             **task_groups,
