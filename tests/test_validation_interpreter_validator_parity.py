@@ -956,7 +956,8 @@ def test_candidate_relative_pythonpath_component_cannot_hijack_validator_startup
     root = tmp_path / ".venv"
     (root / "bin").mkdir(parents=True)
     venv_python = root / "bin" / "python"
-    os.symlink(sys.executable, venv_python)  # a REAL interpreter to import with
+    shutil.copyfile(sys.executable, venv_python)  # a REAL interpreter to import with
+    venv_python.chmod(0o755)
     _pin_root(monkeypatch, root)
     _force_module_present(monkeypatch)
 
