@@ -48,6 +48,7 @@ Windows-specific behaviour keeps native coverage (rework LOW).
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -269,7 +270,12 @@ def test_dash_p_blocks_cwd_validator_module_hijack(
     root = tmp_path / ".venv"
     (root / "bin").mkdir(parents=True)
     venv_python = root / "bin" / "python"
-    os.symlink(sys.executable, venv_python)  # a REAL interpreter to import with
+    # Use a contained, non-world-writable real interpreter. GitHub's Python 3.14
+    # toolcache executable can itself be mode 0777, which the production trust
+    # check correctly refuses; a symlink to it would make this -P regression test
+    # accidentally test hosted-runner permissions instead.
+    shutil.copyfile(sys.executable, venv_python)
+    venv_python.chmod(0o755)
     _pin_root(monkeypatch, root)
     _force_module_present(monkeypatch)  # isolate: this test pins the -P behaviour
 
