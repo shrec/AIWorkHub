@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiworkhub import core, process_launcher, task_store
+from aiworkhub import core, process_launcher, task_store, toolchain_authority
 
 
 @pytest.fixture
@@ -362,6 +362,12 @@ def test_terminal_retry_spark_card_requires_explicit_native_codex_reroute(
             reason="",
         ),
         isolation_enabled=False,
+        # This test owns identity rerouting, not validation capability
+        # discovery.  Its synthetic repository intentionally has no Python
+        # project or test tree, so inject an available authority snapshot.
+        toolchain_authority=toolchain_authority.ToolchainAuthority(
+            coordinator_repo, capability_probe=lambda *_: (),
+        ),
     )
 
     rejected = manager.launch(

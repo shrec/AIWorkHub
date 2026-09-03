@@ -12,10 +12,10 @@
     "target": "pkg/large.py.target_entry",
     "legacy_file_scoped_edge_rows": 100,
     "current_symbol_scoped_edge_rows": 1,
-    "legacy_edge_bytes": 21921,
+    "legacy_edge_bytes": 22445,
     "current_edge_bytes": 277,
-    "structural_reduction_percent": 98.736,
-    "structural_ratio": 79.14
+    "structural_reduction_percent": 98.766,
+    "structural_ratio": 81.03
   },
   "claim_boundary": {
     "grade": "verified_structural_fixture",

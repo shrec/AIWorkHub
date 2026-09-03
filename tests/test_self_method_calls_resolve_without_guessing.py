@@ -136,8 +136,8 @@ def test_a_module_level_function_is_not_bound_through_self(tmp_path):
     assert _bindings(repo, "a.py", "_step") == set()
 
 
-def test_an_ambiguous_name_is_not_bound(tmp_path):
-    """Two definitions means no unique target, whatever the receiver says."""
+def test_same_class_receiver_proof_outweighs_global_name_ambiguity(tmp_path):
+    """The receiver's owning class is exact even when another class reuses the name."""
     repo = _repo(tmp_path, {
         "a.py": (
             "class Worker:\n"
@@ -153,7 +153,7 @@ def test_an_ambiguous_name_is_not_bound(tmp_path):
             "        return 2\n"
         ),
     })
-    assert _bindings(repo, "a.py", "_step") == set()
+    assert _bindings(repo, "a.py", "_step") == {"a.py.Worker._step"}
 
 
 def test_a_binding_is_cleared_when_its_target_disappears(tmp_path):

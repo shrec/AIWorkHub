@@ -975,7 +975,15 @@ def test_concurrent_get_and_store_never_duplicate_or_cross_authorities():
         thread.join()
 
     assert mismatches == []
-    assert len(wm._CACHE) == workers * per_worker
+    # The cache is process-global: another authority may legitimately store
+    # while this concurrency probe is running.  Assert this probe's complete
+    # key set instead of assuming exclusive ownership of the whole cache.
+    expected_keys = {
+        _key(request_id=f"req-{n}", query=f"q{i}")
+        for n in range(workers)
+        for i in range(per_worker)
+    }
+    assert expected_keys <= set(wm._CACHE)
     for n in range(workers):
         for i in range(per_worker):
             key = _key(request_id=f"req-{n}", query=f"q{i}")
