@@ -171,6 +171,7 @@ else:
 atomic_replace = _platform_io.atomic_replace
 chmod_fd = _platform_io.chmod_fd
 chmod_path = _platform_io.chmod_path
+is_windows = _platform_io.is_windows
 posix_path_modes_supported = _platform_io.posix_path_modes_supported
 
 
@@ -565,7 +566,7 @@ def _terminate_git_process_tree(process: subprocess.Popen[str]) -> bool:
     """Terminate the exact process group created for one bounded Git call."""
     if process.poll() is not None:
         return True
-    if os.name == "nt":
+    if is_windows():
         try:
             subprocess.run(
                 ["taskkill", "/F", "/PID", str(process.pid), "/T"],
@@ -5352,7 +5353,7 @@ def _resolve_trusted_validation_executable(
             root_info = root.stat()
         except OSError as exc:
             raise WorkspaceError(f"validation_executable_unavailable:{name}") from exc
-        if os.name != "nt" and root_info.st_uid != os.getuid():
+        if not is_windows() and root_info.st_uid != os.getuid():
             raise WorkspaceError(f"validation_executable_runtime_root_untrusted_owner:{root}")
         if posix_path_modes_supported(os.name) and stat.S_IMODE(root_info.st_mode) & 0o002:
             raise WorkspaceError(f"validation_executable_runtime_root_world_writable:{root}")
@@ -5599,7 +5600,7 @@ def worker_validation_affordance_env(
     env: dict[str, str] = {}
     python_relative = (
         PurePosixPath(".venv/Scripts/python.exe")
-        if os.name == "nt"
+        if is_windows()
         else PurePosixPath(".venv/bin/python")
     )
     canonical_python = repo_path / Path(*python_relative.parts)
@@ -5795,7 +5796,7 @@ def _resolve_trusted_validation_root_interpreter(
             root_info = root.stat()
         except OSError:
             continue
-        if os.name != "nt" and root_info.st_uid != os.getuid():
+        if not is_windows() and root_info.st_uid != os.getuid():
             raise WorkspaceError(
                 f"validation_executable_runtime_root_untrusted_owner:{root}"
             )
@@ -5819,7 +5820,7 @@ def _resolve_trusted_validation_root_interpreter(
         # which requires current-user ownership contained in the trusted root (AC3).
         # Any OTHER foreign owner is still an escalation and is refused.
         if (
-            os.name != "nt"
+            not is_windows()
             and target_info.st_uid != os.getuid()
             and not (
                 target_info.st_uid == 0
