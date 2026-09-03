@@ -2217,23 +2217,30 @@ def reopen_superseded_task_link(
     get_task_fn: Callable[[str], Mapping[str, Any] | None],
     canonical_status_fn: Callable[[Mapping[str, Any]], str],
     reason: str,
+    actor: str = "manager",
 ) -> dict[str, Any]:
     """Return a stale ``task_created`` NeedFix to ``accepted``.
 
     This deliberately narrow manager reconciliation path is valid only when
     the exact linked task still exists in the same canonical task store, is
-    archived, and carries ``archive_operation=superseded``. Active, reviewable,
-    failed-but-recoverable, missing, foreign, and accepted finished tasks all
-    fail closed. The stale link is cleared atomically and retained in the audit
-    event instead of being silently repointed. Each verified reopen increments
-    ``reopen_generation`` (derived from the exact durable reopen event count),
-    which drives a deterministic ``-rN`` successor task_id.
+    archived without acceptance, and records either an ordinary archive or a
+    superseding archive. Active, reviewable, failed-but-recoverable, missing,
+    foreign, and accepted finished tasks all fail closed. The stale link is
+    cleared atomically and retained in the audit event instead of being silently
+    repointed. Each verified reopen increments ``reopen_generation`` (derived
+    from the exact durable reopen event count), which drives a deterministic
+    ``-rN`` successor task_id.
     """
     note = str(reason or "").strip()
     if not note:
         raise NeedFixValidationError("reconciliation reason is required")
     if len(note.encode("utf-8")) > 4_096:
         raise NeedFixValidationError("reconciliation reason exceeds 4096 bytes")
+    audit_actor = str(actor or "").strip()
+    if not audit_actor:
+        raise NeedFixValidationError("reconciliation actor is required")
+    if len(audit_actor.encode("utf-8")) > 256:
+        raise NeedFixValidationError("reconciliation actor exceeds 256 bytes")
 
     conn = _connect(repo_root)
     try:
@@ -2256,44 +2263,70 @@ def reopen_superseded_task_link(
             raise NeedFixValidationError(
                 f"linked task {linked_task_id!r} not found in this repository"
             )
+        canonical_task_id = str(task.get("id") or task.get("task_id") or "").strip()
+        if canonical_task_id and canonical_task_id != linked_task_id:
+            raise NeedFixConflictError(
+                f"canonical task identity {canonical_task_id!r} does not match "
+                f"linked task {linked_task_id!r}"
+            )
         task_status = canonical_status_fn(task)
         archive_operation = str(task.get("archive_operation") or "").strip()
-        if task_status != "archived" or archive_operation != "superseded":
+        accepted_at = str(task.get("accepted_at") or "").strip()
+        supported_archive = archive_operation in {"archived", "superseded"}
+        if task_status != "archived" or not supported_archive or accepted_at:
             raise NeedFixConflictError(
-                f"linked task {linked_task_id!r} is not an archived superseded task "
-                f"(canonical status={task_status!r}, archive_operation={archive_operation!r})"
+                f"linked task {linked_task_id!r} is not an eligible archived task "
+                f"(canonical status={task_status!r}, archive_operation="
+                f"{archive_operation!r}, accepted_at={accepted_at!r})"
             )
 
+        conn.execute("BEGIN IMMEDIATE")
         now = _utcnow_iso()
         current_generation = _authoritative_reopen_generation(conn, needfix_id)
+        if row["reopen_generation"] != current_generation:
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} reopen generation is not authoritative"
+            )
         new_generation = current_generation + 1
         cur = conn.execute(
             "UPDATE needfix SET status = 'accepted', converted_task_id = NULL, "
             "task_planned_at = NULL, reopen_generation = ?, updated_at = ? "
-            "WHERE id = ? AND status = 'task_created' AND converted_task_id = ?",
-            (new_generation, now, needfix_id, linked_task_id),
+            "WHERE id = ? AND status = 'task_created' AND converted_task_id = ? "
+            "AND reopen_generation = ?",
+            (new_generation, now, needfix_id, linked_task_id, current_generation),
         )
         if cur.rowcount != 1:
             raise NeedFixConflictError(
                 f"needfix {needfix_id} changed during stale-link reconciliation"
             )
+        event_name = (
+            "superseded_task_link_reopened"
+            if archive_operation == "superseded"
+            else "archived_task_link_reopened"
+        )
         _record_event(
             conn,
             needfix_id,
-            "superseded_task_link_reopened",
+            event_name,
             {
                 "prior_status": "task_created",
                 "prior_converted_task_id": linked_task_id,
                 "task_status": task_status,
                 "archive_operation": archive_operation,
                 "reopen_generation": new_generation,
+                "actor": audit_actor,
                 "reason": note,
             },
         )
         updated = conn.execute(
             "SELECT * FROM needfix WHERE id = ?", (needfix_id,)
         ).fetchone()
+        conn.commit()
         return _row_to_dict(updated)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     finally:
         conn.close()
 

@@ -1198,6 +1198,105 @@ class TestLinkExistingTask:
         assert unchanged["converted_task_id"] == "task-1"
 
 
+    def test_reopen_ordinary_archived_unaccepted_task_link(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        finished_get, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", finished_get, status_fn
+        )
+        archived_get, archived_status = self._tasks(
+            **{
+                "task-1": {
+                    "id": "task-1",
+                    "status": "archived",
+                    "archive_operation": "archived",
+                }
+            }
+        )
+
+        reopened = needfix_store.reopen_superseded_task_link(
+            init_store,
+            r["id"],
+            get_task_fn=archived_get,
+            canonical_status_fn=archived_status,
+            actor="inventory-repair",
+            reason="Canonical inventory confirms an ordinary archived task.",
+        )
+
+        assert reopened["status"] == "accepted"
+        assert reopened["converted_task_id"] is None
+        event = needfix_store.list_events(init_store, r["id"], limit=1)[0]
+        assert event["event"] == "archived_task_link_reopened"
+        assert event["detail"]["actor"] == "inventory-repair"
+        assert event["detail"]["archive_operation"] == "archived"
+
+    def test_reopen_archived_accepted_task_fails_closed(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        finished_get, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", finished_get, status_fn
+        )
+        archived_get, archived_status = self._tasks(
+            **{
+                "task-1": {
+                    "id": "task-1",
+                    "status": "archived",
+                    "archive_operation": "archived",
+                    "accepted_at": "2026-09-03T00:00:00Z",
+                }
+            }
+        )
+
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.reopen_superseded_task_link(
+                init_store,
+                r["id"],
+                get_task_fn=archived_get,
+                canonical_status_fn=archived_status,
+                reason="Must not reopen accepted work.",
+            )
+
+        unchanged = needfix_store.get_needfix(init_store, r["id"])
+        assert unchanged["status"] == "task_created"
+        assert unchanged["converted_task_id"] == "task-1"
+
+    def test_reopen_rolls_back_if_audit_event_fails(
+        self, init_store: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        r = self._accepted_needfix(init_store)
+        finished_get, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", finished_get, status_fn
+        )
+        archived_get, archived_status = self._tasks(
+            **{
+                "task-1": {
+                    "id": "task-1",
+                    "status": "archived",
+                    "archive_operation": "archived",
+                }
+            }
+        )
+
+        def fail_event(*_args, **_kwargs):
+            raise RuntimeError("simulated audit write failure")
+
+        monkeypatch.setattr(needfix_store, "_record_event", fail_event)
+        with pytest.raises(RuntimeError, match="simulated audit write failure"):
+            needfix_store.reopen_superseded_task_link(
+                init_store,
+                r["id"],
+                get_task_fn=archived_get,
+                canonical_status_fn=archived_status,
+                reason="Prove row and event are one transaction.",
+            )
+
+        unchanged = needfix_store.get_needfix(init_store, r["id"])
+        assert unchanged["status"] == "task_created"
+        assert unchanged["converted_task_id"] == "task-1"
+        assert unchanged["reopen_generation"] == 0
+
+
 class TestReopenGenerationLifecycle:
     """Deterministic ``-rN`` successor task IDs driven by the exact durable
     reopen event count, plus the fail-closed ``reopen_generation`` migration."""
