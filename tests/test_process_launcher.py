@@ -10310,6 +10310,12 @@ def _nf548_terminal_retry_card() -> dict:
     return card
 
 
+def _nf548_recovered_rework_card() -> dict:
+    card = _nf548_failed_card()
+    card["recovered_from_blocked_at"] = "2026-09-01T10:00:17+00:00"
+    return card
+
+
 def _nf548_changed_feedback_card() -> dict:
     card = _nf548_failed_card()
     card["review_feedback"] = [{"reason": "scope_violation"}]
@@ -10338,6 +10344,7 @@ def _nf548_changed_content_card() -> dict:
     "card_fn",
     [
         _nf548_terminal_retry_card,
+        _nf548_recovered_rework_card,
         _nf548_changed_feedback_card,
         _nf548_changed_runner_card,
         _nf548_changed_adapter_card,
@@ -10345,6 +10352,7 @@ def _nf548_changed_content_card() -> dict:
     ],
     ids=[
         "explicit_terminal_retry",
+        "coordinator_recovered_rework",
         "changed_review_feedback_reason",
         "changed_runner",
         "changed_adapter",

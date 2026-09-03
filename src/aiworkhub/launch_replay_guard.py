@@ -91,6 +91,15 @@ def identical_relaunch_refusal(
         return ""
     if recorded_feedback_identity != review_feedback_identity(card):
         return ""
+    # ``recover-blocked-rework`` is itself a coordinator-authorized retry.
+    # It deliberately preserves the terminal episode for auditability, so the
+    # absence of a separate ``terminal_retry`` envelope must not make the
+    # recovered pending card indistinguishable from an unreviewed relaunch.
+    recovered_at = str(
+        "" if card is None else card.get("recovered_from_blocked_at") or ""
+    ).strip()
+    if recovered_at and recovered_at > str(failure.get("recorded_at") or ""):
+        return ""
     retry = _latest_recorded(None if card is None else card.get("terminal_retry"))
     if retry is not None and _terminal_retry_supersedes(retry, failure):
         return ""
