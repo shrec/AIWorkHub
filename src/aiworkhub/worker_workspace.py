@@ -5585,6 +5585,7 @@ def select_sandbox_backend() -> str:
 # a packaged server therefore reported ``module:pytest`` and rejected otherwise
 # runnable cards before launch.
 _TRUSTED_VALIDATION_BARE_EXECUTABLES = frozenset({"pytest", "ruff", "mypy"})
+_TRUSTED_VALIDATION_SYSTEM_EXECUTABLES = frozenset({"git"})
 SANDBOX_VALIDATION_EXECUTABLE_ROOT = "/validation-executable-root"
 
 
@@ -5670,6 +5671,33 @@ def _resolve_trusted_validation_executable(
             raise WorkspaceError(f"validation_executable_runtime_root_world_writable:{root}")
         return _trusted_validation_executable_from_resolved(name, root, resolved)
     raise WorkspaceError(f"validation_executable_unavailable:{name}")
+
+
+def _resolve_trusted_system_validation_executable(
+    name: str, repo: Path | None = None
+) -> Path:
+    """Resolve one explicitly approved host tool to an immutable absolute path."""
+    if name not in _TRUSTED_VALIDATION_SYSTEM_EXECUTABLES:
+        raise WorkspaceError(f"validation_executable_not_approved:{name}")
+    discovered = shutil.which(name)
+    if not discovered:
+        raise WorkspaceError(f"validation_executable_unavailable:{name}")
+    try:
+        resolved = Path(discovered).resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceError(f"validation_executable_unavailable:{name}") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise WorkspaceError(f"validation_executable_not_executable:{resolved}")
+    if repo is not None:
+        try:
+            resolved.relative_to(repo.resolve(strict=False))
+        except ValueError:
+            pass
+        else:
+            raise WorkspaceError(
+                f"validation_executable_repository_owned:{resolved}"
+            )
+    return resolved
 
 
 def _trusted_validation_executable_from_resolved(
@@ -6529,6 +6557,9 @@ def _normalize_trusted_validation_executable_argv_with_authority(
     # here, preserving their existing fail-closed rules.
     if _BARE_PYTHON_INTERPRETER_RE.match(head):
         return [sys.executable, *argv[1:]], (), None
+    if head in _TRUSTED_VALIDATION_SYSTEM_EXECUTABLES:
+        executable = _resolve_trusted_system_validation_executable(head, repo)
+        return [str(executable), *argv[1:]], (), None
     if head not in _TRUSTED_VALIDATION_BARE_EXECUTABLES:
         return list(argv), (), None
     executable = _resolve_trusted_validation_executable(head, repo)

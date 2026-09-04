@@ -351,6 +351,43 @@ def test_pytest_uses_the_trusted_module_validator_authority() -> None:
     )
 
 
+def test_git_uses_the_trusted_system_tool_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system_git = tmp_path.parent / "system" / "git"
+    system_git.parent.mkdir()
+    system_git.write_text("#!/bin/sh\n", encoding="utf-8")
+    system_git.chmod(0o755)
+    monkeypatch.setattr(worker_workspace.shutil, "which", lambda name: str(system_git))
+
+    normalized, roots = (
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            ["git", "diff", "--check"], tmp_path
+        )
+    )
+
+    assert normalized == [str(system_git.resolve()), "diff", "--check"]
+    assert roots == ()
+
+
+def test_git_system_tool_authority_rejects_repository_owned_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_git = tmp_path / "bin" / "git"
+    repo_git.parent.mkdir()
+    repo_git.write_text("#!/bin/sh\n", encoding="utf-8")
+    repo_git.chmod(0o755)
+    monkeypatch.setattr(worker_workspace.shutil, "which", lambda name: str(repo_git))
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_executable_repository_owned",
+    ):
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            ["git", "diff", "--check"], tmp_path
+        )
+
+
 def test_repo_venv_mypy_preferred_over_system(tmp_path, monkeypatch) -> None:
     repo_mypy = _runtime_executable(tmp_path / ".venv", "mypy")
 
