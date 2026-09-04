@@ -276,12 +276,13 @@ def test_unexpired_pid_null_reservation_is_never_stolen(tmp_path):
 
 def test_pid_bearing_starting_reservation_process_false_is_reconciled(tmp_path):
     manager = _manager(tmp_path)
-    # A live pid with the wrong creation ticks is a proven identity mismatch.
+    # A pid with the wrong creation ticks is a proven identity mismatch, but
+    # retirement still requires the reservation lease to have expired.
     manager._append_event(
         _starting(
             request_id="review-req-3",
             task_id="REVIEWER_3",
-            expires_at=time.time() + 120.0,
+            expires_at=time.time() - 1.0,
             pid=os.getpid(),
             pid_start_ticks=1,
         )
@@ -2465,10 +2466,10 @@ def test_a_reservation_this_pass_retired_no_longer_blocks_its_own_relaunch(
         "topic": TOPIC,
         "adapter_id": ADAPTER,
         "state": "starting",
-        # Deliberately UNEXPIRED: only the frozen preparation heartbeat makes
-        # this row terminal, so a stale snapshot would show the duplicate
-        # guard a perfectly live reservation rather than an elapsed one.
-        "reservation_expires_at_epoch": time.time() + 600.0,
+        # The frozen preparation heartbeat supplies the terminal reason only
+        # after the lease expires.  A stale snapshot would still show the
+        # duplicate guard the reservation this pass has just retired.
+        "reservation_expires_at_epoch": time.time() - 1.0,
         "preparation_phase": "worktree_create",
         "preparation_heartbeat_epoch": time.time() - 100_000.0,
     })
