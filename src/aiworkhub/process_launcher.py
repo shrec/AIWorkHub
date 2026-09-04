@@ -6800,7 +6800,6 @@ class ProcessManager:
         # cross-process registry lock, keeps that amplified work off every
         # unrelated reservation acknowledgement waiting on the same lock.
         snapshot = self._latest_by_request_stable()
-        unbound_claim_resolutions = self._resolve_unbound_reviewer_claims(snapshot[0])
         try:
             with self._lock, self._registry_lock():
                 # ONE proven snapshot backs this whole critical section, and
@@ -6815,6 +6814,9 @@ class ProcessManager:
                 if proven is None:
                     return {"ok": False, "error": "ledger_snapshot_unproven"}
                 latest = proven[0]
+                unbound_claim_resolutions = self._resolve_unbound_reviewer_claims(
+                    latest
+                )
                 self._reconcile_expired_starting_reservations(
                     proven,
                     resolved=True,

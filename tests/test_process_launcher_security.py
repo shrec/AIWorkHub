@@ -116,7 +116,7 @@ def test_quality_reviewer_reservation_is_exact_durable_and_replays_before_ack(
     def _proven(snapshot):
         return (_load_latest(), "proven")
 
-    def _reconcile(proven, resolved=True):
+    def _reconcile(proven, resolved=True, _unbound_claim_resolutions=None):
         return None
 
     def _active(latest):
