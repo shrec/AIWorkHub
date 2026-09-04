@@ -6762,6 +6762,9 @@ def test_pytest_validation_seeds_transitive_local_test_import_closure(
     files extracted from pytest validation commands, so helper modules are
     provisioned without broad copying."""
     _commit_validation_worker_package(repo)
+    monkeypatch.setattr(
+        worker_workspace, "_trusted_validation_runtime_roots", lambda repo=None: ()
+    )
     tests_dir = repo / "tests"
     tests_dir.mkdir(exist_ok=True)
     (tests_dir / "_taskdb_compat.py").write_text(
@@ -6820,6 +6823,9 @@ def test_pytest_validation_with_direct_pytest_command_seeds_test_closure(
 ) -> None:
     """Direct pytest invocation (without python -m) also seeds test import closure."""
     _commit_validation_worker_package(repo)
+    monkeypatch.setattr(
+        worker_workspace, "_trusted_validation_runtime_roots", lambda repo=None: ()
+    )
     tests_dir = repo / "tests"
     tests_dir.mkdir(exist_ok=True)
     (tests_dir / "_helper.py").write_text("HELPER = True\n", encoding="utf-8")
@@ -6869,6 +6875,9 @@ def test_pytest_validation_seeds_closure_with_pytest_flags(
 ) -> None:
     """Test file closure seeding works with pytest flags and node selectors."""
     _commit_validation_worker_package(repo)
+    monkeypatch.setattr(
+        worker_workspace, "_trusted_validation_runtime_roots", lambda repo=None: ()
+    )
     tests_dir = repo / "tests"
     tests_dir.mkdir(exist_ok=True)
     (tests_dir / "_support.py").write_text("VALUE = 'support'\n", encoding="utf-8")
