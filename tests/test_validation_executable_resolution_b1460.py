@@ -475,7 +475,19 @@ def test_run_validations_bare_pytest_executes_trusted_repo_interpreter(
     workspace = _workspace(tmp_path)
     runtime_root = tmp_path / "project" / ".venv"
     runtime_root.mkdir(parents=True)
+    interpreter = runtime_root / worker_workspace._python_interpreter_relative_paths()[0]
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
+    interpreter.write_text("#!/bin/sh\n", encoding="utf-8")
+    interpreter.chmod(0o700)
     captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        worker_workspace,
+        "_resolve_trusted_validation_executable",
+        lambda name, repo=None: worker_workspace.TrustedValidationExecutable(
+            path=runtime_root / "bin" / name,
+            root=runtime_root.resolve(strict=False),
+        ),
+    )
     monkeypatch.setattr(
         worker_workspace,
         "resolve_trusted_pytest_runtime_root",
@@ -518,7 +530,7 @@ def test_run_validations_bare_pytest_executes_trusted_repo_interpreter(
 
     result = worker_workspace.run_validations(workspace, ["pytest -q"])
 
-    expected = [worker_workspace.sys.executable, "-P", "-m", "pytest", "-q"]
+    expected = [str(interpreter), "-P", "-m", "pytest", "-q"]
     assert result[0]["executed_argv"] == expected
     assert result[0]["argv"] == expected
     assert result[0]["argv_rewritten"] is True
