@@ -7860,6 +7860,26 @@ def needfix_link_existing_task(needfix_id: str, existing_task_id: str) -> dict[s
     )
 
 
+def needfix_recover_conversion_claim(
+    needfix_id: str,
+    *,
+    expected_updated_at: str,
+    expected_conversion_claim_id: str,
+    reason: str,
+    minimum_age_seconds: int = 300,
+) -> dict[str, Any]:
+    """Manager-facing guarded recovery for a stale conversion/link claim."""
+    ns = _needfix_store_module()
+    return ns.recover_interrupted_conversion_claim(
+        repo_root(),
+        needfix_id,
+        expected_updated_at=expected_updated_at,
+        expected_conversion_claim_id=expected_conversion_claim_id,
+        reason=reason,
+        minimum_age_seconds=minimum_age_seconds,
+    )
+
+
 def needfix_reopen_superseded_task_link(
     needfix_id: str, reason: str
 ) -> dict[str, Any]:

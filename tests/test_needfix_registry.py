@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import needfix_ingest, needfix_store, task_store
+from aiworkhub import core, needfix_ingest, needfix_store, task_store
 
 
 @pytest.fixture
@@ -968,6 +968,40 @@ class TestLinkExistingTask:
         needfix_store.triage_needfix(init_store, r["id"])
         return needfix_store.accept_needfix(init_store, r["id"])
 
+    @pytest.mark.parametrize("claim_kind", ["conversion", "existing_task_link"])
+    def test_claim_event_failure_rolls_back_exact_preimage(
+        self, init_store: Path, monkeypatch, claim_kind: str
+    ):
+        r = self._accepted_needfix(init_store)
+        before = needfix_store.get_needfix(init_store, r["id"])
+        events_before = needfix_store.list_events(init_store, r["id"])
+        original_record_event = needfix_store._record_event
+
+        def fail_claim_event(conn, needfix_id, event, detail=None):
+            if event in {"conversion_claimed", "existing_task_link_claimed"}:
+                raise sqlite3.OperationalError("injected claim-event write failure")
+            return original_record_event(conn, needfix_id, event, detail)
+
+        monkeypatch.setattr(needfix_store, "_record_event", fail_claim_event)
+
+        with pytest.raises(sqlite3.OperationalError, match="injected claim-event"):
+            if claim_kind == "conversion":
+                needfix_store.convert_needfix(
+                    init_store,
+                    r["id"],
+                    lambda _card: pytest.fail("task creation must not run"),
+                )
+            else:
+                get_task_fn, status_fn = self._tasks(
+                    **{"task-1": {"status": "finished"}}
+                )
+                needfix_store.link_existing_task(
+                    init_store, r["id"], "task-1", get_task_fn, status_fn
+                )
+
+        assert needfix_store.get_needfix(init_store, r["id"]) == before
+        assert needfix_store.list_events(init_store, r["id"]) == events_before
+
     def test_link_existing_task_success(self, init_store: Path):
         r = self._accepted_needfix(init_store)
         get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
@@ -1113,36 +1147,46 @@ class TestLinkExistingTask:
         assert row["derived_state"] != "closed"
         assert row["active"] is False
 
-    def test_link_existing_task_archived_is_closed(self, init_store: Path):
-        """Moved to the derived-state contract (was ``archived_without_acceptance_fails_closed``).
-
-        BEFORE: linking to an ``archived`` (never-accepted) card raised
-        ``NeedFixConflictError``. The guard was that a card which never landed
-        its fix could not look handled.
-
-        NOW: linking to an ``archived`` card succeeds; the record's derived
-        state is CLOSED (the fix is recorded as landed, so it stays hidden).
-
-        PROTECTION NOW CARRIED BY:
-        ``test_closed_status_is_hidden_as_fixed`` in tests/test_needfix_store.py
-        (archived derives to CLOSED) and
-        ``test_active_listing_excludes_owned_and_closed`` in
-        tests/test_needfix_active_state_derived_from_card.py (closed records
-        are excluded from the active list).
-        """
+    def test_link_existing_task_archived_fresh_target_fails_before_claim(
+        self, init_store: Path
+    ):
         r = self._accepted_needfix(init_store)
         get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "archived"}})
-        result = needfix_store.link_existing_task(
-            init_store, r["id"], "task-1", get_task_fn, status_fn
-        )
-        assert result["converted_task_id"] == "task-1"
 
-        derived = needfix_store.list_needfix(
-            init_store, get_task_fn=get_task_fn, canonical_status_fn=status_fn
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "task-1", get_task_fn, status_fn
+            )
+
+        unchanged = needfix_store.get_needfix(init_store, r["id"])
+        assert unchanged["status"] == "accepted"
+        assert unchanged["converted_task_id"] is None
+        events = needfix_store.list_events(init_store, r["id"])
+        assert "existing_task_link_claimed" not in {event["event"] for event in events}
+        assert "conversion_committed" not in {event["event"] for event in events}
+
+    def test_link_existing_task_archived_identical_retry_is_lost_ack_safe(
+        self, init_store: Path
+    ):
+        r = self._accepted_needfix(init_store)
+        finished_get, finished_status = self._tasks(
+            **{"task-1": {"status": "finished"}}
         )
-        row = [d for d in derived if d["id"] == r["id"]][0]
-        assert row["derived_state"] == "closed"
-        assert row["active"] is False
+        needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", finished_get, finished_status
+        )
+        events_before_retry = needfix_store.list_events(init_store, r["id"])
+        archived_get, archived_status = self._tasks(
+            **{"task-1": {"status": "archived"}}
+        )
+
+        retry = needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", archived_get, archived_status
+        )
+
+        assert retry["already_converted"] is True
+        assert retry["converted_task_id"] == "task-1"
+        assert needfix_store.list_events(init_store, r["id"]) == events_before_retry
 
     def test_link_existing_task_captured_cannot_link(self, init_store: Path):
         r = needfix_store.capture_proposal(init_store, title="T", description="D")
@@ -2183,3 +2227,505 @@ class TestActiveListingProductionWiring:
 
         assert report["count"] == 0
         assert calls["get"] >= 1
+
+
+class TestInterruptedConversionClaimRecovery:
+    def _accepted(self, repo: Path) -> dict:
+        row = needfix_store.capture_proposal(repo, title="stale", description="claim")
+        needfix_store.triage_needfix(repo, row["id"])
+        return needfix_store.accept_needfix(repo, row["id"])
+
+    def _interrupt_claim(self, repo: Path, monkeypatch) -> tuple[str, str]:
+        row = self._accepted(repo)
+        stale = "2026-01-01T00:00:00+00:00"
+        monkeypatch.setattr(needfix_store, "_utcnow_iso", lambda: stale)
+        with pytest.raises(KeyboardInterrupt):
+            needfix_store.convert_needfix(
+                repo,
+                row["id"],
+                lambda _card: (_ for _ in ()).throw(KeyboardInterrupt()),
+            )
+        assert needfix_store.get_needfix(repo, row["id"])["status"] == "converting"
+        return row["id"], stale
+
+    def _claim_id(self, repo: Path, needfix_id: str) -> str:
+        value = needfix_store.get_needfix(repo, needfix_id)["conversion_claim_id"]
+        assert isinstance(value, str) and value
+        return value
+
+    def test_commit_event_failure_preserves_exact_precommit_state(
+        self, init_store: Path, monkeypatch
+    ):
+        needfix_id, stale = self._interrupt_claim(init_store, monkeypatch)
+        claim_id = self._claim_id(init_store, needfix_id)
+        row_before = needfix_store.get_needfix(init_store, needfix_id)
+        events_before = needfix_store.list_events(init_store, needfix_id)
+        original_record_event = needfix_store._record_event
+
+        def fail_commit_event(conn, event_needfix_id, event, detail=None):
+            if event == "conversion_committed":
+                raise RuntimeError("injected conversion commit event failure")
+            return original_record_event(conn, event_needfix_id, event, detail)
+
+        monkeypatch.setattr(needfix_store, "_record_event", fail_commit_event)
+        with pytest.raises(
+            RuntimeError, match="injected conversion commit event failure"
+        ):
+            needfix_store._commit_conversion(
+                init_store, needfix_id, "T-created", stale, claim_id
+            )
+
+        assert needfix_store.get_needfix(init_store, needfix_id) == row_before
+        assert needfix_store.list_events(init_store, needfix_id) == events_before
+
+    def test_compensation_event_failure_rolls_back_exact_claim_state(
+        self, init_store: Path, monkeypatch
+    ):
+        needfix_id, stale = self._interrupt_claim(init_store, monkeypatch)
+        claim_id = self._claim_id(init_store, needfix_id)
+        row_before = needfix_store.get_needfix(init_store, needfix_id)
+        events_before = needfix_store.list_events(init_store, needfix_id)
+        original_record_event = needfix_store._record_event
+
+        def fail_compensation_event(conn, event_needfix_id, event, detail=None):
+            if event == "conversion_compensated":
+                raise RuntimeError("injected conversion compensation event failure")
+            return original_record_event(conn, event_needfix_id, event, detail)
+
+        monkeypatch.setattr(needfix_store, "_record_event", fail_compensation_event)
+        with pytest.raises(
+            RuntimeError, match="injected conversion compensation event failure"
+        ):
+            needfix_store._compensate_conversion_claim(
+                init_store, needfix_id, "accepted", stale, claim_id
+            )
+
+        assert needfix_store.get_needfix(init_store, needfix_id) == row_before
+        assert needfix_store.list_events(init_store, needfix_id) == events_before
+
+    def test_stale_claim_recovers_exact_prior_status_is_audited_and_idempotent(
+        self, init_store: Path, monkeypatch
+    ):
+        needfix_id, stale = self._interrupt_claim(init_store, monkeypatch)
+        result = needfix_store.recover_interrupted_conversion_claim(
+            init_store,
+            needfix_id,
+            expected_updated_at=stale,
+            expected_conversion_claim_id=self._claim_id(init_store, needfix_id),
+            reason="manager observed interrupted conversion",
+        )
+        assert result["status"] == "accepted"
+        assert result["recovered"] is True
+        event = needfix_store.list_events(init_store, needfix_id)[0]
+        assert event["event"] == "conversion_claim_recovered"
+        assert event["detail"]["prior_status"] == "accepted"
+        assert event["detail"]["reason"] == "manager observed interrupted conversion"
+        assert event["detail"]["actor"] == "manager"
+        assert event["detail"]["claim_identity"]["updated_at"] == stale
+        assert event["detail"]["postimage"] == {
+            "status": "accepted",
+            "updated_at": needfix_store.get_needfix(init_store, needfix_id)["updated_at"],
+            "conversion_claim_id": None,
+            "event_seq": event["seq"],
+        }
+
+        retry = needfix_store.recover_interrupted_conversion_claim(
+            init_store,
+            needfix_id,
+            expected_updated_at=stale,
+            expected_conversion_claim_id=event["detail"]["conversion_claim_id"],
+            reason="manager observed interrupted conversion",
+        )
+        assert retry["idempotent"] is True
+        assert len(needfix_store.list_events(init_store, needfix_id)) == 5
+
+    def test_recovery_uses_actual_autoincrement_identity_after_sequence_gap(
+        self, init_store: Path, monkeypatch
+    ):
+        needfix_id, stale = self._interrupt_claim(init_store, monkeypatch)
+        claim_id = self._claim_id(init_store, needfix_id)
+        conn = sqlite3.connect(str(needfix_store._db_path(init_store)))
+        try:
+            cursor = conn.execute(
+                "INSERT INTO needfix_events "
+                "(needfix_id, event, detail_json, created_at) VALUES (?, ?, ?, ?)",
+                (needfix_id, "sequence_advance", "{}", stale),
+            )
+            advanced_seq = int(cursor.lastrowid)
+            conn.execute("DELETE FROM needfix_events WHERE seq = ?", (advanced_seq,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        reason = "recover after purged highest event"
+        result = needfix_store.recover_interrupted_conversion_claim(
+            init_store,
+            needfix_id,
+            expected_updated_at=stale,
+            expected_conversion_claim_id=claim_id,
+            reason=reason,
+        )
+        assert result["recovered"] is True
+        event = needfix_store.list_events(init_store, needfix_id)[0]
+        assert event["seq"] > advanced_seq
+        assert event["detail"]["postimage"]["event_seq"] == event["seq"]
+
+        retry = needfix_store.recover_interrupted_conversion_claim(
+            init_store,
+            needfix_id,
+            expected_updated_at=stale,
+            expected_conversion_claim_id=claim_id,
+            reason=reason,
+        )
+        assert retry["idempotent"] is True
+        assert needfix_store.list_events(init_store, needfix_id)[0] == event
+
+    def test_old_recovery_retry_fails_after_post_recovery_update(
+        self, init_store: Path, monkeypatch
+    ):
+        needfix_id, stale = self._interrupt_claim(init_store, monkeypatch)
+        claim_id = self._claim_id(init_store, needfix_id)
+        reason = "manager observed interrupted conversion"
+        needfix_store.recover_interrupted_conversion_claim(
+            init_store, needfix_id, expected_updated_at=stale,
+            expected_conversion_claim_id=claim_id, reason=reason,
+        )
+        needfix_store.update_needfix(init_store, needfix_id, title="updated after recovery")
+
+        with pytest.raises(needfix_store.NeedFixConflictError, match="not an interrupted"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store, needfix_id, expected_updated_at=stale,
+                expected_conversion_claim_id=claim_id, reason=reason,
+            )
+
+    def test_old_recovery_retry_fails_after_newer_claim_and_compensation(
+        self, init_store: Path, monkeypatch
+    ):
+        needfix_id, stale = self._interrupt_claim(init_store, monkeypatch)
+        old_claim_id = self._claim_id(init_store, needfix_id)
+        reason = "manager observed interrupted conversion"
+        needfix_store.recover_interrupted_conversion_claim(
+            init_store, needfix_id, expected_updated_at=stale,
+            expected_conversion_claim_id=old_claim_id, reason=reason,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            needfix_store.convert_needfix(
+                init_store,
+                needfix_id,
+                lambda _card: (_ for _ in ()).throw(KeyboardInterrupt()),
+            )
+        new_claim_id = self._claim_id(init_store, needfix_id)
+        assert new_claim_id != old_claim_id
+        needfix_store._compensate_conversion_claim(
+            init_store, needfix_id, "accepted", stale, new_claim_id
+        )
+        assert needfix_store.get_needfix(init_store, needfix_id)["status"] == "accepted"
+
+        with pytest.raises(needfix_store.NeedFixConflictError, match="not an interrupted"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store, needfix_id, expected_updated_at=stale,
+                expected_conversion_claim_id=old_claim_id, reason=reason,
+            )
+
+    def test_recovery_fails_closed_for_fresh_or_changed_claim(
+        self, init_store: Path, monkeypatch
+    ):
+        row = self._accepted(init_store)
+        now = needfix_store._utcnow_iso()
+        monkeypatch.setattr(needfix_store, "_utcnow_iso", lambda: now)
+        with pytest.raises(KeyboardInterrupt):
+            needfix_store.convert_needfix(
+                init_store,
+                row["id"],
+                lambda _card: (_ for _ in ()).throw(KeyboardInterrupt()),
+            )
+        with pytest.raises(needfix_store.NeedFixConflictError, match="in flight"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store, row["id"], expected_updated_at=now,
+                expected_conversion_claim_id=self._claim_id(init_store, row["id"]),
+                reason="fresh"
+            )
+        with pytest.raises(needfix_store.NeedFixConflictError, match="CAS mismatch"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store,
+                row["id"],
+                expected_updated_at="2026-01-01T00:00:00+00:00",
+                expected_conversion_claim_id=self._claim_id(init_store, row["id"]),
+                reason="wrong identity",
+            )
+
+    @pytest.mark.parametrize("prior_status", [None, "captured"])
+    def test_recovery_fails_closed_for_missing_or_invalid_provenance(
+        self, init_store: Path, monkeypatch, prior_status
+    ):
+        needfix_id, stale = self._interrupt_claim(init_store, monkeypatch)
+        conn = sqlite3.connect(str(needfix_store._db_path(init_store)))
+        try:
+            detail = {} if prior_status is None else {"prior_status": prior_status}
+            conn.execute(
+                "UPDATE needfix_events SET detail_json = ? WHERE needfix_id = ? "
+                "AND event = 'conversion_claimed'",
+                (json.dumps(detail), needfix_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with pytest.raises(needfix_store.NeedFixConflictError, match="invalid prior"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store, needfix_id, expected_updated_at=stale,
+                expected_conversion_claim_id=self._claim_id(init_store, needfix_id),
+                reason="bad provenance"
+            )
+
+    def test_unlinkable_candidate_is_rejected_before_claim(
+        self, init_store: Path
+    ):
+        row = self._accepted(init_store)
+        with pytest.raises(needfix_store.NeedFixConflictError, match="not linkable"):
+            needfix_store.link_existing_task(
+                init_store,
+                row["id"],
+                "cancelled-task",
+                lambda _task_id: {"task_id": "cancelled-task"},
+                lambda _task: "cancelled",
+            )
+        assert needfix_store.get_needfix(init_store, row["id"])["status"] == "accepted"
+        assert "existing_task_link_claimed" not in {
+            event["event"] for event in needfix_store.list_events(init_store, row["id"])
+        }
+
+    def test_link_revalidates_and_compensates_when_task_archives_before_commit(
+        self, init_store: Path
+    ):
+        row = self._accepted(init_store)
+        snapshots = iter((
+            {"task_id": "T-racing", "status": "pending"},
+            {"task_id": "T-racing", "status": "archived"},
+        ))
+
+        with pytest.raises(needfix_store.NeedFixConflictError, match="before commit"):
+            needfix_store.link_existing_task(
+                init_store,
+                row["id"],
+                "T-racing",
+                lambda _task_id: next(snapshots),
+                lambda task: task["status"],
+            )
+
+        current = needfix_store.get_needfix(init_store, row["id"])
+        assert current["status"] == "accepted"
+        assert current["converted_task_id"] is None
+        assert current["conversion_claim_id"] is None
+        events = [
+            event["event"] for event in needfix_store.list_events(init_store, row["id"])
+        ]
+        assert "existing_task_link_claimed" in events
+        assert "conversion_compensated" in events
+        assert "conversion_committed" not in events
+
+    def test_legacy_backfill_rejects_two_unmatched_claim_events(
+        self, init_store: Path, monkeypatch
+    ):
+        needfix_id, _stale = self._interrupt_claim(init_store, monkeypatch)
+        conn = sqlite3.connect(str(needfix_store._db_path(init_store)))
+        try:
+            conn.execute(
+                "UPDATE needfix SET conversion_claim_id = NULL WHERE id = ?",
+                (needfix_id,),
+            )
+            conn.execute(
+                "INSERT INTO needfix_events "
+                "(needfix_id, event, detail_json, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    needfix_id,
+                    "existing_task_link_claimed",
+                    json.dumps({"prior_status": "accepted", "existing_task_id": "T-2"}),
+                    "2026-01-01T00:00:01+00:00",
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        needfix_store.initialize_repository(init_store)
+        assert needfix_store.get_needfix(init_store, needfix_id)["conversion_claim_id"] is None
+        with pytest.raises(needfix_store.NeedFixConflictError, match="claim id CAS mismatch"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store,
+                needfix_id,
+                expected_updated_at="2026-01-01T00:00:00+00:00",
+                expected_conversion_claim_id="legacy-event-unknown",
+                reason="ambiguous legacy provenance",
+            )
+
+    @pytest.mark.parametrize(
+        "minimum_age_seconds",
+        [float("nan"), float("inf"), float("-inf"), 60.0, "60", True],
+    )
+    def test_recovery_rejects_non_integer_or_non_finite_age_without_mutation(
+        self, init_store: Path, monkeypatch, minimum_age_seconds
+    ):
+        needfix_id, stale = self._interrupt_claim(init_store, monkeypatch)
+        events_before = needfix_store.list_events(init_store, needfix_id)
+
+        with pytest.raises(needfix_store.NeedFixValidationError, match="finite integer"):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store,
+                needfix_id,
+                expected_updated_at=stale,
+                expected_conversion_claim_id=self._claim_id(init_store, needfix_id),
+                reason="invalid age",
+                minimum_age_seconds=minimum_age_seconds,
+            )
+
+        assert needfix_store.get_needfix(init_store, needfix_id)["status"] == "converting"
+        assert needfix_store.list_events(init_store, needfix_id) == events_before
+
+    def test_resumed_worker_cannot_commit_after_recovery(
+        self, init_store: Path, monkeypatch
+    ):
+        row = self._accepted(init_store)
+        stale = "2026-01-01T00:00:00+00:00"
+        monkeypatch.setattr(needfix_store, "_utcnow_iso", lambda: stale)
+
+        def resumes_after_manager_recovery(_card):
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store,
+                row["id"],
+                expected_updated_at=stale,
+                expected_conversion_claim_id=self._claim_id(init_store, row["id"]),
+                reason="worker was presumed interrupted",
+            )
+            return {"ok": True, "task_id": "T-late-worker"}
+
+        with pytest.raises(needfix_store.NeedFixConflictError, match="changed before commit"):
+            needfix_store.convert_needfix(
+                init_store, row["id"], resumes_after_manager_recovery
+            )
+
+        assert needfix_store.get_needfix(init_store, row["id"])["status"] == "accepted"
+        assert "conversion_committed" not in {
+            event["event"] for event in needfix_store.list_events(init_store, row["id"])
+        }
+
+    def test_recovered_a_cannot_commit_over_newer_b_claim(
+        self, init_store: Path, monkeypatch
+    ):
+        row = self._accepted(init_store)
+        claim_a = "2026-01-01T00:00:00+00:00"
+        # Frozen/coarse clocks make both claims share a timestamp; only the
+        # durable UUID distinguishes ownership.
+        claim_b = claim_a
+        monkeypatch.setattr(needfix_store, "_utcnow_iso", lambda: claim_a)
+        claim_a_id = ""
+
+        def worker_a_resumes_after_b_reclaims(_card):
+            nonlocal claim_a_id
+            claim_a_id = self._claim_id(init_store, row["id"])
+            needfix_store.recover_interrupted_conversion_claim(
+                init_store,
+                row["id"],
+                expected_updated_at=claim_a,
+                expected_conversion_claim_id=claim_a_id,
+                reason="worker A was presumed interrupted",
+            )
+            monkeypatch.setattr(needfix_store, "_utcnow_iso", lambda: claim_b)
+
+            def worker_b_holds_claim(_new_card):
+                claim_b_id = self._claim_id(init_store, row["id"])
+                assert claim_b_id != claim_a_id
+                with pytest.raises(
+                    needfix_store.NeedFixConflictError, match="changed before commit"
+                ):
+                    needfix_store._commit_conversion(
+                        init_store, row["id"], "T-worker-a", claim_a, claim_a_id
+                    )
+                needfix_store._compensate_conversion_claim(
+                    init_store, row["id"], "accepted", claim_a, claim_a_id
+                )
+                held = needfix_store.get_needfix(init_store, row["id"])
+                assert held["status"] == "converting"
+                assert held["conversion_claim_id"] == claim_b_id
+                return {"ok": True, "task_id": "T-worker-b"}
+
+            needfix_store.convert_needfix(init_store, row["id"], worker_b_holds_claim)
+            return {"ok": True, "task_id": "T-worker-a"}
+
+        with pytest.raises(needfix_store.NeedFixConflictError, match="changed before commit"):
+            needfix_store.convert_needfix(
+                init_store, row["id"], worker_a_resumes_after_b_reclaims
+            )
+
+        current = needfix_store.get_needfix(init_store, row["id"])
+        assert current["converted_task_id"] == "T-worker-b"
+        commits = [
+            event
+            for event in needfix_store.list_events(init_store, row["id"])
+            if event["event"] == "conversion_committed"
+        ]
+        assert [event["detail"]["converted_task_id"] for event in commits] == [
+            "T-worker-b"
+        ]
+
+    @pytest.mark.parametrize("size, accepted", [(4096, True), (4097, False)])
+    def test_recovery_reason_utf8_byte_boundary_before_mutation(
+        self, init_store: Path, monkeypatch, size: int, accepted: bool
+    ):
+        needfix_id, stale = self._interrupt_claim(init_store, monkeypatch)
+        claim_id = self._claim_id(init_store, needfix_id)
+        events_before = needfix_store.list_events(init_store, needfix_id)
+        if accepted:
+            result = needfix_store.recover_interrupted_conversion_claim(
+                init_store, needfix_id, expected_updated_at=stale,
+                expected_conversion_claim_id=claim_id, reason="x" * size,
+            )
+            assert result["recovered"] is True
+        else:
+            with pytest.raises(needfix_store.NeedFixValidationError, match="4096 bytes"):
+                needfix_store.recover_interrupted_conversion_claim(
+                    init_store, needfix_id, expected_updated_at=stale,
+                    expected_conversion_claim_id=claim_id, reason="x" * size,
+                )
+            assert needfix_store.get_needfix(init_store, needfix_id)["status"] == "converting"
+            assert needfix_store.list_events(init_store, needfix_id) == events_before
+
+    def test_manager_recovery_surface_rejects_spoofed_actor(self):
+        with pytest.raises(TypeError, match="actor"):
+            core.needfix_recover_conversion_claim(
+                "NF-2026-00469",
+                expected_updated_at="2026-01-01T00:00:00+00:00",
+                expected_conversion_claim_id="claim-id",
+                reason="spoof attempt",
+                actor="attacker",
+            )
+
+    @pytest.mark.parametrize("resolve", [False, True])
+    def test_identical_link_retry_precedes_external_validation(
+        self, init_store: Path, resolve: bool
+    ):
+        row = self._accepted(init_store)
+        first = needfix_store.link_existing_task(
+            init_store,
+            row["id"],
+            "T-durable-link",
+            lambda _task_id: {"task_id": "T-durable-link"},
+            lambda _task: "finished",
+        )
+        assert first["converted_task_id"] == "T-durable-link"
+        if resolve:
+            needfix_store.resolve_needfix(init_store, row["id"])
+
+        def unavailable(_task_id):
+            raise AssertionError("identical retry must not revalidate the external task")
+
+        retry = needfix_store.link_existing_task(
+            init_store,
+            row["id"],
+            "T-durable-link",
+            unavailable,
+            lambda _task: (_ for _ in ()).throw(
+                AssertionError("identical retry must not canonicalize the external task")
+            ),
+        )
+        assert retry["already_converted"] is True
+        assert retry.get("resolved", False) is resolve

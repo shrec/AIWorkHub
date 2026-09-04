@@ -1530,6 +1530,16 @@ def test_liveness_terminal_mapping_ignores_env_and_keeps_candidate_failures(
 ) -> None:
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("CI", "true")
+    monkeypatch.setattr(
+        worker_workspace,
+        "verify_nested_landlock_authority_locator",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "verify_outer_validation_authority_file",
+        lambda _path: None,
+    )
     assert worker_workspace.authenticated_outer_validation_context() is None
     assert (
         process_launcher._terminal_state_for_workspace_error(

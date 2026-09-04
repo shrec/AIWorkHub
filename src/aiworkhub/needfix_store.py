@@ -54,6 +54,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -68,6 +69,7 @@ NEEDFIX_DB_REL = (HUB_DIRNAME, "tasking", "needfix.sqlite")
 # from pathological input rather than throttling legitimate work.
 MAX_DESCRIPTION_BYTES = 200_000
 MAX_EVIDENCE_BYTES = 500_000
+MAX_RECOVERY_REASON_BYTES = 4_096
 MAX_LIST_LIMIT = 500
 DEFAULT_LIST_LIMIT = 100
 
@@ -158,7 +160,10 @@ REOPEN_CARD_STATUSES: frozenset[str] = frozenset(
 )
 
 # Card statuses a manager may link an existing NeedFix to after the fact.
-LINKABLE_CARD_STATUSES: frozenset[str] = OWNED_CARD_STATUSES | CLOSED_CARD_STATUSES
+# Archived tasks are terminal inventory and cannot receive a fresh link.
+LINKABLE_CARD_STATUSES: frozenset[str] = (
+    OWNED_CARD_STATUSES | CLOSED_CARD_STATUSES
+) - {"archived"}
 
 # --- Outer layer: the NeedFix's OWN lifecycle status decides first ----------
 # A NeedFix that is itself terminal is a decided non-problem (rejected /
@@ -281,6 +286,7 @@ CREATE TABLE IF NOT EXISTS needfix (
     status TEXT NOT NULL,
     duplicate_parent_id TEXT,
     converted_task_id TEXT,
+    conversion_claim_id TEXT,
     reopen_generation INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -351,26 +357,43 @@ def _migrate_needfix_schema(conn: sqlite3.Connection) -> None:
     concurrent winner (the column appears after a duplicate-column error) as
     benign, and re-raises any unrelated ``OperationalError``.
     """
-    if _column_exists(conn, "needfix", "reopen_generation"):
-        _backfill_legacy_reopen_generation(conn)
-        return
-    try:
-        conn.execute(
-            "ALTER TABLE needfix ADD COLUMN "
-            "reopen_generation INTEGER NOT NULL DEFAULT 0"
-        )
-    except sqlite3.OperationalError:
-        # A concurrent migrator may have already added the column; that is the
-        # only benign OperationalError. Verify via the live schema, otherwise
-        # re-raise the unrelated error.
-        if not _column_exists(conn, "needfix", "reopen_generation"):
-            raise
-    if not _column_exists(conn, "needfix", "reopen_generation"):
-        raise NeedFixError(
-            "needfix schema migration failed: reopen_generation column "
-            "missing after ALTER"
-        )
+    for column, declaration in (
+        ("reopen_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("conversion_claim_id", "TEXT"),
+    ):
+        if _column_exists(conn, "needfix", column):
+            continue
+        try:
+            conn.execute(f"ALTER TABLE needfix ADD COLUMN {column} {declaration}")
+        except sqlite3.OperationalError:
+            if not _column_exists(conn, "needfix", column):
+                raise
+        if not _column_exists(conn, "needfix", column):
+            raise NeedFixError(
+                f"needfix schema migration failed: {column} column missing after ALTER"
+            )
     _backfill_legacy_reopen_generation(conn)
+    # Give an unambiguous legacy in-flight claim an exact durable event identity.
+    # Ambiguous/missing provenance remains NULL and recovery therefore fails closed.
+    conn.execute(
+        "UPDATE needfix SET conversion_claim_id = ("
+        " SELECT 'legacy-event-' || e.seq FROM needfix_events e"
+        " WHERE e.needfix_id = needfix.id"
+        " AND e.event IN ('conversion_claimed', 'existing_task_link_claimed')"
+        " AND NOT EXISTS (SELECT 1 FROM needfix_events later"
+        "   WHERE later.needfix_id = e.needfix_id AND later.seq > e.seq"
+        "   AND later.event IN ('conversion_compensated', 'conversion_committed',"
+        "     'conversion_claim_recovered'))"
+        ") WHERE status = 'converting' AND conversion_claim_id IS NULL"
+        " AND 1 = (SELECT COUNT(*) FROM needfix_events candidate"
+        "   WHERE candidate.needfix_id = needfix.id"
+        "   AND candidate.event IN ('conversion_claimed', 'existing_task_link_claimed')"
+        "   AND NOT EXISTS (SELECT 1 FROM needfix_events later"
+        "     WHERE later.needfix_id = candidate.needfix_id"
+        "     AND later.seq > candidate.seq"
+        "     AND later.event IN ('conversion_compensated', 'conversion_committed',"
+        "       'conversion_claim_recovered')))"
+    )
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -490,11 +513,14 @@ def _record_event(
     needfix_id: str,
     event: str,
     detail: Mapping[str, Any] | None = None,
-) -> None:
-    conn.execute(
+) -> int:
+    cursor = conn.execute(
         "INSERT INTO needfix_events (needfix_id, event, detail_json, created_at) VALUES (?, ?, ?, ?)",
         (needfix_id, event, json.dumps(detail or {}), _utcnow_iso()),
     )
+    if cursor.lastrowid is None:
+        raise NeedFixError("needfix event insert returned no durable identity")
+    return int(cursor.lastrowid)
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -516,6 +542,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "status": row["status"],
         "duplicate_parent_id": row["duplicate_parent_id"],
         "converted_task_id": row["converted_task_id"],
+        "conversion_claim_id": row["conversion_claim_id"],
         "reopen_generation": row["reopen_generation"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -1912,7 +1939,7 @@ def _check_already_converted(
 
 def _validate_and_claim(
     conn: sqlite3.Connection, needfix_id: str, row: sqlite3.Row
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, str, str, dict[str, Any]]:
     """Status guard + atomic claim.
 
     Raises NeedFixConflictError on captured/triaged or failed claim.
@@ -1927,22 +1954,33 @@ def _validate_and_claim(
 
     prior_status: str = row["status"]
     generation = _authoritative_reopen_generation(conn, needfix_id)
-    cur = conn.execute(
-        "UPDATE needfix SET status = 'converting', updated_at = ? "
-        "WHERE id = ? AND status IN ('accepted', 'task_planned')",
-        (_utcnow_iso(), needfix_id),
-    )
-    if cur.rowcount != 1:
-        raise NeedFixConflictError(
-            f"needfix {needfix_id} could not be claimed for conversion "
-            f"(current status is {prior_status!r}, must be accepted or task_planned)"
+    claim_updated_at = _utcnow_iso()
+    conversion_claim_id = uuid.uuid4().hex
+    conn.execute("SAVEPOINT conversion_claim")
+    try:
+        cur = conn.execute(
+            "UPDATE needfix SET status = 'converting', updated_at = ?, conversion_claim_id = ? "
+            "WHERE id = ? AND status IN ('accepted', 'task_planned')",
+            (claim_updated_at, conversion_claim_id, needfix_id),
         )
-    _record_event(conn, needfix_id, "conversion_claimed", {"prior_status": prior_status})
+        if cur.rowcount != 1:
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} could not be claimed for conversion "
+                f"(current status is {prior_status!r}, must be accepted or task_planned)"
+            )
+        _record_event(conn, needfix_id, "conversion_claimed", {
+            "prior_status": prior_status, "conversion_claim_id": conversion_claim_id,
+        })
+    except Exception:
+        conn.execute("ROLLBACK TO conversion_claim")
+        conn.execute("RELEASE conversion_claim")
+        raise
+    conn.execute("RELEASE conversion_claim")
     needfix_snapshot = _row_to_dict(
         conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
     )
     needfix_snapshot["reopen_generation"] = generation
-    return prior_status, needfix_snapshot
+    return prior_status, claim_updated_at, conversion_claim_id, needfix_snapshot
 
 
 def _resolve_conversion_card(
@@ -1987,43 +2025,242 @@ def _normalize_create_task_receipt(result: Any, needfix_id: str) -> str:
 
 
 def _compensate_conversion_claim(
-    repo_root: str | Path, needfix_id: str, prior_status: str
+    repo_root: str | Path, needfix_id: str, prior_status: str,
+    claim_updated_at: str, conversion_claim_id: str,
 ) -> None:
     """Restore the NeedFix to its pre-claim status after a failed conversion."""
     conn = _connect(repo_root)
     try:
-        conn.execute(
-            "UPDATE needfix SET status = ?, updated_at = ? "
-            "WHERE id = ? AND status = 'converting'",
-            (prior_status, _utcnow_iso(), needfix_id),
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE needfix SET status = ?, updated_at = ?, conversion_claim_id = NULL "
+            "WHERE id = ? AND status = 'converting' AND updated_at = ? "
+            "AND conversion_claim_id = ?",
+            (prior_status, _utcnow_iso(), needfix_id, claim_updated_at, conversion_claim_id),
         )
-        _record_event(
+        if cur.rowcount == 1:
+            _record_event(
+                conn,
+                needfix_id,
+                "conversion_compensated",
+                {"restored_status": prior_status, "claim_updated_at": claim_updated_at,
+                 "conversion_claim_id": conversion_claim_id},
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def recover_interrupted_conversion_claim(
+    repo_root: str | Path,
+    needfix_id: str,
+    *,
+    expected_updated_at: str,
+    expected_conversion_claim_id: str,
+    reason: str,
+    minimum_age_seconds: int = 300,
+) -> dict[str, Any]:
+    """Recover one stale conversion claim using durable provenance and CAS.
+
+    The caller must identify the exact observed claim with ``updated_at``.
+    Fresh claims, changed rows, absent/ambiguous claim provenance, and recorded
+    prior states outside ``CLAIMABLE_STATUSES`` all fail closed.
+    """
+    expected_updated_at = str(expected_updated_at or "").strip()
+    expected_conversion_claim_id = str(expected_conversion_claim_id or "").strip()
+    reason = str(reason or "").strip()
+    actor = "manager"
+    if not expected_updated_at:
+        raise NeedFixValidationError("expected_updated_at is required")
+    if not expected_conversion_claim_id:
+        raise NeedFixValidationError("expected_conversion_claim_id is required")
+    if not reason:
+        raise NeedFixValidationError("recovery reason is required")
+    if len(reason.encode("utf-8")) > MAX_RECOVERY_REASON_BYTES:
+        raise NeedFixValidationError("recovery reason exceeds 4096 bytes")
+    if (
+        isinstance(minimum_age_seconds, bool)
+        or not isinstance(minimum_age_seconds, int)
+        or minimum_age_seconds < 60
+    ):
+        raise NeedFixValidationError(
+            "minimum_age_seconds must be a finite integer of at least 60"
+        )
+
+    conn = _connect(repo_root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status, updated_at, conversion_claim_id FROM needfix WHERE id = ?", (needfix_id,)
+        ).fetchone()
+        if row is None:
+            raise NeedFixNotFoundError(needfix_id)
+
+        latest_event = conn.execute(
+            "SELECT seq, event, detail_json FROM needfix_events WHERE needfix_id = ? "
+            "ORDER BY seq DESC LIMIT 1",
+            (needfix_id,),
+        ).fetchone()
+        if latest_event is not None and latest_event["event"] == "conversion_claim_recovered":
+            detail = json.loads(latest_event["detail_json"] or "{}")
+            postimage = detail.get("postimage") or {}
+            if (
+                detail.get("claim_updated_at") == expected_updated_at
+                and detail.get("conversion_claim_id") == expected_conversion_claim_id
+                and detail.get("reason") == reason
+                and detail.get("actor") == actor
+                and postimage.get("event_seq") == int(latest_event["seq"])
+                and postimage.get("status") == row["status"]
+                and postimage.get("updated_at") == row["updated_at"]
+                and postimage.get("conversion_claim_id")
+                == row["conversion_claim_id"]
+            ):
+                conn.commit()
+                return {
+                    "needfix_id": needfix_id,
+                    "status": row["status"],
+                    "recovered": False,
+                    "idempotent": True,
+                    "claim_identity": detail.get("claim_identity"),
+                }
+
+        if row["status"] != "converting":
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} is not an interrupted converting claim"
+            )
+        if row["updated_at"] != expected_updated_at:
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} claim identity changed (updated_at CAS mismatch)"
+            )
+        if row["conversion_claim_id"] != expected_conversion_claim_id:
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} claim identity changed (claim id CAS mismatch)"
+            )
+        try:
+            claimed_at = datetime.fromisoformat(expected_updated_at)
+            if claimed_at.tzinfo is None:
+                raise ValueError("timezone required")
+        except (TypeError, ValueError) as exc:
+            raise NeedFixConflictError("claim updated_at is not an aware timestamp") from exc
+        age = (datetime.now(timezone.utc) - claimed_at.astimezone(timezone.utc)).total_seconds()
+        if age < minimum_age_seconds:
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} conversion claim is still in flight"
+            )
+
+        lifecycle = conn.execute(
+            "SELECT seq, event, detail_json FROM needfix_events WHERE needfix_id = ? "
+            "AND event IN ('conversion_claimed', 'existing_task_link_claimed', "
+            "'conversion_compensated', 'conversion_committed', "
+            "'conversion_claim_recovered') ORDER BY seq DESC LIMIT 1",
+            (needfix_id,),
+        ).fetchone()
+        if lifecycle is None or lifecycle["event"] not in (
+            "conversion_claimed", "existing_task_link_claimed"
+        ):
+            raise NeedFixConflictError("missing or ambiguous conversion claim provenance")
+        claim_detail = json.loads(lifecycle["detail_json"] or "{}")
+        prior_status = claim_detail.get("prior_status")
+        if prior_status not in CLAIMABLE_STATUSES:
+            raise NeedFixConflictError("conversion claim records an invalid prior status")
+        durable_claim_id = claim_detail.get("conversion_claim_id") or f"legacy-event-{lifecycle['seq']}"
+        if durable_claim_id != expected_conversion_claim_id:
+            raise NeedFixConflictError("conversion claim identity does not match durable provenance")
+        claim_identity = {
+            "event": lifecycle["event"],
+            "event_seq": int(lifecycle["seq"]),
+            "updated_at": expected_updated_at,
+            "existing_task_id": claim_detail.get("existing_task_id"),
+            "conversion_claim_id": expected_conversion_claim_id,
+        }
+        recovered_at = _utcnow_iso()
+        cur = conn.execute(
+            "UPDATE needfix SET status = ?, updated_at = ?, conversion_claim_id = NULL "
+            "WHERE id = ? AND status = 'converting' AND updated_at = ? "
+            "AND conversion_claim_id = ?",
+            (prior_status, recovered_at, needfix_id, expected_updated_at,
+             expected_conversion_claim_id),
+        )
+        if cur.rowcount != 1:
+            raise NeedFixConflictError("conversion claim changed during recovery")
+        recovery_detail = {
+            "prior_status": prior_status,
+            "reason": reason,
+            "actor": actor,
+            "claim_updated_at": expected_updated_at,
+            "conversion_claim_id": expected_conversion_claim_id,
+            "claim_identity": claim_identity,
+            "postimage": {
+                "status": prior_status,
+                "updated_at": recovered_at,
+                "conversion_claim_id": None,
+            },
+        }
+        recovery_event_seq = _record_event(
             conn,
             needfix_id,
-            "conversion_compensated",
-            {"restored_status": prior_status},
+            "conversion_claim_recovered",
+            recovery_detail,
         )
+        recovery_detail["postimage"]["event_seq"] = recovery_event_seq
+        updated = conn.execute(
+            "UPDATE needfix_events SET detail_json = ? WHERE seq = ? "
+            "AND needfix_id = ? AND event = 'conversion_claim_recovered'",
+            (json.dumps(recovery_detail), recovery_event_seq, needfix_id),
+        )
+        if updated.rowcount != 1:
+            raise NeedFixError("recovery event identity changed before postimage binding")
+        conn.commit()
+        return {
+            "needfix_id": needfix_id,
+            "status": prior_status,
+            "recovered": True,
+            "idempotent": False,
+            "claim_identity": claim_identity,
+        }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
 
 def _commit_conversion(
-    repo_root: str | Path, needfix_id: str, task_id: str
+    repo_root: str | Path, needfix_id: str, task_id: str, claim_updated_at: str,
+    conversion_claim_id: str,
 ) -> dict[str, Any]:
     """Atomically record ``task_created`` + ``converted_task_id``."""
     conn = _connect(repo_root)
     try:
-        conn.execute(
+        # _connect uses autocommit so the claim CAS and its durable provenance
+        # must be enclosed explicitly. Otherwise an event-write failure leaves
+        # task_created committed without conversion_committed evidence.
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
             "UPDATE needfix SET status = 'task_created', converted_task_id = ?, "
-            "updated_at = ? WHERE id = ? AND status = 'converting'",
-            (task_id, _utcnow_iso(), needfix_id),
+            "updated_at = ?, conversion_claim_id = NULL WHERE id = ? "
+            "AND status = 'converting' AND updated_at = ? AND conversion_claim_id = ?",
+            (task_id, _utcnow_iso(), needfix_id, claim_updated_at, conversion_claim_id),
         )
-        _record_event(conn, needfix_id, "conversion_committed", {"converted_task_id": task_id})
+        if cur.rowcount != 1:
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} conversion claim changed before commit"
+            )
+        _record_event(conn, needfix_id, "conversion_committed", {
+            "converted_task_id": task_id, "conversion_claim_id": conversion_claim_id,
+        })
+        conn.commit()
         return {
             "needfix_id": needfix_id,
             "converted_task_id": task_id,
             "already_converted": False,
         }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -2071,7 +2308,9 @@ def convert_needfix(
             return already
 
         # -- Phase 2: validate status and atomically claim --------------
-        prior_status, needfix_snapshot = _validate_and_claim(conn, needfix_id, row)
+        prior_status, claim_updated_at, conversion_claim_id, needfix_snapshot = _validate_and_claim(
+            conn, needfix_id, row
+        )
     finally:
         conn.close()
 
@@ -2081,11 +2320,13 @@ def convert_needfix(
         result = create_task_fn(card)
         task_id = _normalize_create_task_receipt(result, needfix_id)
     except Exception:
-        _compensate_conversion_claim(repo_root, needfix_id, prior_status)
+        _compensate_conversion_claim(
+            repo_root, needfix_id, prior_status, claim_updated_at, conversion_claim_id
+        )
         raise
 
     # -- Phase 4: commit the successful conversion ----------------------
-    return _commit_conversion(repo_root, needfix_id, task_id)
+    return _commit_conversion(repo_root, needfix_id, task_id, claim_updated_at, conversion_claim_id)
 
 
 def link_existing_task(
@@ -2160,33 +2401,9 @@ def link_existing_task(
                 f"{row['converted_task_id']!r}, not {existing_task_id!r}"
             )
 
-        if row["status"] in ("captured", "triaged"):
-            raise NeedFixConflictError(
-                f"needfix {needfix_id} is {row['status']!r} -- "
-                f"captured/unverified NeedFixes cannot be linked. "
-                f"A manager must first accept this NeedFix."
-            )
-
-        prior_status = row["status"]
-        cur = conn.execute(
-            "UPDATE needfix SET status = 'converting', updated_at = ? "
-            "WHERE id = ? AND status IN ('accepted', 'task_planned')",
-            (_utcnow_iso(), needfix_id),
-        )
-        if cur.rowcount != 1:
-            raise NeedFixConflictError(
-                f"needfix {needfix_id} could not be claimed for linking "
-                f"(current status is {prior_status!r}, must be accepted or task_planned)"
-            )
-        _record_event(
-            conn, needfix_id, "existing_task_link_claimed",
-            {"prior_status": prior_status, "existing_task_id": existing_task_id},
-        )
-    finally:
-        conn.close()
-
-
-    try:
+        # Only a new link needs external validation. An identical durable-link
+        # retry above remains successful even if the task was later archived
+        # or is temporarily unavailable after the original response was lost.
         task = get_task_fn(existing_task_id)
         if task is None:
             raise NeedFixValidationError(
@@ -2197,18 +2414,68 @@ def link_existing_task(
             linkable = ", ".join(sorted(LINKABLE_CARD_STATUSES))
             raise NeedFixConflictError(
                 f"existing task {existing_task_id!r} is not linkable "
-                f"(canonical status is {task_status!r}; linkable statuses are "
-                f"{linkable})"
+                f"(canonical status is {task_status!r}; linkable statuses are {linkable})"
             )
-    except Exception:
-        # Reuse the shared claim-compensation SQL rather than re-implementing
-        # it -- one code path, so the two conversion routes cannot diverge.
-        _compensate_conversion_claim(repo_root, needfix_id, prior_status)
-        raise
 
-    # Reuse the shared conversion-commit SQL: identical ``task_created`` +
-    # ``converted_task_id`` transition as ``convert_needfix``.
-    return _commit_conversion(repo_root, needfix_id, existing_task_id)
+        if row["status"] in ("captured", "triaged"):
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} is {row['status']!r} -- "
+                f"captured/unverified NeedFixes cannot be linked. "
+                f"A manager must first accept this NeedFix."
+            )
+
+        prior_status = row["status"]
+        claim_updated_at = _utcnow_iso()
+        conversion_claim_id = uuid.uuid4().hex
+        conn.execute("SAVEPOINT existing_task_link_claim")
+        try:
+            cur = conn.execute(
+                "UPDATE needfix SET status = 'converting', updated_at = ?, conversion_claim_id = ? "
+                "WHERE id = ? AND status IN ('accepted', 'task_planned')",
+                (claim_updated_at, conversion_claim_id, needfix_id),
+            )
+            if cur.rowcount != 1:
+                raise NeedFixConflictError(
+                    f"needfix {needfix_id} could not be claimed for linking "
+                    f"(current status is {prior_status!r}, must be accepted or task_planned)"
+                )
+            _record_event(
+                conn, needfix_id, "existing_task_link_claimed",
+                {"prior_status": prior_status, "existing_task_id": existing_task_id,
+                 "conversion_claim_id": conversion_claim_id},
+            )
+        except Exception:
+            conn.execute("ROLLBACK TO existing_task_link_claim")
+            conn.execute("RELEASE existing_task_link_claim")
+            raise
+        conn.execute("RELEASE existing_task_link_claim")
+    finally:
+        conn.close()
+
+
+    # The task store is separate, so the initial check cannot lock its row across
+    # our NeedFix claim. Re-read authoritatively at the last possible point and
+    # compensate this exact claim if the candidate became unlinkable meanwhile.
+    try:
+        current_task = get_task_fn(existing_task_id)
+        if current_task is None:
+            raise NeedFixValidationError(
+                f"existing task {existing_task_id!r} disappeared before link commit"
+            )
+        current_status = canonical_status_fn(current_task)
+        if current_status not in LINKABLE_CARD_STATUSES:
+            raise NeedFixConflictError(
+                f"existing task {existing_task_id!r} became un-linkable before commit "
+                f"(canonical status is {current_status!r})"
+            )
+        return _commit_conversion(
+            repo_root, needfix_id, existing_task_id, claim_updated_at, conversion_claim_id
+        )
+    except Exception:
+        _compensate_conversion_claim(
+            repo_root, needfix_id, prior_status, claim_updated_at, conversion_claim_id
+        )
+        raise
 
 
 def reopen_superseded_task_link(
