@@ -72,6 +72,11 @@ def _write_fake_pytest_package(root: Path, body: str = "print('FAKE_PYTEST_MAIN_
     (pkg / "__main__.py").write_text("import sys\n" + body + "\nraise SystemExit(0)\n", encoding="utf-8")
 
 
+def _write_pytest_probe_plugin(root: Path, name: str, body: str) -> None:
+    """Write a uniquely named plugin importable behind canonical pytest."""
+    (root / f"{name}.py").write_text(body + "\n", encoding="utf-8")
+
+
 class TestApprovedSitePythonpath(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="approved_pytest_site_")
@@ -358,6 +363,11 @@ class TestResolveTrustedPytestRuntimeRoot(_TolerateNestedSeccompChmodDenial):
 class TestIsPytestValidationCommand(unittest.TestCase):
     def test_module_invocation_variants(self) -> None:
         self.assertTrue(worker_workspace._is_pytest_validation_command(["python3", "-m", "pytest", "-q", "x.py"]))
+        self.assertTrue(
+            worker_workspace._is_pytest_validation_command(
+                ["python3", "-P", "-m", "pytest", "-q", "x.py"]
+            )
+        )
         self.assertTrue(worker_workspace._is_pytest_validation_command(["python3", "-m", "pytest"]))
         self.assertTrue(worker_workspace._is_pytest_validation_command(["pytest", "-q"]))
 
@@ -412,10 +422,14 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
                 )
             self.assertEqual(results[0]["returncode"], 0)
             self.assertEqual(
-                results[0]["argv"][:3],
-                [worker_workspace.sys.executable, "-m", "pytest"],
+                results[0]["argv"][1:4],
+                ["-P", "-m", "pytest"],
             )
-            self.assertIn("FAKE_PYTEST_MAIN_OK --version", results[0]["stdout_tail"])
+            self.assertIn("pytest", results[0]["stdout_tail"])
+            self.assertEqual(
+                results[0]["interpreter_authority"]["source"],
+                "module_validator_trusted_runtime_root",
+            )
         finally:
             worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
@@ -432,11 +446,11 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
                 )
             record = results[0]
             self.assertEqual(record["returncode"], 0)
-            self.assertIn("FAKE_PYTEST_MAIN_OK --version", record["stdout_tail"])
+            self.assertIn("pytest", record["stdout_tail"])
             self.assertEqual(record["env_override"]["variable"], "PYTHONPATH")
             components = record["env_override"]["components"]
-            self.assertEqual(components[0], str(fake_root.resolve()))
-            self.assertEqual(components[1:], ["."])
+            self.assertEqual(components, [str(fake_root.resolve())])
+            self.assertEqual(record["env_override"]["dropped_candidate_components"], ["."])
         finally:
             worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
@@ -472,23 +486,36 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
         fake_root = self.tmp_path / "trusted_site_packages_creds"
         fake_root.mkdir()
         os.chmod(fake_root, 0o755)
-        _write_fake_pytest_package(
+        _write_fake_pytest_package(fake_root)
+        _write_pytest_probe_plugin(
             fake_root,
+            "aiworkhub_env_probe",
             body=(
                 "import os, json\n"
                 "print('ENV_KEYS ' + json.dumps(sorted(os.environ.keys())))"
             ),
         )
         repo, workspace = _manual_workspace(self.tmp_path, "b755-no-leak")
+        (workspace.path / "test_probe.py").write_text(
+            "def test_probe():\n    assert True\n",
+            encoding="utf-8",
+        )
         old_env = dict(os.environ)
         try:
             os.environ["ANTHROPIC_API_KEY"] = "super-secret-claude-key"
             os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "super-secret-oauth"
             with mock.patch.object(worker_workspace.site, "getusersitepackages", return_value=str(fake_root)):
-                results = worker_workspace.run_validations(workspace, ["python3 -m pytest --version"])
+                results = worker_workspace.run_validations(
+                    workspace,
+                    ["python3 -m pytest -s -q -p aiworkhub_env_probe test_probe.py"],
+                )
             record = results[0]
             self.assertEqual(record["returncode"], 0)
-            printed_keys = set(json.loads(record["stdout_tail"].split("ENV_KEYS ", 1)[1]))
+            printed_keys = set(
+                json.loads(
+                    record["stdout_tail"].split("ENV_KEYS ", 1)[1].splitlines()[0]
+                )
+            )
             self.assertNotIn("ANTHROPIC_API_KEY", printed_keys)
             self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", printed_keys)
             self.assertNotIn("super-secret-claude-key", record["stdout_tail"])
@@ -526,14 +553,20 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
         fake_root = self.tmp_path / "trusted_site_packages_no_cache"
         fake_root.mkdir()
         os.chmod(fake_root, 0o755)
-        _write_fake_pytest_package(
+        _write_fake_pytest_package(fake_root)
+        _write_pytest_probe_plugin(
             fake_root,
+            "aiworkhub_cache_probe",
             body=(
                 "import os\n"
                 "print('PYTEST_ADDOPTS=' + os.environ.get('PYTEST_ADDOPTS', ''))\n"
             ),
         )
         repo, workspace = _manual_workspace(self.tmp_path, "b755-no-cache-write")
+        (workspace.path / "test_probe.py").write_text(
+            "def test_probe():\n    assert True\n",
+            encoding="utf-8",
+        )
         try:
             with mock.patch.object(
                 worker_workspace.site,
@@ -541,7 +574,8 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
                 return_value=str(fake_root),
             ):
                 results = worker_workspace.run_validations(
-                    workspace, ["python3 -m pytest --version"]
+                    workspace,
+                    ["python3 -m pytest -s -q -p aiworkhub_cache_probe test_probe.py"],
                 )
             self.assertEqual(results[0]["returncode"], 0)
             self.assertIn(

@@ -8485,7 +8485,14 @@ def _is_pytest_validation_command(argv: list[str]) -> bool:
     head = Path(argv[0]).name
     if head == "pytest":
         return True
-    return len(argv) >= 3 and head.startswith("python") and argv[1] == "-m" and argv[2] == "pytest"
+    if not head.startswith("python"):
+        return False
+    # Imported lazily for the same direct-script reason documented by
+    # ``_probe_absent_validator_modules`` below.  The shared parser recognizes
+    # interpreter flags such as the authority resolver's injected ``-P``.
+    from . import validation_runner
+
+    return "pytest" in validation_runner.dash_m_validator_modules(argv)
 
 
 def _is_python_validation_command(argv: list[str]) -> bool:
