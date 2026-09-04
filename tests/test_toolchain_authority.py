@@ -11,7 +11,9 @@ from aiworkhub import toolchain_authority
 
 
 def _card() -> dict[str, object]:
-    return {"validation": [f"{sys.executable} -m pytest -q tests"]}
+    # Cache/digest tests need one stable absolute executable fact, not a
+    # dependency on whichever pytest runtime layout the host Python exposes.
+    return {"validation": [f"{sys.executable} -m compileall -q src"]}
 
 
 def _authority(tmp_path: Path, **kwargs: object) -> toolchain_authority.ToolchainAuthority:
