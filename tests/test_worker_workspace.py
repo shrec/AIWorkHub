@@ -911,6 +911,13 @@ def test_pytest_validation_resolves_sparse_candidate_config_inside_worktree(
     repo: Path,
 ) -> None:
     _commit_validation_worker_package(repo)
+    # This test owns sparse candidate/config resolution, not host toolchain
+    # trust.  Keep it deterministic when a CI virtualenv resolves to a
+    # world-writable hosted-toolcache interpreter; the no-root path still
+    # exercises the canonical sys.executable module-validator fallback.
+    monkeypatch.setattr(
+        worker_workspace, "_trusted_validation_runtime_roots", lambda repo=None: ()
+    )
     monkeypatch.setenv(
         worker_workspace.WORKTREE_ROOT_ENV,
         str(tmp_path / "pytest-candidate-worktrees"),
