@@ -12,6 +12,17 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.85 — 2026-09-04
+
+- Reviewer starts that lose their launcher are recovered from canonical lease,
+  process and claim evidence without disturbing live or ambiguous owners.
+- Sparse worker workspaces now close over safe constant dynamic imports while
+  rejecting tainted package state, stdlib shadows and escaping paths.
+- Generated `git diff --check` gates use the system toolchain authority, so an
+  available Git binary is no longer reported as a missing validation tool.
+- Launch validation tests use the same task-store and authenticated intent
+  contracts as production.
+
 ## What's new in 0.10.84 — 2026-09-03
 
 - Python attributes, member definitions and qualified accesses are now

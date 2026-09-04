@@ -1,5 +1,22 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.85 — 2026-09-04
+
+### Fixed
+
+- Abandoned reviewer `starting` reservations are reconciled from canonical
+  process, lease and claim authority while live or ambiguous owners remain
+  untouched.
+- Sparse worker workspaces include constant dynamic imports transitively and
+  fail closed for tainted package state, shadowed standard-library modules,
+  computed names, symlinks and repository escapes.
+- Template-generated Git validation resolves the host tool to a verified
+  absolute executable instead of failing launch preflight mechanically.
+- Pytest validation keeps credential scrubbing and cache suppression after its
+  trusted interpreter adds Python safe-path isolation.
+- Process-launch validation fixtures follow the production task-store and
+  authenticated intent-reader boundaries.
+
 ## 0.10.84 — 2026-09-03
 
 ### Fixed

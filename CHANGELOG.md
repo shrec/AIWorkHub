@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.85] - 2026-09-04
+
+This release closes two recurring self-hosting loops: abandoned reviewer-start
+reservations and incomplete sparse-workspace import closure.
+
+### Fixed
+
+- Reviewer reservations in `starting` are recovered from canonical process,
+  lease and claim evidence. Dead owners are reaped, live or ambiguous owners
+  are preserved, and recovery remains idempotent across restarts.
+- Sparse worker workspaces now follow constant `importlib` imports transitively
+  without trusting rebound package state, shadowed standard-library bindings,
+  runtime-computed names, symlinks or repository escapes.
+- Template-generated `git diff --check` validation now resolves `git` through
+  the system toolchain authority instead of being rejected as a missing file.
+- Pytest validation remains structurally recognized after the trusted runtime
+  injects Python's safe-path flag, preserving credential scrubbing and
+  read-only-worktree cache suppression.
+- Process-launch regression fixtures now initialize and exercise the same
+  canonical task-store and intent-reader contracts as production.
+
 ## [0.10.84] - 2026-09-03
 
 This release closes the Python Source Graph attribute and member-identity blind
