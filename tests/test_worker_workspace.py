@@ -4531,6 +4531,25 @@ class TestFocusedRegressionExercisesCandidate:
             "resolve_trusted_pytest_runtime_root",
             lambda: pytest_root,
         )
+        # Pin the canonical executable/interpreter authority to this test's
+        # synthetic trusted root.  Otherwise the focused PYTHONPATH test also
+        # inherits host-venv ownership/mode policy (GitHub toolcache is 0777).
+        monkeypatch.setattr(
+            worker_workspace,
+            "_resolve_trusted_validation_executable",
+            lambda name, repo=None: worker_workspace.TrustedValidationExecutable(
+                path=pytest_root / name,
+                root=pytest_root,
+            ),
+        )
+        monkeypatch.setattr(
+            worker_workspace,
+            "_resolve_trusted_validation_root_interpreter",
+            lambda preferred_root, repo=None: worker_workspace.TrustedValidationExecutable(
+                path=Path(worker_workspace.sys.executable),
+                root=pytest_root,
+            ),
+        )
 
         def _approved_site(component: str) -> Path:
             c = Path(component)
