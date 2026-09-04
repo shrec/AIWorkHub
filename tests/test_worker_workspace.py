@@ -3638,8 +3638,8 @@ def test_repo_relative_executable_passes_through_unrelated_and_rejects_untrusted
     ) == (["scripts/run.sh", "arg"], ())
     # A relative path to a non-approved executable name passes through.
     assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
-        [".venv/bin/python3", "-m", "pytest"], repo
-    ) == ([".venv/bin/python3", "-m", "pytest"], ())
+        [".venv/bin/node", "--version"], repo
+    ) == ([".venv/bin/node", "--version"], ())
     # Traversal escapes never resolve to a trusted executable.
     assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
         ["../evil/.venv/bin/ruff", "check"], repo
@@ -3736,7 +3736,7 @@ def test_python_module_mypy_rewrite_is_exact_and_preserves_existing_rules(
         unsupported, tmp_path
     ) == (unsupported, ())
 
-    for tail in (("-m", "pytest", "src"), ("-m", "mypy.api", "src"), ("-mypy", "src")):
+    for tail in (("-m", "mypy.api", "src"), ("-mypy", "src")):
         declared = ["python3", *tail]
         assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
             declared, tmp_path
@@ -4485,10 +4485,10 @@ class TestFocusedRegressionExercisesCandidate:
             assert cleanup_called[0] is True
 
     @staticmethod
-    def test_ordinary_pytest_keeps_trusted_first_pythonpath(
+    def test_ordinary_pytest_keeps_trusted_pythonpath_and_drops_candidate(
         monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Ordinary pytest keeps trusted-root-first PYTHONPATH."""
+        """Ordinary pytest keeps only trusted host PYTHONPATH components."""
         workspace = worker_workspace.WorkerWorkspace(
             request_id="nf128-ordinary-py-order",
             repo=tmp_path,
@@ -4581,13 +4581,13 @@ class TestFocusedRegressionExercisesCandidate:
             assert captured_components is not None, (
                 "resolve_validation_pythonpath was not called"
             )
-            # Ordinary pytest: trusted root FIRST, declared components after.
-            assert len(captured_components) >= 2
-            assert captured_components[0] == str(pytest_root), (
-                f"pytest root expected first, got {captured_components}"
-            )
-            assert captured_components[-1] == 'src', (
-                f"declared 'src' expected last, got {captured_components}"
+            # The canonical validator runtime remains available, while the
+            # candidate-writable component cannot shadow pytest or its imports.
+            assert captured_components == (str(pytest_root),)
+            assert results[0]["env_override"]["dropped_candidate_components"] == [
+                "src"
+            ], (
+                f"candidate component was not dropped: {captured_components}"
             )
         finally:
             monkeypatch.setattr(worker_workspace.subprocess, "run", orig_run)
