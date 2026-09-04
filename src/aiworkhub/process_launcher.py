@@ -17,6 +17,7 @@ import hmac
 import html
 import inspect
 import json
+import math
 import os
 import re
 import shutil
@@ -348,6 +349,8 @@ ACTIVE_PROCESS_STATES = {"starting", "running", "cancel_requested"}
 # ``starting`` reservation reconciled by the same expiry rules -- never an
 # elapsed/quiet-time classification of a live provider.
 QUALITY_REVIEW_ATTEMPT_RESERVATION_SECONDS = 600.0
+REVIEWER_CLAIM_BOUND_STATE = "reviewer_claim_bound"
+_LAUNCH_RESERVATION_ADMISSION_RECOVERY = object()
 WORKER_BRIDGE_AUTHORIZED_PROCESS_STATES = {"starting", "running"}
 _PERSISTED_WATCH_UNKNOWN_MAX_CONSECUTIVE = 3
 FINALIZATION_PENDING_STATES = {
@@ -357,6 +360,39 @@ FINALIZATION_PENDING_STATES = {
 # (``LAUNCHER_TERMINAL_SUBSTATUSES``, a named subset of the single terminal
 # vocabulary); imported here rather than restated (NF-2026-00339).
 TERMINAL_PROCESS_STATES = task_fsm.LAUNCHER_TERMINAL_SUBSTATUSES
+
+
+def _parse_durable_pid(value: Any) -> tuple[int, bool]:
+    """Return a positive durable PID, preserving malformed authority.
+
+    The boolean is true when a persisted value is ambiguous rather than a
+    trustworthy absent (zero/null) identity.  Every durable-identity caller
+    must fail closed on that signal instead of raising or treating it as dead.
+    """
+
+    if value is None or value == "":
+        return 0, False
+    if isinstance(value, bool):
+        return 0, True
+    try:
+        pid = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0, True
+    if pid < 0:
+        return 0, True
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        return 0, True
+    return pid, False
+
+
+def _reservation_deadline_is_live(value: Any) -> bool:
+    """Fail closed unless a finite positive reservation lease has expired."""
+
+    try:
+        deadline = float(value or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return True
+    return not math.isfinite(deadline) or deadline <= 0.0 or deadline > time.time()
 
 
 # Terminal-transition failures that prove the target card is no longer in a
@@ -4646,6 +4682,7 @@ class ProcessManager:
         # cross-process registry lock, keeps that amplified work off every
         # unrelated launch acknowledgement waiting on the same lock.
         snapshot = self._latest_by_request_stable()
+        unbound_claim_resolutions = self._resolve_unbound_reviewer_claims(snapshot[0])
         try:
             with self._lock, self._registry_lock():
                 # Re-prove the handed-in snapshot for this whole critical
@@ -4665,7 +4702,12 @@ class ProcessManager:
                     raise LaunchRejected("ledger_snapshot_unproven")
                 latest, generation = proven
                 self._reconcile_expired_starting_reservations(
-                    (latest, generation), resolved=True
+                    (latest, generation),
+                    resolved=True,
+                    _admission_recovery_authority=(
+                        _LAUNCH_RESERVATION_ADMISSION_RECOVERY
+                    ),
+                    _unbound_claim_resolutions=unbound_claim_resolutions,
                 )
                 if self._active_count(latest) >= _configured_limit():
                     raise LaunchRejected("concurrency_limit_reached")
@@ -4838,12 +4880,23 @@ class ProcessManager:
         # projection's cache identity, so this view can never be served a merge
         # fold. Folded a raw ``iter_events`` pass until NF-2026-00561 -- 2.19 s
         # per call against 7 ms cached, over ~20 sites and a 30 s reconciler.
-        return process_event_ledger.latest_events(
+        latest = process_event_ledger.latest_events(
             self.process_log_path,
             key_field="request_id",
             skip_event_kinds=(RUNTIME_NOTICE_EVENT_KIND,),
             replace=True,
         )
+        # Claim binding is an immutable event in its own right, not a second
+        # reservation.  Its payload is a complete snapshot of the reservation
+        # it binds so the cached replace projection stays one-pass and bounded;
+        # lifecycle consumers interpret that snapshot as the same logical
+        # ``starting`` attempt.  Raw ledger readers still see the distinct
+        # state, preserving exactly one starting reservation row per attempt.
+        for event in latest.values():
+            if event.get("state") == REVIEWER_CLAIM_BOUND_STATE:
+                event["state"] = "starting"
+                event["claim_binding_state"] = REVIEWER_CLAIM_BOUND_STATE
+        return latest
 
     def _latest_by_request_stable(
         self,
@@ -4914,7 +4967,32 @@ class ProcessManager:
         if not task_id or not runner or claim_epoch_int < 1:
             return "identity_incomplete"
         path = self._reviewer_terminal_intent_path(request_id)
-        if path.is_file():
+        try:
+            existing_raw, _opened = self._read_regular_intent(path)
+        except FileNotFoundError:
+            existing_raw = None
+        except (OSError, UnicodeError):
+            return "record_failed"
+        if existing_raw is not None:
+            try:
+                existing = json.loads(existing_raw)
+            except (UnicodeError, json.JSONDecodeError):
+                return "record_failed"
+            expected = {
+                "schema_id": REVIEWER_TERMINAL_INTENT_SCHEMA_ID,
+                "request_id": str(request_id),
+                "task_id": task_id,
+                "runner": runner,
+                "reviewer_claim_epoch": claim_epoch_int,
+                "substatus": self._REVIEWER_TERMINAL_INTENT_SUBSTATUS,
+                "blocked_reason": blocked_reason,
+            }
+            if not isinstance(existing, dict) or any(
+                existing.get(key) != value for key, value in expected.items()
+            ):
+                return "record_failed"
+            if not _is_bool_safe_int(existing.get("reviewer_claim_epoch")):
+                return "record_failed"
             return "already_recorded"
         try:
             write_json_0600(path, {
@@ -5024,6 +5102,30 @@ class ProcessManager:
         threaded through so one pass over many unbindable rows emits a bounded
         number of lines instead of one per row.
         """
+
+        if (
+            event.get("state") == "starting"
+            and event.get("topic") == "quality_review"
+            and "reviewer_claim_epoch" not in event
+        ):
+            # Reservations written before claim epochs were persisted cannot
+            # be bound to an exact task-store claim.  Preserve their original
+            # ledger-only retirement semantics: the blocked row releases the
+            # launch reservation, while deliberately creating no settlement
+            # intent that could mutate an unrelated or newly reclaimed card.
+            self._append_event({
+                "request_id": request_id,
+                "task_id": event.get("task_id"),
+                "runner": event.get("runner"),
+                "topic": event.get("topic"),
+                "adapter_id": event.get("adapter_id"),
+                "state": "blocked",
+                "blocked_reason": blocked_reason,
+                "reservation_expires_at_epoch": event.get(
+                    "reservation_expires_at_epoch"
+                ),
+            })
+            return True, diagnostics_left
 
         disposition = self._record_reviewer_terminal_intent(
             request_id, event, blocked_reason
@@ -5234,12 +5336,24 @@ class ProcessManager:
             # The directory is unwritable, so nothing could be recorded and the
             # caller must not treat this intent as reported.
             return False, remaining
+        # Diagnostics must never turn an already-rejected directory entry into
+        # an I/O operation on its target.  In particular, Path.read_bytes()
+        # follows symlinks and can block forever when the entry is a FIFO.
         try:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            size = path.stat().st_size
+            observed = path.lstat()
         except OSError:
-            digest = ""
-            size = -1
+            observed = None
+        digest = ""
+        size = -1 if observed is None else observed.st_size
+        if observed is not None and stat.S_ISREG(observed.st_mode):
+            try:
+                data, opened = self._read_regular_intent(path)
+            except (OSError, UnicodeError):
+                pass
+            else:
+                if (opened.st_dev, opened.st_ino) == (observed.st_dev, observed.st_ino):
+                    digest = hashlib.sha256(data.encode("utf-8")).hexdigest()
+                    size = opened.st_size
         recorded = self._append_intent_diagnostic({
             "schema_id": REVIEWER_TERMINAL_INTENT_DIAGNOSTIC_SCHEMA_ID,
             "recorded_at": _utcnow(),
@@ -5254,6 +5368,32 @@ class ProcessManager:
             unlink_if_regular(marker)
             return False, remaining
         return True, remaining - 1
+
+    @staticmethod
+    def _read_regular_intent(path: Path) -> tuple[str, os.stat_result]:
+        """Read one regular intent without following or blocking on a node."""
+
+        max_bytes = 1_048_576
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise OSError("nofollow intent reads are unavailable")
+        fd = os.open(path, flags | nofollow)
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OSError("terminal intent is not a regular file")
+            if opened.st_size > max_bytes:
+                raise OSError("terminal intent exceeds read bound")
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                raw = handle.read(max_bytes + 1)
+                if len(raw) > max_bytes:
+                    raise OSError("terminal intent exceeds read bound")
+                return raw, opened
+        finally:
+            if fd >= 0:
+                os.close(fd)
 
     def _diagnose_unsettleable_intent(
         self, path: Path, reason: str, remaining: int
@@ -5423,7 +5563,18 @@ class ProcessManager:
             return 0
         for path in intents:
             try:
-                raw = path.read_text(encoding="utf-8")
+                observed = path.lstat()
+                if not stat.S_ISREG(observed.st_mode):
+                    _recorded, diagnostics_left = self._diagnose_unsettleable_intent(
+                        path, "path_identity_mismatch", diagnostics_left
+                    )
+                    continue
+                raw, opened = self._read_regular_intent(path)
+                if (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino):
+                    _recorded, diagnostics_left = self._diagnose_unsettleable_intent(
+                        path, "path_identity_mismatch", diagnostics_left
+                    )
+                    continue
             except FileNotFoundError:
                 # The settler that won this intent retired it between the glob
                 # and this read.  That is the benign race the whole design
@@ -5473,6 +5624,11 @@ class ProcessManager:
                     path, "identity_unbindable", diagnostics_left
                 )
                 continue
+            if path != self._reviewer_terminal_intent_path(request_id):
+                _recorded, diagnostics_left = self._diagnose_unsettleable_intent(
+                    path, "path_identity_mismatch", diagnostics_left
+                )
+                continue
             substatus = str(
                 payload.get("substatus") or self._REVIEWER_TERMINAL_INTENT_SUBSTATUS
             ).strip()
@@ -5501,10 +5657,22 @@ class ProcessManager:
                     # and transitions nothing, instead of leaning on the
                     # store's CAS to absorb a second attempt.
                     try:
-                        held = json.loads(path.read_text(encoding="utf-8"))
+                        held_raw, locked_observed = self._read_regular_intent(path)
+                        held = json.loads(held_raw)
                     except (OSError, ValueError):
                         continue
-                    if held != payload:
+                    if (
+                        held != payload
+                        or path != self._reviewer_terminal_intent_path(request_id)
+                        or not stat.S_ISREG(locked_observed.st_mode)
+                        or (locked_observed.st_dev, locked_observed.st_ino)
+                        != (observed.st_dev, observed.st_ino)
+                    ):
+                        _recorded, diagnostics_left = (
+                            self._diagnose_unsettleable_intent(
+                                path, "path_identity_mismatch", diagnostics_left
+                            )
+                        )
                         continue
                     ok, state = task_store.mark_terminal_failure(
                         self.repo,
@@ -5528,15 +5696,46 @@ class ProcessManager:
                     # owed -- exactly what a crash, or a failed retire below,
                     # leaves behind.  The store proves that from the card it
                     # wrote rather than the launcher inferring it from a
-                    # refusal string.
-                    owed = ok or task_store.terminal_failure_already_applied(
-                        self.repo,
-                        task_id,
-                        str(state),
-                        runner=runner,
-                        substatus=substatus,
-                        request_id=request_id,
-                        claim_epoch=claim_epoch,
+                    # refusal string.  Only lease expiry requests card recovery;
+                    # every legacy terminal-intent reason retains this exact
+                    # settlement path without an extra TaskStore dependency.
+                    blocked_reason = str(payload.get("blocked_reason") or "")
+                    recovery_requested = (
+                        blocked_reason == "reservation_expired"
+                        or blocked_reason == "reservation_process_false"
+                        or blocked_reason.startswith(
+                            "preparation_heartbeat_stalled:"
+                        )
+                    )
+                    current_card: dict[str, Any] | None = None
+                    retry_already_applied = False
+                    if recovery_requested:
+                        current_card = task_store.get_task(self.repo, task_id)
+                        prior_retry = (
+                            current_card.get("terminal_retry")
+                            if isinstance(current_card, dict)
+                            else None
+                        )
+                        retry_already_applied = (
+                            isinstance(current_card, dict)
+                            and core._lifecycle_state(current_card) == "pending"
+                            and current_card.get("worker_status") == "unclaimed"
+                            and isinstance(prior_retry, dict)
+                            and prior_retry.get("request_id") == request_id
+                            and prior_retry.get("terminal_substatus") == substatus
+                        )
+                    owed = (
+                        ok
+                        or retry_already_applied
+                        or task_store.terminal_failure_already_applied(
+                            self.repo,
+                            task_id,
+                            str(state),
+                            runner=runner,
+                            substatus=substatus,
+                            request_id=request_id,
+                            claim_epoch=claim_epoch,
+                        )
                     )
                     if not owed:
                         # A final refusal that moved no card at all.  The
@@ -5603,6 +5802,34 @@ class ProcessManager:
                         )
                         if not recorded:
                             continue
+                    if (
+                        recovery_requested
+                        and owed
+                        and isinstance(current_card, dict)
+                        and not retry_already_applied
+                    ):
+                        # Reaper failures are operational launch episodes, not
+                        # actionable review evidence. With their exact failure
+                        # and callback durable above, route the same request
+                        # through canonical retry so the card is claimable.
+                        with core._REPOSITORY_SWITCH_LOCK:
+                            prior_repo_override = core._PROCESS_REPO_ROOT_OVERRIDE
+                            core._PROCESS_REPO_ROOT_OVERRIDE = self.repo
+                            try:
+                                retry = core.retry_terminal_task(
+                                    task_id,
+                                    request_id,
+                                    substatus,
+                                    reason=str(payload.get("blocked_reason") or ""),
+                                    topic="quality_review",
+                                )
+                            finally:
+                                core._PROCESS_REPO_ROOT_OVERRIDE = prior_repo_override
+                        if not retry.get("ok"):
+                            # The terminal intent remains the resumable owner.
+                            # A later pass observes the already-applied failure
+                            # and callback, then retries only this exact episode.
+                            continue
                     unlink_if_regular(path)
                     # A repaired intent may carry a marker from when it was
                     # still unbindable, and a retired one carries the marker
@@ -5650,6 +5877,60 @@ class ProcessManager:
             self._diagnose_settlement_pass_failure(error)
             return 0
 
+    def _resolve_unbound_reviewer_claims(
+        self, candidate_latest: dict[str, dict[str, Any]]
+    ) -> dict[str, tuple[str, int | None]]:
+        """Resolve expired unbound reviewer claims without the registry lock."""
+
+        resolutions: dict[str, tuple[str, int | None]] = {}
+        resolution_now = time.time()
+        for request_id, event in candidate_latest.items():
+            if (
+                event.get("state") != "starting"
+                or event.get("topic") != "quality_review"
+                or event.get("reviewer_claim_epoch") is not None
+            ):
+                continue
+            try:
+                deadline = float(event.get("reservation_expires_at_epoch"))
+            except (TypeError, ValueError):
+                continue
+            if not (
+                0.0 < deadline < float("inf") and deadline < resolution_now
+            ):
+                continue
+            task_id = str(event.get("task_id") or "").strip()
+            runner = str(event.get("runner") or "").strip()
+            if not task_id or not runner:
+                continue
+            try:
+                card = task_store.get_task(self.repo, task_id)
+            except Exception:  # noqa: BLE001 -- store ambiguity fails closed
+                continue
+            if card is None:
+                resolutions[request_id] = ("legacy", None)
+                continue
+            if not isinstance(card, dict):
+                continue
+            status = str(card.get("status") or "").strip().lower()
+            worker_status = str(card.get("worker_status") or "").strip().lower()
+            claimed_by = str(card.get("claimed_by") or "").strip()
+            launch_request_id = str(card.get("launch_request_id") or "").strip()
+            if status == "pending" and worker_status == "unclaimed" and not claimed_by:
+                resolutions[request_id] = ("legacy", None)
+                continue
+            claim_epoch = card.get("claim_epoch")
+            if (
+                status == "processing"
+                and worker_status == "claimed"
+                and claimed_by == runner
+                and launch_request_id == request_id
+                and _is_bool_safe_int(claim_epoch)
+                and int(cast(int, claim_epoch)) > 0
+            ):
+                resolutions[request_id] = ("exact", int(cast(int, claim_epoch)))
+        return resolutions
+
     def _reconcile_expired_starting_reservations(
         self,
         snapshot: tuple[
@@ -5657,6 +5938,8 @@ class ProcessManager:
         ] | None = None,
         *,
         resolved: bool = False,
+        _admission_recovery_authority: object | None = None,
+        _unbound_claim_resolutions: dict[str, tuple[str, int | None]] | None = None,
     ) -> int:
         """Truthfully terminalize pid-null starting reservations that expired.
 
@@ -5675,9 +5958,11 @@ class ProcessManager:
         rather than terminalized by its elapsed epoch.
 
         ``snapshot`` is a stable ledger snapshot the caller already took with
-        the registry lock RELEASED; see ``_resolved_reservation_snapshot`` for
-        why that hand-off preserves the exact no-hidden-append authority.
-        Callers that hold no lock omit it and pay for their own snapshot.
+        the registry lock RELEASED.  A caller that has not already proved it
+        is routed through the registry lock here and the generation is proved
+        again only after acquisition.  Thus every terminal intent/event shares
+        the exact serialization boundary with spawn commit, even when this
+        method is entered directly by the periodic reconciler.
 
         ``resolved`` states that the caller ALREADY re-proved that snapshot
         with its own sweep, inside this same lock acquisition, and shares the
@@ -5695,6 +5980,26 @@ class ProcessManager:
         unbindable rows cannot turn a single pass into an unbounded burst of
         marker and ledger writes.
         """
+
+        if not resolved:
+            candidate = snapshot or self._latest_by_request_stable()
+            candidate_latest = candidate[0] if isinstance(candidate, tuple) else candidate
+            unbound_claim_resolutions = self._resolve_unbound_reviewer_claims(
+                candidate_latest
+            )
+            with self._lock, self._registry_lock():
+                proven = self._resolved_reservation_snapshot(candidate)
+                if proven is None:
+                    # A newer row may be spawn/process authority for an exact
+                    # request this pass was about to retire.  Ambiguity always
+                    # preserves that authority and retries on a later scan.
+                    return 0
+                return self._reconcile_expired_starting_reservations(
+                    proven,
+                    resolved=True,
+                    _admission_recovery_authority=_admission_recovery_authority,
+                    _unbound_claim_resolutions=unbound_claim_resolutions,
+                )
 
         now = time.time()
         # The exact requests this pass retired, in ledger order.  It is both
@@ -5714,14 +6019,25 @@ class ProcessManager:
         for request_id, event in latest.items():
             state = event.get("state")
             if state == "provider_spawn_committed":
-                provider_pid = int(event.get("provider_pid") or 0)
-                if provider_pid:
-                    if (
+                provider_pid, provider_pid_ambiguous = _parse_durable_pid(
+                    event.get("provider_pid")
+                )
+                if provider_pid_ambiguous:
+                    continue
+                try:
+                    provider_identity = (
                         _pid_identity_evidence(
                             provider_pid, event.get("provider_pid_start_ticks")
                         ).verdict
-                        is not PidIdentityVerdict.MISMATCH
-                    ):
+                        if provider_pid
+                        else None
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    # Malformed persisted identity is ambiguous. Preserve this
+                    # row and continue the pass so it cannot contain later rows.
+                    continue
+                if provider_pid:
+                    if provider_identity is not PidIdentityVerdict.MISMATCH:
                         # A live provider is never terminalized by elapsed or
                         # quiet time, even when its bounded owner is gone.
                         continue
@@ -5736,10 +6052,25 @@ class ProcessManager:
                     if terminalized:
                         retired.append(request_id)
                     continue
-                owner_pid = int(event.get("owner_pid") or 0)
-                if owner_pid and _pid_identity_evidence(
-                    owner_pid, event.get("owner_pid_start_ticks")
-                ).verdict is PidIdentityVerdict.MISMATCH:
+                owner_pid, owner_pid_ambiguous = _parse_durable_pid(
+                    event.get("owner_pid")
+                )
+                if owner_pid_ambiguous:
+                    continue
+                try:
+                    owner_identity = (
+                        _pid_identity_evidence(
+                            owner_pid, event.get("owner_pid_start_ticks")
+                        ).verdict
+                        if owner_pid
+                        else None
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if (
+                    owner_pid
+                    and owner_identity is PidIdentityVerdict.MISMATCH
+                ):
                     terminalized, diagnostics_left = (
                         self._terminalize_committed_reservation(
                             request_id,
@@ -5753,25 +6084,94 @@ class ProcessManager:
                 continue
             if state != "starting":
                 continue
-            pid = int(event.get("pid") or 0)
+            try:
+                reservation_deadline = float(
+                    event.get("reservation_expires_at_epoch")
+                )
+            except (TypeError, ValueError):
+                # Missing or malformed lease authority is ambiguous. Preserve
+                # the reservation and contain the bad row so other candidates
+                # in this pass can still be reconciled.
+                continue
+            if not (0.0 < reservation_deadline < float("inf")):
+                # Zero, negative, NaN, and infinite deadlines cannot authorize
+                # retirement. Fail closed instead of treating them as expired.
+                continue
+            if reservation_deadline >= now:
+                # No classification, including a stalled preparation
+                # heartbeat or disproved PID, can bypass the exact lease.
+                continue
+            if (
+                event.get("topic") == "quality_review"
+                and event.get("reviewer_claim_epoch") is None
+            ):
+                resolution = (_unbound_claim_resolutions or {}).get(request_id)
+                if resolution is None:
+                    # Canonical state was unavailable, mismatched, newer, or
+                    # otherwise ambiguous when read outside the registry lock.
+                    continue
+                resolution_kind, resolved_epoch = resolution
+                if resolution_kind == "exact" and resolved_epoch is not None:
+                    bound = dict(event)
+                    bound["reviewer_claim_epoch"] = resolved_epoch
+                    bound["claim_binding_state"] = "reviewer_claim_bound"
+                    self._append_event(bound)
+                    latest[request_id] = bound
+                    event = bound
+                elif resolution_kind != "legacy":
+                    continue
+            pid, pid_ambiguous = _parse_durable_pid(event.get("pid"))
+            if pid_ambiguous:
+                continue
+            try:
+                identity = (
+                    _pid_identity_evidence(
+                        pid, event.get("pid_start_ticks")
+                    ).verdict
+                    if pid
+                    else None
+                )
+            except (TypeError, ValueError, OverflowError):
+                # A malformed PID or start-tick value cannot prove absence or
+                # mismatch. Preserve this row without aborting the whole pass.
+                continue
             if pid:
-                if (
-                    _pid_identity_evidence(pid, event.get("pid_start_ticks")).verdict
-                    is PidIdentityVerdict.MISMATCH
-                ):
-                    self._append_event({
-                        "request_id": request_id,
-                        "task_id": event.get("task_id"),
-                        "runner": event.get("runner"),
-                        "topic": event.get("topic"),
-                        "adapter_id": event.get("adapter_id"),
-                        "state": "blocked",
-                        "blocked_reason": "reservation_process_false",
-                        "reservation_expires_at_epoch": event.get(
-                            "reservation_expires_at_epoch"
-                        ),
-                    })
-                    retired.append(request_id)
+                if identity is PidIdentityVerdict.MISMATCH:
+                    terminalized, diagnostics_left = (
+                        self._terminalize_committed_reservation(
+                            request_id,
+                            event,
+                            "reservation_process_false",
+                            diagnostics_left,
+                        )
+                    )
+                    if terminalized:
+                        retired.append(request_id)
+                # Exact PID/start-identity mismatch independently disproves
+                # the recorded owner, regardless of its nominal lease. Live
+                # and ambiguous identities preserve the reservation.
+                continue
+            owner_pid, owner_pid_ambiguous = _parse_durable_pid(
+                event.get("owner_pid")
+            )
+            if owner_pid_ambiguous:
+                continue
+            try:
+                owner_identity = (
+                    _pid_identity_evidence(
+                        owner_pid, event.get("owner_pid_start_ticks")
+                    ).verdict
+                    if owner_pid
+                    else None
+                )
+            except (TypeError, ValueError, OverflowError):
+                # A malformed preparation-owner identity cannot authorize
+                # retirement.  Contain the row and fail closed.
+                continue
+            if owner_pid and owner_identity is not PidIdentityVerdict.MISMATCH:
+                # Every pid-null preparation phase remains owned while the
+                # exact reserving process matches. UNKNOWN is ambiguous and
+                # therefore preserves too, even after the nominal lease.
                 continue
             if self._reviewer_source_graph_prewarm_live_event(event):
                 # A live owned prewarm keeps extending its own liveness; the
@@ -5784,43 +6184,29 @@ class ProcessManager:
                 preparation_phase=event.get("preparation_phase"),
             )
             if preparation_stall["preparation_stalled"]:
-                # A frozen preparation heartbeat is invisible to pid-based
-                # liveness because a launch that never spawned has no pid. Fail
-                # it here with a named reason instead of holding the pid-null
-                # reservation alive until its window merely expires.
-                self._append_event({
-                    "request_id": request_id,
-                    "task_id": event.get("task_id"),
-                    "runner": event.get("runner"),
-                    "topic": event.get("topic"),
-                    "adapter_id": event.get("adapter_id"),
-                    "state": "blocked",
-                    "blocked_reason": preparation_stall["reason"],
-                    "preparation_phase": event.get("preparation_phase"),
-                    "preparation_heartbeat_epoch": event.get(
-                        "preparation_heartbeat_epoch"
-                    ),
-                    "reservation_expires_at_epoch": event.get(
-                        "reservation_expires_at_epoch"
-                    ),
-                })
+                # A frozen preparation heartbeat distinguishes the stable
+                # terminal reason once the exact reservation lease has expired.
+                terminalized, diagnostics_left = (
+                    self._terminalize_committed_reservation(
+                        request_id,
+                        event,
+                        preparation_stall["reason"],
+                        diagnostics_left,
+                    )
+                )
+                if terminalized:
+                    retired.append(request_id)
+                continue
+            terminalized, diagnostics_left = (
+                self._terminalize_committed_reservation(
+                    request_id,
+                    event,
+                    "reservation_expired",
+                    diagnostics_left,
+                )
+            )
+            if terminalized:
                 retired.append(request_id)
-                continue
-            if float(event.get("reservation_expires_at_epoch") or 0.0) >= now:
-                continue
-            self._append_event({
-                "request_id": request_id,
-                "task_id": event.get("task_id"),
-                "runner": event.get("runner"),
-                "topic": event.get("topic"),
-                "adapter_id": event.get("adapter_id"),
-                "state": "blocked",
-                "blocked_reason": "reservation_expired",
-                "reservation_expires_at_epoch": event.get(
-                    "reservation_expires_at_epoch"
-                ),
-            })
-            retired.append(request_id)
         # Mirror this pass's OWN appends into the snapshot it was proved on.
         # A caller sharing the dict (``resolved=True``) decides admission from
         # it with no second parse, so it has to keep describing the ledger
@@ -6045,13 +6431,23 @@ class ProcessManager:
         for request_id, event in latest.items():
             state = event.get("state")
             if state == "provider_spawn_committed":
-                provider_pid = int(event.get("provider_pid") or 0)
+                provider_pid, provider_pid_ambiguous = _parse_durable_pid(
+                    event.get("provider_pid")
+                )
+                if provider_pid_ambiguous:
+                    active.add(request_id)
+                    continue
                 if provider_pid and _pid_identity_evidence(
                     provider_pid, event.get("provider_pid_start_ticks")
                 ).verdict is not PidIdentityVerdict.MISMATCH:
                     active.add(request_id)
                     continue
-                owner_pid = int(event.get("owner_pid") or 0)
+                owner_pid, owner_pid_ambiguous = _parse_durable_pid(
+                    event.get("owner_pid")
+                )
+                if owner_pid_ambiguous:
+                    active.add(request_id)
+                    continue
                 if owner_pid and _pid_identity_evidence(
                     owner_pid, event.get("owner_pid_start_ticks")
                 ).verdict is not PidIdentityVerdict.MISMATCH:
@@ -6059,7 +6455,10 @@ class ProcessManager:
                 continue
             if state not in ACTIVE_PROCESS_STATES:
                 continue
-            pid = int(event.get("pid") or 0)
+            pid, pid_ambiguous = _parse_durable_pid(event.get("pid"))
+            if pid_ambiguous:
+                active.add(request_id)
+                continue
             ticks = event.get("pid_start_ticks")
             if (
                 state == "starting"
@@ -6068,14 +6467,25 @@ class ProcessManager:
             ):
                 active.add(request_id)
                 continue
-            if (
-                state == "starting"
-                and not pid
-                and float(event.get("reservation_expires_at_epoch") or 0.0)
-                > time.time()
-            ):
-                active.add(request_id)
-                continue
+            if state == "starting" and not pid:
+                try:
+                    reservation_deadline = float(
+                        event.get("reservation_expires_at_epoch") or 0.0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    # An unreadable lease is ambiguous authority, not proof
+                    # that the reservation is dead.  Keep admission bounded
+                    # and fail closed while reconciliation preserves it for
+                    # explicit repair.
+                    active.add(request_id)
+                    continue
+                if (
+                    reservation_deadline <= 0.0
+                    or reservation_deadline != reservation_deadline
+                    or reservation_deadline > time.time()
+                ):
+                    active.add(request_id)
+                    continue
             if (
                 pid
                 and _pid_identity_evidence(pid, ticks).verdict
@@ -6980,6 +7390,8 @@ class ProcessManager:
         if base.get("owner_pid"):
             event["owner_pid"] = base.get("owner_pid")
             event["owner_pid_start_ticks"] = base.get("owner_pid_start_ticks")
+        if base.get("reviewer_claim_epoch") is not None:
+            event["reviewer_claim_epoch"] = base.get("reviewer_claim_epoch")
         if detail:
             event["preparation_detail"] = str(detail)[:300]
         self._append_event(event)
@@ -7053,12 +7465,18 @@ class ProcessManager:
                 continue
             state = event.get("state")
             if state == "provider_spawn_committed":
-                provider_pid = int(event.get("provider_pid") or 0)
+                provider_pid, provider_pid_ambiguous = _parse_durable_pid(
+                    event.get("provider_pid")
+                )
+                if provider_pid_ambiguous:
+                    return _admit(request_id)
                 if provider_pid and _pid_identity_evidence(
                     provider_pid, event.get("provider_pid_start_ticks")
                 ).verdict is not PidIdentityVerdict.MISMATCH:
                     return _admit(request_id)
-                owner_pid = int(event.get("owner_pid") or 0)
+                owner_pid, owner_pid_ambiguous = _parse_durable_pid(event.get("owner_pid"))
+                if owner_pid_ambiguous:
+                    return _admit(request_id)
                 if owner_pid and _pid_identity_evidence(
                     owner_pid, event.get("owner_pid_start_ticks")
                 ).verdict is not PidIdentityVerdict.MISMATCH:
@@ -7066,14 +7484,39 @@ class ProcessManager:
                 continue
             if state not in ACTIVE_PROCESS_STATES:
                 continue
-            pid = int(event.get("pid") or 0)
+            pid, pid_ambiguous = _parse_durable_pid(event.get("pid"))
+            if pid_ambiguous:
+                return _admit(request_id)
             if state == "starting" and not pid:
+                owner_pid, owner_pid_ambiguous = _parse_durable_pid(event.get("owner_pid"))
+                if owner_pid_ambiguous:
+                    return _admit(request_id)
+                owner_identity = (
+                    _pid_identity_evidence(
+                        owner_pid, event.get("owner_pid_start_ticks")
+                    ).verdict
+                    if owner_pid > 0
+                    else None
+                )
+                if (
+                    owner_pid > 0
+                    and owner_identity is not PidIdentityVerdict.MISMATCH
+                ):
+                    return _admit(request_id)
                 if self._reviewer_source_graph_prewarm_live_event(event):
                     return _admit(request_id)
-                if (
-                    float(event.get("reservation_expires_at_epoch") or 0.0)
-                    > time.time()
-                ):
+                try:
+                    reservation_deadline = float(
+                        event.get("reservation_expires_at_epoch") or 0.0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    # A malformed lease is ambiguous evidence.  Admission must
+                    # preserve the reservation instead of raising and allowing
+                    # a retry to mint a second provider.
+                    return _admit(request_id)
+                if not math.isfinite(reservation_deadline):
+                    return _admit(request_id)
+                if reservation_deadline > time.time():
                     return _admit(request_id)
                 continue
             if (
@@ -7112,6 +7555,7 @@ class ProcessManager:
         # cross-process registry lock, keeps that amplified work off every
         # unrelated reservation acknowledgement waiting on the same lock.
         snapshot = self._latest_by_request_stable()
+        unbound_claim_resolutions = self._resolve_unbound_reviewer_claims(snapshot[0])
         try:
             with self._lock, self._registry_lock():
                 # ONE proven snapshot backs this whole critical section, and
@@ -7127,7 +7571,9 @@ class ProcessManager:
                     return {"ok": False, "error": "ledger_snapshot_unproven"}
                 latest = proven[0]
                 self._reconcile_expired_starting_reservations(
-                    proven, resolved=True
+                    proven,
+                    resolved=True,
+                    _unbound_claim_resolutions=unbound_claim_resolutions,
                 )
                 existing = self._live_reviewer_receipt(
                     reviewer_task_id,
@@ -7179,6 +7625,148 @@ class ProcessManager:
 
         latest = self._latest_by_request().get(request_id) or {}
         return latest.get("state") == "starting"
+
+    def _bind_reviewer_claim_epoch(
+        self, request_id: str, reviewer_claim_epoch: int
+    ) -> bool:
+        """Durably bind a just-committed reviewer claim to its reservation."""
+
+        snapshot = self._latest_by_request_stable()
+        with self._registry_lock():
+            proven = self._proven_reservation_snapshot(snapshot)
+            if proven is None:
+                return False
+            latest = proven[0].get(request_id) or {}
+            if latest.get("state") != "starting":
+                return False
+            existing = latest.get("reviewer_claim_epoch")
+            if existing is not None:
+                return existing == reviewer_claim_epoch
+            bound = dict(latest)
+            bound.pop("claim_binding_state", None)
+            bound["state"] = REVIEWER_CLAIM_BOUND_STATE
+            bound["reviewer_claim_epoch"] = reviewer_claim_epoch
+            self._append_event(bound)
+            return True
+
+    def _retain_ambiguous_reviewer_claim_for_reconciliation(
+        self, request_id: str, reviewer_task_id: str, runner: str
+    ) -> bool:
+        """Persist authority to recover a claim whose commit result is unreadable."""
+
+        with self._registry_lock():
+            latest = self._latest_by_request().get(request_id) or {}
+            if (
+                latest.get("state") != "starting"
+                or latest.get("task_id") != reviewer_task_id
+                or latest.get("runner") != runner
+            ):
+                return False
+            if latest.get("reviewer_claim_epoch") is not None:
+                return True
+            if latest.get("claim_recovery_state") == "claim_commit_ambiguous":
+                return True
+            retained = dict(latest)
+            retained["claim_recovery_state"] = "claim_commit_ambiguous"
+            retained["claim_recovery_reason"] = (
+                "quality_review_claim_receipt_and_canonical_read_failed"
+            )
+            self._append_event(retained)
+            return True
+
+    def _recover_ambiguous_reviewer_claims(self) -> int:
+        """Bind exact canonical claim epochs for retryable ambiguous reservations."""
+
+        latest, generation = self._latest_by_request_stable()
+        if generation is None:
+            return 0
+        recovered = 0
+        for request_id, event in latest.items():
+            if (
+                event.get("state") != "starting"
+                or event.get("topic") != "quality_review"
+                or event.get("claim_recovery_state") != "claim_commit_ambiguous"
+                or event.get("reviewer_claim_epoch") is not None
+            ):
+                continue
+            task_id = str(event.get("task_id") or "").strip()
+            runner = str(event.get("runner") or "").strip()
+            if not task_id or not runner:
+                continue
+            try:
+                card = task_store.get_task(self.repo, task_id)
+            except Exception:  # noqa: BLE001 -- transient store failure retries
+                continue
+            if not isinstance(card, dict):
+                continue
+            claim_epoch = card.get("claim_epoch")
+            if (
+                card.get("status") != "processing"
+                or card.get("worker_status") != "claimed"
+                or card.get("claimed_by") != runner
+                or card.get("launch_request_id") != request_id
+                or not _is_bool_safe_int(claim_epoch)
+                or int(cast(int, claim_epoch)) < 1
+            ):
+                continue
+            if self._bind_reviewer_claim_epoch(
+                request_id, int(cast(int, claim_epoch))
+            ):
+                recovered += 1
+        return recovered
+
+    def _retain_reviewer_claim_for_reconciliation(
+        self, request_id: str, reviewer_task_id: str, reviewer_claim_epoch: int
+    ) -> bool:
+        """Bind authenticated claim authority after binding and release both fail."""
+
+        with self._registry_lock():
+            latest = self._latest_by_request().get(request_id) or {}
+            if (
+                latest.get("state") != "starting"
+                or latest.get("task_id") != reviewer_task_id
+            ):
+                return False
+            existing = latest.get("reviewer_claim_epoch")
+            if existing is not None:
+                return existing == reviewer_claim_epoch
+            bound = dict(latest)
+            bound.pop("claim_binding_state", None)
+            bound["state"] = REVIEWER_CLAIM_BOUND_STATE
+            bound["reviewer_claim_epoch"] = reviewer_claim_epoch
+            bound["claim_recovery_reason"] = (
+                "quality_review_claim_binding_and_release_failed"
+            )
+            self._append_event(bound)
+            return True
+
+    def _release_or_retain_reviewer_claim_after_launch_failure(
+        self,
+        *,
+        request_id: str,
+        task_id: str,
+        runner: str,
+        reviewer_claim_epoch: int,
+        reason: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Release an exact claimed reviewer, or retain it for lease recovery."""
+
+        released = task_engine.mark_launch_failed(
+            self.repo,
+            task_id,
+            runner,
+            reason=reason[:500],
+            request_id=request_id,
+        )
+        if released.get("ok"):
+            return released, False
+        try:
+            retained = self._retain_reviewer_claim_for_reconciliation(
+                request_id, task_id, reviewer_claim_epoch
+            )
+        except Exception:  # noqa: BLE001 -- caller must emit terminal diagnostics
+            retained = False
+        return released, retained
 
     def _reviewer_provider_committed(self, request_id: str) -> bool:
         """True once a real reviewer provider process exists for the request.
@@ -7398,6 +7986,11 @@ class ProcessManager:
             terminal_intent_recorded = self._record_reviewer_terminal_intent(
                 request_id, latest, reason
             ) in {"recorded", "already_recorded"}
+            if (
+                not terminal_intent_recorded
+                and latest.get("reviewer_claim_epoch") is not None
+            ):
+                return
             self._blocked(
                 task_id, runner, "quality_review", adapter_id, reason,
                 request_id=request_id,
@@ -7421,14 +8014,16 @@ class ProcessManager:
             return False
         if event.get("preparation_phase") != "reviewer_source_graph_prewarm_started":
             return False
-        owner_pid = int(event.get("owner_pid") or 0)
-        if owner_pid <= 0:
+        owner_pid, owner_pid_ambiguous = _parse_durable_pid(event.get("owner_pid"))
+        if owner_pid_ambiguous:
+            return True
+        if not owner_pid:
             return False
         return (
             _pid_identity_evidence(
                 owner_pid, event.get("owner_pid_start_ticks")
             ).verdict
-            is PidIdentityVerdict.MATCH
+            is not PidIdentityVerdict.MISMATCH
         )
 
     def _reviewer_source_graph_prewarm_live(self, request_id: str) -> bool:
@@ -7746,15 +8341,88 @@ class ProcessManager:
             )
             return _fail(reason)
         try:
-            _committed_claim_card(
+            claimed_card = _committed_claim_card(
                 claim,
                 request_id=request_id,
                 task_id=reviewer_task_id,
                 runner=runner,
                 topic="quality_review",
             )
-        except LaunchRejected as exc:
-            return _fail(f"quality_review_claim_failed:{exc}"[:500])
+        except LaunchRejected as receipt_exc:
+            try:
+                canonical = _parse_card(
+                    self._show_task(reviewer_task_id), reviewer_task_id
+                )
+                claimed_card = _committed_claim_card(
+                    {
+                        "ok": True,
+                        "returncode": 0,
+                        "stdout": json.dumps(canonical),
+                    },
+                    request_id=request_id,
+                    task_id=reviewer_task_id,
+                    runner=runner,
+                    topic="quality_review",
+                )
+            except LaunchRejected as recovery_exc:
+                recovery_retained = False
+                try:
+                    recovery_retained = (
+                        self._retain_ambiguous_reviewer_claim_for_reconciliation(
+                            request_id, reviewer_task_id, runner
+                        )
+                    )
+                except Exception:  # noqa: BLE001 -- return stable retry evidence
+                    recovery_retained = False
+                return {
+                    "ok": False,
+                    "error": f"quality_review_claim_failed:{receipt_exc}"[:500],
+                    "recovery_state": "starting_reservation_retained",
+                    "claim_recovery_bound": recovery_retained,
+                    "claim_recovery_error": str(recovery_exc)[:500],
+                }
+        claim_epoch = claimed_card.get("claim_epoch")
+        binding_persisted = False
+        if type(claim_epoch) is int and claim_epoch >= 1:
+            try:
+                binding_persisted = self._bind_reviewer_claim_epoch(
+                    request_id, claim_epoch
+                )
+            except Exception:  # noqa: BLE001 -- claim must never be stranded
+                binding_persisted = False
+        if not binding_persisted:
+            # Terminalize the reservation only after the canonical task release
+            # succeeds.  If that CAS/store operation fails, preserving the
+            # starting reservation keeps it eligible for the periodic reaper.
+            released = task_engine.mark_launch_failed(
+                self.repo,
+                reviewer_task_id,
+                runner,
+                reason="quality_review_claim_binding_failed",
+                request_id=request_id,
+            )
+            if released.get("ok") is not True:
+                recovery_bound = False
+                if type(claim_epoch) is int and claim_epoch >= 1:
+                    try:
+                        recovery_bound = self._retain_reviewer_claim_for_reconciliation(
+                            request_id, reviewer_task_id, claim_epoch
+                        )
+                    except Exception:  # noqa: BLE001 -- report retryable evidence
+                        recovery_bound = False
+                return {
+                    "ok": False,
+                    "error": "quality_review_claim_binding_failed",
+                    "recovery_state": "starting_reservation_retained",
+                    "claim_recovery_bound": recovery_bound,
+                    "release_error": str(
+                        released.get("stderr")
+                        or released.get("stdout")
+                        or released.get("error")
+                        or ""
+                    )[:500],
+                }
+            return _fail("quality_review_claim_binding_failed")
         durable_error = _verify_durable(require_launch_request=True)
         if durable_error is not None:
             return durable_error
@@ -8832,18 +9500,39 @@ class ProcessManager:
             # false review-ready launch failures.  A card already claimed by
             # auto-pickup, or claimed later in this launch, is instead moved to
             # the truthful blocked/launch_failed state below.
+            claim_release_retained = False
             if claimed:
-                blocked_result = task_engine.mark_launch_failed(
-                    self.repo,
-                    task_id,
-                    runner,
-                    reason=reason[:500],
-                    request_id=request_id or reserved_request_id or "",
-                )
+                claim_epoch = card.get("claim_epoch")
+                if (
+                    reserved_request_id is not None
+                    and type(claim_epoch) is int
+                    and claim_epoch >= 1
+                ):
+                    blocked_result, claim_release_retained = (
+                        self._release_or_retain_reviewer_claim_after_launch_failure(
+                            request_id=reserved_request_id,
+                            task_id=task_id,
+                            runner=runner,
+                            reviewer_claim_epoch=claim_epoch,
+                            reason=reason,
+                        )
+                    )
+                else:
+                    blocked_result = task_engine.mark_launch_failed(
+                        self.repo,
+                        task_id,
+                        runner,
+                        reason=reason[:500],
+                        request_id=request_id or reserved_request_id or "",
+                    )
                 if not blocked_result.get("ok"):
-                    reason += ":launch_failure_transition_failed:" + str(
-                        blocked_result.get("stderr") or ""
+                    release_detail = str(
+                        blocked_result.get("stderr")
+                        or blocked_result.get("stdout")
+                        or blocked_result.get("error")
+                        or ""
                     )[:200]
+                    reason += ":launch_failure_transition_failed:" + release_detail
             else:
                 blocker_result = task_engine.record_launch_blocker(
                     self.repo,
@@ -8868,6 +9557,21 @@ class ProcessManager:
                 unlink_if_regular(spec_path)
             if authority_path is not None:
                 unlink_if_regular(authority_path)
+            if claim_release_retained:
+                return {
+                    "ok": False,
+                    "launch_implemented": LAUNCH_IMPLEMENTED,
+                    "launch_enabled": True,
+                    "request_id": reserved_request_id,
+                    "task_id": task_id,
+                    "runner": runner,
+                    "topic": topic,
+                    "adapter_id": adapter_id,
+                    "state": "starting",
+                    "reason": reason,
+                    "recovery_state": "starting_reservation_retained",
+                    "reviewer_claim_epoch": card["claim_epoch"],
+                }
             return self._blocked(
                 task_id,
                 runner,
@@ -8899,13 +9603,18 @@ class ProcessManager:
         for event in latest.values():
             if event.get("task_id") != task_id or event.get("state") not in ACTIVE_PROCESS_STATES:
                 continue
-            pid = int(event.get("pid") or 0)
+            pid, pid_ambiguous = _parse_durable_pid(event.get("pid"))
+            if pid_ambiguous:
+                raise LaunchRejected(
+                    f"duplicate_persisted_task:{event.get('request_id')}"
+                )
             ticks = event.get("pid_start_ticks")
             if (
                 event.get("state") == "starting"
                 and not pid
-                and float(event.get("reservation_expires_at_epoch") or 0.0)
-                > time.time()
+                and _reservation_deadline_is_live(
+                    event.get("reservation_expires_at_epoch")
+                )
             ):
                 raise LaunchRejected(
                     f"duplicate_reserved_task:{event.get('request_id')}"
@@ -8991,7 +9700,11 @@ class ProcessManager:
                         event.get("task_id") == task_id
                         and event.get("state") in ACTIVE_PROCESS_STATES
                     ):
-                        pid = int(event.get("pid") or 0)
+                        pid, pid_ambiguous = _parse_durable_pid(event.get("pid"))
+                        if pid_ambiguous:
+                            raise LaunchRejected(
+                                f"duplicate_persisted_task:{event.get('request_id')}"
+                            )
                         # PID identity evidence, consistently with every other
                         # admission check in this module (see
                         # _assert_no_duplicate_task, _active_request_ids,
@@ -10374,7 +11087,10 @@ class ProcessManager:
                     finalized += 1
                 continue
 
-            pid = int(event.get("pid") or 0)
+            pid, pid_ambiguous = _parse_durable_pid(event.get("pid"))
+            if pid_ambiguous or not pid:
+                # Malformed or absent durable identity cannot prove exit.
+                continue
             ticks = event.get("pid_start_ticks")
             verdict = _pid_identity_evidence(pid, ticks).verdict
             if verdict is PidIdentityVerdict.UNKNOWN:
@@ -10432,11 +11148,22 @@ class ProcessManager:
     def reconcile(self, *, include_gc: bool = True) -> dict[str, Any]:
         """One pass; ``include_gc`` controls the housekeeping half.
 
-        Finalizing exited workers is correctness (0.01 s measured) and runs
-        every pass. The sweep re-proves ~100 pinned predecessors at ~3 s each,
-        so bundling them made time-to-review hostage to garbage collection.
+        Process finalization and expired reviewer-reservation retirement are
+        correctness work and run every pass. The workspace sweep is optional
+        housekeeping because re-proving pinned predecessors is comparatively
+        expensive.
         """
+        ambiguous_claims_recovered = self._recover_ambiguous_reviewer_claims()
+        reservations_retired = self._reconcile_expired_starting_reservations()
+        # Retirement first records a durable terminal intent while holding only
+        # the registry lock. Settle the exact task claim after that lock is
+        # released; a transient store lock leaves the intent resumable for the
+        # next scan instead of losing or duplicating the terminal transition.
+        terminal_intents_settled = (
+            self._settle_reviewer_terminal_intents_contained()
+        )
         result = self._reconcile_persisted_requests()
+        result["ambiguous_claims_recovered"] = ambiguous_claims_recovered
         gc_result: dict[str, int] = (
             self._gc_finalized_workspaces()
             if include_gc
@@ -10452,7 +11179,15 @@ class ProcessManager:
                 self, db_path=review_db, events=self._latest_by_request())
             driver = review_orchestrator.ReviewOrchestrator(self, db_path=review_db)
             review_result = driver.drain(max_actions=1).as_dict()
-        return {"ok": True, **result, **gc_result, **review_result, **automation_result}
+        return {
+            "ok": True,
+            "reservations_retired": reservations_retired,
+            "terminal_intents_settled": terminal_intents_settled,
+            **result,
+            **gc_result,
+            **review_result,
+            **automation_result,
+        }
 
     def abandoned_finalizations(self) -> list[dict[str, Any]]:
         """Operator view of finalizers that terminally gave up.

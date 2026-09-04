@@ -182,15 +182,13 @@ def run_scan(
 ) -> dict[str, Any]:
     """Run one idempotent, bounded reconciliation scan.
 
-    Reuses ``ProcessManager.reconcile()`` (== ``_reconcile_persisted_requests``)
-    unchanged -- the SAME finalize path the isolated launcher already runs on
-    its own startup/status/cancel calls. A request whose supervisor is still
-    actively heartbeating is left untouched; a request whose supervisor
-    already produced a terminal status (or whose exact PID+start-tick
-    identity no longer exists) is finalized exactly once through the
-    existing scope/validate/promote/review-or-release path. Never touches
-    ``AITools/taskdb.py`` directly and never invokes any Claude/Codex/
-    DeepSeek/chat endpoint.
+    Reuses ProcessManager.reconcile() for both correctness paths: expired
+    pid-null reviewer reservations are terminalized and their durable intents
+    settled through the canonical task-store API, then exited workers follow
+    the existing finalize path. Exact PID/start-tick and spawn-commit evidence
+    keeps live or ambiguous reservations untouched. Repeated scans see the
+    terminal event and perform no second retirement transition. Never touches
+    AITools/taskdb.py directly and never invokes a model/chat endpoint.
     """
     mgr = manager or process_launcher.ProcessManager(repo=repo)
     result = mgr.reconcile(include_gc=include_gc)

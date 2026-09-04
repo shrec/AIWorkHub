@@ -5978,6 +5978,7 @@ def test_quality_review_prewarm_reconciliation_defers_live_owned_prewarm(
         show_task=_show(lambda: _card()),
         argv=[sys.executable, "-c", "pass"],
     )
+    process_launcher.task_store.initialize_repository(manager.repo)
     live_request = "req-live-prewarm-expired"
     _reserve_starting(
         manager,
@@ -6018,6 +6019,7 @@ def test_quality_review_prewarm_reconciliation_fails_closed_without_live_owner(
         show_task=_show(lambda: _card()),
         argv=[sys.executable, "-c", "pass"],
     )
+    process_launcher.task_store.initialize_repository(manager.repo)
     cases = {
         "req-dead-owner": {
             "owner_pid": 2**22 + 12345,
@@ -6052,7 +6054,7 @@ def test_quality_review_prewarm_reconciliation_fails_closed_without_live_owner(
         assert latest.get("blocked_reason") == "reservation_expired"
 
 
-def test_quality_review_prewarm_live_fails_closed_on_unknown_identity(
+def test_quality_review_prewarm_preserves_unknown_identity(
     tmp_path: Path,
 ) -> None:
     manager = _manager(
@@ -6062,8 +6064,8 @@ def test_quality_review_prewarm_live_fails_closed_on_unknown_identity(
     )
     request_id = "req-prewarm-unknown"
     # A positive owner pid whose start-ticks are missing yields UNKNOWN
-    # identity evidence.  Live prewarm ownership requires an exact MATCH, so
-    # UNKNOWN must fail closed rather than be treated as a live owned build.
+    # identity evidence.  UNKNOWN is ambiguous authority, so the reservation
+    # must be preserved rather than retired as if the owner were proven dead.
     manager._append_event({
         "request_id": request_id,
         "task_id": "TASK_B1",
@@ -6077,14 +6079,14 @@ def test_quality_review_prewarm_live_fails_closed_on_unknown_identity(
         "owner_pid_start_ticks": None,
     })
 
-    assert manager._reviewer_source_graph_prewarm_live(request_id) is False
+    assert manager._reviewer_source_graph_prewarm_live(request_id) is True
 
     reconciled = manager._reconcile_expired_starting_reservations()
 
-    assert reconciled == 1
+    assert reconciled == 0
     latest = manager._latest_by_request()[request_id]
-    assert latest.get("state") == "blocked"
-    assert latest.get("blocked_reason") == "reservation_expired"
+    assert latest.get("state") == "starting"
+    assert latest.get("blocked_reason") is None
 
 
 def _quality_review_card(task_id: str = "TASK_REVIEW_1") -> dict:
@@ -6975,14 +6977,14 @@ def test_unreadable_intent_bytes_are_named_once_and_never_confused_with_a_race(
     # depends on the filesystem and on whether the suite runs as root, so it
     # cannot state deterministically which branch is under test.
     injected: list[OSError] = [FileNotFoundError(errno.ENOENT, "already retired")]
-    exact_read_text = Path.read_text
+    exact_read_regular_intent = manager._read_regular_intent
 
-    def refusing_read_text(self, *args, **kwargs):
-        if self.name == intent_path.name:
+    def refusing_read_regular_intent(path):
+        if path.name == intent_path.name:
             raise injected[0]
-        return exact_read_text(self, *args, **kwargs)
+        return exact_read_regular_intent(path)
 
-    monkeypatch.setattr(Path, "read_text", refusing_read_text)
+    monkeypatch.setattr(manager, "_read_regular_intent", refusing_read_regular_intent)
 
     # The winner already retired it: nothing to report.
     for _ in range(2):
