@@ -19,6 +19,7 @@ import pytest
 
 from aiworkhub import process_event_ledger
 from aiworkhub import process_launcher
+from aiworkhub import task_store
 
 
 RUNNER = "deepseek_v4-pro"
@@ -26,11 +27,18 @@ TOPIC = "quality_review"
 ADAPTER = "vscode_lm"
 
 
-def _manager(tmp_path: Path) -> process_launcher.ProcessManager:
+def _manager(
+    tmp_path: Path, *, initialize_task_queue: bool = False
+) -> process_launcher.ProcessManager:
     # ``exist_ok`` so a test can build a SECOND manager over the same durable
     # process directory -- the exact shape of a crash-and-restart.
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
+    if initialize_task_queue:
+        # Ledger-only legacy cases require an authoritative task-not-found
+        # result. Initialize the canonical queue so absence is distinguishable
+        # from an unavailable TaskStore, which production correctly preserves.
+        task_store.initialize_repository(repo)
     return process_launcher.ProcessManager(
         repo=repo,
         process_log_path=tmp_path / "proc" / "process_events.jsonl",
@@ -237,7 +245,7 @@ def _running_spy(
 
 
 def test_expired_pid_null_starting_reservation_is_truthfully_terminalized(tmp_path):
-    manager = _manager(tmp_path)
+    manager = _manager(tmp_path, initialize_task_queue=True)
     manager._append_event(
         _starting(
             request_id="review-req-1",
@@ -275,7 +283,7 @@ def test_unexpired_pid_null_reservation_is_never_stolen(tmp_path):
 
 
 def test_pid_bearing_starting_reservation_process_false_is_reconciled(tmp_path):
-    manager = _manager(tmp_path)
+    manager = _manager(tmp_path, initialize_task_queue=True)
     # A pid with the wrong creation ticks is a proven identity mismatch, but
     # retirement still requires the reservation lease to have expired.
     manager._append_event(
@@ -338,7 +346,7 @@ def test_running_reviewer_returns_bounded_receipt(tmp_path):
 
 
 def test_launch_reservation_atomically_reconciles_before_duplicate_check(tmp_path):
-    manager = _manager(tmp_path)
+    manager = _manager(tmp_path, initialize_task_queue=True)
     manager._append_event(
         _starting(
             request_id="review-req-6",
@@ -363,7 +371,7 @@ def test_launch_reservation_atomically_reconciles_before_duplicate_check(tmp_pat
 
 
 def test_reconciliation_does_not_disturb_unrelated_requests(tmp_path):
-    manager = _manager(tmp_path)
+    manager = _manager(tmp_path, initialize_task_queue=True)
     manager._append_event(
         _starting(
             request_id="stale-req",
@@ -2342,7 +2350,7 @@ def test_stale_handed_in_snapshot_terminalizes_nothing(tmp_path):
     # snapshot that no longer describes the ledger may hide a row this pass
     # would contradict, so the pass defers exactly as an unstable bracketed
     # read does.
-    manager = _manager(tmp_path)
+    manager = _manager(tmp_path, initialize_task_queue=True)
     manager._append_event(
         _starting(
             request_id="review-stale-1",
@@ -2458,7 +2466,7 @@ def test_a_reservation_this_pass_retired_no_longer_blocks_its_own_relaunch(
     # the rows this pass retires have to be mirrored back into it.  Without
     # that mirror the CAS would still read the reservation it had just
     # terminalized as live, and refuse the relaunch of the very task it freed.
-    manager = _manager(tmp_path)
+    manager = _manager(tmp_path, initialize_task_queue=True)
     manager._append_event({
         "request_id": "stalled-req",
         "task_id": "STALLED_TASK",
