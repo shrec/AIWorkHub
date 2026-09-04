@@ -167,7 +167,9 @@ def test_active_state_definition_names_all_rule_branches():
     buckets = OWNED_CARD_STATUSES | CLOSED_CARD_STATUSES | REOPEN_CARD_STATUSES
     assert "pending" in buckets and "finished" in buckets and "superseded" in buckets
     assert "cancelled" in buckets or "canceled" in buckets
-    assert LINKABLE_CARD_STATUSES == OWNED_CARD_STATUSES | CLOSED_CARD_STATUSES
+    assert LINKABLE_CARD_STATUSES == (
+        OWNED_CARD_STATUSES | CLOSED_CARD_STATUSES
+    ) - {"archived"}
     # The three buckets are pairwise disjoint: a status landing in two buckets
     # would make derived state depend on evaluation order.
     assert OWNED_CARD_STATUSES.isdisjoint(CLOSED_CARD_STATUSES)
