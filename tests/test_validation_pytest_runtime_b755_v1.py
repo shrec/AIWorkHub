@@ -136,7 +136,10 @@ class TestApprovedSitePythonpath(unittest.TestCase):
                 self._assert_rejected_before_containment(component)
 
     @unittest.skipUnless(os.name == "nt", "covers the Windows in-process path")
-    def test_windows_in_process_pytest_validation_sets_approved_pythonpath(self) -> None:
+    @unittest.skipUnless(os.name == "nt", "requires Windows runtime authority")
+    def test_windows_in_process_pytest_validation_suppresses_redundant_pythonpath(
+        self,
+    ) -> None:
         scratch = self.root / "validation-scratch"
         scratch.mkdir()
         completed = worker_workspace.subprocess.CompletedProcess(
@@ -163,8 +166,10 @@ class TestApprovedSitePythonpath(unittest.TestCase):
             )
 
         self.assertEqual(results[0]["returncode"], 0)
+        self.assertNotIn("PYTHONPATH", run.call_args.kwargs["env"])
         self.assertEqual(
-            run.call_args.kwargs["env"]["PYTHONPATH"], str(self.site.resolve())
+            results[0]["env_override"]["suppressed_for"],
+            "module_validator_no_trusted_root",
         )
 
 
