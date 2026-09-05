@@ -109,6 +109,9 @@ _PATH_LIKE_TOKEN_RE = re.compile(
     r"^(?:\.\.?)$|[/\\]|::|\.(?:py|js|mjs|cjs|ts|tsx|jsx|json|md)$"
 )
 _PYTEST_NODEID_SELECTOR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Compiler include-root option whose path payload may be joined (``-Idir``) or
+# separated (``-I dir``); only the payload is validated, never the option prefix.
+_INCLUDE_ROOT_OPTION = "-I"
 _PYTHON_SUFFIXES = (".py",)
 _NODE_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx")
 _NODE_TEST_MARKERS = (".test", ".spec")
@@ -939,11 +942,30 @@ def validate_custom_validation_roles(
     for item in () if validation is None else validation:
         if not isinstance(item, str):
             raise TaskTemplateError("invalid_validation_not_string")
-        for token in item.split(" "):
-            if not token or not _PATH_LIKE_TOKEN_RE.search(token):
+        tokens = split_command_argv(item)
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            index += 1
+            if token == _INCLUDE_ROOT_OPTION:
+                # Separated include root (``-I dir``): the next token is the real
+                # path operand and is validated exactly like the joined ``-Idir``
+                # payload. A dangling ``-I`` or one whose operand is itself an
+                # option is malformed and rejected, never silently skipped.
+                if index >= len(tokens) or tokens[index].startswith("-"):
+                    raise TaskTemplateError("invalid_validation_embedded_path")
+                payload = tokens[index]
+                index += 1
+            elif token.startswith(_INCLUDE_ROOT_OPTION):
+                # Joined include root (``-Idir``): validate only the path payload
+                # so it matches the separated ``-I dir`` form exactly.
+                payload = token[len(_INCLUDE_ROOT_OPTION) :]
+            elif not token or not _PATH_LIKE_TOKEN_RE.search(token):
                 continue
+            else:
+                payload = token
             try:
-                _validated_validation_token(token)
+                _validated_validation_token(payload)
             except TaskTemplateError as exc:
                 raise TaskTemplateError("invalid_validation_embedded_path") from exc
     for item in () if validation_roles is None else validation_roles:

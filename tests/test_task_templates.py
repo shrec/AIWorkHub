@@ -737,6 +737,71 @@ def test_custom_validation_rejects_node_id_traversal_and_spoofing():
             validate_custom_validation_roles([command], ["generic"])
 
 
+@pytest.mark.parametrize("compiler", ["g++", "clang++"])
+def test_custom_validation_accepts_joined_and_separated_include_roots(compiler):
+    joined = f"{compiler} -Isrc/cpu/include -fsyntax-only src/cpu/src/scalar.cpp"
+    separated = f"{compiler} -I src/cpu/include -fsyntax-only src/cpu/src/scalar.cpp"
+    # Both include-root spellings resolve to the same validated path payload.
+    validate_custom_validation_roles([joined], ["generic"])
+    validate_custom_validation_roles([separated], ["generic"])
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "g++ -I/etc/include -fsyntax-only src/cpu/src/scalar.cpp",
+        "g++ -I../secret/include -fsyntax-only src/cpu/src/scalar.cpp",
+        "g++ -Isrc/../../secret -fsyntax-only src/cpu/src/scalar.cpp",
+        "clang++ -I src/../../secret -fsyntax-only src/cpu/src/scalar.cpp",
+        "g++ -I.. -fsyntax-only src/cpu/src/scalar.cpp",
+    ],
+)
+def test_custom_validation_rejects_unsafe_include_roots(unsafe):
+    with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+        validate_custom_validation_roles([unsafe], ["generic"])
+
+
+def test_custom_validation_include_root_does_not_skip_all_dash_tokens():
+    # A dash-prefixed token carrying an unsafe absolute path must still be
+    # rejected rather than skipped as a bare option.
+    with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+        validate_custom_validation_roles(
+            ["g++ -isystem/etc/passwd src/cpu/src/scalar.cpp"], ["generic"]
+        )
+
+
+@pytest.mark.parametrize("compiler", ["g++", "clang++"])
+def test_custom_validation_consumes_separated_include_operand(compiler):
+    # Empty commands carry no tokens. A separated ``-I`` consumes and validates
+    # its next token as the real include path, even a bare single-segment
+    # directory that is not itself path-like, matching the joined ``-Idir`` form.
+    validate_custom_validation_roles(
+        ["", f"{compiler} -I include -c src/cpu/src/scalar.cpp"], ["generic"]
+    )
+    validate_custom_validation_roles(
+        [f"{compiler} -I src/cpu/include -fsyntax-only src/cpu/src/scalar.cpp"],
+        ["generic"],
+    )
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "g++ -I -c src/cpu/src/scalar.cpp",
+        "clang++ -I -fsyntax-only src/cpu/src/scalar.cpp",
+        "g++ -fsyntax-only src/cpu/src/scalar.cpp -I",
+        "g++ -I",
+        "g++ -I ../secret -c src/cpu/src/scalar.cpp",
+    ],
+)
+def test_custom_validation_rejects_malformed_separated_include_option(malformed):
+    # A separated ``-I`` whose operand is another option, is missing entirely
+    # (dangling), or is an unsafe traversal path is malformed and rejected --
+    # never skipped as a bare dash-prefixed token.
+    with pytest.raises(TaskTemplateError, match="invalid_validation_embedded_path"):
+        validate_custom_validation_roles([malformed], ["generic"])
+
+
 def test_unchanged_required_public_test_outputs_fail_closed():
     with pytest.raises(
         TaskTemplateError, match="unchanged_required_public_test_output"

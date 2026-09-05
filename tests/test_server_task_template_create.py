@@ -113,6 +113,76 @@ def test_unclassified_raw_task_create_fails_without_escape(
     )
 
 
+def test_custom_escape_create_accepts_joined_include_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _ready_repo(tmp_path, monkeypatch)
+    validation = [
+        "g++ -Isrc/cpu/include -fsyntax-only src/cpu/src/scalar.cpp",
+        "clang++ -I src/cpu/include -fsyntax-only src/cpu/src/scalar.cpp",
+        "git diff --check",
+    ]
+    result = server.aiworkhub_task_create(
+        task_id="TASK_NF607_INCLUDE_OK",
+        title="Include root parity",
+        runner="codex_worker_nf607",
+        topic="task_mcp",
+        objective="Validate compiler include roots",
+        acceptance=["joined and separated include roots accepted"],
+        allowed_writes=["src/cpu/src/scalar.cpp"],
+        required_outputs=["src/cpu/src/scalar.cpp"],
+        validation=validation,
+        work_kind="generic",
+        custom_template_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
+    )
+    assert result["ok"] is True
+    stored = task_store.get_task(repo, "TASK_NF607_INCLUDE_OK")
+    assert stored is not None
+    assert stored["validation"] == validation
+
+
+def test_custom_escape_create_rejects_unsafe_include_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ready_repo(tmp_path, monkeypatch)
+    result = server.aiworkhub_task_create(
+        task_id="TASK_NF607_INCLUDE_BAD",
+        title="Unsafe include root",
+        runner="codex_worker_nf607",
+        topic="task_mcp",
+        objective="Reject unsafe include roots",
+        acceptance=["unsafe include roots stay rejected"],
+        allowed_writes=["src/cpu/src/scalar.cpp"],
+        required_outputs=["src/cpu/src/scalar.cpp"],
+        validation=["g++ -I../secret -fsyntax-only src/cpu/src/scalar.cpp"],
+        work_kind="generic",
+        custom_template_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
+    )
+    assert result["ok"] is False
+    assert result["stderr"] == "invalid_validation_embedded_path"
+
+
+def test_custom_escape_create_rejects_malformed_separated_include_option(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ready_repo(tmp_path, monkeypatch)
+    result = server.aiworkhub_task_create(
+        task_id="TASK_NF607_INCLUDE_MALFORMED",
+        title="Malformed separated include root",
+        runner="codex_worker_nf607",
+        topic="task_mcp",
+        objective="Reject malformed separated include options",
+        acceptance=["a dangling or option-operand -I stays rejected"],
+        allowed_writes=["src/cpu/src/scalar.cpp"],
+        required_outputs=["src/cpu/src/scalar.cpp"],
+        validation=["g++ -I -fsyntax-only src/cpu/src/scalar.cpp"],
+        work_kind="generic",
+        custom_template_escape=task_templates.AUDITED_CUSTOM_ESCAPE,
+    )
+    assert result["ok"] is False
+    assert result["stderr"] == "invalid_validation_embedded_path"
+
+
 def test_task_show_returns_stored_provenance_not_live_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
