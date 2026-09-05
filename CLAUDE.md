@@ -1,4 +1,3 @@
-<!-- AIWORKHUB_TOOL_USE_POLICY_START -->
 Target: CLAUDE.md
 Claude Code manager role (read before the protocol below):
 - The manager does not write code: it runs the project with the owner, distributes work to workers by difficulty and cost, and reviews what returns; small precise corrections are allowed, building features is the workers' job.
@@ -12,6 +11,8 @@ Claude Code manager startup (mandatory when AIWorkHub MCP is available):
 - Use built-in file tools only for an exact bounded path/range from Source Graph or after an explicit unsupported/unindexed result; record the fallback.
 - If bootstrap or required Source Graph is unavailable, report the MCP problem instead of silently bypassing AIWorkHub.
 - Direct Claude chats use manager tools; launched task workers use worker tools.
+
+<!-- AIWORKHUB_TOOL_USE_POLICY_START -->
 # AIWorkHub MCP tool-use policy
 Manager role:
 - The manager does not write code: it runs the project with the owner, distributes work to workers by difficulty and cost, and reviews what returns; small precise corrections are allowed, building features is the workers' job.

@@ -6,16 +6,24 @@ import importlib.util
 import json
 import math
 import os
+import posixpath
 import shutil
 import stat
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from os import environ as _process_environ, pathsep as _pathsep
 from pathlib import Path, PureWindowsPath
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
-from . import eval_artifact_gate, evidence_levels, known_bug_scanner, quality_review
+from . import (
+    eval_artifact_gate,
+    evidence_levels,
+    known_bug_scanner,
+    quality_review,
+    quality_reviewer,
+)
 
 # ---------------------------------------------------------------------------
 # 0.6.30 Quality Evidence Engine foundation.
@@ -889,6 +897,31 @@ def normalize_reviewer_reports(
                 "summary": summary[:MAX_SUMMARY_CHARS],
                 "evidence": evidence[:MAX_SUMMARY_CHARS],
             }
+            # The reviewer boundary (quality_reviewer.normalize_packet_findings)
+            # already stamped a canonical category on every finding and, for
+            # over-build findings, a replacement/removable_surface remedy.  The
+            # launcher final receipt schema requires ``category`` on every
+            # finding and permits the two remedy fields, so this second
+            # normalization must carry them through verbatim rather than
+            # silently dropping them (NF-2026-00600).  A missing category
+            # defaults to "general" exactly like the reviewer boundary; a
+            # malformed type or an unknown category value fails the report
+            # closed instead of forging a canonical field.
+            category_value = finding.get("category", "general")
+            if not isinstance(category_value, str):
+                errors.append(
+                    f"reviewer_schema:{index}:{finding_index}:category_invalid"
+                )
+                malformed = True
+                continue
+            category = category_value.strip() or "general"
+            if category not in quality_reviewer.FINDING_CATEGORIES:
+                errors.append(
+                    f"reviewer_schema:{index}:{finding_index}:category_invalid"
+                )
+                malformed = True
+                continue
+            normalized_finding["category"] = category
             structured_text = (
                 "confidence",
                 "evidence_level",
@@ -928,6 +961,29 @@ def normalize_reviewer_reports(
                     f"reviewer_schema:{index}:{finding_index}:evidence_level_invalid"
                 )
                 malformed = True
+                continue
+            # Preserve the canonical over-build remedy fields.  Only a
+            # well-typed, non-empty string survives; a non-string fails the
+            # report closed.  The over-build category<->remedy requirement is
+            # enforced upstream at the reviewer boundary, so this boundary keeps
+            # the accepted remedy verbatim without re-deriving diff scope.
+            invalid_remedy = False
+            for remedy_field in ("replacement", "removable_surface"):
+                if remedy_field not in finding:
+                    continue
+                remedy_value = finding.get(remedy_field)
+                if not isinstance(remedy_value, str):
+                    errors.append(
+                        f"reviewer_schema:{index}:{finding_index}:"
+                        f"{remedy_field}_invalid"
+                    )
+                    malformed = True
+                    invalid_remedy = True
+                    break
+                remedy_text = remedy_value.strip()
+                if remedy_text:
+                    normalized_finding[remedy_field] = remedy_text[:MAX_SUMMARY_CHARS]
+            if invalid_remedy:
                 continue
             evidence_reference = finding.get("evidence_reference")
             if evidence_reference is not None:
@@ -1019,7 +1075,7 @@ def _best_independence_rung(
     worker_provider: str,
     worker_model: str,
     lens: str,
-    reports: list[Mapping[str, Any]],
+    reports: Sequence[Mapping[str, Any]],
     raw_reports: list[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Return the most independent rung any sighted reviewer for a lens reached.
@@ -1129,11 +1185,11 @@ def fold_quality_verdict(
     for report in raw_reports:
         if not isinstance(report, Mapping):
             continue
-        lens = report.get("lens")
-        if not isinstance(lens, str) or lens not in JUDGMENT_LENSES:
+        report_lens = report.get("lens")
+        if not isinstance(report_lens, str) or report_lens not in JUDGMENT_LENSES:
             continue
         if reviewer_report_could_not_inspect(report):
-            blind_lenses.add(lens)
+            blind_lenses.add(report_lens)
 
     reports_by_lens: dict[str, list[dict[str, Any]]] = {}
     refine_required = False
@@ -1323,12 +1379,26 @@ def build_zero_config_profile(repo_root: Path | str) -> dict[str, Any]:
     }
 
 
+def _quality_config_path(repo_root: Path | str) -> Path | None:
+    """Distinguish a genuinely absent policy from an invalid filesystem node."""
+    path = Path(repo_root) / CONFIG_RELATIVE_PATH
+    for node, expected in ((path.parent, stat.S_ISDIR), (path, stat.S_ISREG)):
+        try:
+            mode = node.lstat().st_mode
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise MalformedConfigError(f"unreadable config: {exc}") from exc
+        if not expected(mode):
+            raise MalformedConfigError(f"nonregular quality config path: {node.name}")
+    return path
+
+
 def load_repo_config(repo_root: Path | str) -> dict[str, Any]:
     """Load repo-local .aiworkhub/quality.json. Fail closed on malformed config."""
 
-    root = Path(repo_root)
-    path = root / CONFIG_RELATIVE_PATH
-    if not path.is_file():
+    path = _quality_config_path(repo_root)
+    if path is None:
         return {"checks": []}
     try:
         raw_text = path.read_text(encoding="utf-8")
@@ -1351,16 +1421,15 @@ def load_repo_config(repo_root: Path | str) -> dict[str, Any]:
 def repo_config_status(repo_root: Path | str) -> dict[str, Any]:
     """Return explicit repository quality-policy truth without executing it."""
 
-    root = Path(repo_root)
-    path = root / CONFIG_RELATIVE_PATH
-    if not path.is_file():
+    path = _quality_config_path(repo_root)
+    if path is None:
         return {
             "config_present": False,
             "declared_check_count": 0,
             "status": "unverified",
             "reason": "quality_config_missing",
         }
-    config = load_repo_config(root)
+    config = load_repo_config(repo_root)
     count = len(config.get("checks") or [])
     return {
         "config_present": True,
@@ -1373,6 +1442,8 @@ def repo_config_status(repo_root: Path | str) -> dict[str, Any]:
 def assess_quality_policy_authority(
     canonical_root: Path | str,
     candidate_root: Path | str,
+    *,
+    changed_paths: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Detect a candidate weakening its own declared quality policy.
 
@@ -1395,6 +1466,13 @@ def assess_quality_policy_authority(
     separately failed closed by the completion gate via ``config_error``. This
     assessment reads only declared check descriptors and never executes a
     command.
+
+    ``changed_paths`` is the coordinator's verified, complete candidate delta,
+    never a worker declaration. When provided, a genuinely absent policy not
+    in that delta is an omitted sparse-workspace input, not a deletion. It
+    inherits canonical policy, which acceptance must execute in the combined
+    tree. Omit this argument when comparing two complete trees: absence then
+    remains deletion-sensitive. Present/invalid candidate policy never inherits.
     """
 
     def _signatures(root: Path | str) -> list[dict[str, Any]] | None:
@@ -1427,7 +1505,21 @@ def assess_quality_policy_authority(
         return signatures
 
     canonical_sigs = _signatures(canonical_root)
-    candidate_sigs = _signatures(candidate_root)
+    candidate_policy_source = "candidate"
+    if changed_paths is not None:
+        delta = {posixpath.normpath(str(path).replace("\\", "/")) for path in changed_paths}
+        policy_changed = bool(delta & {".aiworkhub", str(CONFIG_RELATIVE_PATH)})
+        try:
+            absent = _quality_config_path(candidate_root) is None
+        except MalformedConfigError:
+            absent = False
+        if absent and not policy_changed:
+            candidate_policy_source = "canonical_unchanged"
+    candidate_sigs = (
+        canonical_sigs
+        if candidate_policy_source == "canonical_unchanged"
+        else _signatures(candidate_root)
+    )
     canonical_ok = canonical_sigs is not None
     candidate_ok = candidate_sigs is not None
     canonical_count = len(canonical_sigs) if canonical_sigs is not None else 0
@@ -1452,6 +1544,7 @@ def assess_quality_policy_authority(
             "candidate_declared_checks": candidate_count,
             "canonical_config_readable": canonical_ok,
             "candidate_config_readable": candidate_ok,
+            "candidate_policy_source": candidate_policy_source,
         }
 
     def _scope_preserved(
@@ -1514,6 +1607,7 @@ def assess_quality_policy_authority(
         "candidate_declared_checks": candidate_count,
         "canonical_config_readable": canonical_ok,
         "candidate_config_readable": candidate_ok,
+        "candidate_policy_source": candidate_policy_source,
     }
 
 
@@ -1879,9 +1973,15 @@ def _run_command_array(
             }
         )
     try:
+        env = dict(_process_environ)
+        candidate_src = cwd / "src"
+        if candidate_src.is_dir():
+            inherited = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = str(candidate_src) + (_pathsep + inherited if inherited else "")
         completed = subprocess.run(
             argv,
             cwd=str(cwd),
+            env=env,
             shell=False,
             capture_output=True,
             text=True,
@@ -1938,6 +2038,7 @@ def run_declared_checks(
     changed_paths: Iterable[str] | None = None,
     timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
     effective_risk_tier: str = RISK_LOW,
+    policy_root: Path | str | None = None,
 ) -> list[EvidenceCheck]:
     """Execute repo-local declared quality/security commands for one task delta.
 
@@ -1947,7 +2048,9 @@ def run_declared_checks(
     """
 
     root = Path(repo_root)
-    config = load_repo_config(root)
+    # The coordinator may supply canonical policy for an omitted sparse input;
+    # commands and generated reports still belong to the validation tree.
+    config = load_repo_config(policy_root if policy_root is not None else root)
     if effective_risk_tier not in _RISK_RANK:
         raise MalformedConfigError(
             f"unknown effective risk tier: {effective_risk_tier!r}"
@@ -1981,7 +2084,7 @@ def run_declared_checks(
             timeout_seconds=timeout_seconds,
             execution_receipt=execution_receipt,
         )
-        summary = (stdout or "") + (("\n" + stderr) if stderr else "")
+        summary = f"stdout:\n{stdout}\nstderr:\n{stderr}"
         results.append(
             EvidenceCheck(
                 check_id=check_id,
@@ -1995,7 +2098,8 @@ def run_declared_checks(
                 duration_seconds=duration,
                 affected_paths=affected,
                 summary=summary.strip(),
-                provenance=f"repo_config:{CONFIG_RELATIVE_PATH}",
+                provenance=(f"repo_config:{CONFIG_RELATIVE_PATH}:cwd={root}:"
+                            f"source_root={root / 'src'}"),
                 error="" if status != STATUS_NOT_AVAILABLE else stderr,
             )
         )
@@ -2298,6 +2402,7 @@ def run_completion_quality_gate(
     human_approval: bool = False,
     reachability_inputs: Mapping[str, Any] | None = None,
     combined_tree_scope: bool = False,
+    policy_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
 
@@ -2318,7 +2423,7 @@ def run_completion_quality_gate(
     root = Path(repo_root)
     affected = tuple(sorted(str(p) for p in (changed_paths or ())))
     try:
-        config_status = repo_config_status(root)
+        config_status = repo_config_status(policy_root if policy_root is not None else root)
     except MalformedConfigError as exc:
         config_status = {
             "config_present": True,
@@ -2350,6 +2455,7 @@ def run_completion_quality_gate(
             root,
             changed_paths=affected,
             effective_risk_tier=str(risk_profile["effective_tier"]),
+            policy_root=policy_root,
         )
         config_error = ""
     except MalformedConfigError as exc:

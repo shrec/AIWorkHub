@@ -7,11 +7,12 @@ This module is additive and self-contained: it never imports or mutates
 
 Determinism contract:
 
-* Six stable template IDs, each bound to one exact frozen definition.
+* Seven stable template IDs, each bound to one exact frozen definition.
 * A full template ID is ``{name}@v{N}:{digest}`` where ``digest`` is the
   SHA-256 hex digest of the canonical definition JSON at registry version
-  ``N``.  Only the current registry version is ever accepted: a stale
-  version or a forged digest fails closed with a stable reason token.
+  ``N``. Current full IDs are accepted, along with authenticated legacy-v1
+  full IDs whose complete provenance and expanded payload still match exactly;
+  stale or forged identities fail closed with a stable reason token.
 * Expansion is a pure function of (template ID, explicit bounded paths):
   identical inputs always produce an identical payload.
 
@@ -49,6 +50,7 @@ from typing import Any, Mapping, Sequence
 
 __all__ = [
     "AUDITED_CUSTOM_ESCAPE",
+    "CANONICAL_MINIMALITY_CONTRACT",
     "COMMAND_NODE",
     "COMMAND_PYTHON",
     "DIFF_CHECK_COMMAND",
@@ -88,6 +90,15 @@ COMMAND_NODE = "node"
 DIFF_CHECK_COMMAND = "git diff --check"
 AUDITED_CUSTOM_ESCAPE = "audited_custom_unclassified"
 CUSTOM_TEMPLATE_NAME = "custom"
+CANONICAL_MINIMALITY_CONTRACT = (
+    "Keep changes bounded to the exact card contract. When Source Graph is required, "
+    "use a focus or slice query to check an existing repository symbol or primitive "
+    "before introducing a new abstraction. For equivalent solutions, prefer in order "
+    "an existing repository primitive, the standard library or platform facade, an "
+    "already-installed dependency, then the smallest new implementation. Minimality "
+    "must not weaken correctness, security, trust-boundary requirements, portability, "
+    "accessibility, or any exact card requirement."
+)
 
 _HEX64_RE = re.compile(r"[0-9a-f]{64}")
 _VERSION_TOKEN_RE = re.compile(r"v[0-9]+")
@@ -275,7 +286,23 @@ def _canonical_definition_payload(spec: TaskTemplateSpec) -> str:
         "registry_version": REGISTRY_VERSION,
         "definition": asdict(spec),
     }
+    if not spec.read_only:
+        payload["minimality_contract"] = CANONICAL_MINIMALITY_CONTRACT
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+_LEGACY_REGISTRY_VERSION = 1
+
+
+def _legacy_definition_digest(spec: TaskTemplateSpec) -> str:
+    """Return the definition digest emitted by the original v1 registry."""
+    payload = {
+        "name": spec.name,
+        "registry_version": _LEGACY_REGISTRY_VERSION,
+        "definition": asdict(spec),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _definition_digest(spec: TaskTemplateSpec) -> str:
@@ -522,7 +549,7 @@ def _canonical_repo_relative_path(path: str) -> str:
 
 
 def _is_public_test_path(path: str) -> bool:
-    return path.startswith("tests/")
+    return path == _TEST_ROOT or path.startswith(f"{_TEST_ROOT}/")
 
 
 def _looks_like_test_path(path: str) -> bool:
@@ -672,10 +699,47 @@ def expand_template(
         "write_set": list(write_set),
         "validation": validation,
         "validation_roles": validation_roles,
+        **(
+            {"minimality_contract": CANONICAL_MINIMALITY_CONTRACT}
+            if not spec.read_only
+            else {}
+        ),
     }
 
 
-def expanded_contract_digest(card: Mapping[str, Any]) -> str:
+def expanded_contract_digest(
+    card: Mapping[str, Any], *, trusted_legacy_definition_digest: str | None = None
+) -> str:
+    """Hash one canonical expanded payload shape.
+
+    ``trusted_legacy_definition_digest`` is retained for API compatibility but
+    is deliberately not an authority.  Legacy-v1 hashing is selected only for
+    a complete, internally consistent persisted provenance record.
+    """
+    minimality_contract = card.get("minimality_contract")
+    del trusted_legacy_definition_digest
+    legacy_v1 = _authenticated_legacy_v1_provenance(card) is not None
+    provenance = card.get("template_provenance")
+    current_builtin_claim = False
+    if isinstance(provenance, Mapping):
+        name = provenance.get("template_name")
+        if isinstance(name, str) and name in _TEMPLATE_SPECS:
+            current_builtin_claim = provenance.get("definition_digest") == (
+                _definition_digest(_TEMPLATE_SPECS[name])
+            )
+            embedded = provenance.get("expanded_contract")
+            if (
+                minimality_contract is None
+                and current_builtin_claim
+                and isinstance(embedded, Mapping)
+            ):
+                minimality_contract = embedded.get("minimality_contract")
+    if (
+        minimality_contract is None
+        and not bool(card.get("read_only"))
+        and not current_builtin_claim
+    ):
+        minimality_contract = CANONICAL_MINIMALITY_CONTRACT
     payload = {
         "allowed_writes": list(card.get("allowed_writes") or []),
         "read_first": list(card.get("read_first") or []),
@@ -685,9 +749,121 @@ def expanded_contract_digest(card: Mapping[str, Any]) -> str:
         "validation_roles": list(card.get("validation_roles") or []),
         "work_kind": str(card.get("work_kind") or "generic"),
     }
+    if not legacy_v1:
+        payload["minimality_contract"] = str(minimality_contract or "")
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _authenticated_legacy_v1_provenance(
+    card: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    provenance = card.get("template_provenance")
+    if not isinstance(provenance, dict) or "minimality_contract" in card:
+        return None
+    try:
+        validated = validate_template_provenance(provenance, expanded_card=card)
+    except TaskTemplateError:
+        return None
+    name = validated["template_name"]
+    if name not in _TEMPLATE_SPECS:
+        return None
+    spec = _TEMPLATE_SPECS[name]
+    if validated["definition_digest"] != _legacy_definition_digest(spec):
+        return None
+    writes = list(card.get("allowed_writes") or [])
+    input_paths = list(card.get("read_first") or []) if spec.read_only else writes
+    production, tests = _partition_write_set(input_paths)
+    try:
+        expected = expand_template(
+            name,
+            production_paths=production,
+            test_paths=tests,
+            mandatory_changed_outputs=list(card.get("required_outputs") or []),
+        )
+    except TaskTemplateError:
+        return None
+    for field in (
+        "allowed_writes",
+        "read_first",
+        "read_only",
+        "required_outputs",
+        "validation",
+        "validation_roles",
+        "work_kind",
+    ):
+        if card.get(field) != expected[field]:
+            return None
+    legacy_payload = {
+        "allowed_writes": writes,
+        "read_first": list(card.get("read_first") or []),
+        "read_only": bool(card.get("read_only")),
+        "required_outputs": list(card.get("required_outputs") or []),
+        "validation": list(card.get("validation") or []),
+        "validation_roles": list(card.get("validation_roles") or []),
+        "work_kind": str(card.get("work_kind") or "generic"),
+    }
+    digest = hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if validated["expanded_contract_digest"] != digest:
+        return None
+    return validated
+
+
+def _authenticated_current_provenance(
+    card: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    provenance = card.get("template_provenance")
+    if not isinstance(provenance, dict):
+        return None
+    if "minimality_contract" not in card:
+        return _authenticated_legacy_v1_provenance(card)
+    try:
+        validated = validate_template_provenance(provenance, expanded_card=card)
+    except TaskTemplateError:
+        return None
+    name = validated["template_name"]
+    if name not in _TEMPLATE_SPECS:
+        return None
+    writes = list(card.get("allowed_writes") or [])
+    spec = _TEMPLATE_SPECS[name]
+    input_paths = list(card.get("read_first") or []) if spec.read_only else writes
+    production, tests = _partition_write_set(input_paths)
+    try:
+        expected = expand_template(
+            name,
+            production_paths=production,
+            test_paths=tests,
+            mandatory_changed_outputs=list(card.get("required_outputs") or []),
+        )
+    except TaskTemplateError:
+        return None
+    fields = (
+        "allowed_writes",
+        "read_first",
+        "read_only",
+        "required_outputs",
+        "validation",
+        "validation_roles",
+        "work_kind",
+        "minimality_contract",
+    )
+    for field in fields:
+        if card.get(field) != expected.get(field):
+            return None
+    if validated["expanded_contract_digest"] != expanded_contract_digest(card):
+        return None
+    return validated
+
+
+class _BoundTemplateProvenance(dict[str, Any]):
+    """Ephemeral provenance carrying its independently expanded source card."""
+
+    def __init__(self, payload: Mapping[str, Any], expanded_card: Mapping[str, Any]):
+        super().__init__(payload)
+        self.expanded_card = dict(expanded_card)
 
 
 def template_provenance_payload(
@@ -698,7 +874,7 @@ def template_provenance_payload(
     name = str(card.get("template_id") or "")
     digest = str(card.get("definition_digest") or "")
     version = int(card.get("registry_version") or REGISTRY_VERSION)
-    return {
+    payload = {
         "schema_id": PROVENANCE_SCHEMA_ID,
         "template_name": name,
         "template_full_id": str(
@@ -709,6 +885,22 @@ def template_provenance_payload(
         "classification_reason": classification_reason.strip(),
         "expanded_contract_digest": expanded_contract_digest(card),
     }
+    if name in _TEMPLATE_SPECS:
+        payload["expanded_contract"] = {
+            field: card.get(field)
+            for field in (
+                "allowed_writes",
+                "read_first",
+                "read_only",
+                "required_outputs",
+                "validation",
+                "validation_roles",
+                "work_kind",
+                "minimality_contract",
+            )
+        }
+        return _BoundTemplateProvenance(payload, card)
+    return payload
 
 
 def _validated_validation_token(token: str) -> None:
@@ -772,13 +964,26 @@ def reject_unchanged_public_test_outputs(
         if not isinstance(item, str):
             raise TaskTemplateError("unchanged_required_public_test_output")
         normalized = _canonical_repo_relative_path(item).lower()
-        if normalized.startswith(f"{_TEST_ROOT}/") and normalized in required:
+        if _is_public_test_path(normalized) and normalized in required:
             raise TaskTemplateError("unchanged_required_public_test_output")
 
 
-def validate_template_provenance(payload: Any) -> dict[str, Any]:
+def validate_template_provenance(
+    payload: Any,
+    *,
+    expanded_card: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate provenance and bind built-ins to their exact expanded card.
+
+    Built-in provenance is not self-authenticating: its expanded digest must be
+    checked against the card fields it claims to describe.  Passing that card
+    also enables the explicitly supported legacy-v1 upgrade path; callers no
+    longer need a private compatibility flag.
+    """
     if not isinstance(payload, dict):
         raise TaskTemplateError("template_provenance_invalid")
+    if expanded_card is None and isinstance(payload, _BoundTemplateProvenance):
+        expanded_card = payload.expanded_card
     required = (
         "schema_id",
         "template_name",
@@ -818,6 +1023,43 @@ def validate_template_provenance(payload: Any) -> dict[str, Any]:
     if full_id != expected_full_id:
         raise TaskTemplateError("template_provenance_identity_mismatch")
     if name == CUSTOM_TEMPLATE_NAME:
+        if version != REGISTRY_VERSION:
+            raise TaskTemplateError("template_version_stale")
+        embedded_contract = payload.get("expanded_contract")
+        if expanded_card is None or not isinstance(embedded_contract, Mapping):
+            raise TaskTemplateError("template_expanded_contract_required")
+        bound_contract = {
+            field: expanded_card.get(field)
+            for field in (
+                "allowed_writes",
+                "read_first",
+                "read_only",
+                "required_outputs",
+                "validation",
+                "validation_roles",
+                "work_kind",
+                "minimality_contract",
+            )
+        }
+        if dict(embedded_contract) != bound_contract:
+            raise TaskTemplateError("template_expanded_contract_mismatch")
+        digest_card = dict(expanded_card)
+        digest_card.pop("template_provenance", None)
+        if expanded_digest != expanded_contract_digest(digest_card):
+            raise TaskTemplateError("template_expanded_contract_mismatch")
+        canonical_definition = {
+            "name": CUSTOM_TEMPLATE_NAME,
+            "registry_version": REGISTRY_VERSION,
+            "escape": AUDITED_CUSTOM_ESCAPE,
+            "expanded_contract_digest": expanded_digest,
+        }
+        canonical_digest = hashlib.sha256(
+            json.dumps(
+                canonical_definition, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        if definition_digest != canonical_digest:
+            raise TaskTemplateError("template_digest_mismatch")
         if reason != "audited_custom_escape":
             raise TaskTemplateError("template_provenance_invalid")
         return {
@@ -828,15 +1070,55 @@ def validate_template_provenance(payload: Any) -> dict[str, Any]:
             "definition_digest": definition_digest,
             "classification_reason": reason,
             "expanded_contract_digest": expanded_digest,
+            "expanded_contract": dict(embedded_contract),
         }
     if name not in _TEMPLATE_SPECS:
         raise TaskTemplateError("template_unknown")
-    if version != REGISTRY_VERSION:
-        raise TaskTemplateError("template_version_stale")
     spec = _TEMPLATE_SPECS[name]
-    if definition_digest != _definition_digest(spec):
+    current_digest = _definition_digest(spec)
+    legacy_digest = _legacy_definition_digest(spec)
+    is_current = version == REGISTRY_VERSION and definition_digest == current_digest
+    is_legacy = (
+        version == _LEGACY_REGISTRY_VERSION
+        and definition_digest == legacy_digest
+    )
+    if not is_current and not is_legacy:
+        if version not in {REGISTRY_VERSION, _LEGACY_REGISTRY_VERSION}:
+            raise TaskTemplateError("template_version_stale")
         raise TaskTemplateError("template_digest_mismatch")
-    return {
+    embedded_contract = payload.get("expanded_contract")
+    if expanded_card is None:
+        raise TaskTemplateError("template_expanded_contract_required")
+    if (
+        embedded_contract is not None
+        and embedded_contract
+        != {
+            field: expanded_card.get(field)
+            for field in embedded_contract
+        }
+    ):
+        raise TaskTemplateError("template_expanded_contract_mismatch")
+    digest_payload = {
+        "allowed_writes": list(expanded_card.get("allowed_writes") or []),
+        "read_first": list(expanded_card.get("read_first") or []),
+        "read_only": bool(expanded_card.get("read_only")),
+        "required_outputs": list(expanded_card.get("required_outputs") or []),
+        "validation": list(expanded_card.get("validation") or []),
+        "validation_roles": list(expanded_card.get("validation_roles") or []),
+        "work_kind": str(expanded_card.get("work_kind") or "generic"),
+    }
+    if not is_legacy:
+        digest_payload["minimality_contract"] = str(
+            expanded_card.get("minimality_contract") or ""
+        )
+    canonical_expanded_digest = hashlib.sha256(
+        json.dumps(
+            digest_payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    if expanded_digest != canonical_expanded_digest:
+        raise TaskTemplateError("template_expanded_contract_mismatch")
+    validated = {
         "schema_id": PROVENANCE_SCHEMA_ID,
         "template_name": name,
         "template_full_id": full_id,
@@ -845,6 +1127,9 @@ def validate_template_provenance(payload: Any) -> dict[str, Any]:
         "classification_reason": reason.strip(),
         "expanded_contract_digest": expanded_digest,
     }
+    if embedded_contract is not None:
+        validated["expanded_contract"] = embedded_contract
+    return validated
 
 
 def _partition_write_set(paths: Sequence[str]) -> tuple[list[str], list[str]]:
@@ -859,10 +1144,12 @@ def _partition_write_set(paths: Sequence[str]) -> tuple[list[str], list[str]]:
 
 
 def _custom_escape_provenance(card: Mapping[str, Any]) -> dict[str, Any]:
+    expanded_digest = expanded_contract_digest(card)
     payload = {
         "name": CUSTOM_TEMPLATE_NAME,
         "registry_version": REGISTRY_VERSION,
         "escape": AUDITED_CUSTOM_ESCAPE,
+        "expanded_contract_digest": expanded_digest,
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -874,7 +1161,20 @@ def _custom_escape_provenance(card: Mapping[str, Any]) -> dict[str, Any]:
         "registry_version": REGISTRY_VERSION,
         "definition_digest": digest,
         "classification_reason": "audited_custom_escape",
-        "expanded_contract_digest": expanded_contract_digest(card),
+        "expanded_contract_digest": expanded_digest,
+        "expanded_contract": {
+            field: card.get(field)
+            for field in (
+                "allowed_writes",
+                "read_first",
+                "read_only",
+                "required_outputs",
+                "validation",
+                "validation_roles",
+                "work_kind",
+                "minimality_contract",
+            )
+        },
     }
 
 
@@ -889,6 +1189,8 @@ def classify_task_card(
     read_first: Sequence[str] | None = None,
     allow_unchanged_required_outputs: Sequence[str] | None = None,
     custom_escape: str | None = None,
+    template_provenance: Mapping[str, Any] | None = None,
+    minimality_contract: str | None = None,
 ) -> dict[str, Any]:
     validate_custom_validation_roles(validation, validation_roles)
     writes = list(allowed_writes)
@@ -941,6 +1243,22 @@ def classify_task_card(
         "read_only": read_only,
         "read_first": first,
     }
+    if minimality_contract is not None:
+        card_view["minimality_contract"] = minimality_contract
+    if template_provenance is not None:
+        card_view["template_provenance"] = template_provenance
+        if template_provenance.get("template_name") == CUSTOM_TEMPLATE_NAME:
+            if custom_escape != AUDITED_CUSTOM_ESCAPE:
+                raise TaskTemplateError("custom_escape_invalid")
+            return validate_template_provenance(
+                dict(template_provenance), expanded_card=card_view
+            )
+        authenticated = _authenticated_current_provenance(card_view)
+        if authenticated is None:
+            authenticated = _authenticated_legacy_v1_provenance(card_view)
+        if authenticated is None:
+            raise TaskTemplateError("template_legacy_identity_invalid")
+        return authenticated
     for name, reason in candidates:
         try:
             expanded = expand_template(
@@ -962,8 +1280,21 @@ def classify_task_card(
             continue
         if roles != list(expanded["validation_roles"]):
             continue
-        stored = dict(expanded)
-        stored.update(card_view)
+        if (
+            minimality_contract is not None
+            and minimality_contract != expanded.get("minimality_contract")
+        ):
+            continue
+        stored = dict(card_view)
+        for field in (
+            "template_id",
+            "template_full_id",
+            "registry_version",
+            "definition_digest",
+            "minimality_contract",
+        ):
+            if field in expanded:
+                stored[field] = expanded[field]
         return template_provenance_payload(stored, classification_reason=reason)
     escape = "" if custom_escape is None else custom_escape
     if escape == AUDITED_CUSTOM_ESCAPE:

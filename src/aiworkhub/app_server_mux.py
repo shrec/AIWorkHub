@@ -117,9 +117,21 @@ if os.name == "nt":  # pragma: no cover - imported only on Windows hosts
     import ctypes.wintypes as wintypes
 
 try:
-    from .platform_io import background_process_launch_kwargs, chmod_fd, is_windows
+    from .platform_io import (
+        background_process_launch_kwargs,
+        chmod_fd,
+        current_user_uid,
+        is_windows,
+        stat_owned_by_current_user,
+    )
 except ImportError:  # direct-script Codex mux entrypoint
-    from platform_io import background_process_launch_kwargs, chmod_fd, is_windows
+    from platform_io import (
+        background_process_launch_kwargs,
+        chmod_fd,
+        current_user_uid,
+        is_windows,
+        stat_owned_by_current_user,
+    )
 
 if __package__:
     from . import shared_router
@@ -142,8 +154,7 @@ def _default_sideband_dir() -> Path:
         # chmod-hijack, or as their own directory to deny this startup).
         # ensure_private_dir still fails closed if what lands there is not our
         # own non-symlink 0700 directory.
-        getuid = getattr(os, "getuid", None)
-        uid = getuid() if callable(getuid) else None
+        uid = current_user_uid()
         leaf = f"app_server_mux-{uid}" if uid is not None else "app_server_mux"
         return Path(tempfile.gettempdir()) / ".aiworkhub" / leaf
     return home / ".aiworkhub" / "app_server_mux"
@@ -171,21 +182,13 @@ _REPO_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
 def _current_uid() -> int | None:
-    """Return the POSIX uid when the host exposes one.
+    """Compatibility wrapper around the canonical platform uid authority."""
 
-    Windows has no ``os.getuid`` and protects the per-user profile directory
-    with ACLs instead of POSIX mode bits.  Callers therefore enforce the
-    strict uid/mode contract on POSIX and retain the capability-token +
-    per-user-directory boundary on Windows.
-    """
-
-    getuid = getattr(os, "getuid", None)
-    return int(getuid()) if callable(getuid) else None
+    return current_user_uid()
 
 
 def _owned_by_current_user(st: os.stat_result) -> bool:
-    uid = _current_uid()
-    return uid is None or int(getattr(st, "st_uid", uid)) == uid
+    return stat_owned_by_current_user(st)
 
 
 def _private_mode(st: os.stat_result, expected: int) -> bool:

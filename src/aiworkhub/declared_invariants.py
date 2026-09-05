@@ -67,14 +67,18 @@ class Violation:
 
 
 def _python_sources(src_root: Path) -> list[Path]:
+    if not src_root.is_dir():
+        raise NotADirectoryError(f"source root is not a directory: {src_root}")
     return sorted(p for p in src_root.rglob("*.py") if p.is_file())
 
 
 def _read(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return ""
+    except (OSError, UnicodeDecodeError) as exc:
+        error = OSError(f"source read failed ({type(exc).__name__})")
+        error.filename = str(path)
+        raise error from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -182,10 +186,7 @@ def module_level_caches_are_bounded(src_root: Path) -> list[Violation]:
         source = _read(path)
         if not source:
             continue
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            continue
+        tree = ast.parse(source, filename=str(path))
         has_bound_constant = bool(_BOUND_HINT_RE.search(source))
         for node in tree.body:
             targets: list[str] = []
@@ -293,6 +294,20 @@ INVARIANT_NAMES: tuple[str, ...] = tuple(
 )
 
 
+def _unevaluable(name: str, root: Path, exc: Exception) -> Violation:
+    """Describe an inspection failure without allowing unbounded exception text."""
+
+    affected = getattr(exc, "filename", None) or root
+    try:
+        message = " ".join(str(exc).split())[:200]
+    except Exception:  # noqa: BLE001 - diagnostic formatting must also fail closed
+        message = ""
+    detail = f"invariant could not be evaluated: {type(exc).__name__}"
+    if message:
+        detail += f": {message}"
+    return Violation(name, str(affected), detail)
+
+
 def check(src_root: Path | str) -> dict[str, Any]:
     """Return every declared invariant's verdict over ``src_root``.
 
@@ -305,14 +320,17 @@ def check(src_root: Path | str) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     violations: list[Violation] = []
     for name, tree_check in _TREE_INVARIANTS:
-        found = tree_check(root)
+        try:
+            found = tree_check(root)
+        except Exception as exc:  # noqa: BLE001 - unevaluable is a violation
+            found = [_unevaluable(name, root, exc)]
         violations.extend(found)
         results.append({"invariant": name, "violations": len(found)})
     for name, runtime_check in _RUNTIME_INVARIANTS:
         try:
             found = runtime_check()
         except Exception as exc:  # noqa: BLE001 - unevaluable is a violation
-            found = [Violation(name, "", f"invariant could not be evaluated: {exc}")]
+            found = [_unevaluable(name, root, exc)]
         violations.extend(found)
         results.append({"invariant": name, "violations": len(found)})
     return {

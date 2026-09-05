@@ -1,9 +1,54 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from aiworkhub import process_launcher
 from aiworkhub import process_launcher_validation as validation
+
+
+@pytest.mark.parametrize("reason", [
+    "metadata_broker_hardlink_forbidden", "metadata_broker_deleted_fd",
+])
+def test_structural_metadata_denial_does_not_repeat_identical_lane(
+    tmp_path, reason
+) -> None:
+    workspace = SimpleNamespace(
+        request_id="retained", path=tmp_path / "worktree", repo=tmp_path / "repo"
+    )
+    row = {
+        "command": "python -m pytest tests/test_x.py", "returncode": 126,
+        "metadata_broker_denial_attributed": True,
+        "metadata_broker_denials": [{
+            "schema": "aiworkhub.metadata_broker_denial.v1",
+            "authenticated": True, "terminal": True,
+            "reason": reason, "syscall_nr": 90,
+        }],
+    }
+    calls = []
+
+    def run(candidate, commands, **route):
+        calls.append((candidate, commands, route))
+        raise validation.ValidationEnvironmentBlocked(
+            "validation_environment_blocked:metadata_broker_denial", [row],
+            restriction="metadata_broker_denial",
+        )
+
+    with pytest.raises(
+        validation.ValidationEnvironmentBlocked,
+        match="compatible_validation_lane_unavailable:backend=landlock:capabilities=",
+    ) as caught:
+        validation.run_declared_validations(
+            workspace, {"validation": [row["command"]]}, {},
+            run_validations=run,
+            route_resolver=lambda _: {"backend": "landlock"},
+            baseline_comparer=lambda *args: pytest.fail("must retain denial"),
+        )
+    assert len(calls) == 1
+    assert caught.value.results[0]["metadata_broker_denials"] == row["metadata_broker_denials"]
+    assert caught.value.results[0]["returncode"] == 126
+    assert "validation_capability_replay" not in caught.value.results[0]
 
 
 def _mypy_row(*lines: str) -> dict:

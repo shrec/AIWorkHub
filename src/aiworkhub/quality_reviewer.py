@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import ast
+import builtins
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
+import os
 import re
+import sys
+import sysconfig
+import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
@@ -17,6 +25,7 @@ MAX_PACKET_PATHS = 200
 MAX_PACKET_CHECKS = 200
 MAX_PACKET_COMMANDS = 100
 MAX_TEXT_CHARS = 2_000
+REVIEW_PACKET_FILE_ROOT_ENV = "AIWORKHUB_QUALITY_REVIEW_PACKET_ROOT"
 
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -31,6 +40,15 @@ _FINDING_CONFIDENCE = frozenset({"low", "medium", "high"})
 # and is rejected by name.
 FINDING_SEVERITIES = frozenset({"critical", "high", "medium", "low"})
 FINDING_DISPOSITIONS = frozenset({"defect", "observation", "process_limit"})
+OVERBUILD_FINDING_CATEGORIES = frozenset(
+    {
+        "duplicate_existing_symbol",
+        "handrolled_standard_or_platform_capability",
+        "unnecessary_abstraction",
+        "excess_scope",
+    }
+)
+FINDING_CATEGORIES = frozenset({"general"}) | OVERBUILD_FINDING_CATEGORIES
 
 
 QualityReviewFinding = TypedDict(
@@ -51,6 +69,9 @@ QualityReviewFinding = TypedDict(
         "line_start": NotRequired[int],
         "line_end": NotRequired[int],
         "check_id": NotRequired[str],
+        "category": NotRequired[str],
+        "replacement": NotRequired[str],
+        "removable_surface": NotRequired[str],
     },
 )
 QualityReviewFinding.__doc__ = (
@@ -72,6 +93,7 @@ QUALITY_REVIEW_FINDING_REQUIRED_KEYS = frozenset(
         "severity",
         "disposition",
         "actionable",
+        "category",
         "summary",
         "evidence",
         "confidence",
@@ -83,21 +105,38 @@ QUALITY_REVIEW_FINDING_REQUIRED_KEYS = frozenset(
     }
 )
 QUALITY_REVIEW_FINDING_KEYS = QUALITY_REVIEW_FINDING_REQUIRED_KEYS | frozenset(
-    {"evidence_reference"}
+    {"evidence_reference", "replacement", "removable_surface"}
 )
 QUALITY_REVIEW_FINDING_SCHEMA_DOC = (
     "One finding object uses the canonical shape with required keys "
     "severity (critical|high|medium|low), summary and evidence; optional id "
     "(stable identifier, derived when omitted), disposition (defect default; "
     "observation and process_limit must be low severity), confidence "
-    "(low|medium|high), symbol, claim, reproduction and required_validation. "
+    "(low|medium|high), symbol, claim, reproduction, required_validation and "
+    "category. Category defaults to general; over-build categories are "
+    "duplicate_existing_symbol, handrolled_standard_or_platform_capability, "
+    "unnecessary_abstraction and excess_scope. "
     "Defects must cite an exact packet-permitted path and line "
     "(path/line_start/line_end) or a mechanical check_id. Evidence may be a "
     "string containing that exact reference or an object with exactly "
     "path/line_start/line_end (or check_id); the supervisor canonicalizes the "
-    "object before validation. The tool derives "
-    "actionable, evidence_level and evidence_reference; do not invent keys "
-    "outside this shape. An empty findings list is valid."
+    "object before validation. An actionable over-build finding must name "
+    "concrete changed source lines from the candidate diff and a category-specific "
+    "remedy: duplicate_existing_symbol and "
+    "handrolled_standard_or_platform_capability require replacement (the "
+    "pre-existing symbol, standard library or platform capability to use), while "
+    "unnecessary_abstraction and excess_scope require removable_surface (the "
+    "exact abstraction/scope surface to delete). Source Graph or diff evidence "
+    "must prove the changed code and, for in-repo replacements, that the "
+    "replacement is not newly introduced by the candidate diff. Over-build "
+    "reports must be disposition=defect/actionable; observations, process "
+    "limits, check-only evidence and test-target evidence are rejected. Raw line "
+    "count, token count and aesthetic preference are not failures. Correctness, "
+    "security, portability, accessibility and explicit task requirements remain "
+    "higher-priority review obligations and must not be downgraded for "
+    "minimality. The tool derives actionable, evidence_level and "
+    "evidence_reference; do not invent keys outside this shape. An empty "
+    "findings list is valid."
 )
 QUALITY_REVIEW_SUBMIT_TOOL_DESCRIPTION = (
     "Submit findings for the exact coordinator-bound review packet. "
@@ -319,23 +358,51 @@ def verify_review_packet_candidate(
     target_task_id = str(target.get("task_id") or "")
     if not target_request_id or not target_task_id:
         raise ReviewerEvidenceError("quality_review_packet_target_invalid")
-    rows = (packet.get("candidate") or {}).get("changed_paths") or []
+    candidate_section = packet.get("candidate") or {}
+    rows = candidate_section.get("changed_paths") or []
     if not isinstance(rows, list) or not rows:
         raise ReviewerEvidenceError("quality_review_candidate_paths_missing")
+    source_evidence = candidate_section.get("source_evidence") or []
+    source_by_path: dict[str, Mapping[str, Any]] = {}
+    if isinstance(source_evidence, list):
+        for evidence_row in source_evidence:
+            if isinstance(evidence_row, Mapping):
+                source_by_path[str(evidence_row.get("path") or "")] = evidence_row
     resolved_repo = repo.resolve()
-    verified_paths: list[dict[str, str]] = []
+    verified_paths: list[dict[str, str | None]] = []
     for row in rows:
         if not isinstance(row, Mapping):
             raise ReviewerEvidenceError("quality_review_candidate_path_invalid")
         relative = str(row.get("path") or "")
-        expected = str(row.get("sha256") or "")
+        expected_raw = row.get("sha256")
+        expected = str(expected_raw or "") if expected_raw is not None else None
         if not relative or relative.startswith("/") or ".." in relative.split("/"):
             raise ReviewerEvidenceError("quality_review_candidate_path_invalid")
         candidate = resolved_repo / relative
         if _has_symlink_component(resolved_repo, relative):
             raise ReviewerEvidenceError("quality_review_candidate_path_symlink")
         candidate = candidate.resolve()
-        if not candidate.is_relative_to(resolved_repo) or not candidate.is_file():
+        if not candidate.is_relative_to(resolved_repo):
+            raise ReviewerEvidenceError("quality_review_candidate_path_invalid")
+        if expected is None:
+            evidence_row = source_by_path.get(relative)
+            if (
+                not isinstance(evidence_row, Mapping)
+                or evidence_row.get("candidate_sha256") is not None
+                or evidence_row.get("excerpt") != ""
+                or evidence_row.get("excerpt_bytes") != 0
+                or evidence_row.get("source_bytes") != 0
+                or evidence_row.get("truncated") is not False
+                or evidence_row.get("segments") != []
+                or evidence_row.get("omission_reason") != "candidate_deleted_or_non_file"
+                or candidate.is_file()
+            ):
+                raise ReviewerEvidenceError("quality_review_candidate_omission_invalid")
+            verified_paths.append({"path": relative, "sha256": None})
+            continue
+        if not _SHA256_RE.fullmatch(expected):
+            raise ReviewerEvidenceError("quality_review_candidate_hash_invalid")
+        if not candidate.is_file():
             raise ReviewerEvidenceError("quality_review_candidate_path_missing")
         if hashlib.sha256(candidate.read_bytes()).hexdigest() != expected:
             raise ReviewerEvidenceError("quality_review_candidate_hash_mismatch")
@@ -378,7 +445,12 @@ def verify_reviewer_receipt(
     receipt_target = receipt.get("target")
     reviewer = receipt.get("reviewer")
     report = receipt.get("report")
-    if not all(isinstance(value, Mapping) for value in (target, receipt_target, reviewer, report)):
+    if (
+        not isinstance(target, Mapping)
+        or not isinstance(receipt_target, Mapping)
+        or not isinstance(reviewer, Mapping)
+        or not isinstance(report, Mapping)
+    ):
         raise ReviewerEvidenceError("reviewer_receipt_shape_invalid")
     for field in ("request_id", "task_id", "claim_epoch"):
         if receipt_target.get(field) != target.get(field):
@@ -447,6 +519,7 @@ def build_review_prompt(
     lens: str,
     submit_tool_name: str = "aiworkhub_worker_quality_review_submit",
     packet_file: str | None = None,
+    packet_root: Path | str | None = None,
     max_inline_bytes: int = 96 * 1024,
 ) -> str:
     """Render a bounded independent-review prompt from packet facts only.
@@ -456,6 +529,9 @@ def build_review_prompt(
     embedding the full JSON inline.  This avoids E2BIG on native CLI adapters
     where large quality-review payloads would otherwise be passed through argv.
     *max_inline_bytes* guards the inline fallback when *packet_file* is None.
+    *packet_root* is coordinator-owned write authority, independent of the
+    destination path. It overrides the worker-environment fallback without
+    changing process-global state, so concurrent managers keep separate roots.
     """
 
     if lens not in {"correctness", "security", "code_quality"}:
@@ -479,19 +555,31 @@ def build_review_prompt(
         if active_scope is not None
         else ""
     )
+    active_scope_evidence = (
+        "ACTIVE_SCOPED_AUDIT: "
+        + json.dumps(
+            active_scope,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+        if active_scope is not None
+        else ""
+    )
     use_file_transport = (
         packet_file is not None and len(encoded.encode("utf-8")) > max_inline_bytes
     )
-    if use_file_transport:
-        import os as _os
-        if not _os.path.isfile(packet_file):
-            raise ReviewerEvidenceError("review_packet_file_missing")
+    if use_file_transport and packet_file is not None:
+        _write_review_packet_file(Path(packet_file), encoded, packet_root=packet_root)
     packet_evidence = (
         f"QUALITY_REVIEW_PACKET_FILE: {packet_file}\n"
         f"PACKET_SHA256: {packet_digest}\n"
-        "Call aiworkhub_worker_quality_review_packet_read with no arguments "
-        "before reviewing; the returned packet is the authoritative evidence "
-        "for this review. Do not supply a path or identity to that tool.\n"
+        "The packet file has been written with the canonical serialized packet "
+        "whose packet_sha256 is shown above. Call "
+        "aiworkhub_worker_quality_review_packet_read with no arguments before "
+        "reviewing; the returned packet is the authoritative evidence for this "
+        "review. Do not supply a path or identity to that tool.\n"
         if use_file_transport
         else f"QUALITY_REVIEW_PACKET: {encoded}\n"
     )
@@ -517,6 +605,7 @@ def build_review_prompt(
         f"{_ALREADY_ESTABLISHED_MECHANICALLY}"
         "Report only concrete items supported by file/line or check evidence. "
         f"{QUALITY_REVIEW_FINDING_SCHEMA_DOC}\n"
+        f"{active_scope_evidence}"
         "Finish with exactly one JSON object and no surrounding prose, using "
         f'{{"lens":"{lens}","findings":[...]}}. The supervisor derives all '
         "task, request, claim, target, reviewer, and packet identity and durably "
@@ -590,6 +679,18 @@ def normalize_packet_findings(
         if isinstance(row, Mapping)
     }
     permitted_symbols.discard("")
+    changed_paths = {
+        str(row.get("path") or "")
+        for row in (candidate.get("changed_paths") or [])
+        if isinstance(row, Mapping)
+    }
+    changed_paths.discard("")
+    changed_source_lines = _candidate_changed_source_lines(candidate)
+    authorized_repo_replacements = _authorized_overbuild_replacements(
+        scope,
+        changed_paths=changed_paths,
+        changed_source_lines=changed_source_lines,
+    )
 
     rows = list(findings)
     if len(rows) > 100:
@@ -620,6 +721,9 @@ def normalize_packet_findings(
             raise ReviewerEvidenceError(
                 f"review_finding_{index}_nondefect_severity_must_be_low"
             )
+        category = str(finding.get("category") or "general").strip()
+        if category not in FINDING_CATEGORIES:
+            raise ReviewerEvidenceError(f"review_finding_{index}_category_invalid")
         if "summary" not in finding:
             raise ReviewerEvidenceError(f"review_finding_{index}_summary_missing")
         if "evidence" not in finding:
@@ -634,16 +738,22 @@ def normalize_packet_findings(
             index=index,
             permitted_paths=permitted_paths,
             permitted_checks=permitted_checks,
+            allow_test_target=True,
         )
         explicit_path = str(finding.get("path") or "")
         explicit_check = str(finding.get("check_id") or "")
-        if supplied_reference is not None and (explicit_path or explicit_check):
+        explicit_line_start = finding.get("line_start")
+        explicit_line_end = finding.get("line_end")
+        if supplied_reference is not None and (
+            explicit_path
+            or explicit_check
+            or explicit_line_start not in (None, "")
+            or explicit_line_end not in (None, "")
+        ):
             raise ReviewerEvidenceError(
                 f"review_finding_{index}_evidence_reference_conflict"
             )
-        if evidence_reference is not None:
-            pass
-        elif explicit_path:
+        if evidence_reference is None and explicit_path:
             if explicit_path not in permitted_paths:
                 raise ReviewerEvidenceError(
                     f"review_finding_{index}_path_out_of_scope"
@@ -667,18 +777,15 @@ def normalize_packet_findings(
                 "line_start": line_start,
                 "line_end": line_end,
             }
-        elif explicit_check:
+        elif evidence_reference is None and explicit_check:
             if explicit_check not in permitted_checks:
                 raise ReviewerEvidenceError(
                     f"review_finding_{index}_check_out_of_scope"
                 )
             evidence_reference = {"kind": "check", "check_id": explicit_check}
-        else:
+        elif evidence_reference is None:
             for path in sorted(permitted_paths, key=lambda value: (-len(value), value)):
-                match = re.search(
-                    rf"(?<![A-Za-z0-9_.-]){re.escape(path)}:(\d+)(?:-(\d+))?",
-                    evidence,
-                )
+                match = _source_citation_re(path).search(evidence)
                 if match:
                     start = int(match.group(1))
                     end = int(match.group(2) or start)
@@ -697,17 +804,46 @@ def normalize_packet_findings(
                     break
             if evidence_reference is None:
                 for check_id in sorted(permitted_checks):
-                    if check_id and check_id in evidence:
+                    if check_id and _token_re(check_id).search(evidence):
                         evidence_reference = {
                             "kind": "check",
                             "check_id": check_id,
                         }
                         break
 
+        if evidence_reference is not None:
+            _validate_evidence_text_agrees_with_reference(
+                evidence,
+                evidence_reference=evidence_reference,
+                index=index,
+                permitted_paths=permitted_paths,
+                permitted_checks=permitted_checks,
+            )
+
         actionable = disposition == "defect"
         if actionable and evidence_reference is None:
             raise ReviewerEvidenceError(
                 f"review_finding_{index}_exact_evidence_required"
+            )
+        if actionable and evidence_reference is not None and evidence_reference.get("kind") == "test_target":
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_exact_evidence_required"
+            )
+        replacement = str(finding.get("replacement") or "").strip()[:MAX_TEXT_CHARS]
+        removable_surface = str(
+            finding.get("removable_surface") or ""
+        ).strip()[:MAX_TEXT_CHARS]
+        if category in OVERBUILD_FINDING_CATEGORIES:
+            _validate_overbuild_finding(
+                index=index,
+                category=category,
+                disposition=disposition,
+                evidence_reference=evidence_reference,
+                replacement=replacement,
+                removable_surface=removable_surface,
+                authorized_repo_replacements=authorized_repo_replacements,
+                changed_paths=changed_paths,
+                changed_source_lines=changed_source_lines,
             )
         derived_level = (
             EvidenceLevel.STATIC_EVIDENCE
@@ -761,6 +897,7 @@ def normalize_packet_findings(
             "severity": severity,
             "disposition": disposition,
             "actionable": actionable,
+            "category": category,
             "summary": summary[:MAX_TEXT_CHARS],
             "evidence": evidence[:MAX_TEXT_CHARS],
             "confidence": confidence,
@@ -777,6 +914,10 @@ def normalize_packet_findings(
                 )
             )[:MAX_TEXT_CHARS],
         }
+        if replacement:
+            normalized_finding["replacement"] = replacement
+        if removable_surface:
+            normalized_finding["removable_surface"] = removable_surface
         if evidence_reference is not None:
             normalized_finding["evidence_reference"] = evidence_reference
         normalized.append(normalized_finding)
@@ -804,6 +945,7 @@ def _validate_evidence_reference(
     index: int,
     permitted_paths: set[str],
     permitted_checks: set[str],
+    allow_test_target: bool,
 ) -> dict[str, Any] | None:
     """Revalidate one supervisor-shaped reference against packet authority."""
 
@@ -821,6 +963,10 @@ def _validate_evidence_reference(
         path = raw.get("path")
         line_start = raw.get("line_start")
         line_end = raw.get("line_end")
+        if not isinstance(path, str) or not path:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_evidence_reference_invalid"
+            )
         if path not in permitted_paths:
             raise ReviewerEvidenceError(f"review_finding_{index}_path_out_of_scope")
         if (
@@ -844,26 +990,809 @@ def _validate_evidence_reference(
                 f"review_finding_{index}_evidence_reference_invalid"
             )
         check_id = raw.get("check_id")
+        if not isinstance(check_id, str) or not check_id:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_evidence_reference_invalid"
+            )
         if check_id not in permitted_checks:
             raise ReviewerEvidenceError(f"review_finding_{index}_check_out_of_scope")
         return {"kind": "check", "check_id": check_id}
     if kind == "test_target":
+        if not allow_test_target:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_evidence_reference_invalid"
+            )
         if set(raw) != {"kind", "path"}:
             raise ReviewerEvidenceError(
                 f"review_finding_{index}_evidence_reference_invalid"
             )
         path = raw.get("path")
+        if not isinstance(path, str) or not path:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_evidence_reference_invalid"
+            )
         if path not in permitted_paths:
             raise ReviewerEvidenceError(f"review_finding_{index}_path_out_of_scope")
         return {"kind": "test_target", "path": path}
     raise ReviewerEvidenceError(f"review_finding_{index}_evidence_reference_invalid")
 
 
+def _validate_evidence_text_agrees_with_reference(
+    evidence: str,
+    *,
+    evidence_reference: Mapping[str, Any],
+    index: int,
+    permitted_paths: set[str],
+    permitted_checks: set[str],
+) -> None:
+    """Reject canonical reports whose evidence text names a different identity."""
+
+    claimed = _evidence_text_reference(
+        evidence, permitted_paths=permitted_paths, permitted_checks=permitted_checks
+    )
+    if claimed is not None and claimed != evidence_reference:
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_evidence_reference_conflict"
+        )
+
+
+def _evidence_text_reference(
+    evidence: str,
+    *,
+    permitted_paths: set[str],
+    permitted_checks: set[str],
+) -> dict[str, Any] | None:
+    for path in sorted(permitted_paths, key=lambda value: (-len(value), value)):
+        match = _source_citation_re(path).search(evidence)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2) or start)
+            return {
+                "kind": "source",
+                "path": path,
+                "line_start": start,
+                "line_end": end,
+            }
+        if f"{path}::" in evidence:
+            return {
+                "kind": "test_target",
+                "path": path,
+            }
+    generic_source = re.search(
+        r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+"
+        r"\.[A-Za-z0-9_.-]+:(\d+)(?:-(\d+))?(?![A-Za-z0-9_-])",
+        evidence,
+    )
+    if generic_source:
+        return {"kind": "source", "path": "", "line_start": 0, "line_end": 0}
+    for check_id in sorted(permitted_checks):
+        if check_id and _token_re(check_id).search(evidence):
+            return {"kind": "check", "check_id": check_id}
+    return None
+
+
+def _token_re(value: str) -> re.Pattern[str]:
+    """Match an exact evidence token without binding superstrings."""
+
+    return re.compile(
+        rf"(?<![A-Za-z0-9_.:-]){re.escape(value)}(?![A-Za-z0-9_.:-])"
+    )
+
+
+def _source_citation_re(path: str) -> re.Pattern[str]:
+    """Match ``path:line`` or ``path:start-end`` with a hard end boundary."""
+
+    return re.compile(
+        rf"(?<![A-Za-z0-9_.-]){re.escape(path)}:(\d+)(?:-(\d+))?"
+        r"(?![A-Za-z0-9_-])"
+    )
+
+
+def _candidate_changed_source_lines(
+    candidate: Mapping[str, Any],
+) -> dict[str, list[tuple[int, int]]]:
+    """Return changed candidate diff line spans from packet source evidence."""
+
+    spans: dict[str, list[tuple[int, int]]] = {}
+    for row in candidate.get("source_evidence") or []:
+        if not isinstance(row, Mapping):
+            continue
+        path = str(row.get("path") or "")
+        if not path:
+            continue
+        for segment in row.get("segments") or []:
+            if not isinstance(segment, Mapping):
+                continue
+            start = segment.get("changed_start_line")
+            end = segment.get("changed_end_line")
+            if (
+                isinstance(start, int)
+                and not isinstance(start, bool)
+                and isinstance(end, int)
+                and not isinstance(end, bool)
+                and start >= 1
+                and end >= start
+            ):
+                spans.setdefault(path, []).append((start, end))
+    return spans
+
+
+def _line_proves_preexisting_source(
+    row: Mapping[str, Any],
+    *,
+    changed_paths: set[str],
+    changed_source_lines: Mapping[str, list[tuple[int, int]]],
+) -> bool:
+    """Return True only for replacement rows bound outside candidate-added code."""
+
+    path = str(row.get("path") or row.get("file_path") or "").strip()
+    if not path:
+        return False
+    if path not in changed_paths:
+        return True
+    line = row.get("line") or row.get("line_start") or row.get("start_line")
+    if not isinstance(line, int) or isinstance(line, bool):
+        return False
+    spans = changed_source_lines.get(path) or []
+    if not spans:
+        return False
+    return not any(span_start <= line <= span_end for span_start, span_end in spans)
+
+
+def _authorized_overbuild_replacements(
+    scope: Mapping[str, Any],
+    *,
+    changed_paths: set[str],
+    changed_source_lines: Mapping[str, list[tuple[int, int]]],
+) -> set[str]:
+    """Collect replacement names proven outside the candidate diff."""
+
+    replacements: set[str] = set()
+    for row in scope.get("target_symbols") or []:
+        if not isinstance(row, Mapping) or not _line_proves_preexisting_source(
+            row,
+            changed_paths=changed_paths,
+            changed_source_lines=changed_source_lines,
+        ):
+            continue
+        for key in ("qualified_name", "symbol", "name"):
+            value = str(row.get(key) or "").strip()
+            if value:
+                replacements.add(value)
+    for section in ("impact_evidence", "contract_evidence"):
+        for row in scope.get(section) or []:
+            if not isinstance(row, Mapping) or not _line_proves_preexisting_source(
+                row,
+                changed_paths=changed_paths,
+                changed_source_lines=changed_source_lines,
+            ):
+                continue
+            for key in ("qualified_name", "symbol", "reference", "replacement"):
+                value = str(row.get(key) or "").strip()
+                if value:
+                    replacements.add(value)
+    return replacements
+
+
+def _changed_line_reference(
+    value: str,
+    *,
+    changed_paths: set[str],
+    changed_source_lines: Mapping[str, list[tuple[int, int]]],
+) -> dict[str, Any] | None:
+    for path in sorted(changed_paths, key=lambda item: (-len(item), item)):
+        match = re.fullmatch(rf"{re.escape(path)}:(\d+)(?:-(\d+))?", value)
+        if not match:
+            continue
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        spans = changed_source_lines.get(path) or []
+        if any(span_start <= start and end <= span_end for span_start, span_end in spans):
+            return {
+                "kind": "source",
+                "path": path,
+                "line_start": start,
+                "line_end": end,
+            }
+    return None
+
+
+def _write_review_packet_file(
+    packet_path: Path, encoded: str, *, packet_root: Path | str | None = None,
+) -> None:
+    """Write a canonical packet via an exclusive private staging file."""
+
+    payload = encoded.encode("utf-8")
+    root_raw = (
+        packet_root
+        if packet_root is not None
+        else os.environ.get(REVIEW_PACKET_FILE_ROOT_ENV)
+    )
+    if not root_raw:
+        raise ReviewerEvidenceError("review_packet_file_root_missing")
+    runtime_root = Path(root_raw)
+    try:
+        if runtime_root.is_symlink() or not runtime_root.is_dir():
+            raise ReviewerEvidenceError("review_packet_file_root_invalid")
+        runtime_root = runtime_root.resolve()
+    except OSError as exc:
+        raise ReviewerEvidenceError("review_packet_file_root_invalid") from exc
+    if not packet_path.is_absolute():
+        packet_path = runtime_root / packet_path
+    else:
+        try:
+            if not packet_path.resolve(strict=False).is_relative_to(runtime_root):
+                raise ReviewerEvidenceError("review_packet_file_outside_root")
+        except OSError as exc:
+            raise ReviewerEvidenceError("review_packet_file_outside_root") from exc
+    parent = packet_path.parent
+    tmp_path: Path | None = None
+    fd = -1
+    try:
+        if parent.is_symlink() or not parent.is_dir():
+            raise ReviewerEvidenceError("review_packet_file_unwritable")
+        parent = parent.resolve()
+        if not parent.is_relative_to(runtime_root):
+            raise ReviewerEvidenceError("review_packet_file_outside_root")
+        relative_parent = parent.relative_to(runtime_root).as_posix()
+        if relative_parent != "." and _has_symlink_component(runtime_root, relative_parent):
+            raise ReviewerEvidenceError("review_packet_file_symlink")
+        packet_path = parent / packet_path.name
+        parent_before = parent.stat()
+        if packet_path.is_symlink():
+            raise ReviewerEvidenceError("review_packet_file_symlink")
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{packet_path.name}.",
+            suffix=".tmp",
+            dir=parent,
+        )
+        tmp_path = Path(tmp_name)
+        if tmp_path.is_symlink():
+            raise ReviewerEvidenceError("review_packet_file_symlink")
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        parent_after = parent.stat()
+        if (
+            parent_before.st_dev != parent_after.st_dev
+            or parent_before.st_ino != parent_after.st_ino
+            or not parent.resolve().is_relative_to(runtime_root)
+        ):
+            raise ReviewerEvidenceError("review_packet_file_identity_changed")
+        if packet_path.is_symlink():
+            raise ReviewerEvidenceError("review_packet_file_symlink")
+        os.replace(tmp_path, packet_path)
+        tmp_path = None
+        parent_after_replace = parent.stat()
+        if (
+            parent_before.st_dev != parent_after_replace.st_dev
+            or parent_before.st_ino != parent_after_replace.st_ino
+            or not parent.resolve().is_relative_to(runtime_root)
+        ):
+            raise ReviewerEvidenceError("review_packet_file_identity_changed")
+        if packet_path.is_symlink() or packet_path.read_bytes() != payload:
+            raise ReviewerEvidenceError("review_packet_file_digest_invalid")
+    except ReviewerEvidenceError:
+        raise
+    except OSError as exc:
+        raise ReviewerEvidenceError("review_packet_file_unwritable") from exc
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+def _stdlib_search_roots() -> tuple[Path, ...]:
+    roots = {
+        sysconfig.get_path(name)
+        for name in ("stdlib", "platstdlib")
+        if sysconfig.get_path(name)
+    }
+    dynload = Path(sysconfig.get_path("stdlib")) / "lib-dynload"
+    if dynload.is_dir():
+        roots.add(str(dynload))
+    return tuple(Path(root).resolve() for root in roots)
+
+
+def _dotted_identifier_parts(name: str) -> list[str] | None:
+    if "\x00" in name or "/" in name or "\\" in name:
+        return None
+    parts = name.split(".")
+    if not parts or any(not part.isidentifier() for part in parts):
+        return None
+    return parts
+
+
+def _contained_stdlib_path(path: Path, root: Path) -> Path | None:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    if not resolved.is_relative_to(root):
+        return None
+    return resolved
+
+
+def _platform_python_module_path(module: str) -> Path | None:
+    parts = _dotted_identifier_parts(f"{module}.__sentinel__")
+    if parts is None:
+        return None
+    parts = parts[:-1]
+    root = parts[0]
+    if root not in sys.stdlib_module_names and root not in sys.builtin_module_names:
+        return None
+    for search_root in _stdlib_search_roots():
+        current = search_root
+        module_file: Path | None = None
+        for index, part in enumerate(parts):
+            file_candidate = current / f"{part}.py"
+            package_candidate = current / part / "__init__.py"
+            if file_candidate.is_file():
+                module_file = _contained_stdlib_path(file_candidate, search_root)
+                if module_file is None:
+                    return None
+                if index == len(parts) - 1:
+                    return module_file
+                break
+            if package_candidate.is_file():
+                module_file = _contained_stdlib_path(package_candidate, search_root)
+                if module_file is None:
+                    return None
+                current = current / part
+                if index == len(parts) - 1:
+                    return module_file
+                continue
+            break
+    return None
+
+
+def _stdlib_python_tree(module: str) -> ast.Module | None:
+    path = _platform_python_module_path(module)
+    if path is None:
+        return None
+    try:
+        return ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return None
+
+
+def _interpreter_install_roots() -> tuple[Path, ...]:
+    roots: set[Path] = set()
+    for name in ("purelib", "platlib"):
+        value = sysconfig.get_path(name)
+        if not value:
+            continue
+        try:
+            root = Path(value).resolve()
+        except OSError:
+            continue
+        if root.is_dir():
+            roots.add(root)
+    return tuple(sorted(roots))
+
+
+def _typeshed_stdlib_roots() -> tuple[Path, ...]:
+    roots: set[Path] = set()
+    for install_root in _interpreter_install_roots():
+        candidate = install_root / "mypy" / "typeshed" / "stdlib"
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved.is_dir() and resolved.is_relative_to(install_root):
+            roots.add(resolved)
+    return tuple(sorted(roots))
+
+
+def _contained_typeshed_stub_path(path: Path, root: Path) -> Path | None:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    if not resolved.is_relative_to(root):
+        return None
+    return resolved
+
+
+def _typeshed_stub_path(module: str) -> Path | None:
+    parts = _dotted_identifier_parts(f"{module}.__sentinel__")
+    if parts is None:
+        return None
+    module_parts = parts[:-1]
+    for root in _typeshed_stdlib_roots():
+        file_candidate = root.joinpath(*module_parts).with_suffix(".pyi")
+        if file_candidate.is_file():
+            stub = _contained_typeshed_stub_path(file_candidate, root)
+            if stub is not None:
+                return stub
+        package_candidate = root.joinpath(*module_parts, "__init__.pyi")
+        if package_candidate.is_file():
+            stub = _contained_typeshed_stub_path(package_candidate, root)
+            if stub is not None:
+                return stub
+    return None
+
+
+def _typeshed_tree(module: str) -> ast.Module | None:
+    path = _typeshed_stub_path(module)
+    if path is None:
+        return None
+    try:
+        return ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return None
+
+
+def _module_tree_defines(
+    tree: ast.Module | None, symbol: str, *, depth: int = 0
+) -> bool:
+    if tree is None or depth > 4:
+        return False
+
+    def nodes_to_scan(nodes: list[ast.stmt]) -> Iterable[ast.stmt]:
+        for node in nodes:
+            yield node
+            if isinstance(node, ast.If | ast.Try):
+                yield from nodes_to_scan(list(node.body))
+                yield from nodes_to_scan(list(node.orelse))
+                if isinstance(node, ast.Try):
+                    for handler in node.handlers:
+                        yield from nodes_to_scan(list(handler.body))
+
+    for node in nodes_to_scan(tree.body):
+        if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            if node.name == symbol:
+                return True
+        if isinstance(node, ast.Assign | ast.AnnAssign):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(
+                isinstance(target, ast.Name) and target.id == symbol
+                for target in targets
+            ):
+                return True
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*" and node.module:
+                    if _module_tree_defines(
+                        _typeshed_tree(node.module),
+                        symbol,
+                        depth=depth + 1,
+                    ):
+                        return True
+                    continue
+                if (alias.asname or alias.name).split(".", 1)[0] == symbol:
+                    return True
+    return False
+
+
+def _module_tree_class_defines(
+    tree: ast.Module | None,
+    class_name: str,
+    member: str,
+    *,
+    depth: int = 0,
+) -> bool:
+    if tree is None or depth > 4:
+        return False
+
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != class_name:
+            continue
+        for child in node.body:
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                if child.name == member:
+                    return True
+            if isinstance(child, ast.Assign | ast.AnnAssign):
+                targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                if any(
+                    isinstance(target, ast.Name) and target.id == member
+                    for target in targets
+                ):
+                    return True
+            if isinstance(child, ast.ImportFrom):
+                for alias in child.names:
+                    if (alias.asname or alias.name).split(".", 1)[0] == member:
+                        return True
+    return False
+
+
+def _spec_is_platform_module(spec: importlib.machinery.ModuleSpec) -> bool:
+    origin = spec.origin
+    if origin in {"built-in", "frozen"}:
+        return True
+    if not origin:
+        return False
+    try:
+        origin_path = Path(origin).resolve()
+    except OSError:
+        return False
+    return any(
+        origin_path == root or origin_path.is_relative_to(root)
+        for root in _stdlib_search_roots()
+    )
+
+
+def _platform_module_spec(module: str) -> importlib.machinery.ModuleSpec | None:
+    parts = _dotted_identifier_parts(f"{module}.__sentinel__")
+    if parts is None:
+        return None
+    root = parts[0]
+    if root not in sys.stdlib_module_names and root not in sys.builtin_module_names:
+        return None
+    spec = importlib.machinery.BuiltinImporter.find_spec(module)
+    for search_root in _stdlib_search_roots():
+        if spec is not None:
+            break
+        spec = importlib.machinery.PathFinder.find_spec(module, [str(search_root)])
+    if spec is None or not _spec_is_platform_module(spec):
+        return None
+    return spec
+
+
+def _spec_can_be_loaded_without_python_top_level_code(
+    spec: importlib.machinery.ModuleSpec,
+) -> bool:
+    if spec.origin in {"built-in", "frozen"}:
+        return True
+    origin = spec.origin or ""
+    return any(
+        origin.endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    )
+
+
+def _loaded_platform_module(module: str) -> Any | None:
+    spec = _platform_module_spec(module)
+    if spec is None or spec.loader is None:
+        return None
+    if not _spec_can_be_loaded_without_python_top_level_code(spec):
+        return None
+    loaded = sys.modules.get(module)
+    loaded_spec = getattr(loaded, "__spec__", None)
+    if loaded is not None and isinstance(
+        loaded_spec, importlib.machinery.ModuleSpec
+    ) and _spec_is_platform_module(loaded_spec):
+        return loaded
+    try:
+        loaded = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(loaded)
+    except Exception:
+        return None
+    return loaded
+
+
+def _platform_module_runtime_has_attr(module: str, *attrs: str) -> bool:
+    if any(attr.startswith("__") and attr.endswith("__") for attr in attrs):
+        return False
+    current = _loaded_platform_module(module)
+    if current is None:
+        return False
+    for attr in attrs:
+        if not hasattr(current, attr):
+            return False
+        current = getattr(current, attr)
+    return True
+
+
+def _platform_module_has_attr(module: str, symbol: str) -> bool:
+    return (
+        _module_tree_defines(_stdlib_python_tree(module), symbol)
+        or _module_tree_defines(_typeshed_tree(module), symbol)
+        or _platform_module_runtime_has_attr(module, symbol)
+    )
+
+
+def _platform_module_class_has_attr(module: str, class_name: str, symbol: str) -> bool:
+    return (
+        _module_tree_class_defines(_stdlib_python_tree(module), class_name, symbol)
+        or _module_tree_class_defines(_typeshed_tree(module), class_name, symbol)
+        or _platform_module_runtime_has_attr(module, class_name, symbol)
+    )
+
+
+def _stdlib_python_module_defines(module: str, symbol: str) -> bool:
+    return _module_tree_defines(_stdlib_python_tree(module), symbol)
+
+
+def _stdlib_alias_target(module: str, symbol: str) -> str | None:
+    tree = _stdlib_python_tree(module)
+    if tree is None:
+        return None
+    imports: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                imports[bound] = alias.name
+                if bound == symbol:
+                    return alias.name
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                imports[bound] = f"{node.module}.{alias.name}"
+                if bound == symbol:
+                    return f"{node.module}.{alias.name}"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            value = node.value
+            if not isinstance(value, ast.Name) or value.id not in imports:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == symbol:
+                    return imports[value.id]
+    return None
+
+
+def _platform_module_exists(module: str) -> bool:
+    return (
+        _platform_module_spec(module) is not None
+        or _platform_python_module_path(module) is not None
+        or _typeshed_stub_path(module) is not None
+    )
+
+
+def _builtin_class_has_attr(class_name: str, symbol: str) -> bool:
+    if symbol.startswith("__") and symbol.endswith("__"):
+        return False
+    owner = getattr(builtins, class_name, None)
+    return isinstance(owner, type) and hasattr(owner, symbol)
+
+
+def _is_platform_capability_parts(parts: list[str], *, depth: int = 0) -> bool:
+    if depth > 4:
+        return False
+    if len(parts) == 1:
+        return parts[0] in dir(builtins) or _module_tree_defines(
+            _typeshed_tree("builtins"), parts[0]
+        )
+    if len(parts) < 2:
+        return False
+    if parts[0] == "builtins" and len(parts) == 2:
+        return _is_platform_capability_parts([parts[1]], depth=depth + 1)
+    if parts[0] == "builtins" and len(parts) == 3:
+        return _builtin_class_has_attr(parts[1], parts[2]) or _module_tree_class_defines(
+            _typeshed_tree("builtins"), parts[1], parts[2]
+        )
+    if len(parts) == 2 and _is_platform_capability_parts([parts[0]], depth=depth + 1):
+        return _builtin_class_has_attr(parts[0], parts[1]) or _module_tree_class_defines(
+            _typeshed_tree("builtins"), parts[0], parts[1]
+        )
+    for module_end in range(len(parts) - 1, 0, -1):
+        module = ".".join(parts[:module_end])
+        if not _platform_module_exists(module):
+            continue
+        symbol = parts[module_end]
+        if module_end == len(parts) - 1:
+            return _stdlib_python_module_defines(
+                module, symbol
+            ) or _platform_module_has_attr(module, symbol)
+        child_module = ".".join(parts[: module_end + 1])
+        if _platform_module_exists(child_module):
+            if _is_platform_capability_parts(parts[: module_end + 1], depth=depth + 1):
+                return True
+            return _is_platform_capability_parts(
+                [child_module, *parts[module_end + 1 :]],
+                depth=depth + 1,
+            )
+        alias_target = _stdlib_alias_target(module, symbol)
+        if alias_target is not None:
+            return _is_platform_capability_parts(
+                [*alias_target.split("."), *parts[module_end + 1 :]],
+                depth=depth + 1,
+            )
+        if len(parts) == module_end + 2 and _platform_module_class_has_attr(
+            module, symbol, parts[module_end + 1]
+        ):
+            return True
+        return False
+    return False
+
+
+def _is_importable_platform_capability(name: str) -> bool:
+    """Check replacements against stdlib/platform authority without sys.path lookup."""
+
+    parts = _dotted_identifier_parts(name)
+    if parts is None:
+        return False
+    return _is_platform_capability_parts(parts)
+
+
+_REPLACEMENT_CATEGORIES = frozenset(
+    {"duplicate_existing_symbol", "handrolled_standard_or_platform_capability"}
+)
+_REMOVABLE_SURFACE_CATEGORIES = frozenset({"unnecessary_abstraction", "excess_scope"})
+
+
+def _validate_overbuild_finding(
+    *,
+    index: int,
+    category: str,
+    disposition: str,
+    evidence_reference: Mapping[str, Any] | None,
+    replacement: str,
+    removable_surface: str,
+    authorized_repo_replacements: set[str],
+    changed_paths: set[str],
+    changed_source_lines: Mapping[str, list[tuple[int, int]]],
+) -> None:
+    if disposition != "defect":
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_overbuild_must_be_defect"
+        )
+    if evidence_reference is None:
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_overbuild_exact_evidence_required"
+        )
+    if evidence_reference.get("kind") != "source":
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_overbuild_source_evidence_required"
+        )
+    path = str(evidence_reference.get("path") or "")
+    if path not in changed_paths:
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_overbuild_changed_source_required"
+        )
+    start = evidence_reference.get("line_start")
+    end = evidence_reference.get("line_end")
+    spans = changed_source_lines.get(path) or []
+    if (
+        not isinstance(start, int)
+        or isinstance(start, bool)
+        or not isinstance(end, int)
+        or isinstance(end, bool)
+        or not any(
+            span_start <= start and end <= span_end
+            for span_start, span_end in spans
+        )
+    ):
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_overbuild_changed_source_required"
+        )
+    if category in _REPLACEMENT_CATEGORIES:
+        if not replacement or removable_surface:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_overbuild_replacement_required"
+            )
+        if category == "duplicate_existing_symbol":
+            if replacement not in authorized_repo_replacements:
+                raise ReviewerEvidenceError(
+                    f"review_finding_{index}_overbuild_replacement_unbound"
+                )
+            return
+        if not _is_importable_platform_capability(replacement):
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_overbuild_replacement_unbound"
+            )
+        return
+    if category in _REMOVABLE_SURFACE_CATEGORIES:
+        if not removable_surface or replacement:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_overbuild_removable_surface_required"
+            )
+        if _changed_line_reference(
+            removable_surface,
+            changed_paths=changed_paths,
+            changed_source_lines=changed_source_lines,
+        ) is None:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_overbuild_removable_surface_unbound"
+            )
+
+
 def _canonicalize_structured_evidence(
     finding: Mapping[str, Any], *, index: int
 ) -> dict[str, Any]:
     """Convert one exact structured evidence reference to canonical input.
-
     Reviewer providers commonly render a file/line citation as an ``evidence``
     object even when the prompt requests sibling fields.  This conversion is
     deliberately narrow: it accepts only the canonical source/check keys,
@@ -875,18 +1804,32 @@ def _canonicalize_structured_evidence(
     raw = canonical.get("evidence")
     if not isinstance(raw, Mapping):
         return canonical
-    allowed = {"path", "line_start", "line_end", "check_id"}
-    unknown = set(raw) - allowed
-    if unknown:
+    source_keys = {"path", "line_start", "line_end"}
+    check_keys = {"check_id"}
+    raw_keys = set(raw)
+    if raw_keys == source_keys:
+        path = raw.get("path")
+        check_id = None
+    elif raw_keys == check_keys:
+        path = None
+        check_id = raw.get("check_id")
+    else:
         raise ReviewerEvidenceError(
-            f"review_finding_{index}_structured_evidence_unknown_key:"
-            f"{','.join(sorted(str(key) for key in unknown))}"
+            f"review_finding_{index}_structured_evidence_invalid"
         )
-    path = raw.get("path")
-    check_id = raw.get("check_id")
     if bool(path) == bool(check_id):
         raise ReviewerEvidenceError(
             f"review_finding_{index}_structured_evidence_invalid"
+        )
+    sibling_source = any(canonical.get(key) not in (None, "") for key in source_keys)
+    sibling_check = canonical.get("check_id") not in (None, "")
+    if path is None and sibling_source:
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_structured_evidence_conflict:source"
+        )
+    if check_id is None and sibling_check:
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_structured_evidence_conflict:check_id"
         )
     transferred = (
         ("path", path),
@@ -928,14 +1871,17 @@ def _scoped_audit_rows(
     for lens, value in sorted(values.items()):
         if lens not in {"correctness", "security", "code_quality"}:
             raise ReviewerEvidenceError("review_scope_lens_invalid")
+        payload: object
         if isinstance(value, ScopedAuditPacket):
             payload = value.as_json()
             fingerprint = packet_fingerprint(value)
             schema_id = "aiworkhub.scoped_audit.v1"
+            wrapper_known_unknowns = None
         elif isinstance(value, Mapping):
             payload = value.get("packet")
             fingerprint = str(value.get("fingerprint") or "")
             schema_id = str(value.get("schema_id") or "")
+            wrapper_known_unknowns = value.get("known_unknowns")
         else:
             raise ReviewerEvidenceError("review_scope_invalid")
         if schema_id != "aiworkhub.scoped_audit.v1" or not isinstance(payload, Mapping):
@@ -964,9 +1910,20 @@ def _scoped_audit_rows(
         }
         if scope_paths != changed_paths:
             raise ReviewerEvidenceError("review_scope_changed_paths_mismatch")
+        known_unknowns_source = payload.get("known_unknowns")
+        if known_unknowns_source is None:
+            known_unknowns_source = []
+        if not isinstance(known_unknowns_source, list):
+            raise ReviewerEvidenceError("review_scope_known_unknowns_invalid")
+        if wrapper_known_unknowns is not None and wrapper_known_unknowns != known_unknowns_source:
+            raise ReviewerEvidenceError("review_scope_known_unknowns_mismatch")
+        known_unknowns = [
+            str(item)[:MAX_TEXT_CHARS] for item in known_unknowns_source
+        ]
         result[lens] = {
             "schema_id": schema_id,
             "fingerprint": fingerprint,
+            "known_unknowns": known_unknowns,
             "packet": dict(payload),
         }
     return result
@@ -983,7 +1940,7 @@ def _source_evidence_rows(
 ) -> list[dict[str, Any]]:
     """Validate bounded source evidence bound one-to-one to changed paths."""
 
-    def bounded_int(value: object, field: str) -> int:
+    def bounded_int(value: int | float | str | bytes | bytearray | None, field: str) -> int:
         if isinstance(value, bool):
             raise ReviewerEvidenceError("invalid_candidate_source_evidence")
         try:
@@ -1109,6 +2066,8 @@ __all__ = [
     "MAX_SOURCE_EVIDENCE_TOTAL_CHARS",
     "FINDING_SEVERITIES",
     "FINDING_DISPOSITIONS",
+    "FINDING_CATEGORIES",
+    "OVERBUILD_FINDING_CATEGORIES",
     "QualityReviewFinding",
     "QUALITY_REVIEW_FINDING_INPUT_KEYS",
     "QUALITY_REVIEW_FINDING_INPUT_REQUIRED_KEYS",

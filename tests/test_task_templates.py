@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from pathlib import Path
 
 import pytest
@@ -617,7 +619,7 @@ def test_generic_python_production_plus_test_classifies_compatibly():
         == "compatible_generic_python_production_plus_test"
     )
     assert provenance["expanded_contract_digest"] == expanded_contract_digest(card)
-    validate_template_provenance(provenance)
+    validate_template_provenance(provenance, expanded_card=card)
     mismatched = ["reproduction"] + ["generic"] * (len(card["validation"]) - 1)
     with pytest.raises(TaskTemplateError, match="template_unclassified"):
         classify_task_card(
@@ -645,7 +647,43 @@ def test_unclassified_raw_card_fails_closed_without_audited_escape():
     provenance = classify_task_card(**raw, custom_escape=AUDITED_CUSTOM_ESCAPE)
     assert provenance["template_name"] == "custom"
     assert provenance["classification_reason"] == "audited_custom_escape"
-    validate_template_provenance(provenance)
+    with pytest.raises(TaskTemplateError, match="template_expanded_contract_required"):
+        validate_template_provenance(provenance)
+
+    forged_expanded = {**provenance, "expanded_contract_digest": "f" * 64}
+    with pytest.raises(TaskTemplateError, match="template_expanded_contract_mismatch"):
+        validate_template_provenance(
+            forged_expanded, expanded_card=provenance["expanded_contract"]
+        )
+
+    forged_digest = "f" * 64
+    forged = {
+        **provenance,
+        "template_full_id": f"custom@v{REGISTRY_VERSION}:{forged_digest}",
+        "definition_digest": forged_digest,
+    }
+    with pytest.raises(TaskTemplateError, match="template_digest_mismatch"):
+        validate_template_provenance(
+            forged, expanded_card=provenance["expanded_contract"]
+        )
+
+
+@pytest.mark.parametrize("version", [0, REGISTRY_VERSION + 1])
+def test_custom_provenance_rejects_stale_and_future_registry_versions(version):
+    raw = {
+        "allowed_writes": ["src/odd.txt"],
+        "required_outputs": ["src/odd.txt"],
+        "validation": ["python -m pytest -q tests/test_missing.py"],
+        "work_kind": "generic",
+    }
+    provenance = classify_task_card(**raw, custom_escape=AUDITED_CUSTOM_ESCAPE)
+    forged = {
+        **provenance,
+        "template_full_id": f"custom@v{version}:{provenance['definition_digest']}",
+        "registry_version": version,
+    }
+    with pytest.raises(TaskTemplateError, match="template_provenance_invalid|template_version_stale"):
+        validate_template_provenance(forged)
 
 
 @pytest.mark.parametrize("bad", [7, None, {"cmd": "x"}, b"pytest"])
@@ -751,7 +789,69 @@ def test_template_provenance_payload_is_immutable_identity():
     assert payload["template_full_id"] == template_full_id("bugfix_with_regression")
     assert SCHEMA_ID == "aiworkhub.task_templates.v1"
     assert payload["expanded_contract_digest"] == expanded_contract_digest(card)
-    assert validate_template_provenance(payload) == payload
+    assert validate_template_provenance(payload, expanded_card=card) == payload
+
+
+def test_validate_current_provenance_rejects_caller_chosen_expanded_digest():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    provenance = template_provenance_payload(
+        card, classification_reason="explicit_template"
+    )
+    forged = {**provenance, "expanded_contract_digest": "f" * 64}
+
+    with pytest.raises(TaskTemplateError, match="template_expanded_contract_mismatch"):
+        validate_template_provenance(forged, expanded_card=card)
+
+
+def test_current_generated_provenance_reclassifies_unchanged_card():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    provenance = template_provenance_payload(
+        card, classification_reason="explicit_template"
+    )
+    kwargs = {
+        key: card[key]
+        for key in (
+            "allowed_writes",
+            "required_outputs",
+            "validation",
+            "validation_roles",
+            "work_kind",
+            "read_only",
+            "read_first",
+            "minimality_contract",
+        )
+    }
+    assert classify_task_card(**kwargs, template_provenance=provenance) == provenance
+
+
+def test_validate_provenance_rejects_unbound_legacy_expanded_digest():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    provenance = template_provenance_payload(
+        card, classification_reason="explicit_template"
+    )
+    legacy_digest = task_templates_module._legacy_definition_digest(
+        task_templates_module.TEMPLATE_SPECS["implementation_with_tests"]
+    )
+    forged = {
+        **provenance,
+        "template_full_id": f"implementation_with_tests@v1:{legacy_digest}",
+        "definition_digest": legacy_digest,
+        "expanded_contract_digest": "0" * 64,
+    }
+    with pytest.raises(TaskTemplateError, match="template_expanded_contract_mismatch"):
+        validate_template_provenance(forged, expanded_card=card)
 
 
 def test_classify_empty_optional_fields_do_not_wildcard_digest():
@@ -788,6 +888,103 @@ def test_classify_empty_optional_fields_do_not_wildcard_digest():
         classify_task_card(**omitted)
 
 
+def test_classify_rejects_forged_or_stale_explicit_minimality_contract():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/mod.py"],
+        test_paths=["tests/test_mod.py"],
+    )
+    kwargs = {
+        key: card[key]
+        for key in (
+            "allowed_writes",
+            "required_outputs",
+            "validation",
+            "validation_roles",
+            "work_kind",
+            "read_only",
+            "read_first",
+        )
+    }
+
+    accepted = classify_task_card(
+        **kwargs, minimality_contract=card["minimality_contract"]
+    )
+    assert accepted["expanded_contract_digest"] == expanded_contract_digest(card)
+
+    with pytest.raises(TaskTemplateError, match="template_unclassified"):
+        classify_task_card(**kwargs, minimality_contract="forged or stale contract")
+
+
+def test_classify_binds_matched_minimality_contract_before_provenance(monkeypatch):
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/mod.py"],
+        test_paths=["tests/test_mod.py"],
+    )
+    original_contract = card["minimality_contract"]
+    original_digest = expanded_contract_digest(card)
+    real_payload = template_provenance_payload
+
+    def _change_contract_after_match(stored, *, classification_reason):
+        monkeypatch.setattr(
+            task_templates_module,
+            "CANONICAL_MINIMALITY_CONTRACT",
+            "future canonical minimality contract",
+        )
+        assert stored["minimality_contract"] == original_contract
+        return real_payload(stored, classification_reason=classification_reason)
+
+    monkeypatch.setattr(
+        task_templates_module, "template_provenance_payload", _change_contract_after_match
+    )
+    provenance = classify_task_card(
+        allowed_writes=card["allowed_writes"],
+        required_outputs=card["required_outputs"],
+        validation=card["validation"],
+        validation_roles=card["validation_roles"],
+        work_kind=card["work_kind"],
+        read_only=card["read_only"],
+        read_first=card["read_first"],
+    )
+    assert provenance["expanded_contract_digest"] == original_digest
+
+
+def test_omitted_contract_rejects_arbitrary_well_formed_provenance():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/mod.py"],
+        test_paths=["tests/test_mod.py"],
+    )
+    persisted = {
+        key: card[key]
+        for key in (
+            "allowed_writes",
+            "required_outputs",
+            "validation",
+            "validation_roles",
+            "work_kind",
+            "read_only",
+            "read_first",
+        )
+    }
+    forged_definition = "11" * 32
+    persisted["template_provenance"] = {
+        "schema_id": task_templates_module.PROVENANCE_SCHEMA_ID,
+        "template_name": "implementation_with_tests",
+        "template_full_id": (
+            "implementation_with_tests@v1:" + forged_definition
+        ),
+        "registry_version": 1,
+        "definition_digest": forged_definition,
+        "classification_reason": "explicit_template",
+        "expanded_contract_digest": "22" * 32,
+    }
+
+    with pytest.raises(TaskTemplateError, match="template_legacy_identity_invalid"):
+        classify_task_card(**persisted)
+
+
 def test_classify_poisoned_live_template_does_not_reseal_stored_digest(monkeypatch):
     card = expand_template(
         "implementation_with_tests",
@@ -819,6 +1016,63 @@ def test_classify_poisoned_live_template_does_not_reseal_stored_digest(monkeypat
         classify_task_card(**stored)
     assert expanded_contract_digest(stored) == stored_digest
     assert original["expanded_contract_digest"] == stored_digest
+
+
+def test_builtin_provenance_cannot_self_authenticate_embedded_contract():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/mod.py"],
+        test_paths=["tests/test_mod.py"],
+    )
+    forged_card = {**card, "validation": ["git diff --check"]}
+    forged = dict(
+        template_provenance_payload(
+            forged_card, classification_reason="explicit_template"
+        )
+    )
+
+    with pytest.raises(
+        TaskTemplateError, match="template_expanded_contract_required"
+    ):
+        validate_template_provenance(forged)
+
+    provenance = template_provenance_payload(
+        card, classification_reason="explicit_template"
+    )
+    assert validate_template_provenance(provenance) == provenance
+    assert validate_template_provenance(provenance, expanded_card=card) == provenance
+
+
+def test_custom_provenance_requires_audited_escape_and_exact_expanded_card():
+    card = {
+        "allowed_writes": ["src/odd.txt"],
+        "required_outputs": ["src/odd.txt"],
+        "validation": ["python -m pytest -q tests/test_missing.py"],
+        "validation_roles": ["generic"],
+        "work_kind": "generic",
+        "read_only": False,
+        "read_first": [],
+    }
+    provenance = classify_task_card(
+        **card, custom_escape=AUDITED_CUSTOM_ESCAPE
+    )
+
+    with pytest.raises(TaskTemplateError, match="custom_escape_invalid"):
+        classify_task_card(**card, template_provenance=provenance)
+
+    forged = {**card, "validation": ["git diff --check"]}
+    with pytest.raises(TaskTemplateError, match="template_expanded_contract_mismatch"):
+        classify_task_card(
+            **forged,
+            template_provenance=provenance,
+            custom_escape=AUDITED_CUSTOM_ESCAPE,
+        )
+
+    assert classify_task_card(
+        **card,
+        template_provenance=provenance,
+        custom_escape=AUDITED_CUSTOM_ESCAPE,
+    ) == provenance
 
 
 _NODE_TEST_PATH_CASES = (
@@ -915,6 +1169,44 @@ def test_real_suffixless_directory_targets_route_to_python_toolchain():
         "python -m ruff check tests tests/unit",
         "git diff --check",
     ]
+
+
+@pytest.mark.parametrize("test_path", ["tests", "tests/unit"])
+def test_test_directory_targets_partition_and_provenance_round_trip(test_path):
+    assert _looks_like_test_path(test_path)
+    production, tests = _partition_write_set(["src/a.py", test_path])
+    assert production == ["src/a.py"]
+    assert tests == [test_path]
+
+    card = expand_template(
+        "bugfix_with_regression",
+        production_paths=production,
+        test_paths=tests,
+    )
+    provenance = classify_task_card(
+        allowed_writes=card["allowed_writes"],
+        required_outputs=card["required_outputs"],
+        validation=card["validation"],
+        validation_roles=card["validation_roles"],
+        work_kind=card["work_kind"],
+        read_only=card["read_only"],
+        read_first=card["read_first"],
+    )
+    assert provenance["template_name"] == "bugfix_with_regression"
+    assert validate_template_provenance(provenance, expanded_card=card) == provenance
+
+
+@pytest.mark.parametrize("test_path", ["tests", "tests/unit"])
+def test_unchanged_required_test_directory_output_fails_closed(test_path):
+    card = expand_template(
+        "bugfix_with_regression",
+        production_paths=["src/a.py"],
+        test_paths=[test_path],
+    )
+    with pytest.raises(
+        TaskTemplateError, match="unchanged_required_public_test_output"
+    ):
+        reject_unchanged_public_test_outputs([test_path], card["required_outputs"])
 
 
 def test_suffixless_ordinary_files_never_route_to_pytest_or_ruff():
@@ -1336,3 +1628,346 @@ def test_the_gate_is_appended_once_even_for_many_package_paths():
         ["src/aiworkhub/a.py", "src/aiworkhub/b.py"], ["tests/test_a.py"]
     )
     assert sum(1 for c in expanded["validation"] if PACKAGE_GATE in c) == 1
+
+
+def test_code_changing_templates_emit_exact_canonical_minimality_contract():
+    for template_id in TEMPLATE_IDS:
+        spec = resolve_template(template_id)
+        if spec.read_only:
+            continue
+        if template_id == "cross_boundary_bugfix":
+            production_paths = ["src/mod.py", "src/mod.js"]
+            test_paths = ["tests/test_mod.py", "tests/mod.test.js"]
+        else:
+            production_paths = (
+                [] if not spec.production_path_policy.allowed else ["src/mod.py"]
+            )
+            test_paths = (
+                [] if not spec.test_path_policy.allowed else ["tests/test_mod.py"]
+            )
+        card = expand_template(
+            template_id,
+            production_paths=production_paths,
+            test_paths=test_paths,
+        )
+        assert card["minimality_contract"] == (
+            task_templates_module.CANONICAL_MINIMALITY_CONTRACT
+        )
+
+
+def test_current_provenance_binds_persisted_omitted_minimality_contract():
+    expanded = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/mod.py"],
+        test_paths=["tests/test_mod.py"],
+    )
+    provenance = template_provenance_payload(
+        expanded, classification_reason="explicit_template"
+    )
+    persisted = {
+        field: expanded[field]
+        for field in (
+            "allowed_writes",
+            "required_outputs",
+            "validation",
+            "validation_roles",
+            "work_kind",
+            "read_only",
+            "read_first",
+        )
+    }
+    persisted["template_provenance"] = provenance
+
+    assert expanded_contract_digest(persisted) == provenance[
+        "expanded_contract_digest"
+    ]
+    with pytest.raises(TaskTemplateError, match="template_legacy_identity_invalid"):
+        classify_task_card(**persisted)
+    assert classify_task_card(
+        **persisted,
+        minimality_contract=task_templates_module.CANONICAL_MINIMALITY_CONTRACT,
+    ) == provenance
+
+
+def test_literal_legacy_v1_card_and_provenance_survive_registry_upgrade(monkeypatch):
+    legacy_definition_digest = (
+        "023c786094c75429d1ddc081b38c1bb44959c1f52c42f8efd70c680686113dcf"
+    )
+    legacy_expanded_digest = (
+        "144074b6f7f7c8c1895e7a6f4322d65b3d21e0041f3c0d737fc6a404cb37e1f4"
+    )
+    legacy_card = {
+        "allowed_writes": ["src/mod.py", "tests/test_mod.py"],
+        "read_first": ["src/mod.py", "tests/test_mod.py"],
+        "read_only": False,
+        "required_outputs": [],
+        "validation": [
+            "python -m pytest -q tests/test_mod.py",
+            "python -m ruff check src/mod.py tests/test_mod.py",
+            "git diff --check",
+        ],
+        "validation_roles": ["generic", "generic", "generic"],
+        "work_kind": "generic",
+    }
+    legacy_provenance = {
+        "schema_id": "aiworkhub.task_template_provenance.v1",
+        "template_name": "implementation_with_tests",
+        "template_full_id": (
+            "implementation_with_tests@v1:" + legacy_definition_digest
+        ),
+        "registry_version": 1,
+        "definition_digest": legacy_definition_digest,
+        "classification_reason": "explicit_template",
+        "expanded_contract_digest": legacy_expanded_digest,
+    }
+    legacy_card["template_provenance"] = legacy_provenance
+
+    monkeypatch.setattr(
+        task_templates_module,
+        "CANONICAL_MINIMALITY_CONTRACT",
+        "A later canonical minimality contract.",
+    )
+    monkeypatch.setattr(task_templates_module, "REGISTRY_VERSION", 2)
+    monkeypatch.setattr(task_templates_module, "REGISTRY_VERSION_TOKEN", "v2")
+
+    spec = task_templates_module.TEMPLATE_SPECS["implementation_with_tests"]
+    assert task_templates_module._legacy_definition_digest(spec) == (
+        legacy_definition_digest
+    )
+    assert (
+        expanded_contract_digest(
+            legacy_card,
+            trusted_legacy_definition_digest=legacy_definition_digest,
+        )
+        == legacy_expanded_digest
+    )
+    with pytest.raises(TaskTemplateError, match="template_version_stale"):
+        resolve_template(legacy_provenance["template_full_id"])
+    assert (
+        validate_template_provenance(
+            legacy_provenance, expanded_card=legacy_card
+        )
+        == legacy_provenance
+    )
+    assert classify_task_card(**legacy_card) == legacy_provenance
+
+    altered = {**legacy_card, "read_first": ["src/other.py"]}
+    with pytest.raises(TaskTemplateError, match="template_legacy_identity_invalid"):
+        classify_task_card(**altered)
+
+    for field in ("expanded_contract_digest", "definition_digest"):
+        forged = json.loads(json.dumps(legacy_card))
+        forged["template_provenance"][field] = "f" * 64
+        if field == "definition_digest":
+            forged["template_provenance"]["template_full_id"] = (
+                "implementation_with_tests@v1:" + ("f" * 64)
+            )
+        with pytest.raises(TaskTemplateError, match="template_legacy_identity_invalid"):
+            classify_task_card(**forged)
+
+    forged_full_id = json.loads(json.dumps(legacy_card))
+    forged_full_id["template_provenance"]["template_full_id"] = (
+        "implementation_with_tests@v1:" + ("f" * 64)
+    )
+    with pytest.raises(TaskTemplateError, match="template_legacy_identity_invalid"):
+        classify_task_card(**forged_full_id)
+
+    historical_current_digest = task_templates_module._definition_digest(spec)
+    arbitrary_historical_current = json.loads(json.dumps(legacy_card))
+    arbitrary_historical_current["template_provenance"].update(
+        definition_digest=historical_current_digest,
+        template_full_id=(
+            "implementation_with_tests@v1:" + historical_current_digest
+        ),
+    )
+    with pytest.raises(TaskTemplateError, match="template_legacy_identity_invalid"):
+        classify_task_card(**arbitrary_historical_current)
+
+
+@pytest.mark.parametrize(
+    ("template_name", "legacy_card", "legacy_provenance"),
+    [
+        (
+            "read_only_analysis",
+            {
+                "allowed_writes": [],
+                "read_first": ["src/mod.py"],
+                "read_only": True,
+                "required_outputs": [],
+                "validation": [],
+                "validation_roles": [],
+                "work_kind": "generic",
+            },
+            {
+                "schema_id": "aiworkhub.task_template_provenance.v1",
+                "template_name": "read_only_analysis",
+                "template_full_id": "read_only_analysis@v1:a13aaaf4cb57d788291f31599aae6eb5e3e84a9e3d4aa203b120eea15e269a12",
+                "registry_version": 1,
+                "definition_digest": "a13aaaf4cb57d788291f31599aae6eb5e3e84a9e3d4aa203b120eea15e269a12",
+                "classification_reason": "explicit_template",
+                "expanded_contract_digest": "f7a1f9dd2d848165ec493207bf89068640cb87ca76f960c026173e4142be33a4",
+            },
+        ),
+        (
+            "validation_replay",
+            {
+                "allowed_writes": [],
+                "read_first": ["src/mod.py", "tests/test_mod.py"],
+                "read_only": True,
+                "required_outputs": [],
+                "validation": [
+                    "python -m pytest -q tests/test_mod.py",
+                    "python -m ruff check src/mod.py tests/test_mod.py",
+                    "git diff --check",
+                ],
+                "validation_roles": ["generic", "generic", "generic"],
+                "work_kind": "generic",
+            },
+            {
+                "schema_id": "aiworkhub.task_template_provenance.v1",
+                "template_name": "validation_replay",
+                "template_full_id": "validation_replay@v1:ad7d166c83379c7c7dd3e3952e123ff791b4ba9e968cd1ae8d7b7cef85a1edf5",
+                "registry_version": 1,
+                "definition_digest": "ad7d166c83379c7c7dd3e3952e123ff791b4ba9e968cd1ae8d7b7cef85a1edf5",
+                "classification_reason": "explicit_template",
+                "expanded_contract_digest": "9d17be8649778b486d6e3d5741b90ea7c63b3d9ed667d8aa832ed616c8489d15",
+            },
+        ),
+    ],
+)
+def test_persisted_pre_minimality_read_only_cards_keep_authenticated_identity(
+    template_name, legacy_card, legacy_provenance
+):
+    persisted = {**legacy_card, "template_provenance": legacy_provenance}
+
+    assert expanded_contract_digest(persisted) == legacy_provenance[
+        "expanded_contract_digest"
+    ]
+    assert classify_task_card(**persisted) == legacy_provenance
+    assert resolve_template(legacy_provenance["template_full_id"]).name == template_name
+
+    mutated = {**persisted, "read_first": ["src/other.py"]}
+    with pytest.raises(TaskTemplateError, match="template_legacy_identity_invalid"):
+        classify_task_card(**mutated)
+
+
+def test_forged_legacy_provenance_cannot_select_weaker_digest_path(monkeypatch):
+    legacy_definition_digest = (
+        "023c786094c75429d1ddc081b38c1bb44959c1f52c42f8efd70c680686113dcf"
+    )
+    forged_card = {
+        "allowed_writes": ["src/mod.py", "tests/test_mod.py"],
+        "read_first": ["src/mod.py", "tests/test_mod.py"],
+        "read_only": False,
+        "required_outputs": [],
+        "validation": [],
+        "validation_roles": [],
+        "work_kind": "generic",
+        "template_provenance": {
+            "template_name": "implementation_with_tests",
+            "definition_digest": legacy_definition_digest,
+        },
+    }
+    before = expanded_contract_digest(forged_card)
+    asserted = expanded_contract_digest(
+        forged_card,
+        trusted_legacy_definition_digest=legacy_definition_digest,
+    )
+    assert asserted == before
+    monkeypatch.setattr(
+        task_templates_module,
+        "CANONICAL_MINIMALITY_CONTRACT",
+        "A materially revised canonical minimality contract.",
+    )
+    assert expanded_contract_digest(forged_card) != before
+
+
+def test_read_only_templates_do_not_promise_code_changes():
+    for template_id in ("read_only_analysis", "validation_replay"):
+        kwargs = (
+            {"test_paths": ["tests/test_mod.py"]}
+            if template_id == "validation_replay"
+            else {}
+        )
+        assert "minimality_contract" not in expand_template(template_id, **kwargs)
+
+
+def test_minimality_contract_is_deterministic_and_digest_bound():
+    kwargs = {
+        "production_paths": ["src/mod.py"],
+        "test_paths": ["tests/test_mod.py"],
+    }
+    first = expand_template("implementation_with_tests", **kwargs)
+    second = expand_template("implementation_with_tests", **kwargs)
+    assert first == second
+    assert expanded_contract_digest(first) == expanded_contract_digest(second)
+
+    changed = dict(first)
+    changed["minimality_contract"] += " changed"
+    assert expanded_contract_digest(changed) != expanded_contract_digest(first)
+
+
+def test_persisted_digest_is_stable_across_builtin_contract_revision(monkeypatch):
+    name = "implementation_with_tests"
+    kwargs = {
+        "production_paths": ["src/mod.py"],
+        "test_paths": ["tests/test_mod.py"],
+    }
+    original = expand_template(name, **kwargs)
+    original_full_id = template_full_id(name)
+
+    persisted = dict(original)
+    persisted_bytes = json.dumps(
+        persisted, sort_keys=True, separators=(",", ":")
+    ).encode()
+    stored_digest = expanded_contract_digest(json.loads(persisted_bytes))
+    stored_provenance = template_provenance_payload(
+        json.loads(persisted_bytes), classification_reason="explicit_template"
+    )
+    assert stored_provenance["expanded_contract_digest"] == stored_digest
+
+    revised_contract = (
+        task_templates_module.CANONICAL_MINIMALITY_CONTRACT + " Material revision."
+    )
+    monkeypatch.setattr(
+        task_templates_module,
+        "CANONICAL_MINIMALITY_CONTRACT",
+        revised_contract,
+    )
+
+    assert expanded_contract_digest(json.loads(persisted_bytes)) == stored_digest
+    assert (
+        template_provenance_payload(
+            json.loads(persisted_bytes), classification_reason="explicit_template"
+        )["expanded_contract_digest"]
+        == stored_digest
+    )
+    revised = expand_template(name, **kwargs)
+    assert revised["minimality_contract"] == revised_contract
+    assert revised["template_full_id"] != original["template_full_id"]
+    assert template_full_id(name) != original_full_id
+
+
+def test_code_card_digest_uses_canonical_minimality_when_implicit():
+    custom_card = {
+        "allowed_writes": ["src/mod.py"],
+        "read_first": ["src/mod.py"],
+        "read_only": False,
+        "required_outputs": ["src/mod.py"],
+        "validation": ["python -m pytest -q tests/test_mod.py"],
+        "validation_roles": ["behavioral"],
+        "work_kind": "generic",
+    }
+    explicit = {
+        **custom_card,
+        "minimality_contract": task_templates_module.CANONICAL_MINIMALITY_CONTRACT,
+    }
+
+    absent_provenance = task_templates_module._custom_escape_provenance(custom_card)
+    explicit_provenance = task_templates_module._custom_escape_provenance(explicit)
+    assert absent_provenance["expanded_contract_digest"] == (
+        explicit_provenance["expanded_contract_digest"]
+    )
+    assert absent_provenance == task_templates_module._custom_escape_provenance(
+        dict(custom_card)
+    )

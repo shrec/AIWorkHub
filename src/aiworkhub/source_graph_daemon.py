@@ -41,6 +41,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,9 @@ MIN_STALE_AFTER_SECONDS = 120.0
 BUILD_EXECUTION_ENV = "AIWORKHUB_SOURCE_GRAPH_BUILD_EXECUTION"
 BUILD_EXECUTION_SUBPROCESS = "subprocess"
 BUILD_EXECUTION_THREAD = "thread"
+BUILD_OWNER_ENV = "AIWORKHUB_SOURCE_GRAPH_BUILD_OWNER"
+BUILD_IDENTITY_FILE = "build-process.json"
+BUILD_IDENTITY_LOCK_FILE = "build-process.lock"
 
 STATUS_STOPPED = "stopped"
 STATUS_INDEXING = "indexing"
@@ -95,33 +99,398 @@ def _registry_key(repo_root: Path | str) -> str:
     return str(Path(repo_root).resolve())
 
 
-def _repo_has_readable_generation(repo_root: Path | str) -> bool:
-    """True iff the canonical database already holds a committed generation.
-
-    Distinguishes a writer that yielded to another process's build lease
-    (STANDBY) with a usable prior generation from one where no generation
-    has ever been committed -- the former is not a refresh failure, the
-    latter genuinely is.
-    """
+def _windows_taskkill_path() -> str | None:
+    """Resolve taskkill from the kernel-reported system directory, never PATH."""
     try:
-        db_path = source_graph.resolve_db_path(Path(repo_root).resolve())
+        import ctypes
+
+        system_directory = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetSystemDirectoryW(
+            system_directory, len(system_directory)
+        )
+        if length <= 0 or length >= len(system_directory):
+            return None
+        return system_directory.value.rstrip("\\/") + "\\taskkill.exe"
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _build_identity_path(repo_root: Path | str) -> Path:
+    return source_graph.resolve_db_path(Path(repo_root).resolve()).parent / BUILD_IDENTITY_FILE
+
+
+@contextmanager
+def _build_identity_lock(repo_root: Path | str):
+    """Serialize identity publication/CAS deletion across daemon processes."""
+    path = _build_identity_path(repo_root).with_name(BUILD_IDENTITY_LOCK_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if os.name == "nt":
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _read_build_identity(repo_root: Path | str) -> dict[str, Any] | None:
+    try:
+        value = json.loads(_build_identity_path(repo_root).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, source_graph.SourceGraphError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _replace_build_identity_file(path: Path, value: dict[str, Any]) -> None:
+    """Atomically publish private owner identity with mode 0600."""
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    payload = json.dumps(value, sort_keys=True) + "\n"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _write_build_identity(repo_root: Path | str, value: dict[str, Any]) -> None:
+    path = _build_identity_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _build_identity_lock(repo_root):
+        _replace_build_identity_file(path, value)
+
+
+def _publish_build_identity_if_unowned(
+    repo_root: Path | str, value: dict[str, Any]
+) -> bool:
+    """Claim an empty durable slot without replacing another build owner."""
+    path = _build_identity_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _build_identity_lock(repo_root):
+        current = _read_build_identity(repo_root)
+        if current is not None:
+            required = {
+                "pid", "pgid", "session_id", "start_ticks", "owner_token", "repo_root"
+            }
+            if (
+                not required.issubset(current)
+                or current.get("repo_root") != _registry_key(repo_root)
+                or not _cross_instance_identity_supported()
+                or _retained_tree_alive(current)
+            ):
+                return False
+            try:
+                pid = int(current["pid"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            # A mismatching live PID may be recycled. Its presence is not
+            # death proof, so preserve the stale fence and fail closed.
+            if _proc_identity(pid) is not None:
+                return False
+        _replace_build_identity_file(path, value)
+        return True
+
+
+def _compare_and_write_build_identity(
+    repo_root: Path | str,
+    expected: dict[str, Any],
+    value: dict[str, Any],
+) -> bool:
+    """Publish ``value`` only while the exact process still owns the slot."""
+    path = _build_identity_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _build_identity_lock(repo_root):
+        current = _read_build_identity(repo_root)
+        identity_fields = ("pid", "start_ticks", "owner_token")
+        if current is None or any(
+            current.get(field) != expected.get(field) for field in identity_fields
+        ):
+            return False
+        _replace_build_identity_file(path, value)
+        return True
+
+
+def _proc_identity(pid: int) -> dict[str, Any] | None:
+    """Return Linux kernel identity without using a liveness-only PID probe."""
+    if os.name == "nt" or pid <= 0:
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = raw[raw.rfind(")") + 2 :].split()
+        if fields[0] == "Z":
+            return None
+        return {
+            "pid": pid,
+            "state": fields[0],
+            "pgid": int(fields[2]),
+            "session_id": int(fields[3]),
+            "start_ticks": int(fields[19]),
+        }
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _cross_instance_identity_supported() -> bool:
+    """Whether this platform can authenticate retained process identities."""
+    # The retained v1 identity is authenticated with Linux procfs start time,
+    # process-group/session identity, and the private owner token in environ.
+    # Other POSIX platforms still have a safe owning ``Popen`` handle, but do
+    # not necessarily expose equivalent cross-instance evidence.
+    return sys.platform.startswith("linux") and Path("/proc/self/stat").is_file()
+
+
+def _identity_matches(retained: dict[str, Any]) -> bool:
+    try:
+        current = _proc_identity(int(retained["pid"]))
+        return bool(
+            current
+            and current["start_ticks"] == int(retained["start_ticks"])
+            and current["pgid"] == int(retained["pgid"])
+            and current["session_id"] == int(retained["session_id"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _leader_owner_matches(retained: dict[str, Any]) -> bool:
+    """Authenticate the exact retained leader through its process environment."""
+    if not _cross_instance_identity_supported():
+        return False
+    try:
+        pid = int(retained["pid"])
+        token = str(retained["owner_token"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not token or not _identity_matches(retained):
+        return False
+    marker = f"{BUILD_OWNER_ENV}={token}".encode()
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    # Recheck after reading: the PID must not have been recycled while the
+    # environment authority was consulted.
+    return marker in environ and _identity_matches(retained)
+
+
+def _owned_group_members(retained: dict[str, Any]) -> list[dict[str, Any]]:
+    """Find exact token-bearing descendants; PID/start pairs prevent reuse."""
+    if os.name == "nt":
+        return []
+    token = str(retained.get("owner_token") or "")
+    if not token:
+        return []
+    marker = f"{BUILD_OWNER_ENV}={token}".encode()
+    members: list[dict[str, Any]] = []
+    try:
+        proc_entries = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        identity = _proc_identity(int(entry.name))
+        if identity is None:
+            continue
+        try:
+            environ = (entry / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if marker in environ:
+            members.append(identity)
+    return members
+
+
+def _retained_tree_alive(retained: dict[str, Any]) -> bool:
+    if _identity_matches(retained):
+        return True
+    try:
+        pgid = int(retained["pgid"])
+        session_id = int(retained["session_id"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return any(
+        member["pgid"] == pgid and member["session_id"] == session_id
+        for member in _owned_group_members(retained)
+    )
+
+
+def _clear_build_identity_if_dead(repo_root: Path | str, owner_token: str) -> bool:
+    with _build_identity_lock(repo_root):
+        retained = _read_build_identity(repo_root)
+        if retained is None or retained.get("owner_token") != owner_token:
+            return retained is None
+        if _retained_tree_alive(retained):
+            return False
+        try:
+            _build_identity_path(repo_root).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        return True
+
+
+def _restore_build_identity_after_failed_stop(
+    repo_root: Path | str,
+    stopping: dict[str, Any],
+    prior: dict[str, Any],
+) -> None:
+    """Undo only this stop's provisional fence, preserving a newer owner."""
+    path = _build_identity_path(repo_root)
+    try:
+        with _build_identity_lock(repo_root):
+            if _read_build_identity(repo_root) != stopping:
+                return
+            _replace_build_identity_file(path, prior)
+    except OSError:
+        # The stop still fails closed. A later authority may recover the
+        # retained identity without this attempt clobbering concurrent state.
+        return
+
+
+def _stop_retained_build(repo_root: Path | str, *, timeout: float = 5.0) -> bool:
+    """Fence and terminate a durably retained build tree across instances."""
+    retained = _read_build_identity(repo_root)
+    if retained is None:
+        return True
+    required = {"pid", "pgid", "session_id", "start_ticks", "owner_token", "repo_root"}
+    if not required.issubset(retained) or retained.get("repo_root") != _registry_key(repo_root):
+        return False
+    if not _cross_instance_identity_supported():
+        # This identity format is currently authenticated through /proc start
+        # identity and environment ownership. Windows provides neither through
+        # these primitives, so absence of evidence must never become death
+        # proof or permit clearing the durable cross-instance fence.
+        return False
+    if _identity_matches(retained) and not _leader_owner_matches(retained):
+        # Public kernel identity fields are forgeable. Never persist a stop
+        # transition or signal a live leader until its private launch token is
+        # proven by the platform process-environment authority.
+        return False
+    prior = retained
+    retained = {**prior, "state": "stopping", "stop_requested_at": _utcnow()}
+    try:
+        if not _compare_and_write_build_identity(repo_root, prior, retained):
+            return False
+    except OSError:
+        return False
+    deadline = time.monotonic() + max(0.0, timeout)
+    for graceful in (True, False):
+        leader_matches = _identity_matches(retained)
+        if leader_matches and not _leader_owner_matches(retained):
+            _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+            return False
+        members = _owned_group_members(retained)
+        try:
+            pgid = int(retained["pgid"])
+            session_id = int(retained["session_id"])
+        except (TypeError, ValueError):
+            _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+            return False
+        owned_members = [
+            member for member in members
+            if member["pgid"] == pgid and member["session_id"] == session_id
+        ]
+        if not leader_matches and not owned_members:
+            try:
+                current_pid_identity = _proc_identity(int(retained["pid"]))
+            except (KeyError, TypeError, ValueError):
+                _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+                return False
+            if current_pid_identity is not None:
+                # PID exists but its kernel start/group identity differs: it
+                # has been recycled. Preserve the fence and never signal it.
+                _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+                return False
+            cleared = _clear_build_identity_if_dead(
+                repo_root, str(retained["owner_token"])
+            )
+            if not cleared:
+                _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+            return cleared
+        if pgid <= 0:
+            _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+            return False
+
+        # The snapshot above may become stale while stop decides what to do.
+        # Reauthenticate the exact retained leader when it remains alive and
+        # freshly rediscover at least one token-bearing member of the retained
+        # group immediately before every signal. Once the leader has exited,
+        # the authenticated surviving member keeps that group reserved and is
+        # the authority for identity-safe escalation of the same owned tree.
+        signal_leader_matches = _identity_matches(retained)
+        if signal_leader_matches and not _leader_owner_matches(retained):
+            _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+            return False
+        signal_members = [
+            member for member in _owned_group_members(retained)
+            if member["pgid"] == pgid and member["session_id"] == session_id
+        ]
+        if not signal_members:
+            _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+            return False
+        if not signal_leader_matches:
+            try:
+                current_pid_identity = _proc_identity(int(retained["pid"]))
+            except (KeyError, TypeError, ValueError):
+                _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+                return False
+            if current_pid_identity is not None:
+                # The retained leader PID was recycled while its old owned
+                # descendants survived. Never let that unrelated process
+                # authorize a signal; the durable stopping fence remains.
+                _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+                return False
+        try:
+            os.killpg(pgid, signal.SIGTERM if graceful else signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+            return False
+        phase_deadline = min(deadline, time.monotonic() + 2.0)
+        while time.monotonic() < phase_deadline:
+            if not _retained_tree_alive(retained):
+                return _clear_build_identity_if_dead(
+                    repo_root, str(retained["owner_token"])
+                )
+            time.sleep(0.02)
+    _restore_build_identity_after_failed_stop(repo_root, retained, prior)
+    return False
+
+
+def _repo_has_readable_generation(repo_root: Path | str) -> bool:
+    """True iff the canonical generation passes representative retrieval."""
+    try:
+        root = Path(repo_root).resolve()
+        db_path = source_graph.resolve_db_path(root)
         if not db_path.exists():
             return False
-        conn = source_graph.connect(db_path, read_only=True)
-        try:
-            row = conn.execute(
-                "SELECT value FROM meta WHERE key = 'last_build'"
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is None:
-            return False
-        payload = json.loads(row["value"])
-        return bool(
-            payload.get("finished_at")
-            and payload.get("build_revision")
-            and int(payload.get("files_seen") or 0) > 0
-        )
+        source_graph.probe_generation(db_path)
+        return True
     except (
         OSError,
         ValueError,
@@ -272,6 +641,7 @@ class SourceGraphDaemon:
         )
         self._process_lock = threading.Lock()
         self._build_process: subprocess.Popen[str] | None = None
+        self._build_owner_token = uuid.uuid4().hex
         # Exact owned process-group identity of ``_build_process`` (its
         # session/group-leader pid on POSIX; ``None`` on Windows, where the
         # tree is reaped by PID via ``taskkill /T``). Captured while the child
@@ -441,7 +811,12 @@ class SourceGraphDaemon:
         the single child handle rather than guessing another group.
         """
         if os.name == "nt":
-            args = ["taskkill", "/T", "/PID", str(process.pid)]
+            taskkill = _windows_taskkill_path()
+            if taskkill is None:
+                # Never search PATH for a privileged process-control executable.
+                self._signal_single_child(process, graceful=graceful)
+                return
+            args = [taskkill, "/T", "/PID", str(process.pid)]
             if not graceful:
                 args.insert(1, "/F")
             try:
@@ -718,6 +1093,34 @@ class SourceGraphDaemon:
                 "error": self._recovery_error,
                 "coalesced": True,
             }
+        writer_lease = source_graph.index_write_lease(self.repo_root)
+        try:
+            writer_acquired = writer_lease.__enter__()
+        except (source_graph.SourceGraphError, OSError) as exc:
+            self._recovery_lock.release()
+            with self._state_lock:
+                self._recovery_error = (
+                    f"resolve_path:{type(exc).__name__}:{exc}"[:300]
+                )
+                self._recovery_phase = _RECOVERY_PHASE_DETECT
+            return {
+                "recovered": False,
+                "phase": self._recovery_phase,
+                "error": self._recovery_error,
+            }
+        if not writer_acquired:
+            writer_lease.__exit__(None, None, None)
+            self._recovery_lock.release()
+            with self._state_lock:
+                self._status = STATUS_STANDBY
+                self._recovery_phase = _RECOVERY_PHASE_DETECT
+                self._recovery_error = "writer_lease_held_by_other_process"
+            return {
+                "recovered": False,
+                "phase": self._recovery_phase,
+                "error": self._recovery_error,
+                "retryable": True,
+            }
         try:
             self._recovery_started_at = time.monotonic()
             with self._state_lock:
@@ -821,11 +1224,31 @@ class SourceGraphDaemon:
                         self._recovery_started_at = 0.0
                     return {"recovered": False, "phase": self._recovery_phase, "error": self._recovery_error}
 
-                # Phase: commit recovery by ensuring journal_mode=DELETE and
-                # persisting any recovered state.
+                # Phase: commit recovery by forcing DELETE mode and
+                # persisting any recovered state. The pragma also checkpoints
+                # and removes recovery sidecars before strict readers resume.
                 self._recovery_phase = _RECOVERY_PHASE_COMMIT
                 self._recovery_elapsed = time.monotonic() - self._recovery_started_at
-                conn.commit()
+                try:
+                    conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+                    conn.commit()
+                except sqlite3.Error as exc:
+                    with self._state_lock:
+                        self._recovery_error = (
+                            f"commit:{type(exc).__name__}:{exc}"[:300]
+                        )
+                        self._recovery_phase = _RECOVERY_PHASE_COMMIT
+                        self._status = STATUS_DEGRADED
+                        self._recovery_elapsed = (
+                            time.monotonic() - self._recovery_started_at
+                        )
+                        self._recovery_started_at = 0.0
+                    return {
+                        "recovered": False,
+                        "phase": self._recovery_phase,
+                        "error": self._recovery_error,
+                        "retryable": True,
+                    }
 
                 # Re-read last_build from the recovered database to refresh
                 # the daemon's in-memory state so the health surface stays
@@ -912,6 +1335,29 @@ class SourceGraphDaemon:
                         "error": self._recovery_error,
                     }
 
+                # A stale rollback journal can remain even after SQLite finds
+                # no pages to roll back. Remove it only after the recovered
+                # connection is committed and closed, before readers resume.
+                conn.close()
+                try:
+                    Path(f"{db_path}-journal").unlink(missing_ok=True)
+                except OSError as exc:
+                    with self._state_lock:
+                        self._recovery_error = (
+                            f"journal_cleanup:{type(exc).__name__}:{exc}"[:300]
+                        )
+                        self._recovery_phase = _RECOVERY_PHASE_COMMIT
+                        self._status = STATUS_DEGRADED
+                        self._recovery_elapsed = (
+                            time.monotonic() - self._recovery_started_at
+                        )
+                        self._recovery_started_at = 0.0
+                    return {
+                        "recovered": False,
+                        "phase": self._recovery_phase,
+                        "error": self._recovery_error,
+                        "retryable": True,
+                    }
                 with self._state_lock:
                     self._recovery_phase = ""
                     self._recovery_elapsed = time.monotonic() - self._recovery_started_at
@@ -922,6 +1368,7 @@ class SourceGraphDaemon:
             finally:
                 conn.close()
         finally:
+            writer_lease.__exit__(None, None, None)
             self._recovery_lock.release()
 
     def _run_build_subprocess(self, *, incremental: bool) -> dict[str, Any]:
@@ -936,6 +1383,8 @@ class SourceGraphDaemon:
         child_env["PYTHONPATH"] = os.pathsep.join(
             value for value in (package_root, child_env.get("PYTHONPATH", "")) if value
         )
+        owner_token = uuid.uuid4().hex
+        child_env[BUILD_OWNER_ENV] = owner_token
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -949,9 +1398,48 @@ class SourceGraphDaemon:
         # owned identity now, while the child is un-reaped, so termination can
         # never target a recycled PID's unrelated process group.
         pgid = None if os.name == "nt" else process.pid
+        kernel_identity = _proc_identity(process.pid)
+        identity_kind = "cross_instance" if kernel_identity is not None else "owner_handle"
+        retained = {
+            "schema_id": "aiworkhub.source_graph.build_process.v1",
+            "repo_root": str(self.repo_root),
+            "owner_token": owner_token,
+            "owner_pid": os.getpid(),
+            "state": "running",
+            "started_at": _utcnow(),
+            "identity_kind": identity_kind,
+            **(kernel_identity or {"pid": process.pid, "pgid": 0, "session_id": 0, "start_ticks": 0}),
+        }
+        # Retain the owning handle before durable publication. If publication
+        # fails, this is the only strong authority available for safely
+        # terminating and reaping the just-spawned process tree.
         with self._process_lock:
             self._build_process = process
             self._build_pgid = pgid
+            self._build_owner_token = owner_token
+        published_identity = False
+        try:
+            published_identity = _publish_build_identity_if_unowned(
+                self.repo_root, retained
+            )
+        except OSError as exc:
+            self._terminate_build_process()
+            self._drain_after_stop(process, pgid)
+            with self._process_lock:
+                if self._build_process is process:
+                    self._build_process = None
+                    self._build_pgid = None
+                    self._build_owner_token = None
+            return {"kind": "error", "error": f"index_subprocess:identity_persist:{exc}"[:500]}
+        if not published_identity:
+            self._terminate_build_process()
+            self._drain_after_stop(process, pgid)
+            with self._process_lock:
+                if self._build_process is process:
+                    self._build_process = None
+                    self._build_pgid = None
+                    self._build_owner_token = None
+            return {"kind": "error", "error": "index_subprocess:identity_slot_owned"}
         try:
             while True:
                 try:
@@ -979,6 +1467,8 @@ class SourceGraphDaemon:
                 return {"kind": "error", "error": "index_subprocess:invalid_contract"}
             return payload
         finally:
+            if published_identity:
+                _clear_build_identity_if_dead(self.repo_root, owner_token)
             with self._process_lock:
                 if self._build_process is process:
                     self._build_process = None
@@ -1033,6 +1523,12 @@ class SourceGraphDaemon:
         if not self._build_lock.acquire(blocking=False):
             return False
         try:
+            retained = _read_build_identity(self.repo_root)
+            if retained is not None and retained.get("state") == "stopping":
+                with self._state_lock:
+                    self._status = STATUS_STOPPED
+                    self._last_error = "build_start_fenced"
+                return True
             with self._state_lock:
                 self._status = STATUS_INDEXING
             try:
@@ -1250,6 +1746,28 @@ class SourceGraphDaemon:
     def stop(self, *, timeout: float = 5.0) -> None:
         self._stop_event.set()
         self._refresh_event.set()
+        retained = _read_build_identity(self.repo_root)
+        if retained is not None:
+            stopping = {**retained, "state": "stopping"}
+            try:
+                transitioned = _compare_and_write_build_identity(
+                    self.repo_root, retained, stopping
+                )
+            except OSError:
+                # A failed durable transition cannot authorize cross-instance
+                # signalling, but an exact Popen owned by this instance still
+                # can and must be stopped. With no such handle, fail closed.
+                with self._process_lock:
+                    if self._build_process is None:
+                        return
+                self._terminate_build_process()
+            else:
+                if not transitioned:
+                    # A replacement owner won the slot. Never clobber it;
+                    # only an exact local Popen handle remains ours to stop.
+                    with self._process_lock:
+                        if self._build_process is None:
+                            return
         self._terminate_build_process()
         thread = self._thread
         if thread is not None:
@@ -1258,7 +1776,7 @@ class SourceGraphDaemon:
             # Never pretend a timed-out build thread has stopped. Keeping the
             # live thread registered prevents a second daemon from starting
             # against the same repository database.
-            if self._thread is thread and not thread.is_alive():
+            if self._thread is thread and (thread is None or not thread.is_alive()):
                 self._thread = None
                 self._status = STATUS_STOPPED
 
@@ -1493,25 +2011,23 @@ def stop_daemon(repo_root: Path | str) -> bool:
     key = _registry_key(repo_root)
     with _REGISTRY_LOCK:
         daemon = _REGISTRY.get(key)
-    if daemon is None:
-        return False
-    daemon.stop()
-    if daemon.is_running():
-        return False
-    with _REGISTRY_LOCK:
-        if _REGISTRY.get(key) is daemon:
+        retained_was_present = _read_build_identity(repo_root) is not None
+        if daemon is not None:
+            daemon.stop()
+            if daemon.is_running():
+                return False
+        if not _stop_retained_build(repo_root):
+            return False
+        if daemon is not None and _REGISTRY.get(key) is daemon:
             _REGISTRY.pop(key, None)
-    return True
+        return daemon is not None or retained_was_present
 
 
 def stop_all_daemons() -> int:
     """Stop every registered daemon. Used by full-process teardown/tests."""
     with _REGISTRY_LOCK:
-        daemons = list(_REGISTRY.values())
-        _REGISTRY.clear()
-    for daemon in daemons:
-        daemon.stop()
-    return len(daemons)
+        roots = [daemon.repo_root for daemon in _REGISTRY.values()]
+    return sum(1 for root in roots if stop_daemon(root))
 
 
 def daemon_health(repo_root: Path | str) -> dict[str, Any]:
@@ -1549,6 +2065,21 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
             "recovery": {"error": "", "phase": "", "elapsed_seconds": 0.0},
             "last_known_good_generation": {},
         }
+        retained = _read_build_identity(repo_root)
+        if retained is not None and _retained_tree_alive(retained):
+            out.update(
+                {
+                    "ok": False,
+                    "status": STATUS_INDEXING,
+                    "running": True,
+                    "last_error": "unregistered_live_builder",
+                    "retained_build": {
+                        "pid": retained.get("pid"),
+                        "state": retained.get("state", "running"),
+                        "started_at": retained.get("started_at", ""),
+                    },
+                }
+            )
     else:
         out = daemon.health()
     # Writable single-flight recovery MUST precede every readonly probe

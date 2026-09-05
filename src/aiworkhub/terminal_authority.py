@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .platform_io import chmod_fd
+from .platform_io import chmod_fd, is_windows, stat_owned_by_current_user
 from .worker_workspace import write_json_0600
 
 
@@ -37,9 +37,11 @@ def _trusted_key_file(st: os.stat_result, *, platform_name: str) -> bool:
 
     if not stat.S_ISREG(st.st_mode):
         return False
-    if platform_name == "nt":
+    if is_windows(platform_name):
         return True
-    return st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o600
+    return stat_owned_by_current_user(
+        st, platform_name=platform_name
+    ) and stat.S_IMODE(st.st_mode) == 0o600
 
 
 def _read_existing_key(key_path: Path, *, platform_name: str) -> bytes | None:
@@ -145,9 +147,11 @@ def read_grant(path: Path) -> dict[str, Any]:
         return {}
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
         return {}
-    # POSIX enforces owner equivalence via mode bits; Windows relies on the
-    # ACL-protected per-user profile, so os.getuid() is skipped there.
-    if (os.name != "nt" and (st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077)):
+    # POSIX enforces owner equivalence via uid + mode bits; Windows relies on
+    # the ACL-protected per-user profile.
+    if not stat_owned_by_current_user(st) or (
+        os.name != "nt" and stat.S_IMODE(st.st_mode) & 0o077
+    ):
         return {}
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):

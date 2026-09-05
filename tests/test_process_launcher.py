@@ -1552,7 +1552,7 @@ def test_run_declared_validations_replays_authenticated_structural_denial_once(
             "schema": "aiworkhub.metadata_broker_denial.v1",
             "authenticated": True,
             "terminal": True,
-            "reason": "metadata_broker_hardlink_forbidden",
+            "reason": "oserror_EPERM",
             "syscall_nr": 90,
         }],
     }
@@ -1585,13 +1585,13 @@ def test_run_declared_validations_replays_authenticated_structural_denial_once(
 
     rows = process_launcher._run_declared_validations(
         workspace,
-        {"validation": ["pytest"], "work_kind": "code"},
+        {"validation": ["pytest tests/test_landlock.py"], "work_kind": "code"},
         metadata,
     )
 
     assert len(calls) == 2
     assert calls[0][0] is calls[1][0] is workspace
-    assert calls[0][1] == calls[1][1] == ["pytest"]
+    assert calls[0][1] == calls[1][1] == ["pytest tests/test_landlock.py"]
     assert calls[0][2] == {"backend": "landlock"}
     assert calls[1][2] == {
         "backend": "landlock",
@@ -1601,7 +1601,7 @@ def test_run_declared_validations_replays_authenticated_structural_denial_once(
     receipt = rows[0]["validation_capability_replay"]
     assert receipt["attempt"] == 1
     assert receipt["profile"] == "metadata_isolated_v1"
-    assert receipt["capabilities"] == ["hardlink"]
+    assert receipt["capabilities"] == ["nested_landlock"]
     assert receipt["request_identity"]["request_id"] == workspace.request_id
     assert receipt["original_denial"][0]["metadata_broker_denial_attributed"] is True
 
@@ -1624,7 +1624,7 @@ def test_validation_capability_replay_rejects_workspace_identity_mismatch(
             "schema": "aiworkhub.metadata_broker_denial.v1",
             "authenticated": True,
             "terminal": True,
-            "reason": "fchmodat denied",
+            "reason": "oserror_EPERM",
             "syscall_nr": 268,
         }],
     }
@@ -1657,7 +1657,7 @@ def test_validation_capability_replay_rejects_workspace_identity_mismatch(
     with pytest.raises(worker_workspace.ValidationRunError) as caught:
         process_launcher._run_declared_validations(
             workspace,
-            {"validation": ["pytest"], "work_kind": "code"},
+            {"validation": ["pytest tests/test_landlock.py"], "work_kind": "code"},
             {
                 "adapter_id": "codex_cli",
                 "request_id": workspace.request_id,
@@ -3750,6 +3750,7 @@ def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
     card = {
         **_card(task_id="TASK_REPLAY"),
         "claim_epoch": 7,
+        "project_context": {"task_type": "code", "required": True},
         "validation": ["python3 -m py_compile out/result.py"],
         "required_outputs": ["out/result.py"],
         "rework_predecessor": {
@@ -3786,6 +3787,30 @@ def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
         ),
     )
     monkeypatch.setattr(manager, "_preflight_card", lambda *a, **k: dict(card))
+    assert task_store.initialize_repository(repo)["ok"]
+    monkeypatch.setattr(
+        process_launcher.core, "check_runner_topic_allowlist",
+        lambda *a, **k: {"allowed": True},
+    )
+    with task_store._connect(task_store.canonical_db_path(repo)) as conn:
+        conn.execute(
+            "INSERT INTO tasks (task_id, runner, topic, mode, status, worker_status, "
+            "priority, objective, card_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, '', 'pending', 'unclaimed', 'normal', '', ?, '', '')",
+            ("TASK_REPLAY", "claude_worker_b1", "task_mcp", json.dumps(card)),
+        )
+    manager._append_event({
+        "request_id": "predecessor-7",
+        "task_id": "TASK_REPLAY",
+        "state": "review_ready",
+        "worker_mcp_gate": {
+            "gated": True,
+            "satisfied": True,
+            "task_type": "code",
+            "required_tools": ["source_graph"],
+            "verification": {"ok": True, "verified_entries": 1},
+        },
+    })
     monkeypatch.setattr(
         manager,
         "_resolve_provider_env",
@@ -3812,24 +3837,6 @@ def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
         "build_residual_contract_manifest",
         lambda *a, **k: [],
     )
-    monkeypatch.setattr(
-        process_launcher.task_engine,
-        "claim_start_exact",
-        lambda *a, **k: {
-            "ok": True,
-            "returncode": 0,
-            "stdout": json.dumps(
-                {
-                    **card,
-                    "task_id": a[1],
-                    "runner": a[2],
-                    "topic": a[3],
-                    "launch_request_id": k["request_id"],
-                    "claim_epoch": 7,
-                }
-            ),
-        },
-    )
     finalized = []
     monkeypatch.setattr(
         manager,
@@ -3848,12 +3855,38 @@ def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
         timeout_seconds=30,
     )
 
-    assert result["ok"] is True
+    assert result["ok"] is True, json.dumps(result)
     assert result["state"] == "running"
     assert result["terminal"] is False
     assert result["execution_mode"] == "validation_only_replay"
     assert result["provider_launched"] is False
     assert result["pid"] is None
+    metadata = json.loads(
+        (manager.process_dir / f"{result['request_id']}.request.json").read_text()
+    )
+    assert metadata["claim_epoch"] == 8
+    assert process_launcher._worker_mcp_live_call_gate(
+        metadata, result["request_id"]
+    )["satisfied"] is True
+    committed = task_store.get_task(repo, "TASK_REPLAY")
+    assert committed["validation_only_replay_authorization"]["next_claim_epoch"] == 8
+    reconciled = process_launcher.task_engine.claim_start_exact(
+        repo, "TASK_REPLAY", "claude_worker_b1", "task_mcp",
+        request_id=result["request_id"],
+    )
+    assert reconciled["ok"] is True
+    assert reconciled["claim_reconciled"] is True
+    assert json.loads(reconciled["stdout"])["claim_epoch"] == 8
+    for key, value in (("claim_epoch", 7), ("request_id", "other-request"),
+                       ("task_id", "OTHER_TASK")):
+        forged = {**metadata, key: value}
+        assert process_launcher._worker_mcp_live_call_gate(
+            forged, result["request_id"]
+        )["satisfied"] is False
+    forged = {**metadata, "workspace": {**metadata["workspace"], "repo": "/other"}}
+    assert process_launcher._worker_mcp_live_call_gate(
+        forged, result["request_id"]
+    )["satisfied"] is False
     launch_event = next(
         event
         for event in manager._events()
@@ -3867,6 +3900,55 @@ def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
     while not finalized and time.monotonic() < deadline:
         time.sleep(0.01)
     assert finalized == [(result["request_id"], 0)]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("next_claim_epoch", 6), ("next_claim_epoch", True),
+    ("task_id", "OTHER_TASK"), ("actor", "worker"),
+    ("predecessor_request_id", "other-request"),
+    ("changed_path_hashes", {"out/result.py": "d" * 64}),
+    ("request_id", "consumed-request"), ("repo", "/other"),
+    ("one_episode_binding", False),
+])
+def test_validation_only_replay_real_claim_rejects_invalid_grant(
+    monkeypatch, tmp_path, field, value,
+):
+    _open_gates(monkeypatch)
+    monkeypatch.setattr(
+        process_launcher.core, "check_runner_topic_allowlist",
+        lambda *a, **k: {"allowed": True},
+    )
+    repo = _canonical_claimed_task_repo(tmp_path, task_id="TASK_REPLAY")
+    predecessor = {
+        "request_id": "predecessor-7",
+        "changed_path_hashes": {"out/result.py": "b" * 64},
+    }
+    authorization = {
+        "task_id": "TASK_REPLAY", "actor": "codex",
+        "predecessor_request_id": predecessor["request_id"],
+        "changed_path_hashes": predecessor["changed_path_hashes"],
+        "next_claim_epoch": 7, "one_episode_binding": True,
+        field: value,
+    }
+    card = {
+        "claim_epoch": 7, "rework_predecessor": predecessor,
+        "validation_only_replay_authorization": authorization,
+    }
+    with task_store._connect(task_store.canonical_db_path(repo)) as conn:
+        conn.execute(
+            "UPDATE tasks SET status='pending', worker_status='unclaimed', "
+            "claimed_by=NULL, card_json=? WHERE task_id='TASK_REPLAY'",
+            (json.dumps(card),),
+        )
+    result = process_launcher.task_engine.claim_start_exact(
+        repo, "TASK_REPLAY", "claude_worker_b1", "task_mcp", request_id="new-request",
+    )
+    assert result["ok"] is False
+    assert result["stderr"] == "validation_only_replay_claim_binding_invalid"
+    retained = task_store.get_task(repo, "TASK_REPLAY")
+    assert retained["status"] == "pending"
+    assert retained["claim_epoch"] == 7
+    assert retained["validation_only_replay_authorization"] == authorization
 
 
 def test_provider_free_replay_usage_is_labeled_without_fabricated_observation(
@@ -5761,6 +5843,7 @@ def test_native_cli_large_packet_uses_file_transport_avoiding_argv_e2big(
         lens="correctness",
         submit_tool_name="aiworkhub_worker_quality_review_submit",
         packet_file=str(packet_file),
+        packet_root=tmp_path,
         max_inline_bytes=96 * 1024,
     )
     assert "QUALITY_REVIEW_PACKET_FILE:" in prompt

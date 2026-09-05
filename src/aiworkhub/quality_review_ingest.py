@@ -257,11 +257,51 @@ def _normalize_review_finding_aliases(report: Mapping[str, Any]) -> dict[str, An
                     f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
                 )
             reference = dict(raw_reference)
-            allowed = {"path", "line_start", "line_end", "check_id"}
-            if any(not isinstance(key, str) for key in reference) or set(reference) - allowed:
+            source_keys = {"path", "line_start", "line_end"}
+            canonical_source_keys = {"kind", "path", "line_start", "line_end"}
+            check_keys = {"check_id"}
+            canonical_check_keys = {"kind", "check_id"}
+            canonical_test_target_keys = {"kind", "path"}
+            reference_keys = set(reference)
+            if any(not isinstance(key, str) for key in reference) or reference_keys not in (
+                source_keys,
+                canonical_source_keys,
+                check_keys,
+                canonical_check_keys,
+                canonical_test_target_keys,
+            ):
                 raise ReviewProtocolError(
                     f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
                 )
+            kind = reference.get("kind")
+            if reference_keys == canonical_source_keys and kind != "source":
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
+                )
+            if reference_keys == canonical_check_keys and kind != "check":
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
+                )
+            if reference_keys == canonical_test_target_keys and kind != "test_target":
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
+                )
+            if reference_keys in (canonical_source_keys, canonical_test_target_keys):
+                path = reference.get("path")
+                if not isinstance(path, str) or not path:
+                    raise ReviewProtocolError(
+                        f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
+                    )
+            if reference_keys == canonical_check_keys:
+                check_id = reference.get("check_id")
+                if not isinstance(check_id, str) or not check_id:
+                    raise ReviewProtocolError(
+                        f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"
+                    )
+            if "kind" in reference:
+                finding["evidence_reference"] = reference
+                normalized_findings.append(finding)
+                continue
             path = reference.get("path")
             check_id = reference.get("check_id")
             if bool(path) == bool(check_id):
@@ -271,7 +311,9 @@ def _normalize_review_finding_aliases(report: Mapping[str, Any]) -> dict[str, An
             for key in ("path", "check_id"):
                 value = reference.get(key)
                 if value is not None and (
-                    not isinstance(value, str) or not value or len(value.encode("utf-8")) > 4096
+                    not isinstance(value, str)
+                    or not value
+                    or len(value.encode("utf-8")) > 4096
                 ):
                     raise ReviewProtocolError(
                         f"structured_report_invalid:review_finding_{index}_evidence_reference_invalid"

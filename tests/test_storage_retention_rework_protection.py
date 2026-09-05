@@ -96,6 +96,9 @@ def _insert_card(
     launch_request_id: str = "",
     accepted_request_id: str = "",
     rework_predecessor_request_id: str = "",
+    terminal_failure_substatus: str = "",
+    terminal_failure_request_id: str = "",
+    terminal_review_request_id: str = "",
     updated_at: str | None = None,
 ) -> None:
     """Insert one canonical task row directly for test purposes.
@@ -104,6 +107,13 @@ def _insert_card(
     writes into ``card_json`` when a card is rejected back to ``pending`` for
     rework: ``card_json["rework_predecessor"]["request_id"]`` names the prior
     attempt's worktree the launcher will overlay into the successor.
+
+    ``terminal_failure_substatus`` mirrors the shape
+    ``task_store.mark_terminal_failure`` writes when it parks a genuine
+    post-launch operational failure (e.g. ``finalize_failed``) in the
+    canonical ``blocked`` bucket: ``card_json["terminal_substatus"]`` and
+    ``card_json["terminal_failure"]["request_id"]`` both still name the exact
+    attempt that failed, and ``launch_request_id`` is never cleared.
     """
     db_path = task_store.canonical_db_path(repo)
     now = updated_at or datetime.now(timezone.utc).isoformat()
@@ -114,6 +124,19 @@ def _insert_card(
         card["accepted_request_id"] = accepted_request_id
     if rework_predecessor_request_id:
         card["rework_predecessor"] = {"request_id": rework_predecessor_request_id}
+    if terminal_failure_substatus:
+        card["terminal_substatus"] = terminal_failure_substatus
+        card["terminal_failure"] = {
+            "substatus": terminal_failure_substatus,
+            "request_id": terminal_failure_request_id or launch_request_id,
+        }
+        if terminal_review_request_id:
+            # A distinct ``terminal_review`` envelope alongside the failure and
+            # launch ids, so a test can drive a three-way identity disagreement.
+            card["terminal_review"] = {
+                "substatus": terminal_failure_substatus,
+                "request_id": terminal_review_request_id,
+            }
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(
@@ -204,6 +227,319 @@ def _nonfinished_predecessors(repo: Path) -> set[str]:
             if request_id:
                 pinned.add(request_id)
     return pinned
+
+
+def test_blocked_finalize_failed_candidate_and_pinned_predecessor_stay_protected(
+    repo_with_worktrees,
+) -> None:
+    """RM27 regression.
+
+    A card ``blocked`` by its own genuine operational terminal failure
+    (``finalize_failed``) still names the exact request id that failed via
+    both ``launch_request_id`` and ``terminal_failure.request_id`` --
+    ``_protected_attempt_ids`` must protect that CURRENT candidate exactly as
+    a live worker, not merely the card's older ``rework_predecessor``. Both
+    request ids stay out of the reclaim set even when the over-cap forcing
+    pass would otherwise pull an aged, under-cap worktree back in, and even
+    past the retention TTL -- while an unrelated, genuinely reclaimable
+    worktree proves the reclaim pathway itself is still active."""
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    current_candidate = "a4b772bd2b2d4b1887393e8b7cfd25aa"
+    older_predecessor = "af439d0c6d6e4a74a4abdffa50105989"
+    _insert_card(
+        repo,
+        "needfix-NF-2026-00550",
+        status="blocked",
+        launch_request_id=current_candidate,
+        rework_predecessor_request_id=older_predecessor,
+        terminal_failure_substatus="finalize_failed",
+    )
+
+    now = _aged_now()
+    scan = {
+        "base": base,
+        "worktrees": [
+            {
+                "id": current_candidate,
+                "class": storage_retention.worktree_storage.CLASS_REMOVABLE_SAFE,
+                "size_bytes": 1_000_000,
+                "modified_at_epoch": now - 100 * 86400,
+            },
+            {
+                "id": older_predecessor,
+                "class": storage_retention.worktree_storage.CLASS_REMOVABLE_SAFE,
+                "size_bytes": 1_000_000,
+                "modified_at_epoch": now - 100 * 86400,
+            },
+            {
+                "id": "unrelated-old-safe",
+                "class": storage_retention.worktree_storage.CLASS_REMOVABLE_SAFE,
+                "size_bytes": 1_000_000,
+                "modified_at_epoch": now - 100 * 86400,
+            },
+        ],
+    }
+
+    plan = storage_retention.plan_worktree_reclaim(
+        repo, scan, min_age_days=30, max_bytes=1, current_bytes=10_000_000, now=now,
+    )
+
+    kept_ids = {wt["id"] for wt in plan["would_keep"]}
+    removed_ids = {wt["id"] for wt in plan["would_remove"]}
+    assert current_candidate in kept_ids
+    assert older_predecessor in kept_ids
+    assert current_candidate not in removed_ids
+    assert older_predecessor not in removed_ids
+    # The reclaim pathway itself is exercised: an unrelated aged, safe, over-cap
+    # worktree is still reclaimed, so the two assertions above are protection,
+    # not an inert planner.
+    assert "unrelated-old-safe" in removed_ids
+    assert plan["protection_reasons"][current_candidate] == (
+        "blocked_terminal_candidate_retained"
+    )
+    assert plan["protection_reasons"][older_predecessor] == "rework_predecessor_retained"
+
+
+def test_blocked_finalize_failed_conflicting_identity_protects_both_fail_closed(
+    repo_with_worktrees,
+) -> None:
+    """RM27 rework finding: ambiguous retained identity must fail CLOSED.
+
+    When a ``blocked``/``finalize_failed`` card's recorded
+    ``terminal_failure.request_id`` disagrees with its own
+    ``launch_request_id``, the evidence cannot say which worktree holds the
+    failed finalize attempt. Returning no protection there (the prior
+    behaviour) converted that ambiguity into reclaim permission for BOTH
+    worktrees. Protection must instead keep BOTH implicated ids out of the
+    reclaim set -- even when the over-cap forcing pass would otherwise pull an
+    aged, under-cap worktree in and even past the retention TTL. An unrelated
+    aged worktree still proves the reclaim pathway itself is live."""
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    launch_candidate = "a4b772bd2b2d4b1887393e8b7cfd25aa"
+    recorded_candidate = "af439d0c6d6e4a74a4abdffa50105989"
+    _insert_card(
+        repo,
+        "needfix-NF-2026-00550",
+        status="blocked",
+        launch_request_id=launch_candidate,
+        terminal_failure_substatus="finalize_failed",
+        terminal_failure_request_id=recorded_candidate,
+    )
+
+    now = _aged_now()
+    scan = {
+        "base": base,
+        "worktrees": [
+            {
+                "id": wt_id,
+                "class": storage_retention.worktree_storage.CLASS_REMOVABLE_SAFE,
+                "size_bytes": 1_000_000,
+                "modified_at_epoch": now - 100 * 86400,
+            }
+            for wt_id in (launch_candidate, recorded_candidate, "unrelated-old-safe")
+        ],
+    }
+
+    plan = storage_retention.plan_worktree_reclaim(
+        repo, scan, min_age_days=30, max_bytes=1, current_bytes=10_000_000, now=now,
+    )
+
+    removed_ids = {wt["id"] for wt in plan["would_remove"]}
+    kept_ids = {wt["id"] for wt in plan["would_keep"]}
+    # Ambiguity protects BOTH implicated ids -- never manufactures reclaim.
+    assert launch_candidate in kept_ids
+    assert recorded_candidate in kept_ids
+    assert launch_candidate not in removed_ids
+    assert recorded_candidate not in removed_ids
+    assert (
+        plan["protection_reasons"][launch_candidate]
+        == "blocked_terminal_candidate_retained"
+    )
+    assert (
+        plan["protection_reasons"][recorded_candidate]
+        == "blocked_terminal_candidate_retained"
+    )
+    # Not an inert planner: an unrelated aged, safe, over-cap worktree reclaims.
+    assert "unrelated-old-safe" in removed_ids
+
+
+def test_blocked_finalize_failed_three_way_identity_disagreement_protects_all_three(
+    repo_with_worktrees,
+) -> None:
+    """RM27 final rework finding: three-way identity disagreement fails CLOSED.
+
+    A ``blocked``/``finalize_failed`` card can name three DISTINCT request ids
+    at once -- ``launch_request_id``, ``terminal_failure.request_id`` and
+    ``terminal_review.request_id``. The prior fallback logic chose one
+    ``recorded_request_id`` (``terminal_failure`` else ``terminal_review``) and
+    unioned it only with the launch id, silently dropping the third envelope's
+    id and converting that worktree into a reclaim candidate. Every nonempty id
+    must instead be collected independently from all three envelopes, so all
+    three implicated worktrees stay out of the reclaim set even when the
+    over-cap forcing pass would otherwise pull an aged, under-cap worktree in
+    and even past the retention TTL. An unrelated aged worktree still proves the
+    reclaim pathway itself is live."""
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    launch_candidate = "a4b772bd2b2d4b1887393e8b7cfd25aa"
+    failure_candidate = "af439d0c6d6e4a74a4abdffa50105989"
+    review_candidate = "b7c99114e2f04c0aa1d3ee6655f0aa77"
+    _insert_card(
+        repo,
+        "needfix-NF-2026-00550",
+        status="blocked",
+        launch_request_id=launch_candidate,
+        terminal_failure_substatus="finalize_failed",
+        terminal_failure_request_id=failure_candidate,
+        terminal_review_request_id=review_candidate,
+    )
+
+    now = _aged_now()
+    scan = {
+        "base": base,
+        "worktrees": [
+            {
+                "id": wt_id,
+                "class": storage_retention.worktree_storage.CLASS_REMOVABLE_SAFE,
+                "size_bytes": 1_000_000,
+                "modified_at_epoch": now - 100 * 86400,
+            }
+            for wt_id in (
+                launch_candidate,
+                failure_candidate,
+                review_candidate,
+                "unrelated-old-safe",
+            )
+        ],
+    }
+
+    plan = storage_retention.plan_worktree_reclaim(
+        repo, scan, min_age_days=30, max_bytes=1, current_bytes=10_000_000, now=now,
+    )
+
+    removed_ids = {wt["id"] for wt in plan["would_remove"]}
+    kept_ids = {wt["id"] for wt in plan["would_keep"]}
+    # All THREE independently-named ids are retained -- the third envelope
+    # (terminal_review) is never dropped by fallback collapse.
+    for candidate in (launch_candidate, failure_candidate, review_candidate):
+        assert candidate in kept_ids
+        assert candidate not in removed_ids
+        assert (
+            plan["protection_reasons"][candidate]
+            == "blocked_terminal_candidate_retained"
+        )
+    # Not an inert planner: an unrelated aged, safe, over-cap worktree reclaims.
+    assert "unrelated-old-safe" in removed_ids
+
+
+def test_blocked_finalize_failed_malformed_missing_launch_still_protects_named_id(
+    repo_with_worktrees,
+) -> None:
+    """A malformed terminal record must never manufacture reclaim permission.
+
+    A ``blocked``/``finalize_failed`` card whose ``launch_request_id`` is
+    absent (a malformed/partial record) still names its failed attempt via
+    ``terminal_failure.request_id``. That named worktree is retained, not
+    reclaimed -- fail closed on incomplete identity."""
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    named = "attempt-malformed-record"
+    _insert_card(
+        repo,
+        "needfix-NF-2026-00552",
+        status="blocked",
+        terminal_failure_substatus="finalize_failed",
+        terminal_failure_request_id=named,
+    )
+
+    now = _aged_now()
+    scan = {
+        "base": base,
+        "worktrees": [
+            {
+                "id": named,
+                "class": storage_retention.worktree_storage.CLASS_REMOVABLE_SAFE,
+                "size_bytes": 1_000_000,
+                "modified_at_epoch": now - 100 * 86400,
+            }
+        ],
+    }
+
+    plan = storage_retention.plan_worktree_reclaim(
+        repo, scan, min_age_days=30, max_bytes=1, current_bytes=10_000_000, now=now,
+    )
+
+    assert named in {wt["id"] for wt in plan["would_keep"]}
+    assert named not in {wt["id"] for wt in plan["would_remove"]}
+    assert (
+        plan["protection_reasons"][named] == "blocked_terminal_candidate_retained"
+    )
+
+
+def test_preview_to_commit_state_change_cannot_delete_newly_retained_candidate(
+    repo_with_worktrees,
+) -> None:
+    """Preview and the quarantine commit recheck share ONE protection authority.
+
+    A worktree that was a reclaim candidate at preview time becomes protected
+    when a concurrent state change parks its card ``blocked`` by a genuine
+    ``finalize_failed`` terminal failure naming it. The quarantine commit
+    re-runs the SAME measurement, recomputes the digest over the now-shorter
+    candidate set, and refuses the stale digest -- so the newly retained
+    candidate is never deleted on preview-time evidence."""
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    request_id = "attempt-newly-retained"
+    entry = _add_worktree(repo, base, request_id)
+
+    preview = storage_retention.preview(repo, base=base, now=_aged_now())
+    assert request_id in {item["id"] for item in preview["candidates"]}
+
+    # Concurrent state change between preview and commit: the card is parked
+    # blocked by its own finalize_failed terminal failure naming this worktree.
+    _insert_card(
+        repo,
+        "needfix-NF-2026-00551",
+        status="blocked",
+        launch_request_id=request_id,
+        terminal_failure_substatus="finalize_failed",
+    )
+
+    with pytest.raises(
+        storage_retention.StorageRetentionError, match="retention_preview_stale"
+    ):
+        storage_retention.quarantine(
+            repo,
+            preview_digest=preview["preview_digest"],
+            confirm=True,
+            base=base,
+            now=_aged_now(),
+        )
+    # The now-protected candidate was never moved.
+    assert entry.is_dir()
+    assert (entry / "worktree").is_dir()
+
+    # A fresh preview confirms the shared authority now protects it.
+    reconfirm = storage_retention.preview(repo, base=base, now=_aged_now())
+    assert request_id not in {item["id"] for item in reconfirm["candidates"]}
+    assert {"id": request_id, "reason": "blocked_terminal_candidate_retained"} in (
+        reconfirm["protected"]
+    )
+
+
+def test_blocked_manager_park_without_terminal_failure_earns_no_protection(
+    repo_with_worktrees,
+) -> None:
+    """A card merely parked ``blocked`` by a manager review (no genuine
+    ``mark_terminal_failure`` record) must not blanket-protect its
+    ``launch_request_id``: only a real operational terminal failure does."""
+    repo, base = repo_with_worktrees["repo"], repo_with_worktrees["base"]
+    entry = _add_worktree(repo, base, "manager-parked")
+    _insert_card(
+        repo, "NF-PARKED", status="blocked", launch_request_id="manager-parked"
+    )
+
+    preview = storage_retention.preview(repo, base=base, now=_aged_now())
+
+    assert "manager-parked" in {item["id"] for item in preview["candidates"]}
+    assert entry.is_dir()
 
 
 def test_rework_predecessor_of_pending_card_is_protected_and_reported(

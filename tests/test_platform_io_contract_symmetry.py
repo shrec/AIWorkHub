@@ -231,3 +231,53 @@ def test_global_memory_status_declares_argtypes_and_restype(monkeypatch):
     assert recorded["restype"] is ctypes.c_int
     argtypes = recorded["argtypes"]
     assert argtypes is not None and len(argtypes) == 1
+
+
+def test_identity_bound_publication_has_explicit_public_error_contract():
+    assert callable(platform_io.identity_bound_durable_atomic_replace)
+    error = platform_io.IdentityBoundPublicationError(95, "unsupported")
+    assert error.replacement_committed is False
+    assert error.published is False
+    committed = platform_io.PublicationDurabilityError(5, "sync failed")
+    assert committed.replacement_committed is True
+    assert committed.published is True
+
+
+def test_identity_bound_publication_documents_open_parent_authority():
+    contract = platform_io.identity_bound_durable_atomic_replace.__doc__ or ""
+    assert "parent directory object opened at" in contract
+    assert "descriptor-relative commit follows that object" in contract
+    assert "substituted public parent path" in contract
+
+
+def test_identity_bound_publication_fails_closed_off_linux(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"new")
+    destination.write_bytes(b"prior")
+    monkeypatch.setattr(platform_io, "is_linux", lambda _name=None: False)
+
+    with pytest.raises(platform_io.IdentityBoundPublicationError):
+        platform_io.identity_bound_durable_atomic_replace(source, destination)
+
+    assert source.read_bytes() == b"new"
+    assert destination.read_bytes() == b"prior"
+
+
+def test_production_uid_checks_use_the_platform_authority():
+    root = Path(__file__).resolve().parents[1]
+    consumers = [
+        "src/aiworkhub/app_server_mux.py",
+        "src/aiworkhub/deepseek_credentials.py",
+        "src/aiworkhub/glm_credentials.py",
+        "src/aiworkhub/process_launcher.py",
+        "src/aiworkhub/terminal_authority.py",
+        "src/aiworkhub/vscode_lm_bridge.py",
+        "src/aiworkhub/vscode_lm_worker.py",
+        "src/aiworkhub/worker_workspace.py",
+    ]
+
+    for relative in consumers:
+        source = (root / relative).read_text(encoding="utf-8")
+        assert "os.getuid" not in source, relative
+        assert 'getattr(os, "getuid"' not in source, relative

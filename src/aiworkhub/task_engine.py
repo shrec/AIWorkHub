@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -160,6 +161,44 @@ def claim_start_exact(
                 claim_epoch = int(stored_card.get("claim_epoch") or 0) + 1
             except (TypeError, ValueError):
                 claim_epoch = 1
+            replay = stored_card.get("validation_only_replay_authorization")
+            if replay is not None:
+                predecessor = stored_card.get("rework_predecessor")
+                hashes = replay.get("changed_path_hashes") if isinstance(replay, dict) else None
+                if (
+                    not isinstance(replay, dict)
+                    or not isinstance(predecessor, dict)
+                    or replay.get("task_id") != task_id
+                    or replay.get("actor") != core.CODEX_RUNNER
+                    or replay.get("one_episode_binding") is not True
+                    or type(replay.get("next_claim_epoch")) is not int
+                    or replay["next_claim_epoch"] != claim_epoch - 1
+                    or not request_id
+                    or replay.get("request_id")
+                    or replay.get("repo") not in (None, "", str(repo.resolve()))
+                    or not replay.get("predecessor_request_id")
+                    or replay["predecessor_request_id"] != predecessor.get("request_id")
+                    or not isinstance(hashes, dict)
+                    or not hashes
+                    or hashes != predecessor.get("changed_path_hashes")
+                    or not all(
+                        isinstance(path, str) and path.strip()
+                        and isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest)
+                        for path, digest in hashes.items()
+                    )
+                ):
+                    conn.rollback()
+                    return {
+                        "ok": False, "returncode": 1, "command": command, "stdout": "",
+                        "stderr": "validation_only_replay_claim_binding_invalid",
+                    }
+                # Consume the pending grant in the same CAS as the new claim.
+                # The launcher must derive its receipt from this committed
+                # episode, never rewrite an inherited/signed evidence receipt.
+                stored_card["validation_only_replay_authorization"] = {
+                    **replay, "next_claim_epoch": claim_epoch,
+                    "request_id": request_id, "repo": str(repo.resolve()),
+                }
             prior_episode = task_store.begin_claim_episode(stored_card)
             # A prior pre-claim launch failure is operational history, not a
             # permanent task lifecycle state.  This exact successful claim is
@@ -175,7 +214,7 @@ def claim_start_exact(
             cur = conn.execute(
                 "UPDATE tasks SET card_json=?, worker_status='claimed', status='processing', claimed_by=?, "
                 "claimed_at=?, started_at=?, completed_at=NULL, updated_at=? "
-                "WHERE task_id=? AND worker_status='unclaimed' AND status='pending'",
+                "WHERE task_id=? AND worker_status='unclaimed' AND status='pending' AND card_json=?",
                 (
                     json.dumps(stored_card, ensure_ascii=False, sort_keys=True),
                     runner,
@@ -183,6 +222,7 @@ def claim_start_exact(
                     now,
                     now,
                     task_id,
+                    raw_card_json,
                 ),
             )
             event_name = "claim_start"

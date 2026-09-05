@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -21,9 +22,9 @@ _TERMINAL_REVIEW_EVIDENCE = {
 }
 
 
-def test_recover_blocked_terminal_failure_retained_delta_without_required_outputs(
-    tmp_path: Path,
-) -> None:
+def _retained_terminal_failure_fixture(
+    tmp_path: Path, *, required_outputs: bool = False,
+) -> tuple[Path, Path, dict[str, str]]:
     repo = _setup_repo(tmp_path)
     request_id = "a" * 32
     workspace = repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
@@ -73,8 +74,36 @@ def test_recover_blocked_terminal_failure_retained_delta_without_required_output
         "workspace": workspace_metadata,
         "python_candidate_authority": authority,
     }
+    if required_outputs:
+        test_path = "tests/test_retained_candidate.py"
+        test_baseline = repo / test_path
+        test_baseline.parent.mkdir(parents=True)
+        test_baseline.write_bytes(b"baseline test\n")
+        test_candidate = workspace / test_path
+        test_candidate.parent.mkdir(parents=True)
+        test_candidate.write_bytes(b"retained test\n")
+        test_digest = hashlib.sha256(test_candidate.read_bytes()).hexdigest()
+        workspace_metadata["allowed_writes"].append(test_path)
+        workspace_metadata["parent_baseline"][test_path] = (
+            "file:664:" + hashlib.sha256(test_baseline.read_bytes()).hexdigest()
+        )
+        evidence["request_identity"]["allowed_writes"].append(test_path)
+        evidence["request_identity"]["parent_baseline"].update(
+            workspace_metadata["parent_baseline"]
+        )
+        evidence["changed_paths"].append(test_path)
+        evidence["changed_path_hashes"][test_path] = test_digest
+        evidence["required_outputs"] = [
+            {"path": path, "sha256": "file:664:" + digest}
+            for path, digest in evidence["changed_path_hashes"].items()
+        ]
+        authority["sources"].append({
+            "path": test_path, "state": "modified", "bytes_sha256": test_digest,
+        })
     _insert_processing_task(
         repo, "BLOCKED_RETAINED_EMPTY_OUTPUTS", request_id=request_id,
+        allowed_writes=workspace_metadata["allowed_writes"],
+        required_outputs=(workspace_metadata["allowed_writes"] if required_outputs else []),
     )
     assert task_store.mark_terminal_failure(
         repo,
@@ -85,6 +114,17 @@ def test_recover_blocked_terminal_failure_retained_delta_without_required_output
         request_id=request_id,
         claim_epoch=1,
     ) == (True, "blocked")
+    return repo, candidate, evidence["changed_path_hashes"]
+
+
+@pytest.mark.parametrize("validation_only_replay", [False, True])
+@pytest.mark.parametrize("required_outputs", [False, True])
+def test_recover_blocked_terminal_failure_retained_delta_without_required_outputs(
+    tmp_path: Path, validation_only_replay: bool, required_outputs: bool,
+) -> None:
+    repo, candidate, hashes = _retained_terminal_failure_fixture(
+        tmp_path, required_outputs=required_outputs,
+    )
 
     candidate.write_bytes(b"tampered retained candidate\n")
     assert task_store.recover_blocked_rework(
@@ -92,7 +132,7 @@ def test_recover_blocked_terminal_failure_retained_delta_without_required_output
         "BLOCKED_RETAINED_EMPTY_OUTPUTS",
         actor="coordinator",
         feedback_reason="NeedFix: replay retained candidate",
-        validation_only_replay=True,
+        validation_only_replay=validation_only_replay,
     ) == (False, "retained_terminal_candidate_hash_mismatch")
     blocked_card = _get_card(repo, "BLOCKED_RETAINED_EMPTY_OUTPUTS")
     assert blocked_card["status"] == "blocked"
@@ -104,14 +144,118 @@ def test_recover_blocked_terminal_failure_retained_delta_without_required_output
         "BLOCKED_RETAINED_EMPTY_OUTPUTS",
         actor="coordinator",
         feedback_reason="NeedFix: replay retained candidate",
-        validation_only_replay=True,
+        validation_only_replay=validation_only_replay,
     ) == (True, "recovered")
     card = _get_card(repo, "BLOCKED_RETAINED_EMPTY_OUTPUTS")
-    assert card["rework_predecessor"]["request_id"] == request_id
-    assert card["rework_predecessor"]["changed_path_hashes"] == {
-        "src/aiworkhub/task_store.py": digest
-    }
-    assert card["validation_only_replay_authorization"]["next_claim_epoch"] == 2
+    assert card["rework_predecessor"]["request_id"] == "a" * 32
+    assert card["rework_predecessor"]["changed_path_hashes"] == hashes
+    assert card["recovery_feedback"] == "NeedFix: replay retained candidate"
+    if validation_only_replay:
+        assert card["validation_only_replay_authorization"]["next_claim_epoch"] == 2
+    else:
+        assert "validation_only_replay_authorization" not in card
+        assert task_store.recover_blocked_rework(
+            repo, "BLOCKED_RETAINED_EMPTY_OUTPUTS", actor="coordinator",
+            feedback_reason="NeedFix: replay retained candidate",
+        ) == (True, "already_recovered")
+
+
+@pytest.mark.parametrize(("mutation", "expected"), [
+    ("missing_event", "no_retained_predecessor_evidence"),
+    ("event_mismatch", "retained_terminal_candidate_event_mismatch"),
+    ("claim_epoch", "retained_terminal_candidate_claim_epoch_invalid"),
+    ("boolean_claim_epoch", "retained_terminal_candidate_claim_epoch_invalid"),
+    ("identity_epoch", "retained_terminal_candidate_identity_invalid"),
+    ("request_id", "retained_terminal_candidate_identity_invalid"),
+    ("launch_request_id", "retained_terminal_candidate_identity_invalid"),
+    ("task_id", "retained_terminal_candidate_identity_invalid"),
+    ("repo", "retained_terminal_candidate_identity_invalid"),
+    ("baseline", "retained_terminal_candidate_baseline_mismatch"),
+    ("live_pid", "retained_terminal_candidate_process_live"),
+    ("symlink", "retained_terminal_candidate_bytes_invalid"),
+    ("hardlink", "retained_terminal_candidate_bytes_invalid"),
+    ("pinned_predecessor", "no_retained_predecessor_evidence"),
+    ("terminal_review", "hard_blocker:scope_rejected"),
+])
+def test_normal_rework_terminal_failure_fallback_fails_closed(
+    tmp_path: Path, mutation: str, expected: str,
+) -> None:
+    repo, candidate, _hashes = _retained_terminal_failure_fixture(
+        tmp_path, required_outputs=True,
+    )
+    task_id = "BLOCKED_RETAINED_EMPTY_OUTPUTS"
+    card = _get_card(repo, task_id)
+    failure = card["terminal_failure"]
+    evidence = failure["evidence"]
+    if mutation == "event_mismatch":
+        failure["recorded_at"] = "not-the-recorded-event"
+    elif mutation == "claim_epoch":
+        card["claim_epoch"] = 2
+    elif mutation == "boolean_claim_epoch":
+        card["claim_epoch"] = True
+    elif mutation == "identity_epoch":
+        evidence["request_identity"]["claim_epoch"] = True
+    elif mutation == "request_id":
+        failure["request_id"] = "b" * 32
+    elif mutation == "launch_request_id":
+        card["launch_request_id"] = "b" * 32
+    elif mutation == "task_id":
+        evidence["request_identity"]["task_id"] = "OTHER_TASK"
+    elif mutation == "repo":
+        evidence["request_identity"]["repo"] = str(tmp_path)
+    elif mutation == "baseline":
+        (repo / "src/aiworkhub/task_store.py").write_bytes(b"new baseline\n")
+    elif mutation == "live_pid":
+        evidence["pid"] = os.getpid()
+    elif mutation == "symlink":
+        target = candidate.with_suffix(".retained")
+        candidate.rename(target)
+        candidate.symlink_to(target)
+    elif mutation == "hardlink":
+        os.link(candidate, candidate.with_suffix(".retained"))
+    elif mutation == "pinned_predecessor":
+        card["rework_predecessor"] = {
+            "request_id": "reviewer-pinned-request", "workspace": {},
+        }
+
+    _ready, db_path = task_store._require_ready(repo)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card), task_id),
+        )
+        if mutation == "missing_event":
+            conn.execute("DELETE FROM task_events WHERE task_id=?", (task_id,))
+        elif mutation == "terminal_review":
+            conn.execute(
+                "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+                "VALUES (?, 'terminal_review', ?, ?, ?)",
+                (task_id, card["runner"], json.dumps({"substatus": "scope_rejected"}),
+                 "2026-08-06T00:00:00+00:00"),
+            )
+        elif mutation != "event_mismatch":
+            conn.execute(
+                "UPDATE task_events SET payload_json=? "
+                "WHERE task_id=? AND event='terminal_failure'",
+                (json.dumps(failure), task_id),
+            )
+        before_card = conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", (task_id,),
+        ).fetchone()
+        before_events = conn.execute(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY rowid", (task_id,),
+        ).fetchall()
+
+    assert task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator", feedback_reason="Fix retained test",
+    ) == (False, expected)
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", (task_id,),
+        ).fetchone() == before_card
+        assert conn.execute(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY rowid", (task_id,),
+        ).fetchall() == before_events
 
 
 def _setup_repo(tmp_path: Path) -> Path:
@@ -122,14 +266,19 @@ def _setup_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _insert_processing_task(repo: Path, task_id: str, *, request_id: str) -> None:
+def _insert_processing_task(
+    repo: Path, task_id: str, *, request_id: str,
+    allowed_writes: list[str] | None = None,
+    required_outputs: list[str] | None = None,
+) -> None:
     _readiness, db_path = task_store._require_ready(repo)
     now = "2026-08-06T00:00:00+00:00"
     card = {
         "task_id": task_id,
         "runner": "codex_worker_test",
         "topic": "aiworkhub_blocked_rework_recovery",
-        "allowed_writes": ["src/aiworkhub/task_store.py"],
+        "allowed_writes": allowed_writes or ["src/aiworkhub/task_store.py"],
+        "required_outputs": required_outputs or [],
         "claim_epoch": 1,
         "launch_request_id": request_id,
     }

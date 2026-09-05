@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
-from . import task_store
+from . import core, task_store
 
 
 TASK_CONTRACT_KEYS = task_store.TASK_CONTRACT_KEYS
@@ -19,6 +20,74 @@ review_feedback_identity = task_store.review_feedback_identity
 _RELAUNCH_GUARD_FAILURE_SUBSTATUSES = frozenset(
     {"validation_failed"} | set(task_store.MARK_TERMINAL_FAILURE_SUBSTATUSES)
 )
+
+
+def validation_only_replay_authorization(
+    card: Mapping[str, Any], task_id: str
+) -> dict[str, Any] | None:
+    """Return one exact provider-free replay grant or fail closed.
+
+    The task store mints this coordinator-only grant while recovering a
+    blocked task.  Merely finding a similarly named field must never select
+    the deterministic lane: every immutable episode binding is checked before
+    a claim, workspace mutation, credential lookup, or provider operation.
+    Output bytes are checked again by ``validate_required_outputs`` inside the
+    ordinary finalizer, so this routing check cannot authorize stale content.
+    """
+
+    raw = card.get("validation_only_replay_authorization")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("validation_only_replay_authorization_invalid")
+    if raw.get("one_episode_binding") is not True:
+        raise ValueError("validation_only_replay_episode_binding_missing")
+    if str(raw.get("task_id") or "") != task_id:
+        raise ValueError("validation_only_replay_task_mismatch")
+    if str(raw.get("actor") or "") != core.CODEX_RUNNER:
+        raise ValueError("validation_only_replay_actor_mismatch")
+
+    predecessor = card.get("rework_predecessor")
+    if not isinstance(predecessor, dict):
+        raise ValueError("validation_only_replay_predecessor_missing")
+    predecessor_request_id = str(predecessor.get("request_id") or "").strip()
+    if not predecessor_request_id or str(
+        raw.get("predecessor_request_id") or ""
+    ) != predecessor_request_id:
+        raise ValueError("validation_only_replay_predecessor_mismatch")
+    predecessor_hashes = predecessor.get("changed_path_hashes")
+    authorized_hashes = raw.get("changed_path_hashes")
+    if (
+        not isinstance(predecessor_hashes, dict)
+        or not predecessor_hashes
+        or not isinstance(authorized_hashes, dict)
+        or authorized_hashes != predecessor_hashes
+    ):
+        raise ValueError("validation_only_replay_hash_manifest_mismatch")
+    if not all(
+        isinstance(path, str)
+        and path.strip()
+        and isinstance(digest, str)
+        and re.fullmatch(r"[a-f0-9]{64}", digest)
+        for path, digest in authorized_hashes.items()
+    ):
+        raise ValueError("validation_only_replay_hash_manifest_invalid")
+    try:
+        authorized_epoch = int(str(raw.get("next_claim_epoch")))
+        claim_epoch = int(str(card.get("claim_epoch")))
+    except (TypeError, ValueError):
+        raise ValueError("validation_only_replay_claim_epoch_invalid") from None
+    if authorized_epoch != claim_epoch:
+        raise ValueError("validation_only_replay_claim_epoch_mismatch")
+    # A replay may exist solely to re-finalize hash-pinned inherited outputs
+    # after an operational finalizer failure. The authenticated predecessor
+    # hash manifest above is the replay authority; ``required_outputs`` may be
+    # empty when the template authorizes changed paths without declaring every
+    # allowed path as a mandatory changed output. An explicitly empty
+    # validation contract is also authoritative and must not force executable
+    # scratch or a provider call.
+    return dict(raw)
+
 
 
 def _latest_recorded(value: Any) -> dict[str, Any] | None:

@@ -29,7 +29,12 @@ from .runtime_adapters import (  # the ONE editor model vocabulary declaration
     discover_callable_model_names,
 )
 from .source_graph import SOURCE_GRAPH_MODES
-from .platform_io import chmod_fd, chmod_path, posix_path_modes_supported
+from .platform_io import (
+    chmod_fd,
+    chmod_path,
+    posix_path_modes_supported,
+    stat_owned_by_current_user,
+)
 
 
 REQUEST_SCHEMA_ID = "aiworkhub.vscode_lm.request.v1"
@@ -285,7 +290,6 @@ def _owner_only_claim_exists(path: Path) -> bool:
         candidates = list(path.parent.glob(f"{path.name}.claim-*"))
     except OSError:
         return False
-    getuid = getattr(os, "getuid", None)
     for candidate in candidates[:32]:
         try:
             claim_stat = candidate.lstat()
@@ -293,7 +297,7 @@ def _owner_only_claim_exists(path: Path) -> bool:
             continue
         if not stat.S_ISREG(claim_stat.st_mode):
             continue
-        if getuid is not None and claim_stat.st_uid != getuid():
+        if not stat_owned_by_current_user(claim_stat):
             continue
         if posix_path_modes_supported() and stat.S_IMODE(claim_stat.st_mode) != 0o600:
             continue
@@ -365,8 +369,7 @@ def _atomic_json_once(
         temp_stat = os.fstat(fd)
         if posix_path_modes_supported() and stat.S_IMODE(temp_stat.st_mode) != 0o600:
             raise BridgeError("bridge_temp_mode_insecure")
-        getuid = getattr(os, "getuid", None)
-        if getuid is not None and temp_stat.st_uid != getuid():
+        if not stat_owned_by_current_user(temp_stat):
             raise BridgeError("bridge_temp_owner_mismatch")
         current_parent_stat = os.stat(path.parent)
         if (
@@ -423,8 +426,7 @@ def _atomic_json_once(
                 final_stat = os.fstat(verify_fd)
                 if final_stat.st_mode & 0o777 != 0o600:
                     raise BridgeError("bridge_final_mode_insecure")
-            getuid = getattr(os, "getuid", None)
-            if getuid is not None and final_stat.st_uid != getuid():
+            if not stat_owned_by_current_user(final_stat):
                 raise BridgeError("bridge_final_owner_mismatch")
         finally:
             os.close(verify_fd)
@@ -471,9 +473,8 @@ def bridge_readiness(
     for path in paths[:32]:
         try:
             stat_result = path.stat()
-            getuid = getattr(os, "getuid", None)
             if (
-                (getuid is not None and stat_result.st_uid != getuid())
+                not stat_owned_by_current_user(stat_result)
                 or stat_result.st_size > 256 * 1024
             ):
                 continue
@@ -867,8 +868,7 @@ def _validate_private_file_metadata(
         raise BridgeError(f"{error_prefix}_not_regular")
     if metadata.st_size < 1 or metadata.st_size > max_bytes:
         raise TerminalDecisionTransientError(f"{error_prefix}_size_invalid")
-    getuid = getattr(os, "getuid", None)
-    if getuid is not None and metadata.st_uid != getuid():
+    if not stat_owned_by_current_user(metadata):
         raise BridgeError(f"{error_prefix}_foreign_owner")
     if posix_path_modes_supported() and stat.S_IMODE(metadata.st_mode) != 0o600:
         raise BridgeError(f"{error_prefix}_insecure_mode")

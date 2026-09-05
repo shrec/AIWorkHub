@@ -57,6 +57,7 @@ from .platform_io import (
     probe_process_group,
     process_group_launch_kwargs,
     process_is_alive,
+    stat_owned_by_current_user,
     terminate_process_tree,
     unlock_fd,
 )
@@ -75,6 +76,7 @@ from .launch_replay_guard import (
     bounded_error_hash,
     card_content_identity,
     identical_relaunch_refusal,
+    validation_only_replay_authorization,
     review_feedback_identity,
     strip_persistence_envelopes as _strip_persistence_envelopes,
 )
@@ -846,8 +848,8 @@ def read_supervisor_status(path: Path) -> dict[str, Any]:
         return {}
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
         return {}
-    if os.name != "nt":
-        if st.st_uid != os.getuid():
+    if not is_windows():
+        if not stat_owned_by_current_user(st):
             return {}
         if stat.S_IMODE(st.st_mode) & 0o077:
             return {}
@@ -1633,68 +1635,10 @@ def _worker_launch_cwd(
 def _validation_only_replay_authorization(
     card: Mapping[str, Any], task_id: str
 ) -> dict[str, Any] | None:
-    """Return one exact provider-free replay grant or fail closed.
-
-    The task store mints this coordinator-only grant while recovering a
-    blocked task.  Merely finding a similarly named field must never select
-    the deterministic lane: every immutable episode binding is checked before
-    a claim, workspace mutation, credential lookup, or provider operation.
-    Output bytes are checked again by ``validate_required_outputs`` inside the
-    ordinary finalizer, so this routing check cannot authorize stale content.
-    """
-
-    raw = card.get("validation_only_replay_authorization")
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise LaunchRejected("validation_only_replay_authorization_invalid")
-    if raw.get("one_episode_binding") is not True:
-        raise LaunchRejected("validation_only_replay_episode_binding_missing")
-    if str(raw.get("task_id") or "") != task_id:
-        raise LaunchRejected("validation_only_replay_task_mismatch")
-    if str(raw.get("actor") or "") != core.CODEX_RUNNER:
-        raise LaunchRejected("validation_only_replay_actor_mismatch")
-
-    predecessor = card.get("rework_predecessor")
-    if not isinstance(predecessor, dict):
-        raise LaunchRejected("validation_only_replay_predecessor_missing")
-    predecessor_request_id = str(predecessor.get("request_id") or "").strip()
-    if not predecessor_request_id or str(
-        raw.get("predecessor_request_id") or ""
-    ) != predecessor_request_id:
-        raise LaunchRejected("validation_only_replay_predecessor_mismatch")
-    predecessor_hashes = predecessor.get("changed_path_hashes")
-    authorized_hashes = raw.get("changed_path_hashes")
-    if (
-        not isinstance(predecessor_hashes, dict)
-        or not predecessor_hashes
-        or not isinstance(authorized_hashes, dict)
-        or authorized_hashes != predecessor_hashes
-    ):
-        raise LaunchRejected("validation_only_replay_hash_manifest_mismatch")
-    if not all(
-        isinstance(path, str)
-        and path.strip()
-        and isinstance(digest, str)
-        and re.fullmatch(r"[a-f0-9]{64}", digest)
-        for path, digest in authorized_hashes.items()
-    ):
-        raise LaunchRejected("validation_only_replay_hash_manifest_invalid")
     try:
-        authorized_epoch = int(str(raw.get("next_claim_epoch")))
-        claim_epoch = int(str(card.get("claim_epoch")))
-    except (TypeError, ValueError):
-        raise LaunchRejected("validation_only_replay_claim_epoch_invalid") from None
-    if authorized_epoch != claim_epoch:
-        raise LaunchRejected("validation_only_replay_claim_epoch_mismatch")
-    # A replay may exist solely to re-finalize hash-pinned inherited outputs
-    # after an operational finalizer failure. The authenticated predecessor
-    # hash manifest above is the replay authority; ``required_outputs`` may be
-    # empty when the template authorizes changed paths without declaring every
-    # allowed path as a mandatory changed output. An explicitly empty
-    # validation contract is also authoritative and must not force executable
-    # scratch or a provider call.
-    return dict(raw)
+        return validation_only_replay_authorization(card, task_id)
+    except ValueError as exc:
+        raise LaunchRejected(str(exc)) from None
 
 
 def _usage_from_output(
@@ -3653,6 +3597,18 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             and inherited_gate_receipt.get("next_claim_epoch")
             == metadata.get("claim_epoch")
             == authorization.get("next_claim_epoch")
+            and (
+                not authorization.get("request_id")
+                or (
+                    inherited_gate_receipt.get("request_id")
+                    == authorization.get("request_id")
+                    == metadata.get("request_id")
+                    == request_id
+                    and inherited_gate_receipt.get("repo")
+                    == authorization.get("repo")
+                    == (metadata.get("workspace") or {}).get("repo")
+                )
+            )
         )
         inherited_gate = inherited_gate_receipt.get("worker_mcp_gate")
         inherited_verification = (
@@ -5802,6 +5758,8 @@ class ProcessManager:
                 authorization.get("changed_path_hashes") or {}
             ),
             "next_claim_epoch": authorization.get("next_claim_epoch"),
+            "request_id": authorization.get("request_id"),
+            "repo": authorization.get("repo"),
             "task_type": str(gate.get("task_type") or task_type),
             "required_tools": required_tools,
             "worker_mcp_gate": {
@@ -5941,6 +5899,22 @@ class ProcessManager:
                     topic=topic,
                 )
                 claimed = True
+
+                committed_authorization = _validation_only_replay_authorization(
+                    card, task_id
+                )
+                expected_authorization = {
+                    **authorization,
+                    "next_claim_epoch": card["claim_epoch"],
+                    "request_id": request_id,
+                    "repo": str(self.repo.resolve()),
+                }
+                if committed_authorization != expected_authorization:
+                    raise LaunchRejected("validation_only_replay_committed_grant_mismatch")
+                authorization = committed_authorization
+                predecessor_mcp_receipt = self._validation_replay_predecessor_mcp_receipt(
+                    card, authorization, task_id
+                )
 
                 metadata = {
                     "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
@@ -8220,6 +8194,7 @@ class ProcessManager:
                         packet_path=(
                             str(review_packet_path) if review_packet_path is not None else None
                         ),
+                        packet_root=workspace.home / "task_mcp_worker_runtime",
                     )
                     prompt_budget = {
                         "schema_id": "aiworkhub.worker_prompt_budget.v1",
@@ -13953,7 +13928,7 @@ class ProcessManager:
                 # observed signal that escalates the tier (medium+ then demands
                 # combined-tree and reviewer evidence); it does not silently pass.
                 policy_authority = quality_evidence.assess_quality_policy_authority(
-                    self.repo, workspace.path
+                    self.repo, workspace.path, changed_paths=changed
                 )
                 if policy_authority["weakened"] and policy_authority["escalation_signal"]:
                     effective_risk_signals = sorted(
@@ -13970,7 +13945,17 @@ class ProcessManager:
                 )
                 combined_tree: dict[str, Any] | None = None
                 combined_tree_checks: list[dict[str, Any]] = []
-                if risk_profile.get("combined_tree_required"):
+                inherited_policy = (
+                    policy_authority.get("candidate_policy_source") == "canonical_unchanged"
+                    and (
+                        policy_authority.get("canonical_declared_checks")
+                        or not policy_authority.get("canonical_config_readable")
+                    )
+                )
+                # Sparse omission is not policy deletion. Enforce the inherited
+                # policy against the complete candidate union, even at low risk;
+                # never run full-tree commands against the sparse worker tree.
+                if risk_profile.get("combined_tree_required") or inherited_policy:
                     union_workspace, combined_tree = create_combined_validation_workspace(
                         workspace,
                         card,
@@ -13986,12 +13971,16 @@ class ProcessManager:
                             requested_risk_tier=requested_risk_tier,
                             risk_signals=effective_risk_signals,
                             combined_tree_scope=True,
+                            policy_root=self.repo if inherited_policy else None,
                         )
                         if not union_quality.get("passed"):
                             union_blockers = union_quality.get("blocking_checks") or []
+                            failed_checks = [row for row in union_quality.get("checks") or []
+                                             if row.get("check_id") in union_blockers][:3]
                             raise WorkspaceError(
                                 "combined_tree_quality_failed:"
-                                + ",".join(str(value) for value in union_blockers)[:300]
+                                + json.dumps({"blockers": union_blockers,
+                                              "failed_checks": failed_checks})[:4000]
                             )
                         combined_tree_checks = [
                             {
@@ -14139,8 +14128,10 @@ class ProcessManager:
                 quality_gate["combined_tree"] = combined_tree
                 quality_gate["quality_policy_authority"] = policy_authority
                 if not quality_gate.get("passed"):
-                    blockers = quality_gate.get("blocking_checks") or []
-                    reason = quality_gate.get("config_error") or ",".join(str(v) for v in blockers)
+                    quality_blockers = quality_gate.get("blocking_checks") or []
+                    if not isinstance(quality_blockers, list):
+                        raise WorkspaceError("quality_gate_failed:invalid_blocking_checks")
+                    reason = quality_gate.get("config_error") or ",".join(str(v) for v in quality_blockers)
                     raise WorkspaceError("quality_gate_failed:" + str(reason)[:400])
                 quality_gate["destructive_diff_checks"] = destructive_rows
                 quality_gate["destructive_diff_blockers"] = destructive_blockers

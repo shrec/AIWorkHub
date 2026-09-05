@@ -176,6 +176,7 @@ chmod_fd = _platform_io.chmod_fd
 chmod_path = _platform_io.chmod_path
 is_windows = _platform_io.is_windows
 posix_path_modes_supported = _platform_io.posix_path_modes_supported
+stat_owned_by_current_user = _platform_io.stat_owned_by_current_user
 
 
 def bubblewrap_home_env_value() -> str:
@@ -4425,6 +4426,26 @@ def create_combined_validation_workspace(
     request_id = f"union_{source_workspace.request_id[:70]}_{uuid.uuid4().hex[:16]}"
     combined = create_workspace(repo, request_id, union_card, "validation")
     try:
+        # ``create_workspace`` seeds only the sparse candidate/import closure, so
+        # unchanged tracked modules/tests/config that the repo-declared checks
+        # import (for example ``aiworkhub.declared_invariants``) are absent from
+        # the detached worktree and imports fail even though the module is
+        # tracked at ``HEAD``.  Disable the sparse definition so the full ``HEAD``
+        # union is materialized before the overlays below.  Files already
+        # present (seeded closure, allowed outputs) keep their bytes; only the
+        # missing tracked ``HEAD`` files are filled in at ``HEAD`` content, and
+        # the canonical-delta and candidate overlays that follow still take
+        # precedence.  Fail closed if the expansion errors.
+        expansion = _run(
+            ["git", "sparse-checkout", "disable"],
+            cwd=combined.path,
+            timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
+            phase="workspace_provision",
+        )
+        if expansion.returncode != 0:
+            raise WorkspaceError(
+                "combined_tree_full_union_failed:" + expansion.stderr[-500:]
+            )
         for relative in canonical_delta:
             _overlay_regular_path(repo, combined.path, relative)
         baseline_paths = sorted(set(combined.workspace_baseline) | set(canonical_delta))
@@ -5150,7 +5171,7 @@ def _verify_owner_private_directory(path: Path, label: str) -> Path:
         raise WorkspaceError(f"{label}_missing:{path}") from exc
     if not stat.S_ISDIR(info.st_mode):
         raise WorkspaceError(f"{label}_not_directory:{path}")
-    if info.st_uid != os.getuid():
+    if not stat_owned_by_current_user(info):
         raise WorkspaceError(f"{label}_untrusted_owner:{path}")
     if stat.S_IMODE(info.st_mode) & 0o077:
         raise WorkspaceError(f"{label}_not_private:{path}")
@@ -5665,7 +5686,7 @@ def _resolve_trusted_validation_executable(
             root_info = root.stat()
         except OSError as exc:
             raise WorkspaceError(f"validation_executable_unavailable:{name}") from exc
-        if not is_windows() and root_info.st_uid != os.getuid():
+        if not stat_owned_by_current_user(root_info):
             raise WorkspaceError(f"validation_executable_runtime_root_untrusted_owner:{root}")
         if posix_path_modes_supported(os.name) and stat.S_IMODE(root_info.st_mode) & 0o002:
             raise WorkspaceError(f"validation_executable_runtime_root_world_writable:{root}")
@@ -5707,7 +5728,7 @@ def _trusted_validation_executable_from_resolved(
         info = resolved.stat()
     except OSError as exc:
         raise WorkspaceError(f"validation_executable_unavailable:{name}") from exc
-    if os.name != "nt" and info.st_uid != os.getuid():
+    if not stat_owned_by_current_user(info):
         raise WorkspaceError(f"validation_executable_untrusted_owner:{resolved}")
     if posix_path_modes_supported(os.name) and stat.S_IMODE(info.st_mode) & 0o002:
         raise WorkspaceError(f"validation_executable_world_writable:{resolved}")
@@ -5761,7 +5782,7 @@ def _resolve_repo_relative_trusted_validation_executable(
         root_info = root.stat()
     except OSError:
         return None
-    if os.name != "nt" and root_info.st_uid != os.getuid():
+    if not stat_owned_by_current_user(root_info):
         raise WorkspaceError(
             f"validation_executable_runtime_root_untrusted_owner:{root}"
         )
@@ -5829,7 +5850,7 @@ def _verify_validation_interpreter(
         raise WorkspaceError("validation_environment:interpreter_missing") from exc
     if (
         os.name != "nt"
-        and info.st_uid != os.getuid()
+        and not stat_owned_by_current_user(info)
         and not (authenticated_external and info.st_uid == 0)
     ):
         raise WorkspaceError("validation_environment:interpreter_untrusted_owner")
@@ -6135,7 +6156,7 @@ def _resolve_trusted_validation_root_interpreter(
             root_info = root.stat()
         except OSError:
             continue
-        if not is_windows() and root_info.st_uid != os.getuid():
+        if not stat_owned_by_current_user(root_info):
             raise WorkspaceError(
                 f"validation_executable_runtime_root_untrusted_owner:{root}"
             )
@@ -6160,7 +6181,7 @@ def _resolve_trusted_validation_root_interpreter(
         # Any OTHER foreign owner is still an escalation and is refused.
         if (
             not is_windows()
-            and target_info.st_uid != os.getuid()
+            and not stat_owned_by_current_user(target_info)
             and not (
                 target_info.st_uid == 0
                 and _resolved_target_within_system_prefix(root, resolved)
@@ -7094,6 +7115,19 @@ def _metadata_broker_verify_mode(mode: int) -> int:
     return permission_bits
 
 
+def _metadata_broker_decode_mode_arg(raw_mode: int) -> int:
+    """Decode Linux ``mode_t`` from a seccomp notification argument.
+
+    Seccomp exposes six 64-bit argument slots, but the chmod family receives a
+    32-bit ``mode_t``.  Callers are not required to clear the unused upper
+    register bits, so validating the whole slot can reject an otherwise safe
+    Git/pytest chmod as ``metadata_broker_unsafe_mode``.  Mask only the
+    non-ABI upper half, then keep the existing fail-closed permission check on
+    every bit the kernel actually consumes.
+    """
+    return _metadata_broker_verify_mode(int(raw_mode) & 0xFFFFFFFF)
+
+
 def _metadata_broker_verify_flags(flags: int) -> int:
     if flags != 0:
         raise WorkspaceError(f"metadata_broker_unsupported_flags:{flags}")
@@ -7121,18 +7155,18 @@ def _metadata_broker_verify_fd(
     """
     info = os.fstat(fd)
     if stat.S_ISDIR(info.st_mode):
-        if info.st_uid != os.getuid():
+        if not stat_owned_by_current_user(info):
             raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
         return True
     if not stat.S_ISREG(info.st_mode):
         raise WorkspaceError(f"metadata_broker_not_regular_file:{candidate}")
     if info.st_nlink != 1:
-        if info.st_uid != os.getuid():
+        if not stat_owned_by_current_user(info):
             raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
         if requested_mode is None or stat.S_IMODE(info.st_mode) != requested_mode:
             raise WorkspaceError(f"metadata_broker_hardlink_forbidden:{candidate}")
         return True
-    if info.st_uid != os.getuid():
+    if not stat_owned_by_current_user(info):
         raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
     return True
 
@@ -7523,7 +7557,7 @@ def _metadata_broker_apply(
     args = request.data.args
 
     if name == "fchmod":
-        mode = _metadata_broker_verify_mode(int(args[1]))
+        mode = _metadata_broker_decode_mode_arg(int(args[1]))
         raw_fd = ctypes.c_int32(int(args[0]) & 0xFFFFFFFF).value
         if raw_fd < 0:
             raise WorkspaceError(f"metadata_broker_bad_fd:{raw_fd}")
@@ -7575,7 +7609,7 @@ def _metadata_broker_apply(
         return
 
     if name == "chmod":
-        mode = _metadata_broker_verify_mode(int(args[1]))
+        mode = _metadata_broker_decode_mode_arg(int(args[1]))
         raw_target = _metadata_broker_abs_path(
             pid, _AT_FDCWD, _read_child_cstring(pid, int(args[0]))
         )
@@ -7583,7 +7617,7 @@ def _metadata_broker_apply(
         # The classic ``fchmodat`` syscall is (dirfd, path, mode) -- it has NO
         # flags argument, so args[3] is undefined register content and must not
         # be read or validated here.
-        mode = _metadata_broker_verify_mode(int(args[2]))
+        mode = _metadata_broker_decode_mode_arg(int(args[2]))
         raw_target = _metadata_broker_abs_path(
             pid,
             ctypes.c_int32(int(args[0]) & 0xFFFFFFFF).value,
@@ -7592,7 +7626,7 @@ def _metadata_broker_apply(
     elif name == "fchmodat2":
         # Only ``fchmodat2`` carries a flags argument (args[3]); require 0 so an
         # AT_SYMLINK_NOFOLLOW / other variant is denied fail-closed.
-        mode = _metadata_broker_verify_mode(int(args[2]))
+        mode = _metadata_broker_decode_mode_arg(int(args[2]))
         _metadata_broker_verify_flags(int(args[3]))
         raw_target = _metadata_broker_abs_path(
             pid,
@@ -7707,7 +7741,9 @@ def _open_broker_scratch_root(scratch: Path) -> "tuple[int, PurePosixPath]":
         raise WorkspaceError(f"metadata_broker_scratch_unavailable:{exc}") from exc
     try:
         dir_info = os.fstat(scratch_dir_fd)
-        if not stat.S_ISDIR(dir_info.st_mode) or dir_info.st_uid != os.getuid():
+        if not stat.S_ISDIR(dir_info.st_mode) or not stat_owned_by_current_user(
+            dir_info
+        ):
             raise WorkspaceError("metadata_broker_scratch_untrusted")
         try:
             scratch_root = Path(f"/proc/self/fd/{scratch_dir_fd}").resolve(strict=True)
@@ -8572,7 +8608,7 @@ def _resolve_candidate_pytest_wrapper(repo_root: Path) -> tuple[Path, dict[str, 
         raise WorkspaceError(
             f"candidate_pytest_wrapper_unavailable:{wrapper_relative}"
         ) from exc
-    if os.name != "nt" and info.st_uid != os.getuid():
+    if not stat_owned_by_current_user(info):
         raise WorkspaceError(
             f"candidate_pytest_wrapper_untrusted_owner:{wrapper_relative}"
         )
@@ -8663,7 +8699,7 @@ def _validate_pytest_runtime_root(
         raise WorkspaceError(f"validation_pytest_runtime_unavailable:{candidate}") from exc
     # The host pytest runtime is only checked for same-owner where POSIX
     # ownership is meaningful; Windows ACLs protect the package tree.
-    if os.name != "nt" and info.st_uid != os.getuid():
+    if not stat_owned_by_current_user(info):
         raise WorkspaceError(f"validation_pytest_runtime_untrusted_owner:{candidate}")
     if (
         os.name != "nt"

@@ -177,6 +177,7 @@ def test_file_transport_prompt_names_no_argument_packet_tool(tmp_path: Path) -> 
         packet,
         lens="correctness",
         packet_file=str(packet_path),
+        packet_root=tmp_path,
         max_inline_bytes=0,
     )
     assert "aiworkhub_worker_quality_review_packet_read" in prompt
@@ -543,3 +544,48 @@ def test_process_limit_only_report_still_fails_its_lens() -> None:
     )
     assert verdict["passed"] is False
     assert "reviewer_could_not_inspect:correctness" in verdict["blocking_evidence"]
+
+
+# --- NF-2026-00600: category survives BOTH normalization boundaries ----------
+
+
+def test_packet_and_reviewer_normalization_preserve_category_end_to_end() -> None:
+    # The reviewer boundary stamps the canonical category on a defect finding...
+    packet = _packet()
+    packet_finding = quality_reviewer.normalize_packet_findings(
+        packet,
+        lens="correctness",
+        findings=[
+            {
+                "severity": "medium",
+                "disposition": "defect",
+                "summary": "capability set omits a file-read tool",
+                "evidence": f"{CANDIDATE_PATH}:42 delivers the packet as content",
+                "path": CANDIDATE_PATH,
+                "line_start": 42,
+                "line_end": 42,
+            }
+        ],
+    )[0]
+    assert packet_finding["category"] == "general"
+
+    # ...and the evidence-normalization boundary the launcher trusts must carry
+    # that category through rather than dropping it (the NF-2026-00600 defect).
+    report = {
+        "lens": qe.LENS_CORRECTNESS,
+        "provider": "glm",
+        "read_only": True,
+        "can_mutate_repo": False,
+        "findings": [packet_finding],
+    }
+    normalized, errors = qe.normalize_reviewer_reports([report])
+
+    assert errors == []
+    reviewed = normalized[0]["findings"][0]
+    assert reviewed["category"] == "general"
+    assert reviewed["actionable"] is True
+    assert (
+        quality_reviewer.QUALITY_REVIEW_FINDING_REQUIRED_KEYS
+        <= set(reviewed)
+        <= quality_reviewer.QUALITY_REVIEW_FINDING_KEYS
+    )

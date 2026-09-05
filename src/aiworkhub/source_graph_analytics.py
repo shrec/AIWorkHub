@@ -470,6 +470,14 @@ def _history_rows(
     return True, [dict(row) for row in rows], None
 
 
+# The bounded related-test population coverage/testmap resolve before applying
+# the per-call display cap. It matches the internal test-file scan ceiling in
+# ``insights.test_candidates`` (1000 rows), so ``candidate_test_files`` and the
+# truncation signal describe every mapped test up to that same honest bound
+# rather than only the rows that fit the caller's page (NF-2026-00554).
+_RELATED_TEST_POPULATION_CAP = 1000
+
+
 def _test_map(
     conn: sqlite3.Connection,
     repo_root: Path,
@@ -478,10 +486,19 @@ def _test_map(
     *,
     budget: int,
 ) -> dict[str, Any]:
-    candidates = insights.test_candidates(
-        conn, files, matches, limit=max(1, min(budget, 40)),
+    display_limit = max(1, min(budget, 40))
+    # coverage/testmap report one bounded snapshot of the related tests and
+    # cannot paginate: the tests live outside the source target, so there is no
+    # source-corpus cursor to advance (NF-2026-00554). Resolve the full bounded
+    # related-test population first, then take the display page from it, so
+    # ``candidate_test_files`` counts every mapped test and the caller can tell
+    # the page was capped -- instead of a silently dropped tail reading as the
+    # complete set of related tests.
+    population = insights.test_candidates(
+        conn, files, matches, limit=_RELATED_TEST_POPULATION_CAP,
     )
-    mapped_files = {str(row["file_path"]) for row in candidates}
+    candidates = population[:display_limit]
+    mapped_files = {str(row["file_path"]) for row in population}
     from . import evidence_instruments
 
     return {
@@ -491,6 +508,7 @@ def _test_map(
             "status": "available",
             "method": "resolved_call_edges_plus_path_stem_heuristics",
             "candidate_test_files": len(mapped_files),
+            "related_tests_truncated": len(candidates) < len(mapped_files),
             "claim": "test_relationship_only_not_execution_coverage",
         },
         "runtime_coverage": evidence_instruments.runtime_coverage_for_paths(

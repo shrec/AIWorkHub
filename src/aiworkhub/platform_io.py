@@ -15,6 +15,7 @@ import ntpath
 import os
 import posixpath
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -79,6 +80,49 @@ def is_linux(platform_name: str | None = None) -> bool:
 
 def is_macos(platform_name: str | None = None) -> bool:
     return _normalized_platform(platform_name) == "macos"
+
+
+def current_user_uid(platform_name: str | None = None) -> int | None:
+    """Return the current POSIX uid, or ``None`` on Windows.
+
+    Windows ownership is expressed by ACLs rather than ``stat().st_uid`` and
+    does not expose :func:`os.getuid`.  On every non-Windows platform this
+    authority fails closed instead of letting callers silently skip an owner
+    check when the runtime cannot provide a valid uid.
+    """
+
+    if is_windows(platform_name):
+        return None
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        raise OSError(errno.ENOSYS, "current_user_uid_unavailable")
+    try:
+        uid = int(getuid())
+    except (OSError, TypeError, ValueError) as exc:
+        raise OSError(errno.EIO, "current_user_uid_unavailable") from exc
+    if uid < 0:
+        raise OSError(errno.EIO, "current_user_uid_invalid")
+    return uid
+
+
+def stat_owned_by_current_user(
+    metadata: os.stat_result, platform_name: str | None = None
+) -> bool:
+    """Apply the host ownership model to one already-opened file identity.
+
+    Windows callers rely on their separately authenticated per-user ACL/path
+    boundary.  POSIX callers require an exact uid match and fail closed when
+    either the uid authority or stat metadata is unavailable.
+    """
+
+    if is_windows(platform_name):
+        return True
+    try:
+        uid = current_user_uid(platform_name)
+        owner_uid = int(metadata.st_uid)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+    return uid is not None and owner_uid == uid
 
 
 def available_memory_bytes(platform_name: str | None = None) -> int | None:
@@ -974,6 +1018,270 @@ def atomic_replace(source: str | os.PathLike[str], destination: str | os.PathLik
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.01)
+
+
+class PublicationDurabilityError(OSError):
+    """The replacement committed, but its directory entry may not be durable."""
+
+    replacement_committed = True
+    published = True
+
+
+class IdentityBoundPublicationError(OSError):
+    """Publication could not be bound to the verified source-file identity."""
+
+    replacement_committed = False
+    published = False
+
+
+_AT_EMPTY_PATH = 0x1000
+_AT_FDCWD = -100
+_AT_SYMLINK_FOLLOW = 0x400
+
+
+def _link_open_file(
+    source_fd: int, destination_directory_fd: int, destination_name: str
+) -> None:
+    """Create a hard link to an open Linux file without resolving its pathname."""
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        linkat = libc.linkat
+    except (AttributeError, OSError) as exc:
+        raise IdentityBoundPublicationError(
+            errno.ENOTSUP, "identity_bound_publication_not_supported"
+        ) from exc
+    linkat.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    )
+    linkat.restype = ctypes.c_int
+    encoded_name = os.fsencode(destination_name)
+    result = linkat(source_fd, b"", destination_directory_fd, encoded_name, _AT_EMPTY_PATH)
+    if result and ctypes.get_errno() in {errno.ENOENT, errno.EPERM}:
+        # AT_EMPTY_PATH can require CAP_DAC_READ_SEARCH. procfs exposes the
+        # already-open descriptor as an unswappable kernel-owned symlink.
+        descriptor_path = os.fsencode(f"/proc/self/fd/{source_fd}")
+        result = linkat(
+            _AT_FDCWD,
+            descriptor_path,
+            destination_directory_fd,
+            encoded_name,
+            _AT_SYMLINK_FOLLOW,
+        )
+    if result:
+        error_number = ctypes.get_errno()
+        if error_number in {
+            errno.EXDEV,
+            errno.EINVAL,
+            errno.ENOENT,
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            errno.EPERM,
+        }:
+            raise IdentityBoundPublicationError(
+                errno.ENOTSUP, "identity_bound_publication_not_supported"
+            )
+        raise OSError(error_number, os.strerror(error_number), destination_name)
+
+
+def _same_regular_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(left.st_mode)
+        and stat.S_ISREG(right.st_mode)
+        and left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+    )
+
+
+def identity_bound_durable_atomic_replace(
+    source: str | os.PathLike[str], destination: str | os.PathLike[str]
+) -> None:
+    """Durably publish the exact verified regular source-file identity.
+
+    Linux binds a staging hard link directly to the open source descriptor.
+    Destination authority linearizes to the parent directory object opened at
+    call start: the descriptor-relative commit follows that object across a
+    concurrent rename instead of resolving a substituted public parent path.
+    Other platforms fail closed before changing the destination because this
+    module cannot guarantee an equivalent descriptor-bound namespace operation.
+    """
+
+    source_path = os.fspath(source)
+    destination_path = os.fspath(destination)
+    if not is_linux():
+        raise IdentityBoundPublicationError(
+            errno.ENOTSUP, "identity_bound_publication_not_supported"
+        )
+
+    source_directory = os.path.dirname(os.path.abspath(source_path))
+    destination_directory = os.path.dirname(os.path.abspath(destination_path))
+    source_name = os.path.basename(source_path)
+    destination_name = os.path.basename(destination_path)
+    nonce = f"{os.getpid()}-{os.urandom(12).hex()}"
+    staging_directory_name = f".{destination_name}.publish-{nonce}"
+    staging_name = "source"
+    quarantine_name = f".{source_name}.publish-{nonce}"
+
+    source_fd = os.open(
+        source_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    source_directory_fd = -1
+    destination_directory_fd = -1
+    staging_directory_fd = -1
+    staging_directory_created = False
+    source_quarantined = False
+    destination_committed = False
+    try:
+        verified_identity = os.fstat(source_fd)
+        if not stat.S_ISREG(verified_identity.st_mode):
+            raise IdentityBoundPublicationError(
+                errno.EINVAL, "publication_source_is_not_a_regular_file"
+            )
+        source_directory_fd = os.open(
+            source_directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        destination_directory_fd = os.open(
+            destination_directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.mkdir(staging_directory_name, 0o700, dir_fd=destination_directory_fd)
+            staging_directory_created = True
+            staging_directory_fd = os.open(
+                staging_directory_name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=destination_directory_fd,
+            )
+        except (NotImplementedError, TypeError) as exc:
+            raise IdentityBoundPublicationError(
+                errno.ENOTSUP, "identity_bound_publication_not_supported"
+            ) from exc
+        _link_open_file(source_fd, staging_directory_fd, staging_name)
+
+        # Moving the pathname aside is intentionally followed by an fd-identity
+        # check. A substitute is restored and can never reach the destination.
+        os.replace(
+            source_name,
+            quarantine_name,
+            src_dir_fd=source_directory_fd,
+            dst_dir_fd=source_directory_fd,
+        )
+        source_quarantined = True
+        if not _same_regular_file_identity(
+            verified_identity,
+            os.stat(
+                quarantine_name,
+                dir_fd=source_directory_fd,
+                follow_symlinks=False,
+            ),
+        ):
+            os.replace(
+                quarantine_name,
+                source_name,
+                src_dir_fd=source_directory_fd,
+                dst_dir_fd=source_directory_fd,
+            )
+            source_quarantined = False
+            raise IdentityBoundPublicationError(
+                errno.ESTALE, "publication_source_identity_changed"
+            )
+
+        os.fsync(source_fd)
+        try:
+            os.replace(
+                staging_name,
+                destination_name,
+                src_dir_fd=staging_directory_fd,
+                dst_dir_fd=destination_directory_fd,
+            )
+        except (NotImplementedError, TypeError) as exc:
+            raise IdentityBoundPublicationError(
+                errno.ENOTSUP, "identity_bound_publication_not_supported"
+            ) from exc
+        destination_committed = True
+        os.unlink(quarantine_name, dir_fd=source_directory_fd)
+        source_quarantined = False
+        os.fsync(destination_directory_fd)
+        if source_directory_fd != destination_directory_fd:
+            os.fsync(source_directory_fd)
+    except OSError as exc:
+        if destination_committed and not isinstance(exc, PublicationDurabilityError):
+            raise PublicationDurabilityError(
+                exc.errno,
+                f"publication_committed_but_sync_failed:{destination_path}",
+                destination_path,
+            ) from exc
+        raise
+    finally:
+        if source_quarantined and not destination_committed:
+            try:
+                os.replace(
+                    quarantine_name,
+                    source_name,
+                    src_dir_fd=source_directory_fd,
+                    dst_dir_fd=source_directory_fd,
+                )
+            except OSError:
+                pass
+        if staging_directory_fd >= 0:
+            try:
+                os.unlink(staging_name, dir_fd=staging_directory_fd)
+            except FileNotFoundError:
+                pass
+            os.close(staging_directory_fd)
+        if staging_directory_created:
+            try:
+                os.rmdir(staging_directory_name, dir_fd=destination_directory_fd)
+            except OSError:
+                pass
+        if destination_directory_fd >= 0:
+            os.close(destination_directory_fd)
+        if source_directory_fd >= 0:
+            os.close(source_directory_fd)
+        os.close(source_fd)
+
+
+def durable_atomic_replace(
+    source: str | os.PathLike[str], destination: str | os.PathLike[str]
+) -> None:
+    """Durably publish a completed file at ``destination`` where supported.
+
+    The source contents reach stable storage before the atomic namespace
+    change.  POSIX additionally syncs the parent directory after replacement;
+    platforms which cannot open directories truthfully stop after the durable
+    file sync and atomic replacement.
+    """
+
+    source_path = os.fspath(source)
+    destination_path = os.fspath(destination)
+    directory_descriptor = -1
+    if os.name != "nt":
+        directory_descriptor = os.open(
+            os.path.dirname(os.path.abspath(destination_path)),
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+    try:
+        descriptor = os.open(source_path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        atomic_replace(source_path, destination_path)
+        if directory_descriptor >= 0:
+            try:
+                os.fsync(directory_descriptor)
+            except OSError as exc:
+                raise PublicationDurabilityError(
+                    exc.errno,
+                    f"publication_committed_but_directory_sync_failed:{destination_path}",
+                    destination_path,
+                ) from exc
+    finally:
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
 
 
 class _MsvcrtLocking(Protocol):

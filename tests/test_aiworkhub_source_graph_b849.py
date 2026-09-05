@@ -35,9 +35,11 @@ from types import SimpleNamespace
 import pytest
 
 from aiworkhub import project_context as pc
+from aiworkhub import platform_io
 from aiworkhub import source_graph as sg
 from aiworkhub import source_graph_ast as sgast
 from aiworkhub import source_graph_migration as sgm
+from aiworkhub import source_graph_partition as sgpartition
 from aiworkhub import worker_ai_tools_mcp as w
 import aiworkhub.source_graph_semantic as sgsemantic
 from aiworkhub.repository_state import HUB_DIRNAME, bootstrap_repository, inspect_repository
@@ -54,6 +56,184 @@ def _new_repo(tmp_path: Path, name: str) -> Path:
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize("operation", ["index", "remove"])
+def test_single_file_mutation_publishes_staging_without_writable_canonical(
+    tmp_path, monkeypatch, operation,
+):
+    repo = _new_repo(tmp_path, f"single_file_atomic_{operation}")
+    target = repo / "app.py"
+    _write(target, "def committed():\n    return 1\n")
+    report = sg.build_index(repo, incremental=False)
+    canonical = sg.resolve_db_path(repo)
+    original_connect = sg.connect
+    writable_paths: list[Path] = []
+
+    def observed_connect(path, *, read_only=False):
+        if not read_only:
+            writable_paths.append(Path(path))
+        return original_connect(path, read_only=read_only)
+
+    monkeypatch.setattr(sg, "connect", observed_connect)
+    if operation == "index":
+        _write(target, "def refreshed():\n    return 2\n")
+        result = sg.index_file(repo, "app.py", sgast.sha256_bytes(target.read_bytes()))
+        assert result["ok"] and result["file_path"] == "app.py"
+        assert sg.focus(repo, "refreshed", budget=8)["matches"]
+    else:
+        result = sg.remove_file(repo, "app.py")
+        assert result["ok"] and result["file_path"] == "app.py"
+        assert not sg.file_query(repo, "app.py", budget=8)["matches"]
+
+    assert writable_paths
+    assert canonical not in writable_paths
+    assert all(path.parent == canonical.parent for path in writable_paths)
+    conn = original_connect(canonical, read_only=True)
+    try:
+        generation = json.loads(conn.execute(
+            "SELECT value FROM meta WHERE key='last_build'"
+        ).fetchone()[0])
+        mutation = json.loads(conn.execute(
+            "SELECT value FROM meta WHERE key='single_file_last_mutation'"
+        ).fetchone()[0])
+    finally:
+        conn.close()
+    assert generation["finished_at"] == report.finished_at
+    assert mutation["operation"] == operation
+
+
+def test_real_partition_composes_changed_base_and_deleted_files(tmp_path):
+    repo = _new_repo(tmp_path, "real_partition")
+    kept = repo / "kept.py"
+    deleted = repo / "deleted.py"
+    added = repo / "added.py"
+    _write(kept, "def kept_symbol():\n    return 1\n")
+    _write(deleted, "def deleted_symbol():\n    return 2\n")
+    sg.build_index(repo, incremental=False)
+    base = sg.resolve_db_path(repo)
+
+    _write(added, "def added_symbol():\n    return kept_symbol()\n")
+    deleted.unlink()
+    partition = base.with_name("review-partition.sqlite")
+    sgpartition.build_partition(
+        repo,
+        [
+            {"path": "added.py", "sha256": sgast.sha256_bytes(added.read_bytes())},
+            {"path": "deleted.py", "sha256": ""},
+        ],
+        partition,
+        base_db_path=base,
+    )
+
+    conn = sg.connect(partition, read_only=True)
+    try:
+        last_build = json.loads(conn.execute(
+            "SELECT value FROM main.meta WHERE key='last_build'"
+        ).fetchone()[0])
+        assert isinstance(last_build["finished_at"], str) and last_build["finished_at"]
+        assert last_build["build_revision"] == sg.BUILD_REVISION
+        assert sgpartition.composed_find(conn, "added_symbol")
+        assert sgpartition.composed_find(conn, "kept_symbol")
+        assert not sgpartition.composed_find(conn, "deleted_symbol")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("operation", ["index", "remove"])
+def test_single_file_mutation_is_visible_only_after_publication(
+    tmp_path, monkeypatch, operation,
+):
+    repo = _new_repo(tmp_path, f"single_file_visibility_{operation}")
+    target = repo / "app.py"
+    _write(target, "def committed():\n    return 1\n")
+    sg.build_index(repo, incremental=False)
+    canonical = sg.resolve_db_path(repo)
+    candidate_ready = threading.Event()
+    release_publication = threading.Event()
+    original_publish = sg._publish_staged_generation
+    errors: list[BaseException] = []
+
+    def gated_publish(staging_path, canonical_path, **kwargs):
+        assert Path(canonical_path) == canonical
+        candidate_ready.set()
+        assert release_publication.wait(10)
+        return original_publish(staging_path, canonical_path, **kwargs)
+
+    monkeypatch.setattr(sg, "_publish_staged_generation", gated_publish)
+    if operation == "index":
+        _write(target, "def refreshed():\n    return 2\n")
+
+    def mutate() -> None:
+        try:
+            if operation == "index":
+                sg.index_file(repo, "app.py", sgast.sha256_bytes(target.read_bytes()))
+            else:
+                sg.remove_file(repo, "app.py")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = threading.Thread(target=mutate)
+    thread.start()
+    assert candidate_ready.wait(10)
+    assert sg.focus(repo, "committed", budget=8)["matches"]
+    assert sg.file_query(repo, "app.py", budget=8)["matches"]
+    if operation == "index":
+        assert not sg.focus(repo, "refreshed", budget=8)["matches"]
+
+    release_publication.set()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert errors == []
+    if operation == "index":
+        assert sg.focus(repo, "refreshed", budget=8)["matches"]
+        assert not sg.focus(repo, "committed", budget=8)["matches"]
+    else:
+        assert not sg.file_query(repo, "app.py", budget=8)["matches"]
+
+
+@pytest.mark.parametrize("operation", ["index", "remove"])
+def test_single_file_publication_failure_preserves_generation(
+    tmp_path, monkeypatch, operation,
+):
+    repo = _new_repo(tmp_path, f"single_file_publish_failure_{operation}")
+    target = repo / "app.py"
+    _write(target, "def committed():\n    return 1\n")
+    sg.build_index(repo, incremental=False)
+    canonical = sg.resolve_db_path(repo)
+    original_bytes = canonical.read_bytes()
+    conn = sg.connect(canonical, read_only=True)
+    try:
+        original_last_build = conn.execute(
+            "SELECT value FROM meta WHERE key='last_build'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    def fail_publish(*_args, **_kwargs):
+        raise OSError("injected single-file publication failure")
+
+    monkeypatch.setattr(sg, "_publish_staged_generation", fail_publish)
+    if operation == "index":
+        _write(target, "def unpublished():\n    return 2\n")
+        mutation = lambda: sg.index_file(
+            repo, "app.py", sgast.sha256_bytes(target.read_bytes())
+        )
+    else:
+        mutation = lambda: sg.remove_file(repo, "app.py")
+
+    with pytest.raises(OSError, match="publication failure"):
+        mutation()
+
+    assert canonical.read_bytes() == original_bytes
+    conn = sg.connect(canonical, read_only=True)
+    try:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='last_build'"
+        ).fetchone()[0] == original_last_build
+    finally:
+        conn.close()
+    assert sg.focus(repo, "committed", budget=8)["matches"]
 
 
 def test_javascript_fallback_masks_regex_literals_before_matching_braces(
@@ -2462,6 +2642,150 @@ def test_analytics_query_aggregate_modes_reject_a_forged_cursor(tmp_path):
         )
         with pytest.raises(sg.SourceGraphError):
             sg.analytics_query(repo, mode, _NO_MATCH_QUERY, budget=1, cursor=forged)
+
+
+def test_related_evidence_modes_reject_a_zero_offset_cursor(tmp_path):
+    """NF-2026-00554 rework: coverage/testmap return one bounded related-tests
+    snapshot and never mint a cursor. A cursor forged with the engine's own
+    encoder at offset 0 carries a matching digest, so
+    ``_decode_analytics_cursor`` returns 0 rather than raising -- and a guard
+    that only fires on a nonzero offset (``if offset and not is_pageable_mode``)
+    silently accepted it. Any provided cursor for these nonpageable modes must
+    be rejected, zero offset included, while a no-cursor call still succeeds.
+    """
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "mod.py", "def only_symbol():\n    return 1\n")
+    sg.build_index(repo, incremental=True)
+
+    for mode in ("testmap", "coverage"):
+        # offset 0 is the regression: valid digest, decoder returns 0, so the
+        # old ``if offset`` guard let it through. offset 1 was already rejected.
+        for forged_offset in (0, 1):
+            forged = sg._encode_analytics_cursor(
+                forged_offset, mode=mode, query=_NO_MATCH_QUERY, target="", budget=1,
+            )
+            with pytest.raises(sg.SourceGraphError) as excinfo:
+                sg.analytics_query(
+                    repo, mode, _NO_MATCH_QUERY, budget=1, cursor=forged,
+                )
+            assert str(excinfo.value) == "invalid_cursor"
+        # No-cursor behavior is preserved: the call succeeds and offers none.
+        clean = sg.analytics_query(repo, mode, _NO_MATCH_QUERY, budget=1)
+        assert clean["next_cursor"] is None
+
+
+def test_testmap_source_target_returns_related_tests_outside_source_scope(tmp_path):
+    """NF-2026-00554: a source-file target selects source subjects, but the
+    tests exercising them legitimately live in tests/ -- outside that source
+    file. The engine's owning-file scope filter used to strip every related
+    test (they are not under the source target), reporting related_tests=[]
+    and returned/effective_budget=0 even though candidate_test_files had
+    counted the relationship, and it minted a cursor that paged the larger
+    source corpus past the complete test result. The source target must return
+    the real test relationships with truthful counts and no spurious cursor,
+    while target authority for unrelated modes stays intact.
+    """
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "service.py",
+        "def covered_target(value):\n    return value + 1\n\n\n"
+        "def other_target(value):\n    return value - 1\n",
+    )
+    _write(
+        repo / "tests" / "test_service.py",
+        "from pkg.service import covered_target\n\n"
+        "def test_covered_target():\n    assert covered_target(1) == 2\n",
+    )
+    sg.build_index(repo, incremental=True)
+
+    for mode in ("testmap", "coverage"):
+        payload = sg.analytics_query(
+            repo, mode, _NO_MATCH_QUERY, budget=12, target="pkg/service.py",
+        )
+        assert payload["target"] == "pkg/service.py"
+        test_files = {row["file_path"] for row in payload["related_tests"]}
+        assert "tests/test_service.py" in test_files, f"{mode} dropped the related test"
+        # candidate_test_files already counted the relationship; returned and
+        # effective_budget must now agree instead of collapsing to 0.
+        assert payload["structural_mapping"]["candidate_test_files"] >= 1
+        assert payload["coverage"]["returned"] == len(payload["related_tests"])
+        assert payload["coverage"]["returned"] >= 1
+        assert (
+            payload["coverage"]["effective_budget"] == payload["coverage"]["returned"]
+        )
+        # ``eligible`` still describes the scoped source subjects examined; only
+        # the derived, cross-scope test list escapes the owning-file filter.
+        assert payload["coverage"]["eligible"] >= 1
+        # An aggregate test-relationship snapshot must not page past a complete
+        # result: the larger source corpus must not mint a cursor that would
+        # re-derive the same bounded snapshot.
+        assert payload["next_cursor"] is None
+        assert payload["truncated"] is False
+
+    # Target authority for unrelated modes is unchanged: a symbols target still
+    # confines rows to the source scope and never leaks tests/ rows back in.
+    scoped_symbols = sg.analytics_query(
+        repo, "symbols", _NO_MATCH_QUERY, budget=12, target="pkg/service.py",
+    )
+    assert {row["file_path"] for row in scoped_symbols["symbols"]} == {"pkg/service.py"}
+
+
+def test_testmap_over_budget_related_tests_report_truthful_truncation(tmp_path):
+    """NF-2026-00554 (bounded-related-tests completion): coverage/testmap return
+    one bounded snapshot of the related tests and cannot page (the tests live
+    outside the source target, so there is no source-corpus cursor to advance).
+    When more tests relate to the scope than the display cap -- either more than
+    the caller's budget or more than the hard 40-row ceiling -- the snapshot must
+    still count the full mapped population in ``candidate_test_files`` and set
+    ``truncated`` so the capped list never reads as the complete set. The prior
+    code counted only the returned rows and left ``truncated`` False, silently
+    dropping the tail.
+    """
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "service.py",
+        "def covered_target(value):\n    return value + 1\n",
+    )
+    # 41 distinct test files all relate to pkg/service.py by path stem, one past
+    # the hard 40-row display ceiling.
+    for index in range(41):
+        _write(
+            repo / "tests" / f"test_service_{index:02d}.py",
+            "from pkg.service import covered_target\n\n"
+            f"def test_service_{index:02d}():\n"
+            "    assert covered_target(1) == 2\n",
+        )
+    sg.build_index(repo, incremental=True)
+
+    for mode in ("testmap", "coverage"):
+        # Budget below the population: capped to the budget, still truthful.
+        small = sg.analytics_query(
+            repo, mode, _NO_MATCH_QUERY, budget=5, target="pkg/service.py",
+        )
+        assert small["structural_mapping"]["candidate_test_files"] == 41
+        assert small["structural_mapping"]["related_tests_truncated"] is True
+        assert small["coverage"]["returned"] == len(small["related_tests"])
+        assert small["coverage"]["returned"] <= 5
+        assert small["coverage"]["effective_budget"] == small["coverage"]["returned"]
+        assert small["coverage"]["returned"] < 41
+        assert small["truncated"] is True
+        # A snapshot mode never mints a cursor, even when truncated.
+        assert small["next_cursor"] is None
+        assert all(
+            row["file_path"].startswith("tests/") for row in small["related_tests"]
+        )
+
+        # Budget above 40: the hard 40-row ceiling still bounds the list, and the
+        # 41st mapped test is reported as truncated rather than dropped silently.
+        wide = sg.analytics_query(
+            repo, mode, _NO_MATCH_QUERY, budget=100, target="pkg/service.py",
+        )
+        assert wide["structural_mapping"]["candidate_test_files"] == 41
+        assert wide["coverage"]["returned"] == len(wide["related_tests"])
+        assert wide["coverage"]["returned"] == 40
+        assert wide["coverage"]["effective_budget"] == 40
+        assert wide["truncated"] is True
+        assert wide["next_cursor"] is None
 
 
 def test_javascript_same_file_import_bindings_resolve_deterministically(tmp_path):
@@ -6224,3 +6548,216 @@ def test_python_import_reparser_rejects_token_oversize_before_parse(monkeypatch)
     assert len(source) < sg.PYTHON_IMPORT_REPARSE_MAX_SOURCE_CHARS
     assert sg._python_imported_member_accesses(source) == {}
     assert parse_calls == []
+
+
+def test_index_file_bootstraps_private_first_generation_without_writable_canonical(
+    tmp_path, monkeypatch
+):
+    repo = _new_repo(tmp_path, "single_file_first_generation")
+    target = repo / "app.py"
+    _write(target, "def first_generation():\n    return 1\n")
+    canonical = sg.resolve_db_path(repo)
+    assert not canonical.exists()
+
+    original_connect = sg.connect
+    writable_paths: list[Path] = []
+
+    def tracked_connect(path, *, read_only=False):
+        if not read_only:
+            writable_paths.append(Path(path))
+            assert Path(path) != canonical
+        return original_connect(path, read_only=read_only)
+
+    monkeypatch.setattr(sg, "connect", tracked_connect)
+    source_hash = sg.hashlib.sha256(target.read_bytes()).hexdigest()
+
+    result = sg.index_file(repo, "app.py", source_hash)
+
+    assert result["ok"] is True
+    assert result["file_path"] == "app.py"
+    assert canonical.is_file()
+    assert writable_paths
+    assert canonical not in writable_paths
+    assert sg.file_query(repo, "app.py", budget=8)["matches"]
+    conn = original_connect(canonical, read_only=True)
+    try:
+        last_build = json.loads(
+            conn.execute(
+                "SELECT value FROM meta WHERE key='last_build'"
+            ).fetchone()[0]
+        )
+        mutation = json.loads(
+            conn.execute(
+                "SELECT value FROM meta WHERE key='single_file_last_mutation'"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+    assert last_build["files_seen"] == 1
+    assert last_build["build_revision"] == sg.BUILD_REVISION
+    assert mutation["operation"] == "index"
+    assert mutation["file_path"] == "app.py"
+    assert mutation["source_hash"] == source_hash
+
+
+def test_index_file_first_generation_prepublication_failure_leaves_no_canonical(
+    tmp_path, monkeypatch
+):
+    repo = _new_repo(tmp_path, "single_file_first_generation_failure")
+    target = repo / "app.py"
+    _write(target, "def unpublished():\n    return 1\n")
+    canonical = sg.resolve_db_path(repo)
+    assert not canonical.exists()
+
+    def fail_publication(staging_path, canonical_path, *, expected_report=None):
+        assert Path(staging_path).is_file()
+        assert Path(canonical_path) == canonical
+        raise OSError("injected pre-publication failure")
+
+    monkeypatch.setattr(sg, "_publish_staged_generation", fail_publication)
+    source_hash = sg.hashlib.sha256(target.read_bytes()).hexdigest()
+
+    with pytest.raises(OSError, match="injected pre-publication failure"):
+        sg.index_file(repo, "app.py", source_hash)
+
+    assert not canonical.exists()
+
+
+def test_remove_file_before_first_generation_is_idempotent_and_staged(
+    tmp_path, monkeypatch
+):
+    repo = _new_repo(tmp_path, "single_file_remove_before_generation")
+    canonical = sg.resolve_db_path(repo)
+    writable_paths: list[Path] = []
+    original_connect = sg.connect
+
+    def tracked_connect(path, *, read_only=False):
+        if not read_only:
+            writable_paths.append(Path(path))
+            assert Path(path) != canonical
+        return original_connect(path, read_only=read_only)
+
+    monkeypatch.setattr(sg, "connect", tracked_connect)
+
+    result = sg.remove_file(repo, "missing.py")
+
+    assert result == {
+        "ok": True,
+        "file_path": "missing.py",
+        "removed_entities": 0,
+    }
+    assert canonical.is_file()
+    assert writable_paths
+    assert canonical not in writable_paths
+    assert not sg.file_query(repo, "missing.py", budget=8)["matches"]
+
+
+def test_single_file_publication_rejects_unprobed_pathname_substitute(
+    tmp_path, monkeypatch
+):
+    repo = _new_repo(tmp_path, "single_file_identity_bound_publication")
+    target = repo / "app.py"
+    _write(target, "def committed():\n    return 1\n")
+    sg.build_index(repo, incremental=False)
+    canonical = sg.resolve_db_path(repo)
+    original_bytes = canonical.read_bytes()
+    hook_called = False
+
+    def substitute_after_verification(source, destination):
+        nonlocal hook_called
+        hook_called = True
+        assert Path(destination) == canonical
+        Path(source).unlink()
+        Path(source).write_bytes(b"unprobed substitute")
+        raise OSError("reject pathname substitute")
+
+    monkeypatch.setattr(sg, "atomic_replace", substitute_after_verification)
+    _write(target, "def refreshed():\n    return 2\n")
+
+    with pytest.raises(OSError, match="reject pathname substitute"):
+        sg.index_file(repo, "app.py", sgast.sha256_bytes(target.read_bytes()))
+
+    assert hook_called
+    assert canonical.read_bytes() == original_bytes
+    assert sg.focus(repo, "committed", budget=8)["matches"]
+    assert not sg.focus(repo, "refreshed", budget=8)["matches"]
+
+
+def test_synthetic_single_file_generation_tracks_index_and_remove_file_counts(
+    tmp_path,
+):
+    repo = _new_repo(tmp_path, "single_file_synthetic_counts")
+    first = repo / "first.py"
+    second = repo / "second.py"
+    _write(first, "def first_symbol():\n    return 1\n")
+    _write(second, "def second_symbol():\n    return 2\n")
+
+    sg.index_file(repo, "first.py", sgast.sha256_bytes(first.read_bytes()))
+    sg.index_file(repo, "second.py", sgast.sha256_bytes(second.read_bytes()))
+    canonical = sg.resolve_db_path(repo)
+    conn = sg.connect(canonical, read_only=True)
+    try:
+        two_file_generation = json.loads(conn.execute(
+            "SELECT value FROM meta WHERE key='last_build'"
+        ).fetchone()[0])
+    finally:
+        conn.close()
+    assert two_file_generation["files_seen"] == 2
+
+    sg.remove_file(repo, "first.py")
+    conn = sg.connect(canonical, read_only=True)
+    try:
+        one_file_generation = json.loads(conn.execute(
+            "SELECT value FROM meta WHERE key='last_build'"
+        ).fetchone()[0])
+    finally:
+        conn.close()
+    assert one_file_generation["files_seen"] == 1
+    assert one_file_generation["finished_at"] == two_file_generation["finished_at"]
+    assert one_file_generation["build_revision"] == two_file_generation["build_revision"]
+
+
+@pytest.mark.parametrize("operation", ["index", "remove"])
+def test_full_build_replaces_bootstrap_generation_authority_before_single_file_mutation(
+    tmp_path, operation,
+):
+    repo = _new_repo(tmp_path, f"bootstrap_build_then_{operation}")
+    target = repo / "app.py"
+    _write(target, "def bootstrap_symbol():\n    return 1\n")
+    sg.index_file(repo, "app.py", sgast.sha256_bytes(target.read_bytes()))
+
+    report = sg.build_index(repo, incremental=False)
+    canonical = sg.resolve_db_path(repo)
+    conn = sg.connect(canonical, read_only=True)
+    try:
+        authoritative_last_build = conn.execute(
+            "SELECT value FROM meta WHERE key='last_build'"
+        ).fetchone()[0]
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='single_file_generation_metadata'"
+        ).fetchone() is None
+    finally:
+        conn.close()
+    assert json.loads(authoritative_last_build)["finished_at"] == report.finished_at
+
+    if operation == "index":
+        _write(target, "def authoritative_refresh():\n    return 2\n")
+        result = sg.index_file(
+            repo, "app.py", sgast.sha256_bytes(target.read_bytes())
+        )
+        assert result["ok"] is True
+    else:
+        result = sg.remove_file(repo, "app.py")
+        assert result["ok"] is True
+
+    conn = sg.connect(canonical, read_only=True)
+    try:
+        after_mutation = conn.execute(
+            "SELECT value FROM meta WHERE key='last_build'"
+        ).fetchone()[0]
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='single_file_generation_metadata'"
+        ).fetchone() is None
+    finally:
+        conn.close()
+    assert after_mutation == authoritative_last_build

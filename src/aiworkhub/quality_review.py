@@ -41,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from . import quality_reviewer, runtime_adapters
@@ -204,6 +205,7 @@ def assemble_reviewer_prompt(
     adapter_id: str,
     submit_tool_name: str = DEFAULT_SUBMIT_TOOL,
     packet_path: str | None = None,
+    packet_root: Path | str | None = None,
     adapter_fallback_used: bool = False,
 ) -> str:
     """Assemble the reviewer prompt for the exact adapter that will run it.
@@ -216,6 +218,9 @@ def assemble_reviewer_prompt(
     the model no file-read tool of any kind -- receives the packet content
     inline so it can still cite an exact packet-permitted path and line.  A
     blind reviewer is never handed only an unreadable path.
+
+    ``packet_root`` comes from the coordinator's verified worker runtime directory;
+    it is not inferred from ``packet_path`` or asserted by the reviewer.
     """
 
     if runtime_adapters.adapter_provides_file_read(
@@ -226,6 +231,7 @@ def assemble_reviewer_prompt(
             lens=lens,
             submit_tool_name=submit_tool_name,
             packet_file=packet_path,
+            packet_root=packet_root,
         )
     return build_reviewer_prompt_with_content(
         packet,

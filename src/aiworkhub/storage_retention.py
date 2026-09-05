@@ -125,6 +125,57 @@ def _terminal_needfix_task_ids(repo_root: Path) -> tuple[set[str], bool]:
     return {str(row[0]).strip() for row in rows if str(row[0] or "").strip()}, True
 
 
+def _blocked_terminal_candidate_request_ids(
+    card_json: Mapping[str, Any],
+) -> frozenset[str]:
+    """Every request id a ``blocked`` card's own terminal failure still implicates.
+
+    ``task_store.mark_terminal_failure`` parks a post-launch failure (e.g.
+    ``finalize_failed``) in the canonical ``blocked`` bucket WITHOUT clearing
+    ``launch_request_id`` -- the worktree that failed is the one both that
+    field and the recorded ``terminal_failure``/``terminal_review`` still name.
+    A card blocked for any OTHER reason (a manager ``reject_review(...,
+    to="blocked")`` park, for instance) carries no such record, so this
+    returns an empty set and earns the card no new protection: only a genuine
+    operational terminal failure -- a substatus in
+    ``task_store.MARK_TERMINAL_FAILURE_SUBSTATUSES`` -- names a still-needed
+    candidate, never a blanket rule for every blocked card or every past
+    attempt it ever made.
+
+    When the card's own ``launch_request_id`` and the recorded
+    ``terminal_failure``/``terminal_review`` envelopes DISAGREE the retained
+    identity is ambiguous: the evidence cannot say which worktree actually
+    holds the failed finalize attempt. Collapsing them (the prior behaviour --
+    one ``recorded_request_id`` chosen from ``terminal_failure`` else
+    ``terminal_review``, then unioned only with the launch id) silently dropped
+    the third envelope's distinct id, converting that ambiguity into reclaim
+    permission for the worktree it named -- a fail-open bug. Every nonempty id
+    is instead collected INDEPENDENTLY from all three envelopes
+    (``terminal_failure``, ``terminal_review`` AND ``launch_request_id``), so
+    protection fails CLOSED across a three-way disagreement: a mismatched or
+    malformed terminal identity can never manufacture reclaim permission for a
+    worktree that might still hold the only copy of that finalize attempt. A
+    record carrying no usable request id at all names no worktree, so it
+    protects nothing (there is nothing to reclaim either).
+    """
+    terminal_review = card_json.get("terminal_review")
+    terminal_failure = card_json.get("terminal_failure")
+    substatus = str(
+        card_json.get("terminal_substatus")
+        or (terminal_review.get("substatus") if isinstance(terminal_review, dict) else "")
+        or (terminal_failure.get("substatus") if isinstance(terminal_failure, dict) else "")
+        or ""
+    )
+    if substatus not in task_store.MARK_TERMINAL_FAILURE_SUBSTATUSES:
+        return frozenset()
+    implicated: list[str] = []
+    for envelope in (terminal_failure, terminal_review):
+        if isinstance(envelope, dict):
+            implicated.append(str(envelope.get("request_id") or "").strip())
+    implicated.append(str(card_json.get("launch_request_id") or "").strip())
+    return frozenset(rid for rid in implicated if rid)
+
+
 def _protected_attempt_ids(
     repo_root: Path,
 ) -> tuple[dict[str, str], bool, dict[str, list[str]], set[str]]:
@@ -138,6 +189,19 @@ def _protected_attempt_ids(
       actively ``processing`` or ``review`` (the newest attempt under
       evaluation), recorded by the claim path in ``card_json`` as
       ``launch_request_id``.
+    * ``blocked_terminal_candidate_retained`` -- a card that is ``blocked`` by
+      its own genuine operational terminal failure (a substatus in
+      ``task_store.MARK_TERMINAL_FAILURE_SUBSTATUSES``, e.g. ``finalize_failed``)
+      still names this exact request id via ``terminal_failure``/
+      ``terminal_review`` and ``launch_request_id`` alike (see
+      :func:`_blocked_terminal_candidate_request_ids`). ``mark_terminal_failure``
+      never clears ``launch_request_id`` when it parks the card, so the
+      worktree that failed is the only copy of that finalize attempt's
+      evidence; a card merely parked ``blocked`` by a manager review
+      (``reject_review(..., to="blocked")``) carries no such record and earns
+      no protection here. When the recorded terminal id and
+      ``launch_request_id`` disagree the identity is ambiguous, so BOTH are
+      retained (fail closed) rather than granting reclaim permission on either.
     * ``rework_predecessor_retained`` -- it is referenced as the
       ``rework_predecessor`` of a card that has NOT yet reached a finished
       lifecycle state. A card rejected back to ``pending`` (or otherwise still
@@ -215,6 +279,11 @@ def _protected_attempt_ids(
                 request_id = str(card_json.get("launch_request_id") or "").strip()
                 if request_id and not closed_by_needfix:
                     protected[request_id] = "live_worker"
+            if status == "blocked" and not closed_by_needfix:
+                for blocked_request_id in _blocked_terminal_candidate_request_ids(card_json):
+                    protected.setdefault(
+                        blocked_request_id, "blocked_terminal_candidate_retained"
+                    )
             if status not in _FINISHED_STATUSES and not closed_by_needfix:
                 predecessor = card_json.get("rework_predecessor")
                 if isinstance(predecessor, dict):

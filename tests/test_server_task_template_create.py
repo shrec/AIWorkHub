@@ -184,6 +184,12 @@ def test_from_template_serializes_full_provenance_into_storage(
     stored = task_store.get_task(repo, "TASK_NF390_FROM")
     assert stored is not None
     assert stored["template_provenance"] == provenance
+    assert provenance["expanded_contract"]["minimality_contract"] == (
+        task_templates.CANONICAL_MINIMALITY_CONTRACT
+    )
+    assert provenance["expanded_contract_digest"] == (
+        task_templates.expanded_contract_digest(stored)
+    )
     assert "node --test tests/a.test.js" in stored["validation"]
     assert all(
         ".js" not in command

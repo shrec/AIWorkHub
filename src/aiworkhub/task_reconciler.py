@@ -31,7 +31,9 @@ import contextlib
 import json
 import os
 import signal
+import stat
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -69,6 +71,7 @@ MIN_STALE_SCAN_SECONDS = 300.0
 # made a finished card's time-to-review hostage to garbage collection, so the
 # sweep runs on every Nth pass instead.
 GC_SCAN_EVERY_N_PASSES = 20
+AUTHORITY_RETRY_SECONDS = 0.25
 
 
 def _utcnow() -> str:
@@ -83,41 +86,160 @@ def _scan_interval_seconds() -> float:
     return max(MIN_SCAN_INTERVAL_SECONDS, min(value, MAX_SCAN_INTERVAL_SECONDS))
 
 
+def _process_identity() -> dict[str, Any]:
+    """Return the strongest process identity this platform can prove."""
+
+    return {
+        "owner_pid": os.getpid(),
+        "owner_pid_start_ticks": process_launcher._pid_start_ticks(os.getpid()),
+    }
+
+
 class ReconcilerLockHeld(RuntimeError):
     """Another reconciler instance already holds the single-instance lock."""
+
+
+class ReconcilerLockUnsafe(RuntimeError):
+    """The authority path cannot safely identify an ordinary lock file."""
+
+
+def _lock_metadata_unsafe(metadata: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
+        or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+    )
+
+
+def _lock_path_metadata(lock_path: Path) -> os.stat_result | None:
+    try:
+        return os.stat(lock_path, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{lock_path}") from exc
+
+
+def _directory_identity(path: Path) -> tuple[int, int]:
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{path}") from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
+        or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+    ):
+        raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{path}")
+    return metadata.st_dev, metadata.st_ino
 
 
 @contextlib.contextmanager
 def single_instance_lock(lock_path: Path):
     """Bounded, non-blocking advisory single-instance lock.
 
-    Deliberately separate from ``ProcessManager._registry_lock`` (which
-    already makes every individual finalize/claim operation interprocess-
-    safe): this lock only prevents redundant reconciler DAEMONS from running
-    concurrently against the same repo, it is not itself the correctness
-    boundary for finalization.
+    The repository descriptor is a stable guard for the canonical lock-parent
+    chain on POSIX.  The lock itself is opened relative to a bound parent
+    descriptor, whose pathname identity is revalidated after acquisition.
     """
+    lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    flags = os.O_CREAT | os.O_RDWR
+    parent_identity = _directory_identity(lock_path.parent)
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(lock_path, flags, 0o600)
-    chmod_fd(fd, 0o600)
+        directory_flags |= os.O_NOFOLLOW
+
+    repo_fd: int | None = None
+    repo_locked = False
+    rel_parts = LOCK_REL_PATH.parts
+    is_canonical_path = (
+        len(lock_path.parts) > len(rel_parts)
+        and lock_path.parts[-len(rel_parts):] == rel_parts
+    )
+    if os.name != "nt" and is_canonical_path:
+        repo_path = lock_path.parents[len(rel_parts) - 1]
+        try:
+            repo_fd = os.open(repo_path, directory_flags)
+            lock_fd(repo_fd, blocking=False)
+            repo_locked = True
+        except OSError as exc:
+            if repo_fd is not None:
+                os.close(repo_fd)
+            raise ReconcilerLockHeld(f"reconciler_lock_held:{lock_path}") from exc
+
     try:
+        parent_fd = os.open(lock_path.parent, directory_flags)
+    except OSError as exc:
+        if repo_locked and repo_fd is not None:
+            with contextlib.suppress(OSError):
+                unlock_fd(repo_fd)
+            os.close(repo_fd)
+        raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{lock_path.parent}") from exc
+    fd: int | None = None
+    try:
+        parent_metadata = os.fstat(parent_fd)
+        if (parent_metadata.st_dev, parent_metadata.st_ino) != parent_identity:
+            raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{lock_path.parent}")
+        before = _lock_path_metadata(lock_path)
+        if before is not None and _lock_metadata_unsafe(before):
+            raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{lock_path}")
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            if os.open in os.supports_dir_fd:
+                fd = os.open(lock_path.name, flags, 0o600, dir_fd=parent_fd)
+            else:
+                fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{lock_path}") from exc
+        metadata = os.fstat(fd)
+        after = _lock_path_metadata(lock_path)
+        identity = (metadata.st_dev, metadata.st_ino)
+        unsafe = (
+            _lock_metadata_unsafe(metadata)
+            or after is None
+            or _lock_metadata_unsafe(after)
+            or (after.st_dev, after.st_ino) != identity
+            or (before is not None and (before.st_dev, before.st_ino) != identity)
+        )
+        if unsafe:
+            raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{lock_path}")
+        with contextlib.suppress(OSError):
+            chmod_fd(fd, 0o600)
         try:
             lock_fd(fd, blocking=False)
         except OSError as exc:
             raise ReconcilerLockHeld(f"reconciler_lock_held:{lock_path}") from exc
+        locked_path = _lock_path_metadata(lock_path)
+        if (
+            _directory_identity(lock_path.parent) != parent_identity
+            or locked_path is None
+            or _lock_metadata_unsafe(locked_path)
+            or (locked_path.st_dev, locked_path.st_ino) != identity
+        ):
+            raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{lock_path}")
         try:
             os.ftruncate(fd, 0)
             os.write(fd, f"{os.getpid()} {_utcnow()}\n".encode("utf-8"))
         except OSError:
             pass
-        yield
+        yield _process_identity()
     finally:
-        with contextlib.suppress(OSError):
-            unlock_fd(fd)
-        os.close(fd)
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                unlock_fd(fd)
+            os.close(fd)
+        os.close(parent_fd)
+        if repo_locked and repo_fd is not None:
+            with contextlib.suppress(OSError):
+                unlock_fd(repo_fd)
+            os.close(repo_fd)
 
 
 def status_path(repo: Path | str) -> Path:
@@ -129,29 +251,97 @@ def write_status(repo: Path | str, payload: dict[str, Any]) -> None:
 
     target = status_path(repo)
     record = {"schema_id": "aiworkhub.task_reconciler_status.v1", **payload}
+    tmp: str | None = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(record, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+        fd, tmp = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
         )
+        try:
+            fd_stat = os.fstat(fd)
+            path_stat = os.stat(tmp, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(fd_stat.st_mode)
+                or fd_stat.st_nlink != 1
+                or (fd_stat.st_dev, fd_stat.st_ino)
+                != (path_stat.st_dev, path_stat.st_ino)
+            ):
+                raise OSError("unsafe reconciler status temporary file")
+            with contextlib.suppress(OSError):
+                chmod_fd(fd, 0o600)
+            os.write(fd, json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+        finally:
+            os.close(fd)
         os.replace(tmp, target)
+        tmp = None
     except OSError:
         # A reconciler that cannot write its own heartbeat must still
         # reconcile; the missing record is itself reported as unknown health.
         return
+    finally:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
 
 
 def read_status(repo: Path | str) -> dict[str, Any]:
+    target = status_path(repo)
     try:
-        raw = status_path(repo).read_text(encoding="utf-8")
+        before = _lock_path_metadata(target)
+    except ReconcilerLockUnsafe:
+        return {}
+    if before is None or _lock_metadata_unsafe(before):
+        return {}
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(target, flags)
     except OSError:
         return {}
     try:
-        record = json.loads(raw)
-    except json.JSONDecodeError:
+        metadata = os.fstat(fd)
+        after = _lock_path_metadata(target)
+        identity = (metadata.st_dev, metadata.st_ino)
+        if (
+            _lock_metadata_unsafe(metadata)
+            or after is None
+            or _lock_metadata_unsafe(after)
+            or (after.st_dev, after.st_ino) != identity
+            or (before.st_dev, before.st_ino) != identity
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            return {}
+        with os.fdopen(fd, encoding="utf-8") as stream:
+            fd = -1
+            record = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError, ReconcilerLockUnsafe):
         return {}
+    finally:
+        if fd >= 0:
+            os.close(fd)
     return record if isinstance(record, dict) else {}
+
+
+def lock_is_held(lock_path: Path) -> bool:
+    """Probe an existing authority lock without creating any path."""
+
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(lock_path, flags)
+    except OSError:
+        return False
+    try:
+        try:
+            lock_fd(fd, blocking=False)
+        except OSError:
+            return True
+        unlock_fd(fd)
+        return False
+    finally:
+        os.close(fd)
 
 
 def _staleness(record: dict[str, Any]) -> tuple[bool, float | None]:
@@ -220,12 +410,57 @@ class ReconcilerService:
         self._last_scan: dict[str, Any] = {}
         self._last_error = ""
         self._pass_index = 0
+        self._authority_state = "acquiring"
+        self._authority_identity: dict[str, Any] = {}
+        self._acquisition_attempts = 0
+        self._last_acquisition_error = ""
 
     def is_running(self) -> bool:
         return bool(self._thread is not None and self._thread.is_alive())
 
     def _loop(self) -> None:
+        lock_path = self.repo / LOCK_REL_PATH
         while not self._stop_event.is_set():
+            with self._state_lock:
+                self._authority_state = "acquiring"
+                self._acquisition_attempts = getattr(self, "_acquisition_attempts", 0) + 1
+            try:
+                authority = single_instance_lock(lock_path)
+                with authority as identity:
+                    with self._state_lock:
+                        self._authority_state = "active_owner"
+                        self._authority_identity = dict(identity)
+                        self._last_acquisition_error = ""
+                    self._run_as_owner()
+            except ReconcilerLockHeld as exc:
+                with self._state_lock:
+                    self._authority_state = "standby"
+                    self._authority_identity = {}
+                    self._last_acquisition_error = str(exc)
+                self._stop_event.wait(AUTHORITY_RETRY_SECONDS)
+            except ReconcilerLockUnsafe as exc:
+                with self._state_lock:
+                    self._authority_state = "acquisition_failed"
+                    self._authority_identity = {}
+                    self._last_acquisition_error = str(exc)
+                self._stop_event.wait(AUTHORITY_RETRY_SECONDS)
+            finally:
+                with self._state_lock:
+                    if self._authority_state == "active_owner":
+                        self._authority_state = "released"
+                        self._authority_identity = {}
+
+    def _run_as_owner(
+        self,
+        *,
+        max_iterations: int | None = None,
+        on_scan: Any = None,
+        stop_requested: Any = None,
+    ) -> None:
+        iterations = 0
+        while not self._stop_event.is_set():
+            if stop_requested is not None and stop_requested():
+                break
             started = time.time()
             # The first pass sweeps, so a freshly started reconciler still
             # reclaims immediately; after that housekeeping is periodic.
@@ -235,15 +470,21 @@ class ReconcilerService:
             # tell "no reconciler" from "a reconciler mid-pass", and a sweep can
             # run for minutes -- writing only on completion left the loop
             # invisible for exactly as long as it was busiest.
+            previous = read_status(self.repo)
+            owner = _process_identity()
             write_status(self.repo, {
-                "pid": os.getpid(),
+                "pid": owner["owner_pid"],
+                **owner,
                 "repo": str(self.repo),
+                "authority_state": "active_owner",
+                "acquisition_state": "held",
                 "scan_started_epoch": started,
                 "scan_finished_epoch": None,
                 "scan_in_progress": True,
                 "scan_interval_seconds": self.scan_interval_seconds,
                 "gc_included": include_gc,
                 "last_error": "",
+                "last_completed_scan": previous.get("last_completed_scan", previous if previous.get("scan_finished_epoch") else {}),
             })
             try:
                 result = run_scan(self._manager, repo=self.repo, include_gc=include_gc)
@@ -258,21 +499,33 @@ class ReconcilerService:
                     self._last_error = error
             # Written on success AND on failure: a loop that is running but
             # failing every scan must not look the same as one that is working.
-            write_status(self.repo, {
-                "pid": os.getpid(),
-                "repo": str(self.repo),
-                "scan_started_epoch": started,
+            completed = {
                 "scan_finished_epoch": time.time(),
-                "scan_in_progress": False,
                 "scan_duration_seconds": round(time.time() - started, 3),
-                "scan_interval_seconds": self.scan_interval_seconds,
                 "last_error": error,
                 "finalized": result.get("finalized", 0),
                 "watched": result.get("watched", 0),
-                "gc_included": bool(result.get("gc_included")),
+                "gc_included": include_gc,
                 "gc_cleaned": result.get("gc_cleaned", 0),
                 "scanned_at": result.get("scanned_at", ""),
+            }
+            write_status(self.repo, {
+                "pid": owner["owner_pid"],
+                **owner,
+                "repo": str(self.repo),
+                "authority_state": "active_owner",
+                "acquisition_state": "held",
+                "scan_started_epoch": started,
+                "scan_in_progress": False,
+                "scan_interval_seconds": self.scan_interval_seconds,
+                **completed,
+                "last_completed_scan": completed,
             })
+            if on_scan is not None:
+                on_scan(result)
+            iterations += 1
+            if max_iterations is not None and iterations >= max_iterations:
+                break
             if self._stop_event.wait(self.scan_interval_seconds):
                 break
 
@@ -300,10 +553,21 @@ class ReconcilerService:
 
     def health(self) -> dict[str, Any]:
         with self._state_lock:
+            authority_state = getattr(self, "_authority_state", "unknown")
             return {
-                "ok": self.is_running() and not self._last_error,
+                "ok": (
+                    self.is_running()
+                    and not self._last_error
+                    and authority_state != "acquisition_failed"
+                ),
                 "running": self.is_running(),
                 "repo": str(self.repo),
+                "authority_state": authority_state,
+                "active_owner": authority_state == "active_owner",
+                "standby": authority_state in {"acquiring", "standby"},
+                "authority_identity": dict(getattr(self, "_authority_identity", {})),
+                "acquisition_attempts": getattr(self, "_acquisition_attempts", 0),
+                "last_acquisition_error": getattr(self, "_last_acquisition_error", ""),
                 "scan_interval_seconds": self.scan_interval_seconds,
                 "last_scan": dict(self._last_scan),
                 "last_error": self._last_error,
@@ -353,21 +617,51 @@ def reconciler_health(repo: Path | str) -> dict[str, Any]:
         service = _SERVICES.get(key)
     record = read_status(key)
     stale, age = _staleness(record) if record else (True, None)
+    recorded_error = str(record.get("last_error") or "")
+    claims_owner = (
+        record.get("authority_state") == "active_owner"
+        or record.get("acquisition_state") == "held"
+    )
+    owner_pid = record.get("owner_pid")
+    owner_ticks = record.get("owner_pid_start_ticks")
+    owner_identity_live = (
+        isinstance(owner_pid, int)
+        and not isinstance(owner_pid, bool)
+        and (owner_ticks is None or isinstance(owner_ticks, int))
+        and lock_is_held(Path(key) / LOCK_REL_PATH)
+        and process_launcher._pid_matches(owner_pid, owner_ticks)
+    )
+    durable_authority_live = not claims_owner or owner_identity_live
     durable = {
         "durable_status_present": bool(record),
         "durable_scan_stale": stale,
         "durable_scan_age_seconds": round(age, 1) if age is not None else None,
+        "durable_authority_live": durable_authority_live,
         "durable_last_scan": record,
     }
     if service is None:
+        healthy = (
+            bool(record)
+            and not stale
+            and durable_authority_live
+            and not recorded_error
+        )
         return {
-            "ok": bool(record) and not stale,
+            "ok": healthy,
             "running": False,
             "repo": key,
             "last_scan": record,
             "last_error": (
-                "" if record and not stale
-                else "reconciler_unregistered_and_no_recent_scan"
+                ""
+                if healthy
+                else (
+                    recorded_error
+                    or (
+                        "reconciler_recorded_owner_not_live"
+                        if record and not stale and claims_owner
+                        else "reconciler_unregistered_and_no_recent_scan"
+                    )
+                )
             ),
             "startup_error": str(record.get("startup_error") or ""),
             **durable,
@@ -375,9 +669,13 @@ def reconciler_health(repo: Path | str) -> dict[str, Any]:
     return {**service.health(), **durable}
 
 
-def _install_stop_handler(stop_flag: dict[str, bool]) -> None:
+def _install_stop_handler(
+    stop_flag: dict[str, bool], wake_event: threading.Event | None = None
+) -> None:
     def _stop(_signum: int, _frame: Any) -> None:
         stop_flag["stop"] = True
+        if wake_event is not None:
+            wake_event.set()
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
@@ -390,32 +688,65 @@ def run_daemon(
     max_iterations: int | None = None,
     on_scan: Any = None,
 ) -> int:
-    """Continuous bounded reconciliation loop.
+    """Continuous bounded reconciliation loop with passive lock failover.
 
     Builds exactly ONE ``ProcessManager`` for the whole daemon lifetime (not
-    one per iteration) so a request already being watched by that manager's
-    own background watcher thread is never double-watched across
-    iterations; ``run_scan``/``reconcile()`` remain idempotent regardless.
+    one per iteration). A contended daemon remains alive in standby and retries
+    the non-blocking repository authority until the owner releases it or this
+    process receives a stop signal.
     """
     interval = scan_interval_seconds if scan_interval_seconds is not None else _scan_interval_seconds()
     interval = max(MIN_SCAN_INTERVAL_SECONDS, min(interval, MAX_SCAN_INTERVAL_SECONDS))
-    manager = process_launcher.ProcessManager(repo=repo)
     stop_flag = {"stop": False}
-    _install_stop_handler(stop_flag)
 
-    iterations = 0
-    while not stop_flag["stop"]:
-        result = run_scan(manager, repo=repo)
-        if on_scan is not None:
-            on_scan(result)
-        else:
-            print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
-        iterations += 1
-        if max_iterations is not None and iterations >= max_iterations:
-            break
-        if stop_flag["stop"]:
-            break
-        time.sleep(interval)
+    root = Path(repo).resolve() if repo is not None else core.repo_root()
+    service = ReconcilerService(root, scan_interval_seconds=interval)
+    _install_stop_handler(stop_flag, service._stop_event)
+    emit = on_scan or (
+        lambda result: print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
+    )
+    lock_path = root / LOCK_REL_PATH
+    while not service._stop_event.is_set():
+        with service._state_lock:
+            service._authority_state = "acquiring"
+            service._acquisition_attempts += 1
+        try:
+            with single_instance_lock(lock_path) as identity:
+                with service._state_lock:
+                    service._authority_state = "active_owner"
+                    service._authority_identity = dict(identity)
+                    service._last_acquisition_error = ""
+                service._run_as_owner(
+                    max_iterations=max_iterations,
+                    on_scan=emit,
+                    stop_requested=lambda: stop_flag["stop"],
+                )
+                return 0
+        except ReconcilerLockHeld as exc:
+            with service._state_lock:
+                service._authority_state = "standby"
+                service._authority_identity = {}
+                service._last_acquisition_error = str(exc)
+            service._stop_event.wait(AUTHORITY_RETRY_SECONDS)
+        except ReconcilerLockUnsafe as exc:
+            error = str(exc)
+            with service._state_lock:
+                service._authority_state = "acquisition_failed"
+                service._authority_identity = {}
+                service._last_acquisition_error = error
+            write_status(root, {
+                "authority_state": "acquisition_failed",
+                "acquisition_state": "failed",
+                "acquisition_error": error,
+                "owner_pid": None,
+                "owner_pid_start_ticks": None,
+                "scan_in_progress": False,
+                "scan_started_epoch": None,
+                "scan_finished_epoch": None,
+                "scan_interval_seconds": interval,
+                "last_error": error,
+            })
+            return 4
     return 0
 
 
@@ -447,24 +778,30 @@ def main(argv: list[str] | None = None) -> int:
     lock_path = repo / LOCK_REL_PATH
 
     if args.command == "status":
+        lock_present = lock_path.is_file()
+        lock_held = lock_is_held(lock_path) if lock_present else False
+        record = read_status(repo) if lock_held else {}
         print(json.dumps({
             "ok": True,
             "lock_path": str(lock_path),
-            "lock_present": lock_path.is_file(),
+            "lock_present": lock_present,
+            "lock_held": lock_held,
+            "owner_pid": record.get("owner_pid"),
+            "owner_pid_start_ticks": record.get("owner_pid_start_ticks"),
         }, sort_keys=True))
         return 0
 
     try:
-        with single_instance_lock(lock_path):
-            if args.command == "run-once":
+        if args.command == "run-once":
+            with single_instance_lock(lock_path):
                 result = run_scan(repo=repo)
                 print(json.dumps(result, ensure_ascii=False, sort_keys=True))
                 return 0
-            return run_daemon(
-                repo=repo,
-                scan_interval_seconds=args.scan_interval_seconds,
-                max_iterations=args.max_iterations,
-            )
+        return run_daemon(
+            repo=repo,
+            scan_interval_seconds=args.scan_interval_seconds,
+            max_iterations=args.max_iterations,
+        )
     except ReconcilerLockHeld as exc:
         print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
         return 3

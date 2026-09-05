@@ -90,6 +90,19 @@ def test_health_answers_from_the_record_when_no_service_is_registered(tmp_path: 
     assert health["durable_scan_stale"] is False
 
 
+def test_fresh_durable_error_is_unhealthy_without_a_local_service(tmp_path: Path):
+    tr.write_status(tmp_path, {
+        "scan_finished_epoch": time.time(),
+        "scan_interval_seconds": 30.0,
+        "last_error": "RuntimeError:scan failed",
+    })
+    health = tr.reconciler_health(tmp_path)
+    assert health["ok"] is False
+    assert health["running"] is False
+    assert health["durable_scan_stale"] is False
+    assert health["last_error"] == "RuntimeError:scan failed"
+
+
 def test_a_record_too_old_to_be_evidence_is_stale_not_healthy(tmp_path: Path):
     tr.write_status(tmp_path, {
         "scan_finished_epoch": time.time() - 86400,

@@ -168,6 +168,7 @@ def test_atomic_json_remains_portable_when_getuid_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = tmp_path / "private" / "note.json"
+    monkeypatch.setattr(platform_io.sys, "platform", "win32")
     monkeypatch.delattr(vscode_lm_bridge.os, "getuid", raising=False)
     payload = {"portable": "über", "ok": True}
 

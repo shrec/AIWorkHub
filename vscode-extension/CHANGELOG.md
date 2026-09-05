@@ -1,5 +1,86 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.93 — 2026-09-05
+
+### Fixed
+
+- Protect retained terminal-failure candidates from storage cleanup.
+- Fail closed when declared invariants cannot be evaluated.
+- Preserve related test evidence and truthful counts in Source Graph testmap/coverage.
+
+## 0.10.92 — 2026-09-05
+
+### Fixed
+
+- Preserve reviewer finding categories and remedies through receipt normalization
+  without weakening scope, identity or final receipt validation.
+
+## 0.10.91 — 2026-09-05
+
+### Fixed
+
+- Combined acceptance validation includes unchanged tracked modules outside the
+  sparse worker input closure. Candidate overlays retain their precedence.
+
+## 0.10.90 — 2026-09-05
+
+### Fixed
+
+- Quality subprocesses prefer candidate Python sources; combined-check failures
+  expose bounded diagnostics. Replay guard extraction restores the size gate.
+- No retained feature candidate is automatically accepted by this update.
+
+## 0.10.89 — 2026-09-05
+
+### Fixed
+
+- Provider-free replay binds its recovery grant and receipt to the atomic claim's
+  committed epoch, request and repository, rejecting stale or mismatched grants.
+- Unsupported hardlink, deleted-fd and chmod validation restrictions report a
+  missing compatible lane instead of replaying the same denied operation.
+  Sandbox protections and retained candidate evidence are preserved.
+
+Already-failed replay chains are not automatically accepted by this release.
+
+## 0.10.88 — 2026-09-05
+
+### Fixed
+
+- Unchanged canonical quality policy is no longer mistaken for a worker
+  deletion when a sparse review workspace omits it. Inherited checks execute
+  against the complete candidate tree and failed checks still block acceptance.
+- Actual policy deletion, weakening and malformed policy remain guarded.
+- Large native review packets use the coordinator's exact runtime directory,
+  avoiding a missing worker-environment dependency during manager launch.
+- Authenticated retained terminal failures can return to normal rework without
+  losing candidate bytes or bypassing request, claim and hash checks.
+
+## 0.10.87 — 2026-09-05
+
+### Fixed
+
+- Reconciler startup and recovery now share one single-flight authority, so
+  concurrent paths cannot create competing reconciliation owners.
+- Source Graph publication and lifecycle transitions preserve verified
+  generation identity and the last readable generation, failing closed when a
+  replacement cannot be safely published.
+- Ponytail-derived task rules copy only applicable constraints, enforce
+  minimality and reject unsupported overbuild.
+
+## 0.10.86 — 2026-09-04
+
+### Fixed
+
+- Source Graph refreshes publish a separately validated SQLite generation
+  atomically and keep the last readable generation available to queries.
+- Single-file Source Graph updates are bound to the verified source identity and
+  failed full builds retain their diagnostic metadata without publishing partial
+  index contents.
+- Windows finalization and credential paths use the platform identity authority
+  instead of the unavailable `os.getuid()` API.
+- The validation metadata broker accepts real Git/Python chmod calls using the
+  kernel `mode_t` ABI while retaining hardlink and deleted-file-descriptor guards.
+
 ## 0.10.85 — 2026-09-04
 
 ### Fixed

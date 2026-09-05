@@ -20,6 +20,7 @@ and "checked and clean" must never look the same.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -141,6 +142,91 @@ def test_an_unevaluable_invariant_reports_itself_rather_than_passing(monkeypatch
     assert any("could not be evaluated" in v["detail"] for v in report["violations"])
 
 
+def test_exception_with_broken_string_still_fails_closed(monkeypatch, capsys):
+    class UnformattableError(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("diagnostic formatting failed")
+
+    def _explode(_root: Path) -> list[di.Violation]:
+        raise UnformattableError
+
+    monkeypatch.setattr(
+        di, "_TREE_INVARIANTS", (("module_level_caches_are_bounded", _explode),)
+    )
+
+    report = di.check(_PACKAGE)
+    assert report["passed"] is False
+    assert report["violations"][0]["path"] == str(_PACKAGE)
+    assert report["violations"][0]["detail"].endswith("UnformattableError")
+
+    assert di.main(["--src", str(_PACKAGE)]) == 1
+    cli_report = json.loads(capsys.readouterr().out)
+    assert cli_report["passed"] is False
+    assert cli_report["violations"][0]["detail"].endswith("UnformattableError")
+
+
+def test_an_unevaluable_tree_invariant_is_json_and_nonzero(monkeypatch, capsys):
+    def _explode(_root: Path) -> list[di.Violation]:
+        raise RuntimeError("tree index unavailable")
+
+    monkeypatch.setattr(
+        di, "_TREE_INVARIANTS", (("module_level_caches_are_bounded", _explode),)
+    )
+
+    assert di.main(["--src", str(_PACKAGE)]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["passed"] is False
+    assert report["violation_count"] == 1
+    assert report["violations"][0]["invariant"] == "module_level_caches_are_bounded"
+    assert "RuntimeError: tree index unavailable" in report["violations"][0]["detail"]
+
+
+@pytest.mark.parametrize("make_file", [False, True])
+def test_missing_or_nondirectory_source_root_fails_closed(tmp_path: Path, make_file: bool):
+    root = tmp_path / "not-a-package"
+    if make_file:
+        root.write_text("not a directory\n", encoding="utf-8")
+
+    report = di.check(root)
+
+    assert not report["passed"]
+    assert report["violation_count"] == len(di._TREE_INVARIANTS)
+    assert all(v["path"] == str(root) for v in report["violations"])
+    assert all("NotADirectoryError" in v["detail"] for v in report["violations"])
+
+
+def test_source_read_failure_is_not_treated_as_clean(tmp_path: Path, monkeypatch):
+    pkg = tmp_path / "src" / "aiworkhub"
+    pkg.mkdir(parents=True)
+    source = pkg / "broken.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def _fail_read(path: Path, *args, **kwargs):
+        if path == source:
+            raise OSError("injected read failure")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _fail_read)
+    report = di.check(pkg)
+
+    assert not report["passed"]
+    assert any(v["path"] == str(source) and "OSError" in v["detail"] for v in report["violations"])
+
+
+def test_invalid_utf8_and_syntax_errors_fail_closed(tmp_path: Path):
+    for filename, content in (("decode.py", b"\xff"), ("syntax.py", b"def nope(:\n")):
+        pkg = tmp_path / filename / "aiworkhub"
+        pkg.mkdir(parents=True)
+        source = pkg / filename
+        source.write_bytes(content)
+
+        report = di.check(pkg)
+
+        assert not report["passed"]
+        assert any(v["path"] == str(source) for v in report["violations"])
+
+
 def test_the_cli_exit_code_follows_the_verdict(tmp_path: Path, capsys):
     pkg = tmp_path / "src" / "aiworkhub"
     pkg.mkdir(parents=True)
@@ -149,6 +235,13 @@ def test_the_cli_exit_code_follows_the_verdict(tmp_path: Path, capsys):
 
     (pkg / "leaky.py").write_text("_X_CACHE: dict = {}\n", encoding="utf-8")
     assert di.main(["--src", str(pkg)]) == 1
+
+    capsys.readouterr()
+    missing = tmp_path / "missing"
+    assert di.main(["--src", str(missing)]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["src_root"] == str(missing)
+    assert "source root is not a directory" in report["violations"][0]["detail"]
 
 
 @pytest.mark.parametrize("name", di.INVARIANT_NAMES)

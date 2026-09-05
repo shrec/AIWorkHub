@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from . import semantic_edit
+from .platform_io import current_user_uid
 from .vscode_lm_bridge import (
     EDIT_RESPONSE_SCHEMA_ID,
     EDIT_RESPONSE_SCHEMA_ID_V1,
@@ -968,7 +969,7 @@ def run(spec_path: Path) -> dict[str, Any]:
                     progress_path,
                     str(spec.get("request_id") or ""),
                     str(spec.get("repo_id") or ""),
-                    owner_uid=os.getuid() if hasattr(os, "getuid") else None,
+                    owner_uid=current_user_uid(),
                     previous_sequence=(last_progress_sequence or None),
                     defer_transient=True,
                 )
@@ -1015,7 +1016,7 @@ def run(spec_path: Path) -> dict[str, Any]:
             progress_path,
             str(spec.get("request_id") or ""),
             str(spec.get("repo_id") or ""),
-            owner_uid=os.getuid() if hasattr(os, "getuid") else None,
+            owner_uid=current_user_uid(),
             defer_transient=False,
         )
     if response.get("error"):

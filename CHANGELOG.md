@@ -6,6 +6,115 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.93] - 2026-09-05
+
+### Fixed
+
+- Retention protects all recorded terminal-failure candidate identities from purge.
+- Unevaluable declared invariants fail closed with bounded diagnostic evidence.
+- Source Graph testmap/coverage retains related tests outside source target paths,
+  reports bounded population counts, and rejects unsupported pagination cursors.
+- These three candidates passed native canonical acceptance. The separate NF601
+  token-risk policy change is not included.
+
+## [0.10.92] - 2026-09-05
+
+### Fixed
+
+- Reviewer evidence normalization preserves canonical finding categories and
+  overbuild remedies through final receipt validation; malformed values remain
+  rejected. This resolves a system-side rejection of nonempty review reports.
+
+## [0.10.91] - 2026-09-05
+
+### Fixed
+
+- Acceptance materializes the full tracked validation tree before canonical and
+  candidate overlays, including unchanged modules omitted from sparse worker
+  inputs. The existing candidate-only delta checks and cleanup remain enabled.
+
+## [0.10.90] - 2026-09-05
+
+### Fixed
+
+- Declared quality subprocesses prioritize the candidate source tree over an
+  inherited installed Python package; combined-check failures expose bounded
+  check details instead of only the failed check identifier.
+- Replay-grant validation lives in the existing replay guard module, restoring
+  the launcher size ratchet without relaxing authorization or size limits.
+
+RM27 and RM43 candidates still require canonical acceptance after runtime reload.
+
+## [0.10.89] - 2026-09-05
+
+### Fixed
+
+- Provider-free validation replay consumes its pending recovery grant atomically
+  with the claim and binds the new receipt to the committed epoch, request and
+  repository. Stale or mismatched grants fail without claiming the task.
+- Metadata-capability recovery no longer repeats an unchanged sandbox for
+  hardlink, deleted-file-descriptor or chmod restrictions it cannot satisfy.
+  It reports the unavailable validation lane explicitly; protected operations
+  remain denied and affected candidates remain retained, not falsely accepted.
+
+Existing failed-replay receipt chains still require authenticated recovery;
+this release does not relabel them as successful reviews.
+
+## [0.10.88] - 2026-09-05
+
+### Fixed
+
+- Sparse review candidates no longer appear to delete unchanged canonical
+  quality policy. The verified candidate delta distinguishes omitted inputs
+  from actual policy changes; inherited checks run against the complete
+  combined candidate tree and still block acceptance on failure.
+- Malformed, nonregular, deleted or weakened quality policies remain guarded;
+  genuine high-risk approval requirements are unchanged.
+- Native reviewers receive an explicit coordinator-owned packet root, allowing
+  large review packets to launch without a worker-only environment variable.
+  Packet confinement, digest and file-identity checks remain enforced.
+- Normal rework can recover a retained candidate from an authenticated terminal
+  failure when no prior review or pinned predecessor exists. Request, claim,
+  scope, liveness, baseline and content checks remain mandatory; this does not
+  grant validation-only replay authority.
+
+## [0.10.87] - 2026-09-05
+
+This release tightens canonical ownership and publication boundaries while
+making task rules smaller, explicit and evidence-bound.
+
+### Fixed
+
+- Reconciler startup and recovery now share one single-flight authority, so
+  concurrent paths cannot create competing reconciliation owners.
+- Source Graph publication and lifecycle transitions retain verified generation
+  identity, preserve the last readable generation, and fail closed when a new
+  generation cannot be safely published.
+- Ponytail-derived task rules copy only applicable constraints, enforce
+  minimality, and reject unsupported overbuild instead of widening a task beyond
+  its accepted evidence.
+
+## [0.10.86] - 2026-09-04
+
+This intermediate release activates the accepted self-hosting fixes accumulated
+after 0.10.85 so the running Task MCP no longer executes the older failure paths.
+
+### Fixed
+
+- Source Graph builds publish an independently probed SQLite generation
+  atomically, preserve readable generations during refresh, retain failed-build
+  diagnostics, and bind single-file publication to the verified file identity.
+- Windows-safe user identity is centralized in the platform facade; finalization,
+  credential, bridge and worker paths no longer call unavailable `os.getuid()`.
+- The validation metadata broker decodes the kernel `mode_t` ABI correctly, so
+  real Git initialization and ordinary chmod operations are not misclassified as
+  unsafe while hardlink and deleted-descriptor protections remain enforced.
+- Source Graph readiness is coupled to an actual retrieval probe instead of index
+  completion alone, preventing a locked or write-requiring generation from being
+  advertised as readable.
+- Platform-owned durable atomic replacement and cooperative lifecycle helpers are
+  shared by publication and runtime consumers instead of duplicating raw OS calls.
+
 ## [0.10.85] - 2026-09-04
 
 This release closes two recurring self-hosting loops: abandoned reviewer-start

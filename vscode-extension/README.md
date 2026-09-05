@@ -12,6 +12,64 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.93 — 2026-09-05
+
+- Canonically accepted fixes protect retained candidates, fail closed on
+  unevaluable invariants, and correct Source Graph testmap/coverage results.
+
+## What's new in 0.10.92 — 2026-09-05
+
+- Reviewer findings retain their categories and remedies through final validation.
+  Existing candidate acceptance protections remain enabled.
+
+## What's new in 0.10.91 — 2026-09-05
+
+- Full combined-tree validation restores unchanged tracked inputs missing from
+  sparse workers, without bypassing validation or accepting candidates manually.
+
+## What's new in 0.10.90 — 2026-09-05
+
+- Quality commands prioritize candidate Python sources and expose combined-check
+  failure details. Existing validation and acceptance protections remain enabled.
+
+## What's new in 0.10.89 — 2026-09-05
+
+- Provider-free replay binds recovery evidence to the atomically committed claim,
+  including epoch, request and repository identity.
+- Unavailable hardlink/deleted-fd/chmod validation capabilities produce an explicit
+  blocker instead of an identical, inevitably denied replay. Protections remain on.
+- Existing failed replay chains remain blocked until their original authenticated
+  evidence is available; passing tests alone are not canonical acceptance.
+
+## What's new in 0.10.88 — 2026-09-05
+
+- Sparse candidate review preserves unchanged canonical quality policy without
+  false risk escalation. The policy's checks run on the complete candidate tree.
+- Failed checks and actual policy weakening still block acceptance.
+- Native reviewer packet files use an explicit coordinator-owned root.
+- Retained terminal-failure candidates can return to normal, authenticated rework.
+
+## What's new in 0.10.87 — 2026-09-05
+
+- Reconciler startup and recovery use one single-flight authority, preventing
+  competing reconciliation owners.
+- Source Graph publication and lifecycle transitions preserve verified
+  generation identity and the last readable generation while failing closed on
+  unsafe publication.
+- Ponytail-derived task rules copy only applicable constraints, enforce
+  minimality and reject unsupported overbuild.
+
+## What's new in 0.10.86 — 2026-09-04
+
+- Source Graph builds and single-file updates now publish an identity-bound,
+  independently probed SQLite generation without blocking the previous reader.
+- Readiness follows a real retrieval probe, and failed builds keep diagnostic
+  metadata without exposing partial index contents.
+- Windows runtime paths use the shared platform identity authority instead of
+  calling the POSIX-only `os.getuid()` API.
+- Validation accepts ordinary Git/Python chmod behavior through the metadata
+  broker while preserving hardlink and deleted-descriptor protections.
+
 ## What's new in 0.10.85 — 2026-09-04
 
 - Reviewer starts that lose their launcher are recovered from canonical lease,

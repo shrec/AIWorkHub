@@ -213,6 +213,18 @@ def plan_validation_capability_replay(
         return ValidationReplayDecision(
             False, f"compatible_validation_lane_unavailable:backend={backend}", profile
         )
+    # The implemented replay plants nested-workspace authority; it does not
+    # change the broker or provide a different metadata isolation boundary.
+    # Repeating hardlink/deleted-fd/chmod denials would therefore run the same
+    # forbidden syscall again, not supply the advertised capability.
+    unsupported = set(profile.capabilities) - {"nested_landlock", "git_metadata"}
+    if unsupported:
+        return ValidationReplayDecision(
+            False,
+            "compatible_validation_lane_unavailable:backend=landlock:capabilities="
+            + ",".join(sorted(unsupported)),
+            profile,
+        )
     return ValidationReplayDecision(True, "authenticated_structural_denial", profile)
 
 

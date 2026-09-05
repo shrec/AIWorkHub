@@ -309,9 +309,14 @@ def test_authenticated_structural_denial_derives_replay_capability(
     decision = validation_runner.plan_validation_capability_replay(
         [row["command"]], [row], backend="landlock"
     )
-    assert decision.replay is True
+    assert decision.replay is (capability in {"nested_landlock", "git_metadata"})
     assert decision.profile is not None
     assert decision.profile.capabilities == (capability,)
+    if not decision.replay:
+        assert decision.reason == (
+            "compatible_validation_lane_unavailable:backend=landlock:capabilities="
+            + capability
+        )
 
 
 def test_validation_capability_replay_fails_closed_and_is_single_attempt() -> None:

@@ -40,6 +40,8 @@ import multiprocessing
 import os
 import functools
 import re
+import secrets
+import shutil
 import sqlite3
 import stat
 import sys
@@ -49,12 +51,14 @@ from collections import deque
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from . import parallelism
+from .platform_io import PublicationDurabilityError
+from .platform_io import identity_bound_durable_atomic_replace as atomic_replace
 from . import source_graph_ast as sgast
 from . import source_graph_analytics as sganalytics
 from . import source_graph_insights as sginsights
@@ -2936,6 +2940,12 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 entry["file"] for entry in errors
                 if entry.get("status") == "index_write_skipped"
             ]
+            # A full build replaces any bootstrap-only generation identity.
+            # Clearing the marker in the same transaction as last_build prevents
+            # later single-file mutations from rewriting this authoritative receipt.
+            conn.execute(
+                "DELETE FROM meta WHERE key='single_file_generation_metadata'"
+            )
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('last_build', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -3073,8 +3083,248 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
     )
 
 
+def probe_generation(
+    db_path: Path, *, expected_report: BuildReport | None = None
+) -> dict[str, Any]:
+    """Strictly probe one exact generation through representative read paths."""
+
+    conn = connect(db_path, read_only=True)
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='last_build'"
+        ).fetchone()
+        if row is None:
+            raise SourceGraphError("source_graph_generation_probe:no_metadata")
+        generation = json.loads(str(row["value"]))
+        if not isinstance(generation, dict):
+            raise SourceGraphError("source_graph_generation_probe:metadata_not_object")
+        finished_at = generation.get("finished_at")
+        build_revision = generation.get("build_revision")
+        files_seen = generation.get("files_seen")
+        if (
+            not isinstance(finished_at, str)
+            or not finished_at
+            or not isinstance(build_revision, str)
+            or not build_revision
+            or not isinstance(files_seen, int)
+            or isinstance(files_seen, bool)
+            or files_seen < 0
+        ):
+            raise SourceGraphError("source_graph_generation_probe:incomplete")
+
+        representative_file = conn.execute(
+            "SELECT file_path FROM files ORDER BY file_path LIMIT 1"
+        ).fetchone()
+        representative_entity = conn.execute(
+            "SELECT name, qualname FROM entities "
+            "ORDER BY file_path, line_start LIMIT 1"
+        ).fetchone()
+
+        # File/context and bodygrep use the files table and its ordered path
+        # access. Empty generations are valid, so only require a context result
+        # when a representative file exists.
+        if representative_file is not None:
+            file_context = context(
+                conn, str(representative_file["file_path"])
+            )
+            if not file_context.get("found"):
+                raise SourceGraphError("source_graph_generation_probe:file")
+
+        # Focus depends on the FTS virtual table and entity-id mapping. Execute
+        # MATCH directly because find() deliberately falls back to LIKE after
+        # an FTS error, which is unsuitable for a publication/readiness probe.
+        fts_term = (
+            str(
+                representative_entity["qualname"]
+                or representative_entity["name"]
+            )
+            if representative_entity is not None
+            else "__aiworkhub_generation_probe_no_match__"
+        )
+        fts_row = conn.execute(
+            "SELECT e.id FROM entities_fts AS f "
+            "JOIN entities AS e ON e.id = f.entity_id "
+            "WHERE entities_fts MATCH ? LIMIT 1",
+            (_fts_phrase(fts_term),),
+        ).fetchone()
+        if representative_entity is not None and fts_row is None:
+            raise SourceGraphError("source_graph_generation_probe:fts")
+
+        if expected_report is not None and (
+            generation.get("finished_at") != expected_report.finished_at
+            or generation.get("build_revision") != expected_report.build_revision
+        ):
+            raise SourceGraphError("source_graph_generation_probe:mismatch")
+        return generation
+    finally:
+        conn.close()
+
+
+def _staging_prefix(canonical_path: Path) -> str:
+    return f".{canonical_path.name}.building-"
+
+
+def _cleanup_abandoned_staging(canonical_path: Path) -> None:
+    """Remove unpublished candidates while holding the repository writer lease."""
+
+    staging_prefix = _staging_prefix(canonical_path)
+    for abandoned in canonical_path.parent.iterdir():
+        if abandoned.name.startswith(staging_prefix) and abandoned.is_file():
+            try:
+                abandoned.unlink()
+            except OSError:
+                pass
+
+
+@contextmanager
+def _staged_generation(canonical_path: Path, *, copy_existing: bool):
+    """Yield an isolated candidate and remove it unless publication consumed it."""
+
+    staging_path = canonical_path.with_name(
+        f"{_staging_prefix(canonical_path)}{secrets.token_hex(16)}"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(staging_path, flags, 0o600)
+    try:
+        if copy_existing:
+            if not canonical_path.is_file():
+                raise SourceGraphError(
+                    f"source_graph_generation_missing:{canonical_path}"
+                )
+            with canonical_path.open("rb") as source, os.fdopen(
+                descriptor, "wb", closefd=True
+            ) as destination:
+                descriptor = -1
+                shutil.copyfileobj(source, destination)
+        else:
+            os.close(descriptor)
+            descriptor = -1
+        yield staging_path
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            staging_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _publish_staged_generation(
+    staging_path: Path,
+    canonical_path: Path,
+    *,
+    expected_report: BuildReport | None = None,
+) -> dict[str, Any]:
+    """Probe a closed candidate read-only, then publish it in one rename."""
+
+    staging_stat = staging_path.lstat()
+    if not stat.S_ISREG(staging_stat.st_mode):
+        raise SourceGraphError("source_graph_generation_probe:unsafe_staging")
+    generation = probe_generation(staging_path, expected_report=expected_report)
+    verified_stat = staging_path.lstat()
+    if (
+        not stat.S_ISREG(verified_stat.st_mode)
+        or (verified_stat.st_dev, verified_stat.st_ino)
+        != (staging_stat.st_dev, staging_stat.st_ino)
+    ):
+        raise SourceGraphError("source_graph_generation_probe:staging_identity_changed")
+    try:
+        atomic_replace(staging_path, canonical_path)
+    except PublicationDurabilityError as exc:
+        try:
+            probe_generation(canonical_path, expected_report=expected_report)
+        except Exception as probe_exc:
+            raise SourceGraphError(
+                "source_graph_generation_publication_durability_uncertain:"
+                "published=true:canonical_probe_failed"
+            ) from probe_exc
+        raise SourceGraphError(
+            "source_graph_generation_publication_durability_uncertain:"
+            "published=true:canonical_probe_succeeded"
+        ) from exc
+    return generation
+
+
+def _ensure_single_file_generation_metadata(conn: sqlite3.Connection) -> None:
+    """Make a fresh schema-only private database probeable after mutation.
+
+    Partition builders intentionally start from an empty schema and populate it
+    through the single-file APIs.  Such databases have no full-build report to
+    preserve, so establish a truthful minimal generation identity there.  A
+    copied canonical generation already has authoritative metadata and is left
+    byte-for-byte unchanged by this helper.
+    """
+
+    files_seen = int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+    synthetic = conn.execute(
+        "SELECT 1 FROM meta WHERE key='single_file_generation_metadata'"
+    ).fetchone()
+    last_build = conn.execute(
+        "SELECT value FROM meta WHERE key='last_build'"
+    ).fetchone()
+    if last_build and not synthetic:
+        return
+    if last_build:
+        generation = json.loads(str(last_build[0]))
+        generation["files_seen"] = files_seen
+        conn.execute(
+            "UPDATE meta SET value=? WHERE key='last_build'",
+            (json.dumps(generation),),
+        )
+        return
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('last_build', ?)",
+        (
+            json.dumps(
+                {
+                    "finished_at": _now_iso(),
+                    "build_revision": BUILD_REVISION,
+                    "files_seen": files_seen,
+                }
+            ),
+        ),
+    )
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('single_file_generation_metadata', 'true')"
+    )
+
+
+def _persist_failed_build_metadata(
+    staging_path: Path,
+    canonical_path: Path,
+    failure: SourceGraphBuildFailedError,
+) -> None:
+    """Retain failure truth without publishing the failed generation.
+
+    Full builds now happen in an isolated database and only a validated success
+    replaces the readable generation.  A containment-floor failure is therefore
+    discarded with its staging file, but its ``last_build`` row is still the
+    authoritative diagnostic promised by the build contract.  Copy only that
+    internally-produced metadata row into the canonical database while the
+    repository writer lease is held; no candidate entities or edges are exposed.
+    """
+    with connect(staging_path, read_only=True) as staging:
+        row = staging.execute(
+            "SELECT value FROM meta WHERE key='last_build'"
+        ).fetchone()
+    if row is None:
+        raise SourceGraphError("source_graph_failed_build_metadata_missing")
+    payload = json.loads(str(row[0]))
+    if not isinstance(payload, dict) or int(payload.get("files_skipped", 0)) <= 0:
+        raise SourceGraphError("source_graph_failed_build_metadata_invalid")
+    payload["status"] = "failed"
+    payload["failure_reason"] = str(failure)
+    with connect(canonical_path) as canonical:
+        canonical.execute(
+            "INSERT INTO meta(key, value) VALUES('last_build', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps(payload),),
+        )
+
+
 def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bool = True) -> BuildReport:
-    """Build with a repository-local, cross-process single-writer lease."""
+    """Build and atomically publish one independently readable generation."""
 
     repo_root = repo_root.resolve()
     with index_write_lease(repo_root) as acquired:
@@ -3082,12 +3332,33 @@ def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bo
             raise SourceGraphBuildInProgressError(
                 f"source_graph_build_in_progress:{repo_root}"
             )
-        return _build_index_locked(repo_root, db_path=db_path, incremental=incremental)
+        if db_path is not None:
+            return _build_index_locked(repo_root, db_path=db_path, incremental=incremental)
 
+        canonical_path = resolve_db_path(repo_root)
+        _cleanup_abandoned_staging(canonical_path)
+        with _staged_generation(
+            canonical_path,
+            copy_existing=incremental and canonical_path.exists(),
+        ) as staging_path:
+            try:
+                report = _build_index_locked(
+                    repo_root, db_path=staging_path, incremental=incremental
+                )
+            except SourceGraphBuildFailedError as exc:
+                try:
+                    _persist_failed_build_metadata(staging_path, canonical_path, exc)
+                except Exception as metadata_exc:
+                    raise SourceGraphBuildFailedError(
+                        f"{exc}; failed_build_metadata_persist_failed:"
+                        f"{type(metadata_exc).__name__}:{metadata_exc}"
+                    ) from metadata_exc
+                raise
+            _publish_staged_generation(
+                staging_path, canonical_path, expected_report=report
+            )
+            return replace(report, db_path=str(canonical_path))
 
-# ---------------------------------------------------------------------------
-# Query surface: find / func / body / struct / context / summary
-# ---------------------------------------------------------------------------
 
 def _fts_phrase(term: str) -> str:
     cleaned = term.replace('"', '""').strip()
@@ -3877,19 +4148,31 @@ def record_recommendation_roundtrip(
     repo_root: Path,
     payload: dict[str, Any],
 ) -> None:
-    """Persist one manager-owned self-check for the current generation."""
+    """Atomically publish a self-check without mutating the canonical generation."""
 
-    db_path = resolve_db_path(repo_root.resolve())
-    conn = connect(db_path)
-    try:
-        with conn:
-            conn.execute(
-                "INSERT INTO meta(key, value) VALUES('recommendation_roundtrip', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (json.dumps(payload, ensure_ascii=False, sort_keys=True),),
+    repo_root = repo_root.resolve()
+    with index_write_lease(repo_root) as acquired:
+        if not acquired:
+            raise SourceGraphBuildInProgressError(
+                f"source_graph_build_in_progress:{repo_root}"
             )
-    finally:
-        conn.close()
+        canonical_path = resolve_db_path(repo_root)
+        _cleanup_abandoned_staging(canonical_path)
+        with _staged_generation(
+            canonical_path, copy_existing=True
+        ) as staging_path:
+            conn = connect(staging_path)
+            try:
+                with conn:
+                    conn.execute(
+                        "INSERT INTO meta(key, value) "
+                        "VALUES('recommendation_roundtrip', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (json.dumps(payload, ensure_ascii=False, sort_keys=True),),
+                    )
+            finally:
+                conn.close()
+            _publish_staged_generation(staging_path, canonical_path)
 
 
 # ---------------------------------------------------------------------------
@@ -4389,6 +4672,16 @@ _ANALYTICS_ROW_OWNER_PATH_KEYS: tuple[str, ...] = (
     "file_path", "file", "src_file_path", "src_file",
 )
 
+# Modes whose sole result list holds RELATED evidence deliberately living
+# outside the source target: coverage/testmap map in-scope source subjects to
+# the tests exercising them, and those tests live in tests/, not under the
+# source file. This list is therefore neither scope-filtered by owning file nor
+# paged by the source-corpus offset (see _enforce_analytics_target_scope and
+# analytics_query); the target still confines the source corpus the relations
+# are derived from. auditmap is intentionally excluded: its result rows
+# (audit_queue) are the in-scope source files themselves, which stay scoped.
+_ANALYTICS_RELATED_EVIDENCE_MODES: frozenset[str] = frozenset({"coverage", "testmap"})
+
 
 def _analytics_result_row_count(mode: str, payload: dict[str, Any]) -> int:
     total = 0
@@ -4626,20 +4919,30 @@ def _enforce_analytics_target_scope(
 
     if not scope:
         return payload
-    for key_path in _ANALYTICS_RESULT_KEYS.get(mode, ()):
-        parts = key_path.split(".")
-        node: Any = payload
-        for part in parts[:-1]:
+    # A related-evidence mode (coverage/testmap) deliberately reports test rows
+    # that live OUTSIDE the source target -- a source-file target selects source
+    # subjects, but the tests exercising them live in tests/. Filtering that
+    # derived list back to the owning-file scope stripped every real
+    # relationship and reported returned=0 (NF-2026-00554). The target still
+    # confines the source corpus these tests are computed FROM (the scoped
+    # ``matches``/``files`` handed to the analytic); only the cross-scope result
+    # list is exempt here. Every other mode's result rows are still re-asserted
+    # to scope by owning file below.
+    if mode not in _ANALYTICS_RELATED_EVIDENCE_MODES:
+        for key_path in _ANALYTICS_RESULT_KEYS.get(mode, ()):
+            parts = key_path.split(".")
+            node: Any = payload
+            for part in parts[:-1]:
+                if not isinstance(node, dict):
+                    node = None
+                    break
+                node = node.get(part)
             if not isinstance(node, dict):
-                node = None
-                break
-            node = node.get(part)
-        if not isinstance(node, dict):
-            continue
-        last = parts[-1]
-        value = node.get(last)
-        if isinstance(value, list):
-            node[last] = [row for row in value if _analytics_row_in_scope(row, scope)]
+                continue
+            last = parts[-1]
+            value = node.get(last)
+            if isinstance(value, list):
+                node[last] = [row for row in value if _analytics_row_in_scope(row, scope)]
     _scrub_analytics_repo_wide_counts(payload, corpus, _scoped_repo_aggregates(conn, scope))
     return payload
 
@@ -4726,16 +5029,29 @@ def analytics_query(
     budget = max(1, min(requested_budget, MAX_BUDGET_ROWS))
     byte_cap = max(512, budget * 768)
     normalized_target = _normalize_analytics_target(target)
-    is_pageable_mode = bool(_ANALYTICS_RESULT_KEYS.get(mode))
+    # coverage/testmap answer "which tests relate to these in-scope source
+    # subjects": their one result list is a bounded snapshot derived from the
+    # WHOLE scoped source corpus at once, not a row-by-row page of it. A cursor
+    # keyed on the source-corpus offset would page past that complete result
+    # and re-derive the same bounded snapshot -- untruthful truncation -- so
+    # these modes report returned/effective from their result list but never
+    # mint or accept a cursor (NF-2026-00554).
+    is_pageable_mode = (
+        bool(_ANALYTICS_RESULT_KEYS.get(mode))
+        and mode not in _ANALYTICS_RELATED_EVIDENCE_MODES
+    )
     conn = connect(resolve_db_path(repo_root), read_only=True)
     try:
+        cursor_provided = bool(cursor is not None and str(cursor).strip())
         offset = _decode_analytics_cursor(
             cursor, mode=mode, query=query, target=normalized_target, budget=budget,
         )
-        if offset and not is_pageable_mode:
+        if cursor_provided and not is_pageable_mode:
             # This mode never mints a cursor (its result is one aggregate
-            # snapshot, not a row page), so a nonzero offset can only come
-            # from a forged or stale cursor.
+            # snapshot, not a row page), so ANY provided cursor -- including
+            # one that decodes to a valid zero offset -- can only be forged or
+            # stale. Guarding on ``offset`` alone silently accepted a
+            # zero-offset cursor for coverage/testmap (NF-2026-00554).
             raise SourceGraphError("invalid_cursor")
         # An explicit target is a SCOPE, not a filter. The corpus was previously
         # built the other way round -- ``find(query)`` decided membership and the
@@ -4885,6 +5201,21 @@ def analytics_query(
             if is_pageable_mode and paginates_corpus and pending_next_offset < total_eligible
             else None
         )
+        # A related-evidence mode (coverage/testmap) never mints a cursor, so the
+        # top-level truncated flag is the only truthful way to tell a caller that
+        # more tests relate to the scope than this bounded snapshot returned. The
+        # per-mode analytic already counted the full bounded population in
+        # ``candidate_test_files``; a returned list shorter than that count -- from
+        # the display cap or a byte trim -- is a truncated result (NF-2026-00554).
+        related_evidence_truncated = False
+        if mode in _ANALYTICS_RELATED_EVIDENCE_MODES:
+            mapping = payload.get("structural_mapping")
+            if isinstance(mapping, dict) and isinstance(
+                mapping.get("candidate_test_files"), int
+            ):
+                related_evidence_truncated = returned < int(
+                    mapping["candidate_test_files"]
+                )
         payload["cursor"] = cursor
         payload["next_cursor"] = next_cursor
         payload["coverage"] = {
@@ -4895,7 +5226,9 @@ def analytics_query(
             "requested_budget": requested_budget,
             "effective_budget": returned,
         }
-        payload["truncated"] = next_cursor is not None or byte_trimmed
+        payload["truncated"] = (
+            next_cursor is not None or byte_trimmed or related_evidence_truncated
+        )
         payload = _fit_payload_bytes(payload, byte_cap)
         return payload
     finally:
@@ -5015,7 +5348,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     db_path = resolve_db_path(repo_root)
-    conn = connect(db_path)
+    conn = connect(db_path, read_only=True)
     try:
         if args.command == "find":
             _print_json({"matches": find(conn, args.term)})
@@ -5375,16 +5708,21 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
             f"source_graph_single_file_extraction_failed:{rel}:{extraction.status}"
         )
 
-    # Acquire writer lease, open connection, mutate exactly one file.
+    # Acquire the writer lease, mutate an isolated copy, then publish it.
     with index_write_lease(repo_root) as acquired:
         if not acquired:
             raise SourceGraphBuildInProgressError(
                 f"source_graph_build_in_progress:{repo_root}"
             )
-        db_path = resolve_db_path(repo_root)
-        conn = connect(db_path)
-        try:
-            with conn:
+        canonical_path = resolve_db_path(repo_root)
+        _cleanup_abandoned_staging(canonical_path)
+        with _staged_generation(
+            canonical_path,
+            copy_existing=canonical_path.is_file(),
+        ) as staging_path:
+            conn = connect(staging_path)
+            try:
+                conn.execute("BEGIN EXCLUSIVE")
                 python_file = extraction.language == "python"
                 old_python_functions = (
                     {
@@ -5439,6 +5777,7 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                         },
                     )
                 _resolve_javascript_import_bindings(conn)
+                _ensure_single_file_generation_metadata(conn)
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('single_file_last_mutation', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -5450,8 +5789,10 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                         "build_revision": BUILD_REVISION,
                     }),),
                 )
-        finally:
-            conn.close()
+                conn.commit()
+            finally:
+                conn.close()
+            _publish_staged_generation(staging_path, canonical_path)
     return {
         "ok": True,
         "file_path": rel,
@@ -5480,15 +5821,20 @@ def remove_file(repo_root: Path, path: str) -> dict[str, Any]:
             raise SourceGraphBuildInProgressError(
                 f"source_graph_build_in_progress:{repo_root}"
             )
-        db_path = resolve_db_path(repo_root)
-        conn = connect(db_path)
-        try:
-            with conn:
+        canonical_path = resolve_db_path(repo_root)
+        _cleanup_abandoned_staging(canonical_path)
+        with _staged_generation(
+            canonical_path, copy_existing=canonical_path.is_file()
+        ) as staging_path:
+            conn = connect(staging_path)
+            try:
+                conn.execute("BEGIN EXCLUSIVE")
                 # Count before we delete.
                 entity_count = conn.execute(
                     "SELECT COUNT(*) FROM entities WHERE file_path=?", (rel,)
                 ).fetchone()[0]
                 _invalidate_file(conn, rel)
+                _ensure_single_file_generation_metadata(conn)
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('single_file_last_mutation', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -5499,8 +5845,10 @@ def remove_file(repo_root: Path, path: str) -> dict[str, Any]:
                         "build_revision": BUILD_REVISION,
                     }),),
                 )
-        finally:
-            conn.close()
+                conn.commit()
+            finally:
+                conn.close()
+            _publish_staged_generation(staging_path, canonical_path)
     return {
         "ok": True,
         "file_path": rel,

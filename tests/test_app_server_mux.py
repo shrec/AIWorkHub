@@ -34,7 +34,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from aiworkhub import app_server_mux  # noqa: E402
+from aiworkhub import app_server_mux, platform_io  # noqa: E402
 from aiworkhub.app_server_mux import (  # noqa: E402
     SIDEBAND_ALLOWED_METHODS,
     AppServerMux,
@@ -191,6 +191,7 @@ def test_windows_style_runtime_without_getuid_accepts_private_capability_files(m
     pin.chmod(0o600)
     monkeypatch.delenv(app_server_mux.ENV_REAL_EXECUTABLE, raising=False)
     monkeypatch.setenv(app_server_mux.ENV_SIDEBAND_DIR, str(sideband))
+    monkeypatch.setattr(platform_io.sys, "platform", "win32")
     monkeypatch.delattr(app_server_mux.os, "getuid", raising=False)
     assert app_server_mux._current_uid() is None
     assert resolve_real_executable() == str(real)

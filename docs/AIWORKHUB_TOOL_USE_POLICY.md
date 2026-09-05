@@ -1,6 +1,3 @@
-Target: .github/copilot-instructions.md
-
-<!-- AIWORKHUB_TOOL_USE_POLICY_START -->
 # AIWorkHub MCP tool-use policy
 Manager role:
 - The manager does not write code: it runs the project with the owner, distributes work to workers by difficulty and cost, and reviews what returns; small precise corrections are allowed, building features is the workers' job.
@@ -66,4 +63,3 @@ Multicore by default:
 - Threads for IO-bound work that releases the GIL, processes for CPU-bound work, chosen from a measurement, not a rule of thumb.
 - A path left sequential after measurement is a valid outcome; the recorded measurement is what justifies it.
 Stop at Codex review.
-<!-- AIWORKHUB_TOOL_USE_POLICY_END -->

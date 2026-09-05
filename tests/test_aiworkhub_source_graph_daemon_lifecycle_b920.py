@@ -1459,12 +1459,678 @@ def test_new_process_group_popen_kwargs_is_platform_appropriate(monkeypatch):
         == {"start_new_session": True}
     )
 
-    monkeypatch.setattr(source_graph_daemon.os, "name", "nt")
-    win_kwargs = source_graph_daemon.SourceGraphDaemon._new_process_group_popen_kwargs()
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owner-handle lifecycle")
+def test_non_linux_posix_build_uses_owner_handle_and_weak_stop_never_signals(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "non_linux_posix")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    monkeypatch.setattr(source_graph_daemon, "_proc_identity", lambda _pid: None)
+    monkeypatch.setattr(
+        source_graph_daemon, "_cross_instance_identity_supported", lambda: False
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_build_subprocess_command",
+        lambda **_kwargs: [
+            sys.executable,
+            "-c",
+            "import json; print(json.dumps({'kind': 'standby'}))",
+        ],
+    )
+    signals: list[tuple[int, object]] = []
+    monkeypatch.setattr(
+        source_graph_daemon.os,
+        "killpg",
+        lambda pgid, sig: signals.append((pgid, sig)),
+    )
+
+    assert daemon._run_build_subprocess(incremental=False) == {"kind": "standby"}
+    assert source_graph_daemon._read_build_identity(root) is None
+    assert signals == []
+
+    weak = {
+        "schema_id": "aiworkhub.source_graph.build_process.v1",
+        "repo_root": str(root.resolve()),
+        "owner_token": "owner-handle-only",
+        "identity_kind": "owner_handle",
+        "pid": 4242,
+        "pgid": 0,
+        "session_id": 0,
+        "start_ticks": 0,
+        "state": "running",
+    }
+    source_graph_daemon._write_build_identity(root, weak)
+    assert not source_graph_daemon._stop_retained_build(root, timeout=0)
+    assert source_graph_daemon._read_build_identity(root) == weak
+    assert signals == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses Linux /proc start identity")
+def test_dead_owner_cleanup_cannot_delete_replacement_identity(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "identity_cas")
+    old = {
+        "schema_id": "aiworkhub.source_graph.build_process.v1",
+        "repo_root": str(root.resolve()),
+        "owner_token": "old-owner",
+        "pid": 2**31 - 1,
+        "pgid": 2**31 - 1,
+        "session_id": 2**31 - 1,
+        "start_ticks": 1,
+    }
+    source_graph_daemon._write_build_identity(root, old)
+    cleanup_holds_lock = threading.Event()
+    release_cleanup = threading.Event()
+    real_tree_alive = source_graph_daemon._retained_tree_alive
+
+    def blocked_old_liveness(retained):
+        if retained.get("owner_token") == "old-owner":
+            cleanup_holds_lock.set()
+            assert release_cleanup.wait(5)
+            return False
+        return real_tree_alive(retained)
+
+    monkeypatch.setattr(
+        source_graph_daemon, "_retained_tree_alive", blocked_old_liveness
+    )
+    cleared: list[bool] = []
+    cleanup = threading.Thread(
+        target=lambda: cleared.append(
+            source_graph_daemon._clear_build_identity_if_dead(root, "old-owner")
+        )
+    )
+    cleanup.start()
+    assert cleanup_holds_lock.wait(5)
+
+    replacement_env = os.environ.copy()
+    replacement_env[source_graph_daemon.BUILD_OWNER_ENV] = "new-owner"
+    replacement = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+        env=replacement_env,
+    )
+    replacement_identity = source_graph_daemon._proc_identity(replacement.pid)
+    assert replacement_identity is not None
+    new = {
+        "schema_id": "aiworkhub.source_graph.build_process.v1",
+        "repo_root": str(root.resolve()),
+        "owner_token": "new-owner",
+        **replacement_identity,
+    }
+    published = threading.Event()
+    publisher = threading.Thread(
+        target=lambda: (
+            source_graph_daemon._write_build_identity(root, new), published.set()
+        )
+    )
+    publisher.start()
+    try:
+        assert not published.wait(0.05), "publication bypassed identity lock"
+        release_cleanup.set()
+        cleanup.join(5)
+        publisher.join(5)
+        assert cleared == [True]
+        assert published.is_set()
+        assert source_graph_daemon._read_build_identity(root) == new
+
+        assert source_graph_daemon.stop_daemon(root)
+        replacement.wait(timeout=5)
+        assert source_graph_daemon._read_build_identity(root) is None
+    finally:
+        release_cleanup.set()
+        cleanup.join(5)
+        publisher.join(5)
+        if replacement.poll() is None:
+            replacement.terminate()
+            replacement.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses Linux /proc start identity")
+def test_cross_instance_stop_uses_durable_exact_builder_identity(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    pidfile = tmp_path / "builder.pid"
+    staging = source_graph.resolve_db_path(root).with_name("old-staging.sqlite")
+    script = tmp_path / "retained_builder.py"
+    script.write_text(
+        "import os, pathlib, time\n"
+        f"pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid()))\n"
+        f"pathlib.Path({str(staging)!r}).write_text('live writer')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        daemon, "_build_subprocess_command", lambda **_kwargs: [sys.executable, str(script)]
+    )
+    result: list[dict[str, object]] = []
+    runner = threading.Thread(
+        target=lambda: result.append(daemon._run_build_subprocess(incremental=False))
+    )
+    runner.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not pidfile.exists():
+        time.sleep(0.02)
+    assert pidfile.exists()
+    builder_pid = int(pidfile.read_text())
+    retained = source_graph_daemon._read_build_identity(root)
+    assert retained and retained["pid"] == builder_pid
+    assert retained["start_ticks"] > 0 and retained["owner_token"]
+    assert staging.exists(), "live writer staging must remain intact"
+
+    # Simulate loss/replacement of the registry owner. The current authority
+    # has no Popen handle and must terminate through durable exact identity.
+    with source_graph_daemon._REGISTRY_LOCK:
+        source_graph_daemon._REGISTRY.clear()
+    assert source_graph_daemon.stop_daemon(root)
+    runner.join(10)
+    assert not runner.is_alive()
+    assert source_graph_daemon._proc_identity(builder_pid) is None
+
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        unrelated_identity = source_graph_daemon._proc_identity(unrelated.pid)
+        assert unrelated_identity is not None
+        mismatched = {
+            "schema_id": "aiworkhub.source_graph.build_process.v1",
+            "repo_root": str(root),
+            "owner_token": "recycled-owner",
+            **unrelated_identity,
+            "start_ticks": unrelated_identity["start_ticks"] + 1,
+        }
+        source_graph_daemon._write_build_identity(root, mismatched)
+        assert not source_graph_daemon.stop_daemon(root)
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
+        source_graph_daemon._build_identity_path(root).unlink(missing_ok=True)
+
+        monkeypatch.setattr(source_graph_daemon.os, "name", "nt")
+        win_kwargs = source_graph_daemon.SourceGraphDaemon._new_process_group_popen_kwargs()
     assert set(win_kwargs) == {"creationflags"}
     assert win_kwargs["creationflags"] == getattr(
         source_graph_daemon.subprocess, "CREATE_NEW_PROCESS_GROUP", 0
     )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses Linux /proc environment authority")
+def test_stop_rejects_matching_live_leader_without_retained_owner_token(tmp_path):
+    root = _init_repo(tmp_path, "forged_owner")
+    child_env = os.environ.copy()
+    child_env.pop(source_graph_daemon.BUILD_OWNER_ENV, None)
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+        env=child_env,
+    )
+    try:
+        identity = source_graph_daemon._proc_identity(unrelated.pid)
+        assert identity is not None
+        forged = {
+            "schema_id": "aiworkhub.source_graph.build_process.v1",
+            "repo_root": str(root.resolve()),
+            "owner_token": "forged-owner",
+            **identity,
+        }
+        source_graph_daemon._write_build_identity(root, forged)
+
+        assert not source_graph_daemon.stop_daemon(root)
+        assert unrelated.poll() is None
+        assert source_graph_daemon._read_build_identity(root) == forged
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
+        source_graph_daemon._build_identity_path(root).unlink(missing_ok=True)
+
+
+def test_failed_retained_stop_restores_buildable_identity(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "failed_stop_rollback")
+    prior = {
+        "schema_id": "aiworkhub.source_graph.build_process.v1",
+        "repo_root": str(root.resolve()),
+        "owner_token": "exact-owner",
+        "pid": 811,
+        "pgid": 811,
+        "session_id": 811,
+        "start_ticks": 1234,
+        "state": "running",
+    }
+    source_graph_daemon._write_build_identity(root, prior)
+    monkeypatch.setattr(source_graph_daemon, "_identity_matches", lambda _value: True)
+    monkeypatch.setattr(source_graph_daemon, "_leader_owner_matches", lambda _value: True)
+    monkeypatch.setattr(
+        source_graph_daemon,
+        "_owned_group_members",
+        lambda _value: [{"pid": 811, "pgid": 811, "session_id": 811, "start_ticks": 1234}],
+    )
+    monkeypatch.setattr(
+        source_graph_daemon.os,
+        "killpg",
+        lambda _pgid, _sig: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+
+    assert not source_graph_daemon._stop_retained_build(root, timeout=0)
+    assert source_graph_daemon._read_build_identity(root) == prior
+
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    builds = []
+    monkeypatch.setattr(daemon, "_has_prior_build", lambda: False)
+    monkeypatch.setattr(
+        daemon,
+        "_execute_build",
+        lambda **kwargs: builds.append(kwargs) or {"kind": "standby"},
+    )
+    assert daemon._run_one_build()
+    assert builds == [{"incremental": False}]
+
+
+def test_failed_stop_rollback_does_not_overwrite_newer_owner(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "failed_stop_new_owner")
+    prior = {
+        "repo_root": str(root.resolve()), "owner_token": "old", "pid": 812,
+        "pgid": 812, "session_id": 812, "start_ticks": 1235, "state": "running",
+    }
+    newer = {**prior, "owner_token": "new", "pid": 913, "pgid": 913}
+    source_graph_daemon._write_build_identity(root, prior)
+    monkeypatch.setattr(source_graph_daemon, "_identity_matches", lambda _value: True)
+    monkeypatch.setattr(source_graph_daemon, "_leader_owner_matches", lambda _value: True)
+    monkeypatch.setattr(
+        source_graph_daemon,
+        "_owned_group_members",
+        lambda _value: [{"pid": 812, "pgid": 812, "session_id": 812, "start_ticks": 1235}],
+    )
+
+    def replace_then_fail(_pgid, _sig):
+        source_graph_daemon._write_build_identity(root, newer)
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(source_graph_daemon.os, "killpg", replace_then_fail)
+    assert not source_graph_daemon._stop_retained_build(root, timeout=0)
+    assert source_graph_daemon._read_build_identity(root) == newer
+
+
+def test_stop_transition_cas_preserves_replacement_owner(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "stop_transition_cas")
+    prior = {
+        "repo_root": str(root.resolve()), "owner_token": "old", "pid": 814,
+        "pgid": 814, "session_id": 814, "start_ticks": 1237, "state": "running",
+    }
+    newer = {
+        **prior, "owner_token": "new", "pid": 915, "pgid": 915,
+        "session_id": 915, "start_ticks": 2237,
+    }
+    source_graph_daemon._write_build_identity(root, prior)
+    real_compare_and_write = source_graph_daemon._compare_and_write_build_identity
+    transition_reached = threading.Event()
+    release_transition = threading.Event()
+
+    def delayed_compare_and_write(repo_root, expected, value):
+        transition_reached.set()
+        assert release_transition.wait(5)
+        return real_compare_and_write(repo_root, expected, value)
+
+    monkeypatch.setattr(
+        source_graph_daemon,
+        "_compare_and_write_build_identity",
+        delayed_compare_and_write,
+    )
+    monkeypatch.setattr(source_graph_daemon, "_identity_matches", lambda _value: False)
+    monkeypatch.setattr(source_graph_daemon, "_owned_group_members", lambda _value: [])
+    result: list[bool] = []
+    stopper = threading.Thread(
+        target=lambda: result.append(
+            source_graph_daemon._stop_retained_build(root, timeout=0)
+        )
+    )
+    stopper.start()
+    assert transition_reached.wait(5)
+
+    source_graph_daemon._write_build_identity(root, newer)
+    release_transition.set()
+    stopper.join(5)
+
+    assert not stopper.is_alive()
+    assert result == [False]
+    assert source_graph_daemon._read_build_identity(root) == newer
+
+
+def test_standby_builder_cannot_replace_or_clear_live_writer_identity(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "standby_identity_cas")
+    writer = source_graph_daemon.SourceGraphDaemon(root)
+    standby = source_graph_daemon.SourceGraphDaemon(root)
+    monkeypatch.setattr(
+        writer,
+        "_build_subprocess_command",
+        lambda **_kwargs: [sys.executable, "-c", "import time; time.sleep(60)"],
+    )
+    monkeypatch.setattr(
+        standby,
+        "_build_subprocess_command",
+        lambda **_kwargs: [
+            sys.executable,
+            "-c",
+            "import json; print(json.dumps({'kind': 'standby'}))",
+        ],
+    )
+    writer_result = []
+    writer_thread = threading.Thread(
+        target=lambda: writer_result.append(
+            writer._run_build_subprocess(incremental=False)
+        )
+    )
+    writer_thread.start()
+    deadline = time.monotonic() + 5
+    retained = None
+    while time.monotonic() < deadline:
+        retained = source_graph_daemon._read_build_identity(root)
+        if retained is not None:
+            break
+        time.sleep(0.01)
+    assert retained is not None
+
+    standby_outcome = standby._run_build_subprocess(incremental=False)
+    assert standby_outcome == {
+        "kind": "error", "error": "index_subprocess:identity_slot_owned"
+    }
+    assert source_graph_daemon._read_build_identity(root) == retained
+
+    assert source_graph_daemon.stop_daemon(root)
+    writer_thread.join(5)
+    assert not writer_thread.is_alive()
+    assert source_graph_daemon._read_build_identity(root) is None
+
+
+def test_mismatched_retained_leader_never_authorizes_group_signal(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "mismatched_group_leader")
+    retained = {
+        "repo_root": str(root.resolve()), "owner_token": "tree-owner", "pid": 1201,
+        "pgid": 1201, "session_id": 1201, "start_ticks": 51, "state": "running",
+    }
+    source_graph_daemon._write_build_identity(root, retained)
+    monkeypatch.setattr(source_graph_daemon, "_identity_matches", lambda _value: False)
+    monkeypatch.setattr(
+        source_graph_daemon,
+        "_proc_identity",
+        lambda pid: {
+            "pid": pid, "pgid": 991, "session_id": 991, "start_ticks": 999
+        },
+    )
+    monkeypatch.setattr(
+        source_graph_daemon,
+        "_owned_group_members",
+        lambda _value: [
+            {"pid": 1202, "pgid": 1201, "session_id": 1201, "start_ticks": 52}
+        ],
+    )
+    signals = []
+    monkeypatch.setattr(
+        source_graph_daemon.os, "killpg", lambda *args: signals.append(args)
+    )
+
+    assert not source_graph_daemon._stop_retained_build(root, timeout=0)
+    assert signals == []
+    assert source_graph_daemon._read_build_identity(root) == retained
+
+
+def test_dead_retained_leader_escalates_authenticated_surviving_tree(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "dead_leader_live_descendant")
+    retained = {
+        "repo_root": str(root.resolve()), "owner_token": "tree-owner", "pid": 1201,
+        "pgid": 1201, "session_id": 1201, "start_ticks": 51, "state": "running",
+    }
+    source_graph_daemon._write_build_identity(root, retained)
+    monkeypatch.setattr(source_graph_daemon, "_identity_matches", lambda _value: False)
+    monkeypatch.setattr(source_graph_daemon, "_proc_identity", lambda _pid: None)
+    monkeypatch.setattr(
+        source_graph_daemon,
+        "_owned_group_members",
+        lambda _value: [
+            {"pid": 1202, "pgid": 1201, "session_id": 1201, "start_ticks": 52}
+        ],
+    )
+    signals = []
+    monkeypatch.setattr(
+        source_graph_daemon.os, "killpg", lambda *args: signals.append(args)
+    )
+
+    assert not source_graph_daemon._stop_retained_build(root, timeout=0)
+    assert signals == [
+        (1201, signal.SIGTERM),
+        (1201, signal.SIGKILL),
+    ]
+    assert source_graph_daemon._read_build_identity(root) == retained
+
+
+def test_cross_instance_windows_stop_keeps_unauthenticated_identity(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "windows_cross_instance")
+    retained = {
+        "repo_root": str(root.resolve()), "owner_token": "windows-owner", "pid": 991,
+        "pgid": 991, "session_id": 991, "start_ticks": 4412, "state": "running",
+    }
+    source_graph_daemon._write_build_identity(root, retained)
+    monkeypatch.setattr(
+        source_graph_daemon, "_cross_instance_identity_supported", lambda: False
+    )
+    signalled: list = []
+    monkeypatch.setattr(
+        source_graph_daemon.os, "killpg", lambda *args: signalled.append(args)
+    )
+
+    assert source_graph_daemon.get_daemon(root) is None
+    assert not source_graph_daemon.stop_daemon(root)
+    assert source_graph_daemon._read_build_identity(root) == retained
+    assert signalled == []
+
+
+def test_retained_stop_revalidates_owned_group_immediately_before_signal(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "group_revalidation_race")
+    retained = {
+        "repo_root": str(root.resolve()), "owner_token": "race-owner", "pid": 992,
+        "pgid": 992, "session_id": 992, "start_ticks": 4413, "state": "running",
+    }
+    source_graph_daemon._write_build_identity(root, retained)
+    monkeypatch.setattr(source_graph_daemon, "_identity_matches", lambda _value: True)
+    monkeypatch.setattr(source_graph_daemon, "_leader_owner_matches", lambda _value: True)
+    snapshots = iter([
+        [{"pid": 992, "pgid": 992, "session_id": 992, "start_ticks": 4413}],
+        [],
+    ])
+    monkeypatch.setattr(
+        source_graph_daemon, "_owned_group_members", lambda _value: next(snapshots)
+    )
+    signalled: list = []
+    monkeypatch.setattr(
+        source_graph_daemon.os, "killpg", lambda *args: signalled.append(args)
+    )
+
+    assert not source_graph_daemon._stop_retained_build(root, timeout=0)
+    assert signalled == []
+    assert source_graph_daemon._read_build_identity(root) == retained
+
+
+def test_identity_publish_failure_reaps_through_exact_owner_handle(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "identity_publish_failure")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+
+    class Spawned:
+        pid = 4242
+
+    spawned = Spawned()
+    monkeypatch.setattr(source_graph_daemon.subprocess, "Popen", lambda *args, **kwargs: spawned)
+    monkeypatch.setattr(
+        source_graph_daemon,
+        "_proc_identity",
+        lambda _pid: {"pid": 4242, "pgid": 4242, "session_id": 4242, "start_ticks": 9},
+    )
+    monkeypatch.setattr(
+        source_graph_daemon,
+        "_publish_build_identity_if_unowned",
+        lambda *_args: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    actions = []
+    monkeypatch.setattr(
+        daemon,
+        "_terminate_build_process",
+        lambda: actions.append(("terminate", daemon._build_process)),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_drain_after_stop",
+        lambda process, pgid: actions.append(("drain", process, pgid)),
+    )
+
+    result = daemon._run_build_subprocess(incremental=False)
+
+    assert result["kind"] == "error"
+    assert "identity_persist" in result["error"]
+    assert actions == [("terminate", spawned), ("drain", spawned, 4242)]
+    assert daemon._build_process is None
+
+
+def test_stop_uses_exact_owner_handle_when_stopping_fence_write_fails(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "stopping_fence_failure")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    owned = object()
+    daemon._build_process = owned
+    monkeypatch.setattr(
+        source_graph_daemon, "_read_build_identity", lambda _root: {"state": "running"}
+    )
+    monkeypatch.setattr(
+        source_graph_daemon,
+        "_compare_and_write_build_identity",
+        lambda *_args: (_ for _ in ()).throw(OSError("read only")),
+    )
+    terminated = []
+    monkeypatch.setattr(
+        daemon, "_terminate_build_process", lambda: terminated.append(daemon._build_process)
+    )
+
+    daemon.stop()
+
+    assert terminated == [owned, owned]
+
+
+def test_dead_stale_identity_is_atomically_replaced_before_child_continues(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "dead_stale_identity_replacement")
+    stale = {
+        "repo_root": str(root.resolve()), "owner_token": "dead-owner",
+        "pid": 2**31 - 1, "pgid": 2**31 - 1, "session_id": 2**31 - 1,
+        "start_ticks": 1, "state": "running",
+    }
+    source_graph_daemon._write_build_identity(root, stale)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    monkeypatch.setattr(
+        daemon,
+        "_build_subprocess_command",
+        lambda **_kwargs: [sys.executable, "-c", "import time; time.sleep(60)"],
+    )
+    result = []
+    runner = threading.Thread(
+        target=lambda: result.append(daemon._run_build_subprocess(incremental=False))
+    )
+    runner.start()
+    deadline = time.monotonic() + 5
+    retained = stale
+    while time.monotonic() < deadline:
+        retained = source_graph_daemon._read_build_identity(root) or stale
+        if retained.get("owner_token") != stale["owner_token"]:
+            break
+        time.sleep(0.01)
+
+    assert retained.get("owner_token") != stale["owner_token"]
+    assert source_graph_daemon.stop_daemon(root)
+    runner.join(5)
+    assert not runner.is_alive()
+    assert len(result) == 1
+    assert result[0]["kind"] == "error"
+    assert "exit_-15" in result[0]["error"]
+    assert source_graph_daemon._read_build_identity(root) is None
+
+
+def test_build_identity_publications_are_owner_only_under_permissive_umask(tmp_path):
+    root = _init_repo(tmp_path, "private_build_identity")
+    path = source_graph_daemon._build_identity_path(root)
+    first = {
+        "repo_root": str(root.resolve()), "owner_token": "first", "pid": 1,
+        "pgid": 1, "session_id": 1, "start_ticks": 1, "state": "running",
+    }
+    previous_umask = os.umask(0)
+    try:
+        source_graph_daemon._write_build_identity(root, first)
+        assert path.stat().st_mode & 0o777 == 0o600
+        path.unlink()
+        assert source_graph_daemon._publish_build_identity_if_unowned(root, first)
+        assert path.stat().st_mode & 0o777 == 0o600
+        second = {**first, "state": "stopping"}
+        assert source_graph_daemon._compare_and_write_build_identity(root, first, second)
+        assert path.stat().st_mode & 0o777 == 0o600
+    finally:
+        os.umask(previous_umask)
+
+
+def test_daemon_stop_cas_does_not_clobber_concurrent_replacement(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "daemon_stop_cas_replacement")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    prior = {
+        "repo_root": str(root.resolve()), "owner_token": "prior", "pid": 71,
+        "pgid": 71, "session_id": 71, "start_ticks": 7, "state": "running",
+    }
+    newer = {
+        **prior, "owner_token": "newer", "pid": 72, "pgid": 72,
+        "session_id": 72, "start_ticks": 8,
+    }
+    source_graph_daemon._write_build_identity(root, prior)
+
+    def replace_before_cas(repo_root, expected, value):
+        assert expected == prior
+        assert value["state"] == "stopping"
+        source_graph_daemon._write_build_identity(repo_root, newer)
+        return False
+
+    monkeypatch.setattr(
+        source_graph_daemon, "_compare_and_write_build_identity", replace_before_cas
+    )
+    daemon.stop()
+
+    assert source_graph_daemon._read_build_identity(root) == newer
+
+
+def test_unregistered_health_exposes_retained_live_builder(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "retained_health")
+    retained = {"pid": 77, "state": "stopping", "started_at": "then"}
+    monkeypatch.setattr(
+        source_graph_daemon, "_read_build_identity", lambda _root: retained
+    )
+    monkeypatch.setattr(source_graph_daemon, "_retained_tree_alive", lambda value: value is retained)
+
+    health = source_graph_daemon.daemon_health(root)
+
+    assert health["registered"] is False
+    assert health["running"] is True
+    assert health["status"] == source_graph_daemon.STATUS_INDEXING
+    assert health["ok"] is False
+    assert health["retained_build"] == {
+        "pid": 77,
+        "state": "stopping",
+        "started_at": "then",
+    }
 
 
 class _FakeLiveProcess:
@@ -1509,6 +2175,10 @@ def test_windows_stop_signals_tree_via_taskkill(tmp_path, monkeypatch):
     root = _init_repo(tmp_path, "win_group")
     daemon = source_graph_daemon.SourceGraphDaemon(root)
     monkeypatch.setattr(source_graph_daemon.os, "name", "nt")
+    trusted_taskkill = r"C:\\Windows\\System32\\taskkill.exe"
+    monkeypatch.setattr(
+        source_graph_daemon, "_windows_taskkill_path", lambda: trusted_taskkill
+    )
     calls: list = []
     monkeypatch.setattr(
         source_graph_daemon.subprocess,
@@ -1520,10 +2190,12 @@ def test_windows_stop_signals_tree_via_taskkill(tmp_path, monkeypatch):
     daemon._signal_process_tree(proc, None, graceful=True)
     daemon._signal_process_tree(proc, None, graceful=False)
 
+    assert all(call[0] == trusted_taskkill for call in calls)
+
     # /T reaps the whole tree; /F escalates. Exact owned PID, never a guess.
     assert calls == [
-        ["taskkill", "/T", "/PID", "4321"],
-        ["taskkill", "/F", "/T", "/PID", "4321"],
+        [trusted_taskkill, "/T", "/PID", "4321"],
+        [trusted_taskkill, "/F", "/T", "/PID", "4321"],
     ]
 
 
@@ -1658,6 +2330,10 @@ def test_drain_after_stop_force_signals_only_live_leader_windows(tmp_path, monke
     root = _init_repo(tmp_path, "drain_win_live")
     daemon = source_graph_daemon.SourceGraphDaemon(root)
     monkeypatch.setattr(source_graph_daemon.os, "name", "nt")
+    trusted_taskkill = r"C:\\Windows\\System32\\taskkill.exe"
+    monkeypatch.setattr(
+        source_graph_daemon, "_windows_taskkill_path", lambda: trusted_taskkill
+    )
     calls: list = []
     monkeypatch.setattr(
         source_graph_daemon.subprocess,
@@ -1668,7 +2344,7 @@ def test_drain_after_stop_force_signals_only_live_leader_windows(tmp_path, monke
 
     daemon._drain_after_stop(proc, None, timeout=0.01)
 
-    assert calls == [["taskkill", "/F", "/T", "/PID", "4321"]]
+    assert calls == [[trusted_taskkill, "/F", "/T", "/PID", "4321"]]
     assert proc.stdout.closed and proc.stderr.closed
 
 

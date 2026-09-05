@@ -3329,11 +3329,13 @@ def recover_blocked_rework(
     ``changed_path_hashes``; on success the exact provenance and the newly
     computed claim epoch are persisted on the recovered card as
     ``validation_only_replay_authorization``, scoped to this one episode.
-    Default False preserves ordinary recovery behavior unchanged.
+    Default False preserves ordinary worker execution; a retained terminal
+    failure may supply the same authenticated predecessor without granting
+    validation-only execution.
 
     Fails closed on:
       - dependency, policy, or scope blockers (must be resolved first)
-      - blocked tasks without retained terminal-review predecessor evidence
+      - blocked tasks without retained terminal predecessor evidence
       - blocked tasks without residual feedback
       - tasks with a live claim or in-process episode
       - non-blocked tasks
@@ -3657,6 +3659,17 @@ def recover_blocked_rework(
         ).fetchall()
         terminal_row = terminal_rows[0] if terminal_rows else None
 
+        # A first failed finalization has no reviewer transport yet. Normal
+        # rework may reuse its exact retained candidate, but must not replace
+        # any review evidence or pinned predecessor with failure history.
+        if terminal_row is None and not retained_predecessor:
+            terminal_event = "terminal_failure"
+            terminal_row = conn.execute(
+                "SELECT runner, payload_json, created_at FROM task_events "
+                "WHERE task_id=? AND event='terminal_failure' ORDER BY rowid DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+
         if validation_only_replay and has_reviewer_transport:
             predecessor_request_id = str(
                 retained_predecessor.get("request_id") or ""
@@ -3906,13 +3919,21 @@ def recover_blocked_rework(
         # A terminal failure can leave a perfectly usable candidate without
         # ever reaching reject_review (notably worker quota refusals and
         # finalizer failures with required_outputs=[]).  For an explicit
-        # manager validation replay, authenticate the newest terminal event
+        # manager recovery, authenticate the newest terminal event
         # and synthesize the predecessor from its mechanically collected
-        # evidence.  Ordinary rework continues to use the historical path.
-        if validation_only_replay and not retained_predecessor:
+        # evidence. Replay authorization remains a separate explicit grant.
+        if terminal_event == "terminal_failure" and not retained_predecessor:
             recorded_failure = card.get("terminal_failure")
             if recorded_failure != terminal_review:
                 return False, "retained_terminal_candidate_event_mismatch"
+            terminal_claim_epoch = terminal_review.get("claim_epoch")
+            if (
+                type(terminal_claim_epoch) is not int
+                or terminal_claim_epoch < 1
+                or type(card.get("claim_epoch")) is not int
+                or terminal_claim_epoch != card.get("claim_epoch")
+            ):
+                return False, "retained_terminal_candidate_claim_epoch_invalid"
             evidence = terminal_review.get("evidence")
             for pid_key in ("pid", "provider_pid", "supervisor_pid", "stall_supervisor_pid"):
                 raw_pid = evidence.get(pid_key) if isinstance(evidence, dict) else None
@@ -3980,12 +4001,15 @@ def recover_blocked_rework(
                 or authority.get("schema_id") != "aiworkhub.python_candidate_authority.v1"
                 or authority_hashes != changed_hashes
                 or evidence.get("request_id") not in {None, "", request_id}
+                or terminal_review.get("request_id") != request_id
+                or card.get("launch_request_id") != request_id
                 or identity.get("task_id") != task_id
                 or identity.get("runner") != card.get("runner")
                 or str(terminal_row["runner"] or "") != card.get("runner")
                 or identity.get("topic") != card.get("topic")
                 or identity.get("repo") != workspace.get("repo")
-                or identity.get("claim_epoch") != terminal_review.get("claim_epoch")
+                or type(identity.get("claim_epoch")) is not int
+                or identity.get("claim_epoch") != terminal_claim_epoch
                 or identity.get("allowed_writes") != workspace.get("allowed_writes")
                 or identity.get("base_oid") != workspace.get("base_oid")
                 or identity.get("parent_baseline") != workspace.get("parent_baseline")
@@ -4087,11 +4111,6 @@ def recover_blocked_rework(
                     return False, "retained_terminal_candidate_baseline_invalid"
                 if recorded_baseline_hash != baseline_hash:
                     return False, "retained_terminal_candidate_baseline_mismatch"
-            terminal_claim_epoch = terminal_review.get("claim_epoch")
-            if terminal_claim_epoch is None:
-                terminal_claim_epoch = card.get("claim_epoch")
-            if type(terminal_claim_epoch) is not int or terminal_claim_epoch < 1:
-                return False, "retained_terminal_candidate_claim_epoch_invalid"
             retained_predecessor = {
                 "schema_id": "aiworkhub.rework_predecessor.v1",
                 "request_id": request_id,

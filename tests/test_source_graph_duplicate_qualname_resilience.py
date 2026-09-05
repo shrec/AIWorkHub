@@ -257,6 +257,8 @@ def test_build_fails_loudly_when_every_write_is_contained(tmp_path, monkeypatch)
         assert last_build["files_changed"] == 0
         assert last_build["files_skipped"] == 2
         assert len(last_build["skipped_files"]) == 2
+        assert last_build["status"] == "failed"
+        assert "source_graph_build_failed_write_containment" in last_build["failure_reason"]
         # No success costume: the empty index is empty, not silently blessed.
         assert conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 0
     finally:

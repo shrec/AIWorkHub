@@ -20,7 +20,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from . import runtime_adapters
-from .platform_io import chmod_fd, chmod_path
+from .platform_io import chmod_fd, chmod_path, stat_owned_by_current_user
 
 
 ADAPTER_ID = "glm_copilot_cli"
@@ -132,8 +132,7 @@ def load_credential(
         raise CredentialError("credential_symlink_rejected")
     if not stat.S_ISREG(lst.st_mode):
         raise CredentialError("credential_not_regular_file")
-    getuid = getattr(os, "getuid", None)
-    if getuid is not None and lst.st_uid != getuid():
+    if not stat_owned_by_current_user(lst):
         raise CredentialError("credential_wrong_owner")
     if os.name != "nt" and stat.S_IMODE(lst.st_mode) & 0o077:
         raise CredentialError("credential_group_or_world_accessible")

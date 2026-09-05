@@ -4,14 +4,52 @@ import errno
 import io
 import importlib.util
 import os
+import stat
 import threading
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from aiworkhub import _platform_process, platform_io
+
+
+def test_current_user_uid_never_probes_posix_uid_on_windows(monkeypatch):
+    monkeypatch.setattr(
+        platform_io.os,
+        "getuid",
+        lambda: pytest.fail("Windows must not probe os.getuid"),
+        raising=False,
+    )
+
+    assert platform_io.current_user_uid("windows") is None
+    assert platform_io.stat_owned_by_current_user(
+        SimpleNamespace(st_uid=123), "windows"
+    )
+
+
+def test_current_user_uid_fails_closed_when_posix_authority_is_missing(monkeypatch):
+    monkeypatch.delattr(platform_io.os, "getuid", raising=False)
+
+    with pytest.raises(OSError, match="current_user_uid_unavailable"):
+        platform_io.current_user_uid("linux")
+    assert not platform_io.stat_owned_by_current_user(
+        SimpleNamespace(st_uid=123), "linux"
+    )
+
+
+def test_stat_owned_by_current_user_requires_exact_posix_uid(monkeypatch):
+    monkeypatch.setattr(platform_io.os, "getuid", lambda: 123, raising=False)
+
+    assert platform_io.current_user_uid("linux") == 123
+    assert platform_io.stat_owned_by_current_user(
+        SimpleNamespace(st_uid=123), "linux"
+    )
+    assert not platform_io.stat_owned_by_current_user(
+        SimpleNamespace(st_uid=124), "linux"
+    )
 
 
 def test_available_memory_bytes_reads_linux_memavailable(monkeypatch):
@@ -834,6 +872,204 @@ def test_atomic_replace_retries_transient_windows_sharing_violation(monkeypatch)
     platform_io.atomic_replace("seed.tmp", "AGENTS.md")
 
     assert calls == [("seed.tmp", "AGENTS.md"), ("seed.tmp", "AGENTS.md")]
+
+
+def test_durable_atomic_replace_directory_open_failure_preserves_paths(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "canonical"
+    source.write_bytes(b"new")
+    destination.write_bytes(b"prior")
+    destination_directory = os.fspath(tmp_path)
+    real_open = os.open
+
+    def fail_destination_directory_open(path, flags, mode=0o777):
+        if os.fspath(path) == destination_directory and flags & os.O_DIRECTORY:
+            raise OSError(errno.EACCES, "directory open failed")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(platform_io.os, "open", fail_destination_directory_open)
+
+    with pytest.raises(OSError, match="directory open failed"):
+        platform_io.durable_atomic_replace(source, destination)
+
+    assert destination.read_bytes() == b"prior"
+    assert source.read_bytes() == b"new"
+
+
+def test_durable_atomic_replace_reports_post_commit_directory_sync_failure(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "canonical"
+    source.write_bytes(b"new")
+    destination.write_bytes(b"prior")
+    real_fsync = os.fsync
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "directory sync failed")
+        real_fsync(fd)
+
+    monkeypatch.setattr(platform_io.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(platform_io.PublicationDurabilityError) as raised:
+        platform_io.durable_atomic_replace(source, destination)
+
+    assert raised.value.replacement_committed is True
+    assert raised.value.published is True
+    assert destination.read_bytes() == b"new"
+
+
+def test_identity_bound_replace_rejects_source_substitution_before_publication(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.tmp"
+    original = tmp_path / "original.saved"
+    destination = tmp_path / "canonical"
+    source.write_bytes(b"verified")
+    destination.write_bytes(b"prior")
+    real_replace = os.replace
+    swapped = False
+
+    def swap_before_quarantine(left, right, **kwargs):
+        nonlocal swapped
+        if not swapped and os.fspath(left) in {os.fspath(source), source.name}:
+            swapped = True
+            real_replace(source, original)
+            source.write_bytes(b"substitute")
+        return real_replace(left, right, **kwargs)
+
+    monkeypatch.setattr(platform_io.os, "replace", swap_before_quarantine)
+
+    with pytest.raises(
+        platform_io.IdentityBoundPublicationError,
+        match="publication_source_identity_changed",
+    ):
+        platform_io.identity_bound_durable_atomic_replace(source, destination)
+
+    assert swapped
+    assert destination.read_bytes() == b"prior"
+    assert source.read_bytes() == b"substitute"
+    assert original.read_bytes() == b"verified"
+
+
+def test_identity_bound_replace_fails_closed_on_unsupported_platform(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "canonical"
+    source.write_bytes(b"new")
+    destination.write_bytes(b"prior")
+    monkeypatch.setattr(platform_io, "is_linux", lambda _name=None: False)
+
+    with pytest.raises(platform_io.IdentityBoundPublicationError) as raised:
+        platform_io.identity_bound_durable_atomic_replace(source, destination)
+
+    assert raised.value.errno == errno.ENOTSUP
+    assert destination.read_bytes() == b"prior"
+    assert source.read_bytes() == b"new"
+
+
+def test_identity_bound_replace_ignores_public_staging_namespace_substitution(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "canonical"
+    displaced_staging = tmp_path / "displaced-staging"
+    source.write_bytes(b"verified")
+    destination.write_bytes(b"prior")
+    real_link_open_file = platform_io._link_open_file
+
+    def substitute_staging(directory_fd, target_directory_fd, name):
+        real_link_open_file(directory_fd, target_directory_fd, name)
+        staging_directory = os.readlink(f"/proc/self/fd/{target_directory_fd}")
+        os.replace(staging_directory, displaced_staging)
+        os.mkdir(staging_directory)
+        Path(staging_directory, name).write_bytes(b"substitute")
+
+    monkeypatch.setattr(platform_io, "_link_open_file", substitute_staging)
+
+    platform_io.identity_bound_durable_atomic_replace(source, destination)
+
+    assert destination.read_bytes() == b"verified"
+    assert displaced_staging.exists()
+
+
+def test_identity_bound_replace_commits_through_open_destination_directory(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.tmp"
+    destination_directory = tmp_path / "destination"
+    displaced_directory = tmp_path / "destination.displaced"
+    destination_directory.mkdir()
+    destination = destination_directory / "canonical"
+    source.write_bytes(b"verified")
+    destination.write_bytes(b"prior")
+    real_replace = os.replace
+    swapped = False
+
+    def swap_destination_before_commit(left, right, **kwargs):
+        nonlocal swapped
+        if not swapped and kwargs.get("src_dir_fd") != kwargs.get("dst_dir_fd"):
+            swapped = True
+            real_replace(destination_directory, displaced_directory)
+            destination_directory.mkdir()
+            (destination_directory / "canonical").write_bytes(b"substitute")
+        return real_replace(left, right, **kwargs)
+
+    monkeypatch.setattr(platform_io.os, "replace", swap_destination_before_commit)
+
+    platform_io.identity_bound_durable_atomic_replace(source, destination)
+
+    assert swapped
+    assert (displaced_directory / "canonical").read_bytes() == b"verified"
+    assert destination.read_bytes() == b"substitute"
+
+
+def test_identity_bound_replace_removes_staging_for_hard_link_alias(tmp_path):
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "canonical"
+    source.write_bytes(b"verified")
+    os.link(source, destination)
+
+    platform_io.identity_bound_durable_atomic_replace(source, destination)
+
+    assert destination.read_bytes() == b"verified"
+    assert not source.exists()
+    assert list(tmp_path.glob(".canonical.publish-*")) == []
+
+
+def test_identity_bound_replace_fails_closed_on_cross_device_staging(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "canonical"
+    source.write_bytes(b"new")
+    destination.write_bytes(b"prior")
+    monkeypatch.setattr(platform_io.ctypes, "get_errno", lambda: errno.EXDEV)
+
+    class _LinkAt:
+        argtypes = None
+        restype = None
+
+        def __call__(self, *_args):
+            return -1
+
+    monkeypatch.setattr(
+        platform_io.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(linkat=_LinkAt()),
+    )
+
+    with pytest.raises(platform_io.IdentityBoundPublicationError) as raised:
+        platform_io.identity_bound_durable_atomic_replace(source, destination)
+
+    assert raised.value.errno == errno.ENOTSUP
+    assert raised.value.published is False
+    assert destination.read_bytes() == b"prior"
+    assert source.read_bytes() == b"new"
 
 
 def test_windows_lock_backend_uses_one_byte_region(tmp_path, monkeypatch):

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import multiprocessing
 import os
 import signal
 import subprocess
@@ -982,6 +983,111 @@ def test_release_exact_is_idempotent_when_canonical_task_is_already_terminal(
 # --- task_reconciler.py CLI/daemon plumbing ---------------------------------
 
 
+def _single_flight_service_process(repo, entered, release_fd):
+    def _scan(*_args, **_kwargs):
+        entered.send(os.getpid())
+        os.read(release_fd, 1)
+        return {"ok": True, "finalized": 0, "watched": 0}
+
+    task_reconciler.run_scan = _scan
+    service = task_reconciler.ReconcilerService(Path(repo), scan_interval_seconds=5)
+    service.start()
+    service._thread.join()
+
+
+def _signal_wake_daemon_process(repo, entered):
+    def _scan(*_args, **_kwargs):
+        entered.send(os.getpid())
+        return {"ok": True, "finalized": 0, "watched": 0}
+
+    task_reconciler.run_scan = _scan
+    task_reconciler.run_daemon(repo=Path(repo), scan_interval_seconds=3600)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fork-based deterministic process authority test")
+def test_two_services_single_flight_and_standby_takes_over_after_owner_exit(tmp_path):
+    repo = tmp_path / "repo_process_authority"
+    (repo / ".aiworkhub/runtime/process_logs").mkdir(parents=True)
+    ctx = multiprocessing.get_context("fork")
+    entered_reader, entered_writer = ctx.Pipe(duplex=False)
+    release_reader, release_writer = os.pipe()
+    processes = [
+        ctx.Process(
+            target=_single_flight_service_process,
+            args=(repo, entered_writer, release_reader),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    try:
+        assert entered_reader.poll(5)
+        owner_pid = entered_reader.recv()
+        assert not entered_reader.poll(0.5)
+        # The authority is an OS lock, not a scan-long SQLite transaction:
+        # ordinary manager/task-store reconciliation remains available.
+        concurrent_result = process_launcher.ProcessManager(repo=repo).reconcile(
+            include_gc=False
+        )
+        assert isinstance(concurrent_result, dict)
+        owner = next(process for process in processes if process.pid == owner_pid)
+        standby = next(process for process in processes if process.pid != owner_pid)
+        assert owner.is_alive() and standby.is_alive()
+
+        # Killing the exact holder releases the kernel lock. The passive MCP
+        # service retries acquisition and becomes owner without intervention.
+        owner.terminate()
+        owner.join(timeout=5)
+        assert entered_reader.poll(5)
+        assert entered_reader.recv() == standby.pid
+    finally:
+        os.write(release_writer, b"x")
+        for process in processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        os.close(release_reader)
+        os.close(release_writer)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fork and SIGTERM regression")
+def test_daemon_sigterm_wakes_long_wait_and_standby_takes_over(tmp_path):
+    repo = tmp_path / "repo_signal_takeover"
+    (repo / ".aiworkhub/runtime/process_logs").mkdir(parents=True)
+    ctx = multiprocessing.get_context("fork")
+    entered_reader, entered_writer = ctx.Pipe(duplex=False)
+    owner = ctx.Process(target=_signal_wake_daemon_process, args=(repo, entered_writer))
+    release_reader, release_writer = os.pipe()
+    standby = ctx.Process(
+        target=_single_flight_service_process,
+        args=(repo, entered_writer, release_reader),
+    )
+    owner.start()
+    try:
+        assert entered_reader.poll(5)
+        assert entered_reader.recv() == owner.pid
+        standby.start()
+        assert not entered_reader.poll(0.5)
+
+        started = time.monotonic()
+        os.kill(owner.pid, signal.SIGTERM)
+        owner.join(timeout=3)
+        assert not owner.is_alive(), "SIGTERM must wake the 3600-second wait"
+        assert time.monotonic() - started < 3
+        assert entered_reader.poll(5)
+        assert entered_reader.recv() == standby.pid
+    finally:
+        os.write(release_writer, b"x")
+        for process in (owner, standby):
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        os.close(release_reader)
+        os.close(release_writer)
+
+
 def test_single_instance_lock_rejects_a_concurrent_holder(tmp_path):
     lock_path = tmp_path / "reconciler.lock"
     with task_reconciler.single_instance_lock(lock_path):
@@ -991,6 +1097,169 @@ def test_single_instance_lock_rejects_a_concurrent_holder(tmp_path):
     # Lock is released afterwards -- a fresh acquire must succeed.
     with task_reconciler.single_instance_lock(lock_path):
         pass
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory replacement regression")
+def test_replaced_lock_parent_cannot_admit_a_second_process(tmp_path):
+    repo = tmp_path / "repo"
+    lock_path = repo / task_reconciler.LOCK_REL_PATH
+    lock_path.parent.mkdir(parents=True)
+    ctx = multiprocessing.get_context("fork")
+    acquired_reader, acquired_writer = ctx.Pipe(duplex=False)
+    release_reader, release_writer = os.pipe()
+
+    def _hold_authority():
+        with task_reconciler.single_instance_lock(lock_path):
+            acquired_writer.send("owner")
+            os.read(release_reader, 1)
+
+    owner = ctx.Process(target=_hold_authority)
+    owner.start()
+    try:
+        assert acquired_reader.poll(5)
+        assert acquired_reader.recv() == "owner"
+        displaced = lock_path.parent.with_name("locks-displaced")
+        lock_path.parent.rename(displaced)
+        lock_path.parent.mkdir()
+
+        def _try_replacement():
+            try:
+                with task_reconciler.single_instance_lock(lock_path):
+                    acquired_writer.send("entered")
+            except task_reconciler.ReconcilerLockHeld:
+                acquired_writer.send("held")
+
+        contender = ctx.Process(target=_try_replacement)
+        contender.start()
+        contender.join(timeout=5)
+        assert not contender.is_alive()
+        assert acquired_reader.poll(2)
+        assert acquired_reader.recv() == "held"
+    finally:
+        os.write(release_writer, b"x")
+        owner.join(timeout=5)
+        if owner.is_alive():
+            owner.terminate()
+            owner.join(timeout=5)
+        os.close(release_reader)
+        os.close(release_writer)
+
+    with task_reconciler.single_instance_lock(lock_path):
+        pass
+
+
+def test_single_instance_lock_rejects_path_replaced_after_lock(tmp_path, monkeypatch):
+    lock_path = tmp_path / "reconciler.lock"
+    real_lock_fd = task_reconciler.lock_fd
+
+    def _lock_then_replace(fd, *, blocking):
+        real_lock_fd(fd, blocking=blocking)
+        lock_path.unlink()
+        replacement_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.close(replacement_fd)
+
+    monkeypatch.setattr(task_reconciler, "lock_fd", _lock_then_replace)
+    with pytest.raises(task_reconciler.ReconcilerLockUnsafe, match="lock_unsafe"):
+        with task_reconciler.single_instance_lock(lock_path):
+            pass
+
+    monkeypatch.setattr(task_reconciler, "lock_fd", real_lock_fd)
+    with task_reconciler.single_instance_lock(lock_path):
+        pass
+
+
+def test_single_instance_lock_rejects_hardlink_without_modifying_source(tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("do-not-touch", encoding="utf-8")
+    lock_path = tmp_path / "reconciler.lock"
+    try:
+        os.link(victim, lock_path)
+    except (AttributeError, NotImplementedError, OSError) as exc:
+        pytest.skip(f"os.link unsupported: {exc}")
+
+    with pytest.raises(task_reconciler.ReconcilerLockUnsafe, match="lock_unsafe"):
+        with task_reconciler.single_instance_lock(lock_path):
+            pass
+    assert victim.read_text(encoding="utf-8") == "do-not-touch"
+
+
+def test_single_instance_lock_rejects_symlink_without_nofollow_or_modifying_target(
+    tmp_path, monkeypatch
+):
+    victim = tmp_path / "victim"
+    victim.write_text("do-not-touch", encoding="utf-8")
+    lock_path = tmp_path / "reconciler.lock"
+    try:
+        lock_path.symlink_to(victim)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symlink unsupported: {exc}")
+    monkeypatch.delattr(task_reconciler.os, "O_NOFOLLOW", raising=False)
+
+    with pytest.raises(task_reconciler.ReconcilerLockUnsafe, match="lock_unsafe"):
+        with task_reconciler.single_instance_lock(lock_path):
+            pass
+    assert victim.read_text(encoding="utf-8") == "do-not-touch"
+
+
+def test_unsafe_lock_path_is_unhealthy_not_standby(tmp_path, monkeypatch):
+    repo = tmp_path / "repo_unsafe_authority"
+    lock_path = repo / task_reconciler.LOCK_REL_PATH
+    lock_path.parent.mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.write_text("do-not-touch", encoding="utf-8")
+    try:
+        lock_path.symlink_to(victim)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symlink unsupported: {exc}")
+    service = task_reconciler.ReconcilerService(repo, scan_interval_seconds=5)
+    monkeypatch.setattr(
+        service._stop_event,
+        "wait",
+        lambda _seconds: service._stop_event.set() or True,
+    )
+
+    service._loop()
+
+    health = service.health()
+    assert health["ok"] is False
+    assert health["authority_state"] == "acquisition_failed"
+    assert health["standby"] is False
+    assert "lock_unsafe" in health["last_acquisition_error"]
+    assert victim.read_text(encoding="utf-8") == "do-not-touch"
+
+
+def test_write_status_rejects_substituted_mkstemp_path_and_preserves_status(
+    tmp_path, monkeypatch
+):
+    task_reconciler.write_status(tmp_path, {"scan_finished_epoch": 123.0})
+    target = task_reconciler.status_path(tmp_path)
+    victim = tmp_path / "victim-status"
+    victim.write_text("do-not-touch", encoding="utf-8")
+    real_mkstemp = task_reconciler.tempfile.mkstemp
+    attacked_paths = []
+
+    def _substitute_created_path(*args, **kwargs):
+        fd, created_path = real_mkstemp(*args, **kwargs)
+        attacked_paths.append(created_path)
+        os.unlink(created_path)
+        try:
+            os.link(victim, created_path)
+        except (AttributeError, NotImplementedError, OSError) as exc:
+            os.close(fd)
+            pytest.skip(f"os.link unsupported: {exc}")
+        return fd, created_path
+
+    monkeypatch.setattr(task_reconciler.tempfile, "mkstemp", _substitute_created_path)
+    task_reconciler.write_status(tmp_path, {"scan_finished_epoch": 456.0})
+
+    assert victim.read_text(encoding="utf-8") == "do-not-touch"
+    assert attacked_paths and not Path(attacked_paths[0]).exists()
+    assert task_reconciler.read_status(tmp_path)["scan_finished_epoch"] == 123.0
+
+    monkeypatch.setattr(task_reconciler.tempfile, "mkstemp", real_mkstemp)
+    task_reconciler.write_status(tmp_path, {"scan_finished_epoch": 789.0})
+    assert target.exists()
+    assert task_reconciler.read_status(tmp_path)["scan_finished_epoch"] == 789.0
 
 
 def test_run_once_cli_is_bounded_json_and_idempotent_on_an_empty_repo(tmp_path, capsys):
@@ -1016,6 +1285,43 @@ def test_status_cli_reports_lock_presence_read_only(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
     assert payload["lock_present"] is False
+    assert not (repo / task_reconciler.LOCK_REL_PATH).exists()
+
+
+def test_read_status_rejects_symlink_and_insecure_mode(tmp_path):
+    target = task_reconciler.status_path(tmp_path)
+    target.parent.mkdir(parents=True)
+    foreign = tmp_path / "foreign-status.json"
+    foreign.write_text('{"ok": true}', encoding="utf-8")
+    target.symlink_to(foreign)
+    assert task_reconciler.read_status(tmp_path) == {}
+
+    target.unlink()
+    fd = os.open(target, os.O_CREAT | os.O_WRONLY, 0o666)
+    os.write(fd, b'{"ok": true}')
+    os.close(fd)
+    assert task_reconciler.read_status(tmp_path) == {}
+
+
+def test_failed_owner_pass_preserves_attempted_gc_mode(tmp_path, monkeypatch):
+    repo = tmp_path / "repo_failed_gc"
+    (repo / ".aiworkhub/runtime/process_logs").mkdir(parents=True)
+    service = task_reconciler.ReconcilerService(repo, scan_interval_seconds=5)
+    monkeypatch.setattr(
+        task_reconciler,
+        "run_scan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("scan failed")),
+    )
+    service._stop_event.set()
+    service._stop_event.clear()
+    monkeypatch.setattr(service._stop_event, "wait", lambda _seconds: True)
+
+    service._run_as_owner(max_iterations=1)
+
+    record = task_reconciler.read_status(repo)
+    assert record["last_error"] == "RuntimeError:scan failed"
+    assert record["gc_included"] is True
+    assert record["last_completed_scan"]["gc_included"] is True
 
 
 def test_daemon_runs_bounded_iterations_and_scans_repeatedly(tmp_path):
@@ -1031,6 +1337,33 @@ def test_daemon_runs_bounded_iterations_and_scans_repeatedly(tmp_path):
     assert rc == 0
     assert len(scans) == 3
     assert all(scan["ok"] for scan in scans)
+
+
+def test_daemon_lock_unsafe_fails_closed_without_scanning(tmp_path, monkeypatch):
+    repo = tmp_path / "repo_unsafe_lock"
+    (repo / ".aiworkhub/runtime/process_logs").mkdir(parents=True)
+    scans = []
+
+    def _unsafe(_lock_path):
+        raise task_reconciler.ReconcilerLockUnsafe("reconciler_lock_unsafe:test")
+
+    monkeypatch.setattr(task_reconciler, "single_instance_lock", _unsafe)
+    monkeypatch.setattr(
+        task_reconciler,
+        "run_scan",
+        lambda *_args, **_kwargs: scans.append(True),
+    )
+
+    rc = task_reconciler.run_daemon(repo=repo, on_scan=lambda result: scans.append(result))
+
+    assert rc == 4
+    assert scans == []
+    record = task_reconciler.read_status(repo)
+    assert record["authority_state"] == "acquisition_failed"
+    assert record["acquisition_state"] == "failed"
+    assert record["scan_in_progress"] is False
+    assert record["owner_pid"] is None
+    assert record["last_error"] == "reconciler_lock_unsafe:test"
 
 
 def test_repo_bound_reconciler_service_is_idempotent_and_stoppable(tmp_path, monkeypatch):
@@ -1660,3 +1993,104 @@ def test_legacy_supervisor_timed_out_is_not_authoritative_without_enforcement(
     assert event["state"] == "worker_failed"
     assert event["state"] != "timed_out"
     assert releases == [(card["task_id"], "worker_failed")]
+
+
+def test_reconciler_status_rejects_symlink_without_o_nofollow(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    spoof = tmp_path / "spoof.json"
+    _write_status(spoof, {"scan_finished_epoch": time.time(), "ok": True})
+    status = task_reconciler.status_path(repo)
+    status.parent.mkdir(parents=True, exist_ok=True)
+    status.symlink_to(spoof)
+    monkeypatch.delattr(task_reconciler.os, "O_NOFOLLOW", raising=False)
+
+    assert task_reconciler.read_status(repo) == {}
+
+
+def test_stopped_owner_record_is_not_healthy_after_lock_release(tmp_path, monkeypatch):
+    service = task_reconciler.ReconcilerService.__new__(task_reconciler.ReconcilerService)
+    service.repo = tmp_path.resolve()
+    service.scan_interval_seconds = task_reconciler.MIN_SCAN_INTERVAL_SECONDS
+    service._manager = None
+    service._stop_event = __import__("threading").Event()
+    service._thread = None
+    service._state_lock = __import__("threading").Lock()
+    service._last_scan = {}
+    service._last_error = ""
+    service._pass_index = 0
+
+    def one_scan(*_args, **_kwargs):
+        service._stop_event.set()
+        return {"ok": True, "finalized": 0, "watched": 0}
+
+    monkeypatch.setattr(task_reconciler, "run_scan", one_scan)
+    service.start()
+    assert service._thread is not None
+    service._thread.join(timeout=5)
+    service.stop()
+
+    record = task_reconciler.read_status(tmp_path)
+    assert record["authority_state"] == "active_owner"
+    health = task_reconciler.reconciler_health(tmp_path)
+    assert health["ok"] is False
+    assert health["durable_authority_live"] is False
+    assert health["last_error"] == "reconciler_recorded_owner_not_live"
+
+
+def _run_contending_cli_daemon(repo: str, entered, release_path: str) -> None:
+    """Run the real CLI authority loop with an observable bounded scan."""
+    from aiworkhub import task_reconciler as child_reconciler
+
+    def observable_scan(manager, *, repo, include_gc=True):  # noqa: ARG001
+        entered.send(os.getpid())
+        deadline = time.monotonic() + 10
+        while not Path(release_path).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return {"ok": True, "finalized": 0, "watched": 0}
+
+    child_reconciler.run_scan = observable_scan
+    raise SystemExit(child_reconciler.main([
+        "daemon",
+        "--repo",
+        repo,
+        "--scan-interval-seconds",
+        str(child_reconciler.MIN_SCAN_INTERVAL_SECONDS),
+        "--max-iterations",
+        "1",
+    ]))
+
+
+def test_two_cli_daemons_standby_then_fail_over_without_overlapping_scans(tmp_path):
+    """A contended CLI stays alive, then scans only after the owner exits."""
+    ctx = multiprocessing.get_context("spawn")
+    entered, child_entered = ctx.Pipe(duplex=False)
+    release = tmp_path / "release-scan"
+    args = (str(tmp_path), child_entered, str(release))
+    owner = ctx.Process(target=_run_contending_cli_daemon, args=args)
+    standby = ctx.Process(target=_run_contending_cli_daemon, args=args)
+    owner.start()
+    standby.start()
+    try:
+        assert entered.poll(10)
+        first_pid = entered.recv()
+        assert first_pid in {owner.pid, standby.pid}
+        passive = standby if first_pid == owner.pid else owner
+        active = owner if first_pid == owner.pid else standby
+
+        assert not entered.poll(task_reconciler.AUTHORITY_RETRY_SECONDS * 2)
+        assert passive.is_alive()
+
+        active.kill()
+        active.join(timeout=5)
+        assert not active.is_alive()
+        assert entered.poll(10)
+        assert entered.recv() == passive.pid
+        release.touch()
+        passive.join(timeout=10)
+        assert passive.exitcode == 0
+    finally:
+        release.touch(exist_ok=True)
+        for process in (owner, standby):
+            if process.is_alive():
+                process.kill()
+            process.join(timeout=5)

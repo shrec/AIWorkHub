@@ -6658,6 +6658,73 @@ def test_fchmod_hardlink_noop_unlink_race_uses_authenticated_descriptor(
             os.close(spec_fd)
 
 
+def test_metadata_broker_decodes_only_kernel_mode_t_bits() -> None:
+    safe_full_mode = stat.S_IFREG | 0o644
+
+    assert (
+        worker_workspace._metadata_broker_decode_mode_arg(
+            (0xDEADBEEF << 32) | safe_full_mode
+        )
+        == 0o644
+    )
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="metadata_broker_unsafe_mode"
+    ):
+        worker_workspace._metadata_broker_decode_mode_arg(
+            (0xDEADBEEF << 32) | stat.S_IFREG | stat.S_ISUID | 0o644
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux seccomp notification contract")
+@pytest.mark.skipif(
+    worker_workspace.landlock_abi_version() < 1,
+    reason="Landlock is not supported by this kernel",
+)
+@pytest.mark.skipif(
+    not worker_workspace._seccomp_notify_supported(),
+    reason="seccomp user notification is not supported by this runtime",
+)
+def test_metadata_broker_allows_real_git_init_chmod(tmp_path: Path) -> None:
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is unavailable")
+
+    workspace = tmp_path / "workspace"
+    home = tmp_path / "home"
+    scratch = tmp_path / "scratch"
+    for directory in (workspace, home, scratch):
+        directory.mkdir()
+    target = scratch / "repo"
+    env = os.environ.copy()
+    env.update({"TMPDIR": str(scratch), "TMP": str(scratch), "TEMP": str(scratch)})
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(worker_workspace.__file__).resolve()),
+            "--landlock-exec",
+            "--workspace",
+            str(workspace),
+            "--home",
+            str(home),
+            "--exec-scratch",
+            str(scratch),
+            "--",
+            git,
+            "init",
+            str(target),
+        ],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (target / ".git" / "config").is_file()
+
+
 def test_metadata_broker_denial_uses_private_structural_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

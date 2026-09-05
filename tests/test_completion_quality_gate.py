@@ -6,7 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from aiworkhub import process_launcher as launcher
 from aiworkhub import quality_evidence
+from aiworkhub import quality_reviewer
 
 
 def test_completion_quality_gate_passes_valid_changed_sources(tmp_path) -> None:
@@ -597,6 +599,33 @@ def test_posix_declared_command_keeps_executable_token(tmp_path, monkeypatch) ->
     assert observed["kwargs"]["shell"] is False
 
 
+def test_python_module_subprocess_prefers_candidate_source(tmp_path, monkeypatch) -> None:
+    candidate = tmp_path / "candidate"
+    installed = tmp_path / "installed"
+    for root, marker in ((candidate, "candidate"), (installed, "installed")):
+        package = root / "src" / "aiworkhub"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "declared_invariants.py").write_text(
+            f'print("{marker}")\n', encoding="utf-8"
+        )
+    config = candidate / ".aiworkhub" / "quality.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({"checks": [{
+        "id": "declared-invariants", "kind": "static_analysis",
+        "command": ["{python}", "-m", "aiworkhub.declared_invariants"],
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(installed / "src"))
+
+    check = quality_evidence.run_declared_checks(candidate)[0]
+
+    assert check.status == "passed"
+    assert "stdout:\ncandidate" in check.summary
+    assert "installed" not in check.summary
+    assert f"cwd={candidate}" in check.provenance
+    assert check.executed_command[0] == quality_evidence.sys.executable
+
+
 @pytest.mark.parametrize("module", ["ruff", "mypy"])
 def test_python_quality_module_uses_path_entrypoint_when_runtime_lacks_module(
     tmp_path, monkeypatch, module
@@ -904,3 +933,229 @@ def test_destructive_diff_allows_small_or_nonshrinking_edit(tmp_path) -> None:
     )
 
     assert [row.status for row in checks] == ["passed"]
+
+
+# --- NF-2026-00600: reviewer finding normalization parity with the launcher --
+#
+# quality_reviewer.normalize_packet_findings stamps a canonical ``category`` on
+# every finding and, for over-build findings, a replacement/removable_surface
+# remedy.  The signed report then flows through
+# quality_evidence.normalize_reviewer_reports, whose output the launcher final
+# receipt schema re-validates (process_launcher._enforce_quality_review_receipt_schema).
+# NF-2026-00600 reproduced quality_review_finding_0_keys_invalid with
+# missing required=['category'] because the second normalization dropped
+# ``category`` (and the remedy fields) that the launcher requires/permits.
+
+
+def _canonical_reviewer_finding(**overrides: object) -> dict[str, object]:
+    """A finding shaped exactly as normalize_packet_findings emits it."""
+
+    finding: dict[str, object] = {
+        "id": "finding-1",
+        "severity": quality_evidence.SEVERITY_MEDIUM,
+        "disposition": quality_evidence.FINDING_DISPOSITION_DEFECT,
+        "actionable": True,
+        "category": "general",
+        "summary": "a concrete defect",
+        "evidence": "src/aiworkhub/quality_review.py:42 shows the defect",
+        "confidence": "high",
+        "evidence_level": "static_evidence",
+        "symbol": "",
+        "claim": "the defect is real",
+        "reproduction": "",
+        "required_validation": "manager must independently validate this finding",
+    }
+    finding.update(overrides)
+    return finding
+
+
+def _reviewer_report(findings: list[dict[str, object]], *, provider: str = "glm") -> dict[str, object]:
+    return {
+        "lens": quality_evidence.LENS_CORRECTNESS,
+        "provider": provider,
+        "read_only": True,
+        "can_mutate_repo": False,
+        "findings": findings,
+    }
+
+
+def _launcher_final_receipt(
+    findings: list[dict[str, object]], *, provider: str = "glm"
+) -> dict[str, object]:
+    """Build the exact production read-only receipt shape around ``findings``.
+
+    Every sub-object is keyed from the launcher's own canonical key sets so the
+    fixture cannot drift from the schema it exercises; only the scalar fields
+    the gate validates are populated.
+    """
+
+    sha = "a" * 64
+    report = {key: None for key in launcher._QUALITY_REVIEW_REPORT_KEYS}
+    report.update(
+        {
+            "provider": provider,
+            "findings": findings,
+            "read_only": True,
+            "can_mutate_repo": False,
+        }
+    )
+    target = {key: None for key in launcher._QUALITY_REVIEW_TARGET_KEYS}
+    target["claim_epoch"] = 1
+    reviewer = {key: None for key in launcher._QUALITY_REVIEW_REVIEWER_KEYS}
+    reviewer["provider"] = provider
+    authority = {key: None for key in launcher._QUALITY_REVIEW_AUTHORITY_KEYS}
+    authority.update(
+        {
+            "process_identity_verified": True,
+            "audit_verified": True,
+            "terminal_state": "review_ready",
+        }
+    )
+    receipt = {key: None for key in launcher._QUALITY_REVIEW_RECEIPT_TOP_KEYS}
+    receipt.update(
+        {
+            "schema_id": quality_reviewer.RECEIPT_SCHEMA_ID,
+            "packet_sha256": sha,
+            "submission_id": sha,
+            "target": target,
+            "reviewer": reviewer,
+            "report": report,
+            "authority": authority,
+            "physical_submission_count": 1,
+            "logical_submission_count": 1,
+        }
+    )
+    return receipt
+
+
+def test_general_finding_survives_normalization_and_launcher_receipt_schema() -> None:
+    normalized, errors = quality_evidence.normalize_reviewer_reports(
+        [_reviewer_report([_canonical_reviewer_finding()])]
+    )
+
+    assert errors == []
+    finding = normalized[0]["findings"][0]
+    # The canonical category is carried through instead of being dropped.
+    assert finding["category"] == "general"
+    # Its key set satisfies the launcher's exact finding contract...
+    assert (
+        quality_reviewer.QUALITY_REVIEW_FINDING_REQUIRED_KEYS
+        <= set(finding)
+        <= quality_reviewer.QUALITY_REVIEW_FINDING_KEYS
+    )
+    # ...and the real launcher final receipt schema now accepts it.
+    receipt = _launcher_final_receipt([finding])
+    assert launcher._enforce_quality_review_receipt_schema(receipt, "glm") is receipt
+
+
+@pytest.mark.parametrize(
+    ("category", "remedy_field", "remedy_value"),
+    [
+        ("duplicate_existing_symbol", "replacement", "reuse aiworkhub.foo.bar"),
+        (
+            "handrolled_standard_or_platform_capability",
+            "replacement",
+            "use itertools.chain instead",
+        ),
+        ("unnecessary_abstraction", "removable_surface", "delete the FooFactory shim"),
+        ("excess_scope", "removable_surface", "drop the unrelated CLI flag"),
+    ],
+)
+def test_overbuild_remedy_fields_survive_normalization_and_receipt_schema(
+    category: str, remedy_field: str, remedy_value: str
+) -> None:
+    report = _reviewer_report(
+        [
+            _canonical_reviewer_finding(
+                category=category, **{remedy_field: remedy_value}
+            )
+        ]
+    )
+
+    normalized, errors = quality_evidence.normalize_reviewer_reports([report])
+
+    assert errors == []
+    finding = normalized[0]["findings"][0]
+    assert finding["category"] == category
+    # The category-specific remedy survives unchanged.
+    assert finding[remedy_field] == remedy_value
+    # replacement/removable_surface are permitted (not required) launcher keys.
+    assert set(finding) <= quality_reviewer.QUALITY_REVIEW_FINDING_KEYS
+    receipt = _launcher_final_receipt([finding])
+    assert launcher._enforce_quality_review_receipt_schema(receipt, "glm") is receipt
+
+
+@pytest.mark.parametrize("bad_category", ["totally_bogus", 123, None])
+def test_malformed_category_fails_the_report_closed(bad_category: object) -> None:
+    # A non-string type (including an explicit null) or an unknown category
+    # value fails the whole report closed rather than forging a canonical field.
+    report = _reviewer_report(
+        [_canonical_reviewer_finding(category=bad_category)]
+    )
+
+    normalized, errors = quality_evidence.normalize_reviewer_reports([report])
+
+    assert normalized == []
+    assert any("category_invalid" in error for error in errors)
+
+
+def test_blank_string_category_defaults_to_general() -> None:
+    # A blank category string defaults to the canonical "general", exactly like
+    # the reviewer boundary (quality_reviewer.normalize_packet_findings).
+    report = _reviewer_report([_canonical_reviewer_finding(category="   ")])
+
+    normalized, errors = quality_evidence.normalize_reviewer_reports([report])
+
+    assert errors == []
+    assert normalized[0]["findings"][0]["category"] == "general"
+
+
+@pytest.mark.parametrize("remedy_field", ["replacement", "removable_surface"])
+def test_malformed_remedy_type_fails_the_report_closed(remedy_field: str) -> None:
+    report = _reviewer_report(
+        [
+            _canonical_reviewer_finding(
+                category="duplicate_existing_symbol", **{remedy_field: 123}
+            )
+        ]
+    )
+
+    normalized, errors = quality_evidence.normalize_reviewer_reports([report])
+
+    assert normalized == []
+    assert any(f"{remedy_field}_invalid" in error for error in errors)
+
+
+def test_existing_scope_and_actionable_gates_remain_unweakened() -> None:
+    # A non-defect finding must still be low severity (identity/scope gate),
+    # and a malformed reviewer verdict field is still ignored -- adding category
+    # parity does not introduce an empty-report workaround.
+    bad_nondefect = _reviewer_report(
+        [
+            _canonical_reviewer_finding(
+                disposition=quality_evidence.FINDING_DISPOSITION_OBSERVATION,
+                severity=quality_evidence.SEVERITY_HIGH,
+            )
+        ]
+    )
+    normalized, errors = quality_evidence.normalize_reviewer_reports([bad_nondefect])
+    assert normalized == []
+    assert any("nondefect_severity_must_be_low" in error for error in errors)
+
+    # A well-formed observation stays non-actionable and keeps its category.
+    ok_observation = _reviewer_report(
+        [
+            _canonical_reviewer_finding(
+                disposition=quality_evidence.FINDING_DISPOSITION_OBSERVATION,
+                severity=quality_evidence.SEVERITY_LOW,
+                category="general",
+            )
+        ]
+    )
+    normalized_ok, errors_ok = quality_evidence.normalize_reviewer_reports(
+        [ok_observation]
+    )
+    assert errors_ok == []
+    finding = normalized_ok[0]["findings"][0]
+    assert finding["actionable"] is False
+    assert finding["category"] == "general"
