@@ -1358,26 +1358,32 @@ def test_lost_ack_reconciles_identical_template_provenance(
     assert retry["created"] is False
     assert retry["reconciled"] is True
     assert retry["receipt_state"] == "existing_identical"
-    custom_digest = __import__("hashlib").sha256(
-        __import__("json").dumps(
-            {
-                "escape": "audited_custom_unclassified",
-                "name": "custom",
-                "registry_version": 1,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    custom = {
-        "schema_id": "aiworkhub.task_template_provenance.v1",
-        "template_name": "custom",
-        "template_full_id": f"custom@v1:{custom_digest}",
-        "registry_version": 1,
-        "definition_digest": custom_digest,
-        "classification_reason": "audited_custom_escape",
-        "expanded_contract_digest": provenance["expanded_contract_digest"],
-    }
+    from aiworkhub import task_templates
+
+    # A genuinely different but well-formed custom provenance over the same
+    # card fields. The previous fixture hashed the stale pre-``expanded_contract``
+    # custom definition, so it was rejected as malformed before reconciliation
+    # ever ran. This one carries the writable card's authoritative minimality
+    # contract, so it authenticates against the exact fields real core will
+    # create, yet its identity differs from the stored built-in receipt, so a
+    # same-id retry must report a template_provenance conflict rather than
+    # reconcile or fail validation.
+    custom = task_templates._custom_escape_provenance(
+        {
+            "allowed_writes": card["allowed_writes"],
+            "read_first": card["read_first"],
+            "read_only": False,
+            "required_outputs": card["required_outputs"],
+            "validation": card["validation"],
+            "validation_roles": card["validation_roles"],
+            "work_kind": "generic",
+            "minimality_contract": card["expanded"]["minimality_contract"],
+        }
+    )
+    assert custom["template_name"] == "custom"
+    assert (
+        custom["expanded_contract_digest"] == provenance["expanded_contract_digest"]
+    )
     conflict = _create_generic_python_task(
         "TASK_NF390_ACK", card, template_provenance=custom
     )

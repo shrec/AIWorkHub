@@ -1107,16 +1107,30 @@ def validate_template_provenance(
         "validation_roles": list(expanded_card.get("validation_roles") or []),
         "work_kind": str(expanded_card.get("work_kind") or "generic"),
     }
-    if not is_legacy:
-        digest_payload["minimality_contract"] = str(
-            expanded_card.get("minimality_contract") or ""
-        )
-    canonical_expanded_digest = hashlib.sha256(
-        json.dumps(
-            digest_payload, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-    ).hexdigest()
-    if expanded_digest != canonical_expanded_digest:
+
+    def _canonical_expanded_digest(include_minimality: bool) -> str:
+        payload = dict(digest_payload)
+        if include_minimality:
+            minimality = expanded_card.get("minimality_contract")
+            if minimality is None and not payload["read_only"]:
+                minimality = CANONICAL_MINIMALITY_CONTRACT
+            payload["minimality_contract"] = str(minimality or "")
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    # A read-only template's current and legacy definition digests coincide, so
+    # ``is_current`` and ``is_legacy`` can both hold for one authentic receipt.
+    # The current registry hashes the empty minimality contract into the
+    # expansion while the pre-minimality legacy registry omitted it. Authenticate
+    # against the format each identity actually claims -- current (with the
+    # minimality contract) or legacy (without) -- instead of dropping minimality
+    # whenever the legacy digest merely happens to match. A forged expansion that
+    # matches neither format still fails closed.
+    authenticated = (
+        is_current and expanded_digest == _canonical_expanded_digest(True)
+    ) or (is_legacy and expanded_digest == _canonical_expanded_digest(False))
+    if not authenticated:
         raise TaskTemplateError("template_expanded_contract_mismatch")
     validated = {
         "schema_id": PROVENANCE_SCHEMA_ID,

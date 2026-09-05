@@ -1851,6 +1851,113 @@ def test_persisted_pre_minimality_read_only_cards_keep_authenticated_identity(
         classify_task_card(**mutated)
 
 
+def test_read_only_current_and_legacy_receipts_disambiguate_by_format():
+    import hashlib
+
+    card = expand_template("read_only_analysis", production_paths=["src/mod.py"])
+    assert "minimality_contract" not in card
+    provenance = template_provenance_payload(
+        card, classification_reason="explicit_template"
+    )
+
+    # For a read-only template the current and legacy definition digests
+    # coincide, so a single receipt matches both identities. Authentication must
+    # still resolve which expansion format it actually carries.
+    spec = task_templates_module.TEMPLATE_SPECS["read_only_analysis"]
+    assert task_templates_module._definition_digest(spec) == (
+        task_templates_module._legacy_definition_digest(spec)
+    )
+
+    # A fresh current receipt survives a plain JSON round trip and binds to its
+    # exact card even though its identity also matches the legacy digest.
+    roundtripped = json.loads(json.dumps(provenance))
+    validated = validate_template_provenance(roundtripped, expanded_card=card)
+    assert validated["expanded_contract_digest"] == (
+        provenance["expanded_contract_digest"]
+    )
+
+    # The current expansion hashes the empty minimality contract; the
+    # pre-minimality legacy expansion omitted it, so the two digests differ and
+    # each stays valid only for its own declared format.
+    legacy_fields = {
+        "allowed_writes": list(card.get("allowed_writes") or []),
+        "read_first": list(card.get("read_first") or []),
+        "read_only": bool(card.get("read_only")),
+        "required_outputs": list(card.get("required_outputs") or []),
+        "validation": list(card.get("validation") or []),
+        "validation_roles": list(card.get("validation_roles") or []),
+        "work_kind": str(card.get("work_kind") or "generic"),
+    }
+    legacy_digest = hashlib.sha256(
+        json.dumps(legacy_fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assert legacy_digest != provenance["expanded_contract_digest"]
+    legacy_receipt = {
+        key: value for key, value in roundtripped.items() if key != "expanded_contract"
+    }
+    legacy_receipt["expanded_contract_digest"] = legacy_digest
+    legacy_validated = validate_template_provenance(legacy_receipt, expanded_card=card)
+    assert legacy_validated["expanded_contract_digest"] == legacy_digest
+
+    # A forged expansion digest that matches neither format still fails closed.
+    forged = {**roundtripped, "expanded_contract_digest": "f" * 64}
+    with pytest.raises(TaskTemplateError, match="template_expanded_contract_mismatch"):
+        validate_template_provenance(forged, expanded_card=card)
+
+
+def test_writable_plain_json_receipt_requires_authoritative_minimality():
+    # A writable template's expansion carries the canonical minimality contract
+    # implicitly. A plain JSON receipt has no bound source card, so it must be
+    # authenticated against a card that restores that authoritative value -- the
+    # exact normalization real ``create_task`` performs before the embedded
+    # comparison.
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/mod.py"],
+        test_paths=["tests/test_mod.py"],
+    )
+    assert card["minimality_contract"] == (
+        task_templates_module.CANONICAL_MINIMALITY_CONTRACT
+    )
+    provenance = template_provenance_payload(
+        card, classification_reason="explicit_template"
+    )
+    plain = json.loads(json.dumps(provenance))
+    assert not hasattr(plain, "expanded_card")
+
+    without_minimality = {
+        field: card.get(field)
+        for field in (
+            "allowed_writes",
+            "read_first",
+            "read_only",
+            "required_outputs",
+            "validation",
+            "validation_roles",
+            "work_kind",
+        )
+    }
+    # Dropping the authoritative minimality contract makes the genuine writable
+    # receipt look like a contract mismatch, so it must fail closed.
+    with pytest.raises(TaskTemplateError, match="template_expanded_contract_mismatch"):
+        validate_template_provenance(plain, expanded_card=without_minimality)
+
+    with_minimality = dict(
+        without_minimality, minimality_contract=card["minimality_contract"]
+    )
+    validated = validate_template_provenance(plain, expanded_card=with_minimality)
+    assert validated["expanded_contract_digest"] == (
+        provenance["expanded_contract_digest"]
+    )
+
+    # A receipt whose embedded minimality contract is stripped no longer matches
+    # the authoritative writable card and fails closed even with the correct card.
+    tampered = json.loads(json.dumps(provenance))
+    tampered["expanded_contract"]["minimality_contract"] = ""
+    with pytest.raises(TaskTemplateError, match="template_expanded_contract_mismatch"):
+        validate_template_provenance(tampered, expanded_card=with_minimality)
+
+
 def test_forged_legacy_provenance_cannot_select_weaker_digest_path(monkeypatch):
     legacy_definition_digest = (
         "023c786094c75429d1ddc081b38c1bb44959c1f52c42f8efd70c680686113dcf"

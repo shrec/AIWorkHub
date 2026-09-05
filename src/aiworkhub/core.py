@@ -3521,8 +3521,39 @@ def create_task(
                 custom_escape=custom_template_escape,
             )
         else:
+            # A bound provenance object carries the exact source card it was
+            # expanded from; a plain JSON receipt (persisted or re-supplied)
+            # does not, so authenticate that one against the actual card fields
+            # this request would create rather than a caller-chosen expansion.
+            # A writable card's authoritative minimality contract is implicit in
+            # its expansion, so add it here before the embedded-contract
+            # comparison; without it a genuine plain JSON receipt for a writable
+            # template is wrongly rejected as a contract mismatch.
+            requested_card = (
+                None
+                if hasattr(template_provenance, "expanded_card")
+                else {
+                    "allowed_writes": writes2,
+                    "read_first": read_first2,
+                    "read_only": read_only,
+                    "required_outputs": outputs2,
+                    "validation": validation2,
+                    "validation_roles": validation_roles2,
+                    "work_kind": work_kind,
+                    **(
+                        {}
+                        if read_only
+                        else {
+                            "minimality_contract": (
+                                task_templates.CANONICAL_MINIMALITY_CONTRACT
+                            )
+                        }
+                    ),
+                }
+            )
             bound_provenance = task_templates.validate_template_provenance(
-                template_provenance
+                template_provenance,
+                expanded_card=requested_card,
             )
             expected_digest = task_templates.expanded_contract_digest(
                 {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 
 import pytest
 
@@ -399,6 +400,111 @@ def test_create_from_template_real_core_accepts_every_template_id(
         assert card["task_type"] in _CANONICAL_TASK_TYPES
         created.append(template_id)
     assert created == list(TEMPLATE_IDS)
+
+
+def _expected_template_card(template_id):
+    paths = _TEMPLATE_PATHS[template_id]
+    return expand_template(
+        template_id,
+        production_paths=paths.get("production_paths"),
+        test_paths=paths.get("test_paths"),
+        title="Roundtrip template card",
+        objective="Authenticate a JSON round-tripped provenance receipt.",
+    )
+
+
+def _create_task_with_provenance(card, *, task_id, template_provenance):
+    return server.core.create_task(
+        task_id=task_id,
+        title="Roundtrip template card",
+        runner="codex_worker",
+        topic="coding",
+        objective="Authenticate a JSON round-tripped provenance receipt.",
+        acceptance=["Card matches the template."],
+        allowed_writes=list(card["allowed_writes"]),
+        required_outputs=list(card["required_outputs"]),
+        validation=list(card["validation"]),
+        validation_roles=list(card["validation_roles"]),
+        read_first=list(card["read_first"]),
+        work_kind=card["work_kind"],
+        read_only=card["read_only"],
+        template_provenance=template_provenance,
+        callback_required=False,
+    )
+
+
+def test_real_core_authenticates_json_roundtripped_provenance_every_template(
+    monkeypatch, tmp_path
+):
+    # Every built-in template, including read_only_analysis, must create through
+    # real core when its provenance is a plain JSON receipt (persisted and
+    # reloaded, so the bound source card is gone). Core authenticates it against
+    # the exact card fields it will create, restoring the writable card's
+    # authoritative minimality contract before the embedded comparison.
+    _enable_real_core_create(monkeypatch, tmp_path)
+    for template_id in TEMPLATE_IDS:
+        card = _expected_template_card(template_id)
+        provenance = template_provenance_payload(
+            card, classification_reason="explicit_template"
+        )
+        plain = json.loads(json.dumps(provenance))
+        assert not hasattr(plain, "expanded_card")
+        result = _create_task_with_provenance(
+            card,
+            task_id=f"TASK_ROUNDTRIP_{template_id.upper()}",
+            template_provenance=plain,
+        )
+        assert result.get("ok") is True, (template_id, result)
+        assert result.get("created") is True, (template_id, result)
+        stored = json.loads(result["stdout"])
+        bound = stored["template_provenance"]
+        assert bound["template_name"] == template_id, (template_id, bound)
+        assert bound["expanded_contract_digest"] == (
+            provenance["expanded_contract_digest"]
+        )
+
+
+def test_real_core_rejects_tampered_minimality_roundtripped_provenance(
+    monkeypatch, tmp_path
+):
+    _enable_real_core_create(monkeypatch, tmp_path)
+    card = _expected_template_card("implementation_with_tests")
+    provenance = template_provenance_payload(
+        card, classification_reason="explicit_template"
+    )
+    plain = json.loads(json.dumps(provenance))
+    # Strip the authoritative minimality contract from the embedded expansion:
+    # the receipt no longer matches the writable card real core will create.
+    plain["expanded_contract"]["minimality_contract"] = ""
+    result = _create_task_with_provenance(
+        card,
+        task_id="TASK_ROUNDTRIP_TAMPER_MINIMALITY",
+        template_provenance=plain,
+    )
+    assert result.get("ok") is False, result
+    assert result.get("created") is not True, result
+    assert result["stderr"] == "template_expanded_contract_mismatch", result
+
+
+def test_real_core_rejects_tampered_paths_roundtripped_provenance(
+    monkeypatch, tmp_path
+):
+    _enable_real_core_create(monkeypatch, tmp_path)
+    card = _expected_template_card("implementation_with_tests")
+    provenance = template_provenance_payload(
+        card, classification_reason="explicit_template"
+    )
+    plain = json.loads(json.dumps(provenance))
+    # Forge the receipt's declared write scope; it no longer matches the card.
+    plain["expanded_contract"]["allowed_writes"] = ["src/evil.py"]
+    result = _create_task_with_provenance(
+        card,
+        task_id="TASK_ROUNDTRIP_TAMPER_PATHS",
+        template_provenance=plain,
+    )
+    assert result.get("ok") is False, result
+    assert result.get("created") is not True, result
+    assert result["stderr"] == "template_expanded_contract_mismatch", result
 
 
 @pytest.mark.parametrize("path", ["--collect-only", "--exit-zero"])
