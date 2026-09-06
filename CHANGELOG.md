@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.98] - 2026-09-06
+
+### Fixed
+
+- Reuse computed Source Graph symbol metrics instead of recomputing them (NF-2026-00636).
+- Preserve packet-free retained projections (NF-2026-00637).
+- Restore priority parity between Plan and launch task ordering (NF-2026-00653).
+- Bound VS Code LM bridge recovery for missing-create finalization (NF-2026-00651).
+
 ## [0.10.97] - 2026-09-06
 
 ### Fixed
