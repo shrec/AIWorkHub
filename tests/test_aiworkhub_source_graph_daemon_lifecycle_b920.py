@@ -47,6 +47,19 @@ def in_process_builds_for_monkeypatches(monkeypatch):
         source_graph_daemon.BUILD_EXECUTION_ENV,
         source_graph_daemon.BUILD_EXECUTION_THREAD,
     )
+    started_daemons: list[source_graph_daemon.SourceGraphDaemon] = []
+    original_start = source_graph_daemon.SourceGraphDaemon.start
+
+    def tracked_start(daemon):
+        result = original_start(daemon)
+        if daemon not in started_daemons:
+            started_daemons.append(daemon)
+        return result
+
+    monkeypatch.setattr(source_graph_daemon.SourceGraphDaemon, "start", tracked_start)
+    yield
+    for daemon in reversed(started_daemons):
+        daemon.stop()
 
 
 @pytest.fixture
