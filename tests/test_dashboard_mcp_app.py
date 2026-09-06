@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +111,39 @@ def test_snapshot_view_reuses_build_snapshot_as_sole_data_builder(monkeypatch):
     assert result["authority_flags"]["readonly"] is True
     assert result["authority_flags"]["queue_write"] is False
     assert "transport_truncated_fields" not in result
+
+
+def test_snapshot_view_serializes_allocation_heavy_builds(monkeypatch):
+    barrier = threading.Barrier(3)
+    state_lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def fake_build_snapshot(**_kwargs):
+        nonlocal active, peak
+        with state_lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.03)
+        with state_lock:
+            active -= 1
+        return dict(FAKE_SNAPSHOT)
+
+    monkeypatch.setattr(dashboard, "build_snapshot", fake_build_snapshot)
+
+    def run_snapshot():
+        barrier.wait()
+        dashboard_mcp_app.snapshot_view(full=True)
+
+    threads = [threading.Thread(target=run_snapshot) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert peak == 1
 
 
 def test_snapshot_identity_does_not_hide_stopped_callback_dispatcher(monkeypatch):

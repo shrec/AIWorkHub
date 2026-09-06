@@ -18,6 +18,7 @@ import os
 import re
 import sqlite3
 import time
+from threading import Lock
 from typing import Any, Mapping
 
 from aiworkhub import (
@@ -113,6 +114,13 @@ MAX_MEMORY_VALUE_CHARS = 4000
 MAX_SESSION_ROWS = 200
 MAX_KB_ROWS = 200
 MAX_CONTEXT_VALUE_CHARS = 4000
+
+# Full snapshots transiently decode and join hundreds of rich task cards.  A
+# single mature-repository build peaks around 0.5 GiB even though the bounded
+# response is below 0.5 MiB.  Separate visible Webviews can ask the same stdio
+# server concurrently, so serialize that allocation-heavy phase process-wide;
+# per-view polling already coalesces its own requests.
+_SNAPSHOT_BUILD_LOCK = Lock()
 
 # The ONE genuine "repository has never been initialized" reason prefix
 # ``task_store.storage_readiness`` can produce: ``inspect_repository`` raised
@@ -535,12 +543,13 @@ def snapshot_view(
     prior_snapshot = previous if previous is not None else previous_snapshot
     if prior_snapshot is not None:
         build_kwargs["previous"] = prior_snapshot
-    snapshot = dict(
-        _debug_stage(
-            "dashboard.build_snapshot",
-            lambda: dashboard.build_snapshot(**build_kwargs),
+    with _SNAPSHOT_BUILD_LOCK:
+        snapshot = dict(
+            _debug_stage(
+                "dashboard.build_snapshot",
+                lambda: dashboard.build_snapshot(**build_kwargs),
+            )
         )
-    )
     storage = snapshot.get("storage")
     if isinstance(storage, dict) and not storage.get("ready", True):
         storage = dict(storage)
