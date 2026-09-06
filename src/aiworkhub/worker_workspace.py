@@ -9404,7 +9404,27 @@ def run_validations(
                 # commands never reach this branch, so their env/argv stay
                 # byte-equivalent to before.
                 pytest_root = resolve_trusted_pytest_runtime_root()
-                effective_components = (str(pytest_root),) + pythonpath_components
+                pytest_roots = [pytest_root]
+                active_pytest_root = _current_pytest_runtime_root()
+                if (
+                    active_pytest_root is not None
+                    and active_pytest_root != pytest_root
+                ):
+                    try:
+                        active_pytest_root = _validate_pytest_runtime_root(
+                            active_pytest_root,
+                            allow_active_runtime_world_writable=True,
+                        )
+                    except WorkspaceError:
+                        pass
+                    else:
+                        # The package already supplying pytest to this
+                        # coordinator must win over an auxiliary approved
+                        # component (for example a plugin-only user-site).
+                        pytest_roots.insert(0, active_pytest_root)
+                effective_components = tuple(
+                    str(root) for root in pytest_roots
+                ) + pythonpath_components
                 tokens = _normalize_pytest_validation_argv(tokens)
             if _is_python_validation_command(tokens):
                 effective_components = _candidate_pythonpath_components(
@@ -9564,6 +9584,36 @@ def run_validations(
                             for component in effective_components
                             if component not in safe_components
                         ],
+                    }
+                elif (
+                    _module_validator_fallback_authority(module_interpreter_authority)
+                    and _is_pytest_validation_command(tokens)
+                ):
+                    # B755/NF586 parity: pytest has a separately identity-checked
+                    # runtime root prepended to ``effective_components`` above.
+                    # Falling back to the coordinator interpreter must retain
+                    # that one trusted absolute component or the sanitized HOME
+                    # makes ``python -m pytest`` unimportable. Candidate-relative
+                    # components remain excluded, so this does not reopen the
+                    # module/startup shadowing path closed by NF586.
+                    safe_components = _validator_run_pythonpath_components(
+                        effective_components
+                    )
+                    if safe_components:
+                        env["PYTHONPATH"] = resolve_validation_pythonpath(
+                            workspace, selected_backend, safe_components
+                        )
+                    else:
+                        env.pop("PYTHONPATH", None)
+                    env_override_evidence = {
+                        "variable": "PYTHONPATH",
+                        "components": list(safe_components),
+                        "dropped_candidate_components": [
+                            component
+                            for component in effective_components
+                            if component not in safe_components
+                        ],
+                        "retained_for": "trusted_pytest_runtime",
                     }
                 elif _module_validator_fallback_authority(module_interpreter_authority):
                     # NF-2026-00586 finding one (rework HIGH): a ``<python> -m

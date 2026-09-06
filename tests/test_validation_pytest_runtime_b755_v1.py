@@ -166,11 +166,14 @@ class TestApprovedSitePythonpath(unittest.TestCase):
             )
 
         self.assertEqual(results[0]["returncode"], 0)
-        self.assertNotIn("PYTHONPATH", run.call_args.kwargs["env"])
+        pythonpath = run.call_args.kwargs["env"]["PYTHONPATH"].split(os.pathsep)
+        self.assertIn(str(self.site.resolve()), pythonpath)
+        self.assertNotIn(str(self.workspace.path), pythonpath)
         self.assertEqual(
-            results[0]["env_override"]["suppressed_for"],
-            "module_validator_no_trusted_root",
+            results[0]["env_override"]["retained_for"],
+            "trusted_pytest_runtime",
         )
+        self.assertEqual(results[0]["env_override"]["dropped_candidate_components"], [])
 
 
 @unittest.skipIf(os.name == "nt", "requires POSIX ownership and sandbox semantics")
@@ -431,9 +434,14 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
                 ["-P", "-m", "pytest"],
             )
             self.assertIn("pytest", results[0]["stdout_tail"])
+            self.assertTrue(
+                results[0]["interpreter_authority"]["source"].startswith(
+                    "module_validator_no_trusted_root:"
+                )
+            )
             self.assertEqual(
-                results[0]["interpreter_authority"]["source"],
-                "module_validator_trusted_runtime_root",
+                results[0]["env_override"]["retained_for"],
+                "trusted_pytest_runtime",
             )
         finally:
             worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
@@ -454,7 +462,12 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
             self.assertIn("pytest", record["stdout_tail"])
             self.assertEqual(record["env_override"]["variable"], "PYTHONPATH")
             components = record["env_override"]["components"]
-            self.assertEqual(components, [str(fake_root.resolve())])
+            active_root = worker_workspace._current_pytest_runtime_root()
+            self.assertIsNotNone(active_root)
+            self.assertEqual(
+                components,
+                [str(active_root), str(fake_root.resolve())],
+            )
             self.assertEqual(record["env_override"]["dropped_candidate_components"], ["."])
         finally:
             worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
