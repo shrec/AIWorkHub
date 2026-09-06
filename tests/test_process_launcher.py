@@ -6233,9 +6233,20 @@ def _reviewer_launch_setup(tmp_path: Path, monkeypatch):
         show_task=_show(lambda: _quality_review_card()),
         argv=[sys.executable, "-c", "pass"],
     )
+    def fake_claim_start_exact(_repo, task_id, runner, topic, *, request_id):
+        card = _quality_review_card(task_id)
+        card.update(
+            {
+                "runner": runner,
+                "topic": topic,
+                "launch_request_id": request_id,
+                "claim_epoch": 1,
+            }
+        )
+        return {"ok": True, "returncode": 0, "stdout": json.dumps(card)}
+
     monkeypatch.setattr(
-        process_launcher.task_engine, "claim_start_exact",
-        lambda *a, **k: {"ok": True},
+        process_launcher.task_engine, "claim_start_exact", fake_claim_start_exact
     )
     monkeypatch.setattr(
         process_launcher, "_task_authority_repo", lambda repo, card: repo.resolve()
