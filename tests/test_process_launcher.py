@@ -10926,6 +10926,14 @@ def test_declared_validation_forwards_preflight_toolchain_receipt(
         return [{"returncode": 0}]
 
     monkeypatch.setattr(process_launcher, "run_validations", fake_run_validations)
+    # This unit exercises receipt forwarding, not host sandbox discovery.  A
+    # native macOS runner has neither Landlock nor bubblewrap, so keep the
+    # route deterministic instead of consulting the CI host.
+    monkeypatch.setattr(
+        process_launcher,
+        "_sandbox_backend_for_adapter",
+        lambda _adapter_id: "test-sandbox",
+    )
 
     rows = process_launcher._run_declared_validations(
         workspace,
