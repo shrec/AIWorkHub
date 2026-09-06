@@ -21,6 +21,8 @@ node_modules/
 *.sqlite
 *.sqlite3
 *.db
+/.bitnn/
+/.claude/settings.local.json
 .aiworkhub/*
 !.aiworkhub/config/
 .aiworkhub/config/*
@@ -43,6 +45,11 @@ node_modules/
 /AUDIT_TOKEN_ECONOMY_AND_AGENT_QUALITY_*.md
 /docs/AUDIT_2026-08-03.md
 /docs/LIVE_BUG_BACKLOG_2026-08-03.md
+/docs/*_2026-*.md
+/docs/PONYTAIL_CAPABILITY_REVIEW.md
+/docs/reviews/*
+!/docs/reviews/README.md
+/site/assets/aiworkhub-*.png
 
 # Local manager instructions and generated design drafts.
 /AGENTS.md
