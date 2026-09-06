@@ -206,6 +206,11 @@ def test_registry_minimum_version_uses_executable_version_output(
         "_normalize_trusted_validation_executable_argv_with_roots",
         lambda argv, _repo: ([str(validator), *argv[1:]], ()),
     )
+    monkeypatch.setattr(
+        worker_workspace,
+        "trusted_validation_executable_version",
+        lambda resolved: "2.4.1" if resolved == str(validator.resolve()) else "",
+    )
 
     snapshot = toolchain_authority.ToolchainAuthority(
         tmp_path, capability_probe=lambda _repo, _card: ()
