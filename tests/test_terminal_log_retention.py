@@ -290,6 +290,59 @@ def test_terminal_log_quarantine_restore_and_explicit_purge_gate(tmp_path: Path)
     assert (process_root / f"{request_id}.stdout.log").is_file()
 
 
+def test_enforce_purges_expired_batch_beyond_bounded_ui_window(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    quarantine = repo / terminal_log_retention.QUARANTINE_RELATIVE_PATH
+    quarantine.mkdir(parents=True, exist_ok=True)
+    repo_id = terminal_log_retention._repo_id(repo)
+
+    def write_batch(batch_id: str, deadline: str) -> Path:
+        batch = quarantine / batch_id
+        batch.mkdir()
+        (batch / "payload.log").write_text("x", encoding="utf-8")
+        terminal_log_retention._atomic_json(
+            batch / terminal_log_retention.MANIFEST_NAME,
+            {
+                "schema_id": terminal_log_retention.SCHEMA_ID,
+                "repo_id": repo_id,
+                "batch_id": batch_id,
+                "created_at": "2034-01-01T00:00:00+00:00",
+                "restore_deadline": deadline,
+                "status": "quarantined",
+                "quarantined_bytes": 1,
+                "items": [
+                    {
+                        "request_id": "a" * 32,
+                        "state": "quarantined",
+                        "files": [],
+                    }
+                ],
+            },
+        )
+        return batch
+
+    expired = write_batch(
+        "l20200101T000000-000000000000", "2030-01-01T00:00:00+00:00"
+    )
+    for index in range(100):
+        write_batch(
+            f"l20340101T000000-{index:012x}", "2040-01-01T00:00:00+00:00"
+        )
+
+    # The operator-facing listing is deliberately bounded and cannot see the
+    # older entry. Automatic enforcement must still scan every deadline.
+    listed = terminal_log_retention.list_batches(repo)
+    assert listed["count"] == 100
+    assert all(row["batch_id"] != expired.name for row in listed["batches"])
+
+    result = terminal_log_retention.enforce(repo)
+
+    assert result["purged_batches"] == 1
+    assert result["purged_bytes"] == 1
+    assert result["next_deadline"] == "2040-01-01T00:00:00+00:00"
+    assert not expired.exists()
+
+
 def test_stale_preview_and_symlink_swap_fail_closed(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     for index in range(11):

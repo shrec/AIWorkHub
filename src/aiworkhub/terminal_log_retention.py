@@ -950,6 +950,46 @@ def list_batches(repo_root: Path | str) -> dict[str, Any]:
     return {"ok": True, "batches": rows, "count": len(rows)}
 
 
+def _all_batch_deadlines(root: Path) -> list[tuple[str, datetime]]:
+    """Return every valid quarantine deadline without walking batch payloads.
+
+    ``list_batches`` is intentionally UI-bounded to the newest 100 entries. It
+    must therefore never drive automatic expiry: on a busy repository, a steady
+    stream of new batches kept every older expired batch permanently outside
+    that window. This lightweight authority scan reads only each manifest and
+    lets enforcement purge the complete expired population.
+    """
+    qroot = root / QUARANTINE_RELATIVE_PATH
+    try:
+        info = qroot.lstat()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise TerminalLogRetentionError("terminal_log_quarantine_root_invalid") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise TerminalLogRetentionError("terminal_log_quarantine_root_invalid")
+    repo_id = _repo_id(root)
+    rows: list[tuple[str, datetime]] = []
+    for entry in qroot.iterdir():
+        try:
+            entry_info = entry.lstat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISLNK(entry_info.st_mode)
+            or not stat.S_ISDIR(entry_info.st_mode)
+            or not _BATCH_RE.fullmatch(entry.name)
+        ):
+            continue
+        try:
+            value = _manifest(entry / MANIFEST_NAME, repo_id)
+            deadline = datetime.fromisoformat(str(value.get("restore_deadline") or ""))
+        except (TerminalLogRetentionError, ValueError):
+            continue
+        rows.append((entry.name, deadline))
+    return sorted(rows, key=lambda item: (item[1], item[0]))
+
+
 def restore(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str, Any]:
     if confirm is not True:
         raise TerminalLogRetentionError("explicit_confirmation_required")
@@ -1717,7 +1757,8 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
     try:
         purged_batches = 0
         purged_bytes = 0
-        for row in list_batches(root).get("batches") or []:
+        next_deadline: tuple[datetime, str] | None = None
+        for batch_id, deadline in _all_batch_deadlines(root):
             # Reap only batches whose independent seven-day undo window has
             # actually expired.  A pre-existing empty batch is reapable on an
             # explicit operator purge (see ``purge``/``_batch_is_empty``), but
@@ -1725,13 +1766,11 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
             # release: this repository has spent enough of its history letting
             # retention destroy things that were still wanted, so an empty batch
             # is made eligible and surfaced, not silently swept.
-            try:
-                deadline = datetime.fromisoformat(str(row.get("restore_deadline") or ""))
-            except ValueError:
-                continue
             if now_utc() < deadline:
+                if next_deadline is None or deadline < next_deadline[0]:
+                    next_deadline = (deadline, deadline.isoformat())
                 continue
-            result = purge(root, batch_id=str(row["batch_id"]), confirm=True)
+            result = purge(root, batch_id=batch_id, confirm=True)
             purged_batches += 1
             purged_bytes += int(result.get("bytes") or 0)
 
@@ -1785,6 +1824,7 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
             "log_bytes_freed": int(process_bounds.get("log_bytes_freed") or 0),
             "bundles_quarantined": int(process_bounds.get("bundles_quarantined") or 0),
             "bundle_bytes": int(process_bounds.get("bundle_bytes") or 0),
+            "next_deadline": next_deadline[1] if next_deadline else None,
         }
     finally:
         _enforcement_lock.release()
