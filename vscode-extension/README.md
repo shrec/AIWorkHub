@@ -12,6 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.96 — 2026-09-06
+
+- Source Graph closes failure-path SQLite connections deterministically, and
+  terminal outcomes expose evidence support instead of hiding contradictions.
+- Worker preflight catches coordinator-only validation paths while preserving
+  valid compile-and-run chains; generated manager-policy carriers are checked
+  against the real repository tree.
+
 ## What's new in 0.10.95 — 2026-09-06
 
 - Dashboard polling is bounded, terminal worktrees receive automatic

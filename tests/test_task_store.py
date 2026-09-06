@@ -613,6 +613,28 @@ def test_mark_terminal_review_known_failure_substatus_never_deterministically_pa
     assert verification["reason"] == "known_failure_substatus"
 
 
+def test_mark_terminal_review_persists_validation_evidence_support(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_id = "TASK_CONTRADICTED_VALIDATION_FAILURE_NF621"
+    _insert_task(repo, task_id, status="processing")
+
+    ok, state = task_store.mark_terminal_review(
+        repo,
+        task_id,
+        runner="codex_worker_b891",
+        substatus="validation_failed",
+        evidence={"validation": [{"command": "pytest", "returncode": 0}]},
+    )
+
+    assert (ok, state) == (True, "review")
+    card = task_store.get_task(repo, task_id)
+    verification = card["deterministic_verification"]
+    assert verification["reason"] == "substatus_contradicted_by_evidence"
+    assert verification["evidence_support"] == "contradicted"
+    assert card["terminal_review"]["evidence_support"] == "contradicted"
+
+
 def test_mark_terminal_review_review_ready_with_no_gates_is_not_applicable(
     tmp_path: Path,
 ) -> None:

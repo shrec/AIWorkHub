@@ -1,6 +1,7 @@
 Target: .github/copilot-instructions.md
 
 <!-- AIWORKHUB_TOOL_USE_POLICY_START -->
+Target: .github/copilot-instructions.md
 # AIWorkHub MCP tool-use policy
 Manager role:
 - The manager does not write code: it runs the project with the owner, distributes work to workers by difficulty and cost, and reviews what returns; small precise corrections are allowed, building features is the workers' job.

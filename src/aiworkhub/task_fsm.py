@@ -313,6 +313,83 @@ def evidence_verdict(
 # failure class: it can only ever deterministically fail, never pass.
 _SUCCESS_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset({"review_ready", "exited"})
 
+# The failure substatuses whose MEANING is a claim about recorded evidence.
+# ``validation_failed`` asserts one specific measurable thing: a declared
+# validation was run and it failed. That assertion is checkable against the
+# same evidence_verdict the record already carries, so it is the one failure
+# class whose reason must be derived rather than asserted.
+#
+# Deliberately narrow. ``worker_failed``, ``cancelled``, ``timed_out`` and the
+# rest are claims about the PROCESS, not about validation evidence, and an
+# absent measurement is honest for them -- a worker that died before running
+# anything genuinely has nothing to measure. ``required_output_unchanged`` is
+# excluded too: "unchanged" is not what ``missing_required_output_count``
+# counts (that counts records with no path/sha256/size), so this verdict
+# cannot adjudicate it and must not pretend to.
+_EVIDENCE_BEARING_FAILURE_SUBSTATUSES: frozenset[str] = frozenset({"validation_failed"})
+
+# What the recorded evidence says about an evidence-bearing failure claim.
+EVIDENCE_SUPPORT_NOT_APPLICABLE = "not_applicable"
+EVIDENCE_SUPPORT_SUPPORTED = "supported"
+EVIDENCE_SUPPORT_UNMEASURED = "unmeasured"
+EVIDENCE_SUPPORT_CONTRADICTED = "contradicted"
+
+# Reason strings keyed by what the evidence actually supports. ``supported``
+# and ``not_applicable`` keep the historical ``known_failure_substatus`` value
+# so every existing reader of a correctly-recorded failure keeps working; only
+# the two cases that were previously mislabelled get their own names.
+_FAILURE_REASON_BY_SUPPORT: Mapping[str, str] = MappingProxyType(
+    {
+        EVIDENCE_SUPPORT_NOT_APPLICABLE: "known_failure_substatus",
+        EVIDENCE_SUPPORT_SUPPORTED: "known_failure_substatus",
+        EVIDENCE_SUPPORT_UNMEASURED: "substatus_unsupported_no_evidence_recorded",
+        EVIDENCE_SUPPORT_CONTRADICTED: "substatus_contradicted_by_evidence",
+    }
+)
+
+
+def evidence_support(substatus: str, verdict: Mapping[str, object]) -> str:
+    """Say what the recorded evidence supports about one terminal claim.
+
+    Measured on the canonical ledger of this repository (NF-2026-00621):
+    of 1,589 ``validation_failed`` terminal_review records, 189 (11.9%) had
+    ``failed_validation_count == 0`` with ``validation_count > 0`` -- the
+    declared validations ran and none of them failed -- and 333 (21.0%)
+    carried no measurement at all. Every one of those was nevertheless
+    recorded with ``reason = "known_failure_substatus"``, because the reason
+    was asserted from the substatus instead of derived from the evidence
+    sitting in the same record. That made the mechanical/genuine split
+    uncomputable from the ledger.
+
+    Pure and total: never raises, never mutates, returns one of the four
+    ``EVIDENCE_SUPPORT_*`` constants.
+    """
+    substatus = (substatus or "").strip()
+    if substatus not in _EVIDENCE_BEARING_FAILURE_SUBSTATUSES:
+        return EVIDENCE_SUPPORT_NOT_APPLICABLE
+
+    def _count(key: str) -> int:
+        value = verdict.get(key) if isinstance(verdict, Mapping) else None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return 0
+        return value
+
+    failed = _count("failed_validation_count")
+    missing = _count("missing_required_output_count")
+    if failed > 0 or missing > 0:
+        return EVIDENCE_SUPPORT_SUPPORTED
+
+    # Nothing was measured at all: no validation ran and no required output
+    # was checked, so nothing proves a validation failure either way. This is
+    # an unmeasured attempt, not a measured one that failed.
+    measured = _count("validation_count") + _count("required_output_count")
+    if not measured:
+        return EVIDENCE_SUPPORT_UNMEASURED
+
+    # Evidence exists and every piece of it passed, yet the outcome claims a
+    # validation failure. The record contradicts itself.
+    return EVIDENCE_SUPPORT_CONTRADICTED
+
 
 def deterministic_verification(
     substatus: str,
@@ -338,22 +415,31 @@ def deterministic_verification(
     except (TypeError, ValueError):
         epoch = 0
 
+    support = evidence_support(substatus, verdict)
+
     if substatus not in KNOWN_TERMINAL_SUBSTATUSES:
         return {
             "applicable": False,
             "pass": False,
             "substatus": substatus,
             "reason": "unknown_substatus",
+            "evidence_support": EVIDENCE_SUPPORT_NOT_APPLICABLE,
             "claim_epoch": epoch,
             "evidence_verdict": verdict,
         }
 
     if substatus not in _SUCCESS_TERMINAL_SUBSTATUSES:
+        # The reason is DERIVED from the evidence in this same record, never
+        # asserted from the substatus alone. A failure class whose evidence
+        # does not support it is reported as unsupported or contradicted, so
+        # a self-contradicting outcome can no longer be audited in as a
+        # measured failure (NF-2026-00621).
         return {
             "applicable": True,
             "pass": False,
             "substatus": substatus,
-            "reason": "known_failure_substatus",
+            "reason": _FAILURE_REASON_BY_SUPPORT[support],
+            "evidence_support": support,
             "claim_epoch": epoch,
             "evidence_verdict": verdict,
         }
@@ -364,6 +450,7 @@ def deterministic_verification(
             "pass": False,
             "substatus": substatus,
             "reason": "no_gates_recorded",
+            "evidence_support": EVIDENCE_SUPPORT_NOT_APPLICABLE,
             "claim_epoch": epoch,
             "evidence_verdict": verdict,
         }
@@ -373,12 +460,17 @@ def deterministic_verification(
         "pass": bool(verdict["passed"]),
         "substatus": substatus,
         "reason": "evidence_verdict_passed" if verdict["passed"] else "evidence_verdict_failed",
+        "evidence_support": EVIDENCE_SUPPORT_NOT_APPLICABLE,
         "claim_epoch": epoch,
         "evidence_verdict": verdict,
     }
 
 
 __all__ = [
+    "EVIDENCE_SUPPORT_CONTRADICTED",
+    "EVIDENCE_SUPPORT_NOT_APPLICABLE",
+    "EVIDENCE_SUPPORT_SUPPORTED",
+    "EVIDENCE_SUPPORT_UNMEASURED",
     "KNOWN_TERMINAL_SUBSTATUSES",
     "LAUNCHER_TERMINAL_SUBSTATUSES",
     "LEGAL_SOURCE_STATUSES_FOR_TERMINAL_REVIEW",
@@ -387,5 +479,6 @@ __all__ = [
     "TERMINAL_SUBSTATUS_TO_CALLBACK_CLASS",
     "check_terminal_review_transition",
     "deterministic_verification",
+    "evidence_support",
     "evidence_verdict",
 ]

@@ -2119,6 +2119,20 @@ def _mark_terminal_review_transaction(
             "substatus": substatus[:120],
             "evidence": evidence_payload,
             "deterministic_verification": deterministic_verification,
+            # NF-2026-00621: what the recorded evidence actually supports about
+            # this claim, hoisted to the top level so the mechanical/genuine
+            # split is one indexed field away instead of a nested dig through
+            # every payload. "contradicted" means the declared validations ran
+            # and none failed; "unmeasured" means nothing was measured at all.
+            # The substatus itself is deliberately NOT rewritten: it is
+            # load-bearing for rework recovery (the live-claim set and the
+            # retained-predecessor match both key on "validation_failed"), so
+            # correcting the verdict must not silently drop a card out of the
+            # recoverable population.
+            "evidence_support": str(
+                deterministic_verification.get("evidence_support")
+                or task_fsm.EVIDENCE_SUPPORT_NOT_APPLICABLE
+            ),
             "recorded_at": now,
             "runner": runner,
             "claim_epoch": claim_epoch,

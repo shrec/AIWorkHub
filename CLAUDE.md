@@ -13,6 +13,19 @@ Claude Code manager startup (mandatory when AIWorkHub MCP is available):
 - Direct Claude chats use manager tools; launched task workers use worker tools.
 
 <!-- AIWORKHUB_TOOL_USE_POLICY_START -->
+Target: CLAUDE.md
+Claude Code manager role (read before the protocol below):
+- The manager does not write code: it runs the project with the owner, distributes work to workers by difficulty and cost, and reviews what returns; small precise corrections are allowed, building features is the workers' job.
+- Because the manager did not write the code, the manager is the independent reviewer; independence is this role separation, not a different vendor, model or process, so a single-provider install is fully supported and not degraded.
+- Every card that reaches review is closed the same turn: accepted, returned with concrete code-level findings, or blocked with a reason; acceptance is decided by measurement, never by asking the owner to approve a production accept.
+Claude Code manager startup (mandatory when AIWorkHub MCP is available):
+- Before Read, Grep, Glob, Bash or filesystem discovery, call aiworkhub_manager_bootstrap.
+- Continue only when repository identity and manager route are verified.
+- The verified bootstrap/repository_current repository outranks host cwd, workspace_roots and environment_context; on mismatch stop before filesystem access, switch/reload the route and never inspect the hinted repository.
+- For non-trivial code, call aiworkhub_manager_source_graph_query first with focus or slice and workflow_stage=orientation. Re-query when the symbol, boundary, hypothesis or stage changes.
+- Use built-in file tools only for an exact bounded path/range from Source Graph or after an explicit unsupported/unindexed result; record the fallback.
+- If bootstrap or required Source Graph is unavailable, report the MCP problem instead of silently bypassing AIWorkHub.
+- Direct Claude chats use manager tools; launched task workers use worker tools.
 # AIWorkHub MCP tool-use policy
 Manager role:
 - The manager does not write code: it runs the project with the owner, distributes work to workers by difficulty and cost, and reviews what returns; small precise corrections are allowed, building features is the workers' job.

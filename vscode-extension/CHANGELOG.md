@@ -1,5 +1,18 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.96 — 2026-09-06
+
+### Fixed
+
+- Close failed-build Source Graph connections explicitly instead of relying on
+  garbage collection.
+- Record whether terminal validation-failure claims are supported,
+  unmeasured, or contradicted by their own evidence.
+- Detect coordinator-only untracked validation paths before launch without
+  rejecting binaries produced by an earlier declared compile step.
+- Gate the repository's manager-policy carriers against their canonical
+  generated projections.
+
 ## 0.10.95 — 2026-09-06
 
 ### Fixed

@@ -180,8 +180,8 @@ def test_sync_preserves_host_prefix_and_suffix_prose(tmp_path: Path, monkeypatch
 
     assert changed == list(policy_sync.HOST_FILES)
     canonical = policy_sync.read_canonical(tmp_path)
-    generated = policy_sync.generated_block(canonical)
     for relative_path, (prefix, suffix) in surrounding.items():
+        generated = policy_sync.generated_block(canonical, relative_path)
         assert (tmp_path / relative_path).read_bytes() == prefix + generated + suffix
 
 
@@ -213,7 +213,7 @@ def test_sync_preserves_surrounding_host_prose_when_migrating_marker_boundary(
         assert data.endswith(b"\nhost prose after\n")
         assert data == (
             b"host prose before\n"
-            + policy_sync.generated_block(canonical)
+            + policy_sync.generated_block(canonical, relative_path)
             + b"\nhost prose after\n"
         )
 

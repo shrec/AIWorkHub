@@ -8,10 +8,17 @@ import hashlib
 import os
 import secrets
 import stat
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
+
+SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from aiworkhub import agent_tool_instructions
 
 try:
     from aiworkhub import platform_io
@@ -317,7 +324,12 @@ def read_canonical(root: Path = REPO_ROOT) -> bytes:
     return data
 
 
-def generated_block(canonical: bytes) -> bytes:
+def generated_block(canonical: bytes, provider: Path | str | None = None) -> bytes:
+    provider_name = Path(provider).as_posix() if provider is not None else ""
+    if provider_name in agent_tool_instructions.PROVIDERS:
+        return agent_tool_instructions.render_projection(provider_name).rstrip("\n").encode(
+            "utf-8"
+        )
     return START_MARKER_BYTES + b"\n" + canonical + END_MARKER_BYTES
 
 
@@ -346,7 +358,7 @@ def extract_block(data: bytes, path: Path) -> PolicyBlock:
 
 def synced_text(data: bytes, canonical: bytes, path: Path) -> bytes:
     block = extract_block(data, path)
-    return data[: block.start] + generated_block(canonical) + data[block.end :]
+    return data[: block.start] + generated_block(canonical, path) + data[block.end :]
 
 
 def check(root: Path = REPO_ROOT, host_files: Sequence[Path] = HOST_FILES) -> list[str]:
@@ -364,7 +376,7 @@ def check(root: Path = REPO_ROOT, host_files: Sequence[Path] = HOST_FILES) -> li
         except PolicySyncError as exc:
             errors.append(str(exc))
             continue
-        if data[block.start : block.end] != generated_block(canonical):
+        if data[block.start : block.end] != generated_block(canonical, relative_path):
             errors.append(f"{relative_path}: policy block differs from {POLICY_SOURCE}")
     return errors
 

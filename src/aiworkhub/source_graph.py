@@ -49,7 +49,7 @@ import time
 import tokenize
 from collections import deque
 from concurrent.futures.process import BrokenProcessPool
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -3321,7 +3321,7 @@ def _persist_failed_build_metadata(
     internally-produced metadata row into the canonical database while the
     repository writer lease is held; no candidate entities or edges are exposed.
     """
-    with connect(staging_path, read_only=True) as staging:
+    with closing(connect(staging_path, read_only=True)) as staging:
         row = staging.execute(
             "SELECT value FROM meta WHERE key='last_build'"
         ).fetchone()
@@ -3332,12 +3332,13 @@ def _persist_failed_build_metadata(
         raise SourceGraphError("source_graph_failed_build_metadata_invalid")
     payload["status"] = "failed"
     payload["failure_reason"] = str(failure)
-    with connect(canonical_path) as canonical:
+    with closing(connect(canonical_path)) as canonical:
         canonical.execute(
             "INSERT INTO meta(key, value) VALUES('last_build', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (json.dumps(payload),),
         )
+        canonical.commit()
 
 
 def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bool = True) -> BuildReport:

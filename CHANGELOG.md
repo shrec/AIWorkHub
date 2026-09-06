@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.96] - 2026-09-06
+
+### Fixed
+
+- Close Source Graph SQLite connections deterministically on both successful
+  and failed metadata publication paths.
+- Derive validation-failure evidence support from the recorded checks, making
+  contradicted and unmeasured terminal outcomes machine-readable without
+  weakening retained-candidate recovery.
+- Refuse coordinator-only untracked validation paths before worker launch,
+  while preserving declared compile-to-generated-executable chains.
+- Enforce the generated manager-policy projections against the real repository
+  tree so hand-edited carrier drift cannot pass CI.
+
 ## [0.10.95] - 2026-09-06
 
 ### Fixed

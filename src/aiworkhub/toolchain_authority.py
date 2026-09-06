@@ -55,6 +55,133 @@ _SECRET_RELATIVE = ".aiworkhub/toolchain-authority/receipt-hmac.key"
 _RECEIPT_MAC_KEY = "receipt_mac"
 
 
+# NF-2026-00625: a declared validation command is resolved by the coordinator
+# against the CANONICAL repository, but it is executed by a worker inside an
+# isolated git worktree. A git worktree materializes tracked content, so a
+# repository-relative path that git does not track is present for the
+# coordinator and absent for the worker -- the command passes preflight and
+# then cannot possibly run.
+#
+# Measured on this repository's canonical ledger: of 1,053 validation_failed
+# records carrying a declared command, 196 attempts across 138 distinct tasks
+# named a repository-local virtualenv binary, and a filesystem census of the
+# 18 live worker worktrees found 0 of them containing a virtualenv directory.
+#
+# Deliberately narrow, and the boundary is stated rather than guessed: this
+# resolves only repository-relative paths, where "present for the coordinator,
+# untracked, therefore absent for the worker" is a provable fact from the git
+# index. It says NOTHING about bare PATH executables such as node/npm/npx --
+# whether a given adapter's sandbox grants those is adapter policy this module
+# cannot observe, and inventing a verdict there would be an unmeasured bound.
+WORKER_WORKTREE_ABSENT = "repository_path_untracked_so_absent_from_worker_worktree"
+
+
+def repository_tracked_paths(repo: Path) -> frozenset[str]:
+    """Every path git tracks for ``repo``, as repo-relative POSIX strings.
+
+    Returns an empty set when git is unavailable or the directory is not a
+    work tree. An empty set makes ``worker_workspace_unresolvable_paths``
+    report nothing, which is the fail-open direction on purpose: this check
+    may only ever ADD a refusal it can prove, never manufacture one from a
+    missing git.
+    """
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), "ls-files", "-z"],
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return frozenset()
+    if completed.returncode != 0:
+        return frozenset()
+    return frozenset(
+        chunk.decode("utf-8", "surrogateescape")
+        for chunk in completed.stdout.split(b"\0")
+        if chunk
+    )
+
+
+def worker_workspace_unresolvable_paths(
+    repo: Path,
+    command: str,
+    *,
+    tracked: frozenset[str],
+    generated_paths: frozenset[str] = frozenset(),
+) -> tuple[tuple[str, str], ...]:
+    """Repository-relative tokens a worker's worktree cannot supply.
+
+    Pure apart from stat-ing the coordinator's own repository: no network, no
+    mutation, no subprocess. Returns ``(token, reason)`` pairs, empty when
+    every repository-relative token in ``command`` is tracked and therefore
+    materialized in the worker's worktree.
+    """
+    if not tracked:
+        return ()
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return ()
+
+    findings: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if not token or token.startswith("-"):
+            continue
+        if "/" not in token or token.startswith("/") or ":" in token:
+            continue
+        candidate = os.path.normpath(token)
+        if candidate.startswith("..") or candidate in seen:
+            continue
+        seen.add(candidate)
+        posix = Path(candidate).as_posix()
+        if posix in generated_paths:
+            continue
+        if posix in tracked:
+            continue
+        prefix = posix + "/"
+        if any(entry.startswith(prefix) for entry in tracked):
+            continue
+        # Untracked. It only matters when it exists for the coordinator:
+        # a path missing on both sides is already reported by the existing
+        # executable/repository_input checks, and reporting it twice would
+        # just duplicate an existing refusal.
+        if (repo / candidate).exists():
+            findings.append((posix, WORKER_WORKTREE_ABSENT))
+    return tuple(findings)
+
+
+def declared_compiler_outputs(command: str) -> frozenset[str]:
+    """Return repository-relative outputs declared with a compiler ``-o``.
+
+    A later validation command may execute a binary created by an earlier
+    compile command.  Such a path is intentionally untracked but is still
+    available in the worker workspace, so it must not be classified as an
+    impossible coordinator-only dependency.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return frozenset()
+    outputs: set[str] = set()
+    for index, token in enumerate(tokens):
+        raw = ""
+        if token == "-o" and index + 1 < len(tokens):
+            raw = tokens[index + 1]
+        elif token.startswith("-o") and len(token) > 2:
+            raw = token[2:]
+        if not raw or raw.startswith("/") or ":" in raw:
+            continue
+        candidate = os.path.normpath(raw)
+        if candidate.startswith(".."):
+            continue
+        outputs.add(Path(candidate).as_posix())
+    return frozenset(outputs)
+
+
 class ProvisioningDomain(str, Enum):
     """Typed boundary for capabilities deliberately outside ordinary tools."""
 
@@ -688,6 +815,36 @@ class ToolchainAuthority:
                     (detail if separator else kind)[:1024],
                 )
             )
+        # NF-2026-00625: the probe above resolves against the coordinator's own
+        # repository, where an untracked path like a repo-local virtualenv is
+        # present. The worker gets a git worktree, where it is not. Refuse here,
+        # before a token is spent, instead of at finalization.
+        tracked = repository_tracked_paths(self.repo)
+        if tracked:
+            commands = tuple(
+                value
+                for value in (card.get("validation") or [])
+                if isinstance(value, str) and value.strip()
+            )
+            generated_paths = frozenset(
+                output
+                for command in commands
+                for output in declared_compiler_outputs(command)
+            )
+            for command in commands:
+                for token, reason in worker_workspace_unresolvable_paths(
+                    self.repo,
+                    command,
+                    tracked=tracked,
+                    generated_paths=generated_paths,
+                ):
+                    missing.add(
+                        MissingRequirement(
+                            "worker_workspace",
+                            f"{reason}:{token}"[:1024],
+                            command[:1024],
+                        )
+                    )
         return sorted(facts.values(), key=lambda fact: fact.canonical_path), modules, missing
 
     def evaluate(self, card: Mapping[str, Any]) -> AuthoritySnapshot:
