@@ -166,14 +166,11 @@ class TestApprovedSitePythonpath(unittest.TestCase):
             )
 
         self.assertEqual(results[0]["returncode"], 0)
-        pythonpath = run.call_args.kwargs["env"]["PYTHONPATH"].split(os.pathsep)
-        self.assertIn(str(self.site.resolve()), pythonpath)
-        self.assertNotIn(str(self.workspace.path), pythonpath)
+        self.assertNotIn("PYTHONPATH", run.call_args.kwargs["env"])
         self.assertEqual(
-            results[0]["env_override"]["retained_for"],
-            "trusted_pytest_runtime",
+            results[0]["env_override"]["suppressed_for"],
+            "module_validator_no_trusted_root",
         )
-        self.assertEqual(results[0]["env_override"]["dropped_candidate_components"], [])
 
 
 @unittest.skipIf(os.name == "nt", "requires POSIX ownership and sandbox semantics")
@@ -424,6 +421,19 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
                 worker_workspace.site,
                 "getusersitepackages",
                 return_value=str(fake_root),
+            ), mock.patch.object(
+                worker_workspace,
+                "_resolve_trusted_validation_executable",
+                side_effect=worker_workspace.WorkspaceError(
+                    "validation_executable_unavailable:pytest"
+                ),
+            ), mock.patch.object(
+                worker_workspace,
+                "_select_module_validator_interpreter",
+                return_value=(
+                    None,
+                    "validation_executable_module_absent_in_all_trusted_roots:pytest",
+                ),
             ):
                 results = worker_workspace.run_validations(
                     workspace, ["pytest --version"]
@@ -453,7 +463,24 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
         _write_fake_pytest_package(fake_root)
         repo, workspace = _manual_workspace(self.tmp_path, "b755-success")
         try:
-            with mock.patch.object(worker_workspace.site, "getusersitepackages", return_value=str(fake_root)):
+            with mock.patch.object(
+                worker_workspace.site,
+                "getusersitepackages",
+                return_value=str(fake_root),
+            ), mock.patch.object(
+                worker_workspace,
+                "_resolve_trusted_validation_executable",
+                side_effect=worker_workspace.WorkspaceError(
+                    "validation_executable_unavailable:pytest"
+                ),
+            ), mock.patch.object(
+                worker_workspace,
+                "_select_module_validator_interpreter",
+                return_value=(
+                    None,
+                    "validation_executable_module_absent_in_all_trusted_roots:pytest",
+                ),
+            ):
                 results = worker_workspace.run_validations(
                     workspace, ["PYTHONPATH=. python3 -m pytest --version"]
                 )
