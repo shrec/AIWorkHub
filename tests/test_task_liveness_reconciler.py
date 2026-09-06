@@ -1086,8 +1086,13 @@ def test_daemon_sigterm_wakes_long_wait_and_standby_takes_over(tmp_path):
         for process in (owner, standby):
             process.join(timeout=5)
             if process.is_alive():
-                process.terminate()
+                # A full-suite predecessor can leave the reconciler's graceful
+                # SIGTERM handler installed in a fork child.  Test teardown is
+                # final authority for these exact owned children, so use
+                # SIGKILL just like the sibling single-flight regression.
+                process.kill()
                 process.join(timeout=5)
+            assert not process.is_alive()
         os.close(release_reader)
         os.close(release_writer)
 
