@@ -57,8 +57,8 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from . import parallelism
+from . import platform_io
 from .platform_io import PublicationDurabilityError
-from .platform_io import identity_bound_durable_atomic_replace as atomic_replace
 from . import source_graph_ast as sgast
 from . import source_graph_analytics as sganalytics
 from . import source_graph_insights as sginsights
@@ -70,6 +70,23 @@ from .storage_registry import (
     load_storage_registry,
     resolve_database_path,
 )
+
+
+def atomic_replace(source: Path, destination: Path) -> None:
+    """Publish a probed generation through the strongest host primitive.
+
+    POSIX hosts can bind publication to an open file identity.  Windows does
+    not yet expose that descriptor-relative primitive here, but it does provide
+    atomic path replacement; the Source Graph staging name is private,
+    unpredictable, opened with ``O_EXCL``, and re-verified immediately before
+    this call.  Failing the whole Windows index after that proof made the
+    cross-platform runtime unusable without adding any protection.
+    """
+
+    if platform_io.is_windows():
+        platform_io.durable_atomic_replace(source, destination)
+    else:
+        platform_io.identity_bound_durable_atomic_replace(source, destination)
 
 SCHEMA_ID = "aiworkhub.source_graph.v1"
 BUILD_REVISION = "aiworkhub.source_graph.semantic.v6"

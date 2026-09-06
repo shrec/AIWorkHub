@@ -877,6 +877,8 @@ def test_atomic_replace_retries_transient_windows_sharing_violation(monkeypatch)
 def test_durable_atomic_replace_directory_open_failure_preserves_paths(
     tmp_path, monkeypatch
 ):
+    if os.name == "nt":
+        pytest.skip("Windows has no directory-fsync contract")
     source = tmp_path / "source.tmp"
     destination = tmp_path / "canonical"
     source.write_bytes(b"new")
@@ -901,6 +903,8 @@ def test_durable_atomic_replace_directory_open_failure_preserves_paths(
 def test_durable_atomic_replace_reports_post_commit_directory_sync_failure(
     tmp_path, monkeypatch
 ):
+    if os.name == "nt":
+        pytest.skip("Windows has no directory-fsync contract")
     source = tmp_path / "source.tmp"
     destination = tmp_path / "canonical"
     source.write_bytes(b"new")
@@ -925,6 +929,8 @@ def test_durable_atomic_replace_reports_post_commit_directory_sync_failure(
 def test_identity_bound_replace_rejects_source_substitution_before_publication(
     tmp_path, monkeypatch
 ):
+    if os.name == "nt":
+        pytest.skip("descriptor-bound publication is POSIX-only")
     source = tmp_path / "source.tmp"
     original = tmp_path / "original.saved"
     destination = tmp_path / "canonical"
@@ -984,6 +990,8 @@ def _force_macos_publication_branch(monkeypatch):
     still requires the macOS qualification job for final proof.
     """
 
+    if os.name == "nt":
+        pytest.skip("macOS dir-fd branch requires a POSIX host")
     monkeypatch.setattr(platform_io, "is_linux", lambda _name=None: False)
     monkeypatch.setattr(platform_io, "is_macos", lambda _name=None: True)
 
@@ -1089,6 +1097,8 @@ def test_macos_branch_fails_closed_on_cross_device_staging(tmp_path, monkeypatch
 def test_identity_bound_replace_ignores_public_staging_namespace_substitution(
     tmp_path, monkeypatch
 ):
+    if not platform_io.is_linux():
+        pytest.skip("procfs descriptor-link substitution is Linux-specific")
     source = tmp_path / "source.tmp"
     destination = tmp_path / "canonical"
     displaced_staging = tmp_path / "displaced-staging"
@@ -1114,6 +1124,8 @@ def test_identity_bound_replace_ignores_public_staging_namespace_substitution(
 def test_identity_bound_replace_commits_through_open_destination_directory(
     tmp_path, monkeypatch
 ):
+    if os.name == "nt":
+        pytest.skip("descriptor-relative rename requires a POSIX host")
     source = tmp_path / "source.tmp"
     destination_directory = tmp_path / "destination"
     displaced_directory = tmp_path / "destination.displaced"
@@ -1143,6 +1155,8 @@ def test_identity_bound_replace_commits_through_open_destination_directory(
 
 
 def test_identity_bound_replace_removes_staging_for_hard_link_alias(tmp_path):
+    if os.name == "nt":
+        pytest.skip("descriptor-bound publication is POSIX-only")
     source = tmp_path / "source.tmp"
     destination = tmp_path / "canonical"
     source.write_bytes(b"verified")
@@ -1158,6 +1172,8 @@ def test_identity_bound_replace_removes_staging_for_hard_link_alias(tmp_path):
 def test_identity_bound_replace_fails_closed_on_cross_device_staging(
     tmp_path, monkeypatch
 ):
+    if not platform_io.is_linux():
+        pytest.skip("linkat injection exercises the Linux publication branch")
     source = tmp_path / "source.tmp"
     destination = tmp_path / "canonical"
     source.write_bytes(b"new")

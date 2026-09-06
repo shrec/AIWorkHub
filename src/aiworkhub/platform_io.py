@@ -1446,7 +1446,12 @@ def durable_atomic_replace(
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
         )
     try:
-        descriptor = os.open(source_path, os.O_RDONLY)
+        # CPython's Windows ``os.fsync`` rejects a read-only CRT descriptor
+        # with ``EBADF`` even though POSIX accepts it.  Publication candidates
+        # are coordinator-created writable staging files, so open the Windows
+        # descriptor read/write solely for the durability flush.
+        source_flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+        descriptor = os.open(source_path, source_flags)
         try:
             os.fsync(descriptor)
         finally:

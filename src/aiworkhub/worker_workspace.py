@@ -3764,6 +3764,14 @@ def trusted_validation_executable_version(resolved: str) -> str:
                 workspace_baseline={},
             )
             workspace.path.mkdir(mode=0o700)
+            # ``sandbox_argv`` always protects a worker's Git authority with a
+            # dedicated read-only bind.  A synthetic version-probe workspace
+            # has no checkout, so provide the bounded marker that makes the
+            # same mount contract valid under bubblewrap as under Landlock.
+            (workspace.path / ".git").write_text(
+                "gitdir: /nonexistent/aiworkhub-version-probe\n",
+                encoding="utf-8",
+            )
             workspace.home.mkdir(mode=0o700)
             (workspace.home / "tmp").mkdir(mode=0o700)
             scratch = workspace.path / ".exec-scratch"

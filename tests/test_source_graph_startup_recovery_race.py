@@ -352,6 +352,25 @@ def test_recommendation_becomes_visible_only_after_atomic_publication(
         conn.close()
 
 
+def test_windows_generation_publication_uses_durable_atomic_replace(monkeypatch):
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(source_graph.platform_io, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        source_graph.platform_io,
+        "durable_atomic_replace",
+        lambda source, destination: calls.append((str(source), str(destination))),
+    )
+    monkeypatch.setattr(
+        source_graph.platform_io,
+        "identity_bound_durable_atomic_replace",
+        lambda *_args: pytest.fail("Windows must use its supported publisher"),
+    )
+
+    source_graph.atomic_replace(Path("staging.sqlite"), Path("canonical.sqlite"))
+
+    assert calls == [("staging.sqlite", "canonical.sqlite")]
+
+
 @pytest.mark.parametrize("payload", [[], 1, "generation"])
 def test_non_object_generation_metadata_is_not_readable(tmp_path, payload):
     root = _repo(tmp_path)
