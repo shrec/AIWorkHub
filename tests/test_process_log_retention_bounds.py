@@ -103,6 +103,20 @@ def test_preview_reports_an_oversized_terminal_log(tmp_path: Path) -> None:
     assert preview["max_process_log_file_bytes"] == _SMALL_CAP
 
 
+@pytest.mark.parametrize("state", ["accepted", "rejected", "archived"])
+def test_manager_disposition_remains_terminal_for_log_bounds(
+    tmp_path: Path, state: str
+) -> None:
+    repo = _repo(tmp_path)
+    _ledger_row(repo, _TERMINAL, state)
+    _write_log(repo, _TERMINAL, ".stdout.log", _LOG_BODY)
+
+    preview = terminal_log_retention.process_log_bounds_preview(repo)
+
+    assert preview["oversized_log_count"] == 1
+    assert preview["protected_log_count"] == 0
+
+
 def test_preview_never_lists_a_live_run_log(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     _ledger_row(repo, _LIVE, "processing")  # not a terminal state

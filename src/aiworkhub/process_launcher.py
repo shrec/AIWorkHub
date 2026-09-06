@@ -335,6 +335,7 @@ MAX_CONFIGURED_PROCESSES = 32
 MAX_LOG_TAIL_BYTES = 64 * 1024
 MAX_RECEIPT_SCAN_BYTES = 2 * 1024 * 1024
 MAX_RESEARCH_RESULT_BYTES = 32 * 1024 * 1024
+MAX_WORKER_STREAM_LOG_BYTES = 4 * 1024 * 1024
 LAUNCH_IMPLEMENTED = True
 SUPERVISOR_GRACE_SECONDS = 90
 # B894: narrowly scoped, one-task terminal-transition authority. Minted at
@@ -8570,7 +8571,7 @@ class ProcessManager:
                     "cancel_path": str(cancel_path),
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
-                    "max_output_bytes": 16 * 1024 * 1024,
+                    "max_output_bytes": MAX_WORKER_STREAM_LOG_BYTES,
                     "adapter_id": adapter_id,
                     "token_budget": metadata.get("token_budget"),
                 })
@@ -10040,7 +10041,7 @@ class ProcessManager:
                 "cancel_path": str(cancel_path),
                 "stdout_path": str(stdout_path),
                 "stderr_path": str(stderr_path),
-                "max_output_bytes": 16 * 1024 * 1024,
+                "max_output_bytes": MAX_WORKER_STREAM_LOG_BYTES,
                 "adapter_id": "claude_cli",
                 "token_budget": metadata.get("token_budget"),
             },

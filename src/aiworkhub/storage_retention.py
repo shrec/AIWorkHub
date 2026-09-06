@@ -3330,6 +3330,22 @@ def _run_repository_cleanup(
         else:
             if next_deadline is None or parsed < next_deadline[0]:
                 next_deadline = (parsed, deadline)
+    # The same single-flight, repository-locked lane owns terminal process-log
+    # retention.  Accepted/rejected events already schedule this cleanup; before
+    # this wiring they only reaped worktrees, while per-request stdout/stderr was
+    # bounded solely at the next MCP restart and could grow for days.
+    try:
+        from . import terminal_log_retention
+
+        result["terminal_log_cleanup"] = terminal_log_retention.enforce(root)
+    except Exception as exc:
+        # Worktree cleanup has already completed and must remain observable even
+        # if log retention fails.  The nested result makes the failure explicit;
+        # the next terminal hint or MCP startup retries it.
+        result["terminal_log_cleanup"] = {
+            "ok": False,
+            "error": f"{type(exc).__name__}:{exc}"[:300],
+        }
     result["next_deadline"] = next_deadline[1] if next_deadline else None
     return result
 

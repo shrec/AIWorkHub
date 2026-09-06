@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import process_launcher, storage_retention, task_store
+from aiworkhub import (
+    process_launcher,
+    storage_retention,
+    task_store,
+    terminal_log_retention,
+)
 
 
 def test_terminal_hints_coalesce_without_running_scan_inline(monkeypatch, tmp_path: Path) -> None:
@@ -136,6 +141,34 @@ def test_cleanup_telemetry_is_bounded_when_no_candidates(monkeypatch, tmp_path: 
     assert result["scanned"] == 50
     assert result["protected"] == 50
     assert len(result["protected_reasons"]) == 20
+
+
+def test_repository_cleanup_runs_terminal_log_retention_in_same_lane(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        storage_retention,
+        "preview",
+        lambda *args, **kwargs: {
+            "complete": True,
+            "candidates": [],
+            "protected": [],
+            "preview_digest": "digest",
+        },
+    )
+    monkeypatch.setattr(storage_retention, "_iter_batch_rows", lambda *args: iter(()))
+    monkeypatch.setattr(storage_retention, "_repo_id", lambda root: "repo-test")
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        terminal_log_retention,
+        "enforce",
+        lambda root: calls.append(Path(root)) or {"ok": True, "logs_capped": 2},
+    )
+
+    result = storage_retention._run_repository_cleanup(tmp_path, now=1.0)
+
+    assert calls == [tmp_path.resolve()]
+    assert result["terminal_log_cleanup"] == {"ok": True, "logs_capped": 2}
 
 
 def test_cleanup_quarantines_candidates(monkeypatch, tmp_path: Path) -> None:

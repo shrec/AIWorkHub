@@ -24,7 +24,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from . import process_event_ledger, provider_usage, repo_policy, runtime_temp, task_store
+from . import (
+    process_event_ledger,
+    provider_usage,
+    repo_policy,
+    runtime_temp,
+    task_fsm,
+    task_store,
+)
 
 
 SCHEMA_ID = "aiworkhub.terminal_log_retention.v1"
@@ -76,11 +83,14 @@ _REQUEST_RE = re.compile(r"^[a-f0-9]{32}$")
 _BATCH_RE = re.compile(r"^l[0-9]{8}T[0-9]{6}-[a-f0-9]{12}$")
 _OWNED_SUFFIXES = (".request.json", ".stderr.log", ".stdout.log", ".supervisor.json")
 _enforcement_lock = threading.Lock()
-_TERMINAL_STATES = frozenset({
-    "review_ready", "exited", "exited_without_review", "timed_out", "cancelled",
-    "launch_failed", "worker_failed", "scope_rejected", "validation_failed",
-    "promotion_conflict", "finalize_failed", "monitor_error", "blocked",
-})
+# A terminal provider outcome can later gain a manager disposition in the same
+# process ledger.  The latter becomes the latest row, so omitting it made every
+# accepted run look live forever and exempted exactly the successful, finished
+# tasks from both the 4 MiB stream cap and age retention.  Reuse the canonical
+# launcher vocabulary and add only the three post-launch disposition states.
+_TERMINAL_STATES = frozenset(
+    task_fsm.LAUNCHER_TERMINAL_SUBSTATUSES | {"accepted", "rejected", "archived"}
+)
 
 
 class TerminalLogRetentionError(RuntimeError):

@@ -60,7 +60,10 @@ _PR_SET_PDEATHSIG = 1
 # while the child runs. Heartbeat cadence is deliberately independent of any
 # model turn, dashboard read, or MCP request.
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 15.0
-DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+# Keep each live provider stream within a small, predictable disk envelope.
+# The writer retains the newest bytes and marks every compaction explicitly, so
+# lowering this ceiling does not hide the terminal diagnostic tail.
+DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_TOTAL_OUTPUT_BYTES = 8 * 1024 * 1024
 MIN_MAX_OUTPUT_BYTES = 1024
 MAX_TOTAL_OUTPUT_BYTES = 1024 * 1024 * 1024

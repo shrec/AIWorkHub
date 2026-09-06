@@ -21,6 +21,10 @@ from aiworkhub import platform_io  # noqa: E402
 from aiworkhub.worker_workspace import write_json_0600  # noqa: E402
 
 
+def test_default_live_stream_log_bound_is_four_mib() -> None:
+    assert worker_supervisor.DEFAULT_MAX_OUTPUT_BYTES == 4 * 1024 * 1024
+
+
 def test_supervisor_uses_canonical_platform_chmod_fd_in_package_and_direct_context():
     assert worker_supervisor.chmod_fd is platform_io.chmod_fd
 
