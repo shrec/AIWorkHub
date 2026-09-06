@@ -145,6 +145,38 @@ def test_first_build_completion_hands_off_after_build_lock_release(
     assert daemon.refresh_now()["triggered"] is True
 
 
+def test_stop_fences_initial_build_before_subprocess_launch(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+    builds: list[bool] = []
+
+    def delayed_journal_probe() -> bool:
+        probe_entered.set()
+        assert release_probe.wait(timeout=5)
+        return False
+
+    def unexpected_build(*, incremental):
+        builds.append(incremental)
+        raise AssertionError("a stopped daemon must not launch its initial build")
+
+    monkeypatch.setattr(daemon, "_has_pending_journal", delayed_journal_probe)
+    monkeypatch.setattr(daemon, "_execute_build", unexpected_build)
+
+    daemon.start()
+    assert probe_entered.wait(timeout=5)
+    stopper = threading.Thread(target=daemon.stop)
+    stopper.start()
+    assert daemon._stop_event.wait(timeout=5)
+    release_probe.set()
+    stopper.join(timeout=5)
+
+    assert not stopper.is_alive()
+    assert not daemon.is_running()
+    assert builds == []
+
+
 def test_initialized_repo_indexes_instruction_documents_without_source_files(tmp_path):
     root = _init_repo(tmp_path)
     daemon = source_graph_daemon.SourceGraphDaemon(root)

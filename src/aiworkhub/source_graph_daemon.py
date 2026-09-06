@@ -1472,9 +1472,16 @@ class SourceGraphDaemon:
         ``refresh_now()``) already held the lock, in which case this call
         does nothing and reports no state change.
         """
+        if self._stop_event.is_set():
+            return False
         if not self._build_lock.acquire(blocking=False):
             return False
         try:
+            if self._stop_event.is_set():
+                with self._state_lock:
+                    self._status = STATUS_STOPPED
+                    self._last_error = "build_start_fenced"
+                return True
             retained = _read_build_identity(self.repo_root)
             if retained is not None and retained.get("state") == "stopping":
                 with self._state_lock:
