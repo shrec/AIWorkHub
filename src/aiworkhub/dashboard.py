@@ -46,7 +46,7 @@ DEFAULT_TASK_LIMIT = 500
 DEFAULT_PROCESS_LIMIT = 200
 DEFAULT_SNAPSHOT_PROCESS_LIMIT = 50
 DEFAULT_KPI_HISTORY_PROCESS_LIMIT = 1000
-TASK_CARD_SNAPSHOT_LIMIT = 5000
+TASK_CARD_SNAPSHOT_LIMIT = DEFAULT_TASK_LIMIT
 MAX_PROCESS_LOG_BYTES = 4 * 1024 * 1024
 MAX_KPI_HISTORY_LOG_BYTES = 16 * 1024 * 1024
 # Informational observability boundary, not an inactivity or policy verdict.
@@ -342,6 +342,39 @@ def _bounded_nonnegative_float(value: Any) -> float | None:
     if not math.isfinite(parsed) or parsed < 0:
         return None
     return parsed
+
+
+def _read_bound_metadata(
+    source: str,
+    *,
+    configured_limit: int,
+    returned_count: int,
+    scanned_count: int | str | None = None,
+    authoritative_count: int | str | None = None,
+    cache_stats: Mapping[str, Any] | None = None,
+    truncated: bool = False,
+) -> dict[str, Any]:
+    scanned: int | str = scanned_count if scanned_count is not None else returned_count
+    authoritative: int | str = (
+        authoritative_count if authoritative_count is not None else scanned
+    )
+    is_truncated = bool(truncated)
+    if isinstance(authoritative, int):
+        is_truncated = is_truncated or returned_count < authoritative
+    elif isinstance(scanned, int):
+        is_truncated = is_truncated or returned_count < scanned
+    return {
+        "source": source,
+        "configured_limit": max(0, int(configured_limit)),
+        "scanned_count": scanned,
+        "returned_count": max(0, int(returned_count)),
+        "authoritative_count": authoritative,
+        "truncated": is_truncated,
+        "cache": {
+            "hit": _bounded_int((cache_stats or {}).get("hit")),
+            "miss": _bounded_int((cache_stats or {}).get("miss")),
+        },
+    }
 
 
 def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -1622,13 +1655,15 @@ def read_process_runs(
         payload = handle.read(safe_max_bytes)
 
     latest: dict[str, dict[str, Any]] = {}
+    request_ids_seen: set[str] = set()
+    selected_request_ids: set[str] = set()
     # Bounded server-side-only path used to read the supervisor heartbeat
     # file for liveness derivation -- never included in the compact row
     # returned to the browser (matches the existing policy of never exposing
     # stdout_path/stderr_path either).
     status_paths: dict[str, str] = {}
     invalid_records = 0
-    for raw_line in payload.splitlines():
+    for raw_line in reversed(payload.splitlines()):
         try:
             event = json.loads(raw_line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1641,6 +1676,11 @@ def read_process_runs(
         if not request_id:
             invalid_records += 1
             continue
+        request_ids_seen.add(request_id)
+        if request_id not in selected_request_ids:
+            if len(selected_request_ids) >= safe_limit:
+                continue
+            selected_request_ids.add(request_id)
         compact: dict[str, Any] = {}
         for key in _PROCESS_RUN_FIELDS:
             value = event.get(key)
@@ -1650,22 +1690,31 @@ def read_process_runs(
                 compact[key] = value[:500]
             elif isinstance(value, (bool, int, float)):
                 compact[key] = value
+        existing = latest.get(request_id) or {}
         ai_infra = _compact_ai_infra(event)
+        merged_ai_infra = None
         if ai_infra:
-            compact["ai_infra_context"] = _merge_ai_infra(
-                (latest.get(request_id) or {}).get("ai_infra_context"),
+            merged_ai_infra = _merge_ai_infra(
                 ai_infra,
+                existing.get("ai_infra_context"),
             )
-        latest[request_id] = {**latest.get(request_id, {}), **compact, "request_id": request_id}
+        row = {**compact, **existing, "request_id": request_id}
+        if merged_ai_infra is not None:
+            row["ai_infra_context"] = merged_ai_infra
+        latest[request_id] = row
         raw_status_path = event.get("supervisor_status_path")
-        if isinstance(raw_status_path, str) and raw_status_path:
+        if (
+            isinstance(raw_status_path, str)
+            and raw_status_path
+            and request_id not in status_paths
+        ):
             status_paths[request_id] = raw_status_path[:1024]
 
     rows = sorted(
         latest.values(),
         key=lambda row: str(row.get("timestamp") or row.get("finished_at") or row.get("started_at") or ""),
         reverse=True,
-    )[:safe_limit]
+    )
     active_observed = 0
     for row in rows:
         # Liveness describes an active process lease.  A clean terminal row
@@ -1690,11 +1739,23 @@ def read_process_runs(
         else:
             row["observed_state"] = "not_running"
 
+    byte_window_truncated = bool(start)
     return {
         **base_report,
         "active_observed": active_observed,
-        "total_requests": len(latest),
-        "truncated": bool(start),
+        "total_requests": len(request_ids_seen),
+        "scanned_count": len(request_ids_seen),
+        "returned_count": len(rows),
+        "limit": safe_limit,
+        "truncated": byte_window_truncated,
+        "read_bounds": _read_bound_metadata(
+            "process_event_log",
+            configured_limit=safe_limit,
+            returned_count=len(rows),
+            scanned_count=len(request_ids_seen),
+            authoritative_count="unknown" if byte_window_truncated else len(request_ids_seen),
+            truncated=byte_window_truncated,
+        ),
         "invalid_records": invalid_records,
         "processes": rows,
     }
@@ -1757,6 +1818,7 @@ class DashboardProvider:
         self._snapshot_scope_lock = Lock()
         self._snapshot_cache_lock = Lock()
         self._snapshot_cache: dict[str, Future[Any]] = {}
+        self._snapshot_cache_stats: dict[str, int] = {"hit": 0, "miss": 0}
         self._snapshot_cache_active = False
 
     @contextmanager
@@ -1776,6 +1838,10 @@ class DashboardProvider:
                     self._snapshot_cache_active = False
                     self._snapshot_cache.clear()
 
+    def snapshot_cache_stats(self) -> dict[str, int]:
+        with self._snapshot_cache_lock:
+            return dict(self._snapshot_cache_stats)
+
     def _snapshot_once(self, key: str, loader: Callable[[], Any]) -> Any:
         with self._snapshot_cache_lock:
             cache_active = self._snapshot_cache_active
@@ -1785,6 +1851,9 @@ class DashboardProvider:
                 if future is None:
                     future = Future()
                     self._snapshot_cache[key] = future
+                    self._snapshot_cache_stats["miss"] += 1
+                else:
+                    self._snapshot_cache_stats["hit"] += 1
             else:
                 future = None
                 owner = False
@@ -1809,12 +1878,12 @@ class DashboardProvider:
             ),
         )
 
-    def _cost_ledger(self) -> dict[str, Any]:
+    def _cost_ledger(self, *, include_tasks: bool) -> dict[str, Any]:
         return self._snapshot_once(
-            "cost_ledger",
+            f"cost_ledger:{include_tasks}",
             lambda: cost_ledger.build_cost_ledger(
                 repo_root=self.repo_root,
-                include_tasks=True,
+                include_tasks=include_tasks,
             ),
         )
 
@@ -1859,9 +1928,19 @@ class DashboardProvider:
         # Reuse the canonical union ledger exposed through Task MCP. Task
         # cards alone omit retry/terminal usage and can produce a false-zero
         # dashboard while measured launch records exist.
-        result = dict(self._cost_ledger())
+        with self._snapshot_cache_lock:
+            include_tasks = not self._snapshot_cache_active
+        result = dict(self._cost_ledger(include_tasks=include_tasks))
         result["tasks"] = []
         result["schema_id"] = "aiworkhub.dashboard.canonical_cost_ledger.v1"
+        result["read_bounds"] = _read_bound_metadata(
+            "cost_ledger.tasks",
+            configured_limit=0,
+            returned_count=0,
+            scanned_count=0,
+            authoritative_count="aggregate_only",
+            cache_stats=self.snapshot_cache_stats(),
+        )
         return result
 
     def get_collision_report(self) -> dict[str, Any]:
@@ -1950,12 +2029,12 @@ class DashboardProvider:
     def get_workforce_catalog(self) -> dict[str, Any]:
         """Configured workforce joined to bounded canonical process evidence."""
         process_report = read_process_runs(limit=DEFAULT_PROCESS_LIMIT)
-        ledger = self._cost_ledger()
+        ledger = self._cost_ledger(include_tasks=False)
         return workforce_catalog.build_catalog(
             self.repo_root,
             cards=list(self._task_cards()),
             process_rows=process_report.get("processes") or [],
-            usage_rows=ledger.get("tasks") or [],
+            usage_rows=list(ledger.get("tasks") or [])[:DEFAULT_PROCESS_LIMIT],
             preflight=self.get_environment_preflight(),
             cost_per_accepted_outcome=ledger.get("cost_per_accepted_outcome") or {},
         )
@@ -2014,11 +2093,22 @@ class DashboardProvider:
         return api.RecipeRegistry(())
 
 
-def _normalize_task_rows(value: Any, status: str) -> list[dict[str, Any]]:
+def _normalize_task_rows(
+    value: Any,
+    status: str,
+    *,
+    limit: int = DEFAULT_TASK_LIMIT,
+) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise DashboardReadError(f"task list ({status}) returned a non-list")
     rows: list[dict[str, Any]] = []
-    for raw in value:
+    safe_limit = max(0, min(int(limit), DEFAULT_TASK_LIMIT))
+    iterator = iter(value)
+    while len(rows) < safe_limit:
+        try:
+            raw = next(iterator)
+        except StopIteration:
+            break
         if not isinstance(raw, Mapping):
             continue
         task_id = str(raw.get("task_id") or "").strip()
@@ -3088,7 +3178,12 @@ def _build_summary_snapshot(
         )
         task_groups[status] = _safe_read(
             f"tasks.{status}.normalize",
-            partial(_normalize_task_rows, value, status),
+            partial(
+                _normalize_task_rows,
+                value,
+                status,
+                limit=getattr(data_provider, "task_limit", DEFAULT_TASK_LIMIT),
+            ),
             errors,
             [],
         )
@@ -3199,6 +3294,26 @@ def _build_summary_snapshot(
             "exact": exact,
             "truncated": exact > 0,
         }
+    cache_stats_reader = getattr(data_provider, "snapshot_cache_stats", None)
+    cache_stats = cache_stats_reader() if callable(cache_stats_reader) else {}
+    read_bounds = {
+        f"tasks.{status}": _read_bound_metadata(
+            f"tasks.{status}",
+            configured_limit=getattr(data_provider, "task_limit", DEFAULT_TASK_LIMIT),
+            returned_count=row_counts[status]["returned"],
+            authoritative_count=row_counts[status]["exact"],
+            cache_stats=cache_stats,
+        )
+        for status in ACTIVE_STATUSES
+    }
+    for status in ("blocked", "finished", "archived"):
+        read_bounds[f"tasks.{status}"] = _read_bound_metadata(
+            f"tasks.{status}",
+            configured_limit=0,
+            returned_count=0,
+            authoritative_count=row_counts[status]["exact"],
+            cache_stats=cache_stats,
+        )
 
     collision_warnings = [
         dict(item)
@@ -3225,6 +3340,7 @@ def _build_summary_snapshot(
         "status_counts": status_counts,
         "outcome_counts": outcome_counts,
         "row_counts": row_counts,
+        "read_bounds": read_bounds,
         "warnings": {
             "stale": stale_tasks,
             "collisions": collision_warnings,
@@ -3451,7 +3567,12 @@ def build_snapshot(
         value = reads[f"tasks.{status}"]
         task_groups[status] = _safe_read(
             f"tasks.{status}.normalize",
-            partial(_normalize_task_rows, value, status),
+            partial(
+                _normalize_task_rows,
+                value,
+                status,
+                limit=getattr(data_provider, "task_limit", DEFAULT_TASK_LIMIT),
+            ),
             errors,
             [],
         )
@@ -3666,6 +3787,34 @@ def build_snapshot(
     for status in ("blocked", "finished", "archived"):
         exact = status_counts.get(status, 0)
         row_counts[status] = {"returned": 0, "exact": exact, "truncated": exact > 0}
+    cache_stats_reader = getattr(data_provider, "snapshot_cache_stats", None)
+    cache_stats = cache_stats_reader() if callable(cache_stats_reader) else {}
+    read_bounds = {
+        f"tasks.{status}": _read_bound_metadata(
+            f"tasks.{status}",
+            configured_limit=getattr(data_provider, "task_limit", DEFAULT_TASK_LIMIT),
+            returned_count=row_counts[status]["returned"],
+            authoritative_count=row_counts[status]["exact"],
+            cache_stats=cache_stats,
+        )
+        for status in ACTIVE_STATUSES
+    }
+    for status in ("blocked", "finished", "archived"):
+        read_bounds[f"tasks.{status}"] = _read_bound_metadata(
+            f"tasks.{status}",
+            configured_limit=0,
+            returned_count=0,
+            authoritative_count=row_counts[status]["exact"],
+            cache_stats=cache_stats,
+        )
+    process_bounds = process_report.get("read_bounds")
+    if isinstance(process_bounds, Mapping):
+        read_bounds["agent_processes"] = dict(process_bounds)
+    kpi_process_bounds = kpi_process_report.get("read_bounds") if isinstance(kpi_process_report, Mapping) else None
+    if isinstance(kpi_process_bounds, Mapping):
+        read_bounds["kpi_process_history"] = dict(kpi_process_bounds)
+    if isinstance(ledger.get("read_bounds"), Mapping):
+        read_bounds["cost_ledger.tasks"] = dict(ledger["read_bounds"])
 
     source_graph_telemetry = _source_graph_telemetry(process_report)
     source_graph_index_health = reads["source_graph_index_health"]
@@ -3717,6 +3866,7 @@ def build_snapshot(
         "status_counts": status_counts,
         "outcome_counts": outcome_counts,
         "row_counts": row_counts,
+        "read_bounds": read_bounds,
         "tasks": {
             **task_groups,
             "stale": stale_tasks,

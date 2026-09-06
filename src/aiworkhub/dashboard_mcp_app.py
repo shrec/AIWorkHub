@@ -79,6 +79,7 @@ _COMPACT_SNAPSHOT_FIELDS: tuple[str, ...] = (
     "health",
     "status_counts",
     "row_counts",
+    "read_bounds",
     "warnings",
     "errors",
     "manager_identity",
@@ -513,7 +514,11 @@ def _bound_task_detail(detail: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def snapshot_view(full: bool = False) -> dict[str, Any]:
+def snapshot_view(
+    full: bool = False,
+    previous: Mapping[str, Any] | None = None,
+    previous_snapshot: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """READ-ONLY: canonical dashboard snapshot for the native Webview.
 
     Calls ``dashboard.build_snapshot()`` -- the SAME builder the HTTP
@@ -526,10 +531,14 @@ def snapshot_view(full: bool = False) -> dict[str, Any]:
     """
     started = time.perf_counter()
     _debug_trace("snapshot.begin")
+    build_kwargs: dict[str, Any] = {"summary_only": not full}
+    prior_snapshot = previous if previous is not None else previous_snapshot
+    if prior_snapshot is not None:
+        build_kwargs["previous"] = prior_snapshot
     snapshot = dict(
         _debug_stage(
             "dashboard.build_snapshot",
-            lambda: dashboard.build_snapshot(summary_only=not full),
+            lambda: dashboard.build_snapshot(**build_kwargs),
         )
     )
     storage = snapshot.get("storage")
