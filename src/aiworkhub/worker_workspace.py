@@ -3751,7 +3751,8 @@ def trusted_validation_executable_version(resolved: str) -> str:
         return ""
     if backend == VSCODE_LM_IN_PROCESS_BACKEND:
         return ""
-    executable_root = executable.parent
+    executable_roots: tuple[Path, ...] = (executable.parent,)
+    python_runtime_identity_root: Path | None = None
     try:
         base_prefix = Path(sys.base_prefix).resolve(strict=True)
         executable.relative_to(base_prefix)
@@ -3764,7 +3765,13 @@ def trusted_validation_executable_version(resolved: str) -> str:
         # fail with an empty fact.  The running interpreter's immutable base
         # prefix is already the trusted dependency boundary, so bind that whole
         # prefix read-only while keeping ordinary tools scoped to their parent.
-        executable_root = base_prefix
+        # CPython distributions may embed an absolute runtime prefix.  Mounting
+        # that tree under the generic validation alias is therefore not enough:
+        # the binary can still look for libpython/stdlib at the original path.
+        # Preserve only this already-verified interpreter prefix at its identity
+        # path; ordinary validation tools remain alias-mounted and path-scoped.
+        executable_roots = ()
+        python_runtime_identity_root = base_prefix
     try:
         with tempfile.TemporaryDirectory(prefix="aiworkhub-version-probe-") as raw:
             root = Path(raw)
@@ -3796,7 +3803,8 @@ def trusted_validation_executable_version(resolved: str) -> str:
                 [str(executable), "--version"],
                 backend=backend,
                 validation_exec_scratch=scratch,
-                validation_executable_roots=(executable_root,),
+                validation_executable_roots=executable_roots,
+                validation_python_runtime_identity_root=python_runtime_identity_root,
             )
             env = sanitized_env(
                 "validation",
@@ -6810,6 +6818,7 @@ def sandbox_argv(
     package_import_root: Path | None = None,
     validation_cwd: str | None = None,
     validation_executable_roots: tuple[Path, ...] = (),
+    validation_python_runtime_identity_root: Path | None = None,
     outer_validation_authority: bool = False,
 ) -> list[str]:
     if not adapter_argv:
@@ -6901,6 +6910,22 @@ def sandbox_argv(
             for value in rewritten
             for value_path in (Path(value).resolve(strict=False),)
         ]
+    if validation_python_runtime_identity_root is not None:
+        resolved_root = validation_python_runtime_identity_root.resolve(strict=True)
+        trusted_base_prefix = Path(sys.base_prefix).resolve(strict=True)
+        executable_path = Path(adapter_argv[0]).resolve(strict=False)
+        if resolved_root == Path("/") or resolved_root != trusted_base_prefix:
+            raise WorkspaceError("validation_python_runtime_identity_root_untrusted")
+        if not _path_is_relative_to(executable_path, resolved_root):
+            raise WorkspaceError("validation_python_runtime_executable_outside_root")
+        identity_parent_dirs: set[str] = set()
+        for parent in reversed(resolved_root.parents):
+            parent_text = str(parent)
+            if parent_text == "/" or parent_text in identity_parent_dirs:
+                continue
+            validation_binds.extend(("--dir", parent_text))
+            identity_parent_dirs.add(parent_text)
+        validation_binds.extend(("--ro-bind", str(resolved_root), str(resolved_root)))
     if validation_readonly_dirs:
         validation_binds.extend(("--dir", "/validation-pythonpath"))
         for index, path in enumerate(validation_readonly_dirs):

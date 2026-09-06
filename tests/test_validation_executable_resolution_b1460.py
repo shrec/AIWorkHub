@@ -511,7 +511,10 @@ def test_version_probe_publishes_hosted_python_base_prefix(
         worker_workspace,
         "sandbox_argv",
         lambda ws, adapter_id, argv, **kw: captured.update(
-            {"roots": kw.get("validation_executable_roots")}
+            {
+                "roots": kw.get("validation_executable_roots"),
+                "identity_root": kw.get("validation_python_runtime_identity_root"),
+            }
         )
         or ["sandboxed-python", "--version"],
     )
@@ -532,7 +535,74 @@ def test_version_probe_publishes_hosted_python_base_prefix(
         worker_workspace.trusted_validation_executable_version(str(executable))
         == "Python 3.12.0"
     )
-    assert captured["roots"] == (runtime.resolve(),)
+    assert captured["roots"] == ()
+    assert captured["identity_root"] == runtime.resolve()
+
+
+def test_bubblewrap_identity_root_keeps_runtime_at_original_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    (workspace.path / ".git").write_text(
+        "gitdir: /nonexistent/b1460\n", encoding="utf-8"
+    )
+    runtime = tmp_path / "hosted-python"
+    executable = _executable(runtime / "bin" / "python3.12")
+    monkeypatch.setattr(worker_workspace.sys, "base_prefix", str(runtime))
+
+    argv = worker_workspace.sandbox_argv(
+        workspace,
+        "validation",
+        [str(executable), "--version"],
+        backend="bubblewrap",
+        validation_python_runtime_identity_root=runtime,
+    )
+
+    bind_index = argv.index(str(runtime.resolve()))
+    assert argv[bind_index - 1] == "--ro-bind"
+    assert argv[bind_index + 1] == str(runtime.resolve())
+    assert argv[-2:] == [str(executable.resolve()), "--version"]
+    if not Path("/usr/bin/bwrap").is_file():
+        pytest.skip("bubblewrap unavailable")
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    if result.returncode != 0 and "setting up uid map: Permission denied" in result.stderr:
+        pytest.skip("bubblewrap user namespaces unavailable")
+    assert result.returncode == 0, result.stderr
+
+
+def test_bubblewrap_identity_root_rejects_untrusted_or_unrelated_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    trusted_runtime = tmp_path / "trusted-python"
+    untrusted_runtime = tmp_path / "untrusted-python"
+    executable = _executable(untrusted_runtime / "bin" / "python3.12")
+    trusted_runtime.mkdir()
+    monkeypatch.setattr(worker_workspace.sys, "base_prefix", str(trusted_runtime))
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_python_runtime_identity_root_untrusted",
+    ):
+        worker_workspace.sandbox_argv(
+            workspace,
+            "validation",
+            [str(executable), "--version"],
+            backend="bubblewrap",
+            validation_python_runtime_identity_root=untrusted_runtime,
+        )
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_python_runtime_executable_outside_root",
+    ):
+        worker_workspace.sandbox_argv(
+            workspace,
+            "validation",
+            [str(executable), "--version"],
+            backend="bubblewrap",
+            validation_python_runtime_identity_root=trusted_runtime,
+        )
 
 
 def test_run_validations_passes_runtime_root_to_bubblewrap(
