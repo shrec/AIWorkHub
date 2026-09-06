@@ -97,6 +97,41 @@ def test_preview_expires_all_old_finished_runs_and_protects_nonterminal_task(tmp
     assert (repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH).is_file()
 
 
+def test_preview_classification_is_unchanged_by_a_dropped_packet_field(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-00637: dropping ``packet`` from the retained projection must not
+    change any observable candidate/protected decision -- only the retained
+    ledger's byte size changes."""
+
+    repo = _repo(tmp_path)
+    request_id = "1" * 32
+    _run(repo, request_id, "TASK_DONE")
+    ledger = repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH
+    with ledger.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "task_id": "TASK_DONE",
+                    "runner": "runner",
+                    "topic": "topic",
+                    "adapter_id": "codex_cli",
+                    "state": "exited",
+                    "finished_at": "2026-01-01T00:00:00+00:00",
+                    "packet": "p" * 8192,
+                }
+            )
+            + "\n"
+        )
+
+    result = terminal_log_retention.preview(repo)
+
+    assert result["candidate_count"] == 1
+    assert {row["request_id"] for row in result["candidates"]} == {request_id}
+    assert result["protected_count"] == 0
+
+
 def test_preview_is_paginated_but_digest_covers_full_candidate_set(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     for index in range(75):
@@ -130,10 +165,14 @@ def test_latest_rows_uses_incremental_ledger_projection(
         request_id: {"request_id": request_id, "state": "exited"},
         "not-a-request": {"request_id": "not-a-request", "state": "exited"},
     }
+    def _fake_latest_events(_path, *, drop_fields=()):
+        assert drop_fields == ("packet",), "packet must be dropped before retention"
+        return projected
+
     monkeypatch.setattr(
         terminal_log_retention.process_event_ledger,
         "latest_events",
-        lambda _path: projected,
+        _fake_latest_events,
     )
     monkeypatch.setattr(
         terminal_log_retention.process_event_ledger,

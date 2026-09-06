@@ -12,6 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.97 — 2026-09-06
+
+- Source Graph batches FTS invalidation into bounded set-based deletes, avoiding
+  a full virtual-table scan for every deleted entity.
+- Rework reroutes preserve verified predecessor work while recovered launches
+  receive fresh request identities.
+
 ## What's new in 0.10.96 — 2026-09-06
 
 - Source Graph closes failure-path SQLite connections deterministically, and

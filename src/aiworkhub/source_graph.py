@@ -1388,6 +1388,33 @@ def _index_quality_scorecard(
     }
 
 
+_FTS_DELETE_CHUNK_SIZE = 500
+
+
+def _delete_entities_fts_rows(conn: sqlite3.Connection, entity_ids: list[int]) -> None:
+    """Remove entities_fts rows for entity_ids in a bounded number of scans.
+
+    ``entity_id`` is UNINDEXED in the ``entities_fts`` schema, so any DELETE
+    filtering on it costs SQLite one full virtual-table scan no matter how
+    many rows that scan matches. Issuing one statement per id -- the
+    previous ``executemany`` -- therefore paid one full scan PER DELETED
+    ENTITY: 79.5s to remove entities a single set-based statement removes in
+    0.109s (see NF-2026-00635). Chunking ids into a bounded ``IN (...)``
+    clause turns that into ``ceil(len(entity_ids) / chunk)`` scans for the
+    whole batch instead -- one scan for any file whose entity count fits in
+    a single chunk. The chunk size stays comfortably under SQLite's default
+    999 host-parameter ceiling.
+    """
+
+    for start in range(0, len(entity_ids), _FTS_DELETE_CHUNK_SIZE):
+        chunk = entity_ids[start:start + _FTS_DELETE_CHUNK_SIZE]
+        placeholders = ",".join("?" * len(chunk))
+        conn.execute(
+            f"DELETE FROM entities_fts WHERE entity_id IN ({placeholders})",
+            chunk,
+        )
+
+
 def _invalidate_file(conn: sqlite3.Connection, rel: str) -> None:
     """Remove every entity/edge/FTS row a file owns before re-indexing it.
 
@@ -1398,7 +1425,7 @@ def _invalidate_file(conn: sqlite3.Connection, rel: str) -> None:
 
     ids = [row[0] for row in conn.execute("SELECT id FROM entities WHERE file_path=?", (rel,))]
     if ids:
-        conn.executemany("DELETE FROM entities_fts WHERE entity_id=?", [(i,) for i in ids])
+        _delete_entities_fts_rows(conn, ids)
     conn.execute("DELETE FROM entities WHERE file_path=?", (rel,))
     conn.execute("DELETE FROM edges WHERE file_path=?", (rel,))
     conn.execute("DELETE FROM files WHERE file_path=?", (rel,))

@@ -38,8 +38,10 @@ class _LatestEventProjection:
 # A projection's identity is the ledger plus every fold option that changes
 # what it produces. The key was once the path and key field alone, so widening
 # the fold with skip/replace would have served one projection's answer to a
-# different projection's question.
-_ProjectionKey = tuple[str, str, tuple[str, ...], bool]
+# different projection's question. ``drop_fields`` joined the identity for the
+# same reason: a caller that never reads a large field (e.g. ``packet``) must
+# never be served -- or seed the cache for -- a projection that retained it.
+_ProjectionKey = tuple[str, str, tuple[str, ...], bool, tuple[str, ...]]
 
 _LATEST_EVENT_CACHE_LOCK = threading.RLock()
 _LATEST_EVENT_CACHE: OrderedDict[
@@ -498,6 +500,7 @@ def _merge_latest_row(
     *,
     skip_event_kinds: tuple[str, ...] = (),
     replace: bool = False,
+    drop_fields: tuple[str, ...] = (),
 ) -> None:
     """Fold one row into the latest-per-key map.
 
@@ -508,6 +511,11 @@ def _merge_latest_row(
     than a second copy of this projection: the launcher previously reimplemented
     the fold over an uncached full ledger pass, which is how it ended up paying
     1.87 s where the cached projection costs 21 ms.
+
+    ``drop_fields`` removes named keys from the row before it is folded, so a
+    field a consumer never reads (e.g. ``packet``) never enters the retained
+    projection -- it is stripped before retention, not merely from a returned
+    copy.
     """
 
     if skip_event_kinds and str(row.get("event_kind") or "") in skip_event_kinds:
@@ -515,6 +523,8 @@ def _merge_latest_row(
     key = str(row.get(key_field) or "")
     if not key:
         return
+    if drop_fields:
+        row = {k: v for k, v in row.items() if k not in drop_fields}
     latest[key] = dict(row) if replace else {**latest.get(key, {}), **row}
 
 
@@ -545,12 +555,18 @@ def _rebuild_latest_events(
     cache_key: _ProjectionKey,
     skip_event_kinds: tuple[str, ...] = (),
     replace: bool = False,
+    drop_fields: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     before = _ledger_signatures(path)
     latest: dict[str, dict[str, Any]] = {}
     for row in iter_events(path):
         _merge_latest_row(
-            latest, row, key_field, skip_event_kinds=skip_event_kinds, replace=replace
+            latest,
+            row,
+            key_field,
+            skip_event_kinds=skip_event_kinds,
+            replace=replace,
+            drop_fields=drop_fields,
         )
     after = _ledger_signatures(path)
 
@@ -579,6 +595,7 @@ def latest_events(
     key_field: str = "request_id",
     skip_event_kinds: tuple[str, ...] = (),
     replace: bool = False,
+    drop_fields: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     """Return the latest merged row per key using an append-aware projection.
 
@@ -587,14 +604,23 @@ def latest_events(
     any immutable-segment change invalidate the projection and replay the
     canonical ``iter_events`` ordering. The cache is process-local, bounded and
     never an authority: a restart merely pays one cold replay.
+
+    ``drop_fields`` names keys a caller never reads (e.g. ``packet``) that are
+    removed from every row before it is retained in the cached projection --
+    during both a cold rebuild and an incremental append replay -- not merely
+    from the dict handed back to the caller. Omitting it preserves the exact
+    default projection byte-for-byte.
     """
 
     resolved_path = str(path.resolve(strict=False))
     skip_event_kinds = tuple(sorted(skip_event_kinds))
+    drop_fields = tuple(sorted(drop_fields))
     # The fold options are part of the identity: a replace-fold that drops
     # notices is a different projection from a merge-fold that keeps them, and
-    # serving one for the other would be a silent wrong answer.
-    cache_key = (resolved_path, key_field, skip_event_kinds, bool(replace))
+    # serving one for the other would be a silent wrong answer. drop_fields
+    # joins the same identity so two different discard sets never share a
+    # cached projection.
+    cache_key = (resolved_path, key_field, skip_event_kinds, bool(replace), drop_fields)
     current = _ledger_signatures(path)
     with _LATEST_EVENT_CACHE_LOCK:
         cached = _LATEST_EVENT_CACHE.get(cache_key)
@@ -641,6 +667,7 @@ def latest_events(
                     cache_key=cache_key,
                     skip_event_kinds=skip_event_kinds,
                     replace=replace,
+                    drop_fields=drop_fields,
                 )
 
             complete_length = payload.rfind(b"\n") + 1
@@ -653,6 +680,7 @@ def latest_events(
                         key_field,
                         skip_event_kinds=skip_event_kinds,
                         replace=replace,
+                        drop_fields=drop_fields,
                     )
             if _ledger_signatures(path) == current:
                 _cache_projection(
@@ -671,4 +699,5 @@ def latest_events(
         cache_key=cache_key,
         skip_event_kinds=skip_event_kinds,
         replace=replace,
+        drop_fields=drop_fields,
     )

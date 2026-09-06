@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.97 — 2026-09-06
+
+### Fixed
+
+- Batch Source Graph FTS invalidation into bounded set-based deletes instead of
+  scanning the virtual table once per deleted entity (NF-2026-00635).
+- Preserve verified predecessor work across rework reroutes and use a fresh
+  request identity for each recovered launch episode (NF-2026-00645).
+
 ## 0.10.96 — 2026-09-06
 
 ### Fixed

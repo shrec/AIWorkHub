@@ -5453,6 +5453,134 @@ def _has_retained_candidate_delta(card: Mapping[str, Any]) -> bool:
     return isinstance(changed, dict) and bool(changed)
 
 
+def _verified_retained_predecessor_receipt(
+    card: Mapping[str, Any], *, task_id: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Verify a retained candidate before changing its launch identity.
+
+    Workspace materialization repeats these checks at launch.  Reroute must
+    perform them *before* persisting a new provider identity as well, otherwise
+    a malformed or tampered predecessor is made to look transferable in the
+    canonical ledger even though the later launch will (correctly) reject it.
+    """
+    from . import worker_workspace
+
+    predecessor = card.get("rework_predecessor")
+    if not isinstance(predecessor, dict):
+        return None, "reroute_retained_candidate_invalid"
+    request_id = str(predecessor.get("request_id") or "").strip()
+    claim_epoch = predecessor.get("claim_epoch")
+    workspace_payload = predecessor.get("workspace")
+    hashes = predecessor.get("changed_path_hashes")
+    if (
+        predecessor.get("schema_id") != "aiworkhub.rework_predecessor.v1"
+        or str(predecessor.get("task_id") or "") != task_id
+        or re.fullmatch(r"[0-9a-f]{32}", request_id) is None
+        or type(claim_epoch) is not int
+        or claim_epoch < 1
+        or not isinstance(workspace_payload, dict)
+        or not isinstance(hashes, dict)
+        or not hashes
+        or len(hashes) > worker_workspace.MAX_REWORK_OVERLAY_FILES
+    ):
+        return None, "reroute_retained_candidate_identity_mismatch"
+    try:
+        workspace = worker_workspace.WorkerWorkspace.from_metadata(workspace_payload)
+        authority_repo = repo_root().resolve(strict=False)
+        if (
+            workspace.repo.resolve(strict=False) != authority_repo
+            or workspace.request_id != request_id
+        ):
+            return None, "reroute_retained_candidate_identity_mismatch"
+        worker_workspace.assert_gc_safe_workspace_shape(
+            request_id,
+            workspace.path,
+            workspace.home,
+            repo=authority_repo,
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError, worker_workspace.WorkspaceError):
+        return None, "reroute_retained_candidate_workspace_invalid"
+
+    base_oid = workspace.base_oid
+    if not isinstance(base_oid, str) or not re.fullmatch(
+        r"(?:[0-9a-f]{40}|[0-9a-f]{64})", base_oid
+    ):
+        return None, "reroute_retained_candidate_base_oid_invalid"
+    card_allowed = card.get("allowed_writes")
+    if not isinstance(card_allowed, list) or tuple(
+        str(item) for item in card_allowed
+    ) != workspace.allowed_writes:
+        return None, "reroute_retained_candidate_scope_mismatch"
+    if not worker_workspace.has_verified_rework_delta(
+        predecessor, authority_repo=authority_repo
+    ):
+        return None, "reroute_retained_candidate_delta_unverified"
+
+    normalized_hashes: dict[str, str | None] = {}
+    try:
+        for raw_relative, expected in hashes.items():
+            if not isinstance(raw_relative, str):
+                raise worker_workspace.WorkspaceError("invalid_path")
+            relative = worker_workspace._relative_repo_path(raw_relative)
+            if relative != raw_relative or not worker_workspace._matches(
+                relative, workspace.allowed_writes
+            ):
+                return None, "reroute_retained_candidate_scope_mismatch"
+            if expected is not None and (
+                not isinstance(expected, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected)
+            ):
+                return None, "reroute_retained_candidate_hash_invalid"
+            normalized_hashes[relative] = expected
+        observed_paths = worker_workspace.changed_paths(
+            workspace, git_phase="reroute_retained_candidate"
+        )
+    except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError):
+        return None, "reroute_retained_candidate_workspace_unverifiable"
+    if set(observed_paths) != set(normalized_hashes):
+        return None, "reroute_retained_candidate_changed_paths_mismatch"
+
+    total_content_bytes = 0
+    for relative, expected in normalized_hashes.items():
+        target = workspace.path / relative
+        try:
+            worker_workspace._require_beneath(workspace.path, target)
+            if target.is_symlink():
+                return None, "reroute_retained_candidate_hash_mismatch"
+            if expected is None:
+                if target.exists():
+                    return None, "reroute_retained_candidate_hash_mismatch"
+                continue
+            if not target.is_file():
+                return None, "reroute_retained_candidate_hash_mismatch"
+            size = target.stat().st_size
+            total_content_bytes += size
+            if total_content_bytes > worker_workspace.MAX_REWORK_OVERLAY_CONTENT_BYTES:
+                return None, "reroute_retained_candidate_too_large"
+            observed = hashlib.sha256(target.read_bytes()).hexdigest()
+        except (OSError, RuntimeError, ValueError, worker_workspace.WorkspaceError):
+            return None, "reroute_retained_candidate_hash_mismatch"
+        if not hmac.compare_digest(observed, expected):
+            return None, "reroute_retained_candidate_hash_mismatch"
+
+    predecessor_digest = hashlib.sha256(
+        json.dumps(
+            predecessor,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "retained_candidate_preserved": True,
+        "retained_predecessor_request_id": request_id,
+        "retained_predecessor_sha256": predecessor_digest,
+        "retained_base_oid": base_oid,
+        "retained_claim_epoch": claim_epoch,
+        "retained_changed_path_count": len(normalized_hashes),
+    }, None
+
+
 def reroute_launch_identity(
     task_id: str,
     *,
@@ -5467,13 +5595,15 @@ def reroute_launch_identity(
     to an enabled, available, risk-capable canonical workforce tuple.
 
     Permitted only for a card that already carries an exact operational
-    ``terminal_retry`` receipt (see ``retry_terminal_task``) and no retained
-    candidate/rework delta. Preserves task ID, topic, scope, template
-    provenance and history -- mutates only ``runner`` plus a bounded audited
-    old/new identity receipt. Fails closed for a claimed or non-pending task,
-    a retained delta, an arbitrary/ambiguous target identity, a disabled,
-    unavailable or risk-incapable canonical route, and a compare-and-swap
-    race against a concurrent claim or mutation.
+    ``terminal_retry`` receipt (see ``retry_terminal_task``). Preserves task
+    ID, topic, scope, template provenance, history and any hash-pinned retained
+    candidate -- mutates only ``runner`` plus a bounded audited old/new
+    identity receipt. Retained bytes are still reverified against their exact
+    hashes and allowed-write scope by workspace materialization before the new
+    provider can start. Fails closed for a claimed or non-pending task, an
+    arbitrary/ambiguous target identity, a disabled, unavailable or
+    risk-incapable canonical route, and a compare-and-swap race against a
+    concurrent claim or mutation.
     """
     from . import process_launcher  # local import: cycle-safe (see _reconcile_retained_workspaces)
 
@@ -5520,8 +5650,15 @@ def reroute_launch_identity(
     ):
         return _lifecycle_error("reroute_requires_terminal_retry_provenance")
 
+    retained_candidate_receipt: dict[str, Any] = {}
     if _has_retained_candidate_delta(card):
-        return _lifecycle_error("reroute_retained_candidate_delta")
+        retained_candidate_receipt, retained_error = (
+            _verified_retained_predecessor_receipt(card, task_id=task_id)
+        )
+        if retained_error is not None or retained_candidate_receipt is None:
+            return _lifecycle_error(
+                retained_error or "reroute_retained_candidate_unverified"
+            )
 
     card_runner = str(card.get("runner") or "")
     if card_runner != from_runner:
@@ -5566,6 +5703,7 @@ def reroute_launch_identity(
         "to_model": canonical_model,
         "reason": bounded_reason,
         "rerouted_at": now,
+        **retained_candidate_receipt,
     }
     encoded_card = json.dumps(semantic_card, ensure_ascii=False, sort_keys=True)
     try:

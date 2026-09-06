@@ -397,6 +397,7 @@ def _symbol_metrics(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
+    lines_by_path: dict[str, list[str]] = {}
     for match in matches:
         if str(match.get("kind") or "") not in {
             "function", "method", "class", "struct", "union", "enum", "namespace",
@@ -409,7 +410,10 @@ def _symbol_metrics(
         path = str(match.get("file_path") or "")
         start = max(1, int(match.get("line_start") or 1))
         end = max(start, int(match.get("line_end") or start))
-        lines = _safe_lines(repo_root, path)
+        lines = lines_by_path.get(path)
+        if lines is None:
+            lines = _safe_lines(repo_root, path)
+            lines_by_path[path] = lines
         source = "\n".join(lines[start - 1:end])[:12000]
         branches = len(_BRANCH_RE.findall(source))
         loops = len(_LOOP_RE.findall(source))

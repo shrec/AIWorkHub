@@ -992,7 +992,9 @@ def _latest_process_row(root: Path | str, request_id: str) -> Mapping[str, Any] 
     from . import process_event_ledger
 
     return process_event_ledger.latest_events(
-        _process_event_log_path(root), key_field="request_id"
+        _process_event_log_path(root),
+        key_field="request_id",
+        drop_fields=("packet",),
     ).get(request_id)
 
 

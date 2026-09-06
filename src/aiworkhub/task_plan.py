@@ -649,9 +649,16 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         if lifecycle[tid] in RETAINED_STATES:
             retained_paths |= set(c.get("allowed_writes") or [])
 
+    # Keep pending-scope arbitration identical to launch_collision_guard.
+    # Otherwise the plan can advertise one overlapping card as ready while
+    # the atomic launch guard deterministically admits a different winner.
+    priority_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "": 4}
     ordered = sorted(
         by_id.values(),
-        key=lambda c: (str(c.get("created_at") or ""), str(c.get("task_id"))),
+        key=lambda c: (
+            priority_rank.get(str(c.get("priority") or "").strip().lower(), 4),
+            str(c.get("task_id") or ""),
+        ),
     )
 
     def has_persisted_noncollision_blocker(card: dict[str, Any]) -> bool:

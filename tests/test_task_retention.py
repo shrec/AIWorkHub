@@ -333,6 +333,53 @@ def test_final_archive_fence_rejects_live_reserved_retained_and_bad_ledger(
     assert reason == expected_reason
 
 
+def test_final_archive_fence_decision_is_unchanged_by_a_dropped_packet_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NF-2026-00637: ``_latest_process_row`` requests ``drop_fields=("packet",)``.
+
+    A large ``packet`` field on the real ledger row must be stripped before it
+    is retained in the cached projection, and ``_final_archive_fence``'s
+    decision (fenced or not, and why) must be identical to what it would be
+    without that field -- this exercises the real ledger file, not a mock of
+    ``_latest_process_row``.
+    """
+
+    repo = _repo(tmp_path)
+    card: dict[str, Any] = {
+        "task_id": "FAMILY_V1",
+        "launch_request_id": "req-v1",
+        "status": "blocked",
+        "worker_status": "blocked",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "claimed_by": "stale-worker-attribution",
+    }
+    monkeypatch.setattr(task_store, "get_task", lambda _root, _task_id: card)
+    log_path = repo / process_launcher.PROCESS_LOG_DEFAULT_REL
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "task_id": "FAMILY_V1",
+                    "request_id": "req-v1",
+                    "state": "worker_failed",
+                    "timestamp": "2026-01-01T00:00:01+00:00",
+                    "packet": "x" * 8192,
+                }
+            )
+            + "\n"
+        )
+
+    row = task_retention._latest_process_row(repo, "req-v1")
+    assert row is not None and "packet" not in row
+
+    fenced, reason = task_retention._final_archive_fence(repo, "FAMILY_V1", "req-v1")
+
+    assert reason == ""
+    assert fenced == card
+
+
 @pytest.mark.parametrize("callback_state", ["pending", "inflight"])
 def test_final_archive_fence_rejects_live_callback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, callback_state: str

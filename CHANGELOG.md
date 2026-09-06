@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.97] - 2026-09-06
+
+### Fixed
+
+- Batch Source Graph FTS entity invalidation into bounded set-based deletes,
+  avoiding one full virtual-table scan per deleted entity (NF-2026-00635).
+- Preserve and reverify hash-pinned predecessor work when rerouting a recovered
+  rework, while assigning fresh request identities to new launch episodes
+  (NF-2026-00645).
+
 ## [0.10.96] - 2026-09-06
 
 ### Fixed

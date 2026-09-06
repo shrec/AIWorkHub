@@ -11,7 +11,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.10.96";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.10.97";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -3646,6 +3646,18 @@ function vscodeLmRequiredCreateError(items, contractByPath, contentKey, operatio
   return "";
 }
 
+// NF651: the finalize path allows exactly one bounded corrective stage when a
+// required create is missing/empty before failing structurally with the
+// current normalized missing path -- never the generic unbounded retry loop.
+function vscodeLmMissingRequiredCreatePath(finalError, contractByPath) {
+  const match = /^final_edit_fidelity_rejected:(?:missing|empty)_required_create:(.+):(?:v1_file|v2_create|v3_create)$/
+    .exec(String(finalError || ""));
+  if (!match) return "";
+  const normalizedPath = vscodeLmNormalizedPath(match[1]);
+  const contract = contractByPath instanceof Map ? contractByPath.get(normalizedPath) : undefined;
+  return contract && contract.action === "create" ? normalizedPath : "";
+}
+
 function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = {}) {
   if (!envelope || typeof envelope.summary !== "string") {
     return "final_shape_invalid";
@@ -4508,6 +4520,7 @@ async function runVscodeLmTextProtocol(
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
   let stagedEditViolations = 0;
+  let missingCreateViolations = 0;
   const protocolTrace = [];
   let lastProtocolPreview = "";
   const stagedEdits = createVscodeLmStagedEditCollector(request);
@@ -4645,6 +4658,26 @@ async function runVscodeLmTextProtocol(
       }
       const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts);
       if (finalError) {
+        const missingCreatePath = vscodeLmMissingRequiredCreatePath(finalError, vscodeLmContractMap(request.path_contracts));
+        if (missingCreatePath) {
+          protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: finalError });
+          if (missingCreateViolations >= 1) {
+            const missingCreateError = vscodeLmProtocolFailure(
+              "vscode_lm_final_envelope_missing_create", protocolTrace, lastProtocolPreview,
+            );
+            missingCreateError.missingCreatePath = missingCreatePath;
+            throw missingCreateError;
+          }
+          missingCreateViolations += 1;
+          messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+          messages.push(vscode.LanguageModelChatMessage.User(
+            `The previous final envelope was rejected (${finalError}). ` +
+            `Output ONLY one corrected ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object that includes a complete ` +
+            `create entry for ${missingCreatePath}. ` +
+            `Every file path must match allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
+          ));
+          continue;
+        }
         protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: finalError });
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
@@ -4876,6 +4909,7 @@ async function runVscodeLmAgent(
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
   let stagedEditViolations = 0;
+  let missingCreateViolations = 0;
   const protocolTrace = [];
   let lastProtocolPreview = "";
   const stagedEdits = createVscodeLmStagedEditCollector(request);
@@ -5038,6 +5072,26 @@ async function runVscodeLmAgent(
       }
       const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts);
       if (finalError) {
+        const missingCreatePath = vscodeLmMissingRequiredCreatePath(finalError, vscodeLmContractMap(request.path_contracts));
+        if (missingCreatePath) {
+          protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: finalError });
+          if (missingCreateViolations >= 1) {
+            const missingCreateError = vscodeLmProtocolFailure(
+              "vscode_lm_final_envelope_missing_create", protocolTrace, lastProtocolPreview,
+            );
+            missingCreateError.missingCreatePath = missingCreatePath;
+            throw missingCreateError;
+          }
+          missingCreateViolations += 1;
+          messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+          messages.push(vscode.LanguageModelChatMessage.User(
+            `The previous final envelope was rejected (${finalError}). ` +
+            `Output ONLY one corrected ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object that includes a complete ` +
+            `create entry for ${missingCreatePath}. ` +
+            `Every file path must match allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
+          ));
+          continue;
+        }
         protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: finalError });
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(

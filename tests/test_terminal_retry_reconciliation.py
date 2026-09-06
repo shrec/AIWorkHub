@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -10,7 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiworkhub import core, process_launcher, task_store, toolchain_authority
+from aiworkhub import (
+    core,
+    process_launcher,
+    task_store,
+    toolchain_authority,
+    worker_workspace,
+)
 
 
 @pytest.fixture
@@ -270,6 +277,65 @@ def _insert_pending_reroutable(
         conn.close()
 
 
+def _retained_predecessor(
+    repo: Path,
+    *,
+    task_id: str,
+    request_id: str = "a" * 32,
+    content: bytes = b"retained candidate\n",
+) -> dict:
+    workspace_root = worker_workspace.configured_worktree_root(repo) / request_id
+    worktree = workspace_root / "worktree"
+    home = workspace_root / "home"
+    output = worktree / "out" / "result.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    home.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(content)
+    changed_digest = hashlib.sha256(content).hexdigest()
+
+    artifact_bytes = b"{}"
+    artifact_digest = hashlib.sha256(artifact_bytes).hexdigest()
+    artifact_path = (
+        worker_workspace.configured_runtime_root(repo)
+        / "rework_deltas"
+        / f"{artifact_digest}.json"
+    )
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_bytes(artifact_bytes)
+    claim_epoch = 1
+    return {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
+        "task_id": task_id,
+        "request_id": request_id,
+        "claim_epoch": claim_epoch,
+        "changed_path_hashes": {"out/result.json": changed_digest},
+        "workspace": {
+            "request_id": request_id,
+            "repo": str(repo),
+            "path": str(worktree),
+            "home": str(home),
+            "allowed_writes": ["out/result.json"],
+            "parent_baseline": {},
+            "workspace_baseline": {},
+            "base_oid": "b" * 40,
+        },
+        "rework_delta": {
+            "schema_id": "aiworkhub.rework_delta_descriptor.v1",
+            "sealed": True,
+            "authority_repo": str(repo.resolve()),
+            "task_id": task_id,
+            "request_id": request_id,
+            "claim_epoch": claim_epoch,
+            "artifact_path": str(artifact_path),
+            "artifact_sha256": artifact_digest,
+        },
+        "delta_artifact": {
+            "path": str(artifact_path),
+            "digest": artifact_digest,
+        },
+    }
+
+
 def test_reroute_launch_identity_repairs_invalid_pinned_runner(
     coordinator_repo: Path,
 ) -> None:
@@ -526,17 +592,67 @@ def test_reroute_launch_identity_rejects_malformed_or_nonoperational_retry(
     assert json.loads(row["card_json"])["terminal_retry"] == terminal_retry
 
 
-def test_reroute_launch_identity_rejects_retained_candidate_delta(
-    coordinator_repo: Path,
+def test_reroute_launch_identity_preserves_retained_candidate_delta(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task_id = "REROUTE_RETAINED_DELTA"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
     _insert_pending_reroutable(
         coordinator_repo,
         task_id=task_id,
-        rework_predecessor={
-            "schema_id": "aiworkhub.rework_predecessor.v1",
-            "changed_path_hashes": {"out/result.py": "deadbeef"},
-        },
+        rework_predecessor=predecessor,
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    assert result["ok"] is True, result
+    row = _row(coordinator_repo, task_id)
+    assert row["runner"] == "claude_sonnet-5"
+    card = json.loads(row["card_json"])
+    assert card["rework_predecessor"] == predecessor
+    receipt = card["identity_reroute"]
+    assert receipt["retained_candidate_preserved"] is True
+    assert receipt["retained_predecessor_request_id"] == "a" * 32
+    assert receipt["retained_base_oid"] == "b" * 40
+    assert receipt["retained_claim_epoch"] == 1
+    assert receipt["retained_changed_path_count"] == 1
+    expected_digest = hashlib.sha256(
+        json.dumps(
+            predecessor,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert receipt["retained_predecessor_sha256"] == expected_digest
+
+
+def test_reroute_launch_identity_rejects_tampered_retained_bytes(
+    coordinator_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = "REROUTE_RETAINED_TAMPERED"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    Path(predecessor["workspace"]["path"], "out/result.json").write_text(
+        "tampered\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
+    _insert_pending_reroutable(
+        coordinator_repo, task_id=task_id, rework_predecessor=predecessor
     )
 
     result = core.reroute_launch_identity(
@@ -548,7 +664,46 @@ def test_reroute_launch_identity_rejects_retained_candidate_delta(
     )
 
     assert result["ok"] is False
-    assert "reroute_retained_candidate_delta" in result["stderr"]
+    assert "reroute_retained_candidate_hash_mismatch" in result["stderr"]
+    assert _row(coordinator_repo, task_id)["runner"] == "claude_sonnet-4.6"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("task_id", "OTHER_TASK", "identity_mismatch"),
+        ("claim_epoch", 2, "delta_unverified"),
+    ],
+)
+def test_reroute_launch_identity_rejects_retained_identity_drift(
+    coordinator_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+    reason: str,
+) -> None:
+    task_id = f"REROUTE_RETAINED_{field.upper()}"
+    predecessor = _retained_predecessor(coordinator_repo, task_id=task_id)
+    predecessor[field] = value
+    monkeypatch.setattr(
+        worker_workspace,
+        "changed_paths",
+        lambda _workspace, **_kwargs: ["out/result.json"],
+    )
+    _insert_pending_reroutable(
+        coordinator_repo, task_id=task_id, rework_predecessor=predecessor
+    )
+
+    result = core.reroute_launch_identity(
+        task_id,
+        from_runner="claude_sonnet-4.6",
+        to_runner="claude_sonnet-5",
+        to_adapter_id="claude_cli",
+        to_model="sonnet",
+    )
+
+    assert result["ok"] is False
+    assert f"reroute_retained_candidate_{reason}" in result["stderr"]
     assert _row(coordinator_repo, task_id)["runner"] == "claude_sonnet-4.6"
 
 

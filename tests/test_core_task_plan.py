@@ -23,7 +23,7 @@ def _init_repo(tmp_path: Path) -> Path:
 
 def _insert_card(repo: Path, task_id, *, runner="codex_a", topic="coding", status="pending",
                   worker_status="unclaimed", allowed_writes=None, depends_on=None,
-                  created_at="2026-01-01T00:00:00+00:00", archived_at="", **extra):
+                  created_at="2026-01-01T00:00:00+00:00", archived_at="", priority="", **extra):
     _readiness, db_path = task_store._require_ready(repo)
     card = {
         "task_id": task_id,
@@ -31,6 +31,7 @@ def _insert_card(repo: Path, task_id, *, runner="codex_a", topic="coding", statu
         "topic": topic,
         "allowed_writes": allowed_writes or [],
         "depends_on": depends_on or [],
+        "priority": priority,
         "status": status,
         "worker_status": worker_status,
         **extra,
@@ -40,9 +41,9 @@ def _insert_card(repo: Path, task_id, *, runner="codex_a", topic="coding", statu
         conn.execute(
             "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
             "objective, card_json, created_at, updated_at, archived_at) "
-            "VALUES (?, ?, ?, ?, ?, '', '', ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)",
             (
-                task_id, runner, topic, status, worker_status, json.dumps(card),
+                task_id, runner, topic, status, worker_status, priority, json.dumps(card),
                 created_at, created_at, archived_at or "",
             ),
         )
@@ -453,3 +454,24 @@ def test_launch_collision_guard_deterministically_selects_ready_pending_winner()
 
     assert first["ok"] is True
     assert second["ok"] is False
+
+
+def test_plan_and_launch_guard_select_same_priority_winner():
+    repo = core.repo_root()
+    _insert_card(
+        repo, "older_low", priority="low", created_at="2026-01-01T00:00:00+00:00",
+        allowed_writes=["shared.py"],
+    )
+    _insert_card(
+        repo, "newer_critical", priority="critical", created_at="2026-01-02T00:00:00+00:00",
+        allowed_writes=["shared.py"],
+    )
+
+    snapshot = core.task_plan_snapshot()
+    critical_launch = core.launch_collision_guard(task_id="newer_critical", print_json=True)
+    low_launch = core.launch_collision_guard(task_id="older_low", print_json=True)
+
+    assert snapshot["ready"] == ["newer_critical"]
+    assert critical_launch["ok"] is True
+    assert low_launch["ok"] is False
+    assert json.loads(low_launch["stdout"])["blockers"][0]["task_id"] == "newer_critical"

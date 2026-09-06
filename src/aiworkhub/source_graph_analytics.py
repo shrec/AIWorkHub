@@ -709,6 +709,11 @@ def _summary(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+_SYMBOL_METRIC_MODES: frozenset[str] = frozenset({
+    "hotspots", "complexity", "bottlenecks", "reviewqueue", "symbols", "summarize", "pipeline",
+})
+
+
 def query(
     conn: sqlite3.Connection,
     repo_root: Path,
@@ -725,17 +730,19 @@ def query(
     budget = max(1, min(int(budget), 200))
     scoped_matches = _scope_matches(conn, matches, budget=budget)
     files = _scope_files(conn, matches, budget=budget)
-    # A ranked mode sorts these, so its population cannot be a slice sized by
-    # the caller's page. Every other mode reads symbol_metrics as a bounded
-    # detail list where the smaller, budget-shaped limit is the right cost.
-    _metrics_limit = (
-        RANKED_POPULATION_ROWS
-        if mode in _RANKED_SYMBOL_MODES
-        else max(1, min(budget, 80))
-    )
-    symbol_metrics = insights.symbol_metrics(
-        conn, repo_root, scoped_matches, limit=_metrics_limit,
-    )
+    symbol_metrics: list[dict[str, Any]] = []
+    if mode in _SYMBOL_METRIC_MODES:
+        # A ranked mode sorts these, so its population cannot be a slice sized by
+        # the caller's page. Every other consumer reads symbol_metrics as a
+        # bounded detail list where the smaller, budget-shaped limit is right.
+        metrics_limit = (
+            RANKED_POPULATION_ROWS
+            if mode in _RANKED_SYMBOL_MODES
+            else max(1, min(budget, 80))
+        )
+        symbol_metrics = insights.symbol_metrics(
+            conn, repo_root, scoped_matches, limit=metrics_limit,
+        )
 
     base: dict[str, Any] = {
         "mode": mode,

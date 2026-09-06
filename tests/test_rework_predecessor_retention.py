@@ -11,6 +11,7 @@ Exercised through the module-level seams; no ProcessManager is constructed.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -142,3 +143,80 @@ def test_rework_does_not_discard_green_work_over_missing_context_receipts(
     # A rework honors the predecessor's receipts instead of discarding the work.
     assert rework["satisfied"] is True
     assert rework["missing_tools"] == []
+
+
+def test_recovered_rework_gets_fresh_request_but_active_lost_ack_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    predecessor_request_id = "eb03529091744fc49b8ed788916611e3"
+    base = {
+        "task_id": "NF622-V6",
+        "runner": "codex_5.6",
+        "topic": "nf622-v6",
+        "allowed_writes": ["delta.py"],
+        "required_outputs": ["delta.py"],
+        "rework_predecessor": {
+            "request_id": predecessor_request_id,
+            "task_id": "NF622-V6",
+            "changed_path_hashes": {"delta.py": "0" * 64},
+        },
+        "request_id": predecessor_request_id,
+    }
+    manager = object.__new__(pl.ProcessManager)
+    manager.repo = tmp_path
+    manager._toolchain_authority = type(
+        "Authority",
+        (),
+        {
+            "evaluate": lambda _self, _card: type(
+                "Snapshot", (), {"available": True, "missing": []}
+            )(),
+            "repair": lambda _self, _snapshot: None,
+        },
+    )()
+    manager._collision_guard = lambda **_kwargs: {"returncode": 0}
+    monkeypatch.setattr(pl, "_validate_scope", lambda *_args: None)
+    monkeypatch.setattr(pl, "_validate_required_outputs_contract", lambda *_args: None)
+    monkeypatch.setattr(pl.core, "task_card_path_conflicts", lambda _card: [])
+    monkeypatch.setattr(pl.repo_policy, "validate_launch", lambda *_args: {"ok": True})
+    monkeypatch.setattr(
+        pl._toolchain_authority, "authority_receipt", lambda *_args: {}
+    )
+    monkeypatch.setattr(pl, "identical_relaunch_refusal", lambda *_args, **_kwargs: "")
+
+    recovered = {
+        **base,
+        "status": "pending",
+        "worker_status": "unclaimed",
+        "claimed_by": "",
+        "claim_epoch": 7,
+    }
+    manager._show_task = lambda _task_id: {
+        "returncode": 0,
+        "stdout": json.dumps(recovered),
+    }
+    fresh = manager._preflight_card("NF622-V6", "codex_5.6", "nf622-v6", "codex_cli")
+    assert fresh["request_id"] != predecessor_request_id
+    assert len(fresh["request_id"]) == 32
+    assert fresh["rework_predecessor"] == recovered["rework_predecessor"]
+
+    active = {
+        **recovered,
+        "status": "processing",
+        "worker_status": "claimed",
+        "claimed_by": "codex_5.6",
+        "launch_request_id": fresh["request_id"],
+        "request_id": fresh["request_id"],
+    }
+    manager._show_task = lambda _task_id: {
+        "returncode": 0,
+        "stdout": json.dumps(active),
+    }
+    replay = manager._preflight_card(
+        "NF622-V6",
+        "codex_5.6",
+        "nf622-v6",
+        "codex_cli",
+        reserved_request_id=fresh["request_id"],
+    )
+    assert replay["request_id"] == fresh["request_id"]

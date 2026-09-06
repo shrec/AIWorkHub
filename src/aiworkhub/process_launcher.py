@@ -5575,8 +5575,11 @@ class ProcessManager:
         worker_status = str(card.get("worker_status") or "unclaimed")
         claimed_by = str(card.get("claimed_by") or "")
         launch_request_id = str(card.get("launch_request_id") or "")
+        prior_request_id = launch_request_id or card.get("request_id")
         effective_request_id = str(
-            reserved_request_id or card.get("request_id") or launch_request_id or uuid.uuid4().hex
+            reserved_request_id
+            or (None if lifecycle == "pending" else prior_request_id)
+            or uuid.uuid4().hex
         )
         if lifecycle == "pending":
             if worker_status != "unclaimed":
@@ -8743,52 +8746,48 @@ class ProcessManager:
                 if expected
                 else f"unexpected_launch_error:{type(exc).__name__}:{exc}"
             )
-            # A pre-claim failure leaves a pending card pending.  Fabricating a
-            # claim merely to manufacture a terminal review was the source of
-            # false review-ready launch failures.  A card already claimed by
-            # auto-pickup, or claimed later in this launch, is instead moved to
-            # the truthful blocked/launch_failed state below.
+            # Provisioned failures must become recoverable blocked claim episodes.
             claim_release_retained = False
+            if not claimed and workspace is not None and request_id:
+                failed_claim = task_engine.claim_start_exact(
+                    self.repo, task_id, runner, topic, request_id=request_id
+                )
+                if failed_claim.get("ok"):
+                    claimed = True
+                    card = _committed_claim_card(
+                        failed_claim, request_id=request_id, task_id=task_id,
+                        runner=runner, topic=topic,
+                    )
+                else:
+                    detail = failed_claim.get("stderr") or failed_claim.get("stdout") or ""
+                    reason += ":launch_failure_claim_failed:" + str(detail)[:200]
             if claimed:
                 claim_epoch = card.get("claim_epoch")
-                if (
-                    reserved_request_id is not None
-                    and type(claim_epoch) is int
-                    and claim_epoch >= 1
+                if reserved_request_id is not None and (
+                    type(claim_epoch) is int and claim_epoch >= 1
                 ):
                     blocked_result, claim_release_retained = (
                         self._release_or_retain_reviewer_claim_after_launch_failure(
-                            request_id=reserved_request_id,
-                            task_id=task_id,
-                            runner=runner,
-                            reviewer_claim_epoch=claim_epoch,
+                            request_id=reserved_request_id, task_id=task_id,
+                            runner=runner, reviewer_claim_epoch=claim_epoch,
                             reason=reason,
                         )
                     )
                 else:
                     blocked_result = task_engine.mark_launch_failed(
-                        self.repo,
-                        task_id,
-                        runner,
-                        reason=reason[:500],
+                        self.repo, task_id, runner, reason=reason[:500],
                         request_id=request_id or reserved_request_id or "",
                     )
                 if not blocked_result.get("ok"):
                     release_detail = str(
-                        blocked_result.get("stderr")
-                        or blocked_result.get("stdout")
-                        or blocked_result.get("error")
-                        or ""
+                        blocked_result.get("stderr") or blocked_result.get("stdout")
+                        or blocked_result.get("error") or ""
                     )[:200]
                     reason += ":launch_failure_transition_failed:" + release_detail
             else:
                 blocker_result = task_engine.record_launch_blocker(
-                    self.repo,
-                    task_id,
-                    runner,
-                    topic,
-                    adapter_id=adapter_id,
-                    reason=reason,
+                    self.repo, task_id, runner, topic,
+                    adapter_id=adapter_id, reason=reason,
                 )
                 if not blocker_result.get("ok"):
                     reason += ":launch_blocker_record_failed:" + str(
