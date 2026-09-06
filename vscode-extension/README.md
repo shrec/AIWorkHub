@@ -12,12 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.10.98 — 2026-09-06
+## What's new in 0.10.99 — 2026-09-06
 
 - Source Graph reuses computed symbol metrics instead of recomputing them, and
   retained projections stay packet-free.
 - Plan and launch task ordering share priority parity, and the VS Code LM
   bridge bounds recovery for missing-create finalization.
+- Release CI now exercises reviewer launch ordering with a production-shaped,
+  identity-bound claim receipt.
 
 ## What's new in 0.10.97 — 2026-09-06
 

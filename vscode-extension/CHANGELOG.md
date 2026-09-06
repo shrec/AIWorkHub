@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.99 — 2026-09-06
+
+### Fixed
+
+- Make reviewer launch ordering tests use the same identity-bound claim receipt
+  contract enforced by production, restoring deterministic release CI.
+
 ## 0.10.98 — 2026-09-06
 
 ### Fixed
