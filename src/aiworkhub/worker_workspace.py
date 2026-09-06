@@ -9404,27 +9404,7 @@ def run_validations(
                 # commands never reach this branch, so their env/argv stay
                 # byte-equivalent to before.
                 pytest_root = resolve_trusted_pytest_runtime_root()
-                pytest_roots = [pytest_root]
-                active_pytest_root = _current_pytest_runtime_root()
-                if (
-                    active_pytest_root is not None
-                    and active_pytest_root != pytest_root
-                ):
-                    try:
-                        active_pytest_root = _validate_pytest_runtime_root(
-                            active_pytest_root,
-                            allow_active_runtime_world_writable=True,
-                        )
-                    except WorkspaceError:
-                        pass
-                    else:
-                        # The package already supplying pytest to this
-                        # coordinator must win over an auxiliary approved
-                        # component (for example a plugin-only user-site).
-                        pytest_roots.insert(0, active_pytest_root)
-                effective_components = tuple(
-                    str(root) for root in pytest_roots
-                ) + pythonpath_components
+                effective_components = (str(pytest_root),) + pythonpath_components
                 tokens = _normalize_pytest_validation_argv(tokens)
             if _is_python_validation_command(tokens):
                 effective_components = _candidate_pythonpath_components(
@@ -9435,6 +9415,31 @@ def run_validations(
                     tokens, workspace.repo
                 )
             )
+            if (
+                _module_validator_fallback_authority(module_interpreter_authority)
+                and _is_pytest_validation_command(tokens)
+            ):
+                # Unlike ruff/mypy, pytest imports plugins and candidate code.
+                # When no trusted executable runtime root supplies it, retain
+                # the separately approved package root above; if this process
+                # already has a distinct approved pytest root, put that first
+                # so an auxiliary plugin-only root cannot replace pytest itself.
+                active_pytest_root = _current_pytest_runtime_root()
+                if (
+                    active_pytest_root is not None
+                    and str(active_pytest_root) not in effective_components
+                ):
+                    try:
+                        approved_active_root = _approved_pythonpath_site(
+                            str(active_pytest_root)
+                        )
+                    except WorkspaceError:
+                        pass
+                    else:
+                        effective_components = (
+                            str(approved_active_root),
+                            *effective_components,
+                        )
             receipt_fact = _verify_authority_receipt_executable(
                 verified_toolchain_authority_receipt, tokens[0]
             )
