@@ -3751,6 +3751,20 @@ def trusted_validation_executable_version(resolved: str) -> str:
         return ""
     if backend == VSCODE_LM_IN_PROCESS_BACKEND:
         return ""
+    executable_root = executable.parent
+    try:
+        base_prefix = Path(sys.base_prefix).resolve(strict=True)
+        executable.relative_to(base_prefix)
+    except (OSError, ValueError):
+        pass
+    else:
+        # Hosted Python installations keep libpython and their standard library
+        # beside the interpreter, outside ``bin``.  Publishing only ``bin`` into
+        # bubblewrap therefore makes an otherwise valid ``python --version``
+        # fail with an empty fact.  The running interpreter's immutable base
+        # prefix is already the trusted dependency boundary, so bind that whole
+        # prefix read-only while keeping ordinary tools scoped to their parent.
+        executable_root = base_prefix
     try:
         with tempfile.TemporaryDirectory(prefix="aiworkhub-version-probe-") as raw:
             root = Path(raw)
@@ -3782,7 +3796,7 @@ def trusted_validation_executable_version(resolved: str) -> str:
                 [str(executable), "--version"],
                 backend=backend,
                 validation_exec_scratch=scratch,
-                validation_executable_roots=(executable.parent,),
+                validation_executable_roots=(executable_root,),
             )
             env = sanitized_env(
                 "validation",

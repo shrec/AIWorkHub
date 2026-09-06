@@ -499,6 +499,42 @@ def test_version_probe_uses_sandbox_boundary_not_direct_subprocess(
     assert captured["roots"] == (executable.resolve().parent,)
 
 
+def test_version_probe_publishes_hosted_python_base_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "hosted-python"
+    executable = _executable(runtime / "bin" / "python3.12")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(worker_workspace.sys, "base_prefix", str(runtime))
+    monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "bubblewrap")
+    monkeypatch.setattr(
+        worker_workspace,
+        "sandbox_argv",
+        lambda ws, adapter_id, argv, **kw: captured.update(
+            {"roots": kw.get("validation_executable_roots")}
+        )
+        or ["sandboxed-python", "--version"],
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "sanitized_env",
+        lambda *args, **kwargs: {"PATH": "/usr/bin:/bin"},
+    )
+    monkeypatch.setattr(
+        worker_workspace.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, "Python 3.12.0\n", ""
+        ),
+    )
+
+    assert (
+        worker_workspace.trusted_validation_executable_version(str(executable))
+        == "Python 3.12.0"
+    )
+    assert captured["roots"] == (runtime.resolve(),)
+
+
 def test_run_validations_passes_runtime_root_to_bubblewrap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
