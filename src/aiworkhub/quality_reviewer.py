@@ -1601,6 +1601,24 @@ def _platform_module_class_has_attr(module: str, class_name: str, symbol: str) -
     )
 
 
+def _resolved_import_from_module(module: str, node: ast.ImportFrom) -> str | None:
+    if not node.level:
+        return node.module or None
+    spec = _platform_module_spec(module)
+    package = (
+        module
+        if spec is not None and spec.submodule_search_locations is not None
+        else module.rpartition(".")[0]
+    )
+    if not package:
+        return None
+    relative_name = "." * node.level + (node.module or "")
+    try:
+        return importlib.util.resolve_name(relative_name, package)
+    except (ImportError, ValueError):
+        return None
+
+
 def _stdlib_python_module_defines(
     module: str,
     symbol: str,
@@ -1618,28 +1636,13 @@ def _stdlib_python_module_defines(
     if _module_tree_defines(tree, symbol):
         return True
 
-    spec = _platform_module_spec(module)
-    package = (
-        module
-        if spec is not None and spec.submodule_search_locations is not None
-        else module.rpartition(".")[0]
-    )
     next_seen = seen | {module}
     for node in _module_scope_nodes(tree.body):
         if not isinstance(node, ast.ImportFrom) or not any(
             alias.name == "*" for alias in node.names
         ):
             continue
-        if node.level:
-            if not package:
-                continue
-            relative_name = "." * node.level + (node.module or "")
-            try:
-                target = importlib.util.resolve_name(relative_name, package)
-            except (ImportError, ValueError):
-                continue
-        else:
-            target = node.module or ""
+        target = _resolved_import_from_module(module, node)
         if target and _stdlib_python_module_defines(
             target,
             symbol,
@@ -1668,6 +1671,12 @@ def _stdlib_alias_target(module: str, symbol: str) -> str | None:
                 imports[bound] = f"{node.module}.{alias.name}"
                 if bound == symbol:
                     return f"{node.module}.{alias.name}"
+                if alias.name == "*":
+                    star_target = _resolved_import_from_module(module, node)
+                    if star_target and _stdlib_python_module_defines(
+                        star_target, symbol
+                    ):
+                        return f"{star_target}.{symbol}"
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             value = node.value

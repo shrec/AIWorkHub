@@ -1049,6 +1049,9 @@ class TestNormalizePacketFindings:
         assert quality_reviewer._stdlib_python_module_defines(
             "sample", "Capability"
         )
+        assert quality_reviewer._stdlib_alias_target(
+            "sample", "Capability"
+        ) == "sample._local.Capability"
 
     @pytest.mark.parametrize("replacement", ["math.isfinite", "str.removeprefix"])
     def test_handrolled_platform_replacement_accepts_without_typeshed(
