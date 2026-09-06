@@ -42,7 +42,13 @@ from typing import Any
 
 from . import core
 from . import process_launcher
-from .platform_io import chmod_fd, lock_fd, unlock_fd
+from .platform_io import (
+    chmod_fd,
+    is_windows,
+    lock_fd,
+    stat_owned_by_current_user,
+    unlock_fd,
+)
 
 
 DEFAULT_SCAN_INTERVAL_SECONDS = 30.0
@@ -109,7 +115,7 @@ def _lock_metadata_unsafe(metadata: os.stat_result) -> bool:
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
         or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
-        or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+        or not stat_owned_by_current_user(metadata)
     )
 
 
@@ -131,7 +137,7 @@ def _directory_identity(path: Path) -> tuple[int, int]:
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
-        or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+        or not stat_owned_by_current_user(metadata)
     ):
         raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{path}")
     return metadata.st_dev, metadata.st_ino
@@ -161,7 +167,7 @@ def single_instance_lock(lock_path: Path):
         len(lock_path.parts) > len(rel_parts)
         and lock_path.parts[-len(rel_parts):] == rel_parts
     )
-    if os.name != "nt" and is_canonical_path:
+    if not is_windows() and is_canonical_path:
         repo_path = lock_path.parents[len(rel_parts) - 1]
         try:
             repo_fd = os.open(repo_path, directory_flags)
@@ -671,14 +677,19 @@ def reconciler_health(repo: Path | str) -> dict[str, Any]:
 
 def _install_stop_handler(
     stop_flag: dict[str, bool], wake_event: threading.Event | None = None
-) -> None:
+) -> dict[int, Any]:
     def _stop(_signum: int, _frame: Any) -> None:
         stop_flag["stop"] = True
         if wake_event is not None:
             wake_event.set()
 
+    previous = {
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+    }
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
+    return previous
 
 
 def run_daemon(
@@ -701,53 +712,57 @@ def run_daemon(
 
     root = Path(repo).resolve() if repo is not None else core.repo_root()
     service = ReconcilerService(root, scan_interval_seconds=interval)
-    _install_stop_handler(stop_flag, service._stop_event)
+    previous_handlers = _install_stop_handler(stop_flag, service._stop_event)
     emit = on_scan or (
         lambda result: print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
     )
     lock_path = root / LOCK_REL_PATH
-    while not service._stop_event.is_set():
-        with service._state_lock:
-            service._authority_state = "acquiring"
-            service._acquisition_attempts += 1
-        try:
-            with single_instance_lock(lock_path) as identity:
+    try:
+        while not service._stop_event.is_set():
+            with service._state_lock:
+                service._authority_state = "acquiring"
+                service._acquisition_attempts += 1
+            try:
+                with single_instance_lock(lock_path) as identity:
+                    with service._state_lock:
+                        service._authority_state = "active_owner"
+                        service._authority_identity = dict(identity)
+                        service._last_acquisition_error = ""
+                    service._run_as_owner(
+                        max_iterations=max_iterations,
+                        on_scan=emit,
+                        stop_requested=lambda: stop_flag["stop"],
+                    )
+                    return 0
+            except ReconcilerLockHeld as exc:
                 with service._state_lock:
-                    service._authority_state = "active_owner"
-                    service._authority_identity = dict(identity)
-                    service._last_acquisition_error = ""
-                service._run_as_owner(
-                    max_iterations=max_iterations,
-                    on_scan=emit,
-                    stop_requested=lambda: stop_flag["stop"],
-                )
-                return 0
-        except ReconcilerLockHeld as exc:
-            with service._state_lock:
-                service._authority_state = "standby"
-                service._authority_identity = {}
-                service._last_acquisition_error = str(exc)
-            service._stop_event.wait(AUTHORITY_RETRY_SECONDS)
-        except ReconcilerLockUnsafe as exc:
-            error = str(exc)
-            with service._state_lock:
-                service._authority_state = "acquisition_failed"
-                service._authority_identity = {}
-                service._last_acquisition_error = error
-            write_status(root, {
-                "authority_state": "acquisition_failed",
-                "acquisition_state": "failed",
-                "acquisition_error": error,
-                "owner_pid": None,
-                "owner_pid_start_ticks": None,
-                "scan_in_progress": False,
-                "scan_started_epoch": None,
-                "scan_finished_epoch": None,
-                "scan_interval_seconds": interval,
-                "last_error": error,
-            })
-            return 4
-    return 0
+                    service._authority_state = "standby"
+                    service._authority_identity = {}
+                    service._last_acquisition_error = str(exc)
+                service._stop_event.wait(AUTHORITY_RETRY_SECONDS)
+            except ReconcilerLockUnsafe as exc:
+                error = str(exc)
+                with service._state_lock:
+                    service._authority_state = "acquisition_failed"
+                    service._authority_identity = {}
+                    service._last_acquisition_error = error
+                write_status(root, {
+                    "authority_state": "acquisition_failed",
+                    "acquisition_state": "failed",
+                    "acquisition_error": error,
+                    "owner_pid": None,
+                    "owner_pid_start_ticks": None,
+                    "scan_in_progress": False,
+                    "scan_started_epoch": None,
+                    "scan_finished_epoch": None,
+                    "scan_interval_seconds": interval,
+                    "last_error": error,
+                })
+                return 4
+        return 0
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def main(argv: list[str] | None = None) -> int:

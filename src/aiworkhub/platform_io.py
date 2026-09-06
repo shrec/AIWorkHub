@@ -14,6 +14,7 @@ import math
 import ntpath
 import os
 import posixpath
+import select
 import signal
 import stat
 import subprocess
@@ -21,6 +22,7 @@ import sys
 import time
 import unicodedata
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Protocol, TypedDict, cast
 
 
@@ -60,7 +62,10 @@ _platform_process_backend = cast(_PlatformProcessBackend, _platform_process)
 def _normalized_platform(platform_name: str | None = None) -> str:
     """Return the canonical ``windows``, ``linux`` or ``macos`` platform name."""
 
-    name = (sys.platform if platform_name is None else platform_name).lower()
+    if platform_name is None and os.name == "nt":
+        name = "nt"
+    else:
+        name = (sys.platform if platform_name is None else platform_name).lower()
     if name in {"nt", "windows", "win32", "cygwin", "msys"}:
         return "windows"
     if name.startswith("linux") or name == "posix":
@@ -182,7 +187,7 @@ def available_memory_bytes(platform_name: str | None = None) -> int | None:
 def _windows_creation_flag() -> int:
     """Return the named Windows process-group flag through a typed boundary."""
 
-    return cast(int, getattr(subprocess, "CREATE_NEW_PROCESS_GROUP"))
+    return cast(int, getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
 
 
 def process_group_launch_kwargs(
@@ -193,6 +198,112 @@ def process_group_launch_kwargs(
     if is_windows(platform_name):
         return {"creationflags": _windows_creation_flag()}
     return {"start_new_session": True}
+
+
+def windows_system_taskkill_path() -> str | None:
+    """Resolve taskkill from the kernel-reported system directory, never PATH."""
+
+    try:
+        system_directory = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetSystemDirectoryW(
+            system_directory, len(system_directory)
+        )
+        if length <= 0 or length >= len(system_directory):
+            return None
+        return system_directory.value.rstrip("\\/") + "\\taskkill.exe"
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def linux_proc_identity(pid: int) -> dict[str, Any] | None:
+    """Return Linux procfs identity without using a liveness-only PID probe."""
+
+    if is_windows() or pid <= 0:
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = raw[raw.rfind(")") + 2 :].split()
+        if fields[0] == "Z":
+            return None
+        return {
+            "pid": pid,
+            "state": fields[0],
+            "pgid": int(fields[2]),
+            "session_id": int(fields[3]),
+            "start_ticks": int(fields[19]),
+        }
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def cross_instance_process_identity_supported() -> bool:
+    """Whether Linux procfs exposes the retained process identity contract."""
+
+    return is_linux() and Path("/proc/self/stat").is_file()
+
+
+def process_environment_contains(pid: int, marker: bytes) -> bool:
+    try:
+        return marker in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return False
+
+
+def owned_process_group_members(owner_marker: bytes) -> list[dict[str, Any]]:
+    """Find token-bearing procfs members with PID/start identity evidence."""
+
+    members: list[dict[str, Any]] = []
+    try:
+        proc_entries = list(Path("/proc").iterdir())
+    except OSError:
+        return members
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        identity = linux_proc_identity(int(entry.name))
+        if identity is None:
+            continue
+        if process_environment_contains(int(entry.name), owner_marker):
+            members.append(identity)
+    return members
+
+
+def signal_process_group(identity: int, *, graceful: bool) -> None:
+    """Signal one POSIX process group through the platform authority."""
+
+    if not _valid_process_identity(identity):
+        raise ProcessLookupError(identity)
+    posix_killpg = _resolve_posix_killpg(None)
+    if posix_killpg is None:
+        raise OSError(errno.ENOSYS, "process_group_signal_unavailable")
+    posix_killpg(identity, signal.SIGTERM if graceful else _POSIX_SIGKILL)
+
+
+def pipe_write_end_still_open(streams: object) -> bool:
+    """Return whether any inherited pipe write-end may still be open."""
+
+    if is_windows() or not hasattr(select, "poll"):
+        return True
+    poller = select.poll()
+    registered = 0
+    for stream in streams if isinstance(streams, tuple) else ():
+        if stream is None:
+            continue
+        try:
+            if stream.closed:
+                continue
+            fd = stream.fileno()
+        except (ValueError, OSError):
+            continue
+        poller.register(fd, select.POLLIN)
+        registered += 1
+    if registered == 0:
+        return False
+    hangups = 0
+    for _fd, event in poller.poll(0):
+        if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+            hangups += 1
+    return hangups < registered
 
 
 def _valid_process_identity(identity: object) -> bool:
@@ -1097,12 +1208,73 @@ def _same_regular_file_identity(left: os.stat_result, right: os.stat_result) -> 
     )
 
 
+def _link_verified_source_into_staging(
+    verified_identity: os.stat_result,
+    source_directory_fd: int,
+    source_name: str,
+    staging_directory_fd: int,
+    staging_name: str,
+) -> None:
+    """Stage the verified source by name, then re-prove its exact identity.
+
+    macOS exposes neither ``AT_EMPTY_PATH`` nor a procfs descriptor path, so a
+    staging hard link cannot be bound to the open descriptor the way Linux binds
+    it. The link is instead created by name relative to the source directory
+    descriptor and the linked object is re-stat'd and compared against the
+    already-verified identity. The caller keeps the source descriptor open for
+    the whole publication, so that identity pins the verified inode: a mismatch
+    is a source substitution and fails closed with ``ESTALE`` before anything is
+    published. A namespace operation this module cannot perform (cross-device
+    link, unsupported ``linkat``) is reported as unsupported, never published.
+    """
+
+    try:
+        os.link(
+            source_name,
+            staging_name,
+            src_dir_fd=source_directory_fd,
+            dst_dir_fd=staging_directory_fd,
+            follow_symlinks=False,
+        )
+    except (NotImplementedError, TypeError) as exc:
+        raise IdentityBoundPublicationError(
+            errno.ENOTSUP, "identity_bound_publication_not_supported"
+        ) from exc
+    except OSError as exc:
+        if exc.errno in {
+            errno.EXDEV,
+            errno.EINVAL,
+            errno.EMLINK,
+            errno.ENOENT,
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            errno.EPERM,
+        }:
+            raise IdentityBoundPublicationError(
+                errno.ENOTSUP, "identity_bound_publication_not_supported"
+            ) from exc
+        raise
+    staged_identity = os.stat(
+        staging_name, dir_fd=staging_directory_fd, follow_symlinks=False
+    )
+    if not _same_regular_file_identity(verified_identity, staged_identity):
+        raise IdentityBoundPublicationError(
+            errno.ESTALE, "publication_source_identity_changed"
+        )
+
+
 def identity_bound_durable_atomic_replace(
     source: str | os.PathLike[str], destination: str | os.PathLike[str]
 ) -> None:
     """Durably publish the exact verified regular source-file identity.
 
     Linux binds a staging hard link directly to the open source descriptor.
+    macOS has no descriptor-empty-path or procfs link, so it stages the source
+    by name relative to the source directory descriptor and re-proves the linked
+    object's identity against the still-open verified descriptor: that open
+    descriptor pins the verified inode for the whole call, so a matching
+    device/inode proves the exact verified file was staged and rejects any
+    source substitution before publication.
     Destination authority linearizes to the parent directory object opened at
     call start: the descriptor-relative commit follows that object across a
     concurrent rename instead of resolving a substituted public parent path.
@@ -1112,7 +1284,7 @@ def identity_bound_durable_atomic_replace(
 
     source_path = os.fspath(source)
     destination_path = os.fspath(destination)
-    if not is_linux():
+    if not (is_linux() or is_macos()):
         raise IdentityBoundPublicationError(
             errno.ENOTSUP, "identity_bound_publication_not_supported"
         )
@@ -1159,7 +1331,16 @@ def identity_bound_durable_atomic_replace(
             raise IdentityBoundPublicationError(
                 errno.ENOTSUP, "identity_bound_publication_not_supported"
             ) from exc
-        _link_open_file(source_fd, staging_directory_fd, staging_name)
+        if is_linux():
+            _link_open_file(source_fd, staging_directory_fd, staging_name)
+        else:
+            _link_verified_source_into_staging(
+                verified_identity,
+                source_directory_fd,
+                source_name,
+                staging_directory_fd,
+                staging_name,
+            )
 
         # Moving the pathname aside is intentionally followed by an fd-identity
         # check. A substitute is restored and can never reach the destination.
@@ -1241,7 +1422,8 @@ def identity_bound_durable_atomic_replace(
             os.close(destination_directory_fd)
         if source_directory_fd >= 0:
             os.close(source_directory_fd)
-        os.close(source_fd)
+        if source_fd >= 0:
+            os.close(source_fd)
 
 
 def durable_atomic_replace(

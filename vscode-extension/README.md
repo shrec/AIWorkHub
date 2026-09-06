@@ -12,6 +12,15 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.10.95 — 2026-09-06
+
+- Dashboard polling is bounded, terminal worktrees receive automatic
+  authenticated retention, and repository tool resolution is cached in a
+  signed project registry.
+- Final validation uses a complete coordinator snapshot and shared platform
+  process/file authorities, reducing sparse-workspace and cross-platform
+  mechanical failures.
+
 ## What's new in 0.10.93 — 2026-09-05
 
 - Canonically accepted fixes protect retained candidates, fail closed on

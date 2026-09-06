@@ -22,6 +22,98 @@ def _authority(tmp_path: Path, **kwargs: object) -> toolchain_authority.Toolchai
     )
 
 
+def _secret_path(repo: Path) -> Path:
+    return repo / ".aiworkhub" / "toolchain-authority" / "receipt-hmac.key"
+
+
+def _clear_secret_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY", raising=False)
+    monkeypatch.delenv("AIWORKHUB_TOOLCHAIN_AUTHORITY_SECRET", raising=False)
+
+
+def test_authority_secret_prefers_environment_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY",
+        "hex:" + ("ab" * 32),
+    )
+
+    assert toolchain_authority._authority_secret(tmp_path, create=False) == bytes.fromhex(
+        "ab" * 32
+    )
+
+
+def test_authority_secret_rejects_symlink_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_secret_env(monkeypatch)
+    target = tmp_path / "elsewhere.key"
+    target.write_bytes(b"x" * 32)
+    key_path = _secret_path(tmp_path)
+    key_path.parent.mkdir(parents=True)
+    key_path.symlink_to(target)
+
+    assert toolchain_authority._authority_secret(tmp_path, create=False) == b""
+
+
+def test_authority_secret_rejects_wrong_mode_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_secret_env(monkeypatch)
+    key_path = _secret_path(tmp_path)
+    key_path.parent.mkdir(parents=True)
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(b"k" * 32)
+    if key_path.stat().st_mode & 0o077 == 0:
+        pytest.skip("validation_unsupported_in_sandbox:wrong_mode_key_setup")
+
+    assert toolchain_authority._authority_secret(tmp_path, create=False) == b""
+
+
+def test_authority_secret_rejects_malformed_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_secret_env(monkeypatch)
+    key_path = _secret_path(tmp_path)
+    key_path.parent.mkdir(parents=True)
+    key_path.write_bytes(b"too-short")
+
+    assert toolchain_authority._authority_secret(tmp_path, create=False) == b""
+
+
+def test_authority_secret_handles_create_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_secret_env(monkeypatch)
+    from aiworkhub import terminal_authority
+
+    key_path = _secret_path(tmp_path)
+    race_key = b"r" * 32
+    real_open = terminal_authority.os.open
+    raced = False
+
+    monkeypatch.setattr(terminal_authority.os, "chmod", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(terminal_authority, "chmod_fd", lambda *_args, **_kwargs: None)
+
+    def racing_open(path, flags, mode=0o777, *args, **kwargs):
+        nonlocal raced
+        if Path(path) == key_path and flags & os.O_EXCL and not raced:
+            raced = True
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = real_open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(race_key)
+            raise FileExistsError(str(path))
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(terminal_authority.os, "open", racing_open)
+
+    assert toolchain_authority._authority_secret(tmp_path, create=True) == race_key
+    assert raced
+
+
 def test_snapshot_digest_is_deterministic_and_cached(tmp_path: Path) -> None:
     authority = _authority(tmp_path)
 
@@ -32,7 +124,7 @@ def test_snapshot_digest_is_deterministic_and_cached(tmp_path: Path) -> None:
     assert first.digest == second.digest
     assert first.schema_id == "aiworkhub.toolchain_authority.v1"
     assert first.executables[0].canonical_path == str(Path(sys.executable).resolve())
-    assert first.executables[0].version_fact.startswith("sha256:")
+    assert first.executables[0].version_fact.startswith("Python ")
 
 
 def test_repository_dependency_metadata_drift_rebuilds_snapshot(tmp_path: Path) -> None:

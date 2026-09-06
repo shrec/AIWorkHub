@@ -1,0 +1,48 @@
+{
+  "schema_id": "aiworkhub.toolchain_registry.v1",
+  "version": 1,
+  "baseline": [
+    "python",
+    "ruff",
+    "node"
+  ],
+  "tools": {
+    "python": {
+      "minimum_version": "3.11",
+      "candidates": [
+        {
+          "executable": "python3"
+        },
+        {
+          "executable": "python"
+        }
+      ]
+    },
+    "ruff": {
+      "minimum_version": "0.12",
+      "candidates": [
+        {
+          "executable": "ruff"
+        },
+        {
+          "executable": "python",
+          "args": [
+            "-m",
+            "ruff"
+          ]
+        }
+      ]
+    },
+    "node": {
+      "minimum_version": "20.0.0",
+      "candidates": [
+        {
+          "executable": "node"
+        }
+      ]
+    }
+  },
+  "sandbox_capabilities": [
+    "validation_subprocess"
+  ]
+}

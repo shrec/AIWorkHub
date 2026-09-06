@@ -1036,8 +1036,12 @@ def test_two_services_single_flight_and_standby_takes_over_after_owner_exit(tmp_
 
         # Killing the exact holder releases the kernel lock. The passive MCP
         # service retries acquisition and becomes owner without intervention.
-        owner.terminate()
+        # This assertion is about kernel-lock release, not graceful signal
+        # handling (covered separately below). SIGKILL also prevents an
+        # unrelated inherited test handler from keeping a fork child alive.
+        owner.kill()
         owner.join(timeout=5)
+        assert not owner.is_alive()
         assert entered_reader.poll(5)
         assert entered_reader.recv() == standby.pid
     finally:
@@ -1045,7 +1049,7 @@ def test_two_services_single_flight_and_standby_takes_over_after_owner_exit(tmp_
         for process in processes:
             process.join(timeout=5)
             if process.is_alive():
-                process.terminate()
+                process.kill()
                 process.join(timeout=5)
         os.close(release_reader)
         os.close(release_writer)
@@ -1181,6 +1185,25 @@ def test_single_instance_lock_rejects_hardlink_without_modifying_source(tmp_path
         with task_reconciler.single_instance_lock(lock_path):
             pass
     assert victim.read_text(encoding="utf-8") == "do-not-touch"
+
+
+def test_single_instance_lock_uses_platform_owner_predicate(tmp_path, monkeypatch):
+    lock_path = tmp_path / "reconciler.lock"
+    observed = []
+
+    def reject_owner(metadata):
+        observed.append(metadata.st_mode)
+        return False
+
+    monkeypatch.setattr(
+        task_reconciler, "stat_owned_by_current_user", reject_owner
+    )
+
+    with pytest.raises(task_reconciler.ReconcilerLockUnsafe, match="lock_unsafe"):
+        with task_reconciler.single_instance_lock(lock_path):
+            pass
+
+    assert observed
 
 
 def test_single_instance_lock_rejects_symlink_without_nofollow_or_modifying_target(
@@ -1337,6 +1360,20 @@ def test_daemon_runs_bounded_iterations_and_scans_repeatedly(tmp_path):
     assert rc == 0
     assert len(scans) == 3
     assert all(scan["ok"] for scan in scans)
+
+
+def test_bounded_daemon_restores_process_signal_handlers(tmp_path):
+    repo = tmp_path / "repo_signal_restore"
+    (repo / ".aiworkhub/runtime/process_logs").mkdir(parents=True)
+    before = {
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+    }
+
+    assert task_reconciler.run_daemon(repo=repo, max_iterations=1) == 0
+
+    assert signal.getsignal(signal.SIGTERM) is before[signal.SIGTERM]
+    assert signal.getsignal(signal.SIGINT) is before[signal.SIGINT]
 
 
 def test_daemon_lock_unsafe_fails_closed_without_scanning(tmp_path, monkeypatch):

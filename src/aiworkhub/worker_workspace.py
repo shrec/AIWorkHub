@@ -3742,6 +3742,144 @@ def validation_toolchain_authority(
     return snapshot
 
 
+def trusted_validation_executable_version(resolved: str) -> str:
+    """Read ``--version`` through the validation sandbox boundary."""
+    try:
+        executable = Path(resolved).resolve(strict=True)
+        backend = select_sandbox_backend()
+    except (OSError, WorkspaceError):
+        return ""
+    if backend == VSCODE_LM_IN_PROCESS_BACKEND:
+        return ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="aiworkhub-version-probe-") as raw:
+            root = Path(raw)
+            workspace = WorkerWorkspace(
+                request_id=f"version-probe-{uuid.uuid4().hex}",
+                repo=root,
+                path=root / "worktree",
+                home=root / "home",
+                allowed_writes=(),
+                parent_baseline={},
+                workspace_baseline={},
+            )
+            workspace.path.mkdir(mode=0o700)
+            workspace.home.mkdir(mode=0o700)
+            (workspace.home / "tmp").mkdir(mode=0o700)
+            scratch = workspace.path / ".exec-scratch"
+            scratch.mkdir(mode=0o700)
+            wrapped = sandbox_argv(
+                workspace,
+                "validation",
+                [str(executable), "--version"],
+                backend=backend,
+                validation_exec_scratch=scratch,
+                validation_executable_roots=(executable.parent,),
+            )
+            env = sanitized_env(
+                "validation",
+                home=workspace.home if backend == "landlock" else None,
+                isolated_task_queue_db=False,
+                verify_preprovisioned_home=backend == "landlock",
+            )
+            env["TMPDIR"] = str(scratch)
+            env["TMP"] = str(scratch)
+            env["TEMP"] = str(scratch)
+            result = subprocess.run(
+                wrapped,
+                cwd="/",
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                shell=False,
+            )
+    except (OSError, subprocess.SubprocessError, WorkspaceError):
+        return ""
+    output = (result.stdout or result.stderr).strip().splitlines()
+    if result.returncode != 0 or not output:
+        return ""
+    return output[0][:256]
+
+
+def _verify_authority_receipt(
+    receipt: Mapping[str, Any] | None,
+    repo: Path,
+    card: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    if receipt is None:
+        return None
+    try:
+        from . import toolchain_authority
+
+        return toolchain_authority.verify_authority_receipt(receipt, repo, card)
+    except ValueError as exc:
+        raise WorkspaceError(str(exc)) from exc
+
+
+def _authority_receipt_file_fingerprint(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(65536), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _authority_receipt_fact(
+    receipt: Mapping[str, Any] | None, executable: str
+) -> Mapping[str, Any] | None:
+    if not receipt:
+        return None
+    if receipt.get("schema_id") != "aiworkhub.toolchain_authority.receipt.v1":
+        raise WorkspaceError("validation_toolchain_authority_receipt_schema")
+    try:
+        canonical = str(Path(executable).resolve(strict=True))
+    except OSError as exc:
+        raise WorkspaceError("validation_toolchain_authority_executable_missing") from exc
+    for raw in receipt.get("executables") or ():
+        if not isinstance(raw, Mapping):
+            continue
+        if str(raw.get("canonical_path") or "") == canonical:
+            return raw
+    raise WorkspaceError("validation_toolchain_authority_executable_unreceipted")
+
+
+def _verify_authority_receipt_executable(
+    receipt: Mapping[str, Any] | None, executable: str
+) -> Mapping[str, Any] | None:
+    fact = _authority_receipt_fact(receipt, executable)
+    if fact is None:
+        return None
+    try:
+        path = Path(str(fact["canonical_path"])).resolve(strict=True)
+        status = path.stat()
+    except (KeyError, OSError) as exc:
+        raise WorkspaceError("validation_toolchain_authority_executable_missing") from exc
+    try:
+        expected = (
+            int(fact.get("device")),
+            int(fact.get("inode")),
+            int(fact.get("size")),
+            int(fact.get("mode")),
+            int(fact.get("mtime_ns")),
+            str(fact.get("fingerprint") or ""),
+        )
+    except (TypeError, ValueError) as exc:
+        raise WorkspaceError("validation_toolchain_authority_receipt_malformed") from exc
+    observed = (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        stat.S_IMODE(status.st_mode),
+        status.st_mtime_ns,
+        _authority_receipt_file_fingerprint(path),
+    )
+    if observed != expected:
+        raise WorkspaceError("validation_toolchain_authority_executable_identity_drift")
+    return fact
+
+
 def create_workspace(
     repo: Path,
     request_id: str,
@@ -5606,7 +5744,7 @@ def select_sandbox_backend() -> str:
 # a packaged server therefore reported ``module:pytest`` and rejected otherwise
 # runnable cards before launch.
 _TRUSTED_VALIDATION_BARE_EXECUTABLES = frozenset({"pytest", "ruff", "mypy"})
-_TRUSTED_VALIDATION_SYSTEM_EXECUTABLES = frozenset({"git"})
+_TRUSTED_VALIDATION_SYSTEM_EXECUTABLES = frozenset({"git", "node"})
 SANDBOX_VALIDATION_EXECUTABLE_ROOT = "/validation-executable-root"
 
 
@@ -6580,6 +6718,27 @@ def _normalize_trusted_validation_executable_argv_with_authority(
         return [sys.executable, *argv[1:]], (), None
     if head in _TRUSTED_VALIDATION_SYSTEM_EXECUTABLES:
         executable = _resolve_trusted_system_validation_executable(head, repo)
+        # Node is commonly installed through nvm outside /usr.  Bubblewrap
+        # cannot execute that absolute path unless the immutable version root
+        # is explicitly bound.  Preserve the normal system-tool path for a
+        # distro Node, while carrying the exact nvm version root for sandbox
+        # publication when applicable.
+        node_root = _node_install_root(str(executable)) if head == "node" else None
+        if node_root is not None:
+            resolved_root = node_root.resolve(strict=True)
+            root_info = resolved_root.stat()
+            if not stat_owned_by_current_user(root_info):
+                raise WorkspaceError(
+                    f"validation_executable_runtime_root_untrusted_owner:{resolved_root}"
+                )
+            if (
+                posix_path_modes_supported(os.name)
+                and stat.S_IMODE(root_info.st_mode) & 0o002
+            ):
+                raise WorkspaceError(
+                    f"validation_executable_runtime_root_world_writable:{resolved_root}"
+                )
+            return [str(executable), *argv[1:]], (resolved_root,), None
         return [str(executable), *argv[1:]], (), None
     if head not in _TRUSTED_VALIDATION_BARE_EXECUTABLES:
         return list(argv), (), None
@@ -9111,6 +9270,8 @@ def run_validations(
     backend: str | None = None,
     adapter_id: str = "",
     outer_validation_authority: bool = False,
+    toolchain_authority_receipt: Mapping[str, Any] | None = None,
+    toolchain_authority_card: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     rows = list(commands)
     if len(rows) > MAX_VALIDATION_COMMANDS:
@@ -9145,6 +9306,11 @@ def run_validations(
         raise WorkspaceError(
             f"vscode_lm_in_process_validation_adapter_forbidden:{adapter_id}"
         )
+    verified_toolchain_authority_receipt = _verify_authority_receipt(
+        toolchain_authority_receipt,
+        workspace.repo,
+        toolchain_authority_card or {"validation": rows},
+    )
     validation_home = (
         workspace.home
         if selected_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}
@@ -9240,6 +9406,9 @@ def run_validations(
                 _normalize_trusted_validation_executable_argv_with_authority(
                     tokens, workspace.repo
                 )
+            )
+            receipt_fact = _verify_authority_receipt_executable(
+                verified_toolchain_authority_receipt, tokens[0]
             )
             if module_interpreter_authority is not None:
                 # NF-2026-00452: a ``<python> -m <validator>`` command records the
@@ -9463,6 +9632,7 @@ def run_validations(
                         "execution_boundary": execution_boundary,
                         "python_candidate_authority": candidate_authority,
                         "interpreter_authority": interpreter_authority,
+                        "toolchain_authority_receipt": dict(receipt_fact or {}),
                         "returncode": None,
                         "timed_out": True,
                         "timeout_seconds": bounded_timeout,
@@ -9498,6 +9668,7 @@ def run_validations(
                     "execution_boundary": execution_boundary,
                     "python_candidate_authority": candidate_authority,
                     "interpreter_authority": interpreter_authority,
+                    "toolchain_authority_receipt": dict(receipt_fact or {}),
                     "returncode": None,
                     "timed_out": False,
                     "timeout_seconds": bounded_timeout,
@@ -9545,6 +9716,7 @@ def run_validations(
                 "execution_boundary": execution_boundary,
                 "python_candidate_authority": candidate_authority,
                 "interpreter_authority": interpreter_authority,
+                "toolchain_authority_receipt": dict(receipt_fact or {}),
                 "returncode": result.returncode,
                 "timeout_seconds": bounded_timeout,
                 "duration_seconds": round(time.monotonic() - started, 6),

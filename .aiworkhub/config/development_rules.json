@@ -809,16 +809,6 @@
         "count": 1
       },
       {
-        "path": "src/aiworkhub/source_graph_daemon.py",
-        "pattern": "os_killpg",
-        "count": 1
-      },
-      {
-        "path": "src/aiworkhub/source_graph_daemon.py",
-        "pattern": "os_name_eq",
-        "count": 5
-      },
-      {
         "path": "src/aiworkhub/source_graph_migration.py",
         "pattern": "def_atomic",
         "count": 1
@@ -846,7 +836,7 @@
       {
         "path": "src/aiworkhub/storage_retention.py",
         "pattern": "sqlite_connect",
-        "count": 3
+        "count": 2
       },
       {
         "path": "src/aiworkhub/suite_profile_plugin.py",
@@ -977,8 +967,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 146,
-      "accepted_predecessor_delta": -15
+      "current_total": 139,
+      "accepted_predecessor_delta": -22
     }
   }
 }

@@ -33,8 +33,6 @@ from __future__ import annotations
 
 import json
 import os
-import select
-import signal
 import sqlite3
 import subprocess
 import sys
@@ -47,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from . import source_graph
+from . import platform_io
 
 DEFAULT_REFRESH_INTERVAL_SECONDS = 300.0
 MIN_REFRESH_INTERVAL_SECONDS = 30.0
@@ -99,24 +98,12 @@ def _registry_key(repo_root: Path | str) -> str:
     return str(Path(repo_root).resolve())
 
 
-def _windows_taskkill_path() -> str | None:
-    """Resolve taskkill from the kernel-reported system directory, never PATH."""
-    try:
-        import ctypes
-
-        system_directory = ctypes.create_unicode_buffer(32768)
-        length = ctypes.windll.kernel32.GetSystemDirectoryW(
-            system_directory, len(system_directory)
-        )
-        if length <= 0 or length >= len(system_directory):
-            return None
-        return system_directory.value.rstrip("\\/") + "\\taskkill.exe"
-    except (AttributeError, OSError, TypeError, ValueError):
-        return None
-
-
 def _build_identity_path(repo_root: Path | str) -> Path:
     return source_graph.resolve_db_path(Path(repo_root).resolve()).parent / BUILD_IDENTITY_FILE
+
+
+def _windows_taskkill_path() -> str | None:
+    return platform_io.windows_system_taskkill_path()
 
 
 @contextmanager
@@ -126,26 +113,10 @@ def _build_identity_lock(repo_root: Path | str):
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+b")
     try:
-        if os.name == "nt":
-            import msvcrt
-
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        platform_io.lock_fd(handle.fileno(), blocking=True)
         yield
     finally:
-        if os.name == "nt":
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        platform_io.unlock_fd(handle.fileno())
         handle.close()
 
 
@@ -234,22 +205,7 @@ def _compare_and_write_build_identity(
 
 def _proc_identity(pid: int) -> dict[str, Any] | None:
     """Return Linux kernel identity without using a liveness-only PID probe."""
-    if os.name == "nt" or pid <= 0:
-        return None
-    try:
-        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-        fields = raw[raw.rfind(")") + 2 :].split()
-        if fields[0] == "Z":
-            return None
-        return {
-            "pid": pid,
-            "state": fields[0],
-            "pgid": int(fields[2]),
-            "session_id": int(fields[3]),
-            "start_ticks": int(fields[19]),
-        }
-    except (OSError, ValueError, IndexError):
-        return None
+    return platform_io.linux_proc_identity(pid)
 
 
 def _cross_instance_identity_supported() -> bool:
@@ -258,7 +214,7 @@ def _cross_instance_identity_supported() -> bool:
     # process-group/session identity, and the private owner token in environ.
     # Other POSIX platforms still have a safe owning ``Popen`` handle, but do
     # not necessarily expose equivalent cross-instance evidence.
-    return sys.platform.startswith("linux") and Path("/proc/self/stat").is_file()
+    return platform_io.cross_instance_process_identity_supported()
 
 
 def _identity_matches(retained: dict[str, Any]) -> bool:
@@ -286,41 +242,20 @@ def _leader_owner_matches(retained: dict[str, Any]) -> bool:
     if not token or not _identity_matches(retained):
         return False
     marker = f"{BUILD_OWNER_ENV}={token}".encode()
-    try:
-        environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-    except OSError:
-        return False
     # Recheck after reading: the PID must not have been recycled while the
     # environment authority was consulted.
-    return marker in environ and _identity_matches(retained)
+    return platform_io.process_environment_contains(pid, marker) and _identity_matches(retained)
 
 
 def _owned_group_members(retained: dict[str, Any]) -> list[dict[str, Any]]:
     """Find exact token-bearing descendants; PID/start pairs prevent reuse."""
-    if os.name == "nt":
+    if platform_io.is_windows():
         return []
     token = str(retained.get("owner_token") or "")
     if not token:
         return []
     marker = f"{BUILD_OWNER_ENV}={token}".encode()
-    members: list[dict[str, Any]] = []
-    try:
-        proc_entries = list(Path("/proc").iterdir())
-    except OSError:
-        return []
-    for entry in proc_entries:
-        if not entry.name.isdigit():
-            continue
-        identity = _proc_identity(int(entry.name))
-        if identity is None:
-            continue
-        try:
-            environ = (entry / "environ").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if marker in environ:
-            members.append(identity)
-    return members
+    return platform_io.owned_process_group_members(marker)
 
 
 def _retained_tree_alive(retained: dict[str, Any]) -> bool:
@@ -465,7 +400,7 @@ def _stop_retained_build(repo_root: Path | str, *, timeout: float = 5.0) -> bool
                 _restore_build_identity_after_failed_stop(repo_root, retained, prior)
                 return False
         try:
-            os.killpg(pgid, signal.SIGTERM if graceful else signal.SIGKILL)
+            platform_io.signal_process_group(pgid, graceful=graceful)
         except ProcessLookupError:
             pass
         except OSError:
@@ -785,16 +720,7 @@ class SourceGraphDaemon:
         only the parent leaves those grandchildren holding the pipe write-ends
         open, which would deadlock any subsequent ``communicate()``.
         """
-        if os.name == "nt":
-            # A new process group is required for a tree ``taskkill /T`` and
-            # for CTRL-BREAK signalling. ``CREATE_NEW_PROCESS_GROUP`` only
-            # exists on Windows; fall back to ``0`` so the simulated-Windows
-            # branch is importable/exercisable on POSIX test hosts.
-            return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
-        # ``start_new_session`` runs ``setsid()`` in the child, making it a
-        # session/group leader whose pgid equals its pid -- the exact owned
-        # identity ``os.killpg`` targets.
-        return {"start_new_session": True}
+        return dict(platform_io.process_group_launch_kwargs())
 
     def _signal_process_tree(
         self,
@@ -810,7 +736,7 @@ class SourceGraphDaemon:
         group is safe. If the owned identity is unknown, this fails closed to
         the single child handle rather than guessing another group.
         """
-        if os.name == "nt":
+        if platform_io.is_windows():
             taskkill = _windows_taskkill_path()
             if taskkill is None:
                 # Never search PATH for a privileged process-control executable.
@@ -836,9 +762,8 @@ class SourceGraphDaemon:
             # Unknown owned identity: fail closed to the exact child only.
             self._signal_single_child(process, graceful=graceful)
             return
-        sig = signal.SIGTERM if graceful else signal.SIGKILL
         try:
-            os.killpg(pgid, sig)
+            platform_io.signal_process_group(pgid, graceful=graceful)
         except ProcessLookupError:
             pass
         except OSError:
@@ -882,31 +807,9 @@ class SourceGraphDaemon:
         ``select.poll``; there we cannot make this determination and
         conservatively report "open" so no separate reuse guard weakens.
         """
-        if os.name == "nt" or not hasattr(select, "poll"):
-            return True
-        poller = select.poll()
-        registered = 0
-        for stream in (getattr(process, "stdout", None), getattr(process, "stderr", None)):
-            if stream is None:
-                continue
-            try:
-                if stream.closed:
-                    continue
-                fd = stream.fileno()
-            except (ValueError, OSError):
-                continue
-            poller.register(fd, select.POLLIN)
-            registered += 1
-        if registered == 0:
-            return False
-        hangups = 0
-        for _fd, event in poller.poll(0):
-            if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
-                hangups += 1
-        # A pipe with an open, idle write-end yields no poll event at all; only
-        # a fully-closed write-end reports a hangup. If every registered pipe
-        # hung up, no owned descendant remains.
-        return hangups < registered
+        return platform_io.pipe_write_end_still_open(
+            (getattr(process, "stdout", None), getattr(process, "stderr", None))
+        )
 
     def _wait_owned_group_pipes_closed(
         self, process: subprocess.Popen[str], *, timeout: float
@@ -945,7 +848,7 @@ class SourceGraphDaemon:
         chance before the group SIGKILL; when the group was already SIGTERM'd it
         is ``False`` so a signal-ignoring descendant is escalated immediately.
         """
-        if os.name == "nt" or pgid is None or pgid <= 0:
+        if platform_io.is_windows() or pgid is None or pgid <= 0:
             return
         if not self._pipe_write_end_still_open(process):
             return
@@ -1397,7 +1300,7 @@ class SourceGraphDaemon:
         # A session/group-leader's pgid equals its pid. Capture that exact
         # owned identity now, while the child is un-reaped, so termination can
         # never target a recycled PID's unrelated process group.
-        pgid = None if os.name == "nt" else process.pid
+        pgid = None if platform_io.is_windows() else process.pid
         kernel_identity = _proc_identity(process.pid)
         identity_kind = "cross_instance" if kernel_identity is not None else "owner_handle"
         retained = {

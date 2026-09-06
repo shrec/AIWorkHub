@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import worker_workspace
+from aiworkhub import toolchain_authority, worker_workspace
 
 
 def _workspace(tmp_path: Path) -> worker_workspace.WorkerWorkspace:
@@ -294,6 +294,211 @@ def test_run_validations_resolves_ruff_before_landlock_exec(
     assert captured["env"]["RUFF_CACHE_DIR"] == str(tmp_path / "scratch")
 
 
+def test_toolchain_receipt_detects_executable_swap(tmp_path: Path) -> None:
+    first = _executable(tmp_path / "first" / "node")
+    second = _executable(tmp_path / "second" / "node")
+    status = first.stat()
+    receipt = {
+        "schema_id": "aiworkhub.toolchain_authority.receipt.v1",
+        "executables": [
+            {
+                "canonical_path": str(second.resolve()),
+                "device": status.st_dev,
+                "inode": status.st_ino,
+                "size": status.st_size,
+                "mode": status.st_mode & 0o777,
+                "mtime_ns": status.st_mtime_ns,
+            }
+        ],
+    }
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_toolchain_authority_executable_identity_drift",
+    ):
+        worker_workspace._verify_authority_receipt_executable(receipt, str(second))
+
+
+def _authority_receipt_for(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, executable: Path
+) -> tuple[dict[str, object], dict[str, object]]:
+    monkeypatch.setattr(
+        worker_workspace,
+        "_normalize_trusted_validation_executable_argv_with_roots",
+        lambda argv, _repo: ([str(executable.resolve()), *argv[1:]], ()),
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "trusted_validation_executable_version",
+        lambda _resolved: "tool 1.2.3",
+    )
+    card = {
+        "task_id": "TASK_RECEIPT",
+        "request_id": "request-a",
+        "validation": ["tool --check"],
+    }
+    snapshot = toolchain_authority.ToolchainAuthority(
+        repo, capability_probe=lambda _repo, _card: ()
+    ).evaluate(card)
+    return toolchain_authority.authority_receipt(snapshot, card), card
+
+
+def test_toolchain_receipt_rejects_tampered_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "tool")
+    receipt, card = _authority_receipt_for(tmp_path, monkeypatch, executable)
+    receipt["snapshot_digest"] = "0" * 64
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_toolchain_authority_receipt_mac_mismatch",
+    ):
+        worker_workspace._verify_authority_receipt(receipt, tmp_path, card)
+
+
+def test_toolchain_receipt_rejects_cross_repo_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo-a"
+    other = tmp_path / "repo-b"
+    repo.mkdir()
+    other.mkdir()
+    executable = _executable(tmp_path / "bin" / "tool")
+    receipt, card = _authority_receipt_for(repo, monkeypatch, executable)
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_toolchain_authority_receipt_repository_mismatch",
+    ):
+        worker_workspace._verify_authority_receipt(receipt, other, card)
+
+
+def test_toolchain_receipt_rejects_altered_fact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "tool")
+    receipt, card = _authority_receipt_for(tmp_path, monkeypatch, executable)
+    facts = receipt["executables"]
+    assert isinstance(facts, list)
+    facts[0]["version_fact"] = "tool 9.9.9"
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_toolchain_authority_receipt_mac_mismatch",
+    ):
+        worker_workspace._verify_authority_receipt(receipt, tmp_path, card)
+
+
+def test_toolchain_receipt_rejects_altered_fact_with_recomputed_public_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "tool")
+    receipt, card = _authority_receipt_for(tmp_path, monkeypatch, executable)
+    facts = receipt["executables"]
+    assert isinstance(facts, list)
+    facts[0]["version_fact"] = "tool 9.9.9"
+    raw_snapshot = dict(receipt)
+    raw_snapshot["schema_id"] = toolchain_authority.SCHEMA_ID
+    raw_snapshot["digest"] = receipt["snapshot_digest"]
+    snapshot = toolchain_authority.ToolchainAuthority._snapshot_from_dict(
+        raw_snapshot
+    )
+    assert snapshot is not None
+    receipt["snapshot_digest"] = toolchain_authority.ToolchainAuthority._payload_digest(
+        snapshot
+    )
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_toolchain_authority_receipt_mac_mismatch",
+    ):
+        worker_workspace._verify_authority_receipt(receipt, tmp_path, card)
+
+
+def test_toolchain_receipt_rejects_wrong_hmac_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "tool")
+    receipt, card = _authority_receipt_for(tmp_path, monkeypatch, executable)
+    monkeypatch.setenv(
+        "AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY",
+        "hex:" + ("42" * 32),
+    )
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_toolchain_authority_receipt_mac_mismatch",
+    ):
+        worker_workspace._verify_authority_receipt(receipt, tmp_path, card)
+
+
+def test_toolchain_receipt_rejects_cross_request_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "tool")
+    receipt, card = _authority_receipt_for(tmp_path, monkeypatch, executable)
+    replay_card = dict(card)
+    replay_card["request_id"] = "request-b"
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_toolchain_authority_receipt_request_id_mismatch",
+    ):
+        worker_workspace._verify_authority_receipt(receipt, tmp_path, replay_card)
+
+
+def test_toolchain_receipt_rejects_executable_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "tool")
+    receipt, card = _authority_receipt_for(tmp_path, monkeypatch, executable)
+    executable.write_text("#!/bin/sh\nexit 0\n# changed\n", encoding="utf-8")
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_toolchain_authority_executable_identity_drift",
+    ):
+        worker_workspace._verify_authority_receipt(receipt, tmp_path, card)
+
+
+def test_version_probe_uses_sandbox_boundary_not_direct_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _executable(tmp_path / "bin" / "tool")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "bubblewrap")
+    monkeypatch.setattr(
+        worker_workspace,
+        "sandbox_argv",
+        lambda ws, adapter_id, argv, **kw: captured.update(
+            {
+                "workspace": ws,
+                "argv": list(argv),
+                "roots": kw.get("validation_executable_roots"),
+            }
+        )
+        or ["sandboxed-tool", "--version"],
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "sanitized_env",
+        lambda *args, **kwargs: {"PATH": "/usr/bin:/bin"},
+    )
+
+    def fake_run(argv, **kwargs):
+        assert argv != [str(executable.resolve()), "--version"]
+        captured["run_argv"] = list(argv)
+        return subprocess.CompletedProcess(argv, 0, "tool 1.2.3\n", "")
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", fake_run)
+
+    assert worker_workspace.trusted_validation_executable_version(str(executable)) == "tool 1.2.3"
+    assert captured["argv"] == [str(executable.resolve()), "--version"]
+    assert captured["run_argv"] == ["sandboxed-tool", "--version"]
+    assert captured["roots"] == (executable.resolve().parent,)
+
+
 def test_run_validations_passes_runtime_root_to_bubblewrap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -368,6 +573,50 @@ def test_git_uses_the_trusted_system_tool_authority(
 
     assert normalized == [str(system_git.resolve()), "diff", "--check"]
     assert roots == ()
+
+
+def test_node_uses_system_authority_and_publishes_nvm_runtime_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    runtime_root = tmp_path / ".nvm" / "versions" / "node" / "v24.15.0"
+    system_node = _executable(runtime_root / "bin" / "node")
+    monkeypatch.setattr(
+        worker_workspace.shutil,
+        "which",
+        lambda name: str(system_node) if name == "node" else None,
+    )
+
+    normalized, roots = (
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            ["node", "test/check.js"], repo
+        )
+    )
+
+    assert normalized == [str(system_node.resolve()), "test/check.js"]
+    assert roots == (runtime_root.resolve(),)
+
+
+def test_node_capability_preflight_uses_the_same_system_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system_node = _executable(tmp_path.parent / "system" / "node")
+    monkeypatch.setattr(
+        worker_workspace.shutil,
+        "which",
+        lambda name: str(system_node) if name == "node" else None,
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "_declared_workspace_seed_closure",
+        lambda *args: ((), (), ()),
+    )
+
+    assert worker_workspace.preflight_validation_capabilities(
+        tmp_path,
+        {"allowed_writes": [], "validation": ["node test/check.js"]},
+    ) == ()
 
 
 def test_git_system_tool_authority_rejects_repository_owned_binary(

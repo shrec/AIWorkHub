@@ -84,7 +84,7 @@ def test_current_tree_passes_and_baseline_is_sorted():
     # recorded matches were prose, including development_rules.py -- the file
     # that declares the rule -- recorded as violating it. The boundary now
     # measures code only, so the number finally means what it says.
-    assert sum(entry.count for entry in boundary.baseline) == 146
+    assert sum(entry.count for entry in boundary.baseline) == 139
 
 
 def test_new_identity_and_same_identity_growth_fail(tmp_path):

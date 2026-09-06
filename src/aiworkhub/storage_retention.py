@@ -12,11 +12,14 @@ that deadline.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import stat
@@ -25,10 +28,12 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from itertools import islice
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from . import parallelism, repo_policy, task_store, worktree_storage
+from .platform_io import lock_fd, unlock_fd
 from .worker_workspace import configured_worktree_root, has_verified_rework_delta
 
 
@@ -39,6 +44,12 @@ AUDIT_RELATIVE_PATH = Path(".aiworkhub/runtime/storage/retention.audit.jsonl")
 LEGACY_LOG_RELATIVE_PATH = Path("logs")
 CANONICAL_RUNTIME_RELATIVE_PATH = Path(".aiworkhub/runtime")
 UNDO_DAYS = 7
+AUTO_HYGIENE_MAX_PROTECTED_REASONS = 20
+_AUTO_HYGIENE_GUARD = threading.Lock()
+_AUTO_HYGIENE_RUNNING: set[str] = set()
+_AUTO_HYGIENE_LAST: dict[str, dict[str, Any]] = {}
+_AUTO_HYGIENE_TIMERS: dict[str, threading.Timer] = {}
+_AUTO_HYGIENE_MAX_WAKE_SECONDS = 24 * 60 * 60
 MAX_MANIFEST_BYTES = 512 * 1024
 # When unattributed/foreign worktree bytes reach this share of the observed
 # footprint, the preview flags it prominently (byte figure + count) so a short
@@ -250,12 +261,9 @@ def _protected_attempt_ids(
         # f"file:{db_path}?mode=ro" form lets a '#' in the path start a URI
         # fragment, silently dropping ?mode=ro so SQLite opens the connection
         # read-write and create-if-missing at a truncated path.
-        ro_uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
-        conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0)
+        conn = task_store.connect_readonly(db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
         try:
-            conn.execute("PRAGMA query_only = ON")
-            conn.execute("PRAGMA busy_timeout=5000")
             rows = conn.execute(
                 "SELECT task_id, status, worker_status, archived_at, card_json FROM tasks"
             ).fetchall()
@@ -1344,6 +1352,45 @@ def _load_manifest(path: Path, repo_id: str) -> dict[str, Any]:
     return value
 
 
+def _retention_auth_key(repo_root: Path) -> bytes:
+    """Return the private, repository-local key used to authenticate deadlines."""
+    path = repo_root / ".aiworkhub/runtime/storage/retention.auth.key"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        key = secrets.token_bytes(32)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return path.read_bytes()
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(key)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return key
+
+
+def _manifest_authentication(repo_root: Path, manifest: Mapping[str, Any]) -> str:
+    fields = {
+        "schema_id": manifest.get("schema_id"),
+        "repo_id": manifest.get("repo_id"),
+        "batch_id": manifest.get("batch_id"),
+        "created_at": manifest.get("created_at"),
+        "restore_deadline": manifest.get("restore_deadline"),
+        "preview_digest": manifest.get("preview_digest"),
+    }
+    payload = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(_retention_auth_key(repo_root), payload, hashlib.sha256).hexdigest()
+
+
+def _authenticated_manifest(repo_root: Path, manifest: Mapping[str, Any]) -> bool:
+    supplied = str(manifest.get("deadline_authentication") or "")
+    return bool(supplied) and hmac.compare_digest(
+        supplied, _manifest_authentication(repo_root, manifest)
+    )
+
+
 # The states a worktree quarantine item ends in when nothing was moved into the
 # batch for it: its on-disk identity changed between the digest snapshot and the
 # move, so no worktree directory sits under the batch. A batch whose every item
@@ -1454,6 +1501,7 @@ def quarantine(
         "status": "quarantining",
         "items": [dict(item, state="planned") for item in current["candidates"]],
     }
+    manifest["deadline_authentication"] = _manifest_authentication(root, manifest)
     manifest_path = batch / MANIFEST_NAME
     _atomic_json(manifest_path, manifest)
     moved = 0
@@ -1642,12 +1690,11 @@ def prune_stale_registrations(
     return {"ok": True, "pruned": len(pruned_ids), "ids": pruned_ids, "no_op": False}
 
 
-def list_batches(repo_root: Path | str, *, base: Path | None = None) -> dict[str, Any]:
-    root = Path(repo_root).resolve()
-    worktree_base = (base or configured_worktree_root(root)).resolve()
-    repo_id = _repo_id(root)
+def _iter_batch_rows(
+    root: Path, worktree_base: Path, repo_id: str
+) -> Iterator[dict[str, Any]]:
+    """Stream every valid batch row without accumulating repository history."""
     qroot = _read_quarantine_root(root, worktree_base)
-    rows: list[dict[str, Any]] = []
     if qroot is not None:
         for entry in sorted(qroot.iterdir(), reverse=True):
             if not entry.is_dir() or not _ID_RE.fullmatch(entry.name):
@@ -1672,7 +1719,7 @@ def list_batches(repo_root: Path | str, *, base: Path | None = None) -> dict[str
             # empty batch is surfaced purge_eligible even inside a live window so it
             # never sits on the storage panel forever protecting nothing.
             reapable_empty = _batch_reapable_empty(value, entry)
-            rows.append({
+            yield {
                 "batch_id": value["batch_id"],
                 "created_at": str(value.get("created_at") or ""),
                 "restore_deadline": deadline,
@@ -1686,8 +1733,14 @@ def list_batches(repo_root: Path | str, *, base: Path | None = None) -> dict[str
                 # also covers expired-but-still-full batches that collector never
                 # takes.
                 "reapable_empty": reapable_empty,
-            })
-    return {"ok": True, "batches": rows[:100], "count": len(rows[:100])}
+            }
+
+
+def list_batches(repo_root: Path | str, *, base: Path | None = None) -> dict[str, Any]:
+    root = Path(repo_root).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
+    rows = list(islice(_iter_batch_rows(root, worktree_base, _repo_id(root)), 100))
+    return {"ok": True, "batches": rows, "count": len(rows)}
 
 
 def _worktree_admin_dir(checkout: Path) -> Path | None:
@@ -1926,19 +1979,14 @@ def restore(
     }
 
 
-def purge(
-    repo_root: Path | str,
+def _purge_batch(
+    root: Path,
     *,
     batch_id: str,
-    confirm: bool,
-    base: Path | None = None,
+    batch: Path,
+    manifest: Mapping[str, Any],
+    current: datetime,
 ) -> dict[str, Any]:
-    if not confirm:
-        raise StorageRetentionError("explicit_confirmation_required")
-    root = Path(repo_root).resolve()
-    worktree_base = (base or configured_worktree_root(root)).resolve()
-    batch = _verified_batch(root, worktree_base, batch_id)
-    manifest = _load_manifest(batch / MANIFEST_NAME, _repo_id(root))
     try:
         deadline = datetime.fromisoformat(str(manifest.get("restore_deadline") or ""))
     except ValueError as exc:
@@ -1947,7 +1995,7 @@ def purge(
     # could return. A batch empty in BOTH its record and on disk holds nothing to
     # restore, so it is reapable before its deadline; a batch whose record reads
     # empty while its directory still holds bytes keeps its full window.
-    if datetime.now(timezone.utc) < deadline and not _batch_reapable_empty(manifest, batch):
+    if current < deadline and not _batch_reapable_empty(manifest, batch):
         raise StorageRetentionError("retention_undo_window_active")
     shutil.rmtree(batch)
     # The worktree registrations deliberately remain intact during the undo
@@ -1962,6 +2010,30 @@ def purge(
         "bytes": int(manifest.get("quarantined_bytes") or 0),
     })
     return {"ok": True, "batch_id": batch_id, "purged": True, "bytes": int(manifest.get("quarantined_bytes") or 0)}
+
+
+def purge(
+    repo_root: Path | str,
+    *,
+    batch_id: str,
+    confirm: bool,
+    base: Path | None = None,
+) -> dict[str, Any]:
+    if not confirm:
+        raise StorageRetentionError("explicit_confirmation_required")
+    root = Path(repo_root).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
+    batch = _verified_batch(root, worktree_base, batch_id)
+    manifest = _load_manifest(batch / MANIFEST_NAME, _repo_id(root))
+    if "deadline_authentication" in manifest and not _authenticated_manifest(root, manifest):
+        raise StorageRetentionError("retention_deadline_authentication_invalid")
+    return _purge_batch(
+        root,
+        batch_id=batch_id,
+        batch=batch,
+        manifest=manifest,
+        current=datetime.now(timezone.utc),
+    )
 
 
 def purge_empty_batches(
@@ -3174,6 +3246,188 @@ def cleanup_accepted_artifacts(
         )
 
 
+def run_repository_cleanup(
+    repo_root: Path | str, *, base: Path | None = None
+) -> dict[str, Any]:
+    """Run one repository-owned quarantine/purge lane using the wall clock."""
+    return _run_repository_cleanup(
+        repo_root,
+        base=base,
+        now=datetime.now(timezone.utc).timestamp(),
+    )
+
+
+def _run_repository_cleanup(
+    repo_root: Path | str, *, base: Path | None = None, now: float
+) -> dict[str, Any]:
+    """Internal deterministic cleanup helper; now is not a public input."""
+    root = Path(repo_root).resolve()
+    result: dict[str, Any] = {
+        "ok": True,
+        "scanned": 0,
+        "quarantined": 0,
+        "protected": 0,
+        "protected_reasons": {},
+        "bytes_moved": 0,
+        "expired_batches_purged": 0,
+        "bytes_freed": 0,
+        "next_deadline": None,
+    }
+    report = preview(root, base=base, now=now)
+    if not report.get("complete", True):
+        return dict(result, ok=False, error="retention_measurement_incomplete")
+    candidates = list(report.get("candidates") or [])
+    protected = list(report.get("protected") or [])
+    result["scanned"] = len(candidates) + len(protected)
+    result["protected"] = len(protected)
+    reasons: dict[str, int] = {}
+    for item in protected:
+        reason = str(item.get("reason") or "unknown")
+        reasons[reason] = reasons.get(reason, 0) + 1
+    result["protected_reasons"] = dict(
+        sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[
+            :AUTO_HYGIENE_MAX_PROTECTED_REASONS
+        ]
+    )
+    if candidates:
+        moved = quarantine(
+            root,
+            preview_digest=str(report["preview_digest"]),
+            confirm=True,
+            base=base,
+            now=now,
+        )
+        result["quarantined"] = int(moved.get("quarantined") or 0)
+        result["bytes_moved"] = int(moved.get("bytes") or 0)
+    next_deadline: tuple[datetime, str] | None = None
+    current = datetime.fromtimestamp(now, timezone.utc)
+    worktree_base = (base or configured_worktree_root(root)).resolve()
+    repo_id = _repo_id(root)
+    for row in _iter_batch_rows(root, worktree_base, repo_id):
+        deadline = str(row.get("restore_deadline") or "")
+        batch_id = str(row.get("batch_id") or "")
+        try:
+            parsed = datetime.fromisoformat(deadline)
+        except ValueError:
+            continue
+        if current >= parsed:
+            try:
+                batch = _verified_batch(root, worktree_base, batch_id)
+                manifest = _load_manifest(batch / MANIFEST_NAME, repo_id)
+                if not _authenticated_manifest(root, manifest):
+                    continue
+                purged = _purge_batch(
+                    root,
+                    batch_id=batch_id,
+                    batch=batch,
+                    manifest=manifest,
+                    current=current,
+                )
+            except StorageRetentionError:
+                continue
+            result["expired_batches_purged"] += 1
+            result["bytes_freed"] += int(purged.get("bytes") or 0)
+        else:
+            if next_deadline is None or parsed < next_deadline[0]:
+                next_deadline = (parsed, deadline)
+    result["next_deadline"] = next_deadline[1] if next_deadline else None
+    return result
+
+
+def repository_cleanup_status(repo_root: Path | str) -> dict[str, Any]:
+    """Return a bounded snapshot of the repository cleanup lane."""
+    owner = str(Path(repo_root).resolve())
+    with _AUTO_HYGIENE_GUARD:
+        last = dict(_AUTO_HYGIENE_LAST.get(owner) or {})
+        return {
+            "running": owner in _AUTO_HYGIENE_RUNNING,
+            "next_deadline": last.get("next_deadline"),
+            "last_run": last,
+        }
+
+
+def _schedule_deadline_wakeup(
+    root: Path, *, base: Path | None, deadline: str
+) -> None:
+    owner = str(root)
+    try:
+        due = datetime.fromisoformat(deadline)
+        delay = max(0.01, (due - datetime.now(timezone.utc)).total_seconds())
+    except ValueError:
+        return
+    delay = min(delay, float(_AUTO_HYGIENE_MAX_WAKE_SECONDS))
+
+    def wake() -> None:
+        with _AUTO_HYGIENE_GUARD:
+            _AUTO_HYGIENE_TIMERS.pop(owner, None)
+        schedule_repository_cleanup(root, base=base)
+
+    timer = threading.Timer(delay, wake)
+    timer.daemon = True
+    with _AUTO_HYGIENE_GUARD:
+        previous = _AUTO_HYGIENE_TIMERS.get(owner)
+        if previous is not None:
+            previous.cancel()
+        _AUTO_HYGIENE_TIMERS[owner] = timer
+    timer.start()
+
+
+def schedule_repository_cleanup(repo_root: Path | str, *, base: Path | None = None) -> bool:
+    """Coalesce terminal hints and return immediately; the daemon owns scanning."""
+    root = Path(repo_root).resolve()
+    # Resolve environment-derived configuration before the asynchronous handoff.
+    # Otherwise a later request/test can change AIWORKHUB_WORKTREE_ROOT while this
+    # thread is running and make cleanup inspect a different repository's tree.
+    worktree_base = (base or configured_worktree_root(root)).resolve()
+    owner = str(root)
+    with _AUTO_HYGIENE_GUARD:
+        if owner in _AUTO_HYGIENE_RUNNING:
+            return False
+        timer = _AUTO_HYGIENE_TIMERS.pop(owner, None)
+        if timer is not None:
+            timer.cancel()
+        _AUTO_HYGIENE_RUNNING.add(owner)
+
+    def run() -> None:
+        lock_fd_value: int | None = None
+        try:
+            lock_path = root / ".aiworkhub/runtime/storage/retention.cleanup.sqlite"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                lock_fd_value = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                lock_fd(lock_fd_value, blocking=False)
+            except OSError:
+                with _AUTO_HYGIENE_GUARD:
+                    _AUTO_HYGIENE_LAST[owner] = {
+                        "ok": True,
+                        "coalesced": True,
+                        "reason": "repository_cleanup_owner_active",
+                    }
+                return
+            else:
+                result = run_repository_cleanup(root, base=worktree_base)
+                with _AUTO_HYGIENE_GUARD:
+                    _AUTO_HYGIENE_LAST[owner] = result
+        except BaseException as exc:  # keep daemon failures out of stderr
+            with _AUTO_HYGIENE_GUARD:
+                _AUTO_HYGIENE_LAST[owner] = {
+                    "ok": False, "error": str(exc)[:300]
+                }
+        finally:
+            if lock_fd_value is not None:
+                with contextlib.suppress(OSError):
+                    unlock_fd(lock_fd_value)
+                os.close(lock_fd_value)
+            with _AUTO_HYGIENE_GUARD:
+                _AUTO_HYGIENE_RUNNING.discard(owner)
+                deadline = _AUTO_HYGIENE_LAST.get(owner, {}).get("next_deadline")
+            if isinstance(deadline, str) and deadline:
+                _schedule_deadline_wakeup(root, base=worktree_base, deadline=deadline)
+
+    threading.Thread(target=run, name="aiworkhub-storage-retention", daemon=True).start()
+    return True
+
+
 __all__ = [
     "ARTIFACT_GC_SCHEMA_ID",
     "AUDIT_RELATIVE_PATH",
@@ -3189,5 +3443,8 @@ __all__ = [
     "purge_empty_batches",
     "quarantine",
     "recover_stranded_worktrees",
+    "repository_cleanup_status",
     "restore",
+    "run_repository_cleanup",
+    "schedule_repository_cleanup",
 ]

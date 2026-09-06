@@ -12,6 +12,7 @@ import ast
 import ctypes
 import difflib
 import fnmatch
+from functools import partial
 import hashlib
 import hmac
 import html
@@ -65,6 +66,7 @@ from . import quality_evidence
 from . import quality_review_ingest
 from . import quality_review_scope
 from . import process_event_ledger
+from . import storage_retention
 from .process_launcher_acceptance import accepted_outcome_receipt as _accepted_outcome_receipt
 from .process_launcher_acceptance import changed_path_hashes as _changed_path_hashes
 from .process_launcher_acceptance import finished_acceptance_result as _finished_acceptance_result
@@ -621,7 +623,8 @@ def _compare_schema_mypy_baseline(
         candidate,
         create_workspace=create_workspace,
         cleanup_workspace=cleanup_workspace,
-        run_validations=run_validations,
+        run_validations=partial(
+            _run_validations_with_toolchain_receipt, authority=authority),
         route_resolver=_validation_route_kwargs,
     )
 
@@ -635,7 +638,36 @@ def _run_declared_validations(
         workspace,
         authority,
         route_metadata,
-        run_validations=run_validations,
+        run_validations=partial(
+            _run_validations_with_toolchain_receipt, authority=authority),
+        route_resolver=_validation_route_kwargs,
+        baseline_comparer=_compare_schema_mypy_baseline,
+    )
+
+
+def _run_validations_with_toolchain_receipt(
+    target: WorkerWorkspace,
+    commands: Iterable[str],
+    authority: Mapping[str, Any],
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    receipt = authority.get(_toolchain_authority.RECEIPT_CARD_KEY)
+    if isinstance(receipt, Mapping):
+        kwargs.setdefault("toolchain_authority_receipt", receipt)
+        kwargs.setdefault("toolchain_authority_card", authority)
+    return run_validations(target, commands, **kwargs)
+
+
+def _run_full_snapshot_validations(
+    workspace: WorkerWorkspace, authority: Mapping[str, Any],
+    route_metadata: Mapping[str, Any], candidate_changed_paths: Iterable[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    return _launcher_validation.run_full_snapshot_validations(
+        workspace, authority, route_metadata, candidate_changed_paths,
+        create_snapshot=create_combined_validation_workspace,
+        cleanup_workspace=cleanup_workspace,
+        run_validations=partial(
+            _run_validations_with_toolchain_receipt, authority=authority),
         route_resolver=_validation_route_kwargs,
         baseline_comparer=_compare_schema_mypy_baseline,
     )
@@ -4513,26 +4545,11 @@ class ProcessManager:
         self._reconcile_pending_needfix_closures()
 
     def _default_show_task(self, task_id: str) -> dict[str, Any]:
-        """The sole claim/finalization authority: ``self.repo`` -- the exact
-        repository this ProcessManager (and every isolated workspace it
-        launched) is bound to -- never an independently, ambiently
-        re-resolved repository (``core.show_task`` -> ``core.repo_root()``).
-        Every internal caller of ``self._show_task`` (preflight, exact-claim-
-        state, GC eligibility, status) goes through this one binding, so the
-        launcher and the finalizer can never disagree about which
-        ``.aiworkhub/tasking/task_queue.sqlite`` is canonical for this
-        worker's workspace."""
+        """Read from this manager's canonical repository-bound task store."""
         return task_engine.show_task(self.repo, task_id)
 
     def _load_dependency_card(self, dep_id: str) -> dict[str, Any]:
-        """Best-effort read of an arbitrary dependency card by task_id alone.
-
-        Unlike ``_preflight_card`` this never raises and never checks
-        runner/topic/lifecycle: a missing, archived, or malformed dependency
-        simply yields ``{}`` so input enrichment degrades to "add nothing".
-        Goes through the same repo-bound ``self._show_task`` binding so it can
-        never disagree about which task store is canonical for this launcher.
-        """
+        """Best-effort repo-bound dependency-card read; failures yield ``{}``."""
         try:
             envelope = self._show_task(dep_id)
         except Exception:  # noqa: BLE001 -- a dep lookup must never break a launch
@@ -4747,18 +4764,16 @@ class ProcessManager:
         return process_event_ledger.append_event(self.process_log_path, clean)
 
     def _retention_event(self, event: dict[str, Any], *, disposition: str) -> dict[str, Any]:
-        """Single door for a terminal event's retention story: ``disposition``
-        is required and DERIVES ``workspace_retained`` so they cannot disagree
-        (``retained_in_place``/``quarantined`` keep the bytes, ``removed`` does
-        not).  An unknown value raises here, so a branch that forgets the
-        vocabulary fails to construct instead of silently omitting it.
-        """
+        """Record terminal retention evidence and enqueue repository hygiene."""
         retained = {"retained_in_place": True, "quarantined": True,
                     "removed": False}[disposition]
-        return self._append_event({
+        recorded = self._append_event({
             **event, "workspace_disposition": disposition,
             "workspace_retained": retained,
         })
+        if str(event.get("state") or "") in {"accepted", "rejected", "archived"}:
+            storage_retention.schedule_repository_cleanup(self.repo)
+        return recorded
 
     def _events(self) -> list[dict[str, Any]]:
         return list(process_event_ledger.iter_events(self.process_log_path))
@@ -5560,6 +5575,9 @@ class ProcessManager:
         worker_status = str(card.get("worker_status") or "unclaimed")
         claimed_by = str(card.get("claimed_by") or "")
         launch_request_id = str(card.get("launch_request_id") or "")
+        effective_request_id = str(
+            reserved_request_id or card.get("request_id") or launch_request_id or uuid.uuid4().hex
+        )
         if lifecycle == "pending":
             if worker_status != "unclaimed":
                 raise LaunchRejected(f"task_not_unclaimed:{worker_status}")
@@ -5596,11 +5614,10 @@ class ProcessManager:
                 separators=(",", ":"),
             )
             raise LaunchRejected(f"task_contract_unwinnable:{detail}")
-        # NF-2026-00548 (audit M3): refuse a relaunch that is byte-identical to
-        # a recorded terminal failure BEFORE anything is claimed or
-        # provisioned, so the identical attempt is never burned.  Every
-        # changed input and every explicit terminal retry permits the launch;
-        # see ``identical_relaunch_refusal``.
+        card["request_id"] = effective_request_id
+        card[_toolchain_authority.RECEIPT_CARD_KEY] = (
+            _toolchain_authority.authority_receipt(authority_snapshot, card)
+        )
         relaunch_refusal = identical_relaunch_refusal(
             card, runner=runner, adapter_id=adapter_id
         )
@@ -5716,25 +5733,29 @@ class ProcessManager:
         predecessor_request_id = str(
             authorization.get("predecessor_request_id") or ""
         )
-        predecessor_event = next(
-            (
-                event
-                for event in reversed(self._events())
-                if event.get("request_id") == predecessor_request_id
-                and event.get("task_id") == task_id
-                and event.get("state") in TERMINAL_PROCESS_STATES
-            ),
-            None,
-        )
-        if predecessor_event is None:
+        predecessor_event = None
+        terminal_seen = False
+        for event in reversed(self._events()):
+            if (
+                event.get("request_id") != predecessor_request_id
+                or event.get("task_id") != task_id
+                or event.get("state") not in TERMINAL_PROCESS_STATES
+            ):
+                continue
+            terminal_seen = True
+            # Compact retention rows must not shadow the evidence-bearing row.
+            if isinstance(event.get("worker_mcp_gate"), dict):
+                predecessor_event = event
+                break
+        if not terminal_seen:
             raise LaunchRejected(
                 "validation_only_replay_predecessor_terminal_event_missing"
             )
-        gate = predecessor_event.get("worker_mcp_gate")
-        if not isinstance(gate, dict):
+        if predecessor_event is None:
             raise LaunchRejected(
                 "validation_only_replay_predecessor_worker_mcp_gate_missing"
             )
+        gate = predecessor_event["worker_mcp_gate"]
         verification = gate.get("verification")
         if (
             gate.get("gated") is not True
@@ -5831,21 +5852,15 @@ class ProcessManager:
         timeout_seconds: int,
         card: dict[str, Any],
         authorization: dict[str, Any],
+        request_id: str | None = None,
     ) -> dict[str, Any]:
-        """Run a hash-pinned validation replay without invoking a provider.
-
-        This lane deliberately reuses the canonical isolated-worktree
-        finalizer.  It changes only how the successful execution receipt is
-        produced: no prompt, credential, adapter plan, worker MCP runtime,
-        supervisor, or provider process exists.  The normal finalizer still
-        owns exact claim verification, inherited-byte/hash authorization,
-        sandboxed validation, review evidence, and the terminal transition.
-        """
+        """Run a provider-free replay through the normal finalizer."""
 
         predecessor_mcp_receipt = self._validation_replay_predecessor_mcp_receipt(
             card, authorization, task_id
         )
-        request_id = uuid.uuid4().hex
+        request_id = str(request_id or card.get("request_id") or uuid.uuid4().hex)
+        receipt = card.get(_toolchain_authority.RECEIPT_CARD_KEY)
         workspace: WorkerWorkspace | None = None
         claimed = False
         try:
@@ -5994,6 +6009,8 @@ class ProcessManager:
                     "workspace": workspace.as_metadata(),
                     "quality_review": None,
                 }
+                if isinstance(receipt, Mapping):
+                    metadata[_toolchain_authority.RECEIPT_CARD_KEY] = dict(receipt)
                 write_json_0600(metadata_path, metadata)
                 _write_terminal_authority_grant(
                     self._terminal_authority_grant_path(request_id),
@@ -7895,6 +7912,11 @@ class ProcessManager:
                 )
             else:
                 card = self._preflight_card(task_id, runner, topic, adapter_id)
+            request_id = str(
+                card.get("request_id") or reserved_request_id or uuid.uuid4().hex
+            )
+            card.setdefault("request_id", request_id)
+            preflight_card = dict(card)
             claimed = core._lifecycle_state(card) == "processing"
             _enforce_quality_review_launch_binding(topic, quality_review_binding)
 
@@ -7912,6 +7934,7 @@ class ProcessManager:
                     timeout_seconds=timeout_seconds,
                     card=card,
                     authorization=replay_authorization,
+                    request_id=request_id,
                 )
             model = validate_workforce_identity(
                 runner, adapter_id, model, risk_tier=card.get("risk_tier")
@@ -7946,7 +7969,6 @@ class ProcessManager:
                     ) from exc
             sandbox_backend = _sandbox_backend_for_adapter(adapter_id)
             launch_phase = "workspace_and_runtime_provision"
-            request_id = reserved_request_id or uuid.uuid4().hex
             reservation_ctx = (
                 nullcontext()
                 if reserved_request_id is not None
@@ -8350,6 +8372,10 @@ class ProcessManager:
                         runner=runner,
                         topic=topic,
                     )
+                    card["request_id"] = request_id
+                    receipt = preflight_card.get(_toolchain_authority.RECEIPT_CARD_KEY)
+                    if isinstance(receipt, Mapping):
+                        card[_toolchain_authority.RECEIPT_CARD_KEY] = dict(receipt)
                     claimed = True
 
                 prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -11114,6 +11140,7 @@ class ProcessManager:
             release_result: dict[str, Any] | None = None
             worker_mcp_gate: dict[str, Any] | None = None
             quality_gate: dict[str, Any] | None = None
+            full_validation_snapshot: dict[str, Any] | None = None
             research_result: dict[str, Any] | None = None
             residual_contract_result: list[dict[str, Any]] = []
             attempt_artifact_receipt: dict[str, Any] | None = None
@@ -11138,13 +11165,20 @@ class ProcessManager:
                         time.monotonic() - phase_started
                     ) * 1000.0
 
-            def _run_finalization_validations() -> list[dict[str, Any]]:
-                nonlocal validation_wall_duration_ms
+            def _run_finalization_validations(
+                candidate_changed_paths: list[str],
+            ) -> list[dict[str, Any]]:
+                nonlocal validation_wall_duration_ms, full_validation_snapshot
                 phase_started = time.monotonic()
                 try:
-                    return _run_declared_validations(
-                        workspace, metadata, metadata
+                    if not candidate_changed_paths:
+                        return _run_declared_validations(workspace, metadata, metadata)
+                    validations, full_validation_snapshot = (
+                        _run_full_snapshot_validations(
+                            workspace, metadata, metadata, candidate_changed_paths
+                        )
                     )
+                    return validations
                 finally:
                     validation_wall_duration_ms += (
                         time.monotonic() - phase_started
@@ -11364,34 +11398,31 @@ class ProcessManager:
                             ),
                             replay_claim_epoch=metadata.get("claim_epoch"),
                         )
-                        worker_mcp_gate = _worker_mcp_live_call_gate(metadata, request_id)
-                        # Always collect deterministic validation evidence
-                        # before enforcing the context/tool-use gate. A
-                        # missing MCP call must still block promotion, but it
-                        # must not erase the otherwise useful test evidence or
-                        # force the coordinator to rerun the worker merely to
-                        # learn whether its candidate builds.
-                        validations = _run_finalization_validations()
-                        if worker_mcp_gate.get("gated") and not worker_mcp_gate.get("satisfied", True):
-                            raise WorkspaceError(
-                                "validation_required_aiworkhub_mcp_call_missing:"
-                                + str(worker_mcp_gate.get("reason") or "")
-                            )
-                        # An empty validation plan cannot mutate the workspace;
-                        # avoid a second Git scan on the read-only/zero-diff hot
-                        # path. Commands that did run are followed by the full
-                        # post-validation scope check as before.
-                        if validations:
-                            changed = _enforce_finalization_scope()
-                        # B561: union validated required-output exact paths into
-                        # the review candidate set.  validate_required_outputs
-                        # finds gitignored files that changed_paths (git-diff /
-                        # git-ls-files --exclude-standard) silently omits.
                         validated_required_paths = {
                             rec["path"]
                             for rec in required_output_records
                             if not rec.get("unchanged_allowed")
                         }
+                        validation_candidate_paths = sorted(
+                            set(changed)
+                            | validated_required_paths
+                            | {
+                                rec["path"]
+                                for rec in required_output_records
+                                if rec.get("replay_evidence")
+                            }
+                        )
+                        worker_mcp_gate = _worker_mcp_live_call_gate(metadata, request_id)
+                        validations = _run_finalization_validations(
+                            validation_candidate_paths
+                        )
+                        if worker_mcp_gate.get("gated") and not worker_mcp_gate.get("satisfied", True):
+                            raise WorkspaceError(
+                                "validation_required_aiworkhub_mcp_call_missing:"
+                                + str(worker_mcp_gate.get("reason") or "")
+                            )
+                        if validations:
+                            changed = _enforce_finalization_scope()
                         validation_only_replay_records = [
                             rec["replay_evidence"]
                             for rec in required_output_records
@@ -11432,6 +11463,8 @@ class ProcessManager:
                             quality_gate = quality_evidence.run_completion_quality_gate(
                                 workspace.path, changed_paths=changed
                             )
+                            if full_validation_snapshot is not None:
+                                quality_gate["full_validation_snapshot"] = full_validation_snapshot
                             if not quality_gate.get("passed"):
                                 blockers = quality_gate.get("blocking_checks") or []
                                 reason = quality_gate.get("config_error") or ",".join(
@@ -11445,15 +11478,8 @@ class ProcessManager:
                             validations,
                             quality_gate,
                         )
-                        # Phase 1 review-first reconcile: a successful worker
-                        # exit no longer promotes into the canonical repo nor
-                        # marks review via core.mark_review directly. The
-                        # isolated workspace is retained and the coordinator's
-                        # review ledger receives every check's evidence
-                        # (validation, required outputs, the MCP gate, changed
-                        # paths + their hashes, and the exact request/workspace
-                        # identity) so a later coordinator-accept step is the
-                        # only path that can ever touch the canonical repo.
+                        # Review-first reconcile retains the isolated workspace
+                        # and records every check before coordinator acceptance.
                         changed_path_hashes = _changed_path_hashes(workspace, changed)
                         attempt_artifact_receipt = self._persist_attempt_artifacts(
                             request_id,
@@ -14138,9 +14164,10 @@ class ProcessManager:
                 quality_gate["destructive_change_confirmed"] = bool(
                     confirm_destructive_change and destructive_blockers
                 )
-                validations = _run_declared_validations(
-                    workspace, card, latest
+                validations, full_validation_snapshot = (
+                    _run_full_snapshot_validations(workspace, card, latest, changed)
                 )
+                quality_gate["full_validation_snapshot"] = full_validation_snapshot
                 _enforce_behavioral_gate(card, validations, quality_gate)
                 current_hashes = _changed_path_hashes(workspace, changed)
                 if set(current_hashes) != set(stored_hashes) or any(
@@ -14383,4 +14410,5 @@ def default_manager() -> ProcessManager:
     with _DEFAULT_MANAGER_LOCK:
         if _DEFAULT_MANAGER is None:
             _DEFAULT_MANAGER = ProcessManager()
+            storage_retention.schedule_repository_cleanup(_DEFAULT_MANAGER.repo)
         return _DEFAULT_MANAGER

@@ -250,12 +250,17 @@ def test_identity_bound_publication_documents_open_parent_authority():
     assert "substituted public parent path" in contract
 
 
-def test_identity_bound_publication_fails_closed_off_linux(tmp_path, monkeypatch):
+def test_identity_bound_publication_fails_closed_on_unsupported_platform(
+    tmp_path, monkeypatch
+):
     source = tmp_path / "source"
     destination = tmp_path / "destination"
     source.write_bytes(b"new")
     destination.write_bytes(b"prior")
+    # Linux and macOS are the two supported publication hosts; anything else has
+    # no descriptor-bound namespace guarantee and must fail closed.
     monkeypatch.setattr(platform_io, "is_linux", lambda _name=None: False)
+    monkeypatch.setattr(platform_io, "is_macos", lambda _name=None: False)
 
     with pytest.raises(platform_io.IdentityBoundPublicationError):
         platform_io.identity_bound_durable_atomic_replace(source, destination)

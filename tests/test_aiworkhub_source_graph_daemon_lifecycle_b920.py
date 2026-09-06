@@ -23,6 +23,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1458,6 +1459,29 @@ def test_new_process_group_popen_kwargs_is_platform_appropriate(monkeypatch):
         source_graph_daemon.SourceGraphDaemon._new_process_group_popen_kwargs()
         == {"start_new_session": True}
     )
+
+
+def test_signal_process_tree_delegates_group_signal_to_platform_io(monkeypatch):
+    calls: list[tuple[int, bool]] = []
+    child_actions: list[str] = []
+    process = SimpleNamespace(
+        pid=123,
+        terminate=lambda: child_actions.append("terminate"),
+        kill=lambda: child_actions.append("kill"),
+    )
+
+    monkeypatch.setattr(source_graph_daemon.platform_io, "is_windows", lambda: False)
+    monkeypatch.setattr(
+        source_graph_daemon.platform_io,
+        "signal_process_group",
+        lambda pgid, *, graceful: calls.append((pgid, graceful)),
+    )
+
+    daemon = source_graph_daemon.SourceGraphDaemon(Path("/repo"))
+    daemon._signal_process_tree(process, 456, graceful=False)
+
+    assert calls == [(456, False)]
+    assert child_actions == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX owner-handle lifecycle")

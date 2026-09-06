@@ -3344,11 +3344,13 @@ def recover_blocked_rework(
 
     ``clean_root_if_predecessor_missing`` is an explicit coordinator escape
     hatch for an ordinary rework episode whose hash-pinned predecessor
-    workspace has already been removed by retention.  It preserves the
-    predecessor identity and hashes as audit evidence, removes only the stale
-    materialization authority, and records a clean-root authorization.  It is
-    incompatible with validation-only replay, which requires the original
-    bytes.
+    workspace has either been removed by retention or is an exact retained
+    overlay that Source Graph rejected as syntactically unparsable.  The latter
+    requires a system-recorded launch blocker plus an exact path and SHA-256
+    match.  It preserves predecessor identity and hashes as audit evidence,
+    removes only the stale materialization authority, and records a clean-root
+    authorization.  It is incompatible with validation-only replay, which
+    requires the original bytes.
 
     Idempotent: returns ``(True, "already_recovered")`` when a prior recovery
     already re-queued the same task, without duplicating audit history.  A
@@ -3381,7 +3383,7 @@ def recover_blocked_rework(
         if clean_root_if_predecessor_missing and validation_only_replay:
             return False, "clean_root_incompatible_with_validation_only_replay"
 
-        def missing_predecessor_authority() -> tuple[bool, str, dict[str, Any]]:
+        def clean_root_predecessor_authority() -> tuple[bool, str, dict[str, Any]]:
             predecessor = card.get("rework_predecessor")
             if not isinstance(predecessor, dict):
                 return False, "clean_root_rework_predecessor_invalid", {}
@@ -3428,12 +3430,82 @@ def recover_blocked_rework(
                 return False, "clean_root_rework_identity_mismatch", {}
             if source_workspace.is_symlink():
                 return False, "clean_root_rework_workspace_invalid", {}
-            if source_workspace.exists():
+            if not source_workspace.exists():
+                return True, "missing", {
+                    "predecessor_request_id": request_id,
+                    "changed_path_hashes": dict(hashes),
+                    "missing_workspace": str(source_workspace),
+                    "recovery_mode": "clean_root_missing_predecessor",
+                }
+
+            # A failed Source Graph overlay extraction can leave an exact,
+            # hash-pinned predecessor physically present but unusable.  The
+            # ordinary recovery path would replay that same broken tree
+            # forever, while the old clean-root escape hatch rejected it only
+            # because it still existed.  Permit the explicit coordinator
+            # escape only for the narrow, system-recorded parse failure and
+            # only after proving the offending bytes still match the sealed
+            # predecessor identity.
+            blocker = card.get("operational_blocker")
+            blocker_reason = (
+                str(blocker.get("reason") or "")
+                if isinstance(blocker, dict)
+                and str(blocker.get("kind") or "") == "launch_blocked"
+                else ""
+            )
+            marker = "rework_overlay_extract_failed:"
+            if marker not in blocker_reason:
                 return False, "clean_root_rework_workspace_still_available", {}
-            return True, "missing", {
+            failure_identity = blocker_reason.split(marker, 1)[1]
+            try:
+                failed_path, extraction_status = failure_identity.rsplit(":", 1)
+            except ValueError:
+                return False, "clean_root_rework_unusable_identity_invalid", {}
+            if extraction_status != "parse_error_fail_closed" or failed_path not in hashes:
+                return False, "clean_root_rework_unusable_identity_invalid", {}
+            try:
+                expected_workspace_path = (
+                    expected_repo
+                    / ".aiworkhub"
+                    / "runtime"
+                    / "worktrees"
+                    / request_id
+                    / "worktree"
+                )
+                expected_workspace = expected_workspace_path.resolve(strict=True)
+                resolved_workspace = source_workspace.resolve(strict=True)
+                candidate = source_workspace.joinpath(*failed_path.split("/"))
+                resolved_candidate = candidate.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                return False, "clean_root_rework_unusable_bytes_invalid", {}
+            if (
+                source_workspace != expected_workspace_path
+                or resolved_workspace != expected_workspace
+                or any(
+                    path.is_symlink()
+                    for path in (
+                        expected_repo / ".aiworkhub",
+                        expected_repo / ".aiworkhub" / "runtime",
+                        expected_repo / ".aiworkhub" / "runtime" / "worktrees",
+                        expected_workspace_path.parent,
+                        expected_workspace_path,
+                    )
+                )
+                or candidate.is_symlink()
+                or not resolved_candidate.is_file()
+                or not resolved_candidate.is_relative_to(resolved_workspace)
+            ):
+                return False, "clean_root_rework_unusable_bytes_invalid", {}
+            expected_hash = hashes.get(failed_path)
+            if sha256_file(resolved_candidate) != expected_hash:
+                return False, "clean_root_rework_candidate_hash_mismatch", {}
+            return True, "unusable", {
                 "predecessor_request_id": request_id,
                 "changed_path_hashes": dict(hashes),
-                "missing_workspace": str(source_workspace),
+                "unusable_workspace": str(source_workspace),
+                "unusable_path": failed_path,
+                "unusable_reason": blocker_reason,
+                "recovery_mode": "clean_root_unusable_predecessor",
             }
 
         already = conn.execute(
@@ -3441,7 +3513,14 @@ def recover_blocked_rework(
             "WHERE task_id=? AND event='blocked_rework_recovery' LIMIT 1",
             (task_id,),
         ).fetchone()
-        if already is not None:
+        pending_clean_root_blocker = (
+            current_canonical == "pending"
+            and clean_root_if_predecessor_missing
+            and isinstance(card.get("operational_blocker"), dict)
+            and str(card["operational_blocker"].get("kind") or "")
+            == "launch_blocked"
+        )
+        if already is not None or pending_clean_root_blocker:
             if current_canonical == "pending":
                 if validation_only_replay:
                     predecessor = card.get("rework_predecessor")
@@ -3580,11 +3659,12 @@ def recover_blocked_rework(
                     )
                     conn.commit()
                     return True, "consumed_stale_validation_only_replay_authorization"
-                allowed, reason, clean_root_evidence = missing_predecessor_authority()
+                allowed, reason, clean_root_evidence = clean_root_predecessor_authority()
                 if not allowed:
                     return False, reason
                 now = datetime.now(timezone.utc).isoformat()
                 card.pop("rework_predecessor", None)
+                card.pop("operational_blocker", None)
                 card["clean_root_recovery_authorization"] = {
                     **clean_root_evidence,
                     "task_id": task_id,
@@ -3593,7 +3673,7 @@ def recover_blocked_rework(
                     "claim_epoch": card.get("claim_epoch"),
                     "one_episode_binding": True,
                 }
-                card["recovery_mode"] = "clean_root_missing_predecessor"
+                card["recovery_mode"] = str(clean_root_evidence["recovery_mode"])
                 conn.execute(
                     "UPDATE tasks SET updated_at=?, card_json=? WHERE task_id=?",
                     (now, json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
@@ -4206,7 +4286,7 @@ def recover_blocked_rework(
             card.pop("validation_only_replay_authorization", None)
 
         if clean_root_if_predecessor_missing:
-            allowed, reason, clean_root_evidence = missing_predecessor_authority()
+            allowed, reason, clean_root_evidence = clean_root_predecessor_authority()
             if not allowed:
                 return False, reason
             card.pop("rework_predecessor", None)
@@ -4218,7 +4298,7 @@ def recover_blocked_rework(
                 "claim_epoch": claim_epoch,
                 "one_episode_binding": True,
             }
-            card["recovery_mode"] = "clean_root_missing_predecessor"
+            card["recovery_mode"] = str(clean_root_evidence["recovery_mode"])
         else:
             card.pop("clean_root_recovery_authorization", None)
             card.pop("recovery_mode", None)

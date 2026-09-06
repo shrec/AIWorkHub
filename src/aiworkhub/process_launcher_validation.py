@@ -24,6 +24,7 @@ ValidationRunner = Callable[..., list[dict[str, Any]]]
 WorkspaceCreator = Callable[..., WorkerWorkspace]
 WorkspaceCleanup = Callable[..., None]
 RouteResolver = Callable[[Mapping[str, Any]], dict[str, Any]]
+CombinedWorkspaceFactory = Callable[..., tuple[WorkerWorkspace, dict[str, Any]]]
 
 _VALIDATION_REPLAY_LOCK = Lock()
 _VALIDATION_REPLAYS_IN_FLIGHT: set[tuple[str, str, str]] = set()
@@ -402,6 +403,55 @@ def run_declared_validations(
                 f"{exc}:baseline_comparison_failed:{baseline_exc}", rows
             ) from baseline_exc
     return with_roles(results)
+
+
+def run_full_snapshot_validations(
+    workspace: WorkerWorkspace,
+    authority: Mapping[str, Any],
+    route_metadata: Mapping[str, Any],
+    candidate_changed_paths: Iterable[str],
+    *,
+    create_snapshot: CombinedWorkspaceFactory,
+    cleanup_workspace: WorkspaceCleanup,
+    run_validations: ValidationRunner,
+    route_resolver: RouteResolver,
+    baseline_comparer: Callable[..., list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run validation against the complete canonical-plus-candidate snapshot."""
+
+    candidate = sorted({str(value) for value in candidate_changed_paths})
+    if not candidate:
+        raise WorkspaceError("full_snapshot_candidate_empty")
+    if not declared_validation_commands(authority):
+        return [], {
+            "schema_id": "aiworkhub.full_validation_snapshot.v1",
+            "applicable": False,
+            "reason": "no_declared_validations",
+            "request_id": workspace.request_id,
+            "repo": str(workspace.repo),
+            "source_base_oid": workspace.base_oid,
+            "candidate_changed_paths": candidate,
+        }
+    snapshot, combined_tree = create_snapshot(workspace, authority, candidate)
+    try:
+        validations = run_declared_validations(
+            snapshot,
+            authority,
+            route_metadata,
+            run_validations=run_validations,
+            route_resolver=route_resolver,
+            baseline_comparer=baseline_comparer,
+        )
+        return validations, {
+            "schema_id": "aiworkhub.full_validation_snapshot.v1",
+            "request_id": workspace.request_id,
+            "repo": str(workspace.repo),
+            "source_base_oid": workspace.base_oid,
+            "snapshot_base_oid": snapshot.base_oid,
+            "combined_tree": combined_tree,
+        }
+    finally:
+        cleanup_workspace(snapshot.repo, snapshot.path, snapshot.home)
 
 
 def enforce_behavioral_gate(

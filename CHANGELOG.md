@@ -6,6 +6,28 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.10.95] - 2026-09-06
+
+### Fixed
+
+- Bound dashboard snapshot materialization so status polling does not retain the
+  full historical task population in memory.
+- Add authenticated automatic retention for terminal worker worktrees, with
+  bounded streaming cleanup, restore deadlines, quarantine, and single-flight
+  scheduling instead of unbounded repository growth.
+- Route Source Graph, reconciler, retention, and process-liveness operations
+  through the canonical platform boundary, removing another set of direct OS
+  probes and unsafe cross-platform process assumptions.
+- Resolve validation executables through a repository toolchain registry and
+  carry the signed resolution receipt into the isolated validation lane.
+- Build final validation from a complete coordinator snapshot so sparse worker
+  inputs cannot omit unchanged transitive dependencies.
+- Recover validation-only replay evidence from the exact terminal event rather
+  than a later compact retention row for the same request.
+
+This release preserves failed and retained candidates. It does not relabel the
+still-pending NF-2026-00612 reroute attempt as accepted.
+
 ## [0.10.93] - 2026-09-05
 
 ### Fixed

@@ -34,6 +34,15 @@ from aiworkhub import (  # noqa: E402
 )
 
 
+@pytest.fixture(autouse=True)
+def _disable_async_retention_sweep(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        process_launcher.storage_retention,
+        "schedule_repository_cleanup",
+        lambda *_args, **_kwargs: None,
+    )
+
+
 class _RejectingToolchainAuthority:
     def __init__(self) -> None:
         self.repairs = 0
@@ -3423,6 +3432,15 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
     monkeypatch.setattr(
         process_launcher.core, "mark_review", lambda *a, **k: {"ok": True}
     )
+    snapshot_calls = []
+
+    def fake_full_snapshot(_workspace, _authority, _route, candidate_paths):
+        snapshot_calls.append(list(candidate_paths))
+        return [], {"schema_id": "aiworkhub.full_validation_snapshot.v1"}
+
+    monkeypatch.setattr(
+        process_launcher, "_run_full_snapshot_validations", fake_full_snapshot
+    )
 
     review_calls = []
 
@@ -3538,6 +3556,7 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
     assert record["replay_evidence"]["sha256"] == raw_sha256
     assert record["replay_evidence"]["claim_epoch"] == 3
     assert evidence["validation_only_replay"] == [record["replay_evidence"]]
+    assert snapshot_calls == [["out/result.json"]]
 
 
 def test_validation_only_replay_authorization_fails_closed_before_launch():
@@ -3698,6 +3717,16 @@ def test_validation_only_replay_inherits_authenticated_predecessor_mcp_truth(tmp
             "satisfied": True,
             "verification": {"ok": True, "verified_entries": 4},
         },
+    })
+    # A later retention/GC annotation is a lifecycle projection, not a new
+    # terminal evidence record.  It must not hide the authenticated gate from
+    # the exact predecessor episode.
+    manager._append_event({
+        "request_id": "predecessor-green",
+        "task_id": "TASK_REPLAY",
+        "state": "review_ready",
+        "workspace_gc": True,
+        "workspace_disposition": "removed",
     })
     receipt = manager._validation_replay_predecessor_mcp_receipt(
         card, authorization, "TASK_REPLAY"
@@ -10833,6 +10862,305 @@ def test_process_manager_consumes_authority_before_collision_or_provider_launch(
     assert authority.repairs == 1
     assert side_effects == []
     assert not (tmp_path / "events.jsonl").exists()
+
+
+def test_preflight_attaches_identity_bound_toolchain_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "AIWORKHUB_TOOLCHAIN_AUTHORITY_HMAC_KEY",
+        "hex:" + ("cd" * 32),
+    )
+    card = _card()
+    card["validation"] = [f"{sys.executable} -m compileall -q ."]
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+
+    preflight = manager._preflight_card(
+        card["task_id"],
+        card["runner"],
+        card["topic"],
+        "claude_cli",
+        reserved_request_id="receipt-request-1",
+    )
+
+    receipt = preflight[toolchain_authority.RECEIPT_CARD_KEY]
+    assert receipt["schema_id"] == toolchain_authority.RECEIPT_SCHEMA_ID
+    assert receipt["snapshot_digest"]
+    assert receipt["request_id"] == preflight["request_id"] == "receipt-request-1"
+    assert receipt["executables"][0]["canonical_path"] == str(Path(sys.executable).resolve())
+    assert receipt["card_identity"] == toolchain_authority._receipt_card_identity(
+        preflight
+    )
+    assert toolchain_authority.verify_authority_receipt(
+        receipt, manager.repo, preflight
+    )
+    replayed = dict(preflight)
+    replayed["request_id"] = "receipt-request-2"
+    with pytest.raises(
+        ValueError,
+        match="validation_toolchain_authority_receipt_request_id_mismatch",
+    ):
+        toolchain_authority.verify_authority_receipt(receipt, manager.repo, replayed)
+
+
+def test_declared_validation_forwards_preflight_toolchain_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = SimpleNamespace(request_id="req", path=tmp_path, repo=tmp_path)
+    receipt = {
+        "schema_id": toolchain_authority.RECEIPT_SCHEMA_ID,
+        "snapshot_digest": "a" * 64,
+        "executables": [],
+    }
+    seen: dict[str, object] = {}
+
+    def fake_run_validations(target, commands, **kwargs):
+        seen["target"] = target
+        seen["commands"] = list(commands)
+        seen["receipt"] = kwargs.get("toolchain_authority_receipt")
+        seen["card"] = kwargs.get("toolchain_authority_card")
+        return [{"returncode": 0}]
+
+    monkeypatch.setattr(process_launcher, "run_validations", fake_run_validations)
+
+    rows = process_launcher._run_declared_validations(
+        workspace,
+        {
+            "validation": ["python -m pytest -q"],
+            toolchain_authority.RECEIPT_CARD_KEY: receipt,
+        },
+        {"adapter_id": "claude_cli"},
+    )
+
+    assert rows[0]["behavioral_role"] == "generic"
+    assert seen["receipt"] == receipt
+    assert seen["card"][toolchain_authority.RECEIPT_CARD_KEY] == receipt
+    assert seen["commands"] == ["python -m pytest -q"]
+
+
+def test_process_manager_finalization_uses_complete_toolchain_receipt_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _open_gates(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "out").mkdir()
+    (repo / "out" / "result.json").write_text("parent", encoding="utf-8")
+
+    request_id = "receiptfinalization000000000001"
+    card = _card()
+    card["validation"] = [f"{sys.executable} -m compileall -q ."]
+    card["required_outputs"] = ["out/result.json"]
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(lambda: card),
+        collision_guard=_collision,
+        adapter_builder=_plan([sys.executable, "-c", "pass"], repo),
+        isolation_enabled=False,
+    )
+
+    def append_event_nochmod(path: Path, event: dict[str, object], **_kwargs):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.open("a", encoding="utf-8").write(
+            json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+        )
+        return dict(event)
+
+    monkeypatch.setattr(
+        process_launcher.process_event_ledger,
+        "append_event",
+        append_event_nochmod,
+    )
+    preflight = manager._preflight_card(
+        card["task_id"],
+        card["runner"],
+        card["topic"],
+        "claude_cli",
+        reserved_request_id=request_id,
+    )
+    card.update({
+        "status": "processing",
+        "worker_status": "claimed",
+        "claimed_by": card["runner"],
+        "launch_request_id": request_id,
+        "claim_epoch": 1,
+    })
+
+    workspace_dir = tmp_path / "worktree"
+    (workspace_dir / "out").mkdir(parents=True)
+    worked_file = workspace_dir / "out" / "result.json"
+    worked_file.write_text("worker", encoding="utf-8")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=request_id,
+        repo=repo,
+        path=workspace_dir,
+        home=home,
+        allowed_writes=("out/result.json",),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    stdout_path = tmp_path / f"{request_id}.stdout.log"
+    stderr_path = tmp_path / f"{request_id}.stderr.log"
+    status_path = tmp_path / f"{request_id}.supervisor.json"
+    metadata_path = tmp_path / f"{request_id}.request.json"
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+    status_path.write_text(
+        json.dumps({"state": "exited", "exit_code": 0}),
+        encoding="utf-8",
+    )
+    metadata = {
+        **preflight,
+        "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
+        "request_id": request_id,
+        "task_id": card["task_id"],
+        "runner": card["runner"],
+        "topic": card["topic"],
+        "claim_epoch": 1,
+        "adapter_id": "claude_cli",
+        "model": "claude_cli",
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "supervisor_status_path": str(status_path),
+        "cancel_path": str(tmp_path / f"{request_id}.cancel.json"),
+        "prompt_sha256": "0" * 64,
+        "project_context": None,
+        "project_context_delivery": {"injected": False},
+        "sandbox_backend": "landlock",
+        "validation_roles": [],
+        "work_kind": "code",
+        "allow_empty_required_outputs": [],
+        "allow_unchanged_required_outputs": [],
+        "external_readonly_dirs": [],
+        "workspace": workspace.as_metadata(),
+    }
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": card["task_id"],
+        "runner": card["runner"],
+        "topic": card["topic"],
+        "adapter_id": "claude_cli",
+        "model": "claude_cli",
+        "state": "running",
+        "pid": 999_999_999,
+        "pid_start_ticks": 1,
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+    })
+
+    checks: list[str] = []
+
+    def fake_run_validations(target, commands, **kwargs):
+        assert target.as_metadata() == workspace.as_metadata()
+        receipt = kwargs["toolchain_authority_receipt"]
+        signed_card = kwargs["toolchain_authority_card"]
+        toolchain_authority.verify_authority_receipt(receipt, repo, signed_card)
+        with pytest.raises(
+            ValueError,
+            match="validation_toolchain_authority_receipt_card_identity_mismatch",
+        ):
+            toolchain_authority.verify_authority_receipt(
+                receipt,
+                repo,
+                {"request_id": signed_card["request_id"], "validation": list(commands)},
+            )
+        replay = dict(signed_card)
+        replay["request_id"] = "receiptfinalization000000000002"
+        with pytest.raises(
+            ValueError,
+            match="validation_toolchain_authority_receipt_request_id_mismatch",
+        ):
+            toolchain_authority.verify_authority_receipt(receipt, repo, replay)
+        checks.append("verified")
+        return [{"command": list(commands)[0], "returncode": 0}]
+
+    monkeypatch.setattr(process_launcher, "run_validations", fake_run_validations)
+    monkeypatch.setattr(
+        process_launcher,
+        "_validation_route_kwargs",
+        lambda _metadata: {"backend": "landlock"},
+    )
+    monkeypatch.setattr(
+        process_launcher.quality_evidence,
+        "run_completion_quality_gate",
+        lambda *_args, **_kwargs: {
+            "schema_id": "aiworkhub.completion_quality_gate.v1",
+            "applicable": True,
+            "passed": True,
+            "checks": [],
+            "blocking_checks": [],
+        },
+    )
+    monkeypatch.setattr(
+        process_launcher.quality_evidence,
+        "normalize_behavioral_contract",
+        lambda work_kind, commands, roles: ("code", ["gate"]),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "enforce_scope",
+        lambda *_args, **_kwargs: ["out/result.json"],
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_run_full_snapshot_validations",
+        lambda workspace_arg, authority, route_metadata, _paths: (
+            process_launcher._run_declared_validations(
+                workspace_arg, authority, route_metadata
+            ),
+            {},
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_review_terminal_exact",
+        lambda *_args, **_kwargs: {"ok": True, "returncode": 0, "stdout": "{}"},
+    )
+    monkeypatch.setattr(
+        manager,
+        "_persist_attempt_artifacts",
+        lambda *args, **kwargs: {
+            "schema_id": "aiworkhub.attempt_artifact_manifest.v1",
+            "request_id": request_id,
+            "digest": "a" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        manager,
+        "_canonical_outcome_evidence",
+        lambda *args, **kwargs: {
+            "schema_id": "aiworkhub.evidence_record.v1",
+            "reference": "attempt:a" + ("a" * 63),
+            "evidence_level": "tested",
+        },
+    )
+    monkeypatch.setattr(
+        manager,
+        "_request_lock",
+        lambda *_args, **_kwargs: process_launcher.nullcontext(),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_read_supervisor_status",
+        lambda _path: {"state": "exited", "exit_code": 0},
+    )
+
+    event = manager._finalize_isolated_request(request_id, supervisor_returncode=0)
+
+    assert checks == ["verified"], event
+    assert event["state"] == "review_ready"
 
 
 @pytest.mark.parametrize(

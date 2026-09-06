@@ -605,6 +605,119 @@ def test_already_recovered_missing_predecessor_can_be_clean_root_authorized(
     }
 
 
+def _unusable_rework_predecessor(repo: Path) -> tuple[dict, Path]:
+    request_id = "c" * 32
+    workspace = (
+        repo / ".aiworkhub" / "runtime" / "worktrees" / request_id / "worktree"
+    )
+    relative = "src/aiworkhub/storage_retention.py"
+    candidate = workspace / relative
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"def broken(:\n")
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    return (
+        {
+            "request_id": request_id,
+            "changed_path_hashes": {relative: digest},
+            "workspace": {
+                "request_id": request_id,
+                "repo": str(repo),
+                "path": str(workspace),
+                "home": str(workspace.parent / "home"),
+                "allowed_writes": [relative],
+            },
+        },
+        candidate,
+    )
+
+
+def test_pending_parse_broken_predecessor_can_explicitly_use_clean_root(
+    tmp_path: Path,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    predecessor, _candidate = _unusable_rework_predecessor(repo)
+    task_id = "CLEAN_ROOT_UNUSABLE_PREDECESSOR"
+    reason = (
+        "vscode_lm_initial_source_graph_prefetch_failed:"
+        "rework_overlay_extract_failed:"
+        "src/aiworkhub/storage_retention.py:parse_error_fail_closed"
+    )
+    _insert_blocked_task(
+        repo,
+        task_id,
+        reject_review_reason="Reconstruct the invalid retained candidate",
+        extra_card={
+            "rework_predecessor": predecessor,
+            "operational_blocker": {"kind": "launch_blocked", "reason": reason},
+        },
+    )
+    _readiness, db_path = task_store._require_ready(repo)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE tasks SET status='pending', worker_status='unclaimed' "
+            "WHERE task_id=?",
+            (task_id,),
+        )
+
+    ok, state = task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason="Reconstruct on the clean canonical root",
+        clean_root_if_predecessor_missing=True,
+    )
+
+    assert (ok, state) == (True, "recovered_clean_root")
+    task = _get_card(repo, task_id)
+    assert "rework_predecessor" not in task
+    assert task["recovery_mode"] == "clean_root_unusable_predecessor"
+    authorization = task["clean_root_recovery_authorization"]
+    assert authorization["unusable_path"] == "src/aiworkhub/storage_retention.py"
+    assert authorization["unusable_reason"] == reason
+    assert "operational_blocker" not in task
+
+
+def test_pending_parse_broken_predecessor_clean_root_rejects_hash_mismatch(
+    tmp_path: Path,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    predecessor, candidate = _unusable_rework_predecessor(repo)
+    task_id = "CLEAN_ROOT_UNUSABLE_TAMPERED"
+    _insert_blocked_task(
+        repo,
+        task_id,
+        reject_review_reason="Reconstruct the invalid retained candidate",
+        extra_card={
+            "rework_predecessor": predecessor,
+            "operational_blocker": {
+                "kind": "launch_blocked",
+                "reason": (
+                    "vscode_lm_initial_source_graph_prefetch_failed:"
+                    "rework_overlay_extract_failed:"
+                    "src/aiworkhub/storage_retention.py:parse_error_fail_closed"
+                ),
+            },
+        },
+    )
+    _readiness, db_path = task_store._require_ready(repo)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE tasks SET status='pending', worker_status='unclaimed' "
+            "WHERE task_id=?",
+            (task_id,),
+        )
+    candidate.write_bytes(b"def differently_broken(:\n")
+
+    assert task_store.recover_blocked_rework(
+        repo,
+        task_id,
+        actor="coordinator",
+        feedback_reason="Reconstruct on the clean canonical root",
+        clean_root_if_predecessor_missing=True,
+    ) == (False, "clean_root_rework_candidate_hash_mismatch")
+    assert "rework_predecessor" in _get_card(repo, task_id)
+
+
 def test_clean_root_recovery_is_incompatible_with_validation_only_replay(
     tmp_path: Path,
 ) -> None:

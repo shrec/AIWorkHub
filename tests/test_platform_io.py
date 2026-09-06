@@ -962,12 +962,126 @@ def test_identity_bound_replace_fails_closed_on_unsupported_platform(
     destination = tmp_path / "canonical"
     source.write_bytes(b"new")
     destination.write_bytes(b"prior")
+    # A host that is neither Linux nor macOS has no descriptor-bound namespace
+    # operation this module can guarantee, so publication must fail closed.
     monkeypatch.setattr(platform_io, "is_linux", lambda _name=None: False)
+    monkeypatch.setattr(platform_io, "is_macos", lambda _name=None: False)
 
     with pytest.raises(platform_io.IdentityBoundPublicationError) as raised:
         platform_io.identity_bound_durable_atomic_replace(source, destination)
 
     assert raised.value.errno == errno.ENOTSUP
+    assert destination.read_bytes() == b"prior"
+    assert source.read_bytes() == b"new"
+
+
+def _force_macos_publication_branch(monkeypatch):
+    """Drive the macOS staging-link branch on any POSIX host with linkat.
+
+    The macOS branch relies only on portable ``linkat``/``renameat``/``fstatat``
+    semantics that Linux also provides, so its control flow and identity
+    re-verification are exercisable here. Native macOS filesystem behaviour
+    still requires the macOS qualification job for final proof.
+    """
+
+    monkeypatch.setattr(platform_io, "is_linux", lambda _name=None: False)
+    monkeypatch.setattr(platform_io, "is_macos", lambda _name=None: True)
+
+
+def test_identity_bound_replace_publishes_verified_identity_on_macos_branch(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "canonical"
+    source.write_bytes(b"verified")
+    destination.write_bytes(b"prior")
+    _force_macos_publication_branch(monkeypatch)
+
+    platform_io.identity_bound_durable_atomic_replace(source, destination)
+
+    assert destination.read_bytes() == b"verified"
+    assert not source.exists()
+    assert list(tmp_path.glob(".canonical.publish-*")) == []
+
+
+def test_macos_branch_closes_only_valid_publication_descriptors(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "canonical"
+    source.write_bytes(b"verified")
+    destination.write_bytes(b"prior")
+    _force_macos_publication_branch(monkeypatch)
+    real_close = os.close
+    closed: list[int] = []
+
+    def close_valid_fd(fd):
+        assert fd >= 0
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(platform_io.os, "close", close_valid_fd)
+
+    platform_io.identity_bound_durable_atomic_replace(source, destination)
+
+    assert destination.read_bytes() == b"verified"
+    assert not source.exists()
+    assert len(closed) == 4
+
+
+def test_macos_branch_rejects_source_substitution_at_staging_link(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.tmp"
+    original = tmp_path / "original.saved"
+    destination = tmp_path / "canonical"
+    source.write_bytes(b"verified")
+    destination.write_bytes(b"prior")
+    _force_macos_publication_branch(monkeypatch)
+    real_link = os.link
+    swapped = False
+
+    def swap_before_link(src, dst, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            # Substitute the source path after it was verified but before the
+            # staging link binds it: the linked inode must no longer match.
+            os.replace(source, original)
+            source.write_bytes(b"substitute")
+        return real_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(platform_io.os, "link", swap_before_link)
+
+    with pytest.raises(
+        platform_io.IdentityBoundPublicationError,
+        match="publication_source_identity_changed",
+    ):
+        platform_io.identity_bound_durable_atomic_replace(source, destination)
+
+    assert swapped
+    assert destination.read_bytes() == b"prior"
+    assert original.read_bytes() == b"verified"
+    assert list(tmp_path.glob(".canonical.publish-*")) == []
+
+
+def test_macos_branch_fails_closed_on_cross_device_staging(tmp_path, monkeypatch):
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "canonical"
+    source.write_bytes(b"new")
+    destination.write_bytes(b"prior")
+    _force_macos_publication_branch(monkeypatch)
+
+    def cross_device_link(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(platform_io.os, "link", cross_device_link)
+
+    with pytest.raises(platform_io.IdentityBoundPublicationError) as raised:
+        platform_io.identity_bound_durable_atomic_replace(source, destination)
+
+    assert raised.value.errno == errno.ENOTSUP
+    assert raised.value.published is False
     assert destination.read_bytes() == b"prior"
     assert source.read_bytes() == b"new"
 
@@ -1514,3 +1628,26 @@ def test_windows_module_import_and_process_branches_do_not_require_killpg(monkey
     ]
     assert not imported.probe_process_group(42, platform_name="linux")
     assert not imported.terminate_process_tree(42, platform_name="linux")
+
+
+def test_signal_process_group_uses_exact_posix_group_signal(monkeypatch):
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        platform_io.os,
+        "killpg",
+        lambda pgid, sig: calls.append((pgid, sig)),
+        raising=False,
+    )
+
+    platform_io.signal_process_group(42, graceful=True)
+    platform_io.signal_process_group(42, graceful=False)
+
+    assert calls == [
+        (42, platform_io.signal.SIGTERM),
+        (42, platform_io._POSIX_SIGKILL),
+    ]
+
+
+def test_pipe_write_end_probe_fails_closed_on_windows(monkeypatch):
+    monkeypatch.setattr(platform_io.sys, "platform", "win32")
+    assert platform_io.pipe_write_end_still_open(()) is True

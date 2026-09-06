@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.10.95 — 2026-09-06
+
+### Fixed
+
+- Bound dashboard snapshots and automatically quarantine/purge expired terminal
+  worktrees through authenticated, single-flight retention.
+- Use canonical platform process/file authorities across Source Graph,
+  reconciliation and retention paths.
+- Resolve project tools once through the repository registry and validate the
+  complete coordinator snapshot instead of an incomplete sparse tree.
+- Preserve the exact evidence-bearing terminal event for validation-only replay.
+
 ## 0.10.93 — 2026-09-05
 
 ### Fixed

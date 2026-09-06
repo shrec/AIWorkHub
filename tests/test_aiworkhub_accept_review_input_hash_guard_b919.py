@@ -261,12 +261,14 @@ class _FakeWorkspace:
         path: Path,
         home: Path,
         allowed_writes: object = (),
+        base_oid: str = "0" * 40,
     ) -> None:
         self.repo = repo
         self.request_id = request_id
         self.path = path
         self.home = home
         self.allowed_writes = list(allowed_writes or ())
+        self.base_oid = base_oid
 
     @classmethod
     def from_metadata(cls, payload: dict) -> "_FakeWorkspace":
@@ -276,6 +278,7 @@ class _FakeWorkspace:
             path=Path(payload["path"]),
             home=Path(payload["home"]),
             allowed_writes=payload.get("allowed_writes", ()),
+            base_oid=str(payload.get("base_oid") or "0" * 40),
         )
 
     def as_metadata(self) -> dict:
@@ -285,6 +288,7 @@ class _FakeWorkspace:
             "path": str(self.path),
             "home": str(self.home),
             "allowed_writes": list(self.allowed_writes),
+            "base_oid": self.base_oid,
         }
 
 

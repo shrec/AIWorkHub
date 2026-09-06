@@ -167,6 +167,7 @@ def test_purge_requires_expired_manifest_and_explicit_confirmation(retained) -> 
     manifest_path = batch / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["restore_deadline"] = "2000-01-01T00:00:00+00:00"
+    manifest.pop("deadline_authentication", None)
     storage_retention._atomic_json(manifest_path, manifest)
 
     with pytest.raises(storage_retention.StorageRetentionError, match="explicit_confirmation_required"):
