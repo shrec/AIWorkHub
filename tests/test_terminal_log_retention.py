@@ -290,6 +290,31 @@ def test_terminal_log_quarantine_restore_and_explicit_purge_gate(tmp_path: Path)
     assert (process_root / f"{request_id}.stdout.log").is_file()
 
 
+def test_terminal_log_quarantine_accepts_zero_byte_stream(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    for index in range(11):
+        _run(repo, f"{index + 1:032x}", "TASK_DONE")
+    preview = terminal_log_retention.preview(repo)
+    request_id = preview["candidates"][0]["request_id"]
+    process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
+    empty_stream = process_root / f"{request_id}.stderr.log"
+    empty_stream.write_bytes(b"")
+
+    preview = terminal_log_retention.preview(repo)
+    moved = terminal_log_retention.quarantine(
+        repo, preview_digest=preview["preview_digest"], confirm=True
+    )
+
+    assert moved["quarantined"] == 44
+    assert not empty_stream.exists()
+    batch = (
+        repo
+        / terminal_log_retention.QUARANTINE_RELATIVE_PATH
+        / moved["batch_id"]
+    )
+    assert (batch / request_id / empty_stream.name).is_file()
+
+
 def test_enforce_purges_expired_batch_beyond_bounded_ui_window(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     quarantine = repo / terminal_log_retention.QUARANTINE_RELATIVE_PATH

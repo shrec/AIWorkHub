@@ -830,7 +830,15 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
                 break
             source = process_root / name
             info = _owned_regular_file(source, process_root)
-            if info is None or int(info.st_size) != int(expected.get("size_bytes") or -1) or int(info.st_mtime_ns) != int(expected.get("mtime_ns") or -1):
+            expected_size = expected.get("size_bytes")
+            expected_mtime_ns = expected.get("mtime_ns")
+            if (
+                info is None
+                or expected_size is None
+                or expected_mtime_ns is None
+                or int(info.st_size) != int(expected_size)
+                or int(info.st_mtime_ns) != int(expected_mtime_ns)
+            ):
                 complete = False
                 break
         if not complete:
