@@ -3031,10 +3031,16 @@ def aiworkhub_storage_recover_stranded_worktrees(
 
 
 def _enforce_terminal_retention_safely(root: Path) -> None:
-    """Apply retention without ever crashing or polluting MCP stdio startup."""
+    """Schedule retention without racing another MCP process's cleanup lane."""
 
     try:
-        terminal_log_retention.enforce(root)
+        from . import storage_retention
+
+        # Every editor/client owns a separate stdio MCP process. Running terminal
+        # retention directly here let all of them move the same backlog at once.
+        # The repository cleanup scheduler uses the cross-process platform lock
+        # and now includes terminal logs, so startup joins that single authority.
+        storage_retention.schedule_repository_cleanup(root)
     except Exception:
         # Retention remains observable through its preview/audit surfaces and
         # can be retried on the next startup.  A cleanup failure must never
