@@ -539,6 +539,21 @@ def test_version_probe_publishes_hosted_python_base_prefix(
     assert captured["identity_root"] == runtime.resolve()
 
 
+def test_version_probe_uses_authoritative_current_interpreter_fact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        worker_workspace.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("current interpreter must not be reprobed"),
+    )
+
+    expected = sys.version_info
+    assert worker_workspace.trusted_validation_executable_version(sys.executable) == (
+        f"Python {expected.major}.{expected.minor}.{expected.micro}"
+    )
+
+
 def test_bubblewrap_identity_root_keeps_runtime_at_original_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -3746,8 +3746,15 @@ def trusted_validation_executable_version(resolved: str) -> str:
     """Read ``--version`` through the validation sandbox boundary."""
     try:
         executable = Path(resolved).resolve(strict=True)
+        running_interpreter = Path(sys.executable).resolve(strict=True)
+    except OSError:
+        return ""
+    if executable == running_interpreter:
+        version = sys.version_info
+        return f"Python {version.major}.{version.minor}.{version.micro}"
+    try:
         backend = select_sandbox_backend()
-    except (OSError, WorkspaceError):
+    except WorkspaceError:
         return ""
     if backend == VSCODE_LM_IN_PROCESS_BACKEND:
         return ""
