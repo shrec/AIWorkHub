@@ -38,10 +38,20 @@ def in_process_builds_for_monkeypatches(monkeypatch):
 
 
 @pytest.fixture
-def cleanup_daemons():
-    """Stop every daemon this test registered, even on failure."""
+def cleanup_daemons(monkeypatch):
+    """Stop every daemon this test starts, including unregistered instances."""
     roots: list[Path] = []
+    daemons: list[source_graph_daemon.SourceGraphDaemon] = []
+    original_start = source_graph_daemon.SourceGraphDaemon.start
+
+    def start_and_track(daemon):
+        daemons.append(daemon)
+        return original_start(daemon)
+
+    monkeypatch.setattr(source_graph_daemon.SourceGraphDaemon, "start", start_and_track)
     yield roots
+    for daemon in reversed(daemons):
+        daemon.stop()
     for root in roots:
         source_graph_daemon.stop_daemon(root)
 

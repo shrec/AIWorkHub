@@ -13,6 +13,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _TOOL_ROOT = Path(__file__).resolve().parents[1]
 _SRC = _TOOL_ROOT / "src"
 if str(_SRC) not in sys.path:
@@ -22,9 +24,17 @@ from aiworkhub import (  # noqa: E402
     dashboard_mcp_app,
     repository_bootstrap,
     source_graph,
+    source_graph_daemon,
     storage_registry,
     task_store,
 )
+
+
+@pytest.fixture(autouse=True)
+def cleanup_source_graph_daemon(tmp_path):
+    """Repository initialization must not leak its background indexer."""
+    yield
+    source_graph_daemon.stop_daemon(tmp_path)
 
 
 def test_canonicalize_workspace_root_uses_only_resolve(tmp_path) -> None:
