@@ -53,7 +53,11 @@ KEEP_LAST_PER_TASK = 0
 # Compatibility constant for callers/tests.  Writers rotate at 48 MiB and the
 # reader streams every immutable segment, so this is no longer a failure cap.
 MAX_LEDGER_BYTES = 64 * 1024 * 1024
-MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+# Recovery may legitimately batch thousands of old request records after an
+# upgrade fixes a previously-blocked retention class.  The canonical repository
+# currently needs ~2.1 MiB for that one-time backlog, so keep a bounded 8 MiB
+# envelope while steady-state automatic batches remain tiny.
+MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 DEFAULT_PREVIEW_LIMIT = 50
 MAX_PREVIEW_LIMIT = 200
 # Directory a launcher writes one per-request validation/attempt bundle into,
@@ -801,7 +805,13 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
         ),
     }
     manifest_path = batch / MANIFEST_NAME
-    _atomic_json(manifest_path, manifest)
+    try:
+        _atomic_json(manifest_path, manifest)
+    except Exception:
+        # The batch is still empty at this point. Never strand an unlisted empty
+        # directory when even the initial durable manifest cannot be created.
+        batch.rmdir()
+        raise
     process_root = root / PROCESS_FILES_RELATIVE_PATH
     moved_files = 0
     moved_bytes = 0
