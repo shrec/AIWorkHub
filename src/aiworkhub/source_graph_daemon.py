@@ -1288,15 +1288,42 @@ class SourceGraphDaemon:
         )
         owner_token = uuid.uuid4().hex
         child_env[BUILD_OWNER_ENV] = owner_token
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=child_env,
-            **self._new_process_group_popen_kwargs(),
-        )
+        launch_command = command
+        popen_kwargs = self._new_process_group_popen_kwargs()
+        gate_read: int | None = None
+        gate_write: int | None = None
+        if _cross_instance_identity_supported():
+            gate_read, gate_write = os.pipe()
+            launch_command = [
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys\n"
+                    "fd=int(sys.argv[1]); token=os.read(fd,1); os.close(fd)\n"
+                    "if token != b'1': raise SystemExit(75)\n"
+                    "os.execvpe(sys.argv[2],sys.argv[2:],os.environ)\n"
+                ),
+                str(gate_read),
+                *command,
+            ]
+            popen_kwargs["pass_fds"] = (gate_read,)
+        try:
+            process = subprocess.Popen(
+                launch_command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=child_env,
+                **popen_kwargs,
+            )
+        except BaseException:
+            if gate_write is not None:
+                os.close(gate_write)
+            raise
+        finally:
+            if gate_read is not None:
+                os.close(gate_read)
         # A session/group-leader's pgid equals its pid. Capture that exact
         # owned identity now, while the child is un-reaped, so termination can
         # never target a recycled PID's unrelated process group.
@@ -1326,6 +1353,8 @@ class SourceGraphDaemon:
                 self.repo_root, retained
             )
         except OSError as exc:
+            if gate_write is not None:
+                os.close(gate_write)
             self._terminate_build_process()
             self._drain_after_stop(process, pgid)
             with self._process_lock:
@@ -1335,14 +1364,34 @@ class SourceGraphDaemon:
                     self._build_owner_token = None
             return {"kind": "error", "error": f"index_subprocess:identity_persist:{exc}"[:500]}
         if not published_identity:
+            if gate_write is not None:
+                os.close(gate_write)
             self._terminate_build_process()
             self._drain_after_stop(process, pgid)
             with self._process_lock:
                 if self._build_process is process:
                     self._build_process = None
                     self._build_pgid = None
-                    self._build_owner_token = None
+                self._build_owner_token = None
             return {"kind": "error", "error": "index_subprocess:identity_slot_owned"}
+        if gate_write is not None:
+            try:
+                os.write(gate_write, b"1")
+            except OSError as exc:
+                self._terminate_build_process()
+                self._drain_after_stop(process, pgid)
+                _clear_build_identity_if_dead(self.repo_root, owner_token)
+                with self._process_lock:
+                    if self._build_process is process:
+                        self._build_process = None
+                        self._build_pgid = None
+                        self._build_owner_token = None
+                return {
+                    "kind": "error",
+                    "error": f"index_subprocess:start_gate:{exc}"[:500],
+                }
+            finally:
+                os.close(gate_write)
         try:
             while True:
                 try:
