@@ -1022,6 +1022,34 @@ class TestNormalizePacketFindings:
 
         assert result[0]["replacement"] == replacement
 
+    def test_stdlib_symbol_follows_relative_star_reexport_without_importing(
+        self, monkeypatch
+    ):
+        trees = {
+            "sample": quality_reviewer.ast.parse("from ._local import *\n"),
+            "sample._local": quality_reviewer.ast.parse(
+                "class Capability:\n    pass\n"
+            ),
+        }
+        monkeypatch.setattr(
+            quality_reviewer,
+            "_stdlib_python_tree",
+            lambda module: trees.get(module),
+        )
+        monkeypatch.setattr(
+            quality_reviewer,
+            "_platform_module_spec",
+            lambda module: importlib.machinery.ModuleSpec(
+                module,
+                loader=None,
+                is_package=module == "sample",
+            ),
+        )
+
+        assert quality_reviewer._stdlib_python_module_defines(
+            "sample", "Capability"
+        )
+
     @pytest.mark.parametrize("replacement", ["math.isfinite", "str.removeprefix"])
     def test_handrolled_platform_replacement_accepts_without_typeshed(
         self, monkeypatch, replacement

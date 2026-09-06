@@ -1434,23 +1434,24 @@ def _typeshed_tree(module: str) -> ast.Module | None:
         return None
 
 
+def _module_scope_nodes(nodes: list[ast.stmt]) -> Iterable[ast.stmt]:
+    for node in nodes:
+        yield node
+        if isinstance(node, ast.If | ast.Try):
+            yield from _module_scope_nodes(list(node.body))
+            yield from _module_scope_nodes(list(node.orelse))
+            if isinstance(node, ast.Try):
+                for handler in node.handlers:
+                    yield from _module_scope_nodes(list(handler.body))
+
+
 def _module_tree_defines(
     tree: ast.Module | None, symbol: str, *, depth: int = 0
 ) -> bool:
     if tree is None or depth > 4:
         return False
 
-    def nodes_to_scan(nodes: list[ast.stmt]) -> Iterable[ast.stmt]:
-        for node in nodes:
-            yield node
-            if isinstance(node, ast.If | ast.Try):
-                yield from nodes_to_scan(list(node.body))
-                yield from nodes_to_scan(list(node.orelse))
-                if isinstance(node, ast.Try):
-                    for handler in node.handlers:
-                        yield from nodes_to_scan(list(handler.body))
-
-    for node in nodes_to_scan(tree.body):
+    for node in _module_scope_nodes(tree.body):
         if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
             if node.name == symbol:
                 return True
@@ -1600,8 +1601,53 @@ def _platform_module_class_has_attr(module: str, class_name: str, symbol: str) -
     )
 
 
-def _stdlib_python_module_defines(module: str, symbol: str) -> bool:
-    return _module_tree_defines(_stdlib_python_tree(module), symbol)
+def _stdlib_python_module_defines(
+    module: str,
+    symbol: str,
+    *,
+    depth: int = 0,
+    seen: frozenset[str] = frozenset(),
+) -> bool:
+    """Resolve a stdlib definition through bounded, non-executing re-exports."""
+
+    if depth > 4 or module in seen:
+        return False
+    tree = _stdlib_python_tree(module)
+    if tree is None:
+        return False
+    if _module_tree_defines(tree, symbol):
+        return True
+
+    spec = _platform_module_spec(module)
+    package = (
+        module
+        if spec is not None and spec.submodule_search_locations is not None
+        else module.rpartition(".")[0]
+    )
+    next_seen = seen | {module}
+    for node in _module_scope_nodes(tree.body):
+        if not isinstance(node, ast.ImportFrom) or not any(
+            alias.name == "*" for alias in node.names
+        ):
+            continue
+        if node.level:
+            if not package:
+                continue
+            relative_name = "." * node.level + (node.module or "")
+            try:
+                target = importlib.util.resolve_name(relative_name, package)
+            except (ImportError, ValueError):
+                continue
+        else:
+            target = node.module or ""
+        if target and _stdlib_python_module_defines(
+            target,
+            symbol,
+            depth=depth + 1,
+            seen=next_seen,
+        ):
+            return True
+    return False
 
 
 def _stdlib_alias_target(module: str, symbol: str) -> str | None:
