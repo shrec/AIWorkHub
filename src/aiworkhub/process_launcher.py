@@ -326,8 +326,7 @@ EXTERNAL_READONLY_ROOTS: tuple[Path, ...] = (
 )
 PROCESS_LOG_ENV = "AIWORKHUB_PROCESS_LOG_PATH"
 PROCESS_DIR_ENV = "AIWORKHUB_PROCESS_DIR"
-# Repository-local, non-durable runtime tree (never the historical
-# any package-install/monorepo log path): .aiworkhub/runtime/process_logs/.
+# Repository-local, non-durable runtime tree: .aiworkhub/runtime/process_logs/.
 PROCESS_LOG_DEFAULT_REL = Path(".aiworkhub/runtime/process_logs/process_events.jsonl")
 PROCESS_DIR_DEFAULT_REL = Path(".aiworkhub/runtime/process_logs/processes")
 DEFAULT_MAX_PROCESSES = 4
