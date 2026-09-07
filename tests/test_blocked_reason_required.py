@@ -142,3 +142,97 @@ def test_launch_failed_preserves_a_real_reason(tmp_path, monkeypatch):
     assert ok is True
     card = task_store.get_task(repo, "TASK_NAMED") or {}
     assert card["blocker_reason"] == "adapter binary missing"
+
+
+# --- the writer that was NOT covered -------------------------------------- #
+#
+# Audit A6 (2026-09-06): 15 of 147 blocked cards over 30 days carried no blocker
+# reason at all, and 14 of those 15 were MANAGER REJECTIONS. Every writer in
+# ``task_store`` routes its reason through ``blocker_reason_or_named_gap`` and is
+# pinned above -- but ``core.reject_review`` reaches ``blocked`` through a
+# hand-built card update of its own, and simply never wrote the field. The
+# reason was never missing: the manager typed it, and it was recorded in
+# ``review_feedback`` and in the event payload while the field an operator reads
+# stayed empty. That is the bypass; these are the tests that close it.
+
+
+import os  # noqa: E402
+import stat  # noqa: E402
+
+import pytest  # noqa: E402
+
+from aiworkhub import core  # noqa: E402
+
+
+@pytest.fixture
+def coordinated_repo(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, monkeypatch)
+    token = tmp_path / "coordinator.token"
+    token.write_text("coord-token\n", encoding="utf-8")
+    os.chmod(token, stat.S_IRUSR | stat.S_IWUSR)
+    monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN_FILE", str(token))
+    monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN", "coord-token")
+    return repo
+
+
+def _insert_review(repo: Path, task_id: str) -> None:
+    readiness = task_store.storage_readiness(repo)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        conn.execute(
+            "INSERT INTO tasks (task_id, runner, topic, mode, status, worker_status, "
+            "priority, objective, card_json, created_at, updated_at, claimed_by) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id, RUNNER, TOPIC, "solo", "review", "review", "normal",
+             "objective", json.dumps({"task_id": task_id, "runner": RUNNER}),
+             NOW, NOW, RUNNER),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_manager_rejection_to_blocked_records_the_managers_own_reason(coordinated_repo):
+    _insert_review(coordinated_repo, "TASK_REJECTED")
+
+    result = core.reject_review(
+        "TASK_REJECTED", "candidate reverts the NF-622 invariant", to="blocked",
+    )
+    assert result["ok"] is True, result
+
+    card = task_store.get_task(coordinated_repo, "TASK_REJECTED") or {}
+    assert card["status"] == "blocked"
+    reason = card["blocker_reason"]
+    assert reason, "a manager-blocked card must never carry an empty blocker reason"
+    assert reason == "candidate reverts the NF-622 invariant"
+    assert card["blocked_at"]
+    assert card["blocked_by"]
+
+
+def test_manager_rejection_with_no_reason_still_names_the_path(coordinated_repo):
+    """Fail closed the same way every other writer does."""
+    _insert_review(coordinated_repo, "TASK_REJECTED_MUTE")
+
+    result = core.reject_review("TASK_REJECTED_MUTE", "   ", to="blocked")
+    assert result["ok"] is True, result
+
+    card = task_store.get_task(coordinated_repo, "TASK_REJECTED_MUTE") or {}
+    reason = card["blocker_reason"]
+    assert reason
+    # A card with no terminal evidence of its own establishes no category, and
+    # ``inconclusive`` would be exactly the mute placeholder the boundary test
+    # above forbids -- so the named gap identifies this path instead.
+    assert reason == "cause_undetermined:reject_review"
+    assert reason not in {"blocked", "inconclusive", "unknown"}
+
+
+def test_rejection_to_pending_stays_unblocked(coordinated_repo):
+    """The requeue path must not acquire a blocker stamp."""
+    _insert_review(coordinated_repo, "TASK_REQUEUED")
+
+    result = core.reject_review("TASK_REQUEUED", "rework this", to="pending")
+    assert result["ok"] is True, result
+
+    card = task_store.get_task(coordinated_repo, "TASK_REQUEUED") or {}
+    assert card["status"] == "pending"
+    assert not card.get("blocker_reason")

@@ -1029,3 +1029,572 @@ def terminal_event_authority(
     else:
         safe_error = safe_error_text(state=state, exit_code=exit_code, error=error)
     return {**verdict, "error": safe_error}
+
+
+# --------------------------------------------------------------------------- #
+# FAILURE DISPOSITION -- transient / credential / defect (R4, NF-2026-00646).
+#
+# THE PROBLEM. Every terminal reason above answers "what happened". None answers
+# "may this be tried again", so a provider at capacity, an expired credential
+# and a genuinely broken card all end identically at ``blocked`` with a bare
+# ``exit_code=1``. Measured on this repository: 40 of 147 blocked cards over 30
+# days died on exactly that string, and one of them burned 190.8M tokens and
+# $46.07 before its credential expired at the END of the run -- with the
+# finished work then thrown away by the ``launch_failed`` cleanup path.
+#
+# THE RULE. A disposition is only ever read off something the provider or this
+# repository ASSERTED: a typed field in the provider's own terminal envelope, an
+# HTTP status it returned, a refusal kind ``runtime_adapters`` already named, or
+# a control-plane constant AIWorkHub minted about its own refusal. Nothing here
+# matches prose. ``_SIGNATURES`` above is deliberately NOT an input: it is a
+# heuristic scan whose last entry matches the bare word ``error``, and a
+# heuristic that can call a defect "transient" retries a broken card until its
+# budget is spent. Where the evidence names no class the answer is ``unknown``,
+# which behaves exactly as today.
+#
+# FAIL-CLOSED, PER CLASS -- the direction is NOT the same for all three, because
+# the cost of being wrong is not the same:
+#
+#   transient  PROVEN ONLY, strictest. A wrong ``transient`` re-runs a real
+#              defect for its whole retry budget and hides the diagnosis, so
+#              only a provider-asserted retryable status or an already-named
+#              recoverable refusal kind may set it. Unproven is never transient.
+#              (Note this is the OPPOSITE direction from
+#              ``dependency_autolaunch.TRANSIENT_DENIAL_REASONS`` and
+#              ``task_reconciler.classify_lock_failure``, where unproven means
+#              transient: a denied launch has not spent anything yet, so
+#              retrying it is nearly free, while a terminal failure has already
+#              consumed a whole card cycle.)
+#   credential PROVEN ONLY, but a WIDER evidence set is admitted, because being
+#              wrong here is cheap and reversible: the lane pauses and the owner
+#              is told, the card is left holding its work, and nothing is
+#              retried or destroyed. Missing a credential failure is what costs
+#              $46.07; calling one falsely costs one operator message.
+#   defect     PROVEN ONLY. Only AIWorkHub's OWN validator/scope refusals -- the
+#              constants this repository mints to say the declared work did not
+#              happen -- earn it. A defect is never inferred from a provider
+#              message, and never from an exit code alone.
+#   unknown    everything else, including a bare 401/403 whose body names no
+#              cause (NF-2026-00326: a dead key, an expired token and a rate
+#              condition are indistinguishable from that status). Behaves as
+#              today, and records that the cause was not established rather than
+#              pretending one was.
+#
+# NO BYTE OF PROVIDER TEXT SURVIVES. ``provider_terminal_signal`` parses typed
+# JSON and returns THIS module's own constants plus a bounded int status; an
+# unrecognised machine code becomes ``unrecognized``. The module docstring's
+# no-copy invariant therefore holds here exactly as it does for diagnostics.
+# --------------------------------------------------------------------------- #
+
+FAILURE_CLASS_TRANSIENT = "transient"
+FAILURE_CLASS_CREDENTIAL = "credential"
+FAILURE_CLASS_DEFECT = "defect"
+FAILURE_CLASS_UNKNOWN = "unknown"
+
+FAILURE_CLASSES: frozenset[str] = frozenset({
+    FAILURE_CLASS_TRANSIENT,
+    FAILURE_CLASS_CREDENTIAL,
+    FAILURE_CLASS_DEFECT,
+    FAILURE_CLASS_UNKNOWN,
+})
+
+# ``runtime_adapters``' refusal-kind vocabulary, plus the one kind
+# ``process_launcher._provider_model_rejection_from_output`` mints. Named here
+# rather than imported for the same reason ``_PROVIDER_REFUSAL_REASONS`` is;
+# ``test_refusal_kind_vocabulary_matches_runtime_adapters`` is the drift proof.
+PROVIDER_REFUSAL_KINDS: tuple[str, ...] = (
+    "session_limit", "quota_exhausted", "balance_exhausted", "rate_limited",
+    "credential_rejected", "provider_unavailable", "cause_not_distinguished",
+    "model_not_found",
+)
+
+# Every refusal kind, classified by reading what raises it, never its name.
+#
+# ``session_limit``/``quota_exhausted``/``rate_limited`` are exactly
+# ``runtime_adapters._RECOVERABLE_REFUSALS`` -- the provider itself reports a
+# reset window for them. ``provider_unavailable`` is a 5xx upstream outage.
+# ``balance_exhausted`` is an HTTP 402 dead account: only added credit clears
+# it, never elapsed time, so it is emphatically NOT transient -- it needs the
+# owner, which is what ``credential`` means here. ``credential_rejected`` needs
+# a new credential. ``cause_not_distinguished`` is the honest verdict for a
+# bare 401/403 and must stay unplaced. ``model_not_found`` is the route being
+# unusable for this account rather than the card being wrong: the work is
+# retried, and R1's ``workforce_catalog`` circuit is what makes the retry land
+# on a different route instead of the same wall.
+REFUSAL_KIND_DISPOSITION: dict[str, str] = {
+    "session_limit": FAILURE_CLASS_TRANSIENT,
+    "quota_exhausted": FAILURE_CLASS_TRANSIENT,
+    "rate_limited": FAILURE_CLASS_TRANSIENT,
+    "provider_unavailable": FAILURE_CLASS_TRANSIENT,
+    "model_not_found": FAILURE_CLASS_TRANSIENT,
+    "balance_exhausted": FAILURE_CLASS_CREDENTIAL,
+    "credential_rejected": FAILURE_CLASS_CREDENTIAL,
+    "cause_not_distinguished": FAILURE_CLASS_UNKNOWN,
+}
+
+# HTTP statuses the PROVIDER returned in its own terminal envelope.
+# 408/425/429 and the 5xx family are retryable by the specification that
+# defines them. 402 PAYMENT REQUIRED is an account condition. 401/403 name no
+# cause on their own and stay unplaced (NF-2026-00326). 400/404/409 are listed
+# so that a status which reaches this table can never fall through unnoticed --
+# they are unplaced on purpose, and only a machine CODE can place them.
+PROVIDER_STATUS_DISPOSITION: dict[int, str] = {
+    408: FAILURE_CLASS_TRANSIENT,
+    425: FAILURE_CLASS_TRANSIENT,
+    429: FAILURE_CLASS_TRANSIENT,
+    500: FAILURE_CLASS_TRANSIENT,
+    502: FAILURE_CLASS_TRANSIENT,
+    503: FAILURE_CLASS_TRANSIENT,
+    504: FAILURE_CLASS_TRANSIENT,
+    529: FAILURE_CLASS_TRANSIENT,
+    402: FAILURE_CLASS_CREDENTIAL,
+    400: FAILURE_CLASS_UNKNOWN,
+    401: FAILURE_CLASS_UNKNOWN,
+    403: FAILURE_CLASS_UNKNOWN,
+    404: FAILURE_CLASS_UNKNOWN,
+    409: FAILURE_CLASS_UNKNOWN,
+}
+
+# Machine error codes carried in a typed field of a provider terminal envelope
+# -- never prose. The OAuth block is RFC 6749 section 5.2: a token endpoint
+# answers with an ``error`` member drawn from a fixed enumeration, and the four
+# listed there each mean the credential this lane holds will not be accepted
+# again without operator action. That is a machine field of a standard
+# response, which is why it is admitted where a message never would be.
+PROVIDER_CODE_DISPOSITION: dict[str, str] = {
+    # model/route
+    "model_not_found": FAILURE_CLASS_TRANSIENT,
+    "model_not_supported": FAILURE_CLASS_TRANSIENT,
+    "model_not_available": FAILURE_CLASS_TRANSIENT,
+    "unknown_model": FAILURE_CLASS_TRANSIENT,
+    # provider-side load
+    "overloaded_error": FAILURE_CLASS_TRANSIENT,
+    "rate_limit_error": FAILURE_CLASS_TRANSIENT,
+    # credential / account
+    "authentication_failed": FAILURE_CLASS_CREDENTIAL,
+    "invalid_api_key": FAILURE_CLASS_CREDENTIAL,
+    "insufficient_balance": FAILURE_CLASS_CREDENTIAL,
+    # RFC 6749 5.2 token-endpoint error codes
+    "invalid_grant": FAILURE_CLASS_CREDENTIAL,
+    "invalid_client": FAILURE_CLASS_CREDENTIAL,
+    "unauthorized_client": FAILURE_CLASS_CREDENTIAL,
+    "invalid_token": FAILURE_CLASS_CREDENTIAL,
+    "expired_token": FAILURE_CLASS_CREDENTIAL,
+    # named, and deliberately unplaced: each is an envelope label rather than a
+    # cause, so it must never on its own decide that a card may be retried.
+    "api_error": FAILURE_CLASS_UNKNOWN,
+    "invalid_request_error": FAILURE_CLASS_UNKNOWN,
+    "not_found_error": FAILURE_CLASS_UNKNOWN,
+    "permission_error": FAILURE_CLASS_UNKNOWN,
+    "unauthorized": FAILURE_CLASS_UNKNOWN,
+}
+
+# The typed envelope labels that prove the PROVIDER (not the worker, not this
+# repository) terminated the attempt. One of these must be present before any
+# status or code is allowed to place a card.
+_PROVIDER_TERMINAL_ENVELOPES: tuple[str, ...] = (
+    "result_api_error", "api_retry", "provider_error", "turn_failed",
+)
+
+# The two stream events a CLI writes ABOUT A FAILED REQUEST rather than about
+# model output. Only these may have a nested provider body read out of their
+# ``message``: an ``assistant`` line's message is the MODEL's own content, and
+# unwrapping one would let any worker mint any provider body simply by printing
+# it -- the forgery ``test_worker_prose_cannot_forge_a_route_failure`` pins.
+PROVIDER_OWNED_MESSAGE_TYPES: frozenset[str] = frozenset({"error", "turn.failed"})
+_PROVIDER_OWNED_MESSAGE_TYPES = PROVIDER_OWNED_MESSAGE_TYPES
+
+_NO_PROVIDER_ENVELOPE = "no_provider_terminal_envelope"
+_ENVELOPE_NAMES_NO_CLASS = "envelope_names_no_class"
+
+# Bounds on the transient parse. A log tail is untrusted input, so the scan is
+# capped in both dimensions rather than trusting the caller to have bounded it.
+_MAX_SIGNAL_LINES = 400
+_MAX_EMBEDDED_BYTES = 8192
+_MAX_EMBEDDED_DEPTH = 2
+
+# Reasons THIS repository mints, placed by reading the code that raises each.
+#
+# DEFECT is the narrow one on purpose. Only a refusal AIWorkHub itself issued
+# after inspecting the attempt earns it: the mandatory-output validator saying
+# the declared outputs did not change, the scope enforcer rejecting the diff,
+# the declared validation failing. Those are this repository's own findings
+# about the work, which is the only evidence that can honestly say "this work
+# is wrong" rather than "something went wrong near it".
+_DEFECT_REASONS: frozenset[str] = frozenset({
+    "required_output_unchanged_parent_mismatch",
+    "required_output_unchanged",
+    "required_output_zero_bytes",
+    "required_output_symlink",
+    "required_output_no_matches",
+    "required_output_missing",
+    "required_output_invalid",
+    "required_output_mismatch",
+    "scope_rejected",
+    "validation_failed",
+})
+
+# The one control-plane reason whose own definition states it is retryable:
+# ``terminal_failure_transition_conflict`` is a losing race against another
+# terminal writer, and ``TERMINAL_FAILURE_RECLAIM_REFUSAL_STATES`` in
+# ``task_store`` exists because a later pass settles it.
+_TRANSIENT_REASONS: frozenset[str] = frozenset({
+    "terminal_failure_transition_conflict",
+})
+
+# ``claude_auth.RUNTIME_AUTH_FAILURE_REASON``: the subscription-session circuit
+# has decided this credential must be renewed before the route can run again.
+# This is the reason on the card that spent 190.8M tokens and $46.07.
+_CREDENTIAL_REASONS: frozenset[str] = frozenset({
+    "claude_subscription_session_refresh_required",
+})
+
+
+def _provider_refused_disposition() -> dict[str, str]:
+    """Derive every ``provider_refused_<kind>[_suffix]`` reason from the KIND table.
+
+    Deriving rather than restating is what keeps the compound reason vocabulary
+    and ``REFUSAL_KIND_DISPOSITION`` from ever disagreeing about the same kind.
+    The recoverability suffixes describe whether the provider reported a reset
+    window; they never change WHICH cause was named, so they never change the
+    class.
+    """
+    placed: dict[str, str] = {}
+    for reason in _PROVIDER_REFUSAL_REASONS:
+        if not reason.startswith("provider_refused_"):
+            continue
+        tail = reason[len("provider_refused_") :]
+        for kind, kind_class in REFUSAL_KIND_DISPOSITION.items():
+            if tail == kind or tail.startswith(kind + "_"):
+                if kind_class != FAILURE_CLASS_UNKNOWN:
+                    placed[reason] = kind_class
+                break
+    return placed
+
+
+REASON_DISPOSITION: dict[str, str] = {
+    **{reason: FAILURE_CLASS_DEFECT for reason in _DEFECT_REASONS},
+    **{reason: FAILURE_CLASS_TRANSIENT for reason in _TRANSIENT_REASONS},
+    **{reason: FAILURE_CLASS_CREDENTIAL for reason in _CREDENTIAL_REASONS},
+    **_provider_refused_disposition(),
+}
+
+# Reasons deliberately left unplaced, and why they cannot be placed:
+#
+#   * every remaining control-plane reason states that the CARD ROW moved or
+#     that this finalizer could not act (``not_processing``, ``not_claimed``,
+#     ``claim_ownership_lost``, ``finalizer_retries_exhausted``, ...). None of
+#     them says anything about the work or about the provider.
+#   * every terminal STATE name is an envelope label. ``worker_failed`` is the
+#     exact string this whole card exists because it means nothing.
+#   * every ``_SIGNATURES`` code is a heuristic over untrusted prose -- see the
+#     section header for why none of them may place a card.
+#   * ``provider_refused`` and ``cause_not_distinguished_by_response`` are the
+#     classifier's own admissions that the cause was NOT distinguished.
+_DISCLAIMED_REASONS: frozenset[str] = (
+    frozenset(_CONTROL_PLANE_REASONS)
+    | frozenset(_TERMINAL_STATE_NAMES)
+    | frozenset(_LAUNCHER_MINTED_REASONS)
+    | frozenset(code for _pattern, code in _SIGNATURES)
+    | frozenset(_PROVIDER_REFUSAL_REASONS)
+    | {_UNCLASSIFIED, _UNRECOGNIZED}
+) - frozenset(REASON_DISPOSITION)
+
+
+def unclassified_reason_constants() -> tuple[str, ...]:
+    """Reason constants this taxonomy neither places nor disclaims.
+
+    Empty by construction today. A constant added to any of the vocabularies
+    above lands in neither set, so
+    ``test_every_reason_constant_is_placed_or_disclaimed`` fails on it -- the
+    same gate ``dependency_autolaunch.unclassified_denial_reasons`` provides
+    for launch denials, for the same reason: a new reason must not be able to
+    arrive silently unclassified.
+    """
+    return tuple(sorted(
+        token
+        for token in _REASON_CONSTANTS
+        if token not in REASON_DISPOSITION and token not in _DISCLAIMED_REASONS
+    ))
+
+
+def _embedded_objects(text: object, depth: int) -> list[dict[str, Any]]:
+    """Return JSON objects a provider nested INSIDE a message string.
+
+    The Codex CLI forwards the upstream provider's own error body as a quoted
+    JSON string in ``message`` rather than as an object -- measured on the 13
+    byte-identical ``gpt-5.4`` failures, whose outer line carries no status at
+    all while the nested body carries ``status: 400`` and
+    ``error.type: invalid_request_error``. Reading only the outer line loses
+    every typed field the provider actually sent.
+
+    Bounded on all three axes (depth, byte length, one object per string) and
+    parsed, never pattern-matched: a string that is not JSON yields nothing.
+    """
+    if depth > _MAX_EMBEDDED_DEPTH or not isinstance(text, str):
+        return []
+    if not text or len(text) > _MAX_EMBEDDED_BYTES:
+        return []
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return []
+    try:
+        obj = json.loads(text[start : end + 1])
+    except (TypeError, ValueError):
+        return []
+    return [obj] if isinstance(obj, dict) else []
+
+
+def embedded_provider_objects(text: object) -> list[dict[str, Any]]:
+    """Public entry to :func:`_embedded_objects` for one un-nested message.
+
+    ``process_launcher``'s provider-boundary detectors read the same streams
+    this module reads, so the rule for "what did the provider actually send"
+    lives in ONE place. Two implementations of it would drift, and the drift
+    would show up as a route seal that matches nothing on a real log.
+    """
+    return _embedded_objects(text, 0)
+def _harvest_provider_event(event: object, found: dict[str, Any], depth: int = 0) -> None:
+    """Fold one typed provider event into the accumulating signal.
+
+    Only named fields are read. The first status and the first recognised code
+    win, so a nested upstream body cannot be overwritten by a later generic
+    wrapper, and no branch ever stores a slice of the event.
+    """
+    if depth > _MAX_EMBEDDED_DEPTH or not isinstance(event, dict):
+        return
+    kind = str(event.get("type") or "").strip().lower()
+    subtype = str(event.get("subtype") or "").strip().lower()
+    status = None
+    for field in ("api_error_status", "error_status", "status"):
+        candidate = event.get(field)
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            status = candidate
+            break
+    if status is not None and found["status"] is None and 100 <= status <= 599:
+        found["status"] = status
+
+    body = event.get("error")
+    message = event.get("message") if isinstance(event.get("message"), str) else ""
+    code = ""
+    if isinstance(body, str):
+        code = body.strip().lower()
+    elif isinstance(body, dict):
+        code = str(body.get("code") or body.get("type") or "").strip().lower()
+        if not message and isinstance(body.get("message"), str):
+            message = body["message"]
+        data = body.get("data")
+        if not message and isinstance(data, dict) and isinstance(data.get("message"), str):
+            message = data["message"]
+    if code and not found["code"] and code in PROVIDER_CODE_DISPOSITION:
+        # The KEY object is stored, never the parsed argument, so no provider
+        # byte can reach a durable field through this path.
+        found["code"] = next(key for key in PROVIDER_CODE_DISPOSITION if key == code)
+
+    if not found["envelope"]:
+        if (
+            kind == "result"
+            and event.get("is_error") is True
+            and str(event.get("terminal_reason") or "").strip().lower() == "api_error"
+        ):
+            found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[0]
+        elif kind == "system" and subtype == "api_retry":
+            found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[1]
+        elif kind == "error":
+            found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[2]
+        elif kind == "turn.failed":
+            found["envelope"] = _PROVIDER_TERMINAL_ENVELOPES[3]
+
+    # UNWRAP ONLY A PROVIDER-OWNED ENVELOPE'S MESSAGE.  An ``assistant`` line's
+    # ``message`` is the MODEL's own content, so unwrapping one would let a
+    # worker mint any provider body it liked simply by printing it -- exactly
+    # what ``test_worker_prose_cannot_forge_a_route_failure`` forbids, and what
+    # an unrestricted unwrap regressed. Only ``error``/``turn.failed``, the two
+    # envelopes a CLI writes about a failed request rather than about model
+    # output, carry a nested body worth reading.
+    if kind in _PROVIDER_OWNED_MESSAGE_TYPES:
+        for nested in _embedded_objects(message, depth):
+            _harvest_provider_event(nested, found, depth + 1)
+
+
+def provider_terminal_signal(text: str | None) -> dict[str, Any]:
+    """Read the PROVIDER's own typed terminal envelope out of a bounded tail.
+
+    Returns ``{"status", "code", "envelope"}`` where ``status`` is a bounded
+    int or ``None``, ``code`` is an element of ``PROVIDER_CODE_DISPOSITION`` or
+    ``""``, and ``envelope`` is an element of ``_PROVIDER_TERMINAL_ENVELOPES``
+    or ``""``. Every returned string is this module's own constant.
+
+    WHY A TAIL IS SOUND EVIDENCE. The tail is the LAST bytes of the stream, and
+    a provider CLI writes its terminal envelope last, by construction. Model
+    prose that happened to look like one of these envelopes would have to be
+    the final line of the stream to be read at all, which is the same anchor
+    ``_provider_auth_failure_from_output`` has always relied on. It is not
+    proof against a determined forger, and it is not asked to be: a forged
+    ``transient`` costs the card's bounded retry budget and nothing else, and a
+    forged ``credential`` pauses a lane and destroys no work.
+    """
+    found: dict[str, Any] = {"status": None, "code": "", "envelope": ""}
+    for index, raw_line in enumerate(str(text or "").splitlines()):
+        if index >= _MAX_SIGNAL_LINES:
+            break
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        _harvest_provider_event(event, found)
+    return found
+
+
+def disposition_for_reason(reason: str | None) -> str:
+    """Class named by a reason constant THIS repository minted, else ``unknown``.
+
+    Only a reason that parses completely as a module constant is read; a string
+    carrying anything else falls through, exactly as ``recognised_reason`` does.
+    """
+    token = str(reason or "").strip().split(":")[0]
+    return REASON_DISPOSITION.get(token, FAILURE_CLASS_UNKNOWN)
+
+
+def failure_disposition(
+    *,
+    refusal_kind: str | None = None,
+    reason: str | None = None,
+    stdout_tail: str | None = None,
+    stderr_tail: str | None = None,
+) -> dict[str, Any]:
+    """Name the class of one terminal failure, and the evidence that named it.
+
+    PRECEDENCE, and why. A refusal kind already established at the provider
+    boundary is read first: ``process_launcher`` held the provider's response
+    body when it minted that kind, which is strictly more evidence than a log
+    tail retains. A control-plane reason this repository minted is read next --
+    it states why the control plane refused, which is the reason the terminal
+    event exists at all. The provider tail is read last, and only to place what
+    the first two left unplaced.
+
+    ``evidence`` is assembled from module constants and a bounded int only.
+    """
+    kind = str(refusal_kind or "").strip().lower()
+    if kind in REFUSAL_KIND_DISPOSITION:
+        placed = REFUSAL_KIND_DISPOSITION[kind]
+        if placed != FAILURE_CLASS_UNKNOWN:
+            named = next(key for key in REFUSAL_KIND_DISPOSITION if key == kind)
+            return {
+                "failure_class": placed,
+                "evidence": f"refusal_kind={named}",
+                "provider_status": None,
+                "provider_code": "",
+                "envelope": "",
+            }
+
+    reason_class = disposition_for_reason(reason)
+    if reason_class != FAILURE_CLASS_UNKNOWN:
+        token = str(reason or "").strip().split(":")[0]
+        named = next(key for key in REASON_DISPOSITION if key == token)
+        return {
+            "failure_class": reason_class,
+            "evidence": f"control_plane_reason={named}",
+            "provider_status": None,
+            "provider_code": "",
+            "envelope": "",
+        }
+
+    for tail in (stderr_tail, stdout_tail):
+        signal = provider_terminal_signal(tail)
+        if signal["envelope"] not in _PROVIDER_TERMINAL_ENVELOPES:
+            continue
+        code = str(signal["code"])
+        status = signal["status"]
+        if PROVIDER_CODE_DISPOSITION.get(code, FAILURE_CLASS_UNKNOWN) != FAILURE_CLASS_UNKNOWN:
+            return {
+                "failure_class": PROVIDER_CODE_DISPOSITION[code],
+                "evidence": f"provider_code={code}",
+                "provider_status": status,
+                "provider_code": code,
+                "envelope": signal["envelope"],
+            }
+        placed_status = PROVIDER_STATUS_DISPOSITION.get(status, FAILURE_CLASS_UNKNOWN)
+        if placed_status != FAILURE_CLASS_UNKNOWN:
+            return {
+                "failure_class": placed_status,
+                "evidence": f"provider_status={status}",
+                "provider_status": status,
+                "provider_code": code,
+                "envelope": signal["envelope"],
+            }
+        return {
+            "failure_class": FAILURE_CLASS_UNKNOWN,
+            "evidence": f"{_ENVELOPE_NAMES_NO_CLASS}={signal['envelope']}",
+            "provider_status": status,
+            "provider_code": code,
+            "envelope": signal["envelope"],
+        }
+
+    return {
+        "failure_class": FAILURE_CLASS_UNKNOWN,
+        "evidence": _NO_PROVIDER_ENVELOPE,
+        "provider_status": None,
+        "provider_code": "",
+        "envelope": "",
+    }
+
+
+def failure_disposition_from_paths(
+    *,
+    state: str | None,
+    error: str | None = None,
+    refusal_kind: str | None = None,
+    stdout_path: str | Path | None = None,
+    stderr_path: str | Path | None = None,
+    cancelled: bool = False,
+) -> dict[str, Any]:
+    """``failure_disposition`` over the same bounded log tails the classifier reads.
+
+    A cancelled or verdict-free outcome is never dispositioned: there is no
+    failure to retry, pause a lane for, or blame on the card.
+    """
+    state_norm = str(state or "").strip().lower()
+    if cancelled or state_norm in _NO_VERDICT_STATES:
+        return {
+            "failure_class": FAILURE_CLASS_UNKNOWN,
+            "evidence": "no_failure_verdict",
+            "provider_status": None,
+            "provider_code": "",
+            "envelope": "",
+        }
+    return failure_disposition(
+        refusal_kind=refusal_kind,
+        reason=error,
+        stdout_tail=_read_log_tail(stdout_path),
+        stderr_tail=_read_log_tail(stderr_path),
+    )
+
+
+def terminal_workspace_cleanup_allowed(
+    *, terminal_state: str | None, failure_class: str | None,
+) -> bool:
+    """May the finalizer delete this attempt's worktree?
+
+    Only ``launch_failed`` ever swept a workspace, on the reasoning that a
+    launch failure means nothing ran. That reasoning holds for a launch that
+    genuinely never started and fails for the case R4 exists to fix: a
+    CREDENTIAL that expires at the END of a run flips a completed attempt onto
+    ``launch_failed``, and the sweep then deletes finished work. One measured
+    card lost 190.8M tokens and $46.07 that way.
+
+    So a credential-class outcome never sweeps, whatever state it landed on.
+    The owner has to renew a credential either way; the work must still be on
+    disk when they do. Every other combination is unchanged.
+
+    A predicate rather than an inline expression because this is exactly the
+    kind of rule that must be provable in a test without standing up a
+    supervisor, a workspace and a provider.
+    """
+    if str(terminal_state or "").strip().lower() != "launch_failed":
+        return False
+    return str(failure_class or "") != FAILURE_CLASS_CREDENTIAL

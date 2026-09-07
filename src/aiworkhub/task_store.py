@@ -34,7 +34,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -2758,6 +2758,167 @@ def mark_launch_failed(
         )
         conn.commit()
         return True, "blocked"
+
+
+# R4/NF-2026-00646.  A transient provider failure must not consume a card.
+#
+# THE BUDGET IS THE WHOLE SAFETY ARGUMENT.  ``terminal_failure_classification``
+# only ever names ``transient`` from a provider-asserted status or an already
+# named recoverable refusal kind, but no evidence rule is perfect and the cost
+# of being wrong here is a card re-run against a failure that will not clear.
+# Three attempts bounds that cost absolutely: after the third the caller falls
+# back to the ordinary terminal path and the card is blocked exactly as it is
+# today, carrying its measured attempt history.
+TRANSIENT_RETRY_BUDGET = 3
+
+# Doubling, from thirty seconds.  A provider reporting 429/503 recovers on the
+# order of seconds to minutes; the ceiling matters more than the curve, and the
+# budget already caps the total wait at four minutes.
+TRANSIENT_RETRY_BASE_SECONDS = 30
+
+
+def transient_retry_not_before(attempts: int, *, now: datetime | None = None) -> str:
+    """ISO instant before which a transiently-failed card must not be re-claimed."""
+    exponent = max(0, min(int(attempts), TRANSIENT_RETRY_BUDGET))
+    delay = TRANSIENT_RETRY_BASE_SECONDS * (2 ** exponent)
+    base = now or datetime.now(timezone.utc)
+    return (base + timedelta(seconds=delay)).isoformat()
+
+
+def mark_transient_retry(
+    root: str | Path,
+    task_id: str,
+    *,
+    runner: str,
+    reason: str,
+    request_id: str = "",
+    budget: int = TRANSIENT_RETRY_BUDGET,
+) -> tuple[bool, str]:
+    """Return a card whose attempt died on a TRANSIENT provider failure to ``pending``.
+
+    This is the one transition in this module that does not end at ``blocked``.
+    A provider at capacity, a 429, a 503, or a route this account cannot use
+    says nothing about the card, so terminalising it throws away work that the
+    next attempt would have completed -- measured as 16 of 147 blocked cards
+    over 30 days on this repository, every one a card that did nothing wrong.
+
+    Guarded exactly like ``mark_launch_failed``: the same exact-claim,
+    runner-identity and launch-request checks and the same compare-and-swap on
+    the card the caller read, so a losing concurrent finalizer can never
+    re-queue a card that another launch now owns.
+
+    Refuses with ``transient_retry_budget_exhausted`` once the card has spent
+    its budget, so the caller falls through to the ordinary terminal path
+    instead of looping.  ``reason`` must already be a bounded, sanitised
+    diagnostic; this function never sees provider text.
+    """
+    _readiness, db_path = _require_ready(root)
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
+        row = conn.execute(
+            "SELECT runner, status, worker_status, claimed_by, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_not_found"
+        if str(row["runner"] or "") != runner:
+            return False, "runner_mismatch"
+        if canonical_status(dict(row)) != "processing":
+            return False, f"not_processing:current={canonical_status(dict(row))}"
+        if str(row["worker_status"] or "") != "claimed":
+            return False, f"not_claimed:current={row['worker_status']}"
+        if str(row["claimed_by"] or "") != runner:
+            return False, "claim_owner_mismatch"
+        raw_card_json = str(row["card_json"] or "{}")
+        try:
+            card = json.loads(raw_card_json)
+        except json.JSONDecodeError:
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        attached_request_id = str(card.get("launch_request_id") or "")
+        if request_id:
+            if attached_request_id != request_id:
+                return False, "launch_request_mismatch"
+        elif attached_request_id:
+            return False, "launch_request_id_required"
+
+        try:
+            attempts = max(0, int(card.get("transient_retry_attempts") or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        if attempts >= max(0, int(budget)):
+            return False, "transient_retry_budget_exhausted"
+
+        now = datetime.now(timezone.utc).isoformat()
+        bounded_reason = blocker_reason_or_named_gap(
+            reason, path="mark_transient_retry"
+        )
+        attempts += 1
+        card.update(
+            status="pending",
+            worker_status="unclaimed",
+            claimed_by=None,
+            transient_retry_attempts=attempts,
+            transient_retry={
+                "schema_id": "aiworkhub.transient_retry.v1",
+                "attempts": attempts,
+                "budget": int(budget),
+                "reason": bounded_reason,
+                "request_id": request_id[:120],
+                "recorded_at": now,
+            },
+            retry_not_before=transient_retry_not_before(attempts),
+        )
+        # A transient outcome is not a blocked outcome.  A blocker stamp left by
+        # an earlier episode would otherwise outlive the card's return to
+        # pending and make a live card read as parked.
+        for stale in (
+            "blocker_reason", "blocked_at", "blocked_by",
+            "terminal_substatus", "terminal_failure",
+        ):
+            card.pop(stale, None)
+        cur = conn.execute(
+            "UPDATE tasks SET status='pending', worker_status='unclaimed', "
+            "claimed_by=NULL, updated_at=?, card_json=? "
+            "WHERE task_id=? AND status='processing' AND worker_status='claimed' "
+            "AND claimed_by=? AND card_json=?",
+            (
+                now,
+                json.dumps(card, ensure_ascii=False, sort_keys=True),
+                task_id,
+                runner,
+                raw_card_json,
+            ),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "transient_retry_transition_conflict"
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'transient_retry', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps(
+                    {
+                        "reason": bounded_reason,
+                        "attempts": attempts,
+                        "budget": int(budget),
+                        "request_id": request_id[:120],
+                        "transition": "processing->pending",
+                        "recorded_at": now,
+                        "runner": runner,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
+        conn.commit()
+        return True, "pending"
 
 
 # Post-launch failure substatuses this function accepts, routed to the

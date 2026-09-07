@@ -2046,12 +2046,40 @@ def _lifecycle_state(card: dict[str, Any]) -> str:
     return "pending"
 
 
+def _transient_retry_backoff_active(card: Mapping[str, Any], now: str) -> bool:
+    """True while a transiently-retried card is still inside its backoff window.
+
+    ``retry_not_before`` is written only by ``task_store.mark_transient_retry``,
+    so no card that predates R4 carries one and nothing else changes. An
+    unparsable or absent value is treated as elapsed: a malformed timestamp must
+    never be able to park a card forever, and the retry budget on the card is
+    what bounds the loop in any case.
+    """
+    raw = str(card.get("retry_not_before") or "").strip()
+    if not raw:
+        return False
+    try:
+        deadline = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    try:
+        current = datetime.fromisoformat(now)
+    except ValueError:
+        return False
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current < deadline
+
+
 def eligible_dryrun_candidates(
     rows: list[dict[str, Any]],
     runner: str,
     topic: str | None = None,
     *,
     ready_ids: set[str] | None = None,
+    now: str | None = None,
 ) -> list[dict[str, Any]]:
     """Ordered list of cards ``auto_pickup`` would consider claimable, mirroring
     the ``taskctl.cmd_auto_pickup`` predicate. Pure: no IO, no mutation.
@@ -2067,9 +2095,18 @@ def eligible_dryrun_candidates(
         does not overlap a processing/review card's, per
         ``task_plan.build_snapshot``. Cards with no ``depends_on`` and no
         overlapping writes behave identically to before this filter existed.
+      * its transient-retry backoff has elapsed (R4/NF-2026-00646). A card
+        returned to ``pending`` because the PROVIDER failed transiently is
+        genuinely claimable, just not this instant; re-claiming it inside the
+        window would spend its whole retry budget against the same 429.
+
+    ``now`` is the instant the backoff is measured against, defaulting to the
+    current UTC time. It is a parameter so this stays a pure function of its
+    inputs and a test can state the instant instead of sleeping.
 
     Order is preserved; ``auto_pickup`` claims element ``[0]``.
     """
+    current = now or datetime.now(timezone.utc).isoformat()
     out: list[dict[str, Any]] = []
     for c in rows:
         worker_status = str(c.get("worker_status", "unclaimed") or "unclaimed").strip().lower()
@@ -2082,6 +2119,8 @@ def eligible_dryrun_candidates(
         if topic is not None and c.get("topic") != topic:
             continue
         if ready_ids is not None and str(c.get("task_id")) not in ready_ids:
+            continue
+        if _transient_retry_backoff_active(c, current):
             continue
         out.append(c)
     return out
@@ -5273,7 +5312,39 @@ def reject_review(
     }
     prior_episode = task_store.begin_claim_episode(card)
     if disposition == "blocked":
-        card.update(status="blocked", worker_status="blocked")
+        # NF-2026-00307 / audit A6: this was the path through the blocked-reason
+        # requirement.  ``task_store``'s writers (``mark_launch_failed``,
+        # ``mark_terminal_failure``) all route their reason through
+        # ``blocker_reason_or_named_gap``, and
+        # ``tests/test_blocked_reason_required.py`` pins them -- but a MANAGER
+        # rejection reaches ``blocked`` here, through a hand-built card update
+        # that never wrote ``blocker_reason`` at all.  Measured on this
+        # repository: 14 of the 15 blocked cards carrying no reason whatsoever
+        # over 30 days were rejections, and every one of them HAD a reason -- the
+        # manager typed it, and it was recorded in ``review_feedback`` and in the
+        # event payload while the field an operator actually reads stayed empty.
+        # The same boundary function every other writer uses now fills it.
+        card.update(
+            status="blocked",
+            worker_status="blocked",
+            blocker_reason=task_store.blocker_reason_or_named_gap(
+                bounded_reason,
+                path="reject_review",
+                # ``inconclusive`` is the classifier's own admission that it
+                # established nothing, so it is exactly the "bare canonical
+                # name that satisfies a non-empty check while informing no
+                # one" this file's boundary test forbids.  Only a real
+                # category is worth falling back to; otherwise the named gap
+                # identifies this path, which is what an operator can act on.
+                fallback=(
+                    ""
+                    if terminal_disposition == FailureCategory.INCONCLUSIVE.value
+                    else terminal_disposition
+                ),
+            ),
+            blocked_at=now,
+            blocked_by=actor,
+        )
         set_clause = "worker_status='blocked', status='blocked', card_json=?, updated_at=?"
     else:  # "pending" -- rework, requeue for a fresh claim
         card.update(status="pending", worker_status="unclaimed", claimed_by=None)

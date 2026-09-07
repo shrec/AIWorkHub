@@ -2408,54 +2408,91 @@ def _provider_model_rejection_from_output(
         )
     for raw_line in text.splitlines():
         try:
-            event = json.loads(raw_line)
+            outer = json.loads(raw_line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict):
+        if not isinstance(outer, dict):
             continue
-        if str(event.get("type") or "").strip().lower() != "error":
-            continue
-        raw_status = event.get("status", event.get("error_status"))
-        status = (
-            raw_status
-            if isinstance(raw_status, int) and not isinstance(raw_status, bool)
-            else 0
-        )
-        if status not in _MODEL_REJECTION_STATUSES:
-            continue
-        body = event.get("error")
-        if not isinstance(body, dict):
-            continue
-        error_type = str(body.get("type") or "").strip().lower()
-        error_code = str(body.get("code") or "").strip().lower()
+        # THE ENVELOPE IS NESTED, AND READING ONLY THE OUTER LINE MATCHED
+        # NOTHING.  The Codex CLI forwards the upstream provider's own error
+        # body as a QUOTED JSON STRING inside ``message``, so the outer line
+        # carries no ``status`` and no ``error`` object at all.  Replayed
+        # against the 13 byte-identical 725-byte ``gpt-5.4`` logs this seal was
+        # written for, the outer-line-only scan returned ``None`` on every one
+        # of them: ``status: 400``, ``error.type: invalid_request_error`` and
+        # the message naming the pinned model all live in the nested body.
+        #
+        # The anti-forgery anchor is unchanged.  A candidate must still be a
+        # provider ``error`` envelope with a model-shaped type or code, and its
+        # message must still name the exact model THIS launch pinned, so worker
+        # prose still cannot mint a route failure.  The unwrapping is shared
+        # with ``terminal_failure_classification`` so the boundary detector and
+        # the disposition classifier can never disagree about what the provider
+        # sent (R4/NF-2026-00646).
+        #
+        # THE MESSAGE IS UNWRAPPED ONLY FOR A PROVIDER-OWNED ENVELOPE.  An
+        # ``assistant`` line's ``message`` is the model's own content, so
+        # unwrapping one would let a worker mint this seal by printing the body
+        # -- ``test_worker_prose_cannot_forge_a_route_failure`` states exactly
+        # that case, and an unrestricted unwrap regressed it.
+        nested: tuple[dict[str, Any], ...] = ()
         if (
-            error_type not in _MODEL_REJECTION_ERROR_TYPES
-            and error_code not in _MODEL_REJECTION_ERROR_CODES
+            str(outer.get("type") or "").strip().lower()
+            in terminal_failure_classification.PROVIDER_OWNED_MESSAGE_TYPES
         ):
-            continue
-        message = str(body.get("message") or "")
-        names_model = error_code in _MODEL_REJECTION_ERROR_CODES or model in message
-        if not names_model:
-            continue
-        sealed = {
-            "schema_id": "aiworkhub.provider_route_error.v1",
-            "owner": "provider",
-            "sealed": True,
-            "code": error_code if error_code in _MODEL_REJECTION_ERROR_CODES else "model_not_supported",
-            "http_status": status,
-            "model": model,
-            "detail": message[:300],
-        }
-        return {
-            "schema_id": "aiworkhub.provider_launch_failure.v1",
-            "reason": f"provider_route_model_unavailable:model={model}",
-            "refusal_kind": "model_not_found",
-            "recoverable": False,
-            "http_status": status,
-            "error_code": str(sealed["code"]),
-            "session_id": "",
-            "provider_error": sealed,
-        }
+            nested = tuple(
+                terminal_failure_classification.embedded_provider_objects(
+                    outer.get("message")
+                )
+            )
+        for event in (outer, *nested):
+            if str(event.get("type") or "").strip().lower() != "error":
+                continue
+            raw_status = event.get("status", event.get("error_status"))
+            status = (
+                raw_status
+                if isinstance(raw_status, int) and not isinstance(raw_status, bool)
+                else 0
+            )
+            if status not in _MODEL_REJECTION_STATUSES:
+                continue
+            body = event.get("error")
+            if not isinstance(body, dict):
+                continue
+            error_type = str(body.get("type") or "").strip().lower()
+            error_code = str(body.get("code") or "").strip().lower()
+            if (
+                error_type not in _MODEL_REJECTION_ERROR_TYPES
+                and error_code not in _MODEL_REJECTION_ERROR_CODES
+            ):
+                continue
+            message = str(body.get("message") or "")
+            names_model = error_code in _MODEL_REJECTION_ERROR_CODES or model in message
+            if not names_model:
+                continue
+            sealed = {
+                "schema_id": "aiworkhub.provider_route_error.v1",
+                "owner": "provider",
+                "sealed": True,
+                "code": (
+                    error_code
+                    if error_code in _MODEL_REJECTION_ERROR_CODES
+                    else "model_not_supported"
+                ),
+                "http_status": status,
+                "model": model,
+                "detail": message[:300],
+            }
+            return {
+                "schema_id": "aiworkhub.provider_launch_failure.v1",
+                "reason": f"provider_route_model_unavailable:model={model}",
+                "refusal_kind": "model_not_found",
+                "recoverable": False,
+                "http_status": status,
+                "error_code": str(sealed["code"]),
+                "session_id": "",
+                "provider_error": sealed,
+            }
     return None
 
 
@@ -11185,6 +11222,29 @@ class ProcessManager:
             ):
                 claude_auth.clear_runtime_auth_failure()
 
+            # R4/NF-2026-00646.  WHAT KIND of failure this is -- transient,
+            # credential, defect -- decided only from what the provider or this
+            # repository ASSERTED (a typed field, an HTTP status, a refusal kind
+            # already established at the boundary above, a control-plane
+            # constant).  ``unknown`` is the honest and by far the commonest
+            # answer, and it behaves exactly as this path always has.
+            #
+            # The refusal kind is read from ``provider_launch_failure`` because
+            # that detector held the provider's whole response body; a log tail
+            # read later is strictly weaker evidence about the same event.
+            terminal_disposition = terminal_failure_classification.failure_disposition_from_paths(
+                state=terminal_state,
+                error=error,
+                refusal_kind=(
+                    str(provider_launch_failure.get("refusal_kind") or "")
+                    if isinstance(provider_launch_failure, dict)
+                    else ""
+                ),
+                stdout_path=metadata.get("stdout_path"),
+                stderr_path=metadata.get("stderr_path"),
+            )
+            failure_class = str(terminal_disposition["failure_class"])
+
             # NF-2026-00622 V7 rework (temporal-drift fix): terminal_state/
             # error/exit_code can still change below (validation_failed,
             # finalize_failed, review_transition_failed -> review_pending,
@@ -11263,12 +11323,81 @@ class ProcessManager:
                     # A worker that timed out, crashed, or was cancelled produced
                     # no review work: keep its worktree, close it in the blocked
                     # terminal bucket so the review queue remains truthful.
-                    cleanup = terminal_state == "launch_failed"
+                    #
+                    # R4/NF-2026-00646 -- THE ONE LINE THAT COST $46.07.
+                    # ``launch_failed`` is the operational landing for "nothing
+                    # ran", so it cleans the worktree up, which is right when
+                    # nothing ran and catastrophic when a CREDENTIAL expired at
+                    # the END of a run that had already done the work.  Measured
+                    # on this repository: one card, 190.8M tokens, $46.07, its
+                    # entire delta deleted because the Claude subscription
+                    # session lapsed on the last call and the launch-failure
+                    # branch then swept the workspace.  A credential-class
+                    # outcome keeps its workspace, always: the owner has to fix
+                    # a credential either way, and the finished work must still
+                    # be there when they do.
+                    cleanup = terminal_failure_classification.terminal_workspace_cleanup_allowed(
+                        terminal_state=terminal_state, failure_class=failure_class,
+                    )
                     # A non-exited terminal outcome never promotes/writes, so it
                     # never needs the one-task authority grant -- remove it now so
                     # it cannot linger as a stale artifact past this dead request.
                     unlink_if_regular(self._terminal_authority_grant_path(request_id))
-                    if terminal_state == "launch_failed":
+                    transient_requeued = False
+                    if (
+                        failure_class
+                        == terminal_failure_classification.FAILURE_CLASS_TRANSIENT
+                    ):
+                        # The PROVIDER failed, not the card: a 429, a 5xx, a
+                        # route this account cannot use.  Terminalising it
+                        # spends a whole card cycle on a condition that clears
+                        # by itself, so the card goes back to ``pending`` with
+                        # its workspace intact and a bounded retry budget.  The
+                        # store refuses once that budget is spent, and the
+                        # ordinary terminal path below then runs unchanged --
+                        # so a misclassified transient can cost at most
+                        # ``TRANSIENT_RETRY_BUDGET`` attempts, never a loop.
+                        #
+                        # Called on the store directly rather than through
+                        # ``task_engine``: this transition is not terminal and
+                        # owes the manager no callback, because there is no
+                        # decision to make about a card that is back in the
+                        # queue.
+                        transient_requeued, transient_state = (
+                            task_store.mark_transient_retry(
+                                self.repo,
+                                str(metadata["task_id"]),
+                                runner=str(metadata["runner"]),
+                                reason=_settle_terminal_failure_authority()["error"],
+                                request_id=request_id,
+                            )
+                        )
+                        if transient_requeued:
+                            cleanup = False
+                            release_result = {
+                                "ok": True,
+                                "returncode": 0,
+                                "command": ["transient-retry", str(metadata["task_id"])],
+                                "stdout": json.dumps(
+                                    {
+                                        "task_id": str(metadata["task_id"]),
+                                        "status": transient_state,
+                                        "failure_class": failure_class,
+                                        "evidence": str(
+                                            terminal_disposition["evidence"]
+                                        ),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                "stderr": "",
+                                "callback_enqueued": False,
+                            }
+                    if transient_requeued:
+                        # The card is back in the queue with its workspace kept:
+                        # there is no terminal transition to make, no terminal
+                        # evidence to record, and no manager decision owed.
+                        pass
+                    elif terminal_state == "launch_failed":
                         release_result = task_engine.mark_launch_failed(
                             self.repo,
                             str(metadata["task_id"]),
@@ -11281,6 +11410,17 @@ class ProcessManager:
                             "request_id": request_id,
                             "adapter_id": metadata.get("adapter_id"),
                             "model": metadata.get("model"),
+                            # R4/NF-2026-00646: the class this failure was
+                            # placed in, and the exact evidence that placed it.
+                            # Both are module constants, so this is durable
+                            # without being another untrusted string channel --
+                            # and an operator can finally tell "the provider
+                            # hiccuped" from "this work is wrong" on the card
+                            # itself instead of from a bare exit code.
+                            "failure_class": failure_class,
+                            "failure_class_evidence": str(
+                                terminal_disposition["evidence"]
+                            ),
                             # The sealed, provider-owned error object, when one
                             # was read at the boundary.  It is what
                             # ``workforce_catalog._route_failure_kind`` trusts,
