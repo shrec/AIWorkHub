@@ -12,6 +12,7 @@ routes happen to resolve on the machine running the suite.
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,40 +57,62 @@ def test_editor_family_reviewer_submit_is_unknown_never_supported() -> None:
     )
 
 
-def test_editor_family_packet_read_is_measured_unsupported_with_exact_reason() -> None:
-    """The one editor-family capability that WAS measured, and is negative.
+def test_editor_family_packet_read_is_measured_supported_from_the_bridge() -> None:
+    """The one editor-family capability measured against real code, now positive.
 
-    ``aiworkhub_worker_quality_review_packet_read`` is absent from the bridge
-    dispatch allowlist, so it falls through to ``worker_bridge_tool_not_allowed``.
+    It was measured and NEGATIVE for about an hour:
+    ``aiworkhub_worker_quality_review_packet_read`` was absent from the bridge
+    dispatch allowlist and fell through to ``worker_bridge_tool_not_allowed``,
+    so a reviewer handed a file-transport packet could not read its own
+    evidence. a86934d added the dispatch, and this record follows the code.
+
+    The state is asserted here; that it still MATCHES the allowlist is asserted
+    by ``test_declared_code_path_claims_match_the_bridge_allowlist``, which
+    derives the allowlist rather than restating it. This test alone would rot
+    exactly as its predecessor did.
     """
 
     record = contracts.capability_record(
         _EDITOR_FAMILY, contracts.CAPABILITY_REVIEWER_PACKET_READ
     )
-    assert record.state == contracts.CAPABILITY_UNSUPPORTED
+    assert record.state == contracts.CAPABILITY_SUPPORTED
     assert record.evidence_class == contracts.EVIDENCE_DECLARED_FROM_CODE_PATH
-    assert record.reason == contracts.REASON_BRIDGE_TOOL_NOT_ALLOWED
     assert "process_launcher.py" in record.evidence
 
 
 def test_unsupported_and_unknown_are_distinguishable_not_collapsed() -> None:
     """"Measured and negative" and "never measured" are different facts.
 
-    Collapsing them into one boolean is what made a bridge fact readable as a
-    round-trip fact in the first place; they call for different fixes.
+    Collapsing them into one boolean is what let a bridge fact read as a
+    round-trip fact in the first place; they call for different fixes, so the
+    model must keep them apart and the fail-closed reader must refuse both.
+
+    Asserted against constructed records on purpose. The previous version of
+    this test reached for whichever live capability happened to be negative
+    that day, and went red when the code was FIXED -- a test that fails on good
+    news is testing the wrong thing. This is a property of the state model, and
+    it holds whether or not any route is currently unsupported.
     """
 
-    measured_negative = contracts.capability_record(
-        _EDITOR_FAMILY, contracts.CAPABILITY_REVIEWER_PACKET_READ
+    measured_negative = contracts._record(
+        contracts.CAPABILITY_REVIEWER_PACKET_READ,
+        contracts.CAPABILITY_UNSUPPORTED,
+        contracts.EVIDENCE_DECLARED_FROM_CODE_PATH,
+        evidence="src/aiworkhub/process_launcher.py:1-2",
+        reason=contracts.REASON_BRIDGE_TOOL_NOT_ALLOWED,
     )
     never_measured = contracts.capability_record(
         _EDITOR_FAMILY, contracts.CAPABILITY_REVIEWER_SUBMIT
     )
+    assert never_measured.state == contracts.CAPABILITY_UNKNOWN
     assert measured_negative.state != never_measured.state
-    # Both are refused by the fail-closed reader all the same.
+    # Different facts, and the reader refuses both all the same.
     assert measured_negative.state != contracts.CAPABILITY_SUPPORTED
     assert never_measured.state != contracts.CAPABILITY_SUPPORTED
-
+    # The negative one carries an actionable reason; the unmeasured one says
+    # only that nothing was observed. That difference is the point.
+    assert measured_negative.reason == contracts.REASON_BRIDGE_TOOL_NOT_ALLOWED
+    assert never_measured.reason == contracts.REASON_NO_OBSERVED_ROUND_TRIP
 
 def test_undeclared_capability_on_declared_family_is_unknown() -> None:
     """Silence in a contract is unknown, never an inherited yes."""
@@ -364,3 +387,91 @@ def test_observability_carries_capabilities_beside_reachability(
         submit = entry["capabilities"][contracts.CAPABILITY_REVIEWER_SUBMIT]
         assert submit["state"] == contracts.CAPABILITY_UNKNOWN
         assert submit["reason"] == contracts.REASON_NO_OBSERVED_ROUND_TRIP
+
+
+def _bridge_dispatch_evidence() -> tuple[Path, int, int]:
+    """Split ``_EDITOR_BRIDGE_DISPATCH`` into the file and lines it cites."""
+
+    path_text, _, span = contracts._EDITOR_BRIDGE_DISPATCH.partition(":")
+    first, _, last = span.partition("-")
+    root = Path(__file__).resolve().parents[1]
+    return root / path_text, int(first), int(last)
+
+
+def _dispatched_worker_tools(source_path: Path) -> tuple[set[str], dict[str, int]]:
+    """Every tool name the bridge dispatches, read from the source itself.
+
+    Derived, never restated. The registry claims a fact ABOUT this dispatch
+    chain, so the claim has to be checked against the chain rather than against
+    a second hand-written copy of it -- a hand-written copy is what rotted.
+    """
+
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "invoke_vscode_lm_worker_tool":
+            break
+    else:  # pragma: no cover - the method is the subject of the test
+        raise AssertionError("invoke_vscode_lm_worker_tool not found in the cited file")
+
+    names: set[str] = set()
+    lines: dict[str, int] = {}
+    for inner in ast.walk(node):
+        if not isinstance(inner, ast.Compare) or len(inner.comparators) != 1:
+            continue
+        left, right = inner.left, inner.comparators[0]
+        if not (isinstance(left, ast.Name) and left.id == "tool_name"):
+            continue
+        if not (isinstance(right, ast.Constant) and isinstance(right.value, str)):
+            continue
+        names.add(right.value)
+        lines.setdefault(right.value, inner.lineno)
+    return names, lines
+
+
+def test_declared_code_path_claims_match_the_bridge_allowlist():
+    """A ``declared_from_code_path`` claim must be re-derivable from that path.
+
+    This record was ``unsupported`` and became false within the hour, when
+    ``aiworkhub_worker_quality_review_packet_read`` was added to the bridge
+    allowlist (a86934d). Nothing failed: the registry restated a fact about a
+    code path, and no test tied the restatement to the path. That is the
+    silent-rot hazard of the entire evidence class, so it is closed here by
+    deriving the allowlist from the source instead of trusting the comment.
+    """
+
+    source_path, first_line, last_line = _bridge_dispatch_evidence()
+    assert source_path.is_file(), f"cited evidence file is missing: {source_path}"
+    dispatched, at_line = _dispatched_worker_tools(source_path)
+
+    packet_read = "aiworkhub_worker_quality_review_packet_read"
+    record = contracts.capability_record(
+        runtime_adapters.ROUTE_FAMILY_EDITOR_VSCODE_LM,
+        contracts.CAPABILITY_REVIEWER_PACKET_READ,
+    )
+    assert record.evidence_class == contracts.EVIDENCE_DECLARED_FROM_CODE_PATH
+
+    # The claim and the code path must agree in BOTH directions: supported iff
+    # dispatched. Either half alone would let the pair drift again.
+    expected = (
+        contracts.CAPABILITY_SUPPORTED
+        if packet_read in dispatched
+        else contracts.CAPABILITY_UNSUPPORTED
+    )
+    assert record.state == expected, (
+        f"registry says {record.state!r} for {packet_read}, but the bridge "
+        f"{'dispatches' if packet_read in dispatched else 'refuses'} it"
+    )
+
+    # The citation must point at the code it claims to describe; a range that
+    # no longer brackets the dispatch is a stale citation even when the state
+    # happens to be right.
+    if packet_read in dispatched:
+        assert first_line <= at_line[packet_read] <= last_line, (
+            f"{packet_read} is dispatched at line {at_line[packet_read]}, outside "
+            f"the cited range {first_line}-{last_line}"
+        )
+
+    # The submit comment on the same contract asserts a dispatcher fact too:
+    # that the bridge DOES carry submit, which is why its state is unknown for
+    # a different reason rather than unsupported for this one.
+    assert "aiworkhub_worker_quality_review_submit" in dispatched

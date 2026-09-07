@@ -212,18 +212,23 @@ _EDITOR_VSCODE_LM_CONTRACT = RouteContract(
     last_verification=VERIFICATION_NEVER_RUN,
     capabilities=MappingProxyType(
         {
-            # MEASURED AND NEGATIVE.  ``aiworkhub_worker_quality_review_packet_read``
-            # is absent from the bridge dispatch allowlist, so it falls through to
-            # ``worker_bridge_tool_not_allowed``.  When a review packet is large
-            # enough to use file transport the reviewer is told to call exactly
-            # that tool before reviewing (quality_reviewer.py:578-582), so on this
-            # family it cannot read its own evidence.
+            # MEASURED AND POSITIVE, as of a86934d.  The bridge dispatch
+            # allowlist now carries ``aiworkhub_worker_quality_review_packet_read``,
+            # so a reviewer on this family can read the file-transport packet
+            # its own prompt tells it to fetch (quality_reviewer.py:578-582).
+            #
+            # This record was ``unsupported`` for about an hour and became
+            # false the moment that allowlist changed, which is the standing
+            # hazard of the whole EVIDENCE_DECLARED_FROM_CODE_PATH class: a
+            # claim ABOUT a code path, restated by hand, drifts silently when
+            # that path moves.  ``test_declared_code_path_claims_match_the_bridge
+            # _allowlist`` derives the allowlist from the source and fails on
+            # divergence, so this record cannot rot again without a red test.
             CAPABILITY_REVIEWER_PACKET_READ: _record(
                 CAPABILITY_REVIEWER_PACKET_READ,
-                CAPABILITY_UNSUPPORTED,
+                CAPABILITY_SUPPORTED,
                 EVIDENCE_DECLARED_FROM_CODE_PATH,
                 evidence=_EDITOR_BRIDGE_DISPATCH,
-                reason=REASON_BRIDGE_TOOL_NOT_ALLOWED,
             ),
             # NOT MEASURED.  Note carefully what is and is not known here.
             # The bridge DOES dispatch ``aiworkhub_worker_quality_review_submit``
