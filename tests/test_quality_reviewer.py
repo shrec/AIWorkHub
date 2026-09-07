@@ -2072,3 +2072,135 @@ class TestVerifyReviewerReceipt:
                 observed_terminal_state="review_ready",
                 audit_verified=True,
             )
+
+
+class TestSchemaRepairTurn:
+    """NF-2026-00667: the one bounded correction turn, and where it can reach.
+
+    ``assemble_reviewer_prompt`` is the single prompt-assembly seam the reviewer
+    launch path uses, and it is the ONLY thing every reviewer transport shares:
+    the reviewer process is gone by ingest time, only ``prompt_sha256`` is
+    retained, and no route can continue the previous conversation. So the ask
+    rides the prompt of the next turn, which means the sighted CLI adapters and
+    the blind in-process ``vscode_lm`` bridge get exactly the same repair.
+    """
+
+    # Cut verbatim from card_json.blocker_reason on
+    # CLAUDESONNET5_QR_PONYTAIL_MINIMALITY_V1_E38_SECURITY_V7 in
+    # .aiworkhub/tasking/task_queue.sqlite, read 2026-09-07.
+    STORED_REJECTION = (
+        "review_protocol:structured_report_invalid:"
+        "review_finding_0_unknown_key:category,file,line"
+    )
+
+    def _blind_packet(self) -> dict:
+        packet = _packet_with_findings()
+        packet["candidate"]["padding"] = "x" * (100 * 1024)
+        packet["packet_sha256"] = _canonical_digest(
+            {k: v for k, v in packet.items() if k != "packet_sha256"}
+        )
+        return packet
+
+    @pytest.mark.parametrize(
+        "adapter_id,sighted", [("codex_cli", True), ("vscode_lm", False)]
+    )
+    def test_both_transports_carry_the_repair(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        adapter_id: str, sighted: bool,
+    ):
+        monkeypatch.delenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, raising=False)
+        packet = self._blind_packet()
+        path = tmp_path / "packet.json"
+        prompt = quality_review.assemble_reviewer_prompt(
+            packet, lens="correctness", adapter_id=adapter_id,
+            packet_path=str(path), packet_root=tmp_path,
+            prior_rejection=self.STORED_REJECTION,
+        )
+
+        assert prompt.startswith("SCHEMA REPAIR TURN.")
+        assert "review_finding_0_unknown_key:category,file,line" in prompt
+        assert "must be dropped, not decorated" in prompt
+        # The sighted route still uses the file transport, the blind route still
+        # gets the packet inline: the repair changes neither.
+        assert (quality_review.extract_inline_packet(prompt) == packet) is not sighted
+
+    def test_the_repair_is_first_because_the_packet_is_long(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.delenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, raising=False)
+        prompt = quality_review.assemble_reviewer_prompt(
+            self._blind_packet(), lens="correctness", adapter_id="vscode_lm",
+            packet_path=str(tmp_path / "packet.json"), packet_root=tmp_path,
+            prior_rejection=self.STORED_REJECTION,
+        )
+
+        assert prompt.index("SCHEMA REPAIR TURN.") < prompt.index(
+            "QUALITY_REVIEW_PACKET:"
+        )
+
+    @pytest.mark.parametrize(
+        "prior_rejection",
+        [
+            "",
+            "worker_failed:exit=1",
+            # DEEPSEEKV4P_QR_NF625_M2_SECURITY_V1: the provider stream failed,
+            # not the reviewer. Asking again spends a turn on a fault that will
+            # not clear.
+            "review_protocol:provider_events_oversized",
+        ],
+    )
+    def test_an_ordinary_launch_is_byte_identical(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prior_rejection: str,
+    ):
+        """A repair that fires on everything is not a repair, it is a preamble."""
+
+        monkeypatch.delenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, raising=False)
+        packet = self._blind_packet()
+        baseline = quality_review.assemble_reviewer_prompt(
+            packet, lens="correctness", adapter_id="vscode_lm",
+            packet_path=str(tmp_path / "packet.json"), packet_root=tmp_path,
+        )
+        prompt = quality_review.assemble_reviewer_prompt(
+            packet, lens="correctness", adapter_id="vscode_lm",
+            packet_path=str(tmp_path / "packet.json"), packet_root=tmp_path,
+            prior_rejection=prior_rejection,
+        )
+
+        assert prompt == baseline
+        assert "SCHEMA REPAIR TURN." not in prompt
+
+    def test_the_reviewers_own_prose_is_never_echoed_into_the_prompt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """CLAUDESONNET5_QR_NF658_V6_SECURITY_V1's reason is 500 chars of prose."""
+
+        monkeypatch.delenv(quality_reviewer.REVIEW_PACKET_FILE_ROOT_ENV, raising=False)
+        prompt = quality_review.assemble_reviewer_prompt(
+            self._blind_packet(), lens="correctness", adapter_id="vscode_lm",
+            packet_path=str(tmp_path / "packet.json"), packet_root=tmp_path,
+            prior_rejection=(
+                "review_protocol:no_report_in_final:Reported one critical "
+                "finding: the per-request audit-ledger HMAC key lives inside "
+                "the sandboxed worker's own $HOME"
+            ),
+        )
+
+        assert prompt.startswith("SCHEMA REPAIR TURN.")
+        assert "Rejected as: no_report_in_final\n" in prompt
+        assert "audit-ledger" not in prompt
+        assert "$HOME" not in prompt
+
+    def test_the_repair_never_tells_the_reviewer_what_to_conclude(self):
+        for request in (
+            quality_review_ingest.schema_repair_request(self.STORED_REJECTION),
+            quality_review_ingest.schema_repair_request(
+                "review_protocol:no_report_in_final:prose"
+            ),
+            quality_review_ingest.schema_repair_request(
+                "review_protocol:multiple_structured_finals"
+            ),
+        ):
+            assert request is not None
+            instruction = str(request["instruction"]).lower()
+            for forbidden in ("severity", "disposition", "defect", "approve", "accept"):
+                assert forbidden not in instruction, request

@@ -8221,6 +8221,20 @@ class ProcessManager:
                             str(review_packet_path) if review_packet_path is not None else None
                         ),
                         packet_root=workspace.home / "task_mcp_worker_runtime",
+                        # NF-2026-00667.  The ONE launcher-side line of the
+                        # bounded schema-repair turn.  ``core.retry_terminal_
+                        # task`` records the refusal that produced THIS launch
+                        # on the card it requeued and clears every other
+                        # terminal field, so ``terminal_retry.reason`` is
+                        # exactly "why the previous attempt at this review was
+                        # thrown away" and nothing else -- which is why the
+                        # repair is naturally one-shot and needs no new
+                        # counter. Deriving the ask stays in
+                        # ``quality_review_ingest``, the module that refused
+                        # the answer; this only hands it the reason.
+                        prior_rejection=str(
+                            (card.get("terminal_retry") or {}).get("reason") or ""
+                        ),
                     )
                     prompt_budget = {
                         "schema_id": "aiworkhub.worker_prompt_budget.v1",

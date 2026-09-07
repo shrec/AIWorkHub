@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -233,6 +234,143 @@ def _no_report_reason(result: IngestResult) -> str:
         excerpt = result.final_excerpt or "(empty final message)"
         return f"no_report_in_final:{excerpt}"
     return "no_provider_final"
+
+
+# --- NF-2026-00667: the one bounded correction turn ------------------------
+#
+# A reviewer that produced competent judgment and lost it to a SHAPE mistake is
+# the largest remaining mechanical loss on this path: 45 of 147 blocked cards
+# over 30 days, at ~453,650 input tokens per reviewer record.  The ask a repair
+# needs is small and this module is the only place that knows it, because this
+# module is what refused the answer.
+#
+# WHAT CARRIES THE ASK.  The reviewer process is gone by the time its answer is
+# ingested -- ingest runs post-exit inside the MCP server, with no stdin, no
+# session handle, and only ``prompt_sha256`` retained, so the previous
+# conversation cannot be continued on ANY transport.  What every transport does
+# carry is the reviewer PROMPT: ``quality_review.assemble_reviewer_prompt`` is
+# the single prompt-assembly seam for both the sighted CLI adapters and the
+# blind in-process ``vscode_lm`` routes.  So the repair is a fresh turn built
+# from the same packet plus this exact rejection, and it reaches every route
+# the ordinary review reaches -- no new spawn, no credential, no sandbox and no
+# write into the exited reviewer's workspace (which
+# ``_enforce_finalization_scope`` would refuse anyway).
+#
+# WHAT IT MAY SAY.  ``detail`` is only ever a reason token THIS module minted
+# (``review_finding_<n>_<code>``); provider prose is never echoed back into a
+# prompt, and the instruction text is a module constant.  The reviewer is told
+# what shape was refused, never what to conclude.
+SCHEMA_REPAIR_SCHEMA_ID = "aiworkhub.quality_review_schema_repair.v1"
+
+# ``detail`` is admitted whole, never re-split: an ``unknown_key`` reason names
+# its keys as one comma-separated tail, and splitting it dropped every key but
+# the first. The charset is what keeps provider prose out -- a canonical reason
+# token this module minted has no spaces, capitals or punctuation beyond
+# ``_``, ``,`` and ``:``, and a reviewer's own sentence fails on the first
+# space it contains.
+MAX_REPAIR_DETAIL_CHARS = 160
+
+_REPAIR_DETAIL_RE = re.compile(r"\A[a-z][a-z0-9_,:]{0,159}\Z")
+
+# One instruction per refusable shape.  Each names what was wrong and what to
+# do instead; none of them tells the reviewer what to find.
+_REPAIRABLE_INSTRUCTIONS: dict[str, str] = {
+    "no_report_in_final": (
+        "Your previous turn ended in prose and never emitted the report "
+        "object, so nothing could be recorded. Finish this turn with exactly "
+        "one bare JSON object and no text after it."
+    ),
+    "no_provider_final": (
+        "Your previous turn produced no final message at all. Finish this "
+        "turn with exactly one bare JSON object and no text after it."
+    ),
+    "malformed_structured_output": (
+        "Your previous turn's final object was not parseable as the report. "
+        "Emit one syntactically valid JSON object with exactly the keys "
+        "\"lens\" and \"findings\"."
+    ),
+    "multiple_structured_finals": (
+        "Your previous turn emitted more than one report. Emit exactly one, "
+        "in your final message only."
+    ),
+    "multiple_report_objects": (
+        "Your previous turn's final message carried more than one report "
+        "object. Emit exactly one."
+    ),
+    "lens_mismatch": (
+        "Your previous turn reported a different lens than the one you were "
+        "asked for. Set \"lens\" to the review lens named above."
+    ),
+    "structured_report_invalid": (
+        "The named finding was refused on schema grounds. Re-emit the report "
+        "with that finding corrected -- or omit it entirely if this packet "
+        "cannot evidence it."
+    ),
+}
+
+# Refused for reasons the reviewer cannot act on: the provider stream, the
+# audit ledger, or this repository's own submission path. Asking again would
+# spend a reviewer turn on a fault that is not the reviewer's and would not
+# clear.
+_UNREPAIRABLE_CATEGORIES: frozenset[str] = frozenset({
+    "provider_events_oversized",
+    "provider_events_unavailable",
+    "provider_events_unreadable",
+    "submission_count",
+    "explicit_receipt_shape_invalid",
+    "explicit_submission_conflict",
+    "internal_submission_failed",
+})
+
+
+def unclassified_protocol_categories(categories: Iterable[str]) -> tuple[str, ...]:
+    """Categories this module neither offers a repair for nor disclaims.
+
+    Empty by construction. A new ``ReviewProtocolError`` category lands in
+    neither set, so ``test_every_protocol_category_is_repairable_or_disclaimed``
+    fails on it -- the same positive control the terminal-failure taxonomy
+    keeps, and for the same reason: a new refusal must not be able to arrive
+    silently unaskable.
+    """
+    return tuple(sorted(
+        token
+        for token in {str(value).split(":")[0] for value in categories}
+        if token
+        and token not in _REPAIRABLE_INSTRUCTIONS
+        and token not in _UNREPAIRABLE_CATEGORIES
+    ))
+
+
+def schema_repair_request(reason: str | None) -> dict[str, Any] | None:
+    """Turn one durable refusal into the bounded ask for a single repair turn.
+
+    Accepts the reason exactly as it is retained on the card
+    (``review_protocol:<category>[:<detail>]``) or a bare ``exc.category``.
+    Returns ``None`` whenever nothing can honestly be asked, so a caller that
+    passes an unrelated reason -- or none -- simply builds the ordinary prompt.
+    """
+    text = str(reason or "").strip()
+    if not text:
+        return None
+    if text.startswith("review_protocol:"):
+        text = text[len("review_protocol:"):]
+    category, _, tail = text.partition(":")
+    instruction = _REPAIRABLE_INSTRUCTIONS.get(category)
+    if instruction is None:
+        return None
+    detail = tail.strip()[:MAX_REPAIR_DETAIL_CHARS]
+    if not _REPAIR_DETAIL_RE.match(detail):
+        detail = ""
+    if category == "structured_report_invalid" and not detail:
+        # Without a finding this module itself named, there is nothing exact
+        # to correct and the ask would degenerate into "try again".
+        return None
+    return {
+        "schema_id": SCHEMA_REPAIR_SCHEMA_ID,
+        "category": next(key for key in _REPAIRABLE_INSTRUCTIONS if key == category),
+        "detail": detail,
+        "instruction": instruction,
+    }
 
 
 def _normalize_review_finding_aliases(

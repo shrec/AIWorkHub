@@ -15,6 +15,7 @@ from aiworkhub import (
     core,
     process_launcher,
     task_store,
+    terminal_failure_classification,
     toolchain_authority,
     worker_workspace,
 )
@@ -41,6 +42,7 @@ def _insert_blocked(
     task_id: str,
     request_id: str,
     substatus: str,
+    failure_class: str = "",
 ) -> None:
     readiness = task_store.storage_readiness(repo)
     now = "2026-08-03T00:00:00+00:00"
@@ -61,7 +63,14 @@ def _insert_blocked(
         "blocked_by": "worker_runner",
         "terminal_failure": {
             "substatus": substatus,
-            "evidence": {"request_id": request_id, "error": f"{substatus}:exact"},
+            "evidence": {
+                "request_id": request_id,
+                "error": f"{substatus}:exact",
+                # Absent unless a test asks for one: the launcher writes this
+                # key only where the classifier actually ran, and "absent" is
+                # a different fact from any class it could have placed.
+                **({"failure_class": failure_class} if failure_class else {}),
+            },
         },
         "review_feedback": {"schema_id": "aiworkhub.rework_feedback_delta.v1"},
         "rework_predecessor": {"schema_id": "aiworkhub.rework_predecessor.v1"},
@@ -820,3 +829,126 @@ def test_reroute_launch_identity_fails_closed_on_concurrent_mutation(
     assert result["ok"] is False
     assert "reroute_transition_conflict" in result["stderr"]
     assert _row(coordinator_repo, task_id)["runner"] == "claude_sonnet-4.6"
+
+
+# Audit item #5.  The class vocabulary an unattended retry may not act on, and
+# the reason each is refused.  Read from ``terminal_failure_classification``
+# rather than restated, so a class renamed there fails this test instead of
+# silently becoming a class nothing refuses.
+_REFUSED_CLASSES = (
+    terminal_failure_classification.FAILURE_CLASS_TRANSIENT,
+    terminal_failure_classification.FAILURE_CLASS_CREDENTIAL,
+    terminal_failure_classification.FAILURE_CLASS_DEFECT,
+    terminal_failure_classification.FAILURE_CLASS_UNKNOWN,
+)
+
+
+@pytest.mark.parametrize("failure_class", _REFUSED_CLASSES)
+def test_automatic_retry_refuses_every_class_the_classifier_placed(
+    coordinator_repo: Path, failure_class: str
+) -> None:
+    task_id = f"AUTO_REFUSED_{failure_class.upper()}"
+    request_id = (failure_class[0] * 32)[:32]
+    _insert_blocked(
+        coordinator_repo,
+        task_id=task_id,
+        request_id=request_id,
+        substatus="finalize_failed",
+        failure_class=failure_class,
+    )
+
+    result = core.retry_terminal_task(
+        task_id, request_id, "finalize_failed", "reaper", automatic=True
+    )
+
+    assert result["ok"] is False, result
+    assert "terminal_retry_automatic_refused" in result["stderr"]
+    assert f"failure_class_{failure_class}" in result["stderr"]
+    assert _row(coordinator_repo, task_id)["status"] == "blocked"
+
+
+def test_automatic_retry_proceeds_when_no_classifier_ran(
+    coordinator_repo: Path,
+) -> None:
+    """An absent class is not ``unknown``.
+
+    Measured on this repository's canonical store: every reaper-minted terminal
+    failure, and all 45 blocked ``review_protocol:*`` reviewer cards, carry no
+    ``failure_class`` key at all -- the classifier never saw those outcomes.
+    Refusing on absence would refuse exactly the class of card the automatic
+    retry exists to recover.
+    """
+
+    task_id = "AUTO_NO_RECORDED_CLASS"
+    request_id = "n" * 32
+    _insert_blocked(
+        coordinator_repo,
+        task_id=task_id,
+        request_id=request_id,
+        substatus="finalize_failed",
+    )
+
+    result = core.retry_terminal_task(
+        task_id, request_id, "finalize_failed", "reaper", automatic=True
+    )
+
+    assert result["ok"] is True, result
+    assert _row(coordinator_repo, task_id)["status"] == "pending"
+
+
+def test_an_unnamed_class_is_refused_rather_than_treated_as_permission(
+    coordinator_repo: Path,
+) -> None:
+    task_id = "AUTO_UNPLACED_CLASS"
+    request_id = "u" * 32
+    _insert_blocked(
+        coordinator_repo,
+        task_id=task_id,
+        request_id=request_id,
+        substatus="finalize_failed",
+        failure_class="a_class_nobody_reasoned_about",
+    )
+
+    result = core.retry_terminal_task(
+        task_id, request_id, "finalize_failed", "reaper", automatic=True
+    )
+
+    assert result["ok"] is False, result
+    assert "failure_class_unplaced" in result["stderr"]
+    assert _row(coordinator_repo, task_id)["status"] == "blocked"
+
+
+def test_a_manager_holding_the_evidence_is_not_gated(coordinator_repo: Path) -> None:
+    """The gate is on unattended retries only, never on the manager surface.
+
+    ``aiworkhub_task_retry_terminal`` is a verified manager acting with the
+    evidence in hand; refusing it here would take away the only surface that
+    can override a classification.
+    """
+
+    task_id = "MANUAL_DEFECT_RETRY"
+    request_id = "m" * 32
+    _insert_blocked(
+        coordinator_repo,
+        task_id=task_id,
+        request_id=request_id,
+        substatus="finalize_failed",
+        failure_class=terminal_failure_classification.FAILURE_CLASS_DEFECT,
+    )
+
+    result = core.retry_terminal_task(task_id, request_id, "finalize_failed", "manual")
+
+    assert result["ok"] is True, result
+    assert _row(coordinator_repo, task_id)["status"] == "pending"
+
+
+def test_recorded_failure_class_reads_the_card_and_never_recomputes() -> None:
+    assert core.recorded_failure_class({}) == ""
+    assert core.recorded_failure_class({"terminal_failure": "not-a-mapping"}) == ""
+    assert core.recorded_failure_class({"terminal_failure": {"evidence": []}}) == ""
+    assert (
+        core.recorded_failure_class(
+            {"terminal_failure": {"evidence": {"failure_class": "defect"}}}
+        )
+        == "defect"
+    )

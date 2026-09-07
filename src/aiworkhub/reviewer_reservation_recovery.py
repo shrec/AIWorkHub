@@ -445,6 +445,27 @@ def settle_reviewer_terminal_intents(
                     # actionable review evidence. With their exact failure
                     # and callback durable above, route the same request
                     # through canonical retry so the card is claimable.
+                    #
+                    # THE TOPIC IS READ FROM THE CARD, NEVER WRITTEN AS A
+                    # LITERAL.  ``reconcile_expired_starting_reservations``
+                    # terminalizes every expired or pid-disproved reservation
+                    # in the ledger, whatever its topic; only the legacy
+                    # claim-epoch binding branch is reviewer-specific.  A
+                    # literal ``"quality_review"`` here therefore made
+                    # ``retry_terminal_task`` answer ``topic mismatch`` for
+                    # every worker card the same reaper had just blocked, the
+                    # retry was refused, this intent was never retired, and
+                    # each later pass re-derived the identical refusal --
+                    # so the card stayed blocked and waited for a manager's
+                    # MCP call.  ``current_card`` was read and proved just
+                    # above, so its topic is exact evidence about THIS work,
+                    # and passing it keeps the assertion (a card whose
+                    # identity moved under this settler is still refused).
+                    #
+                    # ``automatic=True`` because nobody is watching: the
+                    # retry additionally consults the failure class
+                    # ``terminal_failure_classification`` recorded on the
+                    # card and refuses every class another mechanism owns.
                     with core._REPOSITORY_SWITCH_LOCK:
                         prior_repo_override = core._PROCESS_REPO_ROOT_OVERRIDE
                         core._PROCESS_REPO_ROOT_OVERRIDE = manager.repo
@@ -454,7 +475,8 @@ def settle_reviewer_terminal_intents(
                                 request_id,
                                 substatus,
                                 reason=str(payload.get("blocked_reason") or ""),
-                                topic="quality_review",
+                                topic=str(current_card.get("topic") or "") or None,
+                                automatic=True,
                             )
                         finally:
                             core._PROCESS_REPO_ROOT_OVERRIDE = prior_repo_override

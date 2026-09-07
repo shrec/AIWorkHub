@@ -513,6 +513,23 @@ _ALREADY_ESTABLISHED_MECHANICALLY = (
 )
 
 
+# NF-2026-00667.  The correction block a repair turn opens with.  It is FIRST
+# in the prompt, ahead of the packet, because the packet is the long part and a
+# correction placed after it is the part a model skims.  It names the shape
+# that was refused and nothing about the judgment -- and it says out loud that
+# a finding this packet cannot evidence must be dropped, never invented, which
+# is the one way a repair turn could make a review worse instead of better.
+_SCHEMA_REPAIR_HEADER = (
+    "SCHEMA REPAIR TURN. Your previous answer to this exact review was "
+    "rejected before it could be recorded, on the SHAPE of the report only -- "
+    "not on its judgment. Reach the same conclusions; emit them correctly.\n"
+    "Rejected as: {rejection}\n"
+    "{instruction}\n"
+    "Do not weaken or invent a finding to make it pass. A finding this packet "
+    "cannot evidence must be dropped, not decorated.\n"
+)
+
+
 def build_review_prompt(
     packet: Mapping[str, Any],
     *,
@@ -521,6 +538,7 @@ def build_review_prompt(
     packet_file: str | None = None,
     packet_root: Path | str | None = None,
     max_inline_bytes: int = 96 * 1024,
+    prior_rejection: str = "",
 ) -> str:
     """Render a bounded independent-review prompt from packet facts only.
 
@@ -531,8 +549,15 @@ def build_review_prompt(
     *max_inline_bytes* guards the inline fallback when *packet_file* is None.
     *packet_root* is coordinator-owned write authority, independent of the
     destination path. It overrides the worker-environment fallback without
-    changing process-global state, so concurrent managers keep separate roots.
+    *prior_rejection* is the durable refusal a previous attempt at this exact
+    review earned, exactly as it is retained on the card.  When
+    ``quality_review_ingest`` can name a bounded correction for it, this turn
+    opens with that correction; anything else -- an unrelated reason, an
+    infrastructure failure, or no prior attempt at all -- renders the ordinary
+    prompt, so the repair can never be a mechanism that silently fires on
+    everything.
     """
+
 
     if lens not in {"correctness", "security", "code_quality"}:
         raise ReviewerEvidenceError("invalid_reviewer_lens")
@@ -583,6 +608,24 @@ def build_review_prompt(
         if use_file_transport
         else f"QUALITY_REVIEW_PACKET: {encoded}\n"
     )
+    # Imported here, not at module scope: ``quality_review_ingest`` reads this
+    # module's own ingress allowlist, so the dependency is deliberately one
+    # direction only at import time.
+    from . import quality_review_ingest
+
+    repair = quality_review_ingest.schema_repair_request(prior_rejection)
+    repair_block = (
+        ""
+        if repair is None
+        else _SCHEMA_REPAIR_HEADER.format(
+            rejection=(
+                f"{repair['category']}:{repair['detail']}"
+                if repair["detail"]
+                else str(repair["category"])
+            ),
+            instruction=str(repair["instruction"]),
+        )
+    )
     # Reconciliation of a real contradiction: runtime_adapters grants the
     # reviewer ``aiworkhub_worker_quality_review_submit`` in its allowedTools,
     # yet this prompt bans invoking any submission tool.  The prompt ban is
@@ -596,6 +639,7 @@ def build_review_prompt(
     # name is deliberately kept out of the returned prompt so the reviewer is
     # not nudged toward it.
     return (
+        f"{repair_block}"
         "You are an independent, strictly read-only quality reviewer.\n"
         f"Review lens: {lens}.\n"
         "Inspect the exact candidate workspace and the deterministic packet below. "

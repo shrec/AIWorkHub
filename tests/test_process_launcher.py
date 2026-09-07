@@ -11943,3 +11943,111 @@ def test_process_manager_satisfies_the_review_orchestrator_manager_protocol(
     protocol = inspect.signature(review_orchestrator.Manager.reject_review)
     assert list(protocol.parameters) == ["self", "task_id", "reason", "to"]
     assert protocol.parameters["to"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+class _PromptSeamReached(Exception):
+    """Stops the launch at the exact seam under test."""
+
+
+def _reach_reviewer_prompt_seam(tmp_path, monkeypatch, card_extra: dict) -> dict:
+    """Run the real ``_launch_isolated`` up to the reviewer prompt seam.
+
+    Returns the keyword arguments the launcher actually handed
+    ``quality_review.assemble_reviewer_prompt``.  Green unit tests on the ask
+    itself would not show that the launcher ever supplies it, so this drives
+    the production call site rather than the helper.
+    """
+
+    manager, binding = _reviewer_launch_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        manager,
+        "_show_task",
+        _show(lambda: {**_quality_review_card(), **card_extra}),
+    )
+    monkeypatch.setattr(
+        worker_ai_tools_mcp,
+        "verify_quality_review_prewarm_authority",
+        lambda authority_repo: SimpleNamespace(
+            authority_source="canonical", authority_state="sole_authority",
+        ),
+    )
+    monkeypatch.setattr(
+        worker_ai_tools_mcp,
+        "prewarm_quality_review_source_graph",
+        lambda *_a, **_k: {"ok": True, "built": True},
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_provision_worker_mcp_runtime_for_authority",
+        lambda *_a, **_k: SimpleNamespace(
+            audit_ledger_path=tmp_path / "ledger.jsonl",
+            audit_hmac_key_path=tmp_path / "hmac.key",
+        ),
+    )
+    captured: dict = {}
+
+    def capture(*args, **kwargs):
+        captured.update(kwargs)
+        raise _PromptSeamReached
+
+    monkeypatch.setattr(
+        process_launcher.quality_review, "assemble_reviewer_prompt", capture
+    )
+
+    # ``_launch_isolated`` converts any exception at this phase into a
+    # ``launch_failed`` result rather than propagating it, so the sentinel is
+    # read back out of the diagnostic instead of caught.
+    result = manager._launch_isolated(
+        task_id="TASK_REVIEW_1",
+        runner="claude_worker_reviewer",
+        topic="quality_review",
+        adapter_id="claude_cli",
+        model=None,
+        owner_prompt="",
+        timeout_seconds=30,
+        quality_review_binding=binding,
+    )
+    assert result.get("diagnostic", {}).get("phase") == "prompt_and_adapter_plan"
+    assert result["diagnostic"]["exception_type"] == _PromptSeamReached.__name__
+    assert captured, "the reviewer prompt seam was never reached"
+    return captured
+
+
+def test_launcher_hands_the_repair_ask_the_retry_that_produced_this_launch(
+    monkeypatch, tmp_path,
+):
+    """NF-2026-00667 reachability: the wire exists in production, not only in tests.
+
+    Cut verbatim from ``card_json.blocker_reason`` on
+    ``CLAUDESONNET5_QR_PONYTAIL_MINIMALITY_V1_E38_SECURITY_V7`` in
+    ``.aiworkhub/tasking/task_queue.sqlite``, read 2026-09-07.
+    """
+
+    stored = (
+        "review_protocol:structured_report_invalid:"
+        "review_finding_0_unknown_key:category,file,line"
+    )
+    captured = _reach_reviewer_prompt_seam(
+        tmp_path,
+        monkeypatch,
+        {"terminal_retry": {"request_id": "r" * 32, "reason": stored}},
+    )
+
+    assert captured["prior_rejection"] == stored
+    request = process_launcher.quality_review_ingest.schema_repair_request(
+        captured["prior_rejection"]
+    )
+    assert request is not None
+    assert request["detail"] == "review_finding_0_unknown_key:category,file,line"
+
+
+def test_a_first_reviewer_launch_carries_no_repair_ask(monkeypatch, tmp_path):
+    captured = _reach_reviewer_prompt_seam(tmp_path, monkeypatch, {})
+
+    assert captured["prior_rejection"] == ""
+    assert (
+        process_launcher.quality_review_ingest.schema_repair_request(
+            captured["prior_rejection"]
+        )
+        is None
+    )

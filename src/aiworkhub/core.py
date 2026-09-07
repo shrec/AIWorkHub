@@ -34,6 +34,7 @@ from . import callback_store
 from . import task_plan
 from . import dependency_autolaunch
 from . import learning_commit
+from . import terminal_failure_classification
 from .learning_commit import FailureCategory, classify_failure_category
 
 
@@ -5509,12 +5510,93 @@ _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset(
 )
 
 
+# Audit item #5 / R4-NF-2026-00646.  Which terminal outcomes an UNATTENDED
+# retry may re-run.
+#
+# ``terminal_failure_classification`` is this repository's single definition of
+# what a terminal failure IS.  The table below reads the class that classifier
+# ALREADY RECORDED on the card and never re-derives one, so an automatic retry
+# and the finalizer can never disagree about the same outcome.  Every class it
+# places has already been acted on by the mechanism that owns it:
+#
+#   * ``transient``  -- ``task_store.mark_transient_retry`` owns this class and
+#     runs FIRST, keeping the workspace and returning the card to ``pending``
+#     under a bounded budget.  A card that reached ``blocked`` still carrying
+#     this class is one that mechanism REFUSED, so re-running it here would
+#     spend exactly the budget it already declined.
+#   * ``credential`` -- the lane needs the owner, not another attempt.
+#   * ``defect``     -- this repository's own finding that the WORK is wrong.
+#   * ``unknown``    -- the classifier ran and established nothing.
+#
+# An ABSENT class is not ``unknown``.  It means no classifier ran on this
+# outcome at all, which is exactly the control-plane terminal event a
+# reservation reaper mints before any provider was ever consulted.  Measured on
+# this repository's canonical store: every reaper-minted terminal failure, and
+# all 45 blocked ``review_protocol:*`` reviewer cards, carry no
+# ``failure_class`` key at all.
+_AUTOMATIC_RETRY_REFUSAL_BY_CLASS: dict[str, str] = {
+    terminal_failure_classification.FAILURE_CLASS_TRANSIENT: (
+        "budget_owned_by_mark_transient_retry"
+    ),
+    terminal_failure_classification.FAILURE_CLASS_CREDENTIAL: (
+        "lane_needs_the_owner_not_another_attempt"
+    ),
+    terminal_failure_classification.FAILURE_CLASS_DEFECT: (
+        "a_finding_about_the_work_itself"
+    ),
+    terminal_failure_classification.FAILURE_CLASS_UNKNOWN: (
+        "classifier_established_nothing"
+    ),
+}
+
+
+def recorded_failure_class(card: Mapping[str, Any]) -> str:
+    """The class ``terminal_failure_classification`` recorded, or ``""``.
+
+    Read from the card where ``process_launcher`` durably wrote it after
+    calling that module; never recomputed here.  Two implementations of the
+    same verdict would drift, and the drift would only ever show up as an
+    automatic retry re-running work the finalizer had already judged.
+    """
+
+    terminal_failure = card.get("terminal_failure")
+    evidence = (
+        terminal_failure.get("evidence")
+        if isinstance(terminal_failure, Mapping)
+        else None
+    )
+    if not isinstance(evidence, Mapping):
+        return ""
+    return str(evidence.get("failure_class") or "")
+
+
+def automatic_terminal_retry_refusal(card: Mapping[str, Any]) -> str:
+    """Why an unattended retry must not re-run this card, else ``""``.
+
+    A predicate rather than an inline expression because this is the rule that
+    decides whether a machine may spend a provider turn with nobody watching,
+    and it has to be provable without a store, a launcher or a provider.
+    """
+
+    recorded = recorded_failure_class(card)
+    if not recorded:
+        return ""
+    named = _AUTOMATIC_RETRY_REFUSAL_BY_CLASS.get(recorded)
+    if named is None:
+        # A class this table does not name is a class nobody reasoned about.
+        # Fail closed rather than treat an unrecognised verdict as permission.
+        return f"failure_class_unplaced:{recorded[:60]}"
+    return f"failure_class_{recorded}:{named}"
+
+
 def retry_terminal_task(
     task_id: str,
     request_id: str,
     terminal_substatus: str,
     reason: str = "",
     topic: str | None = None,
+    *,
+    automatic: bool = False,
 ) -> dict[str, Any]:
     """Requeue one exact operational terminal episode under the same task ID.
 
@@ -5524,6 +5606,18 @@ def retry_terminal_task(
     and clears only current-episode claim/terminal fields.  Semantic failures
     (validation/scope/review outcomes), finished tasks and archived tasks must
     follow their existing coordinator workflows instead.
+
+    ``topic`` is an assertion, not a filter: the caller states which topic it
+    believes it is retrying and the call is refused when the live card
+    disagrees.  It must therefore be read from the work -- the reservation or
+    card being recovered -- never written as a literal, or the caller silently
+    stops recovering every other kind of card.
+
+    ``automatic`` marks a retry no human is watching.  Such a retry
+    additionally consults the failure class ``terminal_failure_classification``
+    recorded on the card (see ``automatic_terminal_retry_refusal``) and refuses
+    every class some other mechanism already owns.  A manager calling this
+    surface directly holds the evidence in hand and is not gated.
     """
 
     request_id = str(request_id or "").strip()
@@ -5544,6 +5638,10 @@ def retry_terminal_task(
         return _lifecycle_error("task has no exact topic identity")
     if topic is not None and topic != live_topic:
         return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+    if automatic:
+        refusal = automatic_terminal_retry_refusal(card)
+        if refusal:
+            return _lifecycle_error(f"terminal_retry_automatic_refused:{refusal}")
 
     prior_retry = card.get("terminal_retry")
     if (

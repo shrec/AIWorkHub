@@ -593,3 +593,145 @@ def test_dropped_reasons_are_bounded_and_never_empty():
     assert reasons.count(",") == ingest.MAX_RECORDED_DROP_REASONS - 1
     assert reasons.startswith("0:r0,")
     assert ingest._dropped_reasons([]) == "no_findings_retained"
+
+
+# --- NF-2026-00667: the bounded correction ask ----------------------------
+#
+# EVERY reason below was cut verbatim from ``card_json.blocker_reason`` on a
+# live blocked card in this repository's canonical store
+# (``.aiworkhub/tasking/task_queue.sqlite``), read 2026-09-07. They are the
+# bytes a producer actually emitted, not a shape invented to match the parser:
+# 45 blocked ``review_protocol:*`` reviewer cards existed at that read, and
+# these are one of each distinct family and detail shape among them.
+_STORED_REJECTIONS = {
+    # CODEX54_QR_PONYTAIL_RULECOPY_V1_E34_CODE_QUALITY_V13
+    "exact_evidence": (
+        "review_protocol:structured_report_invalid:"
+        "review_finding_0_exact_evidence_required"
+    ),
+    # CLAUDESONNET5_QR_PONYTAIL_MINIMALITY_V1_E38_SECURITY_V7 -- the key list
+    # is ONE comma-separated tail; splitting it dropped every key but the first.
+    "unknown_keys": (
+        "review_protocol:structured_report_invalid:"
+        "review_finding_0_unknown_key:category,file,line"
+    ),
+    # CLAUDESONNET5_QR_NF622_V7R3_SECURITY_V1 -- a non-zero finding index.
+    "later_finding": (
+        "review_protocol:structured_report_invalid:"
+        "review_finding_1_overbuild_replacement_required"
+    ),
+    # CLAUDESONNET5_QR_RELEASE_01098_V2_CORRECTNESS_V1
+    "multiple_finals": "review_protocol:multiple_structured_finals",
+}
+
+# CLAUDESONNET5_QR_NF658_V6_SECURITY_V1 -- the tail here is 500 characters of
+# the reviewer's OWN prose, which must never be echoed back into a prompt.
+_STORED_PROSE_REJECTION = (
+    "review_protocol:no_report_in_final:Reported one critical finding: the "
+    "per-request audit-ledger HMAC key (`worker_ai_tools_mcp.py`'s "
+    "`task_mcp_worker_runtime/audit_hmac.key`) lives inside the sandboxed "
+    "worker's own $HOME"
+)
+
+# DEEPSEEKV4P_QR_NF625_M2_SECURITY_V1 -- the provider stream, not the reviewer.
+_STORED_INFRASTRUCTURE_REJECTION = "review_protocol:provider_events_oversized"
+
+
+@pytest.mark.parametrize("stored", sorted(_STORED_REJECTIONS.values()))
+def test_stored_rejections_each_yield_one_bounded_ask(stored: str) -> None:
+    request = ingest.schema_repair_request(stored)
+
+    assert request is not None, stored
+    assert request["schema_id"] == ingest.SCHEMA_REPAIR_SCHEMA_ID
+    assert request["category"] in stored
+    assert request["instruction"]
+    assert len(request["detail"]) <= ingest.MAX_REPAIR_DETAIL_CHARS
+
+
+def test_an_unknown_key_reason_keeps_every_key_it_named() -> None:
+    request = ingest.schema_repair_request(_STORED_REJECTIONS["unknown_keys"])
+
+    assert request is not None
+    assert request["detail"] == "review_finding_0_unknown_key:category,file,line"
+
+
+def test_a_prose_tail_is_never_echoed_back_into_the_ask() -> None:
+    request = ingest.schema_repair_request(_STORED_PROSE_REJECTION)
+
+    assert request is not None
+    assert request["category"] == "no_report_in_final"
+    assert request["detail"] == ""
+    assert "HMAC" not in json.dumps(request)
+
+
+def test_an_infrastructure_failure_is_never_asked_of_the_reviewer() -> None:
+    assert ingest.schema_repair_request(_STORED_INFRASTRUCTURE_REJECTION) is None
+
+
+@pytest.mark.parametrize("reason", ["", None, "worker_failed:exit=1", "  "])
+def test_an_unrelated_reason_asks_for_nothing(reason: str | None) -> None:
+    assert ingest.schema_repair_request(reason) is None
+
+
+def test_a_shapeless_structured_report_invalid_asks_for_nothing() -> None:
+    """Without a finding this module named, the ask degenerates to "try again"."""
+
+    assert ingest.schema_repair_request("review_protocol:structured_report_invalid") is None
+    assert (
+        ingest.schema_repair_request(
+            "review_protocol:structured_report_invalid:Something Went Wrong"
+        )
+        is None
+    )
+
+
+def test_a_bare_category_is_accepted_as_well_as_the_durable_reason() -> None:
+    """``exc.category`` and ``card_json.blocker_reason`` are the same fact."""
+
+    assert (
+        ingest.schema_repair_request("multiple_structured_finals")
+        == ingest.schema_repair_request("review_protocol:multiple_structured_finals")
+    )
+
+
+def test_every_protocol_category_is_repairable_or_disclaimed() -> None:
+    """Derived from the source, so a new refusal cannot arrive unaskable.
+
+    The same positive control ``terminal_failure_classification`` keeps for its
+    own vocabulary: a category added to this module lands in neither set and
+    fails here, rather than silently becoming a refusal no reviewer is ever
+    asked to fix.
+    """
+
+    import ast
+    import pathlib
+
+    source = pathlib.Path(ingest.__file__).read_text(encoding="utf-8")
+    raised: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+        if name != "ReviewProtocolError" or not node.args:
+            continue
+        argument = node.args[0]
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            raised.add(argument.value)
+        elif isinstance(argument, ast.JoinedStr):
+            for part in argument.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    raised.add(part.value)
+                    break
+        elif isinstance(argument, ast.IfExp):
+            for branch in (argument.body, argument.orelse):
+                if isinstance(branch, ast.Constant) and isinstance(branch.value, str):
+                    raised.add(branch.value)
+
+    assert raised, "no ReviewProtocolError categories were recovered from the source"
+    assert ingest.unclassified_protocol_categories(raised) == ()
+    # Positive control: a category nobody placed must be reported, or the gate
+    # above would pass in a vacuum.
+    assert ingest.unclassified_protocol_categories(
+        {"a_refusal_nobody_reasoned_about"}
+    ) == ("a_refusal_nobody_reasoned_about",)

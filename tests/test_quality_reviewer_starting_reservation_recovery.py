@@ -33,12 +33,13 @@ def _starting(
     pid: int = 0,
     task_id: str | None = None,
     claim_epoch: int = 1,
+    topic: str = "quality_review",
 ) -> dict[str, object]:
     return {
         "request_id": request_id,
         "task_id": task_id or f"reviewer-{request_id}",
         "runner": "codex",
-        "topic": "quality_review",
+        "topic": topic,
         "adapter_id": "codex_cli",
         "state": "starting",
         "pid": pid,
@@ -47,7 +48,9 @@ def _starting(
     }
 
 
-def _seed_pending_reviewer(tmp_path, task_id: str) -> None:
+def _seed_pending_reviewer(
+    tmp_path, task_id: str, topic: str = "quality_review"
+) -> None:
     task_store.initialize_repository(tmp_path)
     with pytest.MonkeyPatch.context() as seed_patch:
         seed_patch.setattr(task_engine.core, "repo_root", lambda: tmp_path)
@@ -69,7 +72,7 @@ def _seed_pending_reviewer(tmp_path, task_id: str) -> None:
             task_id=task_id,
             title="Reviewer recovery fixture",
             runner="codex",
-            topic="quality_review",
+            topic=topic,
             objective="Exercise reviewer reservation recovery.",
             acceptance=["reservation recovery is deterministic"],
             allowed_writes=[],
@@ -1325,3 +1328,126 @@ def test_post_claim_launch_failure_release_error_is_reaped_exactly_once(
     assert recovered is not None
     assert recovered["status"] == "pending"
     assert recovered["worker_status"] == "unclaimed"
+
+
+@pytest.mark.parametrize("topic", ["quality_review", "worker_implementation"])
+def test_reaper_recovers_every_topic_it_terminalizes(tmp_path, monkeypatch, topic):
+    """The reaper blocks any topic, so its retry must recover any topic.
+
+    ``reconcile_expired_starting_reservations`` walks every ``starting``
+    reservation in the ledger; only its legacy claim-epoch binding branch is
+    reviewer-specific.  While the settler passed a literal ``"quality_review"``
+    to ``core.retry_terminal_task``, that retry answered ``topic mismatch`` for
+    every other card the same reaper had just blocked, the intent ticket was
+    never retired, and each later pass re-derived the identical refusal.
+    """
+
+    task_id = f"REAPER_TOPIC_{topic.upper()}"
+    request_id = f"topic-{topic}"
+    _seed_pending_reviewer(tmp_path, task_id, topic=topic)
+    monkeypatch.setattr(
+        task_engine.core, "_canonical_write_gate", lambda *_args, **_kwargs: None
+    )
+    claimed = task_engine.claim_start_exact(
+        tmp_path, task_id, "codex", topic, request_id
+    )
+    assert claimed["ok"] is True
+    claimed_card = task_store.get_task(tmp_path, task_id)
+    assert claimed_card is not None
+    claim_epoch = int(claimed_card["claim_epoch"])
+
+    manager = _manager_for_periodic_scan(tmp_path, monkeypatch)
+    manager._append_event(
+        _starting(
+            request_id,
+            task_id=task_id,
+            claim_epoch=claim_epoch,
+            deadline=time.time() - 1.0,
+            topic=topic,
+        )
+    )
+    monkeypatch.setattr(
+        process_launcher.task_store,
+        "enqueue_terminal_callback",
+        lambda *_args, **_kwargs: True,
+    )
+
+    scan = task_reconciler.run_scan(manager, repo=tmp_path, include_gc=False)
+    recovered = task_store.get_task(tmp_path, task_id)
+
+    assert scan["reservations_retired"] == 1
+    assert scan["terminal_intents_settled"] == 1
+    assert recovered is not None
+    assert recovered["topic"] == topic
+    assert recovered["status"] == "pending"
+    assert recovered["worker_status"] == "unclaimed"
+    assert recovered["terminal_retry"]["request_id"] == request_id
+    # The ticket is retired, so no later pass re-derives the same refusal.
+    assert not manager._reviewer_terminal_intent_path(request_id).exists()
+
+
+def test_reaper_retry_refuses_a_card_the_classifier_called_a_defect(
+    tmp_path, monkeypatch
+):
+    """An unattended retry consults the recorded class; it never re-derives one.
+
+    ``terminal_failure_classification`` places ``defect`` only on this
+    repository's own finding that the WORK is wrong.  A reaper pass that found
+    such a class already recorded must leave the card blocked rather than spend
+    another provider turn on it with nobody watching.
+    """
+
+    task_id = "REAPER_TOPIC_DEFECT"
+    request_id = "topic-defect"
+    _seed_pending_reviewer(tmp_path, task_id, topic="worker_implementation")
+    monkeypatch.setattr(
+        task_engine.core, "_canonical_write_gate", lambda *_args, **_kwargs: None
+    )
+    claimed = task_engine.claim_start_exact(
+        tmp_path, task_id, "codex", "worker_implementation", request_id
+    )
+    assert claimed["ok"] is True
+    claimed_card = task_store.get_task(tmp_path, task_id)
+    assert claimed_card is not None
+    claim_epoch = int(claimed_card["claim_epoch"])
+
+    manager = _manager_for_periodic_scan(tmp_path, monkeypatch)
+    manager._append_event(
+        _starting(
+            request_id,
+            task_id=task_id,
+            claim_epoch=claim_epoch,
+            deadline=time.time() - 1.0,
+            topic="worker_implementation",
+        )
+    )
+    monkeypatch.setattr(
+        process_launcher.task_store,
+        "enqueue_terminal_callback",
+        lambda *_args, **_kwargs: True,
+    )
+    real_mark = process_launcher.task_store.mark_terminal_failure
+
+    def _mark_with_recorded_class(repo, task, *args, evidence=None, **kwargs):
+        recorded = dict(evidence or {})
+        recorded["failure_class"] = (
+            process_launcher.terminal_failure_classification.FAILURE_CLASS_DEFECT
+        )
+        return real_mark(repo, task, *args, evidence=recorded, **kwargs)
+
+    monkeypatch.setattr(
+        process_launcher.task_store,
+        "mark_terminal_failure",
+        _mark_with_recorded_class,
+    )
+
+    scan = task_reconciler.run_scan(manager, repo=tmp_path, include_gc=False)
+    settled = task_store.get_task(tmp_path, task_id)
+
+    assert scan["reservations_retired"] == 1
+    assert settled is not None
+    assert settled["status"] == "blocked"
+    assert (
+        settled["terminal_failure"]["evidence"]["failure_class"] == "defect"
+    )
+    assert "terminal_retry" not in settled

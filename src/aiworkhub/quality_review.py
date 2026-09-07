@@ -170,6 +170,7 @@ def build_reviewer_prompt_with_content(
     reviewer_tool_names: Iterable[str] = (),
     submit_tool_name: str = DEFAULT_SUBMIT_TOOL,
     packet_path: str | None = None,
+    prior_rejection: str = "",
 ) -> str:
     """Render a reviewer prompt that always embeds the packet content inline.
 
@@ -187,6 +188,7 @@ def build_reviewer_prompt_with_content(
         lens=lens,
         submit_tool_name=submit_tool_name,
         packet_file=None,
+        prior_rejection=prior_rejection,
     )
     if packet_path is not None and capability_set_has_file_read(reviewer_tool_names):
         prompt += (
@@ -207,6 +209,7 @@ def assemble_reviewer_prompt(
     packet_path: str | None = None,
     packet_root: Path | str | None = None,
     adapter_fallback_used: bool = False,
+    prior_rejection: str = "",
 ) -> str:
     """Assemble the reviewer prompt for the exact adapter that will run it.
 
@@ -221,6 +224,12 @@ def assemble_reviewer_prompt(
 
     ``packet_root`` comes from the coordinator's verified worker runtime directory;
     it is not inferred from ``packet_path`` or asserted by the reviewer.
+
+    ``prior_rejection`` (NF-2026-00667) is the durable refusal a previous
+    attempt at this exact review earned.  Because this function is the ONE seam
+    both transports pass through, a bounded schema-repair ask threaded here
+    reaches every reviewer route -- the sighted CLI adapters and the blind
+    in-process ``vscode_lm`` bridge alike -- rather than half the fleet.
     """
 
     if runtime_adapters.adapter_provides_file_read(
@@ -232,6 +241,7 @@ def assemble_reviewer_prompt(
             submit_tool_name=submit_tool_name,
             packet_file=packet_path,
             packet_root=packet_root,
+            prior_rejection=prior_rejection,
         )
     return build_reviewer_prompt_with_content(
         packet,
@@ -239,6 +249,7 @@ def assemble_reviewer_prompt(
         reviewer_tool_names=(),
         submit_tool_name=submit_tool_name,
         packet_path=packet_path,
+        prior_rejection=prior_rejection,
     )
 
 
