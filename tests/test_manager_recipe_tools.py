@@ -481,14 +481,18 @@ def test_projection_flips_to_measured_once_the_catalogue_is_registered(manager):
     assert after["availability"] == "available"
     assert after["returned_count"] > 0
     # The dashboard bounds every primary projection collection at
-    # ``dashboard._PROJECTION_LIST_LIMIT`` (8). A registry larger than that is
-    # reported truncated with an explicitly UNKNOWN total rather than a wrong
-    # one -- "unknown", never 0 -- so the exact count assertions below run
-    # against a registry inside that bound. This is the dashboard's own bound,
-    # not a property of the store: ``store.load_registry`` returns every row.
+    # ``dashboard._PROJECTION_LIST_LIMIT`` (8), so a registry larger than that
+    # returns 8 items and says so. The bound is on the ITEMS, not on the count:
+    # the registry knows its own length and the panel reports it exactly.
+    # NF-2026-00668 -- it used to answer "unknown" here, telling the operator
+    # there are recipes and simultaneously that their number was unknowable,
+    # about a store that could answer for free. This is the dashboard's own
+    # bound, not a property of the store: ``store.load_registry`` returns every
+    # row, and the two counts below must agree.
     assert after["returned_count"] == dashboard._PROJECTION_LIST_LIMIT
     assert after["truncated"] is True
-    assert after["count"] == "unknown"
+    assert after["count"] == len(mrt.CANONICAL_RECIPES)
+    assert after["registry_count"] == len(mrt.CANONICAL_RECIPES)
     assert len(store.list_recipes(manager)) == len(mrt.CANONICAL_RECIPES)
 
 

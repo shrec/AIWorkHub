@@ -2593,9 +2593,69 @@ def _bounded_count_fields(
     return fields
 
 
+# The package a trusted ``__len__`` must be defined in. Derived from this
+# module's own name so it survives a rename or a vendoring, never a literal.
+_PROJECTION_OWN_PACKAGE = __name__.partition(".")[0]
+
+
+def _declared_length(value: Any) -> int | None:
+    """Return a length cheap enough to ask for, or None.
+
+    Two questions, and only both together make a length usable here. This one
+    is cost: calling ``__len__`` runs the object's code, and a projection that
+    must stay bounded cannot run a caller's arbitrary code to find out how big
+    something is -- a ``__len__`` may issue a query, walk a directory, or drain
+    the very iterator we are about to read. So this trusts exactly two kinds:
+    the builtin ``list``/``tuple`` implementations, and a ``__len__`` this
+    package defines, which we can read -- ``RecipeRegistry`` and
+    ``SkillRegistry`` both return ``len`` of an already materialised tuple.
+
+    The second question -- is the length TRUE -- is not asked here, because a
+    cheap length can still be wrong. ``_bounded_primary_collection`` answers it
+    by checking the number against the items its own bounded read saw.
+    """
+
+    type_len = getattr(type(value), "__len__", None)
+    if type_len is None:
+        return None
+    owner = getattr(type_len, "__module__", "") or ""
+    if not (
+        type_len is list.__len__
+        or type_len is tuple.__len__
+        or owner.partition(".")[0] == _PROJECTION_OWN_PACKAGE
+    ):
+        return None
+    try:
+        length = len(value)
+    except Exception:
+        return None
+    if isinstance(length, bool) or not isinstance(length, int) or length < 0:
+        return None
+    return length
+
+
 def _bounded_primary_collection(
     value: Any,
 ) -> tuple[list[Any], bool, int | str] | None:
+    """Return at most ``_PROJECTION_LIST_LIMIT`` items, and how many there are.
+
+    The limit bounds the ITEMS read, not the count reported. It used to bound
+    both: above the limit the count was always ``"unknown"`` -- even for a plain
+    list, whose length had already been measured on the line above and was then
+    discarded, and for a registry, whose authoritative ``__len__`` was never
+    consulted because it is neither a list nor a tuple. The operator was told
+    "there are recipes" and "I cannot tell you how many" about a store that
+    could answer exactly and for free (NF-2026-00668).
+
+    A declared length is used only when the bounded read agrees with it: the
+    read saw exactly that many when the number fits under the limit, or filled
+    the limit when it does not. A length that disagrees with the items it claims
+    to describe is not a measurement, so the read's own count wins and an
+    over-limit read with no trusted length stays ``"unknown"``. Nothing here
+    reads past the bound: an object with no trusted length costs one extra
+    ``next()`` to learn whether more exists, and an object with one costs none.
+    """
+
     if value is None:
         return [], False, 0
     if isinstance(value, (str, bytes, bytearray, Mapping)):
@@ -2604,15 +2664,7 @@ def _bounded_primary_collection(
         iterator = iter(value)
     except TypeError:
         return None
-    value_type = type(value)
-    type_len = getattr(value_type, "__len__", None)
-    authoritative_len: int | None = None
-    if value_type is list or (
-        isinstance(value, list) and type_len is list.__len__
-    ) or value_type is tuple or (
-        isinstance(value, tuple) and type_len is tuple.__len__
-    ):
-        authoritative_len = len(value)
+    declared = _declared_length(value)
     items: list[Any] = []
     while len(items) < _PROJECTION_LIST_LIMIT:
         try:
@@ -2620,20 +2672,26 @@ def _bounded_primary_collection(
         except StopIteration:
             break
     observed = len(items)
-    if authoritative_len is None:
-        has_more = False
-        if observed == _PROJECTION_LIST_LIMIT:
-            try:
-                next(iterator)
-            except StopIteration:
-                has_more = False
-            else:
-                has_more = True
-        truncated = has_more
-        total_count: int | str = "unknown" if truncated else observed
-        return items, truncated, total_count
-    truncated = authoritative_len > _PROJECTION_LIST_LIMIT
-    total_count = observed if not truncated else "unknown"
+    if declared is not None:
+        # A trusted length already says whether there is more, so this path
+        # never reads past the bound -- not even the one extra element the
+        # probe below needs. It is used only if it agrees with what the read
+        # just saw: either it fits under the limit and the read saw exactly
+        # that many, or it exceeds the limit and the read filled the limit. A
+        # number that contradicts the items it describes is discarded.
+        if declared > _PROJECTION_LIST_LIMIT and observed == _PROJECTION_LIST_LIMIT:
+            return items, True, declared
+        if declared == observed:
+            return items, False, declared
+    truncated = False
+    if observed == _PROJECTION_LIST_LIMIT:
+        try:
+            next(iterator)
+        except StopIteration:
+            truncated = False
+        else:
+            truncated = True
+    total_count: int | str = "unknown" if truncated else observed
     return items, truncated, total_count
 
 
@@ -3020,7 +3078,10 @@ def _skill_records(
             return None
         parsed.append(api.SkillRecord.from_mapping(item))
     if truncated:
-        return parsed, True, "unknown"
+        # ``total_count`` is the registry's own count when the registry could be
+        # asked and agreed with the read, and "unknown" otherwise. Restating
+        # "unknown" here threw away the answer in the first case.
+        return parsed, True, total_count
     return parsed, False, len(parsed)
 
 
@@ -3144,10 +3205,13 @@ def _recipe_registry(
     bounded = _bounded_primary_collection(raw)
     if bounded is None:
         return None
-    items, truncated, _ = bounded
+    items, truncated, total_count = bounded
     registry = api.RecipeRegistry(items)
     if truncated:
-        return registry, True, "unknown"
+        # The bounded registry holds 8 recipes; the store holds ``total_count``
+        # of them and said so. The panel reports both -- returned_count 8 and
+        # count 15 -- rather than "available, quantity unknown".
+        return registry, True, total_count
     return registry, False, len(registry)
 
 

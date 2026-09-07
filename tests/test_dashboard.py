@@ -2912,14 +2912,19 @@ def test_coding_foundation_primary_skills_and_recipes_cap_inspection() -> None:
     assert skills["state"] == "measured"
     assert skills["truncated"] is True
     assert skills["returned_count"] == dashboard._PROJECTION_LIST_LIMIT
-    assert skills["count"] == "unknown"
+    # NF-2026-00668: the bound is on the ITEMS, not on the count. These rows
+    # know their own length, so the panel says 20 while returning 8 -- it used
+    # to say "unknown" about a number it had already been handed.
+    assert skills["count"] == 20
     assert skill_rows.inspected <= dashboard._PROJECTION_LIST_LIMIT
     recipes = snapshot["tool_recipes"]
     assert recipes["state"] == "measured"
     assert recipes["truncated"] is True
     assert recipes["returned_count"] == dashboard._PROJECTION_LIST_LIMIT
-    assert recipes["count"] == "unknown"
-    assert "registry_count" not in recipes
+    assert recipes["count"] == 20
+    assert recipes["registry_count"] == 20
+    # And the count costs nothing: a trusted length is decisive on its own, so
+    # this path still never reads an element past the bound.
     assert recipe_rows.inspected <= dashboard._PROJECTION_LIST_LIMIT
 
 
@@ -3030,7 +3035,10 @@ def test_coding_foundation_truncated_skills_omit_prefix_lifecycle() -> None:
     snapshot = dashboard.build_snapshot(_FoundationProvider(skills={"records": rows}))
     skills = snapshot["skills"]
     assert skills["truncated"] is True
-    assert skills["count"] == "unknown"
+    # NF-2026-00668: how many there are is knowable and reported exactly; how
+    # they are DISTRIBUTED is not, because the 9th record -- the only retired
+    # one -- is past the bound. The two facts get different answers.
+    assert skills["count"] == dashboard._PROJECTION_LIST_LIMIT + 1
     lifecycle = skills.get("lifecycle")
     assert lifecycle is None or lifecycle.get("state") == "unknown"
     if isinstance(lifecycle, dict):
@@ -3207,6 +3215,168 @@ def test_coding_foundation_primary_collection_generator_limit_and_misleading_len
     assert truncated is False
     assert total == limit
 
+def test_bounded_primary_collection_keeps_an_authoritative_length(monkeypatch) -> None:
+    """NF-2026-00668: the bound is on the items read, not on the count reported.
+
+    A collection over the limit reported ``count: "unknown"`` even when its size
+    had already been measured -- for a plain list, on the line above; for a
+    ``RecipeRegistry`` or ``SkillRegistry``, never, because the ``__len__`` they
+    expose was consulted only for lists and tuples. The operator was told there
+    are recipes and, at the same time, that how many was unknowable.
+    """
+
+    from aiworkhub.skill_registry import SkillRegistry
+    from aiworkhub.tool_recipes import Recipe, RecipeRegistry, lit
+
+    limit = dashboard._PROJECTION_LIST_LIMIT
+
+    over = dashboard._bounded_primary_collection(list(range(limit + 7)))
+    assert over is not None
+    items, truncated, total = over
+    assert items == list(range(limit))
+    assert truncated is True
+    assert total == limit + 7
+
+    over_tuple = dashboard._bounded_primary_collection(tuple(range(limit + 7)))
+    assert over_tuple is not None
+    assert over_tuple[1] is True
+    assert over_tuple[2] == limit + 7
+
+    # The registries this was found on: a real one, not a stand-in, because the
+    # rule is that the ``__len__`` be one this package defines.
+    registry = RecipeRegistry(
+        Recipe(id=f"echo-{index}", version="1.0.0", argv=(lit("echo"),))
+        for index in range(limit + 7)
+    )
+    bounded = dashboard._bounded_primary_collection(registry)
+    assert bounded is not None
+    items, truncated, total = bounded
+    assert len(items) == limit
+    assert truncated is True
+    assert total == limit + 7
+    assert dashboard._declared_length(registry) == limit + 7
+    assert dashboard._declared_length(SkillRegistry()) == 0
+
+
+def test_bounded_primary_collection_refuses_a_length_it_cannot_afford() -> None:
+    """A count is only worth having if asking for it is free and it is true.
+
+    Two separate refusals. A ``__len__`` this package did not define may do
+    anything at all when called -- a query, a directory walk, draining the very
+    iterator about to be read -- so it is not asked. And a length that is asked
+    for is still checked against the items the bounded read saw, so a number
+    that contradicts them is discarded rather than reported.
+    """
+
+    limit = dashboard._PROJECTION_LIST_LIMIT
+
+    class _ExpensiveLen:
+        """A foreign ``__len__``: correct, and never called."""
+
+        def __init__(self) -> None:
+            self.len_calls = 0
+
+        def __len__(self) -> int:
+            self.len_calls += 1
+            return limit + 7
+
+        def __iter__(self):
+            yield from range(limit + 7)
+
+    foreign = _ExpensiveLen()
+    bounded = dashboard._bounded_primary_collection(foreign)
+    assert bounded is not None
+    assert bounded[1] is True
+    assert bounded[2] == "unknown"
+    assert foreign.len_calls == 0
+    assert dashboard._declared_length(foreign) is None
+
+    class _NotAnInt(list):
+        def __len__(self):  # type: ignore[override]
+            raise RuntimeError("counting is expensive here")
+
+    assert dashboard._declared_length(_NotAnInt()) is None
+
+def test_a_trusted_length_is_still_checked_against_what_was_read() -> None:
+    """Cheap to ask is not the same as true, so the answer is verified.
+
+    ``list.__len__`` is trusted because calling it is free, but a subclass may
+    still iterate something other than what it counts. The declared number is
+    used only if the bounded read agrees with it, and otherwise the read wins --
+    reporting 15 while handing back 3 items would be a worse lie than "unknown".
+    """
+
+    limit = dashboard._PROJECTION_LIST_LIMIT
+
+    class _YieldsFewer(list):
+        def __iter__(self):
+            return iter(list.__getitem__(self, slice(0, 3)))
+
+    class _YieldsMore(list):
+        def __iter__(self):
+            return iter(range(limit + 7))
+
+    fewer = dashboard._bounded_primary_collection(_YieldsFewer(range(limit + 7)))
+    assert fewer is not None
+    items, truncated, total = fewer
+    assert len(items) == 3
+    assert truncated is False
+    assert total == 3
+
+    more = dashboard._bounded_primary_collection(_YieldsMore(range(2)))
+    assert more is not None
+    items, truncated, total = more
+    assert len(items) == limit
+    assert truncated is True
+    assert total == "unknown"
+
+def test_bounded_primary_collection_never_reads_past_the_bound() -> None:
+    """The count must not cost a read: the bound is why this function exists."""
+
+    limit = dashboard._PROJECTION_LIST_LIMIT
+
+    class _Counted(list):
+        def __init__(self, rows) -> None:
+            super().__init__(rows)
+            self.inspected = 0
+
+        def __iter__(self):
+            for row in list.__iter__(self):
+                self.inspected += 1
+                yield row
+
+    rows = _Counted(range(limit + 7))
+    bounded = dashboard._bounded_primary_collection(rows)
+    assert bounded is not None
+    assert bounded[1] is True
+    assert bounded[2] == limit + 7
+    assert rows.inspected == limit
+
+
+def test_a_truncated_registry_reports_its_size_but_not_its_shape() -> None:
+    """The count is knowable above the bound; a breakdown of it is not."""
+
+    from aiworkhub.tool_recipes import Recipe, RecipeRegistry, lit
+
+    limit = dashboard._PROJECTION_LIST_LIMIT
+    registry = RecipeRegistry(
+        Recipe(id=f"echo-{index:02d}", version="1.0.0", argv=(lit("echo"),))
+        for index in range(limit + 7)
+    )
+
+    projected = dashboard._project_tool_recipes(
+        registry, ownership="full", input_state="present"
+    )
+
+    assert projected["state"] == "measured"
+    assert projected["availability"] == "available"
+    assert projected["truncated"] is True
+    assert projected["returned_count"] == limit
+    assert projected["count"] == limit + 7
+    assert projected["registry_count"] == limit + 7
+    # Discovery ran over the 8 recipes that were read, not the 15 that exist, so
+    # it reports nothing rather than a number that would read as a total.
+    assert "discovery_count" not in projected
 
 # ---------------------------------------------------------------------------
 # Work-card outcome accounting (reviewer children, per-card counting, honest

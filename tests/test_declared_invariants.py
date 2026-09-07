@@ -194,9 +194,33 @@ def test_missing_or_nondirectory_source_root_fails_closed(tmp_path: Path, make_f
     report = di.check(root)
 
     assert not report["passed"]
-    assert report["violation_count"] == len(di._TREE_INVARIANTS)
-    assert all(v["path"] == str(root) for v in report["violations"])
-    assert all("NotADirectoryError" in v["detail"] for v in report["violations"])
+    # Every tree detector is a blind spot, and says so in its own row rather
+    # than claiming it ran: `evaluated: true, violations: 0` for a root that
+    # does not exist is the shape NF-2026-00599 was filed against.
+    assert report["unevaluable_count"] == len(di._TREE_INVARIANTS)
+    tree = {name for name, _ in di._TREE_INVARIANTS}
+    rows = [row for row in report["invariants"] if row["invariant"] in tree]
+    assert all(row["evaluated"] is False and row["unevaluable"] for row in rows)
+    assert all("NotADirectoryError" in row["reason"] for row in rows)
+
+    # The sample says the root could not be read at all, which is not the same
+    # fact as a root that was read and held nothing.
+    assert report["source_sample"] == {
+        "readable": False,
+        "modules": 0,
+        "reason": "source root could not be read: NotADirectoryError",
+    }
+    assert report["all_declared_obligations_checked"] is False
+
+    # And the manifest verdict does not claim `absent`. Without an explicit
+    # repo_root the manifest path is DERIVED from this unreadable root, so
+    # "no manifest there" is a statement about a location that means nothing --
+    # it fails closed as unavailable and adds its own violation.
+    assert report["rule_coverage"]["status"] == "unavailable"
+    assert report["violation_count"] == len(di._TREE_INVARIANTS) + 1
+    coverage_breach = report["violations"][-1]
+    assert coverage_breach["invariant"] == "declared_rules_are_all_classified"
+    assert "derived from a source root" in coverage_breach["detail"]
 
 
 def test_source_read_failure_is_not_treated_as_clean(tmp_path: Path, monkeypatch):
@@ -249,6 +273,126 @@ def test_the_cli_exit_code_follows_the_verdict(tmp_path: Path, capsys):
     assert report["src_root"] == str(missing)
     assert "source root is not a directory" in report["violations"][0]["detail"]
 
+def test_a_source_root_with_no_modules_is_no_sample_not_a_clean_tree(tmp_path: Path):
+    """NF-2026-00599. Zero files read is not a clean read of zero violations.
+
+    An existing but empty source root used to give every tree detector
+    ``evaluated: true, violations: 0`` and the report ``passed: true`` -- a
+    scan that never opened a file, presented as a scan that found nothing. The
+    detectors were not breached and are not violations, but they were not
+    evaluated either, and the report now says so in both places.
+    """
+
+    empty = tmp_path / "src" / "aiworkhub"
+    empty.mkdir(parents=True)
+
+    report = di.check(empty)
+
+    assert report["source_sample"]["readable"] is True
+    assert report["source_sample"]["modules"] == 0
+    assert "no python module" in report["source_sample"]["reason"]
+
+    assert report["unevaluable_count"] == 0
+    tree = {name for name, _ in di._TREE_INVARIANTS}
+    rows = [row for row in report["invariants"] if row["invariant"] in tree]
+    assert rows and all(row["evaluated"] is False for row in rows)
+    assert all(row["violations"] == 0 for row in rows)
+    assert all("no python module" in row["reason"] for row in rows)
+    assert tree <= {row["invariant"] for row in report["unevaluated"]}
+    assert report["all_declared_obligations_checked"] is False
+
+
+def test_a_tree_detector_that_ran_reports_the_sample_it_read(tmp_path: Path):
+    """The distinction above is only checkable if the sample size is reported."""
+
+    pkg = tmp_path / "src" / "aiworkhub"
+    pkg.mkdir(parents=True)
+    (pkg / "one.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (pkg / "two.py").write_text("OTHER = 2\n", encoding="utf-8")
+
+    report = di.check(pkg)
+
+    assert report["source_sample"] == {"readable": True, "modules": 2, "reason": ""}
+    tree = {name for name, _ in di._TREE_INVARIANTS}
+    rows = [row for row in report["invariants"] if row["invariant"] in tree]
+    assert all(row["evaluated"] is True for row in rows)
+    assert all(row["measurement"]["modules_scanned"] == 2 for row in rows)
+
+
+def test_an_unreadable_root_is_not_a_repository_that_declares_no_rules(tmp_path: Path):
+    """NF-2026-00599. ``absent`` is a claim, so it needs a tree to be about.
+
+    Without an explicit ``repo_root`` the manifest path is derived from
+    ``src_root``. Derived from a root that cannot be inspected it named
+    ``/.aiworkhub/config/development_rules.json`` -- and the missing file there
+    was reported as ``not_applicable``: this tree simply does not declare rules.
+    That is a positive statement about a tree nobody looked at.
+    """
+
+    missing = tmp_path / "gone"
+    unreadable = di.load_manifest(missing, None)
+    assert unreadable[0] is None
+    assert unreadable[2] == "unreadable"
+    assert "derived from a source root" in unreadable[1]
+
+    # An explicit repo_root is a different question and keeps its honest answer:
+    # this directory is a real place, and it declares no rules.
+    absent = di.load_manifest(missing, tmp_path)
+    assert absent[0] is None
+    assert absent[2] == "absent"
+
+
+def test_a_manifest_that_cannot_be_stat_ed_is_unreadable_not_absent(tmp_path: Path):
+    """``Path.is_file()`` answers False for a file it was not permitted to stat."""
+
+    repo = tmp_path / "repo"
+    config = repo / ".aiworkhub" / "config"
+    config.mkdir(parents=True)
+    manifest = config / "development_rules.json"
+    manifest.write_text("{}", encoding="utf-8")
+
+    original_is_file = Path.is_file
+    original_stat = Path.stat
+
+    def _denied_is_file(path: Path, *args, **kwargs):
+        if path == manifest:
+            return False
+        return original_is_file(path, *args, **kwargs)
+
+    def _denied_stat(path: Path, *args, **kwargs):
+        if path == manifest:
+            raise PermissionError(13, "Permission denied", str(manifest))
+        return original_stat(path, *args, **kwargs)
+
+    # Injected rather than chmod-ed: the worker sandbox cannot run chmod, and a
+    # release qualifies on Windows, where mode bits do not deny a stat at all.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Path, "is_file", _denied_is_file)
+        mp.setattr(Path, "stat", _denied_stat)
+        result = di.load_manifest(repo / "src" / "aiworkhub", repo)
+
+    assert result[0] is None
+    assert result[2] == "unreadable"
+    assert "could not be inspected: PermissionError" in result[1]
+
+
+def test_the_checker_refuses_to_run_as_a_script_rather_than_report_a_broken_tree(
+    monkeypatch, capsys
+):
+    """NF-2026-00599. ``python src/aiworkhub/declared_invariants.py`` cannot work.
+
+    Four invariants and the manifest loader import the package they inspect
+    relatively, so a script run resolves none of them: the report that came back
+    described a repository with four breaches and unreadable rules, when the
+    only thing wrong was the invocation. A checker that cannot run must say so,
+    not answer.
+    """
+
+    monkeypatch.setattr(di, "__package__", "")
+    assert di.main(["--src", str(_PACKAGE)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "python -m aiworkhub.declared_invariants" in captured.err
 
 @pytest.mark.parametrize("name", di.INVARIANT_NAMES)
 def test_every_invariant_is_named_in_the_report(name):

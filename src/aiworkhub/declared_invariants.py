@@ -985,16 +985,48 @@ def _manifest_path(src_root: Path, repo_root: Path | None) -> Path:
 def load_manifest(src_root: Path, repo_root: Path | None) -> tuple[Any, str, str]:
     """Return ``(manifest, reason, status)`` for the repository's rules manifest.
 
-    ``status`` separates two things that must not be confused. ``absent`` means
-    this tree is not a repository that declares rules -- the sparse worktree a
-    worker validates in, or a fixture -- and the coverage question does not
-    apply, exactly as a repository invariant with no canonical store does not
-    apply. ``unreadable`` means a repository DOES declare rules and they cannot
-    be read, which is a defect and fails closed.
+    ``status`` separates three things that must not be confused. ``absent``
+    means this tree is not a repository that declares rules -- the sparse
+    worktree a worker validates in, or a fixture -- and the coverage question
+    does not apply, exactly as a repository invariant with no canonical store
+    does not apply. ``unreadable`` means a repository DOES declare rules and
+    they cannot be read, which is a defect and fails closed. ``ok`` means they
+    were read.
+
+    ``absent`` is a positive claim about a tree, so it may only be made about a
+    tree that was inspected. Two ways it used to be made about one that was not.
+    Without an explicit ``repo_root`` the manifest path is DERIVED from
+    ``src_root``, so a ``src_root`` that does not exist derived a path that
+    means nothing and the missing file there was reported as "this repository
+    declares no rules". And ``Path.is_file()`` answers False for a file it was
+    not permitted to stat, so a manifest behind a closed directory read as a
+    manifest that was never written. Both are now ``unreadable``.
     """
 
+    if repo_root is None and not src_root.is_dir():
+        return (
+            None,
+            f"manifest location is derived from a source root that is not a "
+            f"readable directory: {src_root}",
+            "unreadable",
+        )
     path = _manifest_path(src_root, repo_root)
-    if not path.is_file():
+    try:
+        present = path.is_file()
+        if not present:
+            # ``is_file()`` swallows the OSError and answers False for both
+            # "not there" and "not permitted to look", so ask again in a form
+            # that raises and let the error say which it was.
+            path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None, f"no development rules manifest at {path.as_posix()}", "absent"
+    except OSError as exc:
+        return (
+            None,
+            f"manifest at {path.as_posix()} could not be inspected: {type(exc).__name__}",
+            "unreadable",
+        )
+    if not present:
         return None, f"no development rules manifest at {path.as_posix()}", "absent"
     try:
         from .development_rules import parse_manifest_bytes
@@ -1027,14 +1059,27 @@ def check(
     evaluated reports itself as a violation, because "could not check" and
     "checked and clean" must never look the same.
 
-    Two booleans, and they mean different things. ``passed`` says no detector
-    that ran found a breach. ``all_declared_obligations_checked`` says whether
-    the detectors that ran cover everything ``development_rules.json`` declares
-    -- and on this repository it is False, because 5 of 63 declared obligations
-    execute. Before RM-2026-00048 only ``passed`` existed and it read as the
-    second claim while meaning the first: 15 of 20 declared rules were unchecked
-    and the report said ``unevaluated: []``. Every obligation that does not
-    execute is now listed in ``unevaluated`` by name, with the reason.
+    Four states, deliberately not three. An invariant row carries
+    ``evaluated: true`` only when its predicate actually ran; ``unevaluable:
+    true`` with the reason when it ran and raised, which is still a violation so
+    the verdict fails closed; ``evaluated: false`` with a reason when there was
+    nothing to run it against, which is not a violation because nothing is
+    broken -- but it is never counted as clean either. ``source_sample`` says in
+    one place what the tree detectors had to read: ``readable`` false for a root
+    that could not be inspected, and ``modules: 0`` for one that holds nothing to
+    inspect. A detector that read zero files has not found a clean tree.
+
+    Three numbers, and they mean different things. ``violation_count`` counts
+    breaches and blind spots together, because both must fail; ``unevaluable_count``
+    is how many of those were blind spots. ``passed`` says no detector that ran
+    found a breach. ``all_declared_obligations_checked`` says whether everything
+    ``development_rules.json`` declares was both covered by a detector and
+    actually executed -- and on this repository it is False, because 5 of 63
+    declared obligations execute. Before RM-2026-00048 only ``passed`` existed
+    and it read as the second claim while meaning the first: 15 of 20 declared
+    rules were unchecked and the report said ``unevaluated: []``. Every
+    obligation that does not execute is now listed in ``unevaluated`` by name,
+    with the reason.
 
     ``repo_root`` is the repository whose canonical stores the repository
     invariants measure, and is separate from ``src_root`` deliberately. The
@@ -1051,23 +1096,80 @@ def check(
     violations: list[Violation] = []
     unevaluated: list[dict[str, str]] = []
 
-    def evaluated(name: str, found: list[Violation]) -> None:
+    def evaluated(name: str, found: list[Violation], **extra: Any) -> None:
         violations.extend(found)
         results.append(
-            {"invariant": name, "violations": len(found), "evaluated": True}
+            {"invariant": name, "violations": len(found), "evaluated": True, **extra}
         )
 
+    def unevaluable(name: str, where: Path, exc: Exception) -> None:
+        """Record an invariant whose predicate could not run.
+
+        Fails closed -- it is still a violation, so ``passed`` is False and the
+        CLI exit code is unchanged -- but it is no longer recorded as
+        ``evaluated: true``, which was a plain untruth about an invariant that
+        never ran. A reader can tell a breach from a blind spot from the row
+        itself, and count the blind spots with ``unevaluable_count``.
+
+        Deliberately NOT added to ``unevaluated``. That list is the accepted
+        ones -- an obligation no detector covers, or a detector with nothing to
+        measure -- and a detector that raised is not accepted, it is broken. The
+        two must not share a channel or a reader will discharge the second by
+        reading the first.
+        """
+
+        violation = _unevaluable(name, where, exc)
+        violations.append(violation)
+        results.append({
+            "invariant": name,
+            "violations": 1,
+            "evaluated": False,
+            "unevaluable": True,
+            "reason": violation.detail,
+        })
+
+    def no_sample(name: str, reason: str) -> None:
+        """Record an invariant whose predicate had nothing to run against."""
+
+        results.append({
+            "invariant": name, "violations": 0, "evaluated": False, "reason": reason,
+        })
+        unevaluated.append({"invariant": name, "reason": reason})
+
+    # One inspection of the tree, before any detector runs, so that the report
+    # can distinguish three states a single "0 violations" used to flatten: the
+    # root could not be read at all, the root is readable but holds no module to
+    # read, and the detectors read N modules and found nothing. A tree detector
+    # that scanned zero files has not found a clean tree; it has not looked.
+    source_error: Exception | None = None
+    modules = 0
+    try:
+        modules = len(_python_sources(root))
+    except Exception as exc:  # noqa: BLE001 - an unreadable root is not a clean root
+        source_error = exc
+    no_modules = "" if source_error is not None or modules else (
+        f"source root holds no python module to check: {root}"
+    )
+
     for name, tree_check in _TREE_INVARIANTS:
+        if source_error is not None:
+            unevaluable(name, root, source_error)
+            continue
+        if no_modules:
+            no_sample(name, no_modules)
+            continue
         try:
             found = tree_check(root)
         except Exception as exc:  # noqa: BLE001 - unevaluable is a violation
-            found = [_unevaluable(name, root, exc)]
-        evaluated(name, found)
+            unevaluable(name, root, exc)
+            continue
+        evaluated(name, found, measurement={"modules_scanned": modules})
     for name, runtime_check in _RUNTIME_INVARIANTS:
         try:
             found = runtime_check()
         except Exception as exc:  # noqa: BLE001 - unevaluable is a violation
-            found = [_unevaluable(name, root, exc)]
+            unevaluable(name, root, exc)
+            continue
         evaluated(name, found)
     for name, repository_check in _REPOSITORY_INVARIANTS:
         try:
@@ -1077,19 +1179,12 @@ def check(
                 else _canonical_store_reason(repo)
             )
             if reason:
-                results.append(
-                    {
-                        "invariant": name,
-                        "violations": 0,
-                        "evaluated": False,
-                        "reason": reason,
-                    }
-                )
-                unevaluated.append({"invariant": name, "reason": reason})
+                no_sample(name, reason)
                 continue
             found = repository_check(repo)
         except Exception as exc:  # noqa: BLE001 - unevaluable is a violation
-            found = [_unevaluable(name, repo if repo is not None else root, exc)]
+            unevaluable(name, repo if repo is not None else root, exc)
+            continue
         evaluated(name, found)
 
     # The manifest is what the repository DECLARES; everything above is what it
@@ -1102,10 +1197,7 @@ def check(
             "reason": manifest_reason,
         }
         for name, _ in _RATCHET_INVARIANTS:
-            results.append({
-                "invariant": name, "violations": 0, "evaluated": False, "reason": manifest_reason,
-            })
-            unevaluated.append({"invariant": name, "reason": manifest_reason})
+            no_sample(name, manifest_reason)
     else:
         try:
             coverage = {"status": "evaluated", "reason": "", **rule_detector_coverage(manifest)}
@@ -1118,10 +1210,17 @@ def check(
         if boundary is None:
             reason = "manifest declares no single_definition_boundary ratchet"
             for name, _ in _RATCHET_INVARIANTS:
-                results.append({
-                    "invariant": name, "violations": 0, "evaluated": False, "reason": reason,
-                })
-                unevaluated.append({"invariant": name, "reason": reason})
+                no_sample(name, reason)
+        elif source_error is not None or no_modules:
+            # The ratchets scan the same tree the tree invariants do. A root that
+            # could not be read, or that holds no module, gives them nothing to
+            # count -- and a duplicate count of zero over zero definitions is not
+            # a tree that matches its baseline.
+            for name, _ in _RATCHET_INVARIANTS:
+                if source_error is not None:
+                    unevaluable(name, root, source_error)
+                else:
+                    no_sample(name, no_modules)
         else:
             thresholds = {pattern: boundary.threshold(pattern) for pattern in boundary.patterns}
             baseline: dict[str, dict[str, int]] = {}
@@ -1132,26 +1231,21 @@ def check(
             except Exception as exc:  # noqa: BLE001 - an unreadable tree is not a clean tree
                 counts = None
                 for name, _ in _RATCHET_INVARIANTS:
-                    evaluated(name, [_unevaluable(name, root, exc)])
+                    unevaluable(name, root, exc)
             if counts is not None:
                 for name, ratchet_check in _RATCHET_INVARIANTS:
                     found = ratchet_check(counts, baseline)
-                    violations.extend(found)
                     pattern = (
                         "copied_helper"
                         if name == "copied_helpers_have_one_definition"
                         else "parallel_implementation"
                     )
-                    results.append({
-                        "invariant": name,
-                        "violations": len(found),
-                        "evaluated": True,
-                        "measurement": {
-                            "pattern": pattern,
-                            "modules": len(counts[pattern]),
-                            "definitions": sum(counts[pattern].values()),
-                            "baseline_definitions": sum(baseline.get(pattern, {}).values()),
-                        },
+                    evaluated(name, found, measurement={
+                        "pattern": pattern,
+                        "modules_scanned": modules,
+                        "modules": len(counts[pattern]),
+                        "definitions": sum(counts[pattern].values()),
+                        "baseline_definitions": sum(baseline.get(pattern, {}).values()),
                     })
 
     # An obligation that neither executes nor carries a written reason is a hard
@@ -1181,25 +1275,48 @@ def check(
             f"declared-rule coverage could not be determined: {coverage['reason']}",
         ))
 
+    # The count of invariants that did not run because they could not, as
+    # opposed to those that ran and found nothing. Both leave `passed` False --
+    # unevaluable fails closed, as RM-2026-00048 requires -- but they are not the
+    # same fact and a reader must not have to grep violation text to tell them
+    # apart.
+    unevaluable_count = sum(1 for row in results if row.get("unevaluable"))
     return {
         "schema_id": SCHEMA_ID,
         "src_root": str(root),
         "repo_root": str(repo) if repo is not None else "",
+        # What the tree detectors actually had to read. `readable: false` means
+        # the root could not be inspected at all; `modules: 0` on a readable root
+        # means there was nothing to inspect. Neither is a clean tree, and before
+        # this both looked exactly like one.
+        "source_sample": {
+            "readable": source_error is None,
+            "modules": modules,
+            "reason": (
+                f"source root could not be read: {type(source_error).__name__}"
+                if source_error is not None
+                else no_modules
+            ),
+        },
         "invariants": results,
         "unevaluated": unevaluated,
         "rule_coverage": coverage,
-        # False whenever any declared obligation does not execute. It is False on
-        # this repository today -- 5 of 63 obligations execute -- and saying so is
-        # the difference between a gate and a gate people believe.
+        # False whenever any declared obligation does not execute -- because no
+        # detector covers it, because a detector that covers it had nothing to
+        # measure, or because a detector that covers it raised.
         "all_declared_obligations_checked": (
             coverage["status"] == "evaluated"
             and not coverage["accepted_undetected"]
             and not coverage["undetected"]
+            and not unevaluated
+            and not unevaluable_count
         ),
+        "unevaluable_count": unevaluable_count,
         "violation_count": len(violations),
         "violations": [v.to_dict() for v in violations[:MAX_VIOLATIONS_PER_INVARIANT]],
-        # "no detector that ran found a breach", NOT "every declared rule holds".
-        # Read it with all_declared_obligations_checked, never alone.
+        # "no detector that ran found a breach", NOT "every declared rule holds"
+        # and NOT "every detector ran". Read it with all_declared_obligations_checked
+        # and unevaluable_count, never alone.
         "passed": not violations,
     }
 
@@ -1208,6 +1325,22 @@ def main(argv: Iterable[str] | None = None) -> int:
     import argparse
     import json
     import sys
+
+    # Half of this module's invariants import the package they inspect
+    # (``from .task_fsm import ...``), and ``load_manifest`` imports
+    # ``development_rules`` the same way. Run as a plain script the package is
+    # not on the import path, every one of those raises ImportError, and the
+    # report that comes back is a repository with four breaches and unreadable
+    # rules -- an unrunnable checker describing itself as a broken tree. Refuse
+    # instead, naming the invocation that works. This is the module's own rule
+    # applied to its entry point: could-not-run must not be reported as a result.
+    if not __package__:
+        sys.stderr.write(
+            "aiworkhub.declared_invariants must run as a module, not a script: "
+            "the invariants import the package they inspect, which a script run "
+            "cannot resolve. Use: python -m aiworkhub.declared_invariants\n"
+        )
+        return 2
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
