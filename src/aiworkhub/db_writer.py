@@ -53,6 +53,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from . import platform_io
+
 __all__ = [
     "DEFAULT_LEASE_TIMEOUT_S",
     "WriteLeaseError",
@@ -102,20 +104,16 @@ class WriteLeaseTimeout(WriteLeaseError):
         self.waited_s = float(waited_s)
         self.timeout_s = float(timeout_s)
         self.retryable = True
-
-
 # --------------------------------------------------------------------------
 # Platform backend
 # --------------------------------------------------------------------------
-try:  # POSIX
-    import fcntl as _fcntl
-except ImportError:  # pragma: no cover - exercised on Windows only
-    _fcntl = None  # type: ignore[assignment]
-
-try:  # Windows
-    import msvcrt as _msvcrt
-except ImportError:
-    _msvcrt = None  # type: ignore[assignment]
+# There is deliberately no fcntl/msvcrt branching in this module. Every
+# platform difference belongs to ``platform_io`` and nowhere else. The earlier
+# in-module reimplementation was not merely duplication: its Windows branch
+# seeked to byte zero without restoring the caller's offset and never ensured
+# byte zero existed, so ``msvcrt.locking`` would have failed on an empty lock
+# file. ``platform_io.lock_fd`` handles both, plus the fact that
+# ``msvcrt.LK_LOCK`` is not the Windows equivalent of ``flock(LOCK_EX)``.
 
 
 def backend() -> str:
@@ -125,46 +123,25 @@ def backend() -> str:
     care about cross-process guarantees can record that degradation instead of
     assuming a guarantee the host cannot provide.
     """
-    if _fcntl is not None:
-        return "flock"
-    if _msvcrt is not None:
-        return "msvcrt"
-    return "none"
+
+    return platform_io.advisory_lock_backend()
 
 
 def _try_lock(fd: int) -> bool:
     """Attempt one non-blocking exclusive acquisition. False if held."""
-    if _fcntl is not None:
-        try:
-            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-            return True
-        except OSError:
-            return False
-    if _msvcrt is not None:  # pragma: no cover - Windows only
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
-            return True
-        except OSError:
-            return False
-    # No cross-process primitive on this host: the in-process lock already held
-    # by the caller is the only serialization available.
+
+    try:
+        platform_io.lock_fd(fd, blocking=False)
+    except (OSError, platform_io.AdvisoryLockTimeout):
+        return False
     return True
 
 
 def _unlock(fd: int) -> None:
-    if _fcntl is not None:
-        try:
-            _fcntl.flock(fd, _fcntl.LOCK_UN)
-        except OSError:
-            pass
-        return
-    if _msvcrt is not None:  # pragma: no cover - Windows only
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
-        except OSError:
-            pass
+    try:
+        platform_io.unlock_fd(fd)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -228,10 +205,10 @@ def _path_fd(key: str, lock_file: Path) -> int:
     """Descriptor for ``lock_file``, opened once per process."""
     with _REGISTRY_GUARD:
         fd = _PATH_FDS.get(key)
-        if fd is not None:
-            return fd
-        lock_file.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        # The lock-file open lives in platform_io: the flag set is platform
+        # knowledge (O_CLOEXEC is POSIX-only, O_BINARY is Windows-only) and it
+        # must agree with what lock_fd needs, which is a WRITABLE descriptor.
+        fd = platform_io.open_lock_file(lock_file)
         _PATH_FDS[key] = fd
         return fd
 

@@ -1478,6 +1478,42 @@ class _MsvcrtLocking(Protocol):
     def locking(self, fd: int, mode: int, nbytes: int) -> None: ...
 
 
+def advisory_lock_backend() -> str:
+    """Name the cross-process advisory-lock primitive this host provides.
+
+    ``"none"`` means the host offers no cross-process lock, so a caller can
+    record that degradation instead of assuming a guarantee it does not have.
+    """
+
+    if os.name == "nt":
+        return "msvcrt"
+    return "flock"
+
+
+def open_lock_file(path: Path) -> int:
+    """Open (creating if needed) a lock file and return its descriptor.
+
+    The flag set is platform knowledge and belongs here, not at a call site.
+    ``O_CLOEXEC`` is POSIX-only and ``O_BINARY`` is Windows-only; each resolves
+    to 0 where the platform does not define it, and 0 is a no-op inside the
+    mask, so one call serves every platform. CI caught the inline version of
+    this on Windows: ``os.O_CLOEXEC`` simply does not exist there.
+
+    The descriptor is opened for WRITING because :func:`lock_fd` needs a
+    writable fd on Windows -- ``msvcrt.locking`` locks a byte range that has to
+    exist, and the read-only descriptor POSIX would accept fails with EBADF.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = (
+        os.O_CREAT
+        | os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    return os.open(str(path), flags, 0o600)
+
+
 def _prepare_windows_lock_byte(fd: int) -> None:
     """Ensure byte zero exists and select it for ``msvcrt.locking``.
 

@@ -4086,8 +4086,19 @@ def preflight_validation_capabilities(
     # ``MissingRequirement`` BEFORE a worker is launched) rather than a terminal
     # event.  Only this certainty refuses; the lane's capability gaps are
     # path-dependent and are reported by ``plan_validation_lane`` instead.
+    #
+    # It refuses on LINUX ONLY, and CI is why. Landlock is a Linux facility and
+    # bubblewrap is a Linux package, so ``select_sandbox_backend`` raises by
+    # design on macOS and Windows. Refusing there turned a validation-time fact
+    # into a launch-time one and blocked EVERY launch on both platforms -- the
+    # macOS job failed with
+    # ``task_contract_unwinnable:["validation_lane:...:landlock_unsupported"]``
+    # on tests that never reach validation at all. On Linux the same raise means
+    # a genuinely misconfigured host, which is exactly what should be refused
+    # early; elsewhere it is the platform, not a defect, so the lane fact is
+    # recorded by ``plan_validation_lane`` and the launch proceeds.
     plan = plan_validation_lane(repo, card)
-    if not plan.available:
+    if not plan.available and _platform_io.is_linux():
         missing.add(f"validation_lane:{plan.reason}")
     return tuple(sorted(missing))
 
