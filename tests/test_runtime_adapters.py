@@ -13,7 +13,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import runtime_adapters  # noqa: E402
+from aiworkhub import runtime_adapters, worker_workspace  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -458,7 +458,6 @@ def test_grok_kilo_registry_and_provider_family_are_explicit():
     assert runtime_adapters.ADAPTER_EXECUTABLES["grok_kilo_cli"] == "kilo"
     assert runtime_adapters.provider_for_adapter("grok_kilo_cli") == "xai"
 
-
 def test_grok_kilo_preserves_windows_appcontainer_gate(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -476,7 +475,9 @@ def test_grok_kilo_preserves_windows_appcontainer_gate(monkeypatch, tmp_path):
         "Prompt",
         repo,
         executable_overrides={"grok_kilo_cli": executable},
-        outer_sandbox_backend="appcontainer",
+        outer_sandbox_backend=(
+            runtime_adapters.WINDOWS_APPCONTAINER_SANDBOX_BACKEND
+        ),
     )
 
     assert blocked.launchable is False
@@ -484,6 +485,66 @@ def test_grok_kilo_preserves_windows_appcontainer_gate(monkeypatch, tmp_path):
         runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
     )
     assert allowed.launchable is True
+
+
+@pytest.mark.parametrize(
+    "adapter_id", ["claude_cli", "codex_cli", "grok_kilo_cli"]
+)
+def test_windows_gate_admits_only_the_backend_the_supervisor_dispatches_on(
+    monkeypatch, tmp_path, adapter_id
+):
+    """A near-miss backend spelling must not buy a launchable Windows plan.
+
+    ``worker_supervisor`` selects its AppContainer launch on the exact string
+    ``"windows_appcontainer"``.  Any other spelling accepted here -- the bare
+    ``"appcontainer"`` this gate used to take, most of all -- yields a plan
+    that reads as sandboxed while the supervisor spawns the worker through
+    plain ``subprocess.Popen``, held by a Job Object and nothing else.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, adapter_id)
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
+
+    def _plan(backend):
+        return runtime_adapters.build_runtime_command(
+            adapter_id,
+            "Prompt",
+            repo,
+            executable_overrides={adapter_id: executable},
+            outer_sandbox_backend=backend,
+        )
+
+    for near_miss in ("appcontainer", "AppContainer", "windows-appcontainer", ""):
+        rejected = _plan(near_miss)
+        assert rejected.launchable is False, near_miss
+        assert rejected.argv == []
+        assert rejected.validation_reason == (
+            runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+        )
+
+    assert _plan(
+        runtime_adapters.WINDOWS_APPCONTAINER_SANDBOX_BACKEND
+    ).launchable is True
+
+
+def test_appcontainer_backend_token_is_shared_with_policy_and_supervisor():
+    """One identifier, or the planner and the supervisor disagree in silence."""
+    assert (
+        runtime_adapters.WINDOWS_APPCONTAINER_SANDBOX_BACKEND
+        == worker_workspace.WINDOWS_APPCONTAINER_BACKEND
+    )
+    # The literal worker_supervisor dispatches on.  Read as source text rather
+    # than executed, because importing the supervisor here would be a Windows
+    # syscall on a Windows runner and a no-op elsewhere -- neither proves the
+    # string.
+    supervisor_source = (
+        Path(runtime_adapters.__file__).with_name("worker_supervisor.py")
+    ).read_text(encoding="utf-8")
+    assert (
+        f'execution_backend == "'
+        f'{runtime_adapters.WINDOWS_APPCONTAINER_SANDBOX_BACKEND}"'
+    ) in supervisor_source
 
 
 def test_grok_kilo_discovers_newest_bounded_vscode_extension(monkeypatch, tmp_path):

@@ -471,3 +471,112 @@ def test_provider_env_uses_observed_editor_alias_in_bridge_request(
     payload = json.loads(request.request_path.read_text(encoding="utf-8"))
     assert payload["model"] == observed_model
     assert payload["model"] != requested_model
+
+
+# ── Measured Windows confinement verdict ───────────────────────────────────
+# Every branch below is driven by INJECTION.  This suite runs on Linux, macOS
+# and a real Windows runner, and a test that forces a platform name and then
+# makes a Windows syscall passes on one and fails on the others.
+
+
+def _probe(available: bool, detail: str):
+    return lambda: SimpleNamespace(available=available, detail=detail)
+
+
+def test_confinement_report_separates_host_fact_from_unwired_execution_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
+
+    unavailable = worker_workspace.windows_confinement_report(
+        probe=_probe(False, "required Win32 export unavailable")
+    )
+    assert unavailable["platform_is_windows"] is True
+    assert unavailable["host_appcontainer_available"] is False
+    assert unavailable["reason"] == "win32_appcontainer_unavailable"
+    assert unavailable["host_appcontainer_detail"] == (
+        "required Win32 export unavailable"
+    )
+    assert unavailable["available"] is False
+
+    # A host that CAN build an AppContainer is still refused, and the reason
+    # now names AIWorkHub rather than blaming the host.
+    capable = worker_workspace.windows_confinement_report(
+        probe=_probe(True, "AppContainer APIs resolved.")
+    )
+    assert capable["host_appcontainer_available"] is True
+    assert capable["execution_path_wired"] is False
+    assert capable["reason"] == "execution_path_not_wired"
+    assert capable["available"] is False
+
+
+def test_confinement_report_never_claims_a_boundary_it_does_not_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
+
+    report = worker_workspace.windows_confinement_report(
+        probe=_probe(True, "AppContainer APIs resolved.")
+    )
+
+    # Windows today holds a native CLI worker with a kill-on-close Job Object
+    # and nothing else.  The report must say so in as many words rather than
+    # letting an unconfined tier read as sandboxed.
+    assert report["active_confinement"] == "job_object_lifetime_only"
+    assert "filesystem" in report["active_does_not_contain"]
+    assert "network" in report["active_does_not_contain"]
+    assert "filesystem" not in report["active_contains"]
+
+
+def test_confinement_report_does_not_describe_windows_on_another_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: False)
+
+    report = worker_workspace.windows_confinement_report()
+
+    assert report["reason"] == "platform_not_windows"
+    assert report["available"] is False
+    assert report["active_confinement"] == "not_applicable"
+    assert report["active_contains"] == ()
+    assert report["active_does_not_contain"] == ()
+
+
+def test_windows_sandbox_refusal_carries_the_measured_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
+
+    with pytest.raises(worker_workspace.WorkspaceError) as excinfo:
+        worker_workspace.select_sandbox_backend()
+
+    identifier, _, measured = str(excinfo.value).partition(":")
+    # The identifier is the stable contract every existing caller matches on.
+    assert identifier == "windows_appcontainer_sandbox_unavailable"
+    # The suffix is measured from the running host, so this asserts that a
+    # cause is named -- never which one, which differs between a Windows
+    # runner and every other platform this suite runs on.
+    assert measured in {
+        "win32_appcontainer_unavailable",
+        "execution_path_not_wired",
+    }
+
+
+def test_appcontainer_execution_stays_off_until_the_launcher_declares_it() -> None:
+    """The last wire, asserted as the single switch it is.
+
+    ``worker_supervisor`` dispatches AppContainer on ``execution_backend``,
+    but ``process_launcher`` never writes that key into the supervisor spec,
+    so the AppContainer branch is unreachable from production.  Flipping the
+    flag without that spec key would report a confinement the runtime does not
+    apply, so the flag and the spec key must land together.
+    """
+    launcher_source = (
+        Path(worker_workspace.__file__).with_name("process_launcher.py")
+    ).read_text(encoding="utf-8")
+    launcher_declares_backend = '"execution_backend"' in launcher_source
+
+    assert (
+        worker_workspace.WINDOWS_APPCONTAINER_EXECUTION_WIRED
+        is launcher_declares_backend
+    )

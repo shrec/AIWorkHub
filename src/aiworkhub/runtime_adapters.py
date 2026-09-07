@@ -17,6 +17,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from . import platform_io
+
 
 SUPPORTED_ADAPTERS: tuple[str, ...] = (
     "vscode_lm",
@@ -87,6 +89,16 @@ GROK_KILO_DEFAULT_MODEL = GROK_KILO_SUPPORTED_MODELS[0]
 _KILO_EXTENSION_DIR_GLOB = "kilocode.kilo-code-*"
 VSCODE_LM_ADAPTER = "vscode_lm"
 WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER = "windows_native_cli_requires_appcontainer_sandbox"
+# The single spelling of the Windows confinement backend.  This exact string is
+# what worker_supervisor dispatches its AppContainer launch on
+# (``execution_backend == "windows_appcontainer"``) and what repo_policy gates
+# native-CLI launchability on.  Accepting any other spelling here would hand
+# back a plan that READS as sandboxed while the supervisor falls through to its
+# plain ``subprocess.Popen`` branch -- a worker held only by a kill-on-close Job
+# Object, with no filesystem, registry or network boundary whatsoever.  One
+# identifier, shared by planner, policy and supervisor, is what makes that
+# mismatch impossible.
+WINDOWS_APPCONTAINER_SANDBOX_BACKEND = "windows_appcontainer"
 
 # ── Route families ─────────────────────────────────────────────────────────
 # A route family is the PROTOCOL a route speaks, not the model behind it.
@@ -586,7 +598,7 @@ def _kilo_extension_version(path: Path) -> tuple[int, ...]:
 
 
 def _resolve_kilo_extension_executable(adapter_id: str) -> ExecutableResolution:
-    binary_name = "kilo.exe" if os.name == "nt" else "kilo"
+    binary_name = platform_io.executable_name("kilo")
     candidates: list[Path] = []
     for root in _default_kilo_extension_roots():
         if root.is_symlink() or not root.is_dir():
@@ -777,7 +789,10 @@ def _resolve_repo(repo: PathValue) -> tuple[str | None, str | None]:
 
 
 def _is_windows_host() -> bool:
-    return os.name == "nt"
+    # Every platform branch belongs to platform_io.  This stays a named
+    # function only because it is the seam the adapter tests inject a host
+    # platform through; the decision itself is made in exactly one module.
+    return platform_io.is_windows()
 
 
 def _resolve_additional_readonly_dirs(
@@ -955,7 +970,10 @@ def build_runtime_command(
             "vscode_lm_requires_process_launcher_bridge_context",
             cwd=cwd,
         )
-    if _is_windows_host() and outer_sandbox_backend != "appcontainer":
+    if (
+        _is_windows_host()
+        and outer_sandbox_backend != WINDOWS_APPCONTAINER_SANDBOX_BACKEND
+    ):
         return _invalid_plan(
             adapter_id,
             WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER,

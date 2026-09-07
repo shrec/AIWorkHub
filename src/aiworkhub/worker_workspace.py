@@ -38,7 +38,7 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 if TYPE_CHECKING:
     from .toolchain_authority import AuthoritySnapshot
@@ -6156,12 +6156,117 @@ def _bubblewrap_usable(bwrap: Path) -> bool:
 
 
 def _is_windows_host() -> bool:
-    return os.name == "nt"
+    # Every platform branch belongs to platform_io.  This stays a named
+    # function only because it is the seam the workspace tests inject a host
+    # platform through; the decision itself is made in exactly one module.
+    return is_windows()
+
+
+# ── Windows native-CLI confinement ─────────────────────────────────────────
+# Windows CAN confine a native CLI worker.  A repo-scoped AppContainer profile
+# plus a kill-on-close Job Object is implemented end to end in
+# ``windows_appcontainer.py``, and ``worker_supervisor`` already knows how to
+# launch through it (``execution_backend == "windows_appcontainer"``).
+#
+# What is missing is the last wire.  ``process_launcher`` writes the supervisor
+# spec without ``execution_backend`` -- and without the ``repo_id`` /
+# ``worker_kind`` that ``worker_supervisor._launch_appcontainer_process``
+# reads -- so the supervisor always falls through to its plain
+# ``subprocess.Popen`` branch.  Announcing "windows_appcontainer" from this
+# function before that spec carries the backend would not weaken a sandbox; it
+# would report one that is never applied, and run a model's code against the
+# owner's machine with no filesystem boundary at all.
+#
+# So this stays False until the launcher declares the backend, and it is
+# deliberately NOT an environment override: an unconfined worker must never be
+# one variable away.
+WINDOWS_APPCONTAINER_EXECUTION_WIRED = False
+WINDOWS_APPCONTAINER_BACKEND = "windows_appcontainer"
+
+
+def windows_confinement_report(
+    *, probe: Callable[[], Any] | None = None
+) -> dict[str, Any]:
+    """Measure -- never assume -- what confines a native CLI worker here.
+
+    Separates the three causes that one ``windows_appcontainer_sandbox_``
+    ``unavailable`` string used to hide: a host that is not Windows, a Windows
+    host whose AppContainer APIs do not resolve, and a Windows host that could
+    confine but which AIWorkHub has not wired an execution path to.
+
+    ``probe`` is injectable so every branch can be exercised without a Windows
+    syscall; the default probe short-circuits on ``os.name != "nt"`` before it
+    touches a single Windows symbol.
+    """
+
+    platform_is_windows = _is_windows_host()
+    host_available = False
+    host_detail = "not measured on a non-Windows host"
+    if platform_is_windows:
+        if probe is None:
+            try:
+                from . import windows_appcontainer
+            except ImportError:  # direct-script entrypoint
+                import windows_appcontainer  # type: ignore[no-redef]
+
+            probe = windows_appcontainer.probe
+        verdict = probe()
+        host_available = bool(getattr(verdict, "available", False))
+        host_detail = str(
+            getattr(verdict, "detail", "") or getattr(verdict, "reason", "") or ""
+        )
+    wired = bool(WINDOWS_APPCONTAINER_EXECUTION_WIRED)
+    if not platform_is_windows:
+        reason = "platform_not_windows"
+    elif not host_available:
+        reason = "win32_appcontainer_unavailable"
+    elif not wired:
+        reason = "execution_path_not_wired"
+    else:
+        reason = ""
+    return {
+        "backend": WINDOWS_APPCONTAINER_BACKEND,
+        "platform_is_windows": platform_is_windows,
+        # Can this host build an AppContainer at all?  A host fact.
+        "host_appcontainer_available": host_available,
+        "host_appcontainer_detail": host_detail[:200],
+        # Does the production launch path actually select it?  A code fact.
+        "execution_path_wired": wired,
+        "available": bool(platform_is_windows and host_available and wired),
+        "reason": reason,
+        # What a native CLI worker would actually be held by on Windows RIGHT
+        # NOW.  The supervisor's non-AppContainer branch assigns a
+        # kill-on-close Job Object, which bounds the process tree's lifetime
+        # and nothing else.  Stated only for Windows: on Linux the active
+        # boundary is landlock/bubblewrap and this report does not describe it.
+        "active_confinement": (
+            "job_object_lifetime_only" if platform_is_windows else "not_applicable"
+        ),
+        "active_contains": (
+            ("worker_process_tree_lifetime",) if platform_is_windows else ()
+        ),
+        "active_does_not_contain": (
+            (
+                "filesystem",
+                "registry",
+                "network",
+                "other_processes_of_the_same_user",
+            )
+            if platform_is_windows
+            else ()
+        ),
+    }
 
 
 def select_sandbox_backend() -> str:
     if _is_windows_host():
-        raise WorkspaceError("windows_appcontainer_sandbox_unavailable")
+        # Refuse, and say which of the three causes it is.  The identifier
+        # stays the leading token so existing callers and receipts keep
+        # matching on it.
+        report = windows_confinement_report()
+        raise WorkspaceError(
+            f"windows_appcontainer_sandbox_unavailable:{report['reason']}"
+        )
     requested = os.environ.get(SANDBOX_BACKEND_ENV, "auto").strip().lower()
     if requested not in {"auto", "bubblewrap", "landlock"}:
         raise WorkspaceError(f"invalid_sandbox_backend:{requested}")
