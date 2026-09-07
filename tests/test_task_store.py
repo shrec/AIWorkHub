@@ -988,3 +988,471 @@ def test_review_feedback_identity_still_reads_legacy_rows() -> None:
     assert task_store.review_feedback_identity({}) == task_store.review_feedback_identity(
         {"review_feedback": None}
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical write-path serialization (the DB-lock class).
+#
+# Measured cause: 452 of 549 recorded runtime lock events are
+# "review_transition_failed:database is locked" raised out of
+# mark_terminal_review_with_callback. The failure is a waiter at the back of the
+# single-writer queue burning its whole 5000ms busy_timeout -- reproduced at
+# 12 processes x ~120ms hold as 5/72 failures at exactly 5008ms, and reduced to
+# 0/72 by the cross-process write lease.
+# ---------------------------------------------------------------------------
+
+
+def test_connect_keeps_implicit_transactions_unless_explicit_txn_requested(
+    tmp_path: Path,
+) -> None:
+    """The explicit-transaction mode must stay opt-in.
+
+    task_engine (7 sites) and learning_commit_store (1 site) open canonical
+    connections through task_store._connect and rely on sqlite3's implicit
+    transaction. Making isolation_level=None the module default would silently
+    convert their multi-statement writes to autocommit and turn their
+    rollback() calls into no-ops, so the default must not change.
+    """
+    database = tmp_path / "task.sqlite"
+
+    legacy = task_store._connect(database)
+    try:
+        assert legacy.isolation_level == ""
+    finally:
+        legacy.close()
+
+    explicit = task_store._connect(database, explicit_txn=True)
+    try:
+        assert explicit.isolation_level is None
+        # commit/rollback must still work once a transaction is actually open.
+        explicit.execute("CREATE TABLE probe(a)")
+        task_store._begin_immediate(explicit)
+        explicit.execute("INSERT INTO probe VALUES (1)")
+        assert explicit.in_transaction is True
+        explicit.commit()
+        assert explicit.in_transaction is False
+        assert explicit.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 1
+        task_store._begin_immediate(explicit)
+        explicit.execute("INSERT INTO probe VALUES (2)")
+        explicit.rollback()
+        assert explicit.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 1
+    finally:
+        explicit.close()
+
+
+def test_begin_immediate_is_idempotent_inside_an_open_transaction(
+    tmp_path: Path,
+) -> None:
+    """A second _begin_immediate must not raise 'transaction within a transaction'."""
+    connection = task_store._connect(tmp_path / "task.sqlite", explicit_txn=True)
+    try:
+        connection.execute("CREATE TABLE probe(a)")
+        task_store._begin_immediate(connection)
+        assert connection.in_transaction is True
+        task_store._begin_immediate(connection)  # must be a no-op, not an error
+        assert connection.in_transaction is True
+    finally:
+        connection.close()
+
+
+class _FlakyWalConnection(sqlite3.Connection):
+    """sqlite3.Connection is an immutable C type, so the WAL pragma failure is
+    injected through a connection factory rather than by patching a method."""
+
+    wal_attempts = 0
+    wal_failures_to_inject = 0
+    wal_error = "database is locked"
+
+    def execute(self, sql, *args):  # type: ignore[override,no-untyped-def]
+        if str(sql).strip().upper() == "PRAGMA JOURNAL_MODE=WAL":
+            type(self).wal_attempts += 1
+            if type(self).wal_attempts <= type(self).wal_failures_to_inject:
+                raise sqlite3.OperationalError(type(self).wal_error)
+        return super().execute(sql, *args)
+
+
+def _install_flaky_wal(monkeypatch, *, failures: int, error: str) -> type:
+    factory = type("_Flaky", (_FlakyWalConnection,), {})
+    factory.wal_attempts = 0
+    factory.wal_failures_to_inject = failures
+    factory.wal_error = error
+    real_connect = sqlite3.connect
+
+    def connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        kwargs["factory"] = factory
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(task_store.sqlite3, "connect", connect)
+    return factory
+
+
+def test_connect_retries_wal_pragma_while_the_database_is_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PRAGMA journal_mode=WAL is itself a write on a not-yet-WAL database.
+
+    Measured: 301ms to 'database is locked' against a held BEGIN EXCLUSIVE on a
+    DELETE-mode file. callback_store.open_db already retries this exact
+    statement on this exact file; _connect must too.
+    """
+    factory = _install_flaky_wal(monkeypatch, failures=2, error="database is locked")
+    connection = task_store._connect(tmp_path / "task.sqlite")
+    try:
+        assert factory.wal_attempts == 3  # two failures, then success
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        connection.close()
+
+
+def test_connect_gives_up_after_the_bounded_wal_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bounded, not infinite: a permanently locked file must fail closed."""
+    factory = _install_flaky_wal(monkeypatch, failures=99, error="database is locked")
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        task_store._connect(tmp_path / "task.sqlite")
+    assert factory.wal_attempts == task_store._WAL_RETRY_COUNT
+
+
+def test_connect_does_not_retry_a_non_lock_pragma_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry loop must not swallow an unrelated failure."""
+    factory = _install_flaky_wal(monkeypatch, failures=99, error="disk I/O error")
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        task_store._connect(tmp_path / "task.sqlite")
+    assert factory.wal_attempts == 1  # failed closed on the first attempt
+
+
+def test_write_connection_takes_the_lease_before_it_opens_the_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordering is the whole point: _connect issues the WAL pragma, which is
+    itself a write that can fail on a lock, so connecting outside the lease
+    would leave the first statement of the write path unserialized. Taking the
+    lease outside also keeps it from ever being acquired inside an open
+    transaction, which is the ordering that could deadlock."""
+    order: list[str] = []
+    real_lease = task_store.db_writer.write_lease
+    real_connect = task_store._connect
+
+    import contextlib as _contextlib
+
+    @_contextlib.contextmanager
+    def traced_lease(db_path, **kwargs):  # type: ignore[no-untyped-def]
+        order.append("lease_acquired")
+        with real_lease(db_path, **kwargs) as receipt:
+            yield receipt
+        order.append("lease_released")
+
+    def traced_connect(path, **kwargs):  # type: ignore[no-untyped-def]
+        order.append("connect")
+        return real_connect(path, **kwargs)
+
+    monkeypatch.setattr(task_store.db_writer, "write_lease", traced_lease)
+    monkeypatch.setattr(task_store, "_connect", traced_connect)
+
+    with task_store._write_connection(tmp_path / "task.sqlite") as conn:
+        order.append("body")
+        assert conn is not None
+
+    assert order == ["lease_acquired", "connect", "body", "lease_released"]
+
+
+def test_write_connection_holds_the_lease_for_the_whole_block(tmp_path: Path) -> None:
+    """No second holder may enter while the block runs.
+
+    The probe runs on another THREAD: db_writer's lease is deliberately
+    re-entrant within one (process, thread, path) so nested use cannot
+    self-deadlock, so a same-thread probe would be let straight through and
+    would prove nothing.
+    """
+    import threading
+
+    database = tmp_path / "task.sqlite"
+    outcome: list[str] = []
+
+    def probe() -> None:
+        try:
+            with task_store.db_writer.write_lease(database, timeout_s=0.05):
+                outcome.append("acquired")
+        except task_store.db_writer.WriteLeaseTimeout:
+            outcome.append("timed_out")
+
+    with task_store._write_connection(database):
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join(timeout=30)
+
+    assert outcome == ["timed_out"]
+
+
+def _child_probe_lease(database: str, started, done) -> None:  # pragma: no cover
+    """Run in a separate PROCESS: an in-process lock could not exclude this."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from aiworkhub import db_writer as _db_writer
+
+    started.set()
+    try:
+        with _db_writer.write_lease(database, timeout_s=0.5):
+            done.put("acquired")
+    except _db_writer.WriteLeaseTimeout:
+        done.put("timed_out")
+
+
+def test_write_connection_excludes_another_process(tmp_path: Path) -> None:
+    """The measured contention is cross-process (6,247 distinct supervisor pids,
+    up to 12 alive at once), so the exclusion must hold across processes."""
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    database = tmp_path / "task.sqlite"
+    started = ctx.Event()
+    done: "mp.Queue[str]" = ctx.Queue()
+
+    with task_store._write_connection(database):
+        child = ctx.Process(target=_child_probe_lease, args=(str(database), started, done))
+        child.start()
+        assert started.wait(timeout=30)
+        outcome = done.get(timeout=30)
+        child.join(timeout=30)
+
+    assert outcome == "timed_out"
+
+
+def test_mark_terminal_review_runs_inside_an_explicit_write_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The card UPDATE, the task_events INSERT and the callback outbox row are
+    one transaction whose boundary is stated, not inferred from driver
+    behaviour."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _insert_task(repo, "T-EXPLICIT-TXN", status="processing")
+
+    observed: dict[str, object] = {}
+    real_txn = task_store._mark_terminal_review_transaction
+
+    def probing_txn(conn, task_id, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_txn(conn, task_id, **kwargs)
+        observed["isolation_level"] = conn.isolation_level
+        return result
+
+    monkeypatch.setattr(task_store, "_mark_terminal_review_transaction", probing_txn)
+    ok, state, _enqueued = task_store.mark_terminal_review_with_callback(
+        repo,
+        "T-EXPLICIT-TXN",
+        runner="codex_worker_b891",
+        substatus="review_ready",
+        evidence={"request_id": "req-1"},
+        callback_transition="review_ready",
+        callback_provider="codex",
+    )
+
+    assert (ok, state) == (True, "review")
+    # An explicit-transaction connection: sqlite3 issued no implicit BEGIN.
+    assert observed["isolation_level"] is None
+    # And the guarded write really landed.
+    card = task_store.get_task(repo, "T-EXPLICIT-TXN") or {}
+    assert card.get("status") == "review"
+    assert card.get("terminal_substatus") == "review_ready"
+
+
+def _child_mark_review(repo: str, task_id: str, out) -> None:  # pragma: no cover
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from pathlib import Path as _Path
+
+    from aiworkhub import task_store as _task_store
+
+    try:
+        ok, state, _enq = _task_store.mark_terminal_review_with_callback(
+            _Path(repo),
+            task_id,
+            runner="codex_worker_b891",
+            substatus="review_ready",
+            evidence={"request_id": "req-concurrent"},
+            callback_transition="review_ready",
+            callback_provider="codex",
+        )
+        out.put(("ok", f"{ok}:{state}"))
+    except Exception as exc:  # noqa: BLE001 - the whole point is to catch a lock
+        out.put((type(exc).__name__, str(exc)))
+
+
+def test_concurrent_processes_do_not_surface_database_is_locked(tmp_path: Path) -> None:
+    """The regression this whole change exists for.
+
+    Every one of the 452 measured failures reached process_launcher as
+    'review_transition_failed:database is locked'. Concurrent supervisor
+    PROCESSES must now queue on the lease instead.
+    """
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_ids = [f"T-CONC-{i}" for i in range(6)]
+    for task_id in task_ids:
+        _insert_task(repo, task_id, status="processing")
+
+    out: "mp.Queue[tuple[str, str]]" = ctx.Queue()
+    children = [
+        ctx.Process(target=_child_mark_review, args=(str(repo), task_id, out))
+        for task_id in task_ids
+    ]
+    for child in children:
+        child.start()
+    results = [out.get(timeout=120) for _ in task_ids]
+    for child in children:
+        child.join(timeout=120)
+
+    locked = [r for r in results if "locked" in r[1].lower()]
+    assert not locked, f"database is locked resurfaced: {locked}"
+    assert all(kind == "ok" and value == "True:review" for kind, value in results), results
+    for task_id in task_ids:
+        assert (task_store.get_task(repo, task_id) or {}).get("status") == "review"
+
+
+def test_tasks_status_index_is_created_and_used_by_the_review_seed_query(
+    tmp_path: Path,
+) -> None:
+    """tasks shipped with only sqlite_autoindex_tasks_1; the dispatcher poll
+    filters it on status IN ('review','blocked') on every pass.
+
+    Measured on the real 341MB canonical store (4,628 rows):
+      before  SCAN tasks / USE TEMP B-TREE FOR ORDER BY  -- median 8.9ms
+      after   SEARCH tasks USING INDEX ... (status=?)    -- median 3.5ms
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _readiness, db_path = task_store._require_ready(repo)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        names = {str(row[1]) for row in connection.execute("PRAGMA index_list(tasks)")}
+        assert "idx_task_store_tasks_status" in names
+
+        plan = " ".join(
+            str(row[-1])
+            for row in connection.execute(
+                "EXPLAIN QUERY PLAN "
+                "SELECT task_id, status, card_json, origin_thread_id FROM tasks "
+                "WHERE status IN ('review','blocked') "
+                "AND (archived_at IS NULL OR archived_at='') "
+                "ORDER BY updated_at ASC, task_id ASC"
+            )
+        )
+        assert "idx_task_store_tasks_status" in plan
+        assert "SCAN tasks" not in plan
+    finally:
+        connection.close()
+
+
+def test_ensure_task_status_index_migrates_an_existing_store_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """Existing canonical stores must gain the index through the migration
+    path, never by writing to a live database directly."""
+    database = tmp_path / "legacy.sqlite"
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending');"
+        )
+        connection.commit()
+        names = {str(row[1]) for row in connection.execute("PRAGMA index_list(tasks)")}
+        assert "idx_task_store_tasks_status" not in names
+
+        assert task_store.ensure_task_status_index(connection) is True
+        names = {str(row[1]) for row in connection.execute("PRAGMA index_list(tasks)")}
+        assert "idx_task_store_tasks_status" in names
+
+        # Idempotent: a second migration pass reports no change.
+        assert task_store.ensure_task_status_index(connection) is False
+    finally:
+        connection.close()
+
+
+def test_ensure_task_status_index_declines_a_table_without_status(tmp_path: Path) -> None:
+    """Fail closed rather than raise against an unexpected/older shape."""
+    connection = sqlite3.connect(tmp_path / "odd.sqlite")
+    try:
+        connection.executescript("CREATE TABLE tasks (task_id TEXT PRIMARY KEY);")
+        connection.commit()
+        assert task_store.ensure_task_status_index(connection) is False
+    finally:
+        connection.close()
+
+
+def test_write_lease_converts_a_busy_timeout_failure_into_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact measured failure, made deterministic.
+
+    In production a waiter at the back of the single-writer queue burnt its
+    whole 5000ms busy_timeout and surfaced 'database is locked' (5/72 at 12
+    processes x ~120ms hold). Here the timeout is shortened to 200ms and the
+    holder holds for 1s, so without the lease the second writer MUST fail and
+    with the lease it MUST simply wait its turn. Two threads, not one: the
+    lease is re-entrant within a single (process, thread, path).
+    """
+    import threading
+    import time as _time
+
+    database = tmp_path / "task.sqlite"
+    seed = task_store._connect(database)
+    try:
+        seed.execute("CREATE TABLE probe(a)")
+        seed.commit()
+    finally:
+        seed.close()
+
+    real_connect = task_store._connect
+
+    def short_busy_timeout_connect(path, **kwargs):  # type: ignore[no-untyped-def]
+        kwargs.setdefault("busy_timeout_ms", 200)
+        return real_connect(path, **kwargs)
+
+    monkeypatch.setattr(task_store, "_connect", short_busy_timeout_connect)
+
+    holder_inside = threading.Event()
+    outcome: dict[str, str | None] = {}
+
+    def holder() -> None:
+        with task_store._write_connection(database) as conn:
+            task_store._begin_immediate(conn)
+            conn.execute("INSERT INTO probe VALUES (1)")
+            holder_inside.set()
+            _time.sleep(1.0)  # 5x the 200ms busy_timeout
+            conn.commit()
+
+    def waiter() -> None:
+        assert holder_inside.wait(timeout=30)
+        try:
+            with task_store._write_connection(database) as conn:
+                task_store._begin_immediate(conn)
+                conn.execute("INSERT INTO probe VALUES (2)")
+                conn.commit()
+            outcome["waiter"] = None
+        except Exception as exc:  # noqa: BLE001 - catching the lock is the point
+            outcome["waiter"] = f"{type(exc).__name__}: {exc}"
+
+    threads = [threading.Thread(target=holder), threading.Thread(target=waiter)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert outcome["waiter"] is None, (
+        f"the second writer failed instead of waiting: {outcome['waiter']}"
+    )
+    check = sqlite3.connect(database)
+    try:
+        assert check.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 2
+    finally:
+        check.close()

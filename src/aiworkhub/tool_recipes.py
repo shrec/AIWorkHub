@@ -1113,3 +1113,167 @@ def build_receipt(
         changed_paths=paths,
         digest=digest,
     )
+
+
+# ---------------------------------------------------------------------------
+# Manifest serialization round-trip.
+#
+# ``_recipe_payload`` already projects a manifest to its canonical, JSON-safe
+# form -- it is exactly what ``recipe_digest`` hashes.  What was missing is the
+# inverse: without it a manifest could be described, validated and hashed but
+# never written down and read back, so nothing could hold a recipe between two
+# calls.  These functions close that loop and are what ``tool_recipes_store``
+# persists through.
+#
+# They stay inside this module's posture.  Reconstruction runs the ordinary
+# dataclass constructors, so every fail-closed manifest check above applies to
+# a manifest read off disk exactly as it applies to one written in Python: an
+# unsafe literal, a non-literal executable, an unknown argv slot or an invalid
+# schema raises ``RecipeError`` instead of yielding a Recipe.  Nothing here
+# executes anything.
+# ---------------------------------------------------------------------------
+
+
+def recipe_payload(recipe: "Recipe") -> dict[str, Any]:
+    """Return the canonical, JSON-safe payload of ``recipe``.
+
+    This is the exact mapping :func:`recipe_digest` hashes, so a payload and
+    the digest of the recipe it came from can never describe different bytes.
+    """
+    if not isinstance(recipe, Recipe):
+        raise RecipeError(REASON_BAD_MANIFEST, "recipe_payload requires a Recipe")
+    return _recipe_payload(recipe)
+
+
+def _field(payload: Mapping[str, Any], key: str) -> Any:
+    """Return one payload field verbatim, absent or not.
+
+    A missing required field arrives as ``None`` and is refused by the
+    constructor it is passed to, which is where every other manifest check
+    already lives; this helper exists so that fail-closed path is not
+    short-circuited into a plausible default on the way there.
+    """
+    return payload.get(key)
+
+
+def _enum_member(enum_cls: Any, value: Any, label: str) -> Any:
+    try:
+        return enum_cls(value)
+    except (ValueError, TypeError):
+        raise RecipeError(REASON_BAD_MANIFEST, f"invalid {label} {value!r}") from None
+
+
+def _str_sequence(value: Any, label: str) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise RecipeError(REASON_BAD_MANIFEST, f"{label} must be a list of strings")
+    for item in value:
+        if not isinstance(item, str):
+            raise RecipeError(REASON_BAD_MANIFEST, f"{label} must be a list of strings")
+    return tuple(value)
+
+
+def _param_from_mapping(payload: Any) -> ParamSpec:
+    if not isinstance(payload, Mapping):
+        raise RecipeError(REASON_BAD_MANIFEST, "parameter payload must be a mapping")
+    item_type = payload.get("item_type")
+    return ParamSpec(
+        name=_field(payload, "name"),
+        type=_enum_member(ParamType, payload.get("type"), "parameter type"),
+        required=bool(payload.get("required", False)),
+        default=payload.get("default"),
+        values=_str_sequence(payload.get("values", ()), "parameter values"),
+        minimum=payload.get("minimum"),
+        maximum=payload.get("maximum"),
+        item_type=(
+            None
+            if item_type is None
+            else _enum_member(ParamType, item_type, "parameter item_type")
+        ),
+        item_values=_str_sequence(payload.get("item_values", ()), "parameter item_values"),
+    )
+
+
+def _output_from_mapping(payload: Any) -> OutputSpec:
+    if not isinstance(payload, Mapping):
+        raise RecipeError(REASON_BAD_MANIFEST, "output payload must be a mapping")
+    description = payload.get("description", "")
+    if not isinstance(description, str):
+        raise RecipeError(REASON_BAD_MANIFEST, "output description must be str")
+    return OutputSpec(
+        name=_field(payload, "name"),
+        type=_enum_member(OutputType, payload.get("type"), "output type"),
+        description=description,
+    )
+
+
+def _bounds_from_mapping(payload: Any) -> ResourceBounds:
+    if payload is None:
+        return ResourceBounds()
+    if not isinstance(payload, Mapping):
+        raise RecipeError(REASON_BAD_MANIFEST, "resource_bounds must be a mapping")
+    return ResourceBounds(
+        max_runtime_seconds=payload.get("max_runtime_seconds"),
+        max_memory_mb=payload.get("max_memory_mb"),
+        max_output_bytes=payload.get("max_output_bytes"),
+    )
+
+
+def _argv_token_from_payload(token: Any) -> ArgvLiteral | ArgvSlot:
+    if isinstance(token, (str, bytes)) or not isinstance(token, (list, tuple)):
+        raise RecipeError(REASON_BAD_MANIFEST, "argv token must be a [kind, text] pair")
+    if len(token) != 2:
+        raise RecipeError(REASON_BAD_MANIFEST, "argv token must be a [kind, text] pair")
+    kind, text = token
+    if not isinstance(text, str):
+        raise RecipeError(REASON_BAD_MANIFEST, "argv token text must be str")
+    if kind == "literal":
+        return ArgvLiteral(text)
+    if kind == "slot":
+        return ArgvSlot(text)
+    raise RecipeError(REASON_BAD_MANIFEST, f"unknown argv token kind {kind!r}")
+
+
+def recipe_from_mapping(payload: Mapping[str, Any]) -> "Recipe":
+    """Reconstruct a :class:`Recipe` from :func:`recipe_payload` output.
+
+    Fail-closed: every field is rebuilt through the ordinary dataclass
+    constructors, so a manifest read off disk is validated exactly as strictly
+    as one written in Python.  A missing field is not defaulted into
+    plausibility -- ``id``, ``version``, ``task_kind``, ``risk_class`` and
+    ``cache_policy`` have no safe default, so their absence raises.
+
+    The round-trip is DIGEST-stable rather than field-identical: unordered
+    collections (``values``, ``item_values``, parameter and output order,
+    platform and capability tags) come back in the canonical sorted order the
+    payload stores them in.  That is the same order :func:`recipe_digest`
+    hashes, so ``recipe_digest(recipe_from_mapping(recipe_payload(r)))``
+    equals ``recipe_digest(r)`` for every valid manifest.
+    """
+    if not isinstance(payload, Mapping):
+        raise RecipeError(REASON_BAD_MANIFEST, "recipe payload must be a mapping")
+    parameters = payload.get("parameters", ())
+    outputs = payload.get("outputs", ())
+    argv = payload.get("argv", ())
+    for label, value in (
+        ("parameters", parameters),
+        ("outputs", outputs),
+        ("argv", argv),
+    ):
+        if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+            raise RecipeError(REASON_BAD_MANIFEST, f"{label} must be a list")
+    return Recipe(
+        id=_field(payload, "id"),
+        version=_field(payload, "version"),
+        purpose=payload.get("purpose", ""),
+        task_kind=_enum_member(TaskKind, payload.get("task_kind"), "task_kind"),
+        parameters=tuple(_param_from_mapping(item) for item in parameters),
+        outputs=tuple(_output_from_mapping(item) for item in outputs),
+        platforms=_str_sequence(payload.get("platforms", ()), "platforms"),
+        capabilities=_str_sequence(payload.get("capabilities", ()), "capabilities"),
+        risk_class=_enum_member(RiskClass, payload.get("risk_class"), "risk_class"),
+        resource_bounds=_bounds_from_mapping(payload.get("resource_bounds")),
+        cache_policy=_enum_member(
+            CachePolicy, payload.get("cache_policy"), "cache_policy"
+        ),
+        argv=tuple(_argv_token_from_payload(token) for token in argv),
+    )

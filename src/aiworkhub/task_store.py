@@ -32,10 +32,11 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .repository_state import (
     HUB_DIRNAME,
@@ -55,6 +56,7 @@ from .storage_registry import (
     resolve_database_path,
 )
 from .provider_tool_guards import ProviderGuardError, apply_repository_guards
+from . import db_writer
 from . import review_lifecycle
 from . import task_fsm
 from .sqlite_readonly import connect_readonly
@@ -220,6 +222,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   origin_thread_id TEXT,
   archived_at TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS idx_task_store_tasks_status ON tasks(status);
 
 CREATE TABLE IF NOT EXISTS task_events (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -313,6 +316,37 @@ def ensure_event_indexes(conn: sqlite3.Connection) -> bool:
     }
     return before != after
 
+# ``tasks`` shipped with only ``sqlite_autoindex_tasks_1`` (the task_id primary
+# key). ``callback_store.seed_missing_review_callbacks`` filters it on
+# ``status IN ('review','blocked')`` on every dispatcher poll and had no index
+# to use. Measured on the real 341MB canonical store (4,628 rows):
+#   before  SCAN tasks / USE TEMP B-TREE FOR ORDER BY  -- median 8.9ms
+#   after   SEARCH tasks USING INDEX ... (status=?)    -- median 3.5ms
+# A composite ``(status, updated_at, task_id)`` was also measured and rejected:
+# identical plan, identical 3.6ms, 5x the build cost, and it does NOT remove the
+# temp B-tree because ``status IN (...)`` scans two disjoint ranges that cannot
+# yield a single global ordering.
+TASK_STATUS_INDEX_SCHEMA = """
+CREATE INDEX IF NOT EXISTS idx_task_store_tasks_status ON tasks(status);
+"""
+
+
+def ensure_task_status_index(conn: sqlite3.Connection) -> bool:
+    """Install the tasks.status index; True when this call created it.
+
+    Runs through the same schema/migration path as ``ensure_event_indexes`` so
+    existing canonical stores gain it on their next readiness upgrade. Never
+    executed against a live database directly.
+    """
+
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "status" not in columns:
+        return False
+    before = {str(row[1]) for row in conn.execute("PRAGMA index_list(tasks)").fetchall()}
+    conn.executescript(TASK_STATUS_INDEX_SCHEMA)
+    after = {str(row[1]) for row in conn.execute("PRAGMA index_list(tasks)").fetchall()}
+    return before != after
+
 
 class TaskStoreError(RuntimeError):
     """Base class for canonical task-store failures. Always fail closed."""
@@ -348,15 +382,58 @@ class StorageReadiness:
         }
 
 
+# ``PRAGMA journal_mode=WAL`` is a no-op read once a database is already in WAL,
+# but the FIRST conversion of a DELETE-mode database is a write that takes an
+# exclusive lock and does raise "database is locked" under a concurrent holder
+# (measured: 301ms to failure against a held BEGIN EXCLUSIVE on a DELETE-mode
+# file). ``callback_store.open_db`` already retries that exact statement on this
+# exact file; this mirrors its constants rather than inventing a second policy.
+_WAL_RETRY_COUNT = 5
+_WAL_RETRY_BACKOFF_S = 0.05
+
+
+def _set_journal_mode_wal(conn: sqlite3.Connection) -> None:
+    """Set WAL, retrying the bounded lock window. Same shape as callback_store."""
+    for attempt in range(_WAL_RETRY_COUNT):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            if attempt == _WAL_RETRY_COUNT - 1:
+                raise
+            time.sleep(_WAL_RETRY_BACKOFF_S * (attempt + 1))
+
+
 def _connect(
-    path: Path, *, readonly: bool = False, busy_timeout_ms: int = 5000
+    path: Path,
+    *,
+    readonly: bool = False,
+    busy_timeout_ms: int = 5000,
+    explicit_txn: bool = False,
 ) -> sqlite3.Connection:
+    """Open the canonical store.
+
+    ``explicit_txn`` opts one connection out of sqlite3's legacy implicit
+    transaction handling (``isolation_level=None``) so the caller states its own
+    ``BEGIN IMMEDIATE``/``COMMIT``. It is deliberately opt-in rather than the
+    module default: ``task_engine`` (7 sites) and ``learning_commit_store``
+    (1 site) also open connections through this function and rely on the
+    implicit transaction, and flipping the default would silently convert their
+    multi-statement writes to autocommit and turn their ``rollback()`` calls
+    into no-ops. ``commit()``/``rollback()`` still work normally on an
+    ``explicit_txn`` connection once a transaction is open, because sqlite3
+    issues them whenever ``sqlite3_get_autocommit()`` is false.
+    """
     bounded_busy = max(0, int(busy_timeout_ms))
     if not readonly:
         path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(path), timeout=5.0)
+        conn = sqlite3.connect(
+            str(path), timeout=5.0, isolation_level=None if explicit_txn else ""
+        )
         conn.execute(f"PRAGMA busy_timeout={bounded_busy}")
-        conn.execute("PRAGMA journal_mode=WAL")
+        _set_journal_mode_wal(conn)
         conn.execute("PRAGMA synchronous=NORMAL")
     else:
         conn = connect_readonly(path, timeout=5.0)
@@ -364,6 +441,54 @@ def _connect(
         conn.execute("PRAGMA query_only=ON")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _begin_immediate(conn: sqlite3.Connection) -> None:
+    """Open an explicit write transaction, idempotently.
+
+    Safe on both an ``explicit_txn`` connection and a legacy one: if a
+    transaction is already open this is a no-op instead of the
+    "cannot start a transaction within a transaction" error.
+    """
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+
+
+@contextmanager
+def _write_connection(
+    db_path: Path,
+    *,
+    timeout_s: float | None = None,
+) -> "Iterator[sqlite3.Connection]":
+    """One serialized canonical writer, ACROSS PROCESSES, for the whole block.
+
+    The measured contention on ``task_queue.sqlite`` is cross-process -- 6,247
+    distinct supervisor processes over history, up to 12 alive at once, each
+    with its own ``pid_start_ticks`` -- so an in-process queue cannot make them
+    take turns. ``db_writer.write_lease`` is an OS-level advisory file lock that
+    every process on the host observes.
+
+    Measured on a production-shaped write (12 processes, ~120ms hold, 23.5KB
+    ``card_json``): without the lease 5/72 transactions died with
+    ``database is locked`` at exactly 5008ms -- the full ``busy_timeout``, burnt
+    by a waiter at the back of the writer queue. With the lease, 0/72 failed and
+    total wall time was unchanged (8.9s vs 9.0s): the tail became bounded
+    WAITING rather than failure. No single >5s lock holder is needed to produce
+    the outage; twelve short holds are enough, which is why one was never found.
+
+    The lease is taken strictly OUTSIDE and BEFORE the connection. ``_connect``
+    issues ``PRAGMA journal_mode=WAL``, which on a not-yet-WAL database is
+    itself a write that can fail on a lock, so connecting outside the lease
+    would leave the first statement of the write path unserialized. Taking it
+    outside also keeps it from ever being acquired inside an open transaction,
+    which is the ordering that could deadlock.
+    """
+    with db_writer.write_lease(db_path, timeout_s=timeout_s):
+        conn = _connect(db_path, explicit_txn=True)
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -400,6 +525,7 @@ def _atomic_init_schema(path: Path) -> None:
             conn.executescript(SCHEMA)
             conn.executescript(review_lifecycle.SCHEMA)
             ensure_event_indexes(conn)
+            ensure_task_status_index(conn)
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.commit()
         finally:
@@ -723,6 +849,7 @@ def _upgrade_compatible_schema(path: Path) -> bool:
                 changed = True
         changed = review_lifecycle.ensure_schema(conn) or changed
         changed = ensure_event_indexes(conn) or changed
+        changed = ensure_task_status_index(conn) or changed
         conn.commit()
     finally:
         conn.close()
@@ -2130,6 +2257,17 @@ def _mark_terminal_review_transaction(
     callback_request_id: str = "",
 ) -> tuple[bool, str, bool]:
     try:
+        # Explicit write transaction. The legacy sqlite3 default would open an
+        # implicit DEFERRED transaction at the first DML instead, leaving the
+        # boundary of this multi-statement write (card UPDATE + task_events
+        # INSERT + callback outbox row) implicit and dependent on driver
+        # behaviour. BEGIN IMMEDIATE states it, and is safe here only because
+        # the caller already holds the cross-process write lease: taken alone
+        # it would widen the write-lock hold to cover the card json.loads /
+        # hashing / json.dumps below and make contention worse, not better
+        # (measured: 12 processes x ~120ms hold, 5/72 -> 0/72 failures come
+        # from the lease, not from this statement).
+        _begin_immediate(conn)
         row = conn.execute(
             "SELECT runner, status, worker_status, archived_at, claimed_by, card_json, "
             "origin_thread_id "
@@ -2258,8 +2396,7 @@ def mark_terminal_review(
     """Route a terminal outcome to review without a callback route."""
 
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
+    with _write_connection(db_path) as conn:
         ok, state, _callback_enqueued = _mark_terminal_review_transaction(
             conn,
             task_id,
@@ -2268,8 +2405,6 @@ def mark_terminal_review(
             evidence=evidence,
         )
         return ok, state
-    finally:
-        conn.close()
 
 
 def mark_terminal_review_with_callback(
@@ -2283,11 +2418,19 @@ def mark_terminal_review_with_callback(
     callback_provider: str,
     callback_request_id: str = "",
 ) -> tuple[bool, str, bool]:
-    """Atomically persist terminal review state, event and callback outbox row."""
+    """Atomically persist terminal review state, event and callback outbox row.
+
+    This is the measured hot spot of the canonical lock class: 452 of the 549
+    recorded runtime lock events (82%) are ``review_transition_failed:database
+    is locked`` raised out of this call and surfaced by
+    ``task_engine.mark_terminal_review`` to ``process_launcher``.  The write is
+    serialized on ``db_writer.write_lease`` so competing supervisor PROCESSES
+    take turns instead of racing SQLite's busy timeout; see
+    ``_write_connection`` for why the lease is taken before the connection.
+    """
 
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
+    with _write_connection(db_path) as conn:
         return _mark_terminal_review_transaction(
             conn,
             task_id,
@@ -2298,8 +2441,6 @@ def mark_terminal_review_with_callback(
             callback_provider=callback_provider,
             callback_request_id=callback_request_id,
         )
-    finally:
-        conn.close()
 
 
 def mark_review_workspace_missing(
@@ -2319,8 +2460,8 @@ def mark_review_workspace_missing(
     """
 
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
         row = conn.execute(
             "SELECT runner, status, worker_status, claimed_by, card_json "
             "FROM tasks WHERE task_id=?",
@@ -2398,8 +2539,6 @@ def mark_review_workspace_missing(
         )
         conn.commit()
         return True, "blocked"
-    finally:
-        conn.close()
 
 
 def mark_launch_failed(
@@ -2419,8 +2558,8 @@ def mark_launch_failed(
     that actually acquired the card.
     """
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
         row = conn.execute(
             "SELECT runner, status, worker_status, claimed_by, card_json "
             "FROM tasks WHERE task_id=?",
@@ -2499,8 +2638,6 @@ def mark_launch_failed(
         )
         conn.commit()
         return True, "blocked"
-    finally:
-        conn.close()
 
 
 # Post-launch failure substatuses this function accepts, routed to the
@@ -2695,8 +2832,8 @@ def mark_terminal_failure(
     if claim_epoch is not None and not _is_bool_safe_int(claim_epoch):
         return False, "expected_claim_epoch_invalid"
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
         row = conn.execute(
             "SELECT runner, status, worker_status, claimed_by, card_json "
             "FROM tasks WHERE task_id=?",
@@ -2794,8 +2931,6 @@ def mark_terminal_failure(
         )
         conn.commit()
         return True, "blocked"
-    finally:
-        conn.close()
 
 
 # ``mark_terminal_failure`` states proving no later attempt could ever move

@@ -1,5 +1,39 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.1 — 2026-09-07
+
+### Fixed
+
+- Review ingest strips unknown finding keys and records them instead of
+  raising, and validates every finding instead of aborting at the first.
+- The quality-review receipt floor is derived from the canonical schema, so a
+  field declared optional is no longer demanded of a receipt.
+- Reviewer children orphaned by a parent relaunch are classified rather than
+  silently skipped.
+- `restore_task` reverses the whole archive in one guarded update, and
+  archive-inconsistency scanning runs in both directions.
+- Terminal transitions carry a typed reason, so an AIWorkHub-minted cause is no
+  longer collapsed into a generic runtime error.
+- Validation lane compatibility is decided before a worker starts, not after it
+  has already spent its tokens.
+- Task-store terminal transitions take a cross-process write lease, converting
+  a busy-timeout failure into bounded waiting.
+
+### Changed
+
+- A measured mechanical failure returns a card for rework instead of spending a
+  reviewer launch; an unmeasured verdict still launches the reviewer.
+- Every card must declare validation commands or name an explicit exemption.
+- Routing withholds an observed value below the minimum sample floor and sorts
+  acceptance ahead of latency.
+- Accept/reject metrics exclude reviewer children and count distinct cards.
+
+### Added
+
+- Tool Recipes has a durable store; an empty panel is now a fact about the
+  repository rather than an artifact of the dashboard.
+- Read efficiency feeds an evidence check, observation-only by default.
+
 ## 0.11.0 — 2026-09-07
 
 ### Fixed

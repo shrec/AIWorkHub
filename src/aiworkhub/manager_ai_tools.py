@@ -16,7 +16,6 @@ from . import core
 from . import context_writes
 from . import context_importer
 from . import context_graph
-from . import cost_ledger
 from . import feature_settings
 from . import learning_commit_store
 from . import needfix_ingest
@@ -260,32 +259,9 @@ def context_graph_rebuild() -> dict[str, Any]:
     return {**result, "manager": manager, "surface": "manager_mcp"}
 
 
-def _workforce_process_rows(repo: Path) -> list[dict[str, Any]]:
-    """Read one authority repository's bounded process ledger without reconcile."""
-    # Import lazily: dashboard imports workforce_catalog during server
-    # bootstrap. Its reader is intentionally read-only and receives the exact
-    # authority repo's process log, avoiding the ambient/default ProcessManager
-    # that may belong to another VS Code window.
-    from . import dashboard
-
-    report = dashboard.read_process_runs(
-        process_log_path=(repo / ".aiworkhub/runtime/process_logs/process_events.jsonl"),
-        limit=1000,
-    )
-    return [dict(item) for item in report.get("processes") or [] if isinstance(item, dict)]
-
-
 def workforce_catalog_read() -> dict[str, Any]:
     def call(ctx: worker_tools.WorkerToolContext) -> dict[str, Any]:
-        ledger = cost_ledger.build_cost_ledger(
-            repo_root=ctx.authority_repo, include_tasks=True
-        )
-        return workforce_catalog.build_catalog(
-            ctx.authority_repo,
-            process_rows=_workforce_process_rows(ctx.authority_repo),
-            usage_rows=ledger.get("tasks") or [],
-            cost_per_accepted_outcome=ledger.get("cost_per_accepted_outcome") or {},
-        )
+        return workforce_catalog.build_routing_catalog(ctx.authority_repo)
 
     return _invoke(
         call
@@ -311,15 +287,7 @@ def workforce_rank(
             tool_needs=tool_needs or [],
             quality_floor=quality_floor,
         )
-        ledger = cost_ledger.build_cost_ledger(
-            repo_root=ctx.authority_repo, include_tasks=True
-        )
-        snapshot = workforce_catalog.build_catalog(
-            ctx.authority_repo,
-            process_rows=_workforce_process_rows(ctx.authority_repo),
-            usage_rows=ledger.get("tasks") or [],
-            cost_per_accepted_outcome=ledger.get("cost_per_accepted_outcome") or {},
-        )
+        snapshot = workforce_catalog.build_routing_catalog(ctx.authority_repo)
         return workforce_catalog.rank_task(ctx.authority_repo, task, catalog=snapshot)
 
     return _invoke(call)

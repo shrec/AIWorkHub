@@ -679,6 +679,21 @@
         "count": 1
       },
       {
+        "path": "src/aiworkhub/db_writer.py",
+        "pattern": "import_fcntl",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/db_writer.py",
+        "pattern": "import_msvcrt",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/db_writer.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
         "path": "src/aiworkhub/deepseek_credentials.py",
         "pattern": "os_name_ne",
         "count": 2
@@ -874,6 +889,11 @@
         "count": 1
       },
       {
+        "path": "src/aiworkhub/tool_recipes_store.py",
+        "pattern": "sqlite_connect",
+        "count": 1
+      },
+      {
         "path": "src/aiworkhub/vscode_lm_bridge.py",
         "pattern": "def_atomic",
         "count": 2
@@ -967,8 +987,8 @@
     "measurement": {
       "reference_commit": "4ef0001cf9ef66fc9ebd70d5b724d46c485b1840",
       "reference_total": 161,
-      "current_total": 139,
-      "accepted_predecessor_delta": -22
+      "current_total": 143,
+      "accepted_predecessor_delta": -18
     }
   }
 }

@@ -5825,6 +5825,176 @@ def test_quality_review_receipt_schema_rejects_missing_findings() -> None:
         )
 
 
+def _canonical_receipt_findings(
+    *, path: str = "src/aiworkhub/x.py", lens: str = "correctness"
+) -> list[dict]:
+    """Produce findings exactly as the canonical reviewer pipeline emits them.
+
+    This is the real two-stage path a submitted receipt travels:
+    quality_reviewer.normalize_packet_findings (the reviewer boundary) followed
+    by quality_evidence.normalize_reviewer_reports (the receipt producer). No
+    hand-written finding literal can stand in for it, because the whole defect
+    was the launcher disagreeing with what these two actually emit.
+    """
+    from aiworkhub import quality_evidence as _qe
+    from aiworkhub import quality_reviewer as _qr
+
+    scope = {
+        "changed_paths": [{"path": path}],
+        "target_symbols": [{"qualified_name": f"{path}.f"}],
+    }
+    packet = {
+        "candidate": {
+            "scoped_audits": {lens: {"packet": scope}},
+            "changed_paths": [{"path": path}],
+        },
+        "mechanical_checks": [{"check_id": "ruff"}],
+        "combined_tree_checks": [],
+    }
+    normalized = _qr.normalize_packet_findings(
+        packet,
+        lens=lens,
+        findings=[
+            {
+                "severity": "high",
+                "summary": "off-by-one in the bound",
+                "evidence": f"{path}:10-12 compares with <= instead of <",
+            }
+        ],
+    )
+    reports, errors = _qe.normalize_reviewer_reports(
+        [
+            {
+                "lens": lens,
+                "provider": "deepseek_vscode_lm",
+                "read_only": True,
+                "can_mutate_repo": False,
+                "findings": normalized,
+            }
+        ]
+    )
+    assert not errors, errors
+    return reports[0]["findings"]
+
+
+def test_quality_review_receipt_schema_accepts_canonical_normalizer_output() -> None:
+    """The launcher must accept what the canonical normalizer actually emits.
+
+    The validator floor used to be quality_reviewer's full emit-set, so a
+    receipt built by the canonical pipeline was rejected at the last step of
+    finalization with quality_review_finding_0_keys_invalid, discarding a
+    complete reviewer run.
+    """
+    findings = _canonical_receipt_findings()
+    receipt = _sealed_reviewer_receipt()
+    receipt["report"]["findings"] = findings
+
+    validated = process_launcher._enforce_quality_review_receipt_schema(
+        receipt, "deepseek_vscode_lm"
+    )
+    assert validated["report"]["findings"] == findings
+
+
+def test_quality_review_receipt_schema_accepts_finding_without_category() -> None:
+    """A finding carrying no ``category`` is the dominant real receipt shape.
+
+    ``category`` is optional in the canonical finding schema and the receipt
+    producer only passes it through when supplied, so requiring it refused the
+    great majority of durable receipts.
+    """
+    findings = _canonical_receipt_findings()
+    findings[0].pop("category")
+    receipt = _sealed_reviewer_receipt()
+    receipt["report"]["findings"] = findings
+
+    validated = process_launcher._enforce_quality_review_receipt_schema(
+        receipt, "deepseek_vscode_lm"
+    )
+    assert "category" not in validated["report"]["findings"][0]
+
+
+def test_quality_review_receipt_schema_still_rejects_unknown_finding_key() -> None:
+    """Widening the floor must not admit a key outside the canonical ceiling."""
+    findings = _canonical_receipt_findings()
+    findings[0]["verdict"] = "reject"
+    receipt = _sealed_reviewer_receipt()
+    receipt["report"]["findings"] = findings
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_finding_0_keys_invalid",
+    ):
+        process_launcher._enforce_quality_review_receipt_schema(
+            receipt, "deepseek_vscode_lm"
+        )
+
+
+def test_quality_review_receipt_schema_still_rejects_missing_required_key() -> None:
+    """``actionable`` is emitted unconditionally, so its absence stays fatal."""
+    findings = _canonical_receipt_findings()
+    findings[0].pop("actionable")
+    receipt = _sealed_reviewer_receipt()
+    receipt["report"]["findings"] = findings
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_finding_0_keys_invalid",
+    ):
+        process_launcher._enforce_quality_review_receipt_schema(
+            receipt, "deepseek_vscode_lm"
+        )
+
+
+def test_quality_review_receipt_schema_floor_keeps_value_checks_fail_closed() -> None:
+    """A key the floor no longer demands is still enforced by value.
+
+    ``disposition`` is optional in the canonical finding schema, so it left the
+    presence floor.  It stays mandatory in practice because the check
+    immediately below refuses an absent or unusable value, and ``actionable``
+    must equal ``disposition == "defect"``.  A receipt therefore cannot smuggle
+    a finding through by omitting it.
+    """
+    findings = _canonical_receipt_findings()
+    findings[0].pop("disposition")
+    receipt = _sealed_reviewer_receipt()
+    receipt["report"]["findings"] = findings
+
+    assert "disposition" not in (
+        process_launcher._QUALITY_REVIEW_FINDING_RECEIPT_REQUIRED_KEYS
+    )
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_finding_0_disposition_invalid",
+    ):
+        process_launcher._enforce_quality_review_receipt_schema(
+            receipt, "deepseek_vscode_lm"
+        )
+
+
+def test_quality_review_finding_floor_is_derived_not_restated() -> None:
+    """The floor must stay derived from quality_reviewer's own vocabularies.
+
+    A second hand-maintained copy of the key set is what let the launcher and
+    the normalizer disagree in the first place.
+    """
+    from aiworkhub import quality_reviewer as _qr
+
+    assert process_launcher._QUALITY_REVIEW_FINDING_RECEIPT_REQUIRED_KEYS == (
+        _qr.QUALITY_REVIEW_FINDING_REQUIRED_KEYS
+        - (
+            _qr.QUALITY_REVIEW_FINDING_INPUT_KEYS
+            - _qr.QUALITY_REVIEW_FINDING_INPUT_REQUIRED_KEYS
+        )
+    )
+    # The floor stays a real subset of the ceiling: still fail-closed, never a
+    # no-op that would accept any object at all.
+    assert process_launcher._QUALITY_REVIEW_FINDING_RECEIPT_REQUIRED_KEYS
+    assert (
+        process_launcher._QUALITY_REVIEW_FINDING_RECEIPT_REQUIRED_KEYS
+        < _qr.QUALITY_REVIEW_FINDING_KEYS
+    )
+
+
 def test_native_cli_large_packet_uses_file_transport_avoiding_argv_e2big(
     tmp_path: Path,
 ) -> None:
@@ -10642,7 +10812,9 @@ def test_worker_launch_env_exposes_canonical_validation_affordances(tmp_path):
     # Caches land inside the request-owned writable temp, never the worktree.
     assert env["RUFF_CACHE_DIR"] == str(Path(env["TMPDIR"]) / "ruff-cache")
     assert env["MYPY_CACHE_DIR"] == str(Path(env["TMPDIR"]) / "mypy-cache")
-    assert env["PYTEST_ADDOPTS"] == "-p no:cacheprovider"
+    # Bound to the canonical constant, not a literal: worker_workspace owns the
+    # worker validation ADDOPTS string and grew it a traceback-shaping flag.
+    assert env["PYTEST_ADDOPTS"] == worker_workspace._WORKER_PYTEST_ADDOPTS
     # The sanitized PATH is untouched: the affordance is an explicit variable,
     # never a PATH widening.
     assert env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
@@ -10677,7 +10849,9 @@ def test_worker_launch_env_omits_missing_or_untrusted_affordances(tmp_path):
     )
     assert "AIWORKHUB_CANONICAL_PYTHON" not in env
     assert "AIWORKHUB_CANONICAL_RUFF" not in env
-    assert env["PYTEST_ADDOPTS"] == "-p no:cacheprovider"
+    # Bound to the canonical constant, not a literal: worker_workspace owns the
+    # worker validation ADDOPTS string and grew it a traceback-shaping flag.
+    assert env["PYTEST_ADDOPTS"] == worker_workspace._WORKER_PYTEST_ADDOPTS
     # A ruff that escapes the venv root by symlink is untrusted and omitted.
     venv_bin = repo / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
@@ -11215,3 +11389,557 @@ def test_validation_capability_preflight_accepts_supported_command_forms(
         tmp_path, {"allowed_writes": [], "validation": [command]}
     ) == ()
     assert probed_modules == ([] if expected_module is None else [expected_module])
+
+
+# --------------------------------------------------------------------------- #
+# Finalizer retry exhaustion is classified, not assumed.
+#
+# ``_finalize_after_process_exit`` retries reconciliation three times inside a
+# 250ms budget and then terminalized every failure shape alike as
+# ``finalize_failed`` -- permanently blocking the card. Exhaustion has exactly
+# two shapes and only one of them may be re-armed:
+#
+#   TRANSIENT  every attempt ended on a contended/temporarily-unavailable
+#              boundary (``OSError`` and subclasses, ``sqlite3.OperationalError``).
+#              Those lock windows are measured in seconds; 250ms cannot outlast
+#              them, so the run defers as ``reconcile_pending`` and the
+#              reconciler re-arms it -- bounded by a finite per-request budget so
+#              a deterministic transient-shaped failure still settles.
+#
+#   DECIDED    an attempt that produced no terminal event, or failed for any
+#              other reason. The only ``None`` return of
+#              ``_finalize_isolated_request`` that survives to exhaustion under a
+#              MISMATCH verdict is missing/unusable request metadata, which
+#              ``retry_finalization`` refuses forever as
+#              ``finalization_retry_metadata_invalid``; re-arming it could only
+#              loop. It stays terminal.
+# --------------------------------------------------------------------------- #
+
+
+def _finalizer_manager(tmp_path: Path) -> process_launcher.ProcessManager:
+    repo = tmp_path / "finalizer_repo"
+    repo.mkdir(exist_ok=True)
+    return process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "finalizer_events.jsonl",
+        process_dir=tmp_path / "finalizer_processes",
+        isolation_enabled=False,
+    )
+
+
+def _seed_finalizer_request(
+    mgr: process_launcher.ProcessManager,
+    request_id: str,
+    task_id: str,
+    runner: str,
+    state: str = "finalizing",
+) -> None:
+    mgr._append_event({
+        "request_id": request_id,
+        "task_id": task_id,
+        "runner": runner,
+        "topic": "task_mcp",
+        "state": state,
+    })
+
+
+def _capture_terminal_failures(monkeypatch, *, result=None) -> list:
+    """Record every ``mark_terminal_failure`` call so a test can prove the card
+    was -- or was not -- moved to a terminal state at all."""
+    calls: list = []
+
+    def _mark(*args, **kwargs):
+        calls.append((args, kwargs))
+        return dict(result or {"ok": True, "callback_enqueued": True})
+
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_failure", _mark)
+    return calls
+
+
+def test_finalizer_transient_exhaustion_defers_instead_of_blocking_the_card(
+    tmp_path, monkeypatch
+) -> None:
+    """Losing three attempts to a contended SQLite boundary inside 250ms is not
+    evidence the card failed. The run must defer for the reconciler and must not
+    move the card to a terminal state at all."""
+    monkeypatch.setattr(process_launcher.time, "sleep", lambda *a, **k: None)
+    mgr = _finalizer_manager(tmp_path)
+    rid, tid, runner = "req-transient", "TASK-TRANSIENT", "worker-t"
+    _seed_finalizer_request(mgr, rid, tid, runner)
+    calls = _capture_terminal_failures(monkeypatch)
+
+    attempts = {"n": 0}
+
+    def _contended(request_id, supervisor_returncode=None, *, lock_blocking=True):
+        attempts["n"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(mgr, "_finalize_isolated_request", _contended)
+
+    event = mgr._finalize_after_process_exit(rid)
+
+    assert attempts["n"] == 3, "the bounded retry loop still runs in full"
+    assert event["state"] == "reconcile_pending"
+    assert event["state"] not in process_launcher.TERMINAL_PROCESS_STATES
+    assert event["state"] in process_launcher.FINALIZATION_PENDING_STATES
+    assert (
+        event["reconciliation_deferred"]
+        == process_launcher.FINALIZER_TRANSIENT_DEFERRAL_REASON
+    )
+    assert event["finalizer_transient_deferral"] is True
+    assert event["finalizer_transient_deferrals"] == 1
+    assert event["workspace_retained"] is True
+    assert event.get("finalizer_abandoned") is False
+    # The whole point: the card was never terminalized, so a human is not the
+    # thing that has to re-arm it.
+    assert calls == []
+    assert mgr.abandoned_finalizations() == []
+
+
+def test_finalizer_transient_deferral_is_picked_up_by_the_reconciler(
+    tmp_path, monkeypatch
+) -> None:
+    """A deferred run must actually be re-armed: ``reconcile_pending`` is a
+    finalization-pending state, so the reconciler retries it unaided."""
+    monkeypatch.setattr(process_launcher.time, "sleep", lambda *a, **k: None)
+    mgr = _finalizer_manager(tmp_path)
+    rid, tid, runner = "req-rearm", "TASK-REARM", "worker-r"
+    _seed_finalizer_request(mgr, rid, tid, runner)
+    _capture_terminal_failures(monkeypatch)
+
+    attempts = {"n": 0}
+    settled = {"event": None}
+
+    def _contended_then_settles(
+        request_id, supervisor_returncode=None, *, lock_blocking=True
+    ):
+        attempts["n"] += 1
+        if attempts["n"] <= 3:
+            raise OSError(errno.EAGAIN, "resource temporarily unavailable")
+        settled["event"] = mgr._append_event({
+            "request_id": request_id,
+            "task_id": tid,
+            "runner": runner,
+            "topic": "task_mcp",
+            "state": "review_ready",
+        })
+        return settled["event"]
+
+    monkeypatch.setattr(mgr, "_finalize_isolated_request", _contended_then_settles)
+
+    deferred = mgr._finalize_after_process_exit(rid)
+    assert deferred["state"] == "reconcile_pending"
+
+    # The reconciler alone -- no operator, no retry_finalization call -- carries
+    # it the rest of the way.
+    stats = mgr._reconcile_persisted_requests()
+    assert stats["finalized"] == 1
+    assert mgr._latest_by_request()[rid]["state"] == "review_ready"
+
+
+def test_finalizer_no_terminal_event_exhaustion_stays_terminal(
+    tmp_path, monkeypatch
+) -> None:
+    """A run that produced no terminal event is decided, never transient.
+
+    Its only stable cause under a MISMATCH identity verdict is missing/unusable
+    request metadata, which ``retry_finalization`` refuses forever as
+    ``finalization_retry_metadata_invalid`` -- auto re-arming it could only spin.
+    """
+    monkeypatch.setattr(process_launcher.time, "sleep", lambda *a, **k: None)
+    mgr = _finalizer_manager(tmp_path)
+    rid, tid, runner = "req-nometa", "TASK-NOMETA", "worker-n"
+    _seed_finalizer_request(mgr, rid, tid, runner)
+    calls = _capture_terminal_failures(monkeypatch)
+
+    monkeypatch.setattr(
+        mgr,
+        "_finalize_isolated_request",
+        lambda request_id, supervisor_returncode=None, *, lock_blocking=True: None,
+    )
+
+    event = mgr._finalize_after_process_exit(rid)
+
+    assert event["state"] == "finalize_failed"
+    assert event["state"] in process_launcher.TERMINAL_PROCESS_STATES
+    assert event.get("reconciliation_deferred") is None
+    assert event.get("finalizer_transient_deferral") is None
+    assert len(calls) == 1
+    assert calls[0][0][3] == "finalize_failed"
+    assert "no_terminal_event" in calls[0][1]["evidence"]["error"]
+
+
+def test_finalizer_mixed_exhaustion_causes_stay_terminal(tmp_path, monkeypatch) -> None:
+    """Fail-closed: deferral requires that EVERY attempt was transient. One
+    decided attempt settles the whole run."""
+    monkeypatch.setattr(process_launcher.time, "sleep", lambda *a, **k: None)
+    mgr = _finalizer_manager(tmp_path)
+    rid, tid, runner = "req-mixed", "TASK-MIXED", "worker-m"
+    _seed_finalizer_request(mgr, rid, tid, runner)
+    calls = _capture_terminal_failures(monkeypatch)
+
+    outcomes = [OSError(errno.EAGAIN, "busy"), None, OSError(errno.EAGAIN, "busy")]
+
+    def _mixed(request_id, supervisor_returncode=None, *, lock_blocking=True):
+        outcome = outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+        return None
+
+    monkeypatch.setattr(mgr, "_finalize_isolated_request", _mixed)
+
+    event = mgr._finalize_after_process_exit(rid)
+
+    assert event["state"] == "finalize_failed"
+    assert event.get("finalizer_transient_deferral") is None
+    assert len(calls) == 1
+
+
+def test_finalizer_non_transient_exception_stays_terminal(tmp_path, monkeypatch) -> None:
+    """An exception that names no contended resource is not a retry signal: only
+    the named transient types defer."""
+    monkeypatch.setattr(process_launcher.time, "sleep", lambda *a, **k: None)
+    mgr = _finalizer_manager(tmp_path)
+    rid, tid, runner = "req-bug", "TASK-BUG", "worker-g"
+    _seed_finalizer_request(mgr, rid, tid, runner)
+    calls = _capture_terminal_failures(monkeypatch)
+
+    def _programming_error(request_id, supervisor_returncode=None, *, lock_blocking=True):
+        raise TypeError("unhashable type")
+
+    monkeypatch.setattr(mgr, "_finalize_isolated_request", _programming_error)
+
+    event = mgr._finalize_after_process_exit(rid)
+
+    assert event["state"] == "finalize_failed"
+    assert event.get("finalizer_transient_deferral") is None
+    assert len(calls) == 1
+
+
+def test_finalizer_transient_deferral_is_bounded_and_settles(
+    tmp_path, monkeypatch
+) -> None:
+    """Deferral must never become an unbounded re-arm loop: a deterministic
+    transient-shaped failure settles once the per-request budget is spent."""
+    monkeypatch.setattr(process_launcher.time, "sleep", lambda *a, **k: None)
+    mgr = _finalizer_manager(tmp_path)
+    rid, tid, runner = "req-bounded", "TASK-BOUNDED", "worker-b"
+    _seed_finalizer_request(mgr, rid, tid, runner)
+    calls = _capture_terminal_failures(monkeypatch)
+
+    def _always_contended(request_id, supervisor_returncode=None, *, lock_blocking=True):
+        raise OSError(errno.EAGAIN, "resource temporarily unavailable")
+
+    monkeypatch.setattr(mgr, "_finalize_isolated_request", _always_contended)
+
+    budget = process_launcher.FINALIZER_TRANSIENT_DEFERRAL_BUDGET
+    states = []
+    for _ in range(budget + 3):
+        mgr._reconcile_persisted_requests()
+        states.append(mgr._latest_by_request()[rid]["state"])
+
+    assert states[:budget] == ["reconcile_pending"] * budget
+    assert states[budget:] == ["finalize_failed"] * (len(states) - budget)
+    # Terminal means terminal: the reconciler stops picking it up, so the card
+    # is terminalized exactly once no matter how many passes run.
+    assert len(calls) == 1
+
+    deferrals = [
+        event
+        for event in mgr._request_events(rid)
+        if event.get("finalizer_transient_deferral")
+    ]
+    assert [event["finalizer_transient_deferrals"] for event in deferrals] == list(
+        range(1, budget + 1)
+    )
+
+
+def test_finalizer_transient_deferral_still_reaches_abandonment(
+    tmp_path, monkeypatch
+) -> None:
+    """Deferral delays a decision, it never prevents one: a card that is no
+    longer processing still abandons with its named cause once the budget is
+    spent."""
+    monkeypatch.setattr(process_launcher.time, "sleep", lambda *a, **k: None)
+    mgr = _finalizer_manager(tmp_path)
+    rid, tid, runner = "req-gone", "TASK-GONE", "worker-x"
+    _seed_finalizer_request(mgr, rid, tid, runner)
+    _capture_terminal_failures(
+        monkeypatch, result={"ok": False, "stderr": "not_processing:current=archived"}
+    )
+
+    def _always_contended(request_id, supervisor_returncode=None, *, lock_blocking=True):
+        raise OSError(errno.EAGAIN, "resource temporarily unavailable")
+
+    monkeypatch.setattr(mgr, "_finalize_isolated_request", _always_contended)
+
+    budget = process_launcher.FINALIZER_TRANSIENT_DEFERRAL_BUDGET
+    for _ in range(budget + 2):
+        mgr._reconcile_persisted_requests()
+
+    latest = mgr._latest_by_request()[rid]
+    assert latest["state"] == "finalize_abandoned"
+    assert latest["state"] in process_launcher.TERMINAL_PROCESS_STATES
+    assert [a["request_id"] for a in mgr.abandoned_finalizations()] == [rid]
+
+
+def test_finalizer_attempt_transience_vocabulary_is_closed() -> None:
+    """The transient set is a named closed vocabulary, not "any exception"."""
+    is_transient = process_launcher._finalizer_attempt_is_transient
+    assert is_transient(OSError("io")) is True
+    assert is_transient(PermissionError("locked")) is True
+    assert is_transient(BlockingIOError("busy")) is True
+    assert is_transient(sqlite3.OperationalError("database is locked")) is True
+    # No terminal event is a decided outcome, never a retry.
+    assert is_transient(None) is False
+    assert is_transient(RuntimeError("no_terminal_event")) is False
+    assert is_transient(TypeError("bug")) is False
+    assert is_transient(ValueError("bad json")) is False
+
+
+# --- reject_review: the canonical return-for-rework surface -------------------
+#
+# review_orchestrator cannot import core (circular), so the only way the review
+# queue can return a mechanically failing candidate for rework is through this
+# manager method. It is a delegation, not a second implementation: core owns
+# the disposition vocabulary, the atomic `WHERE worker_status='review'` move,
+# the reject_review event, the reviewer-child finalization and the learning
+# duty. What is checked here is everything core CANNOT check for itself --
+# above all that the manager and core agree on which repository they are in,
+# because core resolves the card through its module-global binding while this
+# manager is bound to self.repo.
+
+
+def _reject_manager(tmp_path: Path) -> process_launcher.ProcessManager:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    return process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        isolation_enabled=False,
+    )
+
+
+def _never_called(monkeypatch: pytest.MonkeyPatch) -> list:
+    seen: list = []
+
+    def _reject(*args, **kwargs):
+        seen.append((args, kwargs))
+        return {"ok": True}
+
+    monkeypatch.setattr(process_launcher.core, "reject_review", _reject)
+    return seen
+
+
+def test_reject_review_delegates_to_core_and_returns_its_result_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The core result passes through whole; nothing is re-wrapped or dropped."""
+    mgr = _reject_manager(tmp_path)
+    monkeypatch.setattr(process_launcher.core, "repo_root", lambda: mgr.repo)
+    calls: list = []
+
+    def _reject(task_id, reason, to="pending"):
+        calls.append((task_id, reason, to))
+        return {
+            "ok": True,
+            "returncode": 0,
+            "command": [],
+            "stdout": '{"task_id": "T-1", "status": "pending"}',
+            "stderr": "",
+            "reviewer_finalization": {"finalized": ["reviewer-1"]},
+            "learning_commit_owed": {"outcome": "rejected", "evidence": "file:x"},
+        }
+
+    monkeypatch.setattr(process_launcher.core, "reject_review", _reject)
+
+    result = mgr.reject_review("T-1", "  mechanically_failing_candidate:n=2  ")
+
+    assert calls == [("T-1", "mechanically_failing_candidate:n=2", "pending")]
+    assert result["ok"] is True
+    assert result["task_id"] == "T-1"
+    assert result["to"] == "pending"
+    assert result["stdout"] == '{"task_id": "T-1", "status": "pending"}'
+    # The two products of a rejection that nothing else can recompute later.
+    assert result["reviewer_finalization"] == {"finalized": ["reviewer-1"]}
+    assert result["learning_commit_owed"] == {
+        "outcome": "rejected", "evidence": "file:x"
+    }
+    assert "error" not in result
+
+
+def test_reject_review_refuses_a_repository_authority_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manager bound elsewhere must never reach core.
+
+    core.reject_review resolves its card through core's module-global
+    repository, not through self.repo. A manager pointed at a different tree
+    would therefore reject whatever card happens to carry that id THERE --
+    destroying a completed review in a repository it was never asked about.
+    The mismatch is named in the result so it cannot be read as "not found".
+    """
+    mgr = _reject_manager(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.setattr(process_launcher.core, "repo_root", lambda: other)
+    seen = _never_called(monkeypatch)
+
+    result = mgr.reject_review("T-1", "why")
+
+    assert seen == [], "a mismatched manager must never reach core"
+    assert result["ok"] is False
+    assert result["error"] == "repo_authority_mismatch"
+    assert result["task_id"] == "T-1"
+    assert result["manager_repo"] == str(mgr.repo)
+    assert result["core_repo"] == str(other)
+
+
+def test_reject_review_refuses_when_the_repository_root_cannot_be_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """repo_root() raises on a contradictory environment. Unknown is not equal."""
+    mgr = _reject_manager(tmp_path)
+
+    def _boom():
+        raise RuntimeError("repo_root_env_mismatch:AIWORKHUB_REPO_ROOT=/a:AIWORKHUB_REPO=/b")
+
+    monkeypatch.setattr(process_launcher.core, "repo_root", _boom)
+    seen = _never_called(monkeypatch)
+
+    result = mgr.reject_review("T-1", "why")
+
+    assert seen == []
+    assert result["ok"] is False
+    assert result["error"] == "repo_authority_unavailable:RuntimeError"
+
+
+@pytest.mark.parametrize(
+    ("task_id", "reason", "error"),
+    [
+        ("T-1", "", "reject_reason_required"),
+        ("T-1", "   ", "reject_reason_required"),
+        ("T-1", None, "reject_reason_required"),
+        ("", "why", "task_id_required"),
+        ("   ", "why", "task_id_required"),
+        (None, "why", "task_id_required"),
+    ],
+)
+def test_reject_review_refuses_an_unexplained_or_unidentified_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    task_id: object, reason: object, error: str,
+) -> None:
+    """A card may not leave review without a reason and an identity.
+
+    A rejection with no recorded reason is a state transition nobody can
+    dispose of afterwards -- this repository's worst defect class. Refusing
+    costs one reviewer launch; accepting costs a card nobody can explain.
+    """
+    mgr = _reject_manager(tmp_path)
+    monkeypatch.setattr(process_launcher.core, "repo_root", lambda: mgr.repo)
+    seen = _never_called(monkeypatch)
+
+    result = mgr.reject_review(task_id, reason)
+
+    assert seen == [], "core must not be reached with an incomplete intent"
+    assert result["ok"] is False
+    assert result["error"] == error
+
+
+def test_reject_review_surfaces_a_core_refusal_as_a_readable_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """core refuses a row that is no longer in review; that must read as one field.
+
+    core returns the canonical lifecycle shape (stderr carries the reason),
+    while every caller of this manager reads ``error``. Both are present, so
+    neither a canonical reader nor an orchestrator reader has to guess.
+    """
+    mgr = _reject_manager(tmp_path)
+    monkeypatch.setattr(process_launcher.core, "repo_root", lambda: mgr.repo)
+    monkeypatch.setattr(
+        process_launcher.core, "reject_review",
+        lambda *_a, **_k: {
+            "ok": False, "returncode": 1, "command": [], "stdout": "",
+            "stderr": "reject_not_reviewable:task_id=T-1",
+        },
+    )
+
+    result = mgr.reject_review("T-1", "why")
+
+    assert result["ok"] is False
+    assert result["error"] == "reject_not_reviewable:task_id=T-1"
+    assert result["stderr"] == "reject_not_reviewable:task_id=T-1"
+    assert result["task_id"] == "T-1"
+
+
+@pytest.mark.parametrize("bad", [None, [], "ok", 0])
+def test_reject_review_refuses_a_result_shape_it_cannot_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: object
+) -> None:
+    """An unreadable result is never optimistically read as success."""
+    mgr = _reject_manager(tmp_path)
+    monkeypatch.setattr(process_launcher.core, "repo_root", lambda: mgr.repo)
+    monkeypatch.setattr(
+        process_launcher.core, "reject_review", lambda *_a, **_k: bad
+    )
+
+    result = mgr.reject_review("T-1", "why")
+
+    assert result["ok"] is False
+    assert result["error"] == "reject_review_result_invalid"
+
+
+def test_reject_review_forwards_the_disposition_for_core_to_validate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """core owns the disposition vocabulary; this method keeps no second copy.
+
+    pending / blocked / archived / superseded are validated in exactly one
+    place. A duplicate list here would drift, and the two would disagree about
+    what a rejection is allowed to do.
+    """
+    mgr = _reject_manager(tmp_path)
+    monkeypatch.setattr(process_launcher.core, "repo_root", lambda: mgr.repo)
+    calls: list = []
+    monkeypatch.setattr(
+        process_launcher.core, "reject_review",
+        lambda task_id, reason, to="pending": (
+            calls.append((task_id, reason, to)) or {"ok": True}
+        ),
+    )
+
+    mgr.reject_review("T-1", "why", to="blocked")
+    mgr.reject_review("T-1", "why", to="not_a_disposition")
+
+    assert calls == [
+        ("T-1", "why", "blocked"),
+        ("T-1", "why", "not_a_disposition"),
+    ]
+
+
+def test_process_manager_satisfies_the_review_orchestrator_manager_protocol(
+) -> None:
+    """Green tests do not prove the new code is ever called. This proves reach.
+
+    review_orchestrator.Manager is a structural Protocol -- nothing checks it
+    at runtime -- so a signature drift between the two files would surface only
+    as a live rejection silently degrading to "manager_has_no_reject_review".
+    """
+    import inspect
+
+    from aiworkhub import review_orchestrator
+
+    for name in ("_append_event", "launch_quality_reviewer", "accept_review",
+                 "reject_review", "status"):
+        assert callable(getattr(process_launcher.ProcessManager, name, None)), name
+
+    sig = inspect.signature(process_launcher.ProcessManager.reject_review)
+    assert list(sig.parameters) == ["self", "task_id", "reason", "to"]
+    assert sig.parameters["to"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["to"].default == "pending"
+
+    protocol = inspect.signature(review_orchestrator.Manager.reject_review)
+    assert list(protocol.parameters) == ["self", "task_id", "reason", "to"]
+    assert protocol.parameters["to"].kind is inspect.Parameter.KEYWORD_ONLY

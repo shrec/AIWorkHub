@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 import uuid
 from contextlib import closing
 from dataclasses import dataclass
@@ -61,6 +62,83 @@ def canonical_review_db(manager: Manager) -> Path | None:
     return Path(readiness.canonical_db) if readiness.ready else None
 
 
+# --- routing catalog -----------------------------------------------------
+#
+# ``workforce_catalog.rank_task`` defaults ``catalog`` to a bare
+# ``build_catalog(repo)``, whose ``process_rows`` and ``usage_rows`` default to
+# empty (workforce_catalog.py:735-750). Ranked on no evidence at all, every
+# eligible candidate ties on all nine substantive keys and selection falls
+# through to the final lexical ``(provider, model, worker_id)`` tie-break: the
+# reviewer for ``risk="critical"`` work chosen by string ordering, a decision
+# that looks successful from the outside. Measured here before this call was
+# wired: 2 eligible candidates, both accepted_rate=0.5, sample_count=0,
+# p50=3600.0, and NO key differing between them.
+#
+# ``build_routing_catalog`` is the one place that joins the process ledger and
+# the cost ledger onto the catalog, so the ranking sees the evidence this
+# repository already holds.
+#
+# It COSTS time, it does not save it: measured bare rank_task 2.20s vs 3.69s
+# through the parameterised path, +1.49s per reviewer launch. The justification
+# is an evidenced decision, never speed. Because one ``drain`` pass runs up to
+# 12 actions, the catalog is memoised so that cost is paid once per pass rather
+# than once per launch.
+_ROUTING_CATALOG_TTL_SECONDS = 60.0
+_ROUTING_CATALOG_CACHE: dict[str, tuple[float, Mapping[str, Any]]] = {}
+
+
+def reset_routing_catalog_cache() -> None:
+    """Drop the memoised routing catalog. Called at the top of every pass."""
+    _ROUTING_CATALOG_CACHE.clear()
+
+
+def _usable_catalog(built: Any) -> Mapping[str, Any] | None:
+    """Return a catalog only if it can actually rank; otherwise None.
+
+    ``rank_task`` does ``dict(catalog or build_catalog(repo))``, so a falsy
+    catalog already degrades to the conservative prior on its own. A catalog
+    that is truthy but carries no workers does NOT: it ranks zero candidates,
+    yields ``launch_contract=None`` and takes the reviewer launch down with it.
+    That shape is rejected here so it can never reach ``rank_task``.
+    """
+    if not isinstance(built, Mapping):
+        return None
+    workers = built.get("workers")
+    if not isinstance(workers, (list, tuple)) or not workers:
+        return None
+    return built
+
+
+def routing_catalog(repo: Path) -> Mapping[str, Any] | None:
+    """Return the evidenced routing catalog, or None to rank on the prior.
+
+    Fail closed means the REVIEW still happens. A reviewer chosen on the
+    conservative prior is a worse decision than one chosen on evidence; a
+    reviewer that never launches at all, because reading a ledger raised, is
+    worse than both. So every failure degrades to None, and the caller ranks
+    exactly as it did before this helper existed.
+    """
+    key = str(repo)
+    cached = _ROUTING_CATALOG_CACHE.get(key)
+    now = time.monotonic()
+    if cached is not None and (now - cached[0]) < _ROUTING_CATALOG_TTL_SECONDS:
+        return cached[1]
+    try:
+        built = workforce_catalog.build_routing_catalog(repo)
+    except Exception:
+        # Deliberately broad. This reads the cost ledger and, through a lazy
+        # ``from . import dashboard``, the process ledger -- a chain that can
+        # raise OSError, sqlite3.Error, ValueError on a malformed row, or
+        # ImportError/SyntaxError from a module mid-edit (observed live during
+        # this change). Any of them must cost evidence, never the review.
+        return None
+    catalog = _usable_catalog(built)
+    if catalog is None:
+        return None
+    _ROUTING_CATALOG_CACHE[key] = (now, catalog)
+    return catalog
+
+
 def select_reviewer_route(repo: Path, reviewer_task_id: str, lens: str) -> Mapping[str, Any]:
     """Select one currently available review worker through canonical policy."""
     readiness = task_store.storage_readiness(repo)
@@ -73,7 +151,10 @@ def select_reviewer_route(repo: Path, reviewer_task_id: str, lens: str) -> Mappi
         risk="critical",
         tool_needs=("source-graph", "session-manager", "ai-memory", "kb"),
     )
-    contract = workforce_catalog.rank_task(repo, task).get("launch_contract")
+    # A None catalog makes rank_task rebuild the bare one itself, which is
+    # precisely the conservative-prior ranking this did unconditionally before.
+    ranked = workforce_catalog.rank_task(repo, task, catalog=routing_catalog(repo))
+    contract = ranked.get("launch_contract")
     if not isinstance(contract, Mapping):
         raise RuntimeError("review_route_unavailable:" + lens)
     route = {
@@ -397,6 +478,11 @@ class ReviewOrchestrator:
 
     def drain(self, *, max_actions: int = 1, now: datetime | None = None) -> DrainResult:
         """Claim and execute a bounded number of lifecycle effects exactly once."""
+        # One routing catalog per pass, not per action. This pass runs up to 12
+        # actions and each launch would otherwise rebuild it at +1.49s measured;
+        # the reset also keeps a pass from ever ranking on a previous pass's
+        # ledger, so evidence can go stale within a pass but never across one.
+        reset_routing_catalog_cache()
         instant = now or datetime.now(timezone.utc)
         attempted = completed = failed = pending = 0
         for _ in range(max(0, min(int(max_actions), 12))):

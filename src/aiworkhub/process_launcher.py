@@ -66,7 +66,7 @@ from . import quality_evidence
 from . import quality_review_ingest
 from . import quality_review_scope
 from . import process_event_ledger
-from . import storage_retention
+from . import storage_retention, terminal_failure_classification
 from .process_launcher_acceptance import accepted_outcome_receipt as _accepted_outcome_receipt
 from .process_launcher_acceptance import changed_path_hashes as _changed_path_hashes
 from .process_launcher_acceptance import finished_acceptance_result as _finished_acceptance_result
@@ -135,6 +135,22 @@ except ImportError:
     project_context = _FallbackProjectContext()  # type: ignore[assignment]
 from . import runtime_adapters
 from . import quality_review
+# The receipt schema surface moved to ``quality_review_receipt`` unchanged.
+# Re-exported under the original names so every existing reader -- production
+# call sites and the tests that pin this contract -- keeps resolving the exact
+# same objects from ``process_launcher``.
+from .quality_review_receipt import (
+    _QUALITY_REVIEW_AUTHORITY_KEYS,
+    _QUALITY_REVIEW_FINDING_RECEIPT_REQUIRED_KEYS,
+    _QUALITY_REVIEW_RECEIPT_TOP_KEYS,
+    _QUALITY_REVIEW_REPORT_KEYS,
+    _QUALITY_REVIEW_REVIEWER_KEYS,
+    _QUALITY_REVIEW_TARGET_KEYS,
+    _SHA256_HEX_RE,
+    _enforce_quality_review_receipt_schema,
+    _is_sha256_hex,
+    _verified_quality_review_receipt,
+)
 from . import quality_reviewer
 from . import reviewer_reservation_recovery
 from . import terminal_authority
@@ -425,6 +441,16 @@ def _finalizer_card_not_processing(reason: str) -> str | None:
         if reason == token or reason.startswith(token + ":"):
             return token
     return None
+
+
+# Finalizer retry-exhaustion classification lives in
+# ``terminal_failure_classification`` -- the module that owns what a terminal
+# attempt MEANS -- and is re-exported here under its original private names so
+# every existing reader resolves the exact same objects.
+_FINALIZER_TRANSIENT_EXCEPTIONS = terminal_failure_classification.FINALIZER_TRANSIENT_EXCEPTIONS
+FINALIZER_TRANSIENT_DEFERRAL_BUDGET = terminal_failure_classification.FINALIZER_TRANSIENT_DEFERRAL_BUDGET
+FINALIZER_TRANSIENT_DEFERRAL_REASON = terminal_failure_classification.FINALIZER_TRANSIENT_DEFERRAL_REASON
+_finalizer_attempt_is_transient = terminal_failure_classification.finalizer_attempt_is_transient
 
 
 class _BridgeCancellationDeferred(RuntimeError):
@@ -3929,30 +3955,6 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     return gate_result
 
 
-_QUALITY_REVIEW_RECEIPT_TOP_KEYS = frozenset(
-    {
-        "schema_id",
-        "packet_sha256",
-        "target",
-        "reviewer",
-        "report",
-        "authority",
-        "submission_id",
-        "physical_submission_count",
-        "logical_submission_count",
-    }
-)
-_QUALITY_REVIEW_TARGET_KEYS = frozenset({"request_id", "task_id", "claim_epoch"})
-_QUALITY_REVIEW_REVIEWER_KEYS = frozenset({"request_id", "task_id", "provider"})
-_QUALITY_REVIEW_REPORT_KEYS = frozenset(
-    {"lens", "provider", "read_only", "can_mutate_repo", "findings"}
-)
-_QUALITY_REVIEW_AUTHORITY_KEYS = frozenset(
-    {"process_identity_verified", "audit_verified", "terminal_state"}
-)
-_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
-
-
 # One authority for the bool-safe integer rule, owned by the store that binds
 # the claim epochs it guards.  A private copy here would silently stop matching
 # the store's rule and admit an epoch the store would reject -- visible only as
@@ -3960,91 +3962,9 @@ _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 _is_bool_safe_int = task_store.is_bool_safe_int
 
 
-def _is_sha256_hex(value: object) -> bool:
-    return isinstance(value, str) and _SHA256_HEX_RE.fullmatch(value) is not None
-
-
-def _enforce_quality_review_receipt_schema(
-    receipt: dict[str, Any], observed_provider: str
-) -> dict[str, Any]:
-    """Reject any deviation from the exact production read-only receipt shape."""
-    if set(receipt) != _QUALITY_REVIEW_RECEIPT_TOP_KEYS:
-        raise WorkspaceError("quality_review_receipt_top_level_keys_invalid")
-    if receipt.get("schema_id") != quality_reviewer.RECEIPT_SCHEMA_ID:
-        raise WorkspaceError("quality_review_receipt_schema_mismatch")
-    packet_sha256 = receipt.get("packet_sha256")
-    submission_id = receipt.get("submission_id")
-    if not _is_sha256_hex(packet_sha256):
-        raise WorkspaceError("quality_review_packet_sha256_invalid")
-    if not _is_sha256_hex(submission_id):
-        raise WorkspaceError("quality_review_submission_id_invalid")
-    target = receipt.get("target")
-    reviewer = receipt.get("reviewer")
-    report = receipt.get("report")
-    authority = receipt.get("authority")
-    if not (
-        isinstance(target, dict)
-        and isinstance(reviewer, dict)
-        and isinstance(report, dict)
-        and isinstance(authority, dict)
-    ):
-        raise WorkspaceError("quality_review_receipt_shape_invalid")
-    if set(target) != _QUALITY_REVIEW_TARGET_KEYS:
-        raise WorkspaceError("quality_review_target_keys_invalid")
-    if set(reviewer) != _QUALITY_REVIEW_REVIEWER_KEYS:
-        raise WorkspaceError("quality_review_reviewer_keys_invalid")
-    if set(report) != _QUALITY_REVIEW_REPORT_KEYS:
-        raise WorkspaceError("quality_review_report_keys_invalid")
-    if set(authority) != _QUALITY_REVIEW_AUTHORITY_KEYS:
-        raise WorkspaceError("quality_review_authority_keys_invalid")
-    claim_epoch = target.get("claim_epoch")
-    if not _is_bool_safe_int(claim_epoch):
-        raise WorkspaceError("quality_review_claim_epoch_invalid")
-    if str(reviewer.get("provider") or "") != observed_provider:
-        raise WorkspaceError("quality_review_reviewer_provider_mismatch")
-    if str(report.get("provider") or "") != observed_provider:
-        raise WorkspaceError("quality_review_report_provider_mismatch")
-    findings = report.get("findings")
-    if not isinstance(findings, list):
-        raise WorkspaceError("quality_review_report_findings_invalid")
-    for index, finding in enumerate(findings):
-        if not isinstance(finding, dict):
-            raise WorkspaceError(f"quality_review_finding_{index}_invalid")
-        finding_keys = set(finding)
-        if not (
-            quality_reviewer.QUALITY_REVIEW_FINDING_REQUIRED_KEYS <= finding_keys
-            <= quality_reviewer.QUALITY_REVIEW_FINDING_KEYS
-        ):
-            raise WorkspaceError(f"quality_review_finding_{index}_keys_invalid")
-        if str(finding.get("severity") or "") not in quality_reviewer.FINDING_SEVERITIES:
-            raise WorkspaceError(f"quality_review_finding_{index}_severity_invalid")
-        if (
-            str(finding.get("disposition") or "")
-            not in quality_reviewer.FINDING_DISPOSITIONS
-        ):
-            raise WorkspaceError(f"quality_review_finding_{index}_disposition_invalid")
-        if finding.get("actionable") is not (finding.get("disposition") == "defect"):
-            raise WorkspaceError(f"quality_review_finding_{index}_actionable_invalid")
-    if authority.get("process_identity_verified") is not True:
-        raise WorkspaceError("quality_review_authority_process_identity_invalid")
-    if authority.get("audit_verified") is not True:
-        raise WorkspaceError("quality_review_authority_audit_invalid")
-    if authority.get("terminal_state") != "review_ready":
-        raise WorkspaceError("quality_review_authority_terminal_state_invalid")
-    if report.get("read_only") is not True or report.get("can_mutate_repo") is not False:
-        raise WorkspaceError("quality_review_report_not_read_only")
-    physical_submission_count = receipt.get("physical_submission_count")
-    logical_submission_count = receipt.get("logical_submission_count")
-    if (
-        not _is_bool_safe_int(physical_submission_count)
-        or physical_submission_count != 1
-    ):
-        raise WorkspaceError("quality_review_physical_submission_count_invalid")
-    if not _is_bool_safe_int(logical_submission_count) or logical_submission_count != 1:
-        raise WorkspaceError("quality_review_logical_submission_count_invalid")
-    return receipt
-
-
+# Stays with the launcher: it reconstructs a ``WorkerWorkspace``, which is the
+# launcher's own collaborator and its established test seam, so the binding it
+# resolves must remain this module's.
 def _enforce_readonly_retained_workspace(terminal_evidence: dict[str, Any]) -> None:
     """Require a retained reviewer workspace to be provably read-only and empty."""
     changed_paths = terminal_evidence.get("changed_paths")
@@ -4065,102 +3985,6 @@ def _enforce_readonly_retained_workspace(terminal_evidence: dict[str, Any]) -> N
         raise WorkspaceError("quality_review_workspace_reconstruction_failed") from exc
     if reconstructed.allowed_writes:
         raise WorkspaceError("quality_review_reconstructed_workspace_not_read_only")
-
-
-def _verified_quality_review_receipt(
-    metadata: dict[str, Any],
-    workspace: WorkerWorkspace,
-    request_id: str,
-) -> dict[str, Any]:
-    """Resolve exactly one authenticated logical submission for a reviewer process."""
-
-    binding = metadata.get("quality_review")
-    if not isinstance(binding, dict):
-        raise WorkspaceError("quality_review_binding_missing")
-    packet_path_raw = binding.get("packet_path")
-    if not isinstance(packet_path_raw, str) or not packet_path_raw:
-        raise WorkspaceError("quality_review_packet_path_missing")
-    packet_path = Path(packet_path_raw).resolve()
-    try:
-        packet_path.relative_to(workspace.home.resolve())
-    except ValueError as exc:
-        raise WorkspaceError("quality_review_packet_outside_home") from exc
-    try:
-        if packet_path.is_symlink() or not packet_path.is_file():
-            raise WorkspaceError("quality_review_packet_invalid")
-        if packet_path.stat().st_size > worker_ai_tools_mcp.MAX_QUALITY_REVIEW_PACKET_BYTES:
-            raise WorkspaceError("quality_review_packet_too_large")
-        packet = json.loads(packet_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise WorkspaceError("quality_review_packet_unreadable") from exc
-    expected_lens = str(binding.get("lens") or "")
-    try:
-        verification, payloads = quality_review_ingest.supervisor_ingest(
-            metadata=metadata,
-            workspace=workspace,
-            packet=packet,
-            packet_path=packet_path,
-            request_id=request_id,
-            expected_lens=expected_lens,
-        )
-    except quality_review_ingest.ReviewProtocolError as exc:
-        raise WorkspaceError(str(exc)) from exc
-    if len(payloads) != 1:
-        raise WorkspaceError(f"quality_review_submission_count:{len(payloads)}")
-    receipt_payload = payloads[0]
-    observed_provider = str(metadata.get("adapter_id") or "")
-    target = packet.get("target") if isinstance(packet, dict) else None
-    if not isinstance(target, dict):
-        raise WorkspaceError("quality_review_packet_target_missing")
-    worker_provider_name = str(target.get("worker_provider") or "")
-    rung_record = quality_review.resolve_independence_rung(
-        worker_provider=worker_provider_name,
-        reviewer_provider=observed_provider,
-        worker_model=worker_provider_name,
-        reviewer_model=observed_provider,
-    )
-    if rung_record["rung"] not in quality_review.INDEPENDENCE_LADDER:
-        raise WorkspaceError(
-            "quality_review_provider_not_independent:"
-            f"worker_provider={worker_provider_name},"
-            f"reviewer_provider={observed_provider}"
-        )
-    receipt = json.loads(json.dumps(receipt_payload, ensure_ascii=False))
-    reviewer = receipt.get("reviewer")
-    report = receipt.get("report")
-    if not isinstance(reviewer, dict) or not isinstance(report, dict):
-        raise WorkspaceError("quality_review_receipt_shape_invalid")
-    reviewer["provider"] = observed_provider
-    report["provider"] = observed_provider
-    entries_tampered = verification.get("entries_tampered")
-    if not _is_bool_safe_int(entries_tampered):
-        raise WorkspaceError("quality_review_audit_entries_tampered_invalid")
-    audit_verified = bool(verification.get("ok")) and entries_tampered == 0
-    try:
-        verified = quality_reviewer.verify_reviewer_receipt(
-            receipt,
-            packet=packet,
-            expected_reviewer_request_id=request_id,
-            expected_reviewer_task_id=str(metadata.get("task_id") or ""),
-            observed_provider=observed_provider,
-            observed_terminal_state="review_ready",
-            audit_verified=audit_verified,
-        )
-    except quality_reviewer.ReviewerEvidenceError as exc:
-        raise WorkspaceError(f"quality_review_receipt_invalid:{exc}") from exc
-    if str((verified.get("report") or {}).get("lens") or "") != expected_lens:
-        raise WorkspaceError("quality_review_lens_mismatch")
-    verified["submission_id"] = hashlib.sha256(
-        json.dumps(
-            receipt_payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-    verified["physical_submission_count"] = 1
-    verified["logical_submission_count"] = 1
-    return _enforce_quality_review_receipt_schema(verified, observed_provider)
 
 
 def _verified_accepted_quality_review_receipt(
@@ -9439,6 +9263,7 @@ class ProcessManager:
             "usage_recorded": usage_recorded,
             "usage_error": usage_error,
             "project_context_acknowledgement": context_ack,
+            **terminal_failure_classification.terminal_event_authority(state=state, exit_code=returncode, error=None, stdout_path=live.stdout_path, stderr_path=live.stderr_path, cancelled=was_cancelled),
         })
         with self._lock:
             self._remove_live_if_current(live)
@@ -10178,14 +10003,34 @@ class ProcessManager:
         in ``processing``.  Retry the exact idempotent reconciliation a small
         bounded number of times. Request-lock contention is different: it
         proves another finalizer currently owns the only writer boundary, so
-        defer without changing durable state. If the implementation itself
-        keeps failing, convert the still-processing card into a truthful
-        ``finalize_failed`` terminal outcome and enqueue its manager callback.
-        The isolated workspace remains retained for diagnosis.
+        defer without changing durable state.
+
+        Exhausting that bounded retry is then classified, not assumed. An
+        exhausted run whose every attempt ended on a contended or
+        temporarily-unavailable boundary is deferred as ``reconcile_pending``
+        for the reconciler to re-arm, up to a finite per-request budget --
+        250ms of in-line retry is far narrower than the lock windows those
+        boundaries actually have, and a card must not be blocked on that gap.
+        An exhausted run that produced no terminal event, or that failed for
+        any other reason, is decided: it converts the still-processing card
+        into a truthful ``finalize_failed`` terminal outcome and enqueues its
+        manager callback. The isolated workspace remains retained for
+        diagnosis in every case.
         """
         finalization_started = time.monotonic()
 
         errors: list[str] = []
+        # The cause that ended each exhausted attempt, in order: the exception
+        # raised, or ``None`` when the attempt simply produced no terminal
+        # event. Exhaustion is classified from these objects, never from the
+        # flattened ``errors`` strings, so a provider message that happens to
+        # contain an exception type name can never be mistaken for that type.
+        attempt_causes: list[BaseException | None] = []
+        # The bounded in-line budget stays deliberately short: it exists only
+        # to ride out a sub-second write race without blocking the daemon
+        # monitor thread. A contended SQLite or filesystem boundary that needs
+        # longer is handled by deferring to the reconciler below, not by
+        # sleeping here.
         for attempt, delay in enumerate((0.0, 0.05, 0.2), start=1):
             if delay:
                 time.sleep(delay)
@@ -10210,6 +10055,7 @@ class ProcessManager:
                             "workspace_retained": True,
                         }
                 errors.append(f"attempt={attempt}:no_terminal_event")
+                attempt_causes.append(None)
             except _BridgeCancellationDeferred:
                 deferred = self._request_events(request_id)
                 return deferred[-1] if deferred else None
@@ -10237,14 +10083,64 @@ class ProcessManager:
                 errors.append(
                     f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500]
                 )
+                attempt_causes.append(exc)
             except Exception as exc:  # noqa: BLE001 - monitor must remain durable
                 errors.append(f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500])
+                attempt_causes.append(exc)
 
         events = self._request_events(request_id)
         event_identity = self._event_identity(events)
         task_id = str(event_identity.get("task_id") or "")
         runner = str(event_identity.get("runner") or "")
         error = "finalizer_retries_exhausted:" + "|".join(errors)
+
+        # Exhausting three attempts inside a 250ms budget is not by itself
+        # evidence that the card failed. When every attempt ended on a
+        # contended or temporarily-unavailable boundary -- the filesystem and
+        # SQLite races this loop's own docstring names -- the reconcile pass
+        # thirty seconds from now can still succeed. Record a non-terminal
+        # ``reconcile_pending`` deferral and let the reconciler re-arm it
+        # instead of a human: ``FINALIZATION_PENDING_STATES`` contains
+        # ``reconcile_pending``, so ``_reconcile_persisted_requests`` picks the
+        # request up again on its next pass with no operator action at all.
+        # ``no_terminal_event`` is deliberately NOT transient -- see
+        # ``_finalizer_attempt_is_transient`` for why re-arming it could only
+        # loop. The budget bounds the deferral so that a deterministic
+        # transient-shaped failure still settles: once it is spent, the
+        # original terminal path below runs unchanged.
+        deferrals_used = sum(
+            1 for prior in events if prior.get("finalizer_transient_deferral")
+        )
+        if (
+            attempt_causes
+            and all(_finalizer_attempt_is_transient(c) for c in attempt_causes)
+            and deferrals_used < FINALIZER_TRANSIENT_DEFERRAL_BUDGET
+        ):
+            return self._retention_event({
+                **event_identity,
+                "request_id": request_id,
+                "state": "reconcile_pending",
+                "exit_code": supervisor_returncode,
+                "finalizer_abandoned": False,
+                "finalizer_transient_deferral": True,
+                "finalizer_transient_deferrals": deferrals_used + 1,
+                "finalizer_transient_deferral_budget": (
+                    FINALIZER_TRANSIENT_DEFERRAL_BUDGET
+                ),
+                "reconciliation_deferred": FINALIZER_TRANSIENT_DEFERRAL_REASON,
+                "finalize_attempts": len(errors),
+                "release_transition_ok": False,
+                "callback_enqueued": False,
+                "finalization_duration_ms": round(
+                    (time.monotonic() - finalization_started) * 1000.0, 3
+                ),
+                **terminal_failure_classification.terminal_event_authority(
+                    state="reconcile_pending",
+                    exit_code=supervisor_returncode,
+                    error=error[:500],
+                ),
+            }, disposition="retained_in_place")
+
         release_result: dict[str, Any] = {
             "ok": False,
             "stderr": "request_identity_missing",
@@ -10308,7 +10204,7 @@ class ProcessManager:
             "finalization_duration_ms": round(
                 (time.monotonic() - finalization_started) * 1000.0, 3
             ),
-            "error": error_detail[:500],
+            **terminal_failure_classification.terminal_event_authority(state=terminal_state, exit_code=supervisor_returncode, error=error_detail[:500]),
         }, disposition="retained_in_place")
 
     def _reconcile_persisted_requests(self) -> dict[str, int]:
@@ -10778,7 +10674,6 @@ class ProcessManager:
                         "topic": latest.get("topic"),
                         "adapter_id": latest.get("adapter_id"),
                         "state": "finalize_failed",
-                        "error": f"review_workspace_quarantine_failed:{exc}"[:500],
                         "workspace_gc": False,
                         "workspace_gc_at": _utcnow(),
                         "workspace_gc_reason": integrity_reason,
@@ -10786,6 +10681,8 @@ class ProcessManager:
                         "callback_enqueued": bool(
                             transition.get("callback_enqueued")
                         ),
+                        # ``review_workspace_quarantine_failed`` is now a named control-plane reason, so this no longer degrades to ``finalize_failed:runtime_error``; the ``{exc}`` tail stays caller text on the sanitised channel.
+                        **terminal_failure_classification.terminal_event_authority(state="finalize_failed", exit_code=None, error=f"review_workspace_quarantine_failed:{exc}"[:500]),
                     }, disposition="retained_in_place")
                     return {
                         "request_id": request_id,
@@ -10925,8 +10822,9 @@ class ProcessManager:
                 return self._append_event({
                     **self._event_identity(events),
                     "state": "finalize_failed",
-                    "error": f"metadata_invalid:{exc}"[:500],
                     "finished_at": _utcnow(),
+                    # Same split: ``metadata_invalid`` is a named reason now, the ``{exc}`` tail is not and is never copied.
+                    **terminal_failure_classification.terminal_event_authority(state="finalize_failed", exit_code=None, error=f"metadata_invalid:{exc}"[:500]),
                 })
 
             status_path = Path(str(metadata["supervisor_status_path"]))
@@ -10946,11 +10844,9 @@ class ProcessManager:
                 ):
                     return None
             supervisor_alive = identity.verdict is PidIdentityVerdict.MATCH
-            # The supervisor is spawned before its first atomic status write, so
-            # a concurrent reconciler can see the exact live PID while the status
-            # file is briefly absent: that launch window is active work.
+            # The supervisor is spawned before its first status write; a live PID
+            # with an absent status file during that launch window is active work.
             liveness_lost = False
-            stall_detected = False
             stall_idle_seconds: float | None = None
             stall_error = ""
             terminate_supervisor = False
@@ -10968,31 +10864,20 @@ class ProcessManager:
                     and isinstance(meaningful_at, (int, float))
                 ):
                     stall_idle_seconds = max(0.0, time.time() - float(meaningful_at))
-                    # Meaningful-output age is observability only. Providers
-                    # can legitimately poll or work silently for an unbounded
-                    # interval, so elapsed/quiet time is never terminal
-                    # evidence while the exact supervisor identity and its
-                    # heartbeat remain live (NF-2026-00176).
-                if (
-                    not stall_detected
-                    and liveness["liveness_state"] in {"alive", "quiet", "unresponsive"}
-                ):
+                    # Elapsed/quiet time is observability only, never terminal
+                    # evidence while identity + heartbeat stay live (NF-2026-00176).
+                if liveness["liveness_state"] in {"alive", "quiet", "unresponsive"}:
                     return None
-                # liveness_state == "lost": the heartbeat lease AND bounded
-                # recovery grace both elapsed while the exact supervisor PID
-                # still exists (a hung/deadlocked supervisor, not merely a
-                # slow one). Recheck identity ONE more time immediately
-                # before any termination action -- still under this whole
-                # call's registry lock -- then terminate ONLY the exact
-                # matching supervisor/child process group(s). Never act on a
-                # bare "process exists" signal alone.
-                if not stall_detected:
-                    liveness_lost = True
-                    recheck = _pid_identity_evidence(supervisor_pid, supervisor_ticks)
-                    if recheck.verdict is PidIdentityVerdict.UNKNOWN:
-                        raise _PidIdentityUnknownDeferred("pid_identity_unknown")
-                    terminate_supervisor = recheck.verdict is PidIdentityVerdict.MATCH
-                    supervisor_alive = False
+                # liveness_state == "lost": lease + recovery grace elapsed
+                # while the exact supervisor PID still exists. Recheck
+                # identity once more under this call's lock, then terminate
+                # only the exact matching process group(s).
+                liveness_lost = True
+                recheck = _pid_identity_evidence(supervisor_pid, supervisor_ticks)
+                if recheck.verdict is PidIdentityVerdict.UNKNOWN:
+                    raise _PidIdentityUnknownDeferred("pid_identity_unknown")
+                terminate_supervisor = recheck.verdict is PidIdentityVerdict.MATCH
+                supervisor_alive = False
 
             if _requires_bridge_cancellation(metadata):
                 self._publish_bridge_cancellation_before_finalization(
@@ -11029,8 +10914,19 @@ class ProcessManager:
             ):
                 _terminate_process_group(verified_child_pid, grace_seconds=5.0)
 
-            exit_code = supervisor_status.get("exit_code")
+            exit_code = terminal_failure_classification.normalize_exit_code(supervisor_status.get("exit_code"))
             error = stall_error or str(supervisor_status.get("error") or "")[:500]
+            # SPOOFING SURFACE, NAMED AND DELIBERATELY LEFT OPEN FOR STEP 2.
+            # This is the one control-plane candidate that comes from OUTSIDE
+            # this process: ``supervisor_status`` is JSON a supervisor wrote, so
+            # its ``error``/``state`` fields are an OPEN vocabulary. The no-copy
+            # invariant still holds -- ``recognised_reason`` re-emits the
+            # classifier's own constants and refuses any string carrying a token
+            # it does not already own -- but a corrupt or hostile supervisor CAN
+            # still SELECT which known reason is reported, by writing a
+            # recognised token into that field. Closing that needs a typed wire
+            # schema for the status packet, which Step 1 does not change.
+            reason = terminal_failure_classification.recognised_reason(error)
             if liveness_lost and not error:
                 error = f"liveness_lost:heartbeat_lease_and_recovery_grace_exceeded:rc={supervisor_returncode}"
             if supervisor_state == "timed_out" and metadata.get("timeout_enforced") is True:
@@ -11040,14 +10936,9 @@ class ProcessManager:
                     + str(metadata.get("timeout_seconds") or "unknown")
                     + f":exit_code={exit_code}"
                 )
-            # NF: The supervisor is uncapped and no longer authorizes a token
-            # budget, so it never emits a fresh ``token_budget_exceeded`` state.
-            # A legacy supervisor packet that still carries that state must NOT
-            # synthesize a new token-cap terminal outcome; with the branch gone
-            # it falls through to the infrastructure-failure classification
-            # below (``worker_failed`` / ``supervisor_incomplete``). Historical
-            # ``token_budget_exceeded`` rows stay readable and diagnosable -- no
-            # new token-cap transition is minted here.
+            # The supervisor no longer authorizes a token budget, so a legacy
+            # packet still carrying token_budget_exceeded falls through to the
+            # infrastructure-failure classification below; no new transition.
             elif supervisor_state == "output_budget_exceeded":
                 terminal_state = "output_budget_exceeded"
                 budget = supervisor_status.get("output_budget") or {}
@@ -11073,9 +10964,12 @@ class ProcessManager:
                 terminal_state = "exited"
             elif supervisor_state in {"exited", "spawn_failed", "supervisor_error", "timed_out"}:
                 terminal_state = "worker_failed"
-                error = error or (
-                    f"worker_failed:supervisor_state={supervisor_state}:exit_code={exit_code}"
-                )
+                if not error:
+                    # The launcher holds this constant, so it states it TYPED
+                    # rather than leaving the ``supervisor_state=`` field to be
+                    # recovered downstream from a shape that cannot carry it.
+                    reason = terminal_failure_classification.supervisor_failure_reason(supervisor_state, exit_code)
+                    error = reason.render()
             else:
                 # A missing, malformed, or stale running status is never proof
                 # that the worker ran successfully. Cancellation intent is the
@@ -11084,10 +10978,9 @@ class ProcessManager:
                     terminal_state = "cancelled"
                 else:
                     terminal_state = "worker_failed"
-                detail = supervisor_state or "missing"
-                error = error or (
-                    f"supervisor_incomplete:state={detail}:rc={supervisor_returncode}"
-                )
+                if not error:
+                    reason = terminal_failure_classification.supervisor_incomplete_reason(supervisor_state, supervisor_returncode)
+                    error = reason.render()
             provider_launch_failure = None
             if terminal_state == "worker_failed":
                 provider_output_path = Path(str(metadata["stdout_path"]))
@@ -11124,12 +11017,40 @@ class ProcessManager:
                     # downstream exit_code=1 (NF-2026-00275, NF-2026-00326).
                     if error != claude_auth.RUNTIME_AUTH_FAILURE_REASON:
                         error = str(provider_launch_failure["reason"])
+                    # Both branches assigned a constant this repository owns --
+                    # the auth circuit's own verdict, or ``classify_provider_
+                    # outcome``'s closed refusal vocabulary -- so it is re-minted
+                    # typed here and reaches the sink as itself instead of being
+                    # flattened to the ``launch_failed:runtime_error`` its
+                    # exception-shaped text would otherwise classify as.
+                    reason = terminal_failure_classification.recognised_reason(error)
             elif (
                 terminal_state == "exited"
                 and str(metadata.get("adapter_id") or "") == "claude_cli"
                 and int(metadata.get("claude_auth_retry_count") or 0) == 1
             ):
                 claude_auth.clear_runtime_auth_failure()
+
+            # NF-2026-00622 V7 rework (temporal-drift fix): terminal_state/
+            # error/exit_code can still change below (validation_failed,
+            # finalize_failed, review_transition_failed -> review_pending,
+            # release_pending), so no call site caches this closure's result
+            # across a mutation boundary -- each calls it fresh. ``reason`` is
+            # read fresh for the same reason: a later branch may mint one.
+            def _settle_terminal_failure_authority() -> dict[str, Any]:
+                classification_state = (
+                    "liveness_lost"
+                    if terminal_state == "worker_failed" and liveness_lost
+                    else terminal_state
+                )
+                return terminal_failure_classification.terminal_event_authority(
+                    state=classification_state,
+                    exit_code=exit_code,
+                    error=error,
+                    reason=reason,
+                    stdout_path=metadata.get("stdout_path"),
+                    stderr_path=metadata.get("stderr_path"),
+                )
 
             changed: list[str] = []
             promoted: list[str] = []
@@ -11198,7 +11119,7 @@ class ProcessManager:
                             self.repo,
                             str(metadata["task_id"]),
                             str(metadata["runner"]),
-                            reason=error,
+                            reason=_settle_terminal_failure_authority()["error"],
                             request_id=request_id,
                         )
                     else:
@@ -11206,11 +11127,11 @@ class ProcessManager:
                             "request_id": request_id,
                             "adapter_id": metadata.get("adapter_id"),
                             "model": metadata.get("model"),
-                            "error": error[:500],
+                            "error": _settle_terminal_failure_authority()["diagnostic"],
                             "supervisor_state": supervisor_state,
                             "exit_code": exit_code,
                             "liveness_lost": liveness_lost,
-                            "stall_detected": stall_detected,
+                            "stall_detected": False,
                             "stall_idle_seconds": stall_idle_seconds,
                             "stall_last_meaningful_phase": supervisor_status.get(
                                 "last_meaningful_phase"
@@ -11466,11 +11387,17 @@ class ProcessManager:
                                 quality_gate["full_validation_snapshot"] = full_validation_snapshot
                             if not quality_gate.get("passed"):
                                 blockers = quality_gate.get("blocking_checks") or []
-                                reason = quality_gate.get("config_error") or ",".join(
+                                # Named ``gate_reason``, not ``reason``: the
+                                # enclosing finalizer's ``reason`` is the TYPED
+                                # terminal reason, and a str assignment here
+                                # would silently replace it -- the exact
+                                # erosion the non-str reason type exists to
+                                # make impossible.
+                                gate_reason = quality_gate.get("config_error") or ",".join(
                                     str(v) for v in blockers
                                 )
                                 raise WorkspaceError(
-                                    "quality_gate_failed:" + str(reason)[:400]
+                                    "quality_gate_failed:" + str(gate_reason)[:400]
                                 )
                         _enforce_behavioral_gate(
                             metadata,
@@ -11586,27 +11513,19 @@ class ProcessManager:
                 if isinstance(exc, ValidationRunError):
                     validations = [dict(row) for row in exc.results]
                 error = str(exc)
+                # A workspace error reads ``<constant>:<caller text>``: the
+                # prefix is a reason this repository mints, the tail is a path,
+                # a card field or an exception. Only the prefix is typed, and
+                # the mandatory-output list is re-minted from the CARD's own
+                # declared ``required_outputs`` -- never from the validator's
+                # observed filenames, which a glob lets a worker choose.
+                reason = terminal_failure_classification.workspace_error_reason(error, metadata.get("required_outputs"))
                 terminal_state = _terminal_state_for_workspace_error(exc)
                 # Keep the isolated candidate intact for coordinator
-                # diagnosis/retry on every genuine terminal failure, including
-                # a lost-claim race (error starts with "claim_ownership_lost").
-                # Deleting it here forces needless model reruns and destroys
-                # the evidence needed to distinguish a product defect from a
-                # validator/promotion-race defect (the coordinator
-                # review-first lifecycle owns cleanup after its accept/reject
-                # decision, not the worker's own finalize path). B863: a
-                # claim_ownership_lost read is not reliable proof that a
-                # different runner legitimately owns this task -- it can also
-                # be a false positive from a launcher/finalizer canonical-
-                # authority disagreement (the B860/B861 failure mode), and
-                # this worker's own claim episode may still be exact-current.
-                # Cleanup here used to be unconditional on ownership_lost,
-                # which deleted still-valid worktrees on every false positive.
-                # Deletion is deferred entirely to the canonical-status-gated
-                # sweep in _gc_finalized_workspace, which independently
-                # re-reads this exact self.repo's task_queue.sqlite and
-                # requires a genuinely finished/archived status before ever
-                # touching disk.
+                # diagnosis/retry on every genuine failure, including a
+                # lost-claim race. B863: a claim_ownership_lost read can be a
+                # false positive (B860/B861), so cleanup is deferred entirely
+                # to _gc_finalized_workspace's canonical-status-gated sweep.
                 ownership_lost = error.startswith("claim_ownership_lost")
                 cleanup = False
                 if not ownership_lost and not promoted:
@@ -11850,6 +11769,9 @@ class ProcessManager:
                     cleanup_workspace(workspace.repo, workspace.path, workspace.home)
                 except WorkspaceError as exc:
                     cleanup_error = f"cleanup_failed:{exc}"[:500]
+            # Derive fresh, live authority immediately before construction --
+            # after every branch above has had its say -- never a cached value.
+            final_terminal_failure_authority = _settle_terminal_failure_authority()
             event = self._retention_event({
                 "request_id": request_id,
                 "task_id": metadata["task_id"],
@@ -11893,7 +11815,7 @@ class ProcessManager:
                     (release_result or {}).get("canonical_lifecycle") or ""
                 )[:40],
                 "liveness_lost": liveness_lost,
-                "stall_detected": stall_detected,
+                "stall_detected": False,
                 "stall_idle_seconds": stall_idle_seconds,
                 "stall_last_meaningful_phase": supervisor_status.get("last_meaningful_phase"),
                 "stall_last_meaningful_progress_epoch": supervisor_status.get(
@@ -11907,7 +11829,7 @@ class ProcessManager:
                 "stall_stderr_bytes": supervisor_status.get("stderr_bytes"),
                 "stall_supervisor_pid": supervisor_pid,
                 "stall_supervisor_pid_start_ticks": supervisor_ticks,
-                "error": error[:500],
+                **final_terminal_failure_authority,
                 "usage": usage,
                 "usage_recorded": usage_recorded,
                 "usage_error": usage_error,
@@ -11942,15 +11864,19 @@ class ProcessManager:
     @staticmethod
     def _event_identity(events: list[dict[str, Any]]) -> dict[str, Any]:
         merged: dict[str, Any] = {}
+        identity_keys = (
+            "request_id", "task_id", "runner", "topic", "adapter_id", "model",
+            "pid", "pid_start_ticks", "stdout_path", "stderr_path", "metadata_path",
+            "supervisor_status_path", "cancel_path", "sandbox_backend", "exit_code",
+        )
         for event in events:
-            for key in (
-                "request_id", "task_id", "runner", "topic", "adapter_id", "model",
-                "pid", "pid_start_ticks", "stdout_path", "stderr_path", "metadata_path",
-                "supervisor_status_path", "cancel_path", "sandbox_backend", "exit_code",
-                "error",
-            ):
-                if event.get(key) is not None:
-                    merged[key] = event[key]
+            merged.update({k: event[k] for k in identity_keys if k in event})
+            if "failure_kind" in event:
+                merged["failure_kind"] = event["failure_kind"]
+                merged.update({k: event[k] for k in ("diagnostic", "error") if k in event})
+            elif "error" in event:
+                # Sparse GC/retention/disposal overlay rows never carry failure_kind; an authoritative row always does (even a None verdict), so presence -- not error-value truthiness -- is the marker.
+                merged["retention_error" if "error" in merged else "error"] = event["error"]
         return merged
 
     @staticmethod
@@ -12017,6 +11943,8 @@ class ProcessManager:
         # the final row authoritative for state/disposition.
         lineage = self._event_identity(events)
         latest = {**lineage, **events[-1]}
+        # Restore the lineage's error/retention_error over an overlay row.
+        latest.update({key: lineage[key] for key in ("error", "retention_error") if key in lineage})
         if (
             latest.get("state") in ACTIVE_PROCESS_STATES | FINALIZATION_PENDING_STATES
             and latest.get("metadata_path")
@@ -12574,7 +12502,7 @@ class ProcessManager:
             "pid", "exit_code", "runner", "topic", "adapter_id", "model", "error",
             # Stable public lifecycle evidence used by coordinator/security
             # consumers.  These are scalar paths, not recursive payloads.
-            "metadata_path", "workspace_retained", "workspace_disposition",
+            "metadata_path", "workspace_retained", "workspace_disposition", "failure_kind", "diagnostic", "retention_error",
         )
         card_summary = {key: card.get(key) for key in card_fields if key in card}
         event_summary = {key: latest.get(key) for key in event_fields if key in latest}
@@ -14343,6 +14271,67 @@ class ProcessManager:
                 "finished_at": _utcnow(),
             }, disposition="removed")
             return accepted_reply
+
+    def reject_review(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        to: str = "pending",
+    ) -> dict[str, Any]:
+        """Coordinator-gated rejection of one ``review`` card, back to rework.
+
+        The transition itself belongs to :func:`core.reject_review` and none of
+        it is re-implemented here: it re-reads the live card, refuses a
+        disposition it does not know, moves the row atomically and only
+        ``WHERE worker_status='review'``, writes the ``reject_review`` event,
+        finalizes the quality-review children bound to the rejected request,
+        and names the learning duty the rejection incurs.
+
+        Three preconditions are checked before delegating.  ``core`` resolves
+        the card through its *module-global* repository binding, while this
+        manager is bound to ``self.repo`` -- so a manager pointed somewhere
+        else must never reach it: it would reject a same-named card in the
+        wrong tree and destroy a completed review there.  And a rejection with
+        no reason, or no task, is an unexplained state transition, which this
+        repository does not permit.  Every refusal returns without touching
+        any card, exactly as a failed precondition in ``accept_review`` leaves
+        the canonical repository untouched with the reason returned.
+
+        The core result is returned intact -- ``ok``/``returncode``/``stdout``
+        plus ``reviewer_finalization``, ``learning_commit_owed`` and any
+        ``rework_delta_recovery`` -- with ``task_id``/``to`` echoed and, on
+        failure, ``error`` set from ``stderr`` so one field reads either way.
+        """
+        refusal: dict[str, Any] = {"ok": False, "task_id": task_id, "to": to}
+        target = str(task_id or "").strip()
+        if not target:
+            return {**refusal, "error": "task_id_required"}
+        bounded_reason = str(reason or "").strip()
+        if not bounded_reason:
+            return {**refusal, "error": "reject_reason_required"}
+        try:
+            authority = core.repo_root().resolve()
+        except Exception as exc:  # noqa: BLE001 -- an unresolvable root refuses
+            return {
+                **refusal,
+                "error": f"repo_authority_unavailable:{type(exc).__name__}",
+            }
+        if authority != self.repo:
+            return {
+                **refusal,
+                "error": "repo_authority_mismatch",
+                "manager_repo": str(self.repo),
+                "core_repo": str(authority),
+            }
+        result = core.reject_review(target, bounded_reason, to=to)
+        if not isinstance(result, dict):
+            return {**refusal, "error": "reject_review_result_invalid"}
+        result.setdefault("task_id", target)
+        result.setdefault("to", to)
+        if result.get("ok") is not True:
+            result["error"] = str(result.get("stderr") or "reject_review_failed")
+        return result
 
     def list_processes(self, limit: int = 100) -> dict[str, Any]:
         self._reconcile_persisted_requests()

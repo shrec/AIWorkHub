@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from aiworkhub.tool_recipes import (
@@ -34,6 +36,7 @@ from aiworkhub.tool_recipes import (
     Recipe,
     RecipeError,
     RecipeRegistry,
+    ResourceBounds,
     RiskClass,
     TaskKind,
     build_argv,
@@ -42,6 +45,8 @@ from aiworkhub.tool_recipes import (
     discover,
     lit,
     recipe_digest,
+    recipe_from_mapping,
+    recipe_payload,
     render_argv,
     slot,
     validate_invocation,
@@ -866,3 +871,257 @@ def test_argv_tokens_are_immutable_typed():
     assert isinstance(slot("x"), ArgvSlot)
     with pytest.raises(AttributeError):
         lit("x").text = "y"  # frozen dataclass
+
+
+# ---------------------------------------------------------------------------
+# Manifest serialization round-trip.
+#
+# Without an inverse for ``recipe_payload`` a manifest could be described and
+# hashed but never written down and read back, which is why nothing could hold
+# a recipe between two calls.  These assert that a manifest survives a JSON
+# round-trip with its digest and its behaviour intact, and that reconstruction
+# is as fail-closed as construction.
+# ---------------------------------------------------------------------------
+
+
+def _round_trip(recipe):
+    return recipe_from_mapping(json.loads(json.dumps(recipe_payload(recipe))))
+
+
+def test_recipe_payload_is_json_serializable():
+    payload = recipe_payload(make_echo_recipe())
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_recipe_payload_is_exactly_what_recipe_digest_hashes():
+    recipe = make_echo_recipe()
+    assert recipe_digest(recipe) == recipe.digest
+    assert recipe_payload(recipe) == recipe_payload(_round_trip(recipe))
+
+
+def test_recipe_payload_rejects_a_non_recipe():
+    with pytest.raises(RecipeError) as excinfo:
+        recipe_payload({"id": "echo", "version": "1.0.0"})
+    assert excinfo.value.reason == REASON_BAD_MANIFEST
+
+
+def test_round_trip_preserves_the_digest():
+    recipe = make_echo_recipe()
+    assert _round_trip(recipe).digest == recipe.digest
+
+
+def test_round_trip_preserves_every_typed_field():
+    recipe = make_echo_recipe(
+        parameters=(
+            ParamSpec("message", ParamType.STR, required=True),
+            ParamSpec("ratio", ParamType.FLOAT, required=False, minimum=0.0, maximum=1.0),
+            ParamSpec("quiet", ParamType.BOOL, required=False, default=False),
+            ParamSpec("paths", ParamType.LIST, item_type=ParamType.PATH),
+            ParamSpec("tag", ParamType.ENUM, values=("a", "b"), default="a"),
+        ),
+        outputs=(OutputSpec("text", OutputType.STDOUT, description="stdout"),),
+        platforms=("linux", "darwin"),
+        capabilities=("network",),
+        risk_class=RiskClass.MEDIUM,
+        cache_policy=CachePolicy.NEVER,
+        argv=(lit("echo"), slot("message"), slot("paths")),
+    )
+    loaded = _round_trip(recipe)
+
+    assert loaded.digest == recipe.digest
+    assert loaded.task_kind is recipe.task_kind
+    assert loaded.risk_class is recipe.risk_class
+    assert loaded.cache_policy is recipe.cache_policy
+    assert loaded.platforms == recipe.platforms
+    assert loaded.capabilities == recipe.capabilities
+    assert loaded.outputs == recipe.outputs
+    assert loaded.argv == recipe.argv
+    types = {p.name: p.type for p in loaded.parameters}
+    assert types == {p.name: p.type for p in recipe.parameters}
+    assert types["paths"] is ParamType.LIST
+
+
+def test_round_trip_preserves_resource_bounds():
+    recipe = make_echo_recipe(
+        resource_bounds=ResourceBounds(
+            max_runtime_seconds=1.5, max_memory_mb=64, max_output_bytes=1024
+        )
+    )
+    assert _round_trip(recipe).resource_bounds == recipe.resource_bounds
+
+
+def test_a_reconstructed_recipe_renders_the_same_argv():
+    recipe = make_echo_recipe(argv=(lit("echo"), lit("-n"), slot("message")))
+    params = {"message": "hello"}
+    assert build_argv(_round_trip(recipe), params) == build_argv(recipe, params)
+
+
+def test_a_reconstructed_recipe_validates_identically():
+    recipe = make_echo_recipe()
+    loaded = _round_trip(recipe)
+
+    with pytest.raises(RecipeError) as original:
+        validate_parameters(recipe, {"message": "hi", "nope": 1})
+    with pytest.raises(RecipeError) as reloaded:
+        validate_parameters(loaded, {"message": "hi", "nope": 1})
+    assert original.value.reason == reloaded.value.reason == REASON_EXTRA_PARAMETER
+
+
+def test_a_reconstructed_recipe_decides_cache_eligibility_identically():
+    for recipe in (
+        make_echo_recipe(),
+        make_echo_recipe(capabilities=("write",)),
+        make_echo_recipe(risk_class=RiskClass.HIGH),
+    ):
+        assert cache_eligibility(_round_trip(recipe)) == cache_eligibility(recipe)
+
+
+def test_round_trip_is_digest_stable_across_unordered_input():
+    """Insertion order of unordered collections must not change identity."""
+    first = make_echo_recipe(
+        parameters=(
+            ParamSpec("message", ParamType.STR, required=True),
+            ParamSpec("level", ParamType.ENUM, values=("error", "info", "warn")),
+        ),
+        platforms=("linux", "darwin"),
+    )
+    second = make_echo_recipe(
+        parameters=(
+            ParamSpec("level", ParamType.ENUM, values=("warn", "info", "error")),
+            ParamSpec("message", ParamType.STR, required=True),
+        ),
+        platforms=("darwin", "linux"),
+    )
+    assert first.digest == second.digest
+    assert _round_trip(first).digest == _round_trip(second).digest == first.digest
+
+
+@pytest.mark.parametrize(
+    "payload,reason",
+    [
+        ({}, REASON_BAD_MANIFEST),
+        ({"version": "1.0.0"}, REASON_BAD_MANIFEST),
+        ({"id": "echo"}, REASON_BAD_MANIFEST),
+        (
+            {
+                "id": "echo",
+                "version": "1.0.0",
+                "task_kind": "not-a-kind",
+                "risk_class": "none",
+                "cache_policy": "never",
+                "argv": [["literal", "echo"]],
+            },
+            REASON_BAD_MANIFEST,
+        ),
+        (
+            {
+                "id": "echo",
+                "version": "1.0.0",
+                "task_kind": "generate",
+                "risk_class": "none",
+                "cache_policy": "never",
+                "argv": [["literal", "echo; rm -rf /"]],
+            },
+            REASON_UNSAFE_LITERAL,
+        ),
+        (
+            {
+                "id": "echo",
+                "version": "1.0.0",
+                "task_kind": "generate",
+                "risk_class": "none",
+                "cache_policy": "never",
+                "argv": [["slot", "message"]],
+                "parameters": [{"name": "message", "type": "str"}],
+            },
+            REASON_NON_LITERAL_EXECUTABLE,
+        ),
+        (
+            {
+                "id": "echo",
+                "version": "1.0.0",
+                "task_kind": "generate",
+                "risk_class": "none",
+                "cache_policy": "never",
+                "argv": [["literal", "echo"], ["slot", "ghost"]],
+            },
+            REASON_UNKNOWN_PARAMETER,
+        ),
+        (
+            {
+                "id": "echo",
+                "version": "1.0.0",
+                "task_kind": "generate",
+                "risk_class": "none",
+                "cache_policy": "never",
+                "argv": [["shell", "echo"]],
+            },
+            REASON_BAD_MANIFEST,
+        ),
+        (
+            {
+                "id": "echo",
+                "version": "1.0.0",
+                "task_kind": "generate",
+                "risk_class": "none",
+                "cache_policy": "never",
+                "argv": "echo",
+            },
+            REASON_BAD_MANIFEST,
+        ),
+        (
+            {
+                "id": "echo",
+                "version": "1.0.0",
+                "task_kind": "generate",
+                "risk_class": "none",
+                "cache_policy": "never",
+                "argv": [["literal", "echo"]],
+                "platforms": "linux",
+            },
+            REASON_BAD_MANIFEST,
+        ),
+        (
+            {
+                "id": "echo",
+                "version": "1.0.0",
+                "task_kind": "generate",
+                "risk_class": "none",
+                "cache_policy": "never",
+                "argv": [["literal", "echo"]],
+                "parameters": [{"name": "1bad", "type": "str"}],
+            },
+            REASON_BAD_MANIFEST,
+        ),
+    ],
+)
+def test_recipe_from_mapping_is_fail_closed(payload, reason):
+    with pytest.raises(RecipeError) as excinfo:
+        recipe_from_mapping(payload)
+    assert excinfo.value.reason == reason
+
+
+def test_recipe_from_mapping_rejects_a_non_mapping():
+    for payload in (None, [], "echo", 3):
+        with pytest.raises(RecipeError) as excinfo:
+            recipe_from_mapping(payload)
+        assert excinfo.value.reason == REASON_BAD_MANIFEST
+
+
+def test_reconstruction_never_executes_anything():
+    """The inverse must stay inside the module's no-execution posture."""
+    import ast
+    import inspect
+
+    forbidden_modules = {"subprocess", "os", "socket", "shutil", "urllib"}
+    forbidden_builtins = {"eval", "exec", "compile", "__import__", "open"}
+    for func in (recipe_payload, recipe_from_mapping):
+        tree = ast.parse(inspect.getsource(func))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            target = node.func
+            if isinstance(target, ast.Name):
+                assert target.id not in forbidden_builtins
+            elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                assert target.value.id not in forbidden_modules

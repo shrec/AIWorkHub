@@ -435,8 +435,10 @@ def test_needfix_close_without_linked_findings_completes_exactly_once(
     assert receipt["needfix_closed_count"] == 0
 
 
-def test_default_route_uses_canonical_workforce_contract(monkeypatch, tmp_path: Path) -> None:
-    captured: list[object] = []
+_CATALOG = {"schema_id": "aiworkhub.workforce_catalog.v1", "workers": [{"worker_id": "gpt-5.5"}]}
+
+
+def _ready_storage(monkeypatch) -> None:
     monkeypatch.setattr(
         review_orchestrator.task_store,
         "storage_readiness",
@@ -444,10 +446,27 @@ def test_default_route_uses_canonical_workforce_contract(monkeypatch, tmp_path: 
             ready=True, reason="ready", repo_id="repo-test", canonical_db="queue.sqlite"
         ),
     )
+
+
+def _capture_rank(monkeypatch, captured: list) -> None:
     monkeypatch.setattr(
         review_orchestrator.workforce_catalog,
         "rank_task",
-        lambda _repo, task: captured.append(task) or {"launch_contract": dict(ROUTE)},
+        lambda _repo, task, *, catalog=None: (
+            captured.append((task, catalog)) or {"launch_contract": dict(ROUTE)}
+        ),
+    )
+
+
+def test_default_route_uses_canonical_workforce_contract(monkeypatch, tmp_path: Path) -> None:
+    captured: list = []
+    review_orchestrator.reset_routing_catalog_cache()
+    _ready_storage(monkeypatch)
+    _capture_rank(monkeypatch, captured)
+    monkeypatch.setattr(
+        review_orchestrator.workforce_catalog,
+        "build_routing_catalog",
+        lambda _repo: dict(_CATALOG),
     )
 
     route = review_orchestrator.select_reviewer_route(
@@ -455,9 +474,157 @@ def test_default_route_uses_canonical_workforce_contract(monkeypatch, tmp_path: 
     )
 
     assert route == ROUTE
-    assert captured[0].kinds == frozenset({"review"})
-    assert captured[0].risk == "critical"
-    assert "session-manager" in captured[0].tool_needs
+    task, catalog = captured[0]
+    assert task.kinds == frozenset({"review"})
+    assert task.risk == "critical"
+    assert "session-manager" in task.tool_needs
+    # The point of this wiring: ranking sees the evidenced catalog, and no
+    # longer falls through to build_catalog's empty process/usage defaults.
+    assert catalog == _CATALOG
+
+
+def test_reviewer_route_still_selects_when_the_catalog_build_raises(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A reviewer chosen on the prior beats a reviewer that never launches."""
+    captured: list = []
+    review_orchestrator.reset_routing_catalog_cache()
+    _ready_storage(monkeypatch)
+    _capture_rank(monkeypatch, captured)
+
+    def _explode(_repo):
+        raise OSError("process ledger unreadable")
+
+    monkeypatch.setattr(
+        review_orchestrator.workforce_catalog, "build_routing_catalog", _explode
+    )
+
+    route = review_orchestrator.select_reviewer_route(
+        tmp_path, "QUALITY_REVIEW_EXACT", "security"
+    )
+
+    assert route == ROUTE
+    # catalog=None makes rank_task rebuild the bare catalog itself, which is
+    # exactly the conservative-prior ranking used before this was wired.
+    assert captured[0][1] is None
+
+
+def test_a_catalog_build_that_raises_anything_never_stops_the_review(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Every failure mode of the ledger chain degrades to the prior, not to no review."""
+    review_orchestrator.reset_routing_catalog_cache()
+    _ready_storage(monkeypatch)
+    for failure in (
+        OSError("io"),
+        sqlite3.Error("db"),
+        ValueError("malformed row"),
+        ImportError("dashboard mid-edit"),
+        SyntaxError("module being edited"),
+        RuntimeError("anything at all"),
+    ):
+        captured: list = []
+        _capture_rank(monkeypatch, captured)
+        review_orchestrator.reset_routing_catalog_cache()
+
+        def _explode(_repo, _exc=failure):
+            raise _exc
+
+        monkeypatch.setattr(
+            review_orchestrator.workforce_catalog, "build_routing_catalog", _explode
+        )
+
+        route = review_orchestrator.select_reviewer_route(
+            tmp_path, "QUALITY_REVIEW_EXACT", "security"
+        )
+
+        assert route == ROUTE, failure
+        assert captured[0][1] is None, failure
+
+
+@pytest.mark.parametrize(
+    "unusable",
+    [None, {}, [], "catalog", {"workers": []}, {"workers": None}, {"no_workers": 1}],
+)
+def test_an_unusable_catalog_never_reaches_rank_task(
+    monkeypatch, tmp_path: Path, unusable
+) -> None:
+    """A truthy catalog with no workers ranks zero candidates and kills the launch."""
+    captured: list = []
+    review_orchestrator.reset_routing_catalog_cache()
+    _ready_storage(monkeypatch)
+    _capture_rank(monkeypatch, captured)
+    monkeypatch.setattr(
+        review_orchestrator.workforce_catalog,
+        "build_routing_catalog",
+        lambda _repo: unusable,
+    )
+
+    route = review_orchestrator.select_reviewer_route(
+        tmp_path, "QUALITY_REVIEW_EXACT", "security"
+    )
+
+    assert route == ROUTE
+    assert captured[0][1] is None
+
+
+def test_an_unusable_catalog_is_never_cached_as_if_it_were_good(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A failed build must not poison the memo for the rest of the pass."""
+    review_orchestrator.reset_routing_catalog_cache()
+    _ready_storage(monkeypatch)
+    _capture_rank(monkeypatch, [])
+    builds: list[int] = []
+
+    def _fail_then_succeed(_repo):
+        builds.append(1)
+        if len(builds) == 1:
+            raise OSError("transient")
+        return dict(_CATALOG)
+
+    monkeypatch.setattr(
+        review_orchestrator.workforce_catalog,
+        "build_routing_catalog",
+        _fail_then_succeed,
+    )
+
+    assert review_orchestrator.routing_catalog(tmp_path) is None
+    assert review_orchestrator.routing_catalog(tmp_path) == _CATALOG
+    assert len(builds) == 2
+
+
+def test_the_routing_catalog_is_built_once_per_pass_not_once_per_action(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """12 actions in a drain pass must not pay the measured +1.49s twelve times."""
+    review_orchestrator.reset_routing_catalog_cache()
+    _ready_storage(monkeypatch)
+    _capture_rank(monkeypatch, [])
+    builds: list[int] = []
+    monkeypatch.setattr(
+        review_orchestrator.workforce_catalog,
+        "build_routing_catalog",
+        lambda _repo: builds.append(1) or dict(_CATALOG),
+    )
+
+    for _ in range(12):
+        review_orchestrator.select_reviewer_route(tmp_path, "QUALITY_REVIEW", "security")
+
+    assert len(builds) == 1
+
+
+def test_each_drain_pass_starts_from_a_fresh_routing_catalog(tmp_path: Path) -> None:
+    """Evidence may go stale within a pass, never across one."""
+    review_orchestrator.reset_routing_catalog_cache()
+    review_orchestrator._ROUTING_CATALOG_CACHE["primed"] = (0.0, dict(_CATALOG))
+    driver = review_orchestrator.ReviewOrchestrator(
+        _Manager(tmp_path), db_path=tmp_path / "review.sqlite", route_selector=_route
+    )
+
+    driver.drain(max_actions=1, now=NOW)
+
+    assert review_orchestrator._ROUTING_CATALOG_CACHE == {}
 
 
 def test_workspace_binding_commits_and_closes_its_connection(

@@ -6,6 +6,58 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-07
+
+### Fixed
+
+- Review ingest strips unknown finding keys and records them instead of
+  raising, and validates every finding instead of aborting at the first, so one
+  malformed finding no longer discards a whole reviewer run.
+- The launcher's quality-review receipt floor is derived from the canonical
+  schema rather than hand-maintained, so `category` — declared NotRequired — is
+  no longer demanded of a receipt.
+- Reviewer children orphaned by a parent relaunch are classified rather than
+  silently skipped: a strictly-older claim epoch supersedes, and anything else
+  is refused with a named reason instead of leaving the child stranded.
+- `restore_task` reverses the whole archive in one preimage-guarded update with
+  a post-commit re-read, and archive-inconsistency scanning now runs in both
+  directions.
+- Terminal transitions carry a typed reason, so an AIWorkHub-minted cause is no
+  longer collapsed into a generic runtime error. Caller-supplied text stays
+  sanitised; the reason type is deliberately not a `str` subclass so it cannot
+  erode back into an untyped string.
+- Validation lane compatibility is decided at preflight instead of after a
+  worker has already spent its tokens, and no weaker lane is ever substituted.
+- Task-store terminal transitions take a cross-process write lease, converting
+  a busy-timeout failure into bounded waiting.
+
+### Changed
+
+- A mechanical failure verdict that is positive, explicit, in-epoch and
+  measured now returns a card for rework instead of spending a reviewer launch.
+  An absent, stale, malformed or unmeasured verdict still launches the
+  reviewer: not having measured must never read as having passed.
+- Every card must declare validation commands or carry one explicitly named
+  exemption; an empty list can no longer stand in for exemption.
+- Routing withholds an observed value from a worker below the minimum sample
+  floor, and sorts evidence-weighted acceptance ahead of latency.
+- Accept/reject metrics exclude reviewer children and count distinct cards
+  rather than decision events.
+- Worker pytest output carries `--tb=short`; acceptance evidence is unaffected
+  because it is built from structured receipts, not worker stdout.
+- Rejections may promote to AI Memory and KB. Context Graph stays
+  acceptance-only: an unverified causal edge contaminates every path through it.
+
+### Added
+
+- Tool Recipes has a durable store, so an empty panel now reports a fact about
+  the repository rather than an artifact of the dashboard building an empty
+  registry on every call.
+- Read efficiency feeds an evidence check, reported as an observation with an
+  honest denominator and blocking off by default.
+- `db_writer` provides a cross-process write lease; the lock class it addresses
+  is cross-process, so an in-process queue could not have resolved it.
+
 ## [0.11.0] - 2026-09-07
 
 ### Fixed

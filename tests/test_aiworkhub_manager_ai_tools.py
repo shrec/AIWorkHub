@@ -20,6 +20,7 @@ from aiworkhub import (  # noqa: E402
     shared_router,
     source_graph,
     task_store,
+    workforce_catalog,
     worker_ai_tools_mcp as worker_tools,
 )
 from aiworkhub.worker_workspace import materialize_rework_overlay  # noqa: E402
@@ -345,15 +346,19 @@ def test_manager_workforce_reads_only_authority_repo_process_log(tmp_path, monke
     assert task_store.initialize_repository(root)["ok"]
     monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
     observed: list[Path] = []
+    # The reader moved into workforce_catalog.default_process_rows when the
+    # hand-assembled catalog collapsed onto build_routing_catalog. The contract
+    # under test is unchanged: the process ledger is read from the exact
+    # authority repository, never an ambient ProcessManager's default.
     monkeypatch.setattr(
-        manager_ai_tools,
-        "_workforce_process_rows",
-        lambda repo: observed.append(repo) or [],
+        workforce_catalog,
+        "default_process_rows",
+        lambda repo, **kwargs: observed.append(Path(repo)) or [],
     )
     result = manager_ai_tools.workforce_catalog_read()
 
     assert result["ok"] is True
-    assert observed == [root]
+    assert observed == [root.resolve()]
     assert result["manager"]["repo"] == str(root)
 
 

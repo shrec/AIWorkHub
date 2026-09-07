@@ -168,6 +168,11 @@ BOUNDED_BY_CONSTRUCTION: dict[tuple[str, str], str] = {
     ("worker_ai_tools_mcp.py", "_STORAGE_REGISTRY_CACHE"):
         "keyed by str(authority_repo); one entry per repository this process "
         "has served, not per request",
+    ("review_orchestrator.py", "_ROUTING_CATALOG_CACHE"):
+        "keyed by repository root, one entry per repository this process has "
+        "served -- and unlike a read-only TTL, reset_routing_catalog_cache() "
+        "clears the whole dict at the top of every drain() pass, so the key "
+        "space cannot outlive a single pass",
 }
 
 

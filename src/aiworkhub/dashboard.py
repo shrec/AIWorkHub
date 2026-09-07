@@ -2247,7 +2247,19 @@ class DashboardProvider:
         api = _load_tool_recipes_api()
         if api is None:
             raise RuntimeError("tool_recipes_unavailable")
-        return api.RecipeRegistry(())
+        store = _load_tool_recipes_store()
+        if store is None:
+            return api.RecipeRegistry(())
+        # Load the durable store, but never let an absent, empty or unreadable
+        # recipe database fail a dashboard refresh: degrade to an empty registry
+        # so a repository with no registered recipes renders a clean, empty
+        # panel.  The panel may still read ``no_sample`` -- but that is now a
+        # measured fact about the store, not this method handing the projection
+        # an empty list and the projection reporting that the list is empty.
+        try:
+            return store.load_registry(self.repo_root)
+        except Exception:  # noqa: BLE001 - a bad store must never break the dashboard
+            return api.RecipeRegistry(())
 
 
 def _normalize_task_rows(
@@ -2873,6 +2885,14 @@ def _load_skill_registry_store() -> Any | None:
 def _load_tool_recipes_api() -> Any | None:
     try:
         from aiworkhub import tool_recipes as module
+    except ImportError:
+        return None
+    return module
+
+
+def _load_tool_recipes_store() -> Any | None:
+    try:
+        from aiworkhub import tool_recipes_store as module
     except ImportError:
         return None
     return module

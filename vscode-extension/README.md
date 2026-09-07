@@ -12,6 +12,24 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.1 — 2026-09-07
+
+- Review ingest strips unknown finding keys and records them instead of
+  raising, and validates every finding instead of aborting at the first, so a
+  single malformed finding no longer discards a whole reviewer run.
+- A measured mechanical failure returns a card for rework instead of spending a
+  reviewer launch. An unmeasured verdict still launches the reviewer: not
+  having measured must never read as having passed.
+- Terminal transitions carry a typed reason, so an AIWorkHub-minted cause is no
+  longer collapsed into a generic runtime error, while caller-supplied text
+  stays sanitised.
+- Validation lane compatibility is decided before a worker starts rather than
+  after it has already spent its tokens.
+- Task-store terminal transitions take a cross-process write lease, converting
+  a database busy-timeout failure into bounded waiting.
+- Tool Recipes has a durable store, so an empty panel now states a fact about
+  the repository instead of an artifact of the dashboard.
+
 ## What's new in 0.11.0 — 2026-09-07
 
 - Process launcher and worker workspace record terminal-failure evidence
