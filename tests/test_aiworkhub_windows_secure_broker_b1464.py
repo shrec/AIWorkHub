@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -304,9 +305,13 @@ def test_windows_workforce_allocation_uses_only_launchable_editor_routes(
         "glm_copilot_cli",
     }
 
-    # Zero-history GLM route: the editor bridge is launchable but no recent
-    # authenticated terminal success was observed, so the route stays
-    # unobserved and no worker is selected or launched.
+    # Zero-history GLM route: the editor bridge is launchable and nothing has
+    # been measured failing, so the route is AVAILABLE and selectable.  It
+    # used to be held unavailable until a recent terminal success appeared,
+    # which no route on a fresh install can ever produce: unavailable routes
+    # are never launched, so they never earn the success that would make them
+    # available.  Absence of a success is the unmeasured case, not a measured
+    # failure, and only measured failures gate here.
     zero_history = workforce_catalog.build_catalog(
         root,
         cards=[],
@@ -319,11 +324,23 @@ def test_windows_workforce_allocation_uses_only_launchable_editor_routes(
         if worker["worker_id"] == "glm-5.2"
     )
     assert glm["launch_eligible"] is True
-    assert glm["available"] is False
-    assert glm["availability_observed"] is False
-    assert glm["route_health"]["state"] == "unobserved"
-    assert glm["route_health"]["reason"] == "no_recent_terminal_execution"
-    assert glm["readiness_status"] == "route_unobserved"
+    assert glm["available"] is True
+    assert glm["route_health"]["state"] == "closed"
+    assert glm["route_health"]["failure_kind"] == ""
+    # `readiness_status` quotes preflight's own status verbatim -- one word
+    # for one fact, never a second spelling invented on this surface.
+    glm_preflight = next(
+        row for row in preflight["providers"]
+        if row["adapter_id"] == "glm_vscode_lm"
+    )
+    assert glm["readiness_status"] == glm_preflight["status"]
+    # The absence of history is reported as evidence, never as a verdict.
+    assert (
+        glm["route_observation"]["reason"]
+        == repo_policy.ROUTE_OBSERVATION_NEVER_RECORDED
+    )
+    # The point of THIS test is unchanged: on a Windows host with no
+    # AppContainer sandbox, no native CLI route may be used at all.
     assert all(
         worker["available"] is False
         for worker in zero_history["workers"]
@@ -339,42 +356,6 @@ def test_windows_workforce_allocation_uses_only_launchable_editor_routes(
         tool_needs=["source-graph"],
     )
     decision = workforce_catalog.rank_task(root, task, catalog=zero_history)
-    assert decision["selected_worker_id"] is None
-    assert decision["launch_contract"] is None
-
-    # One exact recent authenticated terminal-success row for glm-5.2 on the
-    # glm_vscode_lm route makes the route observed, closed and rankable.
-    observed = workforce_catalog.build_catalog(
-        root,
-        cards=[],
-        process_rows=[{
-            "request_id": "glm-review-1",
-            "task_id": "T-glm-review",
-            "adapter_id": "glm_vscode_lm",
-            "model": "glm-5.2",
-            "state": "review_ready",
-            "runner": "glm_5.2",
-            "finished_at": "2033-05-18T03:33:10+00:00",
-        }],
-        preflight=preflight,
-        now_epoch=now_epoch,
-    )
-    glm = next(
-        worker for worker in observed["workers"]
-        if worker["worker_id"] == "glm-5.2"
-    )
-    assert glm["launch_eligible"] is True
-    assert glm["available"] is True
-    assert glm["availability_observed"] is True
-    assert glm["route_health"]["state"] == "closed"
-    assert glm["readiness_status"] != "route_unobserved"
-    assert all(
-        worker["available"] is False
-        for worker in observed["workers"]
-        if worker["effective_adapter_id"] in native_adapters
-    )
-
-    decision = workforce_catalog.rank_task(root, task, catalog=observed)
     assert decision["selected_worker_id"] == "glm-5.2"
     assert decision["selected_adapter_id"] == "glm_vscode_lm"
     assert decision["launch_contract"] == {
@@ -384,6 +365,44 @@ def test_windows_workforce_allocation_uses_only_launchable_editor_routes(
         "task_id": "T-windows-editor-route",
         "identity_rule": "use_same_runner_for_task_create_and_agent_launch_task",
     }
+
+    # A measured FAILURE is what takes the route away.  Two transient
+    # failures inside the cooldown trip the circuit; the native CLI routes
+    # stay unavailable throughout, which is what this test exists to hold.
+    failing = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[{
+            "request_id": f"glm-fail-{index}",
+            "task_id": f"T-glm-fail-{index}",
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "state": "launch_failed",
+            "runner": "glm_5.2",
+            "finished_at": datetime.fromtimestamp(
+                now_epoch - 60 - index, tz=timezone.utc
+            ).isoformat(),
+        } for index in range(2)],
+        preflight=preflight,
+        now_epoch=now_epoch,
+    )
+    glm = next(
+        worker for worker in failing["workers"]
+        if worker["worker_id"] == "glm-5.2"
+    )
+    assert glm["launch_eligible"] is False
+    assert glm["available"] is False
+    assert glm["route_health"]["state"] == "open"
+    assert glm["readiness_status"] == "route_circuit_open"
+    assert all(
+        worker["available"] is False
+        for worker in failing["workers"]
+        if worker["effective_adapter_id"] in native_adapters
+    )
+
+    decision = workforce_catalog.rank_task(root, task, catalog=failing)
+    assert decision["selected_worker_id"] is None
+    assert decision["launch_contract"] is None
 
 
 def test_editor_model_aliases_resolve_only_to_observed_same_provider_models() -> None:

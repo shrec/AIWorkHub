@@ -387,12 +387,13 @@ def test_copilot_exact_model_switch_does_not_disable_sibling_model(tmp_path: Pat
         and row["model"] in {"glm-5.2", "glm-5.3"}
     }
     assert by_model["glm-5.2"]["launch_eligible"] is True
-    assert by_model["glm-5.2"]["available"] is False
-    assert by_model["glm-5.2"]["availability_observed"] is False
-    assert by_model["glm-5.2"]["route_health"]["state"] == "unobserved"
-    assert by_model["glm-5.2"]["route_health"]["reason"] == "no_recent_terminal_execution"
+    # The sibling model is untouched by the exact-model switch: it is
+    # startable, its circuit is closed, and it has no failures, so it is
+    # available.  Availability never waited on an observed success.
+    assert by_model["glm-5.2"]["available"] is True
+    assert by_model["glm-5.2"]["route_health"]["state"] == "closed"
     assert by_model["glm-5.2"]["route_health"]["failure_kind"] == ""
-    assert by_model["glm-5.2"]["readiness_status"] == "route_unobserved"
+    assert by_model["glm-5.2"]["readiness_status"] == "ready"
     assert by_model["glm-5.3"]["available"] is False
 
 
@@ -446,7 +447,11 @@ def test_explicit_disabled_discovered_model_overrides_family_projection(
     assert len(candidates) == 1
     assert candidates[0]["excluded"] is True
     assert decision["selected_worker_id"] != "glm-5.3"
-    assert decision["launch_contract"] is None
+    # The healthy sibling may well win a contract -- it is startable and its
+    # circuit is closed.  The invariant under test is only that an explicitly
+    # DISABLED discovered model never does.
+    contract = decision["launch_contract"]
+    assert contract is None or contract["model"] != "glm-5.3"
 
 
 def test_explicit_enabled_discovered_model_stays_authoritative_and_dynamic() -> None:
@@ -694,10 +699,9 @@ def test_deepseek_uses_launchable_copilot_fallback_without_identity_drift(
     )
     worker = next(row for row in snapshot["workers"] if row["worker_id"] == "deepseek-v4-pro")
     assert worker["launch_eligible"] is True
-    assert worker["available"] is False
-    assert worker["availability_observed"] is False
-    assert worker["route_health"]["state"] == "unobserved"
-    assert worker["readiness_status"] == "route_unobserved"
+    assert worker["available"] is True
+    assert worker["route_health"]["state"] == "closed"
+    assert worker["readiness_status"] == "ready"
     assert worker["adapter_id"] == "deepseek_vscode_lm"
     assert worker["effective_adapter_id"] == "deepseek_copilot_cli"
     assert worker["adapter_fallback_used"] is True
@@ -720,10 +724,9 @@ def test_glm_uses_launchable_copilot_fallback(tmp_path: Path) -> None:
     )
     worker = next(row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2")
     assert worker["launch_eligible"] is True
-    assert worker["available"] is False
-    assert worker["availability_observed"] is False
-    assert worker["route_health"]["state"] == "unobserved"
-    assert worker["readiness_status"] == "route_unobserved"
+    assert worker["available"] is True
+    assert worker["route_health"]["state"] == "closed"
+    assert worker["readiness_status"] == "ready"
     assert worker["effective_adapter_id"] == "glm_copilot_cli"
     assert worker["adapter_fallback_used"] is True
 
@@ -1120,10 +1123,9 @@ def test_enabled_deepseek_copilot_route_survives_disabled_copilot_catalog_model(
     assert worker["policy_provider"] == "deepseek"
     assert worker["policy_enabled"] is True
     assert worker["launch_eligible"] is True
-    assert worker["available"] is False
-    assert worker["availability_observed"] is False
-    assert worker["route_health"]["state"] == "unobserved"
-    assert worker["readiness_status"] == "route_unobserved"
+    assert worker["available"] is True
+    assert worker["route_health"]["state"] == "closed"
+    assert worker["readiness_status"] == "ready_unverified"
 
 
 def test_canonical_usage_rows_supply_tokens_and_labeled_unknown_cost(tmp_path: Path) -> None:
@@ -1281,9 +1283,8 @@ def test_route_circuit_is_exact_adapter_model_and_never_shared_mcp(
     assert pro["route_health"]["scope"] == "exact_adapter_and_model"
     assert pro["route_health"]["mcp_control_plane_affected"] is False
     assert flash["launch_eligible"] is True
-    assert flash["available"] is False
-    assert flash["availability_observed"] is False
-    assert flash["route_health"]["state"] == "unobserved"
+    assert flash["available"] is True
+    assert flash["route_health"]["state"] == "closed"
 
     task = workforce_router.TaskRequirements.build(
         task_id="route-local-fallback",
@@ -1293,8 +1294,15 @@ def test_route_circuit_is_exact_adapter_model_and_never_shared_mcp(
         tool_needs=["source-graph"],
     )
     decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
-    assert decision["selected_worker_id"] is None
-    assert decision["launch_contract"] is None
+    # The tripped route is excluded.  Its healthy sibling is not: an open
+    # circuit on one exact route must never starve the whole workforce.
+    assert decision["selected_worker_id"] != "deepseek-v4-pro"
+    pro_candidate = next(
+        item for item in decision["candidates"]
+        if item["worker_id"] == "deepseek-v4-pro"
+    )
+    assert pro_candidate["excluded"] is True
+    assert "worker_unavailable" in pro_candidate["exclusion_reasons"]
 
 
 def test_route_success_resets_transient_circuit_and_auth_circuit_half_opens(
@@ -1346,8 +1354,9 @@ def test_route_success_resets_transient_circuit_and_auth_circuit_half_opens(
         if row["worker_id"] == "deepseek-v4-pro"
     )
     assert pro["launch_eligible"] is True
-    assert pro["available"] is False
-    assert pro["availability_observed"] is False
+    # Half-open is the breaker's retry state: the cooldown elapsed, so the
+    # route may be tried again and is available.
+    assert pro["available"] is True
     assert pro["route_health"]["state"] == "half_open"
     assert pro["route_health"]["failure_kind"] == "auth"
 
@@ -1404,9 +1413,8 @@ def test_authenticated_http_402_quota_opens_exact_route_after_one_failure(
     assert pro["route_health"]["mcp_control_plane_affected"] is False
     # Sibling model on the same adapter stays healthy and rankable.
     assert flash["launch_eligible"] is True
-    assert flash["available"] is False
-    assert flash["availability_observed"] is False
-    assert flash["route_health"]["state"] == "unobserved"
+    assert flash["available"] is True
+    assert flash["route_health"]["state"] == "closed"
 
     task = workforce_router.TaskRequirements.build(
         task_id="quota-route-local-fallback",
@@ -1416,8 +1424,9 @@ def test_authenticated_http_402_quota_opens_exact_route_after_one_failure(
         tool_needs=["source-graph"],
     )
     decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
-    assert decision["selected_worker_id"] is None
-    assert decision["launch_contract"] is None
+    # The quota-failed route is excluded.  Its healthy sibling is not: one
+    # route tripping must never starve the whole workforce.
+    assert decision["selected_worker_id"] != "deepseek-v4-pro"
     pro_candidate = next(
         item for item in decision["candidates"]
         if item["worker_id"] == "deepseek-v4-pro"
@@ -1479,9 +1488,8 @@ def test_only_sealed_provider_errors_classify_not_prose_or_spoofing(
             if row["worker_id"] == "deepseek-v4-pro"
         )
         assert pro["launch_eligible"] is True, label
-        assert pro["available"] is False, label
-        assert pro["availability_observed"] is False, label
-        assert pro["route_health"]["state"] == "unobserved", label
+        assert pro["available"] is True, label
+        assert pro["route_health"]["state"] == "closed", label
         assert pro["route_health"]["failure_kind"] == "", label
         assert pro["route_health"]["consecutive_failures"] == 0, label
 
@@ -1574,9 +1582,10 @@ def test_unsealed_auth_error_prose_never_opens_route_circuit(
             if row["worker_id"] == "deepseek-v4-pro"
         )
         assert pro["launch_eligible"] is True, error
-        assert pro["available"] is False, error
-        assert pro["availability_observed"] is False, error
-        assert pro["route_health"]["state"] == "unobserved", error
+        # Prose never trips a circuit, so nothing was measured failing and
+        # the route stays available on the unmeasured case.
+        assert pro["available"] is True, error
+        assert pro["route_health"]["state"] == "closed", error
         assert pro["route_health"]["failure_kind"] == "", error
         assert pro["route_health"]["consecutive_failures"] == 0, error
 
@@ -1610,9 +1619,11 @@ def test_sealed_auth_401_403_open_only_exact_route_and_sealed_success_recovers(
         assert pro["route_health"]["threshold"] == 1, (http_status, code)
         # Sibling model and the shared control plane stay healthy.
         assert flash["launch_eligible"] is True, (http_status, code)
-        assert flash["available"] is False, (http_status, code)
-        assert flash["availability_observed"] is False, (http_status, code)
-        assert flash["route_health"]["state"] == "unobserved", (http_status, code)
+        # The sibling has no failures of its own, so its circuit is closed
+        # and it stays available -- isolation is per exact route.
+        assert flash["available"] is True, (http_status, code)
+        assert flash["route_health"]["state"] == "closed", (http_status, code)
+        assert flash["route_health"]["failure_kind"] == "", (http_status, code)
         assert pro["route_health"]["mcp_control_plane_affected"] is False
 
     # A later sealed authenticated success deterministically closes the circuit.
@@ -1820,10 +1831,10 @@ def test_route_with_decided_history_is_never_published_as_never_observed(
     )
     glm = next(row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2")
 
-    # The verdict stays negative -- nothing recent proves the route still
-    # works -- but it must not claim the route was never observed.
-    assert glm["available"] is False
-    assert glm["readiness_status"] == "route_unobserved_in_window"
+    # The verdict on the ROUND TRIP stays negative -- nothing recent proves
+    # the route still works -- but it must not claim the route was never
+    # observed, and it must not make the route unavailable either.
+    assert glm["available"] is True
 
     observation = glm["route_observation"]
     assert observation["reason"] == repo_policy.ROUTE_OBSERVATION_OUTSIDE_WINDOW
@@ -1852,8 +1863,11 @@ def test_route_with_no_history_stays_unobserved_and_never_borrows_evidence(
     )
     glm = next(row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2")
 
-    assert glm["available"] is False
-    assert glm["readiness_status"] == "route_unobserved"
+    # Never run is UNKNOWN, not bad: the route stays available so it can earn
+    # its first observation.  A gate that needs a success to open can never
+    # open on a fresh install.
+    assert glm["available"] is True
+    assert glm["route_health"]["state"] == "closed"
     observation = glm["route_observation"]
     assert observation["reason"] == repo_policy.ROUTE_OBSERVATION_NEVER_RECORDED
     assert observation["prior_observation_count"] == 0
@@ -1907,14 +1921,20 @@ def test_a_stale_terminal_execution_still_counts_as_a_prior_observation(
         row for row in stale["workers"] if row["worker_id"] == "deepseek-v4-pro"
     )
     # `supported` must decay out of the window -- an old success cannot keep
-    # asserting the route works today.
-    assert stale_pro["available"] is False
+    # asserting the route works today -- but decay is not a failure, so the
+    # route stays available.  This is the owner's second case: a week away
+    # must not make a working route unavailable on Monday.
+    assert stale_pro["available"] is True
+    assert stale_pro["route_health"]["state"] == "closed"
     assert (
         stale_pro["route_observation"]["state"]
         == provider_route_contracts.CAPABILITY_UNKNOWN
     )
-    # ...but the route was observed, so it is not reported as never run.
-    assert stale_pro["readiness_status"] == "route_unobserved_in_window"
+    # ...and the route was observed, so it is not reported as never run.
+    assert (
+        stale_pro["route_observation"]["reason"]
+        == repo_policy.ROUTE_OBSERVATION_OUTSIDE_WINDOW
+    )
     assert stale_pro["route_observation"]["prior_observation_count"] == 1
     assert (
         stale_pro["route_observation"]["evidence_class"]
@@ -2020,12 +2040,30 @@ def test_rank_task_carries_the_exact_reason_an_excluded_route_was_dropped(
     tmp_path: Path,
 ) -> None:
     root = _root(tmp_path)
+    now = 2_000_000_000.0
+    # A route with 53 decided tasks that is ALSO failing right now.  Only the
+    # measured failures exclude it; the decided history travels with the
+    # decision so a reader can see the route is not a stranger, merely sick.
+    failing = [
+        {
+            "request_id": f"glm-fail-{index}",
+            "task_id": f"T-glm-fail-{index}",
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "state": "launch_failed",
+            "finished_at": datetime.fromtimestamp(
+                now - 60 - index, tz=timezone.utc
+            ).isoformat(),
+        }
+        for index in range(2)
+    ]
     snapshot = workforce_catalog.build_catalog(
         root,
         cards=[],
-        process_rows=[],
+        process_rows=failing,
         preflight=_preflight(),
         cost_per_accepted_outcome=_glm_route_economics(matched=53, accepted=23),
+        now_epoch=now,
     )
     task = workforce_router.TaskRequirements.build(
         task_id="reason-propagation",
@@ -2042,8 +2080,8 @@ def test_rank_task_carries_the_exact_reason_an_excluded_route_was_dropped(
     assert "worker_unavailable" in glm["exclusion_reasons"]
     # The router only knows "unavailable"; the catalog knows why.  A reader of
     # the decision must not have to go back to the catalog to find out.
-    assert glm["availability_reason"] == (
-        repo_policy.ROUTE_OBSERVATION_OUTSIDE_WINDOW
+    assert glm["availability_reason"].startswith(
+        repo_policy.ROUTE_OBSERVATION_CIRCUIT_OPEN
     )
     assert glm["route_observation"]["prior_observation_count"] == 53
 
@@ -2051,11 +2089,11 @@ def test_rank_task_carries_the_exact_reason_an_excluded_route_was_dropped(
 def test_availability_predicate_says_which_questions_decided_the_verdict(
     tmp_path: Path,
 ) -> None:
-    """`available` is a conjunction; the row must say which one it used.
+    """`available` is a conjunction; the row must say which questions it used.
 
-    Pinning every row to the round-trip question would be a second wrong
-    label: a non-gated route's `available` is decided by startability alone,
-    which is the question preflight already answers.
+    The conjunction is now the SAME two questions for every route.  It used
+    to include the round-trip question for two provider families only, which
+    is what made a fresh install unable to start them at all.
     """
     root = _root(tmp_path)
     snapshot = workforce_catalog.build_catalog(
@@ -2063,21 +2101,18 @@ def test_availability_predicate_says_which_questions_decided_the_verdict(
     )
     by_id = {row["worker_id"]: row for row in snapshot["workers"]}
 
-    gated = by_id["glm-5.2"]
-    assert gated["observation_gated_route"] is True
-    assert gated["availability_predicate"] == [
-        repo_policy.ROUTE_QUESTION_STARTABLE,
-        repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED,
-    ]
+    for worker_id in ("glm-5.2", "claude-opus-5"):
+        row = by_id[worker_id]
+        assert row["availability_predicate"] == [
+            repo_policy.ROUTE_QUESTION_STARTABLE,
+            repo_policy.ROUTE_QUESTION_FAILURE_CIRCUIT_CLOSED,
+        ], worker_id
+        assert row["available"] is row["launch_eligible"], worker_id
 
-    ungated = by_id["claude-opus-5"]
-    assert ungated["observation_gated_route"] is False
-    # Startability alone -- the same question preflight answers, decided from
-    # preflight's own verdict, so the two surfaces share one predicate here.
-    assert ungated["availability_predicate"] == [
-        repo_policy.ROUTE_QUESTION_STARTABLE
-    ]
-    assert ungated["available"] is ungated["launch_eligible"]
+    # The switch that carried the old per-provider asymmetry is gone, not
+    # merely unread: a dead gate is one edit away from being re-armed.
+    assert not hasattr(workforce_catalog, "_OBSERVATION_GATED_PROVIDERS")
+    assert all("observation_gated_route" not in row for row in snapshot["workers"])
 
     for row in snapshot["workers"]:
         # Whatever the conjunction, the round-trip fact is reported for every
@@ -2090,3 +2125,364 @@ def test_availability_predicate_says_which_questions_decided_the_verdict(
             provider_route_contracts.CAPABILITY_UNSUPPORTED,
             provider_route_contracts.CAPABILITY_UNKNOWN,
         }
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00672.  Two defects in one expression.
+#
+# 1. Availability required a terminal success inside a 24h window for two
+#    provider families, which is a gate that can never open on a fresh
+#    install and that closes again after a week away.
+# 2. "Has this route EVER run?" was answered from the process log, which this
+#    repository retains for 7 days and which held 78 minutes of history when
+#    the defect was measured -- so every route reported that no terminal
+#    execution was ever recorded while the usage ledger held 143 records for
+#    the same runner.
+# ---------------------------------------------------------------------------
+
+
+def _decided_card(
+    *, task_id: str, adapter_id: str, model: str, status: str = "finished",
+) -> dict:
+    """A card as the RETAINED store holds it: no live process row survives."""
+    return {
+        "task_id": task_id,
+        "status": status,
+        "terminal_substatus": "review_ready",
+        "terminal_review": {
+            "evidence": {"adapter_id": adapter_id, "model": model},
+        },
+    }
+
+
+def test_a_route_with_no_history_at_all_is_available(tmp_path: Path) -> None:
+    """The owner's first case: what happens the first time someone works?
+
+    A fresh install has no history by construction.  If availability requires
+    an observed success, the route is never available, so it is never
+    launched, so it never earns the success -- the gate is self-locking.
+    """
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], usage_rows=[],
+        preflight=_preflight(), now_epoch=2_000_000_000.0,
+    )
+    for worker_id in ("glm-5.2", "deepseek-v4-pro", "claude-opus-5"):
+        row = next(
+            item for item in snapshot["workers"]
+            if item["worker_id"] == worker_id
+        )
+        assert row["available"] is row["launch_eligible"], worker_id
+        assert row["route_health"]["state"] == "closed", worker_id
+        assert row["route_health"]["consecutive_failures"] == 0, worker_id
+        # The absence is reported honestly, and as UNKNOWN -- never as a
+        # measured negative.  Nobody measured this route failing.
+        observation = row["route_observation"]
+        assert observation["prior_observation_count"] == 0, worker_id
+        assert observation["reason"] == (
+            repo_policy.ROUTE_OBSERVATION_NEVER_RECORDED
+        ), worker_id
+        assert observation["state"] == (
+            provider_route_contracts.CAPABILITY_UNKNOWN
+        ), worker_id
+
+    glm = next(
+        item for item in snapshot["workers"] if item["worker_id"] == "glm-5.2"
+    )
+    assert glm["available"] is True
+    task = workforce_router.TaskRequirements.build(
+        task_id="T-first-ever-run",
+        repo_id="repo",
+        kinds=["code"],
+        risk="high",
+        owner_model_pin="glm-5.2",
+        tool_needs=["source-graph"],
+    )
+    decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
+    assert decision["selected_worker_id"] == "glm-5.2"
+
+
+def test_a_route_whose_only_history_is_older_than_the_window_is_available(
+    tmp_path: Path,
+) -> None:
+    """The owner's second case: coming back after a week away.
+
+    The window is the circuit breaker's, and a breaker trips on failures.  A
+    success ageing out of it is not a failure; it is the same route, quieter.
+    """
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    stale_epoch = now - workforce_catalog.ROUTE_CIRCUIT_LOOKBACK_SECONDS * 7
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[{
+            "request_id": "week-old-success",
+            "task_id": "T-week-old",
+            "adapter_id": "glm_vscode_lm",
+            "model": "glm-5.2",
+            "state": "accepted",
+            "finished_at": datetime.fromtimestamp(
+                stale_epoch, tz=timezone.utc
+            ).isoformat(),
+        }],
+        preflight=_preflight(),
+        now_epoch=now,
+    )
+    glm = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2"
+    )
+    assert glm["available"] is True
+    assert glm["route_health"]["state"] == "closed"
+    assert glm["route_health"]["failure_kind"] == ""
+    observation = glm["route_observation"]
+    assert observation["reason"] == repo_policy.ROUTE_OBSERVATION_OUTSIDE_WINDOW
+    assert observation["state"] == provider_route_contracts.CAPABILITY_UNKNOWN
+    assert observation["prior_observation_count"] == 1
+    assert snapshot["summary"]["decided_history_outside_observation_window"] >= 1
+
+
+def test_prior_observations_survive_a_process_log_that_aged_out(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-00672 exactly: no process rows, 205 decided cards, count 205.
+
+    The process log is passed EMPTY, which is what a 7-day log holding 78
+    minutes looks like to this join.  Reading the count from that log is what
+    published `no_terminal_execution_ever_recorded` for a route with a
+    hundreds-strong decided history.
+    """
+    root = _root(tmp_path)
+    cards = [
+        _decided_card(
+            task_id=f"T-glm-{index}",
+            adapter_id="glm_vscode_lm",
+            model="glm-5.2",
+        )
+        for index in range(205)
+    ]
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=cards, process_rows=[], usage_rows=[],
+        preflight=_preflight(), now_epoch=2_000_000_000.0,
+    )
+    glm = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2"
+    )
+    observation = glm["route_observation"]
+    assert observation["prior_observation_count"] == 205
+    assert observation["reason"] == repo_policy.ROUTE_OBSERVATION_OUTSIDE_WINDOW
+    assert (
+        observation["evidence_class"]
+        == provider_route_contracts.EVIDENCE_OBSERVED_ROUND_TRIP
+    )
+    # The number is auditable: it says which retained ledger it came from,
+    # and that it did NOT come from the process log.
+    sources = observation["prior_observation_sources"]
+    assert sources["retained_decided_task_cards"] == 205
+    assert sources["process_log_cards"] == 0
+    assert sources["process_log_terminal_events"] == 0
+
+
+def test_prior_observations_reach_the_retained_usage_ledger(
+    tmp_path: Path,
+) -> None:
+    """The ledger `aiworkhub_task_usage_report` reads is reachable here too.
+
+    Its rows key on `requested_model`, which is the catalog's own model name,
+    so the join needs no runner translation -- and must not attempt one: the
+    runner column is many-to-one against models.
+    """
+    root = _root(tmp_path)
+    usage = [
+        {
+            "task_id": f"T-usage-{index}",
+            "runner": "glm" if index % 2 else "glm_5.2",
+            "adapter_id": "glm_vscode_lm",
+            "requested_model": "glm-5.2",
+            "model": "customendpoint/glm-5.2/glm-5.2/GLM-5.2/1.0.0",
+        }
+        for index in range(143)
+    ]
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], usage_rows=usage,
+        preflight=_preflight(), now_epoch=2_000_000_000.0,
+    )
+    glm = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2"
+    )
+    observation = glm["route_observation"]
+    assert observation["prior_observation_count"] == 143
+    assert observation["prior_observation_sources"]["retained_usage_records"] == 143
+    # Two different runner spellings, one route: keying on runner would have
+    # split this history in half.
+    assert {row["runner"] for row in usage} == {"glm", "glm_5.2"}
+
+
+def test_a_record_whose_route_cannot_be_resolved_is_never_attributed(
+    tmp_path: Path,
+) -> None:
+    """Fail closed on the OTHER side: unknown is unknown, not this route.
+
+    `deepseek_copilot` and `codex` are provider-family spellings the ledgers
+    really contain.  They name a vendor, not one of the two routes a DeepSeek
+    worker can take, so folding them in would credit `deepseek_vscode_lm`
+    with `deepseek_copilot_cli`'s history.
+    """
+    root = _root(tmp_path)
+    unresolvable = [
+        {
+            "task_id": "T-vendor-only",
+            "runner": "deepseek",
+            "provider": "deepseek_copilot",
+            "requested_model": "deepseek-v4-pro",
+        },
+        {
+            "task_id": "T-no-model",
+            "runner": "glm_5.2",
+            "adapter_id": "glm_vscode_lm",
+            "requested_model": "",
+            "model": "",
+        },
+    ]
+    index = workforce_catalog.retained_route_observations(
+        [
+            _decided_card(
+                task_id="T-card-no-model", adapter_id="claude_cli", model=""
+            )
+        ],
+        unresolvable,
+    )
+    # The guard lives in the identity function itself, so it holds for every
+    # caller: a vendor-family spelling resolves to NO adapter, a declared one
+    # resolves to itself.  Normalizing `deepseek_copilot` onto either
+    # DeepSeek route would credit one transport with the other's history.
+    assert workforce_catalog.route_evidence_identity(
+        "", "deepseek-v4-pro", adapter_fallback="deepseek_copilot"
+    ) == ("", "deepseek-v4-pro")
+    assert workforce_catalog.route_evidence_identity(
+        "", "deepseek-v4-pro", adapter_fallback="deepseek_vscode_lm"
+    ) == ("deepseek_vscode_lm", "deepseek-v4-pro")
+    assert workforce_catalog.route_evidence_identity(
+        "glm_vscode_lm", "glm-5.2"
+    ) == ("glm_vscode_lm", "glm-5.2")
+    assert index["unresolved_usage_records"] == 2
+    assert index["unresolved_decided_cards"] == 1
+    assert index["usage_records"] == {}
+    assert index["decided_tasks"] == {}
+
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], usage_rows=unresolvable,
+        preflight=_preflight(), now_epoch=2_000_000_000.0,
+    )
+    for worker_id in ("deepseek-v4-pro", "glm-5.2"):
+        row = next(
+            item for item in snapshot["workers"]
+            if item["worker_id"] == worker_id
+        )
+        assert row["route_observation"]["prior_observation_count"] == 0, worker_id
+        assert row["route_observation"]["reason"] == (
+            repo_policy.ROUTE_OBSERVATION_NEVER_RECORDED
+        ), worker_id
+
+
+def test_history_is_attributed_to_the_exact_route_not_the_sibling_adapter(
+    tmp_path: Path,
+) -> None:
+    """One model, two transports, two histories -- kept apart.
+
+    `deepseek-v4-pro` runs over the editor bridge and over the BYOK Copilot
+    CLI.  They are different authorizations, and one's history is not
+    evidence about the other.
+    """
+    root = _root(tmp_path)
+    cards = (
+        [
+            _decided_card(
+                task_id=f"T-bridge-{i}",
+                adapter_id="deepseek_vscode_lm",
+                model="deepseek-v4-pro",
+            )
+            for i in range(68)
+        ]
+        + [
+            _decided_card(
+                task_id=f"T-byok-{i}",
+                adapter_id="deepseek_copilot_cli",
+                model="deepseek-v4-pro",
+            )
+            for i in range(274)
+        ]
+    )
+    bridge_only = {
+        "providers": [
+            {"adapter_id": "deepseek_vscode_lm", "launchable": True, "status": "ready"},
+        ]
+    }
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=cards, process_rows=[], usage_rows=[],
+        preflight=bridge_only, now_epoch=2_000_000_000.0,
+    )
+    pro = next(
+        row for row in snapshot["workers"]
+        if row["worker_id"] == "deepseek-v4-pro"
+    )
+    assert pro["effective_adapter_id"] == "deepseek_vscode_lm"
+    # 68, not 342: the BYOK route's 274 belong to the BYOK route.
+    assert pro["route_observation"]["prior_observation_count"] == 68
+
+
+def test_claude_cli_alias_is_translated_by_the_one_existing_alias_table(
+    tmp_path: Path,
+) -> None:
+    """The catalog says `sonnet`; the ledgers say `claude-sonnet-5`.
+
+    That translation already exists once, in `_EDITOR_MODEL_ALIASES`.  A
+    second table here is how the two vocabularies drifted apart.
+    """
+    assert "claude-sonnet-5" in workforce_catalog.route_model_identities("sonnet")
+    assert workforce_catalog.route_model_identities("sonnet") >= {
+        "sonnet", *workforce_catalog._EDITOR_MODEL_ALIASES["sonnet"]
+    }
+
+    root = _root(tmp_path)
+    cards = [
+        _decided_card(
+            task_id="T-alias-cli", adapter_id="claude_cli", model="sonnet"
+        ),
+        _decided_card(
+            task_id="T-alias-ledger",
+            adapter_id="claude_cli",
+            model="claude-sonnet-5",
+        ),
+    ]
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=cards, process_rows=[], usage_rows=[],
+        preflight=_preflight(), now_epoch=2_000_000_000.0,
+    )
+    sonnet = next(
+        row for row in snapshot["workers"]
+        if row["worker_id"] == "claude-sonnet-5"
+    )
+    assert sonnet["route_observation"]["prior_observation_count"] == 2
+
+
+def test_route_observation_verdict_reports_where_its_count_came_from() -> None:
+    verdict = repo_policy.route_observation_verdict(
+        observed_in_window=False,
+        prior_observation_count=205,
+        observation_window_seconds=86_400.0,
+        evidence_sources={"retained_decided_task_cards": 205, "process_log_cards": 0},
+    )
+    assert verdict["prior_observation_count"] == 205
+    assert verdict["prior_observation_sources"] == {
+        "retained_decided_task_cards": 205,
+        "process_log_cards": 0,
+    }
+    assert verdict["reason"] == repo_policy.ROUTE_OBSERVATION_OUTSIDE_WINDOW
+    # Omitting the breakdown is allowed and reports an empty mapping, never a
+    # fabricated attribution.
+    assert repo_policy.route_observation_verdict(
+        observed_in_window=False,
+        prior_observation_count=0,
+        observation_window_seconds=86_400.0,
+    )["prior_observation_sources"] == {}

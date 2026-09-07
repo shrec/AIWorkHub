@@ -53,16 +53,19 @@ _MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,127}$")
 ROUTE_CIRCUIT_COOLDOWN_SECONDS = 600.0
 ROUTE_CIRCUIT_LOOKBACK_SECONDS = 86_400.0
 ROUTE_CIRCUIT_TRANSIENT_THRESHOLD = 2
-# Providers whose routes must show a LIVE round trip before the catalog will
-# call them available.  Their routes reach the model over the editor bridge or
-# a BYOK CLI, and for those families `provider_route_contracts` declares no
-# evidence that a unit of work can be carried end to end -- bridge presence is
-# a fact about the transport being up, never about a job finishing
-# (NF-2026-00669).  Membership is unchanged from 0.11.2 and is deliberately
-# not derived from the registry's declared capabilities: doing so would also
-# gate `kilo_xai_cli`, and changing which routes may be selected is a routing
-# decision that needs its own measurement, not a side effect of relabelling.
-_OBSERVATION_GATED_PROVIDERS: frozenset[str] = frozenset({"deepseek", "zhipu"})
+# Availability is NOT time-gated.  It used to require a terminal success
+# inside `ROUTE_CIRCUIT_LOOKBACK_SECONDS` for the editor-bridge/BYOK provider
+# families, which made the gate self-locking: a route that is never available
+# is never launched, so it can never earn the success that would make it
+# available, and a route that worked last week reads as unavailable after a
+# week away.  Absence of a recent success is the UNMEASURED case, not a
+# measured failure, and this repository does not publish unmeasured as
+# measured-negative.  A circuit breaker trips on observed FAILURES, and
+# `_route_circuit` below already is that breaker -- correctly bounded to
+# recent failures, with its own threshold and cooldown.  The round-trip
+# observation remains published as evidence (`route_observation`) and remains
+# available to ranking; it is no longer a gate, so the provider-membership
+# switch that carried the asymmetry has no remaining reader and is gone.
 # outcomes: the provider returned a usable result, so they close (never open)
 # a route circuit and are never counted as provider-route failures.
 _ROUTE_SUCCESS_STATES = frozenset(
@@ -742,6 +745,113 @@ def _expand_discovered_workers(
     return expanded
 
 
+def route_model_identities(model: str) -> frozenset[str]:
+    """Every spelling one catalog model identity is recorded under.
+
+    The catalog names Claude models by their CLI alias (``sonnet``) while the
+    retained ledgers record what was actually requested (``claude-sonnet-5``).
+    That translation already exists exactly once, in ``_EDITOR_MODEL_ALIASES``,
+    and is reused here rather than respelled: a second alias table is how the
+    two vocabularies drifted apart in the first place.
+    """
+
+    name = str(model or "").strip()
+    if not name:
+        return frozenset()
+    return frozenset({name, *_EDITOR_MODEL_ALIASES.get(name, ())})
+
+
+def route_evidence_identity(
+    adapter_id: Any, model: Any, *, adapter_fallback: Any = ""
+) -> tuple[str, str]:
+    """Resolve one retained record onto the catalog's exact route identity.
+
+    Returns ``(adapter_id, model)`` in the catalog's own vocabulary.  Either
+    half is returned EMPTY when it cannot be resolved, and an empty half means
+    unknown -- never "this route".  An adapter is resolved only against the
+    declared registry (``runtime_adapters.SUPPORTED_ADAPTERS``); the ledgers
+    also carry provider-family spellings (``deepseek_copilot``, ``codex``,
+    ``claude``) that name a vendor rather than a route, and attributing those
+    to one exact adapter would over-count a sibling route's history onto this
+    one.  Under-counting publishes real history as never-observed and
+    over-counting invents history; the empty half is how a record says
+    neither.
+    """
+
+    adapter = str(adapter_id or "").strip()
+    if adapter not in runtime_adapters.SUPPORTED_ADAPTERS:
+        fallback = str(adapter_fallback or "").strip()
+        adapter = fallback if fallback in runtime_adapters.SUPPORTED_ADAPTERS else ""
+    return adapter, str(model or "").strip()
+
+
+def retained_route_observations(
+    cards: Iterable[Mapping[str, Any]],
+    usage_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Index "has this exact route ever run?" over the RETAINED ledgers.
+
+    This answers a different question from ``_route_circuit`` and must read a
+    different ledger.  The circuit asks "did this route fail recently?" and is
+    correctly answered from the process log, which this repository retains for
+    ``logs_days`` (7).  "Has it ever run at all?" cannot be answered there: on
+    this repository that log held 78 minutes of history while the card store
+    held 4,628 decided cards, so every route read as never-observed.
+
+    Both retained stores already carry the exact route identity in the
+    catalog's own vocabulary -- a decided card in ``terminal_review.evidence``
+    (adapter_id + model, retained ``archived_tasks_days`` = 90) and a usage
+    record in ``adapter_id``/``requested_model``.  Neither is keyed on
+    ``runner``, and deliberately so: measured on this repository the runner
+    ``glm`` covers six different requested models, so a runner-keyed join
+    cannot attribute a record to one route without over-counting.
+
+    Sequential by measurement, not by default.  This is one pass of dict
+    lookups over the card and usage lists the caller has already materialized:
+    4,628 cards + 6,511 usage rows index in 7 ms on this repository, against
+    1,358 ms for the card read that produced them.  Handing 11k dict lookups
+    to a worker pool costs more in pickling and process start-up than the
+    whole pass, so the multicore default does not apply here.
+    """
+
+    decided: dict[tuple[str, str], int] = {}
+    usage: dict[tuple[str, str], int] = {}
+    unresolved_cards = 0
+    unresolved_usage = 0
+    for card in cards:
+        terminal = card.get("terminal_review") if isinstance(card, Mapping) else None
+        evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+        if not isinstance(evidence, Mapping):
+            # Not a decided card: it never reached a terminal review, so it is
+            # not evidence that the route completed anything.
+            continue
+        identity = route_evidence_identity(
+            evidence.get("adapter_id"), evidence.get("model")
+        )
+        if not identity[0] or not identity[1]:
+            unresolved_cards += 1
+            continue
+        decided[identity] = decided.get(identity, 0) + 1
+    for row in usage_rows:
+        if not isinstance(row, Mapping):
+            continue
+        identity = route_evidence_identity(
+            row.get("adapter_id"),
+            row.get("requested_model") or row.get("model"),
+            adapter_fallback=row.get("provider"),
+        )
+        if not identity[0] or not identity[1]:
+            unresolved_usage += 1
+            continue
+        usage[identity] = usage.get(identity, 0) + 1
+    return {
+        "decided_tasks": decided,
+        "usage_records": usage,
+        "unresolved_decided_cards": unresolved_cards,
+        "unresolved_usage_records": unresolved_usage,
+    }
+
+
 def build_catalog(
     repo_root: Path | str,
     *,
@@ -803,6 +913,11 @@ def build_catalog(
     economics_by_model = economic_view.get("routes")
     if not isinstance(economics_by_model, Mapping):
         economics_by_model = {}
+    # Built once per catalog, not once per worker: reading a 90-day store per
+    # row would turn the preflight path the dashboard and every launch
+    # decision hit into a quadratic scan.  Both inputs are already in memory,
+    # so this adds no I/O at all to any caller.
+    retained_observations = retained_route_observations(task_cards, usage)
     rows: list[dict[str, Any]] = []
     attributed_process_ids: set[int] = set()
     for worker in _expand_discovered_workers(catalog["workers"], ready_by_adapter):
@@ -975,53 +1090,64 @@ def build_catalog(
         if not isinstance(model_economics, Mapping):
             model_economics = {}
         # How much history this exact route already has, at ANY time -- not
-        # only inside the window.  Three independent ledgers can each show the
-        # route ran: a terminal process event, a decided task card, and the
-        # cost ledger's matched decided-task partitions.  Taking the largest
-        # fails closed in the honest direction, because an under-count is what
-        # lets a route with real history be published as never observed, which
-        # is the defect being fixed.
+        # only inside the window.  This is a different question from the
+        # circuit's, and until this commit it was answered from the circuit's
+        # ledger: every source below descended from the process log, which
+        # this repository retains for 7 days and which held 78 minutes of
+        # history when the defect was measured.  A card whose process row had
+        # aged out was unreachable even though the card itself is retained for
+        # 90 days, so the max of three blind sources was still blind and every
+        # route published `no_terminal_execution_ever_recorded` while the
+        # usage ledger returned 143 records for the same runner.
+        #
+        # The retained sources below reach the 90-day card store and the usage
+        # ledger directly, keyed on an identity both of them record and both
+        # vocabularies agree on (adapter + model).  Taking the largest fails
+        # closed in the honest direction: an under-count republishes real
+        # history as never-observed, which is the defect.  Over-counting is
+        # prevented on the other side, in `route_evidence_identity`, which
+        # refuses to attribute a record whose route it cannot resolve exactly.
         route_terminal_executions = sum(
             1 for process in matched if _process_event_epoch(process) is not None
         )
-        prior_observation_count = max(
-            len(matched_cards),
-            route_terminal_executions,
-            sum(
-                int(partition.get("matched_decided_tasks") or 0)
-                for family in model_economics.values()
-                if isinstance(family, Mapping)
-                for partition in family.values()
-                if isinstance(partition, Mapping)
-            ),
+        route_identities = {
+            (adapter, name)
+            for adapter in adapter_ids_to_match
+            for name in route_model_identities(worker["model"])
+        }
+        retained_decided_tasks = sum(
+            retained_observations["decided_tasks"].get(identity, 0)
+            for identity in route_identities
         )
-        # Which routes must show a live round trip before they may be called
-        # available.  The membership is unchanged from 0.11.2 -- widening or
-        # narrowing it is a routing decision, not a labelling one -- but it is
-        # no longer an unexplained pair of provider names: these are the
-        # editor-bridge and BYOK families whose contract declares no evidence
-        # that they can carry a unit of work end to end, so bridge presence
-        # alone must not stand in for a completed round trip (NF-2026-00669).
-        observation_gated_route = worker["provider"] in _OBSERVATION_GATED_PROVIDERS
+        retained_usage_records = sum(
+            retained_observations["usage_records"].get(identity, 0)
+            for identity in route_identities
+        )
+        cost_ledger_decided_tasks = sum(
+            int(partition.get("matched_decided_tasks") or 0)
+            for family in model_economics.values()
+            if isinstance(family, Mapping)
+            for partition in family.values()
+            if isinstance(partition, Mapping)
+        )
+        prior_observation_sources = {
+            "process_log_cards": len(matched_cards),
+            "process_log_terminal_events": route_terminal_executions,
+            "cost_ledger_decided_tasks": cost_ledger_decided_tasks,
+            "retained_decided_task_cards": retained_decided_tasks,
+            "retained_usage_records": retained_usage_records,
+        }
+        prior_observation_count = max(prior_observation_sources.values())
         route_family = provider_route_contracts.route_family_for_adapter(
             effective_adapter
         )
-        if (
-            observation_gated_route
-            and not exact_route_success_observed
-            and route_health["state"] == "closed"
-        ):
-            route_health = {
-                **route_health,
-                "state": "unobserved",
-                "reason": "no_recent_terminal_execution",
-            }
         # ONE predicate, shared with the preflight surface, for "has a round
         # trip been observed on this route?".  It reports state and evidence
         # class in the repository's existing capability vocabulary, so a
-        # reader can tell a route that has never run from one that has 53
+        # reader can tell a route that has never run from one that has 205
         # decided tasks and has merely gone quiet -- the two were previously
-        # both published as `route_unobserved`.
+        # both published as `route_unobserved`.  It is evidence a ranker may
+        # weigh; it is not a gate on selection.
         route_observation = repo_policy.route_observation_verdict(
             observed_in_window=exact_route_success_observed,
             prior_observation_count=prior_observation_count,
@@ -1031,16 +1157,17 @@ def build_catalog(
                 if not route_available
                 else ""
             ),
+            evidence_sources=prior_observation_sources,
         )
-        availability_observed = (
-            exact_route_success_observed
-            if observation_gated_route
-            else access_observed or bool(sample_count > 0)
-        )
-        available = bool(
-            launch_eligible
-            and (exact_route_success_observed if observation_gated_route else True)
-        )
+        availability_observed = access_observed or bool(sample_count > 0)
+        # Availability is startability AND no tripped failure circuit -- one
+        # question each, both already answered elsewhere and quoted here.  It
+        # deliberately does NOT require an observed round trip: a route nobody
+        # has run yet is unmeasured, not known-bad, and requiring a success to
+        # become available is a gate that can never open on a fresh install
+        # and that closes again after a week away.  Failures, not the absence
+        # of successes, are what `route_available` reports.
+        available = launch_eligible
         # `available=false` must never be a bare no.  Each branch names the
         # exact fact that blocked selection, and when the blocker belongs to
         # the OTHER surface the row quotes that surface's own verdict rather
@@ -1076,46 +1203,33 @@ def build_catalog(
             # `route_question` names the question `route_observation` answers,
             # which is the round-trip one for every row.
             #
-            # `available` is a different matter and must not be mislabelled:
-            # it is a conjunction, and which questions it conjoins depends on
-            # whether this route is observation gated.  For a gated route
-            # `available` requires BOTH a startable transport and an observed
-            # round trip; for every other route it requires startability
-            # alone -- which is the same question preflight answers, decided
-            # from preflight's own `launchable`, so the two surfaces share one
-            # predicate there rather than each computing a rival answer.
-            # Publishing the conjunction is what lets a reader check that.
+            # `available` answers a different question and must not be
+            # mislabelled.  It is a conjunction of exactly the two questions
+            # below, the same two for every route: can this route be STARTED
+            # here (preflight's question, decided from preflight's own
+            # `launchable`), and is its failure circuit closed.  It used to
+            # conjoin a third question -- "was a round trip observed in the
+            # last 24 hours?" -- for two provider families only, which is why
+            # a fresh install could never start them.  Publishing the
+            # conjunction is what lets a reader check it.
             "route_question": repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED,
-            "availability_predicate": (
-                [
-                    repo_policy.ROUTE_QUESTION_STARTABLE,
-                    repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED,
-                ]
-                if observation_gated_route
-                else [repo_policy.ROUTE_QUESTION_STARTABLE]
-            ),
+            "availability_predicate": [
+                repo_policy.ROUTE_QUESTION_STARTABLE,
+                repo_policy.ROUTE_QUESTION_FAILURE_CIRCUIT_CLOSED,
+            ],
             "route_family": route_family,
-            "observation_gated_route": observation_gated_route,
             "availability_reason": availability_reason,
             "route_observation": route_observation,
             "availability_observed": availability_observed,
+            # One rule for every route.  The round-trip fact is NOT repeated
+            # here: it is `route_observation`'s, published on every row with
+            # its evidence class and its per-source count, and a second
+            # spelling of it in this field -- for two providers only -- is
+            # what made the same route read differently in two places.
             "readiness_status": (
                 "route_circuit_open"
                 if not route_available
-                else (
-                    (
-                        # A route with prior terminal executions or decided
-                        # tasks HAS been observed.  Saying otherwise publishes
-                        # measured evidence as unmeasured; only a route with
-                        # no history at all is honestly `route_unobserved`.
-                        "route_unobserved_in_window"
-                        if prior_observation_count
-                        else "route_unobserved"
-                    )
-                    if observation_gated_route
-                    and not exact_route_success_observed
-                    else str(adapter_ready.get("status") or "unobserved")
-                )
+                else str(adapter_ready.get("status") or "unobserved")
             ),
             "route_health": route_health,
             "quota_observed": False,

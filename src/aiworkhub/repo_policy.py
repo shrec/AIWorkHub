@@ -69,6 +69,12 @@ QUOTA_STATE_UNAVAILABLE = "unavailable_from_provider_api"
 # once without either being wrong.
 ROUTE_QUESTION_STARTABLE = "route_startable_here"
 ROUTE_QUESTION_ROUND_TRIP_OBSERVED = "route_round_trip_observed_in_window"
+# The third question, and the only other one selection is allowed to conjoin:
+# has this route been measured FAILING recently enough to still be held open?
+# It is answered from observed failures with a threshold and a cooldown, so a
+# route nobody has run yet passes it -- unlike the round-trip question, which
+# a never-run route can never pass and which therefore must never gate.
+ROUTE_QUESTION_FAILURE_CIRCUIT_CLOSED = "route_failure_circuit_closed"
 
 # Exact reasons for a round-trip verdict.  "Never observed" and "observed,
 # but not inside the window" are different facts calling for different
@@ -532,6 +538,7 @@ def route_observation_verdict(
     prior_observation_count: int,
     observation_window_seconds: float,
     circuit_open_failure_kind: str = "",
+    evidence_sources: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Answer ``ROUTE_QUESTION_ROUND_TRIP_OBSERVED`` for exactly one route.
 
@@ -543,7 +550,11 @@ def route_observation_verdict(
     ``prior_observation_count`` is how many terminal executions and decided
     tasks this exact route has on record AT ANY TIME, not only inside the
     window.  It is the number that separates a route nobody has ever run from
-    one that has run and gone quiet.
+    one that has run and gone quiet.  It must therefore be derived from a
+    ledger that RETAINS that history: the caller's decided/archived task cards
+    and usage records, never the short-lived process log the window question
+    reads.  A count taken from the process log answers a different question
+    and silently republishes "aged out of a 7-day log" as "never happened".
 
     The three-valued state and the evidence classes are deliberately the
     repository's existing capability vocabulary from
@@ -592,6 +603,15 @@ def route_observation_verdict(
         "reason": reason,
         "observation_window_seconds": window,
         "prior_observation_count": observed_before,
+        # Which retained ledger each prior observation came from.  The count
+        # alone cannot be audited: a reader who sees 205 has no way to check
+        # whether the join reached the 90-day card store or merely counted the
+        # same short-lived process rows twice.  Publishing the per-source
+        # breakdown is what makes the number falsifiable.
+        "prior_observation_sources": {
+            str(name): max(0, int(value))
+            for name, value in (evidence_sources or {}).items()
+        },
     }
 
 

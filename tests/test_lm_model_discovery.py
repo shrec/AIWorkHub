@@ -18,6 +18,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import (  # noqa: E402
+    repo_policy,
     repository_state,
     runtime_adapters,
     task_store,
@@ -181,13 +182,19 @@ def test_workforce_catalog_carries_one_row_per_discovered_model(tmp_path: Path) 
     assert {row["model"] for row in glm_rows} == set(discovered)
     assert len(glm_rows) == len(discovered)
     assert all(row.get("discovered_from_editor") for row in glm_rows)
-    # Editor discovery makes each GLM row launch-eligible, but zero terminal
-    # history leaves it unavailable, unobserved, and on an unobserved route.
+    # Editor discovery makes each GLM row launch-eligible AND available: a
+    # newly discovered model has no history by definition, and requiring one
+    # would mean a model the editor just exposed could never be used.
     assert all(row["launch_eligible"] for row in glm_rows)
-    assert all(not row["available"] for row in glm_rows)
-    assert all(not row["availability_observed"] for row in glm_rows)
-    assert all(row["route_health"]["state"] == "unobserved" for row in glm_rows)
-    assert all(row["route_health"]["reason"] == "no_recent_terminal_execution" for row in glm_rows)
+    assert all(row["available"] for row in glm_rows)
+    assert all(row["route_health"]["state"] == "closed" for row in glm_rows)
+    assert all(row["route_health"]["failure_kind"] == "" for row in glm_rows)
+    # The absence of history is still reported, just not as a verdict.
+    assert all(
+        row["route_observation"]["reason"]
+        == repo_policy.ROUTE_OBSERVATION_NEVER_RECORDED
+        for row in glm_rows
+    )
 
 
 def test_single_vocabulary_declaration_is_shared_across_consumers() -> None:
