@@ -12299,6 +12299,15 @@ class ProcessManager:
                 idempotency_key=tool_input.get("idempotency_key", ""),
                 provenance=tool_input.get("provenance", ""),
             )
+        # A read on the way IN, so the reviewer prompt's ban on submission
+        # tools does not reach it.  The packet path is bound server-side from
+        # the request metadata above; the prompt tells the reviewer to call
+        # this with no arguments and forbids supplying a path or identity
+        # (quality_reviewer.py:578-582), so ``tool_input`` is deliberately NOT
+        # forwarded -- a provider can neither redirect the read nor break it
+        # by mirroring a stray field.
+        if tool_name == "aiworkhub_worker_quality_review_packet_read":
+            return worker_ai_tools_mcp.quality_review_packet_read(ctx)
         if tool_name == "aiworkhub_worker_quality_review_submit":
             findings = tool_input.get("findings", [])
             if not isinstance(findings, list):

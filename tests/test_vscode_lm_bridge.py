@@ -15,6 +15,7 @@ import pytest
 from aiworkhub import (
     platform_io,
     process_launcher,
+    quality_reviewer,
     repository_state,
     task_store,
     vscode_lm_bridge,
@@ -1395,6 +1396,133 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
             "ok": False,
             "reason": "worker_bridge_rework_overlay_symlink_forbidden",
         }
+
+
+def test_bridge_dispatches_reviewer_packet_read_with_server_side_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file-transport reviewer must be able to read its own evidence.
+
+    When a review packet is too large to inline, ``quality_reviewer`` tells the
+    reviewer to call ``aiworkhub_worker_quality_review_packet_read`` with no
+    arguments, and forbids supplying a path or identity to it.  The
+    editor-hosted bridge dispatched every other reviewer tool but not that one,
+    so the call fell through to ``worker_bridge_tool_not_allowed`` and the
+    reviewer could never see what it was reviewing.
+
+    This is a read on the way IN; the reviewer prompt's ban on submission tools
+    is untouched.  Identity is server-side by construction: the packet path
+    comes from the request metadata the launcher wrote, so a provider that
+    invents a path cannot redirect the read.
+    """
+
+    repo = _repo(tmp_path)
+    process_dir = repo / ".aiworkhub" / "runtime" / "processes"
+    process_dir.mkdir(parents=True)
+    request_id = "c" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    candidate = workspace / "src" / "app.py"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"def target():\n    return 1\n")
+    home.mkdir(parents=True)
+    ledger = home / "audit.jsonl"
+    key = home / "audit.key"
+    ledger.write_text("", encoding="utf-8")
+    key.write_bytes(b"k" * 32)
+    packet = quality_reviewer.build_review_packet(
+        request_id=request_id,
+        task_id="PACKET_READ_BRIDGE_TEST",
+        claim_epoch=1,
+        worker_provider="glm",
+        changed_path_hashes={
+            "src/app.py": hashlib.sha256(candidate.read_bytes()).hexdigest()
+        },
+        objective="the reviewer must be able to read this packet",
+        validation=["python3 -m pytest -q"],
+    )
+    packet_path = home / "review-packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    # The packet a provider must never be able to redirect the read to.
+    decoy = home / "decoy-packet.json"
+    decoy.write_text(json.dumps({"schema_id": "not-a-packet"}), encoding="utf-8")
+    metadata_path = process_dir / f"{request_id}.request.json"
+    metadata_path.write_text(json.dumps({
+        "request_id": request_id,
+        "task_id": "PACKET_READ_BRIDGE_TEST",
+        "runner": "glm52_bridge_test",
+        "topic": "quality_review",
+        "adapter_id": "glm_vscode_lm",
+        "workspace": {"path": str(workspace), "home": str(home)},
+        "worker_mcp": {
+            "authority_repo": str(repo),
+            "source_graph_targets": ["src"],
+            "allowed_writes": [],
+            "session_topic": "bounded review",
+            "audit_ledger_path": str(ledger),
+            "audit_hmac_key_path": str(key),
+        },
+        "quality_review": {
+            "lens": "correctness",
+            "packet_sha256": packet["packet_sha256"],
+            "packet_path": str(packet_path),
+        },
+    }), encoding="utf-8")
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=process_dir,
+        isolation_enabled=False,
+    )
+    event = {
+        "request_id": request_id,
+        "adapter_id": "glm_vscode_lm",
+        "state": "running",
+        "metadata_path": str(metadata_path),
+    }
+    monkeypatch.setattr(manager, "_request_events", lambda _rid: [event])
+
+    result = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_worker_quality_review_packet_read",
+        {},
+    )
+    assert result == {
+        "ok": True,
+        "tool": "quality_review_packet_read",
+        "packet_sha256": packet["packet_sha256"],
+        "packet": packet,
+    }
+
+    # A provider that supplies a path or an identity is ignored, never obeyed,
+    # and never punished for the call the prompt told it to make.
+    redirected = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_worker_quality_review_packet_read",
+        {
+            "path": str(decoy),
+            "packet_path": str(decoy),
+            "task_id": "SOME_OTHER_TASK",
+        },
+    )
+    assert redirected == result
+
+    # The bridge ran it with the launched worker's own HMAC audit identity, so
+    # completion gates observe genuine worker tool use.
+    verification = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger,
+        key,
+        task_id="PACKET_READ_BRIDGE_TEST",
+        runner="glm52_bridge_test",
+        topic="quality_review",
+        request_id=request_id,
+    )
+    assert verification["ok"] is True
+    assert verification["entries_tampered"] == 0
+    assert (
+        verification["successful_call_count_by_tool"]["quality_review_packet_read"]
+        == 2
+    )
 
 
 def _progress_payload(*, sequence: int = 1) -> dict[str, object]:
