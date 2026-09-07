@@ -88,6 +88,48 @@ _KILO_EXTENSION_DIR_GLOB = "kilocode.kilo-code-*"
 VSCODE_LM_ADAPTER = "vscode_lm"
 WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER = "windows_native_cli_requires_appcontainer_sandbox"
 
+# ── Route families ─────────────────────────────────────────────────────────
+# A route family is the PROTOCOL a route speaks, not the model behind it.
+# ``glm_vscode_lm`` and ``deepseek_vscode_lm`` are two models over one editor
+# bridge: they share a transport, a tool-dispatch allowlist and an event
+# envelope, so every capability statement true of one is true of the other.
+# Keying capability contracts on this value -- rather than on an adapter or
+# model name -- is what lets a newly added model on an existing family inherit
+# that family's verified contract without a code change
+# (see provider_route_contracts.py).
+ROUTE_FAMILY_EDITOR_VSCODE_LM = "editor_hosted_vscode_lm"
+ROUTE_FAMILY_COPILOT_BYOK_CLI = "copilot_byok_cli"
+ROUTE_FAMILY_CLAUDE_CLI = "claude_cli"
+ROUTE_FAMILY_CODEX_CLI = "codex_cli"
+ROUTE_FAMILY_KILO_XAI_CLI = "kilo_xai_cli"
+ROUTE_FAMILY_UNKNOWN = "unknown"
+
+_ROUTE_FAMILY_BY_ADAPTER: Mapping[str, str] = MappingProxyType(
+    {
+        VSCODE_LM_ADAPTER: ROUTE_FAMILY_EDITOR_VSCODE_LM,
+        GLM_VSCODE_LM_ADAPTER: ROUTE_FAMILY_EDITOR_VSCODE_LM,
+        DEEPSEEK_VSCODE_LM_ADAPTER: ROUTE_FAMILY_EDITOR_VSCODE_LM,
+        DEEPSEEK_COPILOT_ADAPTER: ROUTE_FAMILY_COPILOT_BYOK_CLI,
+        GLM_COPILOT_ADAPTER: ROUTE_FAMILY_COPILOT_BYOK_CLI,
+        "claude_cli": ROUTE_FAMILY_CLAUDE_CLI,
+        "codex_cli": ROUTE_FAMILY_CODEX_CLI,
+        GROK_KILO_ADAPTER: ROUTE_FAMILY_KILO_XAI_CLI,
+    }
+)
+
+
+def route_family(adapter_id: str) -> str:
+    """Return the protocol family this adapter speaks, or ``unknown``.
+
+    An unrecognized adapter resolves to ``unknown`` rather than raising or
+    guessing: callers fail closed on that value instead of letting a new
+    adapter silently inherit some other family's capability contract.
+    """
+
+    if not isinstance(adapter_id, str):
+        return ROUTE_FAMILY_UNKNOWN
+    return _ROUTE_FAMILY_BY_ADAPTER.get(adapter_id, ROUTE_FAMILY_UNKNOWN)
+
 # ── Worker temp authority environment variables ────────────────────────────
 # THE single declaration of which environment variables carry a launched
 # worker's temporary-file root.  Both real ProcessManager launch paths overlay
@@ -1485,6 +1527,13 @@ __all__ = [
     "GROK_KILO_ADAPTER",
     "GROK_KILO_DEFAULT_MODEL",
     "GROK_KILO_SUPPORTED_MODELS",
+    "ROUTE_FAMILY_CLAUDE_CLI",
+    "ROUTE_FAMILY_CODEX_CLI",
+    "ROUTE_FAMILY_COPILOT_BYOK_CLI",
+    "ROUTE_FAMILY_EDITOR_VSCODE_LM",
+    "ROUTE_FAMILY_KILO_XAI_CLI",
+    "ROUTE_FAMILY_UNKNOWN",
+    "route_family",
     "EDITOR_NONCALLABLE_VENDORS",
     "EDITOR_NONCALLABLE_ID_PREFIXES",
     "EDITOR_REQUESTED_MODEL_RE",

@@ -22,6 +22,7 @@ from . import (
     codex_auth,
     kilo_auth,
     model_settings,
+    provider_route_contracts,
     quality_evidence,
     runtime_adapters,
     source_graph_daemon,
@@ -807,6 +808,11 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         # rather than leaving the universal ready_unverified an unexplained
         # blanket (NF-2026-00270).
         "provider_observability": provider_observability_report(root),
+        # The capability registry itself, so a caller can see the whole
+        # contract set -- transports, protocols, model families, documentation
+        # provenance and what is still unknown -- and not merely the verdicts
+        # it produced for this host's routes (RM-2026-00033 phase 1).
+        "provider_route_contracts": provider_route_contracts.registry_report(),
         "provider_summary": {
             "route_count": len(providers),
             "eligible_route_count": len(eligible_routes),
@@ -845,6 +851,30 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
                 }
                 for item in excluded_routes
             ],
+            # Launchable says a route can be STARTED, never that it can FINISH
+            # a given job. For every capability in the registry vocabulary the
+            # two maps below split the launchable routes into those that can
+            # complete it and those that cannot -- each exclusion carrying the
+            # exact state and reason. A route whose transport cannot carry a
+            # reviewer submit is therefore visible here, instead of being
+            # discovered after a card has been spent on it (NF-2026-00669).
+            "capability_launchable_routes": {
+                capability: [
+                    str(item.get("adapter_id") or "")
+                    for item in launchable_routes
+                    if provider_route_contracts.adapter_can_complete(
+                        str(item.get("adapter_id") or ""), capability
+                    )
+                ]
+                for capability in provider_route_contracts.CAPABILITY_VOCABULARY
+            },
+            "capability_exclusions": {
+                capability: provider_route_contracts.capability_exclusions(
+                    [str(item.get("adapter_id") or "") for item in launchable_routes],
+                    capability,
+                )
+                for capability in provider_route_contracts.CAPABILITY_VOCABULARY
+            },
         },
         "selected_adapter": selected,
     }
@@ -971,13 +1001,20 @@ def workforce_admission(
 # reachable in THIS installation, with evidence, before any code claim.
 # ---------------------------------------------------------------------------
 PROVIDER_OBSERVABILITY_SCHEMA_ID = "aiworkhub.provider_observability.v1"
+PROVIDER_ROUTE_CONTRACT_SCHEMA_ID = (
+    provider_route_contracts.PROVIDER_ROUTE_CONTRACT_SCHEMA_ID
+)
 
-_ROUTE_FAMILY_EDITOR = "editor_hosted_vscode_lm"
-_ROUTE_FAMILY_COPILOT = "copilot_byok_cli"
-_ROUTE_FAMILY_CLAUDE = "claude_cli"
-_ROUTE_FAMILY_CODEX = "codex_cli"
-_ROUTE_FAMILY_KILO = "kilo_xai_cli"
-_ROUTE_FAMILY_UNKNOWN = "unknown"
+# One protocol-first classifier, shared with the capability registry. These
+# aliases keep the local vocabulary while runtime_adapters owns the mapping,
+# so a route family cannot mean one thing in preflight and another in the
+# contract registry that decides what the family can complete.
+_ROUTE_FAMILY_EDITOR = runtime_adapters.ROUTE_FAMILY_EDITOR_VSCODE_LM
+_ROUTE_FAMILY_COPILOT = runtime_adapters.ROUTE_FAMILY_COPILOT_BYOK_CLI
+_ROUTE_FAMILY_CLAUDE = runtime_adapters.ROUTE_FAMILY_CLAUDE_CLI
+_ROUTE_FAMILY_CODEX = runtime_adapters.ROUTE_FAMILY_CODEX_CLI
+_ROUTE_FAMILY_KILO = runtime_adapters.ROUTE_FAMILY_KILO_XAI_CLI
+_ROUTE_FAMILY_UNKNOWN = runtime_adapters.ROUTE_FAMILY_UNKNOWN
 
 _QUOTA_UNOBSERVABLE_REASON_BY_FAMILY: Mapping[str, str] = {
     _ROUTE_FAMILY_EDITOR: (
@@ -998,20 +1035,14 @@ _QUOTA_UNOBSERVABLE_REASON_BY_FAMILY: Mapping[str, str] = {
 
 
 def _adapter_route_family(adapter_id: str) -> str:
-    if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
-        return _ROUTE_FAMILY_EDITOR
-    if adapter_id in (
-        runtime_adapters.DEEPSEEK_COPILOT_ADAPTER,
-        runtime_adapters.GLM_COPILOT_ADAPTER,
-    ):
-        return _ROUTE_FAMILY_COPILOT
-    if adapter_id == "claude_cli":
-        return _ROUTE_FAMILY_CLAUDE
-    if adapter_id == "codex_cli":
-        return _ROUTE_FAMILY_CODEX
-    if adapter_id == runtime_adapters.GROK_KILO_ADAPTER:
-        return _ROUTE_FAMILY_KILO
-    return _ROUTE_FAMILY_UNKNOWN
+    """Delegate to the single protocol-first classifier.
+
+    Route family decides which capability contract a route inherits, so
+    preflight and ``provider_route_contracts`` must never be able to
+    disagree about what family an adapter belongs to.
+    """
+
+    return runtime_adapters.route_family(adapter_id)
 
 
 def describe_provider_observability(
@@ -1165,6 +1196,16 @@ def describe_provider_observability(
         "quota_observable": False,
         "quota_observability_reason": _QUOTA_UNOBSERVABLE_REASON_BY_FAMILY[family],
         "observable_signals": observable_signals,
+        # Every signal above is a fact about this route being PRESENT and
+        # consented to here -- a binary resolving, a bridge module importing,
+        # a host answering, consent granted. None of them is a fact about a
+        # unit of work COMPLETING. The capability contract below states, per
+        # named capability, what this route family can actually finish and
+        # what class of evidence backs that, so no caller can read
+        # reachability as a blanket yes (NF-2026-00669).
+        "capabilities": provider_route_contracts.describe_adapter_capabilities(
+            adapter_id
+        )["capabilities"],
     }
 
 
@@ -1208,6 +1249,7 @@ __all__ = [
     "DEFAULT_MAX_PROCESSES",
     "MAX_PROCESSES_CEILING",
     "PROVIDER_OBSERVABILITY_SCHEMA_ID",
+    "PROVIDER_ROUTE_CONTRACT_SCHEMA_ID",
     "build_preflight",
     "describe_provider_observability",
     "ensure_policy",
