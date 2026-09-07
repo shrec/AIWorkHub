@@ -2136,3 +2136,252 @@ def test_two_cli_daemons_standby_then_fail_over_without_overlapping_scans(tmp_pa
             if process.is_alive():
                 process.kill()
             process.join(timeout=5)
+
+
+def _emulate_a_host_without_directory_descriptors(monkeypatch):
+    """Drive the Windows branch of the lock from this POSIX host.
+
+    Windows defines neither ``O_DIRECTORY`` nor ``O_NOFOLLOW`` and refuses
+    ``os.open`` on a directory outright, so ``platform_io`` reports that it can
+    supply no directory descriptor at all. Injecting that answer -- rather than
+    asserting the Windows path works -- is the only way this suite can cover it.
+    """
+
+    monkeypatch.setattr(
+        task_reconciler,
+        "directory_descriptor_backend",
+        lambda: task_reconciler.DIRECTORY_DESCRIPTOR_BACKEND_NONE,
+    )
+    monkeypatch.setattr(
+        task_reconciler,
+        "open_directory_descriptor",
+        lambda _path: None,
+    )
+
+
+def test_lock_acquires_on_a_host_that_cannot_open_a_directory_descriptor(
+    tmp_path, monkeypatch
+):
+    """Regression: the reconciler could never acquire its lock on Windows.
+
+    ``single_instance_lock`` built ``os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW``
+    behind ``hasattr`` guards. On Windows NEITHER constant exists, so the mask
+    collapsed to a bare ``O_RDONLY`` and ``os.open`` of the lock PARENT raised
+    ``PermissionError`` -- surfacing as ``reconciler_lock_unsafe:<parent>`` on
+    every single attempt, which is exactly what the field report showed.
+    """
+
+    repo = tmp_path / "repo"
+    lock_path = repo / task_reconciler.LOCK_REL_PATH
+    _emulate_a_host_without_directory_descriptors(monkeypatch)
+
+    with task_reconciler.single_instance_lock(lock_path) as identity:
+        assert identity["owner_pid"] == os.getpid()
+        # The weaker guarantee is NAMED, never silently accepted.
+        assert (
+            identity["parent_authority_backend"]
+            == task_reconciler.DIRECTORY_DESCRIPTOR_BACKEND_NONE
+        )
+        assert identity["reduced_guarantees"] == [
+            "lock_parent_not_pinned_to_a_descriptor"
+        ]
+
+
+def test_reduced_authority_still_excludes_a_second_instance(tmp_path, monkeypatch):
+    """A lock that reports success without exclusion is worse than no lock."""
+
+    repo = tmp_path / "repo"
+    lock_path = repo / task_reconciler.LOCK_REL_PATH
+    _emulate_a_host_without_directory_descriptors(monkeypatch)
+
+    with task_reconciler.single_instance_lock(lock_path):
+        with pytest.raises(task_reconciler.ReconcilerLockHeld):
+            with task_reconciler.single_instance_lock(lock_path):
+                pass
+    with task_reconciler.single_instance_lock(lock_path):
+        pass
+
+
+def test_reduced_authority_still_proves_the_locked_file_is_the_validated_file(
+    tmp_path, monkeypatch
+):
+    """The dev/ino re-check that defeats a swap must survive the weaker path."""
+
+    repo = tmp_path / "repo"
+    lock_path = repo / task_reconciler.LOCK_REL_PATH
+    lock_path.parent.mkdir(parents=True)
+    _emulate_a_host_without_directory_descriptors(monkeypatch)
+    real_lock_fd = task_reconciler.lock_fd
+
+    def _lock_then_replace(fd, *, blocking):
+        real_lock_fd(fd, blocking=blocking)
+        lock_path.unlink()
+        replacement = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.close(replacement)
+
+    monkeypatch.setattr(task_reconciler, "lock_fd", _lock_then_replace)
+    with pytest.raises(task_reconciler.ReconcilerLockUnsafe, match="lock_unsafe"):
+        with task_reconciler.single_instance_lock(lock_path):
+            pass
+
+
+def test_reduced_authority_is_recorded_in_health_and_the_durable_status(
+    tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _emulate_a_host_without_directory_descriptors(monkeypatch)
+    service = task_reconciler.ReconcilerService(repo, scan_interval_seconds=5)
+    monkeypatch.setattr(
+        task_reconciler, "run_scan", lambda *_a, **_k: {"ok": True, "finalized": 0}
+    )
+
+    with task_reconciler.single_instance_lock(repo / task_reconciler.LOCK_REL_PATH) as i:
+        service._authority_identity = dict(i)
+        service._authority_state = "active_owner"
+        service._run_as_owner(max_iterations=1, stop_requested=lambda: False)
+
+    health = service.health()
+    assert health["reduced_guarantees"] == ["lock_parent_not_pinned_to_a_descriptor"]
+    assert (
+        health["parent_authority_backend"]
+        == task_reconciler.DIRECTORY_DESCRIPTOR_BACKEND_NONE
+    )
+    record = task_reconciler.read_status(repo)
+    assert record["reduced_guarantees"] == ["lock_parent_not_pinned_to_a_descriptor"]
+    assert (
+        record["parent_authority_backend"]
+        == task_reconciler.DIRECTORY_DESCRIPTOR_BACKEND_NONE
+    )
+
+
+def test_a_deterministic_acquisition_failure_backs_off_instead_of_spinning(
+    tmp_path, monkeypatch
+):
+    """88 -> 230 attempts within seconds is a busy loop, not a retry policy."""
+
+    repo = tmp_path / "repo_backoff"
+    lock_path = repo / task_reconciler.LOCK_REL_PATH
+    lock_path.parent.mkdir(parents=True)
+    service = task_reconciler.ReconcilerService(repo, scan_interval_seconds=5)
+    monkeypatch.setattr(
+        task_reconciler,
+        "single_instance_lock",
+        lambda _path: (_ for _ in ()).throw(
+            task_reconciler.ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{lock_path}")
+        ),
+    )
+    waits: list[float] = []
+
+    def _record(seconds):
+        waits.append(seconds)
+        if len(waits) >= 5:
+            service._stop_event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(service._stop_event, "wait", _record)
+    service._loop()
+
+    base = task_reconciler.AUTHORITY_RETRY_SECONDS
+    assert waits == [base, base * 2, base * 4, base * 8, base * 16]
+    assert service.health()["acquisition_backoff_seconds"] == base * 16
+    assert service.health()["authority_state"] == "acquisition_failed"
+
+
+def test_backoff_is_bounded_and_a_contended_lock_keeps_the_fast_retry(
+    tmp_path, monkeypatch
+):
+    """A live holder may exit at any moment, so a takeover must stay fast."""
+
+    repo = tmp_path / "repo_held"
+    lock_path = repo / task_reconciler.LOCK_REL_PATH
+    lock_path.parent.mkdir(parents=True)
+    service = task_reconciler.ReconcilerService(repo, scan_interval_seconds=5)
+    monkeypatch.setattr(
+        task_reconciler,
+        "single_instance_lock",
+        lambda _path: (_ for _ in ()).throw(
+            task_reconciler.ReconcilerLockHeld(f"reconciler_lock_held:{lock_path}")
+        ),
+    )
+    waits: list[float] = []
+
+    def _record(seconds):
+        waits.append(seconds)
+        if len(waits) >= 4:
+            service._stop_event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(service._stop_event, "wait", _record)
+    service._loop()
+
+    assert waits == [task_reconciler.AUTHORITY_RETRY_SECONDS] * 4
+    assert service.health()["authority_state"] == "standby"
+
+
+def test_lock_failure_classification_reads_the_raising_code_not_the_name():
+    held = task_reconciler.ReconcilerLockHeld("reconciler_lock_held:/x")
+    unsafe = task_reconciler.ReconcilerLockUnsafe("reconciler_lock_unsafe:/x")
+
+    assert task_reconciler.lock_failure_reason(unsafe) == "reconciler_lock_unsafe"
+    assert task_reconciler.classify_lock_failure(unsafe) == "deterministic"
+    # Fail closed: an unclassified reason keeps the fast retry.
+    assert task_reconciler.classify_lock_failure(held) == "transient"
+    assert (
+        task_reconciler.classify_lock_failure(RuntimeError("something_new:/x"))
+        == "transient"
+    )
+    assert (
+        task_reconciler.AUTHORITY_BACKOFF_MAX_SECONDS
+        > task_reconciler.AUTHORITY_RETRY_SECONDS
+    )
+
+
+def test_lock_asks_platform_io_for_directory_authority_instead_of_its_own_mask(
+    tmp_path, monkeypatch
+):
+    """The seam itself is the fix, so prove the seam is on the code path.
+
+    A behaviour test that injects at ``open_directory_descriptor`` passes
+    vacuously if someone reinstates a direct ``os.open`` with a hand-built
+    mask -- which is exactly the defect. This asserts the call happens.
+    """
+
+    lock_path = tmp_path / "repo" / task_reconciler.LOCK_REL_PATH
+    observed: list[Path] = []
+    real = task_reconciler.open_directory_descriptor
+
+    def _record(path):
+        observed.append(Path(path))
+        return real(path)
+
+    monkeypatch.setattr(task_reconciler, "open_directory_descriptor", _record)
+    with task_reconciler.single_instance_lock(lock_path):
+        pass
+
+    assert lock_path.parent in observed
+
+
+def test_reconciler_declares_no_platform_facts_of_its_own():
+    """All platform-specific code lives in platform_io and nowhere else.
+
+    The Windows lock failure was one line of platform sniffing that had leaked
+    out of ``platform_io``: ``hasattr(os, "O_DIRECTORY")`` silently produced a
+    mask that could never open a directory on Windows. This fails the moment
+    such a fact is reintroduced here.
+    """
+
+    source = Path(task_reconciler.__file__).read_text(encoding="utf-8")
+    forbidden = (
+        'hasattr(os, "O_',
+        "hasattr(os, 'O_",
+        'os.name ==',
+        "os.name ==",
+        "sys.platform",
+        "import fcntl",
+        "import msvcrt",
+    )
+    offenders = [token for token in forbidden if token in source]
+    assert offenders == [], f"platform facts leaked into task_reconciler: {offenders}"

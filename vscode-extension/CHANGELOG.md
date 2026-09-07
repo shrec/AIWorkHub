@@ -1,5 +1,49 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.2 — 2026-09-07
+
+### Fixed
+
+- The reconciler could never take its authority lock on Windows, and never
+  had, so no exited worker was ever finalized there and the attempt counter
+  spun. It now asks the platform layer for the capability, and a host that can
+  only offer a weaker lock says so instead of reporting the same authority.
+- A deterministic acquisition failure backs off instead of retrying at full
+  speed.
+- Readiness reported `ready` while the reconciler was down, because it never
+  consulted it. A reconciler that has never been observed now degrades the
+  aggregate rather than passing silently.
+- Claude finalization was blocked on Windows for every directory on the host by
+  a privacy check written in POSIX mode bits, which Windows does not have. The
+  verdict is now explicitly unmeasured and recorded, never assumed.
+- Platform branches live in `platform_io` and nowhere else. The task-store
+  lease opened its file with a literal `os.O_CLOEXEC`, absent on Windows, and
+  had reimplemented the lock helpers without the byte-zero preparation
+  `msvcrt.locking` requires.
+- Launching on macOS and Windows no longer fails for a Linux fact. Landlock is
+  a Linux facility, and refusing a launch when it is unavailable blocked every
+  launch on both platforms, including work that never reaches validation.
+- The `_MsvcrtLocking` protocol had lost the `locking` method that names it.
+
+### Added
+
+- Skills persist across restarts, and activation requires evidence from at
+  least two distinct actor identities.
+- Tool Recipes reach production through four MCP tools over 15 canonical
+  recipes.
+- Every launch denial reason the launcher can emit is discovered from the AST
+  and classified as deterministic or transient; an unclassified reason fails
+  the check instead of retrying forever.
+- A charts backend over eight canonical-store series.
+
+### Changed
+
+- Learning duty is enforced at the decision: two decisions without a lesson
+  fail the check.
+- Dashboard state colours are fixed slots, not hues generated from an index --
+  `review_ready` was rendering red. Failure modes get their own uncapped panel.
+- The model selector no longer spawns scrollbars or shifts the page.
+
 ## 0.11.1 — 2026-09-07
 
 ### Fixed

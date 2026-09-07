@@ -8,6 +8,7 @@ from aiworkhub import (
     repo_policy,
     runtime_adapters,
     source_graph_daemon,
+    task_reconciler,
     worker_workspace,
 )
 
@@ -39,6 +40,20 @@ def _common(monkeypatch, *, graph: dict[str, object]) -> None:
             "status": "ready",
             "reason": "",
             "phase": "preflight_finalization",
+        },
+    )
+    # The aggregate now consults reconciler authority as its own evidence
+    # source, and an UNMEASURED reconciler degrades it on purpose. These
+    # fixtures are about provider-route coverage and finalization, so hand
+    # them a measured, healthy reconciler and leave each test's subject alone.
+    monkeypatch.setattr(
+        task_reconciler,
+        "reconciler_health",
+        lambda _root: {
+            "ok": True,
+            "running": True,
+            "authority_state": "active_owner",
+            "active_owner": True,
         },
     )
 

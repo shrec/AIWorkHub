@@ -6,6 +6,83 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-09-07
+
+### Fixed
+
+- The reconciler could never acquire its authority lock on Windows, and never
+  had. It built its directory-open mask from `O_DIRECTORY` and `O_NOFOLLOW`,
+  neither of which Windows defines, so the mask collapsed to a bare `O_RDONLY`
+  and `os.open` on a directory raised. Every attempt failed identically --
+  `reconciler_lock_unsafe:<...>\runtime\locks`, the attempt counter climbing
+  88 to 230 within seconds -- so nothing durable was written and no exited
+  worker was ever finalized on that host. `task_reconciler` now asks
+  `platform_io` for the capability and contains no platform fact of its own.
+  Where a host cannot hold a descriptor on a directory the parent is not
+  pinned, and that weaker guarantee is named in `parent_authority_backend` and
+  `reduced_guarantees` rather than reported as the same authority.
+- A deterministic acquisition failure now backs off (0.25s doubling to 60s)
+  instead of retrying at full speed. Classification reads the code that raises
+  the reason, not its name, and anything unproven stays transient and fast.
+- The readiness aggregate never consulted the reconciler at all, so it reported
+  `ready` while the only component that finalizes an exited worker was down.
+  `build_preflight` gains a `reconciler` block, and one list now drives both
+  the warnings and the label, so no component can read degraded in its own
+  block while the total reads ready. Absence of evidence is not health: a
+  reconciler that has never been observed reports `not_measured` and degrades
+  the aggregate.
+- `claude_projection_home_not_private` blocked Claude finalization on Windows
+  for every directory on the host. `_verify_owner_private_directory` tested
+  `S_IMODE(st_mode) & 0o077`, but Windows has no POSIX mode bits -- Python
+  synthesizes them from the read-only attribute, giving `0o777` or `0o555`,
+  both non-zero under that mask, and `os.chmod` cannot move either. Privacy is
+  an ACL question there, so `platform_io` returns an explicit unmeasured
+  verdict instead of a boolean it cannot justify. Unmeasured is not a pass: it
+  is recorded as `<label>_privacy_unmeasured` where it can be read.
+- Platform branches live in `platform_io` and nowhere else. `db_writer` opened
+  its lease file with a literal `os.O_CLOEXEC`, which does not exist on
+  Windows, and had reimplemented `lock_fd`/`unlock_fd` without the seek restore
+  or the byte-zero preparation `msvcrt.locking` requires. It now asks
+  `advisory_lock_backend()` and `open_lock_file()` and holds no platform branch
+  of its own.
+- The validation-lane preflight refused a launch on macOS and Windows for a
+  Linux fact. Landlock is a Linux facility, so `select_sandbox_backend` raises
+  by design elsewhere, and every launch on both platforms failed with
+  `task_contract_unwinnable:["validation_lane:...:landlock_unsupported"]` --
+  including tests that never reach validation. The refusal is now Linux-only;
+  `plan_validation_lane` still records the lane fact everywhere.
+- The `_MsvcrtLocking` protocol had lost the `locking` method that names it.
+
+### Added
+
+- Skills persist. The dashboard rebuilt an empty registry on every call, so a
+  proposal could not survive a restart and coverage measured 1%. Activation
+  requires evidence from at least two distinct actor identities: a skill cannot
+  certify itself.
+- Tool Recipes are wired to production through four MCP tools over 15 canonical
+  recipes, and all three stores initialize from `main()` instead of lazily on
+  first read.
+- `discover_launch_denial_reasons` walks the AST for every reason the launcher
+  can emit (101) and classifies each as deterministic (26) or transient (80).
+  `unclassified_denial_reasons()` is empty, so a new reason added without a
+  classification fails the check instead of silently retrying forever.
+- `history_series` backs the charts surface with eight canonical-store series
+  over 43 days and 6,232 events, cached on `(size, mtime_ns)` with a 60s TTL.
+
+### Changed
+
+- Learning duty is enforced at the decision rather than left to intent:
+  `recent_decisions_record_a_lesson` fails after two decisions without a
+  lesson. It fired on this release's own work.
+- Dashboard state colours are fixed slots instead of hues generated from an
+  index. `review_ready` was rendering red, and red reads as alarm. Failure
+  modes get their own uncapped panel, because a problematic metric carries more
+  information here than a successful one.
+- Layout containment stops the model selector from spawning scrollbars and
+  shifting the page.
+- `accept_review` is extracted from `process_launcher` (1,288 lines), and every
+  task-store write takes the cross-process lease.
+
 ## [0.11.1] - 2026-09-07
 
 ### Fixed

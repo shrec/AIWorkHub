@@ -364,3 +364,167 @@ def test_preflight_filters_disabled_observed_models_without_hiding_reachability(
     assert status["observed_models_excluded_by_repository_model_policy"] == 1
     assert status["access_observed"] is True
     assert status["launchable"] is True
+
+
+def _reconciler_ready_preflight_deps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Everything except the reconciler is healthy, so it alone moves status."""
+
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: False)
+    monkeypatch.setattr(
+        repo_policy.task_store,
+        "storage_readiness",
+        lambda _root: SimpleNamespace(ready=True, reason="ready", repo_id="repo_test"),
+    )
+    monkeypatch.setattr(
+        repo_policy.task_store, "callback_bridge_health", lambda _root: {"ok": True}
+    )
+    monkeypatch.setattr(
+        repo_policy.workspace_hygiene,
+        "inventory",
+        lambda _root, refresh_sizes=False: {},
+    )
+    monkeypatch.setattr(
+        repo_policy.source_graph_daemon,
+        "daemon_health",
+        lambda _root: {
+            "ok": True,
+            "status": "ready",
+            "running": True,
+            "registered": True,
+            "readable_generation": 7,
+            "last_success_at": "2026-09-07T00:00:00Z",
+            "build_revision": "rev",
+            "files_seen": 12,
+            "index_age_seconds": 1,
+            "stale_after_seconds": 600,
+        },
+    )
+
+
+def _preflight_with_reconciler(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, health: dict, name: str = "a"
+) -> dict:
+    from aiworkhub import task_reconciler
+
+    root = _initialized_root(tmp_path / name)
+    _reconciler_ready_preflight_deps(monkeypatch)
+    monkeypatch.setattr(task_reconciler, "reconciler_health", lambda _root: health)
+    return repo_policy.build_preflight(root)
+
+
+def test_preflight_blocks_when_reconciler_authority_acquisition_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A green aggregate over a dead reconciler is the defect this prevents.
+
+    Field report, AIWorkHub 0.10.95 on Windows: ``authority_state:
+    acquisition_failed``, ``active_owner: false``, ``standby: false``,
+    ``durable_status_present: false`` -- and the overall preflight still said
+    ``ready``, because it never consulted the reconciler at all.
+    """
+
+    report = _preflight_with_reconciler(
+        monkeypatch,
+        tmp_path,
+        {
+            "ok": False,
+            "running": True,
+            "authority_state": "acquisition_failed",
+            "active_owner": False,
+            "standby": False,
+            "acquisition_attempts": 230,
+            "acquisition_backoff_seconds": 4.0,
+            "last_acquisition_error": "reconciler_lock_unsafe:D:\\Dev\\x\\locks",
+            "durable_status_present": False,
+            "durable_scan_stale": True,
+        },
+    )
+
+    assert report["status"] == "blocked"
+    assert report["ok"] is False
+    assert "worker_reconciler_authority_failed" in report["errors"]
+    assert report["reconciler"]["status"] == "blocked"
+    assert report["reconciler"]["acquisition_attempts"] == 230
+    assert report["reconciler"]["acquisition_backoff_seconds"] == 4.0
+    assert "reconciler_lock_unsafe" in report["reconciler"]["last_acquisition_error"]
+
+
+def test_preflight_degrades_when_the_reconciler_was_never_measured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Absence of evidence is not evidence of health."""
+
+    report = _preflight_with_reconciler(
+        monkeypatch,
+        tmp_path,
+        {"ok": False, "running": False, "durable_status_present": False},
+    )
+
+    assert report["status"] == "degraded"
+    assert "worker_reconciler_unmeasured" in report["warnings"]
+    assert report["reconciler"]["status"] == "not_measured"
+    # Unmeasured is not an error: it withholds a verdict, it does not invent one.
+    assert "worker_reconciler_authority_failed" not in report["errors"]
+
+
+def test_preflight_degrades_on_a_stale_measured_reconciler_and_is_ready_when_live(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    stale = _preflight_with_reconciler(
+        monkeypatch,
+        tmp_path,
+        {
+            "ok": False,
+            "running": False,
+            "durable_status_present": True,
+            "durable_scan_stale": True,
+            "authority_state": "active_owner",
+        },
+    )
+    assert stale["status"] == "degraded"
+    assert "worker_reconciler_degraded" in stale["warnings"]
+
+    live = _preflight_with_reconciler(
+        monkeypatch,
+        tmp_path,
+        {
+            "ok": True,
+            "running": True,
+            "authority_state": "active_owner",
+            "active_owner": True,
+        },
+        name="live",
+    )
+    # This fixture's provider routes are independently degraded, so assert the
+    # reconciler's own contribution rather than the whole aggregate; the
+    # end-to-end "ready" transition is covered by the full-coverage fixtures in
+    # tests/test_aiworkhub_preflight_truth_b1461.py.
+    assert live["reconciler"]["status"] == "ready"
+    assert "worker_reconciler_degraded" not in live["warnings"]
+    assert "worker_reconciler_unmeasured" not in live["warnings"]
+    assert "worker_reconciler_authority_failed" not in live["errors"]
+
+
+def test_preflight_carries_a_reduced_lock_guarantee_instead_of_flattening_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A host that could only grant a weaker lock must say so in the report."""
+
+    report = _preflight_with_reconciler(
+        monkeypatch,
+        tmp_path,
+        {
+            "ok": True,
+            "running": True,
+            "authority_state": "active_owner",
+            "active_owner": True,
+            "parent_authority_backend": "none",
+            "reduced_guarantees": ["lock_parent_not_pinned_to_a_descriptor"],
+        },
+    )
+
+    assert "worker_reconciler_degraded" not in report["warnings"]
+    assert report["reconciler"]["parent_authority_backend"] == "none"
+    assert report["reconciler"]["reduced_guarantees"] == [
+        "lock_parent_not_pinned_to_a_descriptor"
+    ]

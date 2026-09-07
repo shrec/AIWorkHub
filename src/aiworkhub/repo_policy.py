@@ -610,6 +610,64 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         )
         if not finalization_probe.get("ok") and not finalization_pending:
             errors.append("worker_finalization_not_ready")
+    # A green aggregate over a dead reconciler is precisely the failure this
+    # report exists to prevent.  The reconciler is the ONLY thing that
+    # finalizes an exited worker, so "ready" while its authority is failing
+    # means cards sit in `processing` forever while every surface says fine.
+    # Imported inside the function on purpose: `repo_policy` is imported BY
+    # `process_launcher`, which `task_reconciler` imports, so a module-level
+    # import here is a cycle.
+    from . import task_reconciler
+
+    try:
+        reconciler_report = task_reconciler.reconciler_health(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        reconciler_report = {
+            "ok": False,
+            "authority_state": "unknown",
+            "last_error": f"reconciler_health_unavailable:{type(exc).__name__}",
+        }
+    reconciler_authority_state = str(reconciler_report.get("authority_state") or "")
+    # Unmeasured is not failing.  A repository with no reconciler registered in
+    # THIS process and no durable record has produced no evidence either way,
+    # and the report already distinguishes that case elsewhere (`not_required`,
+    # `ready_unverified`) rather than inventing a verdict from silence.
+    reconciler_measured = bool(
+        reconciler_report.get("running")
+        or reconciler_report.get("durable_status_present")
+    )
+    reconciler_status = {
+        "ok": bool(reconciler_report.get("ok")),
+        "status": (
+            "blocked"
+            if reconciler_authority_state == "acquisition_failed"
+            else (
+                "not_measured"
+                if not reconciler_measured
+                else ("ready" if reconciler_report.get("ok") else "degraded")
+            )
+        ),
+        "authority_state": reconciler_authority_state,
+        "active_owner": bool(reconciler_report.get("active_owner")),
+        "acquisition_attempts": int(reconciler_report.get("acquisition_attempts") or 0),
+        "acquisition_backoff_seconds": float(
+            reconciler_report.get("acquisition_backoff_seconds") or 0.0
+        ),
+        "last_acquisition_error": str(
+            reconciler_report.get("last_acquisition_error") or ""
+        )[:300],
+        # Carried verbatim: a host that could only grant a weaker lock must
+        # show that here, not have it flattened into a boolean.
+        "parent_authority_backend": str(
+            reconciler_report.get("parent_authority_backend") or ""
+        ),
+        "reduced_guarantees": list(reconciler_report.get("reduced_guarantees") or []),
+        "durable_status_present": bool(reconciler_report.get("durable_status_present")),
+        "durable_scan_stale": bool(reconciler_report.get("durable_scan_stale")),
+        "last_error": str(reconciler_report.get("last_error") or "")[:300],
+    }
+    if reconciler_status["status"] == "blocked":
+        errors.append("worker_reconciler_authority_failed")
     selected_route_backend = str((selected or {}).get("sandbox_backend") or "")
     route_enforceable = bool(
         selected_route_backend and (selected or {}).get("launchable")
@@ -639,11 +697,22 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             "reason": f"workspace_hygiene_unavailable:{type(exc).__name__}",
         }
     unique_errors = list(dict.fromkeys(errors))
-    warnings = (
-        ["provider_route_coverage_degraded"]
-        if route_coverage_status == "degraded"
-        else []
-    )
+    # One list decides both the warning set and the aggregate label, so a
+    # component can never be reported degraded in its own block while the
+    # overall status still reads "ready".
+    degraded_reasons: list[str] = []
+    if route_coverage_status == "degraded":
+        degraded_reasons.append("provider_route_coverage_degraded")
+    if reconciler_status["status"] == "degraded":
+        degraded_reasons.append("worker_reconciler_degraded")
+    if reconciler_status["status"] == "not_measured":
+        # Absence of evidence is not evidence of health. The reconciler is the
+        # only thing that finalizes an exited worker, so a report that has
+        # never seen it -- no service in this process, no durable record -- has
+        # not established that finalization works, and must not print "ready"
+        # as though it had.
+        degraded_reasons.append("worker_reconciler_unmeasured")
+    warnings = list(degraded_reasons)
     if finalization_pending:
         warnings.append("worker_finalization_probe_pending")
     return {
@@ -655,7 +724,7 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             else (
                 "probing"
                 if finalization_pending
-                else ("degraded" if route_coverage_status == "degraded" else "ready")
+                else ("degraded" if degraded_reasons else "ready")
             )
         ),
         "errors": unique_errors,
@@ -665,6 +734,7 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             "reason": str(readiness.reason)[:200],
             "repo_id": str(readiness.repo_id),
         },
+        "reconciler": reconciler_status,
         "policy": {
             "valid": not policy_error,
             "configured": bool(policy.get("configured")),

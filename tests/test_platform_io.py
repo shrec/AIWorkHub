@@ -1667,3 +1667,128 @@ def test_signal_process_group_uses_exact_posix_group_signal(monkeypatch):
 def test_pipe_write_end_probe_fails_closed_on_windows(monkeypatch):
     monkeypatch.setattr(platform_io.sys, "platform", "win32")
     assert platform_io.pipe_write_end_still_open(()) is True
+
+
+def test_directory_descriptor_backend_names_what_the_host_can_actually_pin():
+    """Windows cannot hold a descriptor on a directory; say so, do not guess.
+
+    The reconciler used to assemble its own mask with
+    ``hasattr(os, "O_DIRECTORY")`` / ``hasattr(os, "O_NOFOLLOW")``. Neither
+    constant exists on Windows, so the mask silently degraded to a bare
+    ``os.O_RDONLY`` -- and ``os.open`` of a DIRECTORY with that mask raises
+    ``PermissionError`` on Windows, every time, forever.
+    """
+
+    assert (
+        platform_io.directory_descriptor_backend("windows")
+        == platform_io.DIRECTORY_DESCRIPTOR_BACKEND_NONE
+    )
+    assert (
+        platform_io.directory_descriptor_backend("linux")
+        == platform_io.DIRECTORY_DESCRIPTOR_BACKEND_POSIX
+    )
+    assert (
+        platform_io.directory_descriptor_backend("macos")
+        == platform_io.DIRECTORY_DESCRIPTOR_BACKEND_POSIX
+    )
+
+
+def test_open_directory_descriptor_refuses_rather_than_degrading_on_windows(tmp_path):
+    """The Windows branch is exercised by injection from this POSIX host."""
+
+    target = tmp_path / "locks"
+    target.mkdir()
+
+    assert platform_io.open_directory_descriptor(target, "windows") is None
+    # ``None`` must be safe to hand straight back to the closer.
+    platform_io.close_directory_descriptor(None)
+
+    descriptor = platform_io.open_directory_descriptor(target, "linux")
+    try:
+        assert isinstance(descriptor, int)
+        assert stat.S_ISDIR(os.fstat(descriptor).st_mode)
+    finally:
+        platform_io.close_directory_descriptor(descriptor)
+
+
+def test_directory_open_flags_never_reduce_to_a_bare_read_only_open():
+    """A directory open must carry O_DIRECTORY wherever the host defines it."""
+
+    flags = platform_io.directory_open_flags()
+    for name in ("O_DIRECTORY", "O_NOFOLLOW"):
+        constant = getattr(os, name, None)
+        if constant is not None:
+            assert flags & constant == constant
+
+
+def test_nofollow_flag_is_read_at_call_time_not_captured_at_import(monkeypatch):
+    """A caller that removes the constant must be observed by every reader."""
+
+    assert platform_io.nofollow_open_flag() == getattr(os, "O_NOFOLLOW", 0)
+    monkeypatch.delattr(platform_io.os, "O_NOFOLLOW", raising=False)
+    assert platform_io.nofollow_open_flag() == 0
+    assert platform_io.lock_file_open_flags(nofollow=True) == (
+        platform_io.lock_file_open_flags()
+    )
+
+
+def test_lock_file_open_flags_are_the_single_source_for_open_lock_file(tmp_path):
+    flags = platform_io.lock_file_open_flags()
+    assert flags & os.O_CREAT and flags & os.O_RDWR
+    for name in ("O_CLOEXEC", "O_BINARY"):
+        constant = getattr(os, name, None)
+        if constant is not None:
+            assert flags & constant == constant
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    assert platform_io.lock_file_open_flags(nofollow=True) == flags | nofollow
+
+    descriptor = platform_io.open_lock_file(tmp_path / "nested" / "a.lock")
+    try:
+        assert (tmp_path / "nested" / "a.lock").is_file()
+    finally:
+        os.close(descriptor)
+
+
+def test_directory_privacy_is_a_mode_question_on_posix_and_unmeasured_on_windows():
+    """Windows has no POSIX mode bits, so a mode test reports nothing at all.
+
+    Python synthesizes ``st_mode`` on Windows from the read-only attribute:
+    0o777 when writable, 0o555 when read-only. ``0o777 & 0o077 == 0o077`` and
+    ``0o555 & 0o077 == 0o055`` -- both non-zero -- so the old inline check
+    raised "not private" for EVERY directory on that host, and ``os.chmod``
+    could not clear it because there it only toggles read-only.
+    """
+
+    assert (
+        platform_io.directory_privacy_backend("windows")
+        == platform_io.DIRECTORY_PRIVACY_BACKEND_NONE
+    )
+    assert (
+        platform_io.directory_privacy_backend("linux")
+        == platform_io.DIRECTORY_PRIVACY_BACKEND_POSIX_MODE
+    )
+
+    for windows_mode in (stat.S_IFDIR | 0o777, stat.S_IFDIR | 0o555):
+        metadata = SimpleNamespace(st_mode=windows_mode)
+        # The POSIX reading of the very same synthesized mode is a hard "no".
+        assert (
+            platform_io.directory_is_private_to_current_user(metadata, "linux") is False
+        )
+        # Windows withholds a verdict instead of inventing one.
+        assert (
+            platform_io.directory_is_private_to_current_user(metadata, "windows") is None
+        )
+
+
+def test_directory_privacy_never_returns_true_for_an_unmeasured_host():
+    """``None`` must stay distinct from ``True``: a pass has to be earned."""
+
+    private = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)
+    assert platform_io.directory_is_private_to_current_user(private, "linux") is True
+    assert platform_io.directory_is_private_to_current_user(private, "windows") is None
+    assert platform_io.directory_is_private_to_current_user(private, "windows") is not True
+    for group_or_other in (0o750, 0o705, 0o770, 0o707, 0o777):
+        metadata = SimpleNamespace(st_mode=stat.S_IFDIR | group_or_other)
+        assert (
+            platform_io.directory_is_private_to_current_user(metadata, "linux") is False
+        )

@@ -7427,3 +7427,74 @@ def test_canonical_validation_keeps_its_own_unshaped_addopts() -> None:
         assert value.value == "-p no:cacheprovider"
         assert "--tb" not in value.value
     assert worker_workspace._WORKER_PYTEST_ADDOPTS != "-p no:cacheprovider"
+
+
+def test_claude_projection_home_privacy_is_enforced_on_posix_and_recorded_when_unmeasured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: ``claude_projection_home_not_private`` on every Windows host.
+
+    ``_verify_owner_private_directory`` tested ``stat.S_IMODE(...) & 0o077``.
+    Windows has no POSIX mode bits -- Python synthesizes ``st_mode`` there from
+    the read-only attribute alone (0o777 writable, 0o555 read-only) -- and both
+    are non-zero under that mask, so the check raised for EVERY directory and
+    ``os.chmod`` could not clear it. Claude finalization could not run at all.
+
+    The Windows branch is driven by injection, since this host is POSIX.
+    """
+
+    source_home = tmp_path / "source-home"
+    (source_home / ".claude").mkdir(parents=True, mode=0o700)
+    (source_home / ".claude" / ".credentials.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(source_home))
+
+    world_readable = tmp_path / "leaky-home"
+    world_readable.mkdir(mode=0o755)
+    (world_readable / "tmp").mkdir(mode=0o700)
+
+    # POSIX still refuses outright: a measured "not private" is a hard failure.
+    with pytest.raises(worker_workspace.WorkspaceError, match="_not_private:"):
+        worker_workspace.refresh_claude_credential_projection(world_readable)
+
+    # A host that answers privacy with an ACL this module does not read must
+    # neither raise nor silently pass; it records the reduced guarantee.
+    monkeypatch.setattr(
+        worker_workspace,
+        "directory_is_private_to_current_user",
+        lambda _info: None,
+    )
+    worker_workspace.UNMEASURED_DIRECTORY_PRIVACY.clear()
+    result = worker_workspace.refresh_claude_credential_projection(world_readable)
+
+    assert result["refreshed"] is True
+    recorded = list(worker_workspace.UNMEASURED_DIRECTORY_PRIVACY)
+    assert any(
+        item.startswith("claude_projection_home_privacy_unmeasured:") for item in recorded
+    )
+    worker_workspace.UNMEASURED_DIRECTORY_PRIVACY.clear()
+
+
+def test_unmeasured_privacy_record_is_deduplicated_and_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        worker_workspace,
+        "directory_is_private_to_current_user",
+        lambda _info: None,
+    )
+    worker_workspace.UNMEASURED_DIRECTORY_PRIVACY.clear()
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    for _ in range(3):
+        worker_workspace._verify_owner_private_directory(home, "probe")
+    assert worker_workspace.UNMEASURED_DIRECTORY_PRIVACY == [
+        f"probe_privacy_unmeasured:{home}"
+    ]
+
+    cap = worker_workspace._MAX_UNMEASURED_DIRECTORY_PRIVACY
+    for index in range(cap + 5):
+        target = tmp_path / f"home_{index}"
+        target.mkdir(mode=0o700)
+        worker_workspace._verify_owner_private_directory(target, "probe")
+    assert len(worker_workspace.UNMEASURED_DIRECTORY_PRIVACY) <= cap
+    worker_workspace.UNMEASURED_DIRECTORY_PRIVACY.clear()

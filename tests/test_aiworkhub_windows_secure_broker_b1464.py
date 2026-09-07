@@ -15,6 +15,7 @@ from aiworkhub import (  # noqa: E402
     process_launcher,
     repo_policy,
     runtime_adapters,
+    task_reconciler,
     vscode_lm_bridge,
     workforce_catalog,
     workforce_router,
@@ -55,6 +56,20 @@ def _ready_preflight_deps(monkeypatch: pytest.MonkeyPatch) -> None:
         repo_policy.runtime_adapters,
         "resolve_executable",
         lambda adapter_id: runtime_adapters.ExecutableResolution(adapter_id, "/bin/model", True, ""),
+    )
+    # The preflight aggregate now consults reconciler authority as its own
+    # evidence source, and an UNMEASURED reconciler degrades it on purpose.
+    # This fixture is about the Windows sandbox boundary, so hand it a
+    # measured, healthy reconciler and leave the subject of the test alone.
+    monkeypatch.setattr(
+        task_reconciler,
+        "reconciler_health",
+        lambda _root: {
+            "ok": True,
+            "running": True,
+            "authority_state": "active_owner",
+            "active_owner": True,
+        },
     )
 
 

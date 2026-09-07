@@ -130,6 +130,49 @@ def stat_owned_by_current_user(
     return uid is not None and owner_uid == uid
 
 
+# Directory-privacy vocabulary. "Is this directory readable only by its owner"
+# is a POSIX MODE question on POSIX and an ACL question on Windows; this module
+# reads the first and does not yet read the second, so it must be able to say
+# so rather than return a boolean it cannot justify.
+DIRECTORY_PRIVACY_BACKEND_POSIX_MODE = "posix_mode_bits"
+DIRECTORY_PRIVACY_BACKEND_NONE = "none"
+
+
+def directory_privacy_backend(platform_name: str | None = None) -> str:
+    """Name the primitive this host offers for proving directory privacy."""
+
+    if is_windows(platform_name):
+        return DIRECTORY_PRIVACY_BACKEND_NONE
+    return DIRECTORY_PRIVACY_BACKEND_POSIX_MODE
+
+
+def directory_is_private_to_current_user(
+    metadata: os.stat_result, platform_name: str | None = None
+) -> bool | None:
+    """Is this directory closed to group and other?  ``None`` means unmeasured.
+
+    On POSIX the mode bits answer directly: no group or other bit set.
+
+    Windows returns ``None``, and the arithmetic is why.  Windows has no POSIX
+    mode bits at all; Python synthesizes ``st_mode`` there from the read-only
+    attribute alone, so a directory is ``0o777`` when writable and ``0o555``
+    when read-only.  ``0o777 & 0o077 == 0o077`` and ``0o555 & 0o077 == 0o055``
+    -- both non-zero -- so a mode test does not report "not private" on
+    Windows, it reports NOTHING, and reports it as a failure for every
+    directory on the host.  ``os.chmod`` cannot move the answer either: on
+    Windows it only toggles the read-only attribute.
+
+    ``None`` is deliberately not ``True``.  A caller that treats an unmeasured
+    verdict as a pass hands out a directory nobody proved was private, which is
+    worse than the hard failure it replaces; the contract is that ``None`` must
+    be RECORDED as a reduced guarantee at the call site.
+    """
+
+    if directory_privacy_backend(platform_name) == DIRECTORY_PRIVACY_BACKEND_NONE:
+        return None
+    return not bool(stat.S_IMODE(metadata.st_mode) & 0o077)
+
+
 def available_memory_bytes(platform_name: str | None = None) -> int | None:
     """Return host-available physical memory, or ``None`` when it cannot be measured."""
 

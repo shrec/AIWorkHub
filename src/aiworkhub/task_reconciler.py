@@ -43,9 +43,14 @@ from typing import Any
 from . import core
 from . import process_launcher
 from .platform_io import (
+    DIRECTORY_DESCRIPTOR_BACKEND_NONE,
     chmod_fd,
-    is_windows,
+    close_directory_descriptor,
+    directory_descriptor_backend,
     lock_fd,
+    lock_file_open_flags,
+    nofollow_open_flag,
+    open_directory_descriptor,
     stat_owned_by_current_user,
     unlock_fd,
 )
@@ -78,6 +83,29 @@ MIN_STALE_SCAN_SECONDS = 300.0
 # sweep runs on every Nth pass instead.
 GC_SCAN_EVERY_N_PASSES = 20
 AUTHORITY_RETRY_SECONDS = 0.25
+# A cause that cannot change without the environment changing must not be
+# retried at full speed.  A Windows host reported the acquisition counter
+# climbing 88 -> 230 within seconds against a lock it could never open: the
+# loop spun a core, wrote nothing durable, and buried the one fact that
+# mattered (the same reason, every single time) under the attempt count.
+#
+# Classification rule -- read the code that RAISES the reason, never its name,
+# exactly as ``dependency_autolaunch.DETERMINISTIC_DENIAL_REASONS`` does:
+#   deterministic: every operand is a property of the lock path's own
+#                  filesystem objects, so an identical retry can only
+#                  reproduce the identical failure; only an environment change
+#                  -- ownership, mode, the directory itself, the host's own
+#                  primitives -- can clear it.
+#   transient:     at least one operand lives outside this process's view.
+#                  ``reconciler_lock_held`` is the whole of that set: another
+#                  live owner, which may exit at any moment.
+# Fail closed: a failure that cannot be PROVEN deterministic stays transient
+# and keeps the fast retry.  Backing off a transient failure delays a
+# legitimate takeover; leaving a deterministic one out costs only the retries
+# it would have saved.
+DETERMINISTIC_LOCK_FAILURE_REASONS = frozenset({"reconciler_lock_unsafe"})
+AUTHORITY_BACKOFF_FACTOR = 2.0
+AUTHORITY_BACKOFF_MAX_SECONDS = 60.0
 
 
 def _utcnow() -> str:
@@ -107,6 +135,29 @@ class ReconcilerLockHeld(RuntimeError):
 
 class ReconcilerLockUnsafe(RuntimeError):
     """The authority path cannot safely identify an ordinary lock file."""
+
+
+def lock_failure_reason(error: BaseException) -> str:
+    """The stable token of one acquisition failure, without its path operand.
+
+    Both acquisition exceptions carry ``<reason>:<path>``; the path is evidence
+    for a human and noise for a classifier, so only the token is matched.
+    """
+
+    return str(error).split(":", 1)[0]
+
+
+def classify_lock_failure(error: BaseException) -> str:
+    """Classify one acquisition failure as ``deterministic`` or ``transient``.
+
+    Fail closed.  Only a reason proven to depend solely on the lock path's own
+    filesystem objects is deterministic; everything else -- including a reason
+    nobody has classified yet -- keeps the fast retry.
+    """
+
+    if lock_failure_reason(error) in DETERMINISTIC_LOCK_FAILURE_REASONS:
+        return "deterministic"
+    return "transient"
 
 
 def _lock_metadata_unsafe(metadata: os.stat_result) -> bool:
@@ -150,15 +201,29 @@ def single_instance_lock(lock_path: Path):
     The repository descriptor is a stable guard for the canonical lock-parent
     chain on POSIX.  The lock itself is opened relative to a bound parent
     descriptor, whose pathname identity is revalidated after acquisition.
+
+    Where the host cannot hold a descriptor on a directory at all -- Windows,
+    which defines neither ``O_DIRECTORY`` nor ``O_NOFOLLOW`` and rejects
+    ``os.open`` on a directory outright -- the parent is NOT pinned, and its
+    identity is proven by re-``stat``ing the pathname instead.  That is a
+    genuinely weaker guarantee, so it is named in the yielded identity
+    (``parent_authority_backend`` and ``reduced_guarantees``) and carried into
+    the durable status record: this lock never reports the same authority on
+    two hosts while actually holding different guarantees.
+
+    What is NOT reduced on either host: single-instance exclusion, and the
+    proof that the file locked is the file validated.  Both rest on the
+    ``before``/``after``/``locked_path`` device+inode chain below, and
+    ``os.stat`` supplies a real volume serial and file index on Windows too.
     """
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     parent_identity = _directory_identity(lock_path.parent)
-    directory_flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        directory_flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        directory_flags |= os.O_NOFOLLOW
+    parent_backend = directory_descriptor_backend()
+    parent_pinned = parent_backend != DIRECTORY_DESCRIPTOR_BACKEND_NONE
+    reduced_guarantees = (
+        [] if parent_pinned else ["lock_parent_not_pinned_to_a_descriptor"]
+    )
 
     repo_fd: int | None = None
     repo_locked = False
@@ -167,10 +232,16 @@ def single_instance_lock(lock_path: Path):
         len(lock_path.parts) > len(rel_parts)
         and lock_path.parts[-len(rel_parts):] == rel_parts
     )
-    if not is_windows() and is_canonical_path:
+    # The repository descriptor is a directory descriptor like any other, so it
+    # is gated on the same capability rather than on a second platform test.
+    if parent_pinned and is_canonical_path:
         repo_path = lock_path.parents[len(rel_parts) - 1]
         try:
-            repo_fd = os.open(repo_path, directory_flags)
+            repo_fd = open_directory_descriptor(repo_path)
+            if repo_fd is None:
+                # Unreachable while ``parent_pinned`` holds; kept so the
+                # descriptor stays typed as an int for the lock call.
+                raise OSError("reconciler_repo_descriptor_unavailable")
             lock_fd(repo_fd, blocking=False)
             repo_locked = True
         except OSError as exc:
@@ -178,8 +249,9 @@ def single_instance_lock(lock_path: Path):
                 os.close(repo_fd)
             raise ReconcilerLockHeld(f"reconciler_lock_held:{lock_path}") from exc
 
+    parent_fd: int | None = None
     try:
-        parent_fd = os.open(lock_path.parent, directory_flags)
+        parent_fd = open_directory_descriptor(lock_path.parent)
     except OSError as exc:
         if repo_locked and repo_fd is not None:
             with contextlib.suppress(OSError):
@@ -188,17 +260,23 @@ def single_instance_lock(lock_path: Path):
         raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{lock_path.parent}") from exc
     fd: int | None = None
     try:
-        parent_metadata = os.fstat(parent_fd)
-        if (parent_metadata.st_dev, parent_metadata.st_ino) != parent_identity:
+        if parent_fd is not None:
+            parent_metadata = os.fstat(parent_fd)
+            observed_parent = (parent_metadata.st_dev, parent_metadata.st_ino)
+        else:
+            # No descriptor to fstat, so re-prove the pathname instead.  This
+            # is the reduced guarantee named in the docstring: the directory is
+            # not pinned, so a swap between this check and the open below is
+            # detected afterwards rather than excluded outright.
+            observed_parent = _directory_identity(lock_path.parent)
+        if observed_parent != parent_identity:
             raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{lock_path.parent}")
         before = _lock_path_metadata(lock_path)
         if before is not None and _lock_metadata_unsafe(before):
             raise ReconcilerLockUnsafe(f"reconciler_lock_unsafe:{lock_path}")
-        flags = os.O_CREAT | os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        flags = lock_file_open_flags(nofollow=True)
         try:
-            if os.open in os.supports_dir_fd:
+            if parent_fd is not None and os.open in os.supports_dir_fd:
                 fd = os.open(lock_path.name, flags, 0o600, dir_fd=parent_fd)
             else:
                 fd = os.open(lock_path, flags, 0o600)
@@ -235,13 +313,17 @@ def single_instance_lock(lock_path: Path):
             os.write(fd, f"{os.getpid()} {_utcnow()}\n".encode("utf-8"))
         except OSError:
             pass
-        yield _process_identity()
+        yield {
+            **_process_identity(),
+            "parent_authority_backend": parent_backend,
+            "reduced_guarantees": list(reduced_guarantees),
+        }
     finally:
         if fd is not None:
             with contextlib.suppress(OSError):
                 unlock_fd(fd)
             os.close(fd)
-        os.close(parent_fd)
+        close_directory_descriptor(parent_fd)
         if repo_locked and repo_fd is not None:
             with contextlib.suppress(OSError):
                 unlock_fd(repo_fd)
@@ -298,9 +380,7 @@ def read_status(repo: Path | str) -> dict[str, Any]:
         return {}
     if before is None or _lock_metadata_unsafe(before):
         return {}
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY | nofollow_open_flag()
     try:
         fd = os.open(target, flags)
     except OSError:
@@ -332,9 +412,7 @@ def read_status(repo: Path | str) -> dict[str, Any]:
 def lock_is_held(lock_path: Path) -> bool:
     """Probe an existing authority lock without creating any path."""
 
-    flags = os.O_RDWR
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDWR | nofollow_open_flag()
     try:
         fd = os.open(lock_path, flags)
     except OSError:
@@ -420,12 +498,17 @@ class ReconcilerService:
         self._authority_identity: dict[str, Any] = {}
         self._acquisition_attempts = 0
         self._last_acquisition_error = ""
+        self._acquisition_backoff_seconds = 0.0
 
     def is_running(self) -> bool:
         return bool(self._thread is not None and self._thread.is_alive())
 
     def _loop(self) -> None:
         lock_path = self.repo / LOCK_REL_PATH
+        # Grows only while the SAME deterministic cause keeps repeating, and is
+        # reset by acquisition or by any transient outcome, so a real takeover
+        # is never delayed by a stale penalty.
+        backoff_seconds = AUTHORITY_RETRY_SECONDS
         while not self._stop_event.is_set():
             with self._state_lock:
                 self._authority_state = "acquiring"
@@ -433,23 +516,37 @@ class ReconcilerService:
             try:
                 authority = single_instance_lock(lock_path)
                 with authority as identity:
+                    backoff_seconds = AUTHORITY_RETRY_SECONDS
                     with self._state_lock:
                         self._authority_state = "active_owner"
                         self._authority_identity = dict(identity)
                         self._last_acquisition_error = ""
+                        self._acquisition_backoff_seconds = 0.0
                     self._run_as_owner()
             except ReconcilerLockHeld as exc:
+                # Another live owner is the one transient cause: it may exit at
+                # any moment, so a takeover attempt must stay fast.
+                backoff_seconds = AUTHORITY_RETRY_SECONDS
                 with self._state_lock:
                     self._authority_state = "standby"
                     self._authority_identity = {}
                     self._last_acquisition_error = str(exc)
+                    self._acquisition_backoff_seconds = AUTHORITY_RETRY_SECONDS
                 self._stop_event.wait(AUTHORITY_RETRY_SECONDS)
             except ReconcilerLockUnsafe as exc:
+                deterministic = classify_lock_failure(exc) == "deterministic"
+                wait_seconds = backoff_seconds if deterministic else AUTHORITY_RETRY_SECONDS
+                backoff_seconds = (
+                    min(wait_seconds * AUTHORITY_BACKOFF_FACTOR, AUTHORITY_BACKOFF_MAX_SECONDS)
+                    if deterministic
+                    else AUTHORITY_RETRY_SECONDS
+                )
                 with self._state_lock:
                     self._authority_state = "acquisition_failed"
                     self._authority_identity = {}
                     self._last_acquisition_error = str(exc)
-                self._stop_event.wait(AUTHORITY_RETRY_SECONDS)
+                    self._acquisition_backoff_seconds = wait_seconds
+                self._stop_event.wait(wait_seconds)
             finally:
                 with self._state_lock:
                     if self._authority_state == "active_owner":
@@ -478,12 +575,24 @@ class ReconcilerService:
             # invisible for exactly as long as it was busiest.
             previous = read_status(self.repo)
             owner = _process_identity()
+            # The authority the lock actually granted travels into the durable
+            # record: a reader in another process must be able to tell that a
+            # scan ran under a REDUCED guarantee, not merely that it ran.
+            with self._state_lock:
+                granted = dict(self._authority_identity)
+            authority_evidence = {
+                "parent_authority_backend": str(
+                    granted.get("parent_authority_backend", "")
+                ),
+                "reduced_guarantees": list(granted.get("reduced_guarantees", [])),
+            }
             write_status(self.repo, {
                 "pid": owner["owner_pid"],
                 **owner,
                 "repo": str(self.repo),
                 "authority_state": "active_owner",
                 "acquisition_state": "held",
+                **authority_evidence,
                 "scan_started_epoch": started,
                 "scan_finished_epoch": None,
                 "scan_in_progress": True,
@@ -521,6 +630,7 @@ class ReconcilerService:
                 "repo": str(self.repo),
                 "authority_state": "active_owner",
                 "acquisition_state": "held",
+                **authority_evidence,
                 "scan_started_epoch": started,
                 "scan_in_progress": False,
                 "scan_interval_seconds": self.scan_interval_seconds,
@@ -574,6 +684,24 @@ class ReconcilerService:
                 "authority_identity": dict(getattr(self, "_authority_identity", {})),
                 "acquisition_attempts": getattr(self, "_acquisition_attempts", 0),
                 "last_acquisition_error": getattr(self, "_last_acquisition_error", ""),
+                # Named so a caller can tell "retrying hard" from "backed off
+                # against a cause that cannot change" without counting attempts.
+                "acquisition_backoff_seconds": float(
+                    getattr(self, "_acquisition_backoff_seconds", 0.0)
+                ),
+                # The guarantees this host could actually supply for the lock.
+                # An authority that reports the same state while holding less
+                # must say so here, not silently.
+                "parent_authority_backend": str(
+                    getattr(self, "_authority_identity", {}).get(
+                        "parent_authority_backend", ""
+                    )
+                ),
+                "reduced_guarantees": list(
+                    getattr(self, "_authority_identity", {}).get(
+                        "reduced_guarantees", []
+                    )
+                ),
                 "scan_interval_seconds": self.scan_interval_seconds,
                 "last_scan": dict(self._last_scan),
                 "last_error": self._last_error,

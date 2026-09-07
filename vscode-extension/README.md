@@ -12,6 +12,30 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.2 — 2026-09-07
+
+- Windows can finalize work again. The component that closes out an exited
+  worker could never take its lock there -- it had never worked on Windows --
+  so cards stayed in progress while every surface reported healthy.
+- Readiness no longer says `ready` while that component is down. It was not
+  weighing it too lightly; it was never asking.
+- Claude finalization on Windows was blocked for every folder on the machine by
+  a permission test that only means something on Linux and macOS.
+- Launching works on macOS and Windows again. A Linux-only sandbox fact was
+  being asserted on every platform, so every launch on both failed before it
+  started.
+- Platform-specific code now lives in one module. The task-store lease was
+  opening its file with a flag Windows does not define.
+- Skills survive a restart. The registry was rebuilt empty on every call, so
+  nothing proposed could ever become active.
+- Tool Recipes are connected to production, so an empty panel states a fact
+  about the repository rather than an artifact of the dashboard.
+- Every launch denial reason is classified as deterministic or transient, so a
+  refusal that cannot change is no longer retried forever.
+- Dashboard colours no longer generate a hue from an index -- `review_ready`
+  was rendering red, and red reads as alarm. Failure modes have their own
+  panel.
+
 ## What's new in 0.11.1 — 2026-09-07
 
 - Review ingest strips unknown finding keys and records them instead of

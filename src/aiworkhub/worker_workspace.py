@@ -177,6 +177,14 @@ chmod_path = _platform_io.chmod_path
 is_windows = _platform_io.is_windows
 posix_path_modes_supported = _platform_io.posix_path_modes_supported
 stat_owned_by_current_user = _platform_io.stat_owned_by_current_user
+directory_is_private_to_current_user = _platform_io.directory_is_private_to_current_user
+# Privacy verdicts this host could not actually measure.  Windows answers
+# directory privacy with an ACL, not with POSIX mode bits, so the check in
+# ``_verify_owner_private_directory`` can only WITHHOLD a verdict there -- and a
+# withheld verdict has to be readable, never silent: whoever hands a worker a
+# home directory needs to be able to see that nobody proved it was private.
+UNMEASURED_DIRECTORY_PRIVACY: list[str] = []
+_MAX_UNMEASURED_DIRECTORY_PRIVACY = 64
 
 
 def bubblewrap_home_env_value() -> str:
@@ -5724,8 +5732,26 @@ def _verify_owner_private_directory(path: Path, label: str) -> Path:
         raise WorkspaceError(f"{label}_not_directory:{path}")
     if not stat_owned_by_current_user(info):
         raise WorkspaceError(f"{label}_untrusted_owner:{path}")
-    if stat.S_IMODE(info.st_mode) & 0o077:
+    # Privacy is a POSIX MODE question on POSIX and an ACL question on Windows.
+    # The inline ``stat.S_IMODE(info.st_mode) & 0o077`` this replaces asserted
+    # the POSIX fact on every host: Windows synthesizes ``st_mode`` from the
+    # read-only attribute alone (0o777 writable, 0o555 read-only), both of which
+    # are non-zero under ``& 0o077``, so the check raised for EVERY directory on
+    # Windows and ``os.chmod`` could not clear it.  That is the measured cause
+    # of ``claude_projection_home_not_private:D:\...\worktrees\...\home``
+    # blocking Claude finalization there.
+    private = directory_is_private_to_current_user(info)
+    if private is False:
         raise WorkspaceError(f"{label}_not_private:{path}")
+    if private is None:
+        # Unmeasured is NOT a pass. Nothing here proved the directory is closed
+        # to other accounts, so the reduced guarantee is recorded where a caller
+        # can read it rather than being swallowed.
+        notice = f"{label}_privacy_unmeasured:{path}"
+        if notice not in UNMEASURED_DIRECTORY_PRIVACY:
+            if len(UNMEASURED_DIRECTORY_PRIVACY) >= _MAX_UNMEASURED_DIRECTORY_PRIVACY:
+                del UNMEASURED_DIRECTORY_PRIVACY[0]
+            UNMEASURED_DIRECTORY_PRIVACY.append(notice)
     return path.resolve(strict=True)
 
 
