@@ -103,9 +103,15 @@ assert.match(insights[0], /id="header-skills"/);
 assert.match(insights[0], />Skills</);
 assert.match(insights[0], /id="header-tool-recipes"/);
 assert.match(insights[0], />Tool Recipes</);
-assert.match(insights[0], /id="header-development-rules-value">No sample/);
-assert.match(insights[0], /id="header-skills-value">No sample/);
-assert.match(insights[0], /id="header-tool-recipes-value">No sample/);
+// NF-2026-00675: the static markup must not assert "No sample" before any
+// projection has arrived. The default snapshot omits all three fields, so a
+// first paint that claims no sample is a measured verdict about a thing
+// nobody looked at -- which is what the owner read as the rule count vanishing.
+assert.match(insights[0], /id="header-development-rules-value">Loading/);
+assert.match(insights[0], /id="header-skills-value">Loading/);
+assert.match(insights[0], /id="header-tool-recipes-value">Loading/);
+assert.doesNotMatch(insights[0], /id="header-development-rules-value">No sample/);
+assert.match(insights[0], /id="header-development-rules" data-state="pending"/);
 assert.doesNotMatch(insights[0], /id="header-development-rules-value">0/);
 assert.doesNotMatch(insights[0], /id="header-skills-value">0</);
 assert.doesNotMatch(insights[0], /id="header-tool-recipes-value">0</);
@@ -213,3 +219,49 @@ assert.strictEqual(internals.codingFoundationCardModel("skills", {}), null);
 assert.strictEqual(internals.codingFoundationHeaderMarkup().includes("header-insight-card"), true);
 
 console.log("coding foundation dashboard: ok");
+
+// NF-2026-00675: an omitted field reads as pending, and a summary refresh must
+// never blank a card the full snapshot already measured. The owner read
+// "Unavailable / No evidence" on Development Rules while the full snapshot
+// carried 20 rules the whole time.
+{
+  const pendingSlot = (value, detail) => ({
+    card: { title: "", attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } },
+    value: { textContent: value },
+    detail: { textContent: detail },
+  });
+  const cards = {
+    development_rules: pendingSlot("Loading", "Awaiting the full snapshot"),
+    skills: pendingSlot("Loading", "Awaiting the full snapshot"),
+    tool_recipes: pendingSlot("Loading", "Awaiting the full snapshot"),
+  };
+
+  internals.renderCodingFoundationCards({
+    snapshot_mode: "summary",
+    full_snapshot_available: true,
+    omitted_fields: ["development_rules", "skills", "tool_recipes"],
+  }, cards);
+  assert.strictEqual(cards.development_rules.value.textContent, "Loading");
+  assert.strictEqual(cards.development_rules.card.attrs["data-state"], "pending");
+  assert.notStrictEqual(cards.development_rules.value.textContent, "Unavailable");
+  assert.notStrictEqual(cards.development_rules.detail.textContent, "No evidence");
+
+  internals.renderCodingFoundationCards({
+    snapshot_mode: "full",
+    development_rules: {
+      schema_id: "aiworkhub.dashboard.development_rules.v1",
+      state: "measured",
+      declared_rule_count: 20,
+      resolved_rule_count: 8,
+    },
+  }, cards);
+  assert.strictEqual(cards.development_rules.value.textContent, "20 rules");
+  assert.strictEqual(cards.development_rules.card.attrs["data-state"], "measured");
+
+  internals.renderCodingFoundationCards({
+    snapshot_mode: "summary",
+    full_snapshot_available: true,
+    omitted_fields: ["development_rules"],
+  }, cards);
+  assert.strictEqual(cards.development_rules.value.textContent, "20 rules");
+}

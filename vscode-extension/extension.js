@@ -9118,6 +9118,19 @@ function codingFoundationCardModel(kind, projection) {
   };
 }
 
+// NF-2026-00675. A field the summary snapshot deliberately did not send must
+// not read as a field the server could not produce. `snapshot_mode: "summary"`
+// keeps a bounded set and names the rest in `omitted_fields`; the webview then
+// asks for the full shape. Until that arrives these cards know nothing, and
+// saying so is the only honest state.
+function codingFoundationOmitted(snap, kind) {
+  const omitted = Array.isArray(snap.omitted_fields) ? snap.omitted_fields : [];
+  if (omitted.map(String).includes(String(kind))) return true;
+  // A summary can drop a field without naming it, so the mode is the
+  // authority whenever the projection is simply absent.
+  return String(snap.snapshot_mode || "").trim().toLowerCase() === "summary";
+}
+
 function renderCodingFoundationCards(snapshot, elements) {
   if (!elements || typeof elements !== "object") return;
   const snap = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot) ? snapshot : {};
@@ -9126,7 +9139,27 @@ function renderCodingFoundationCards(snapshot, elements) {
     const slot = elements[kind];
     if (!slot || !slot.value || !slot.detail) continue;
     const model = codingFoundationCardModel(kind, snap[kind]);
-    if (!model) continue;
+    if (!model) {
+      // Only a card that has never been measured may be reset. A summary
+      // refresh omits the field on every poll, so resetting unconditionally
+      // would blank a card the full snapshot had already filled -- the test
+      // for this caught exactly that on the first attempt. The card's own
+      // state is the record of whether anything was ever established.
+      const settled = slot.card && typeof slot.card.getAttribute === "function"
+        ? String(slot.card.getAttribute("data-state") || "")
+        : (slot.card && slot.card.attrs ? String(slot.card.attrs["data-state"] || "") : "");
+      const neverMeasured = settled === "" || settled === "pending";
+      if (snap[kind] === undefined && neverMeasured && codingFoundationOmitted(snap, kind)) {
+        const label = CODING_FOUNDATION_LABELS[kind] || kind;
+        slot.value.textContent = "Loading";
+        slot.detail.textContent = "Awaiting the full snapshot";
+        if (slot.card) {
+          slot.card.title = label + ": awaiting the full snapshot";
+          if (typeof slot.card.setAttribute === "function") slot.card.setAttribute("data-state", "pending");
+        }
+      }
+      continue;
+    }
     slot.value.textContent = model.value;
     slot.detail.textContent = model.detail;
     if (slot.card) {
@@ -9163,21 +9196,27 @@ function bindCodingFoundationDashboard(doc) {
 }
 
 function codingFoundationHeaderMarkup() {
+  // NF-2026-00675. These start PENDING, not "No sample". The default snapshot
+  // is snapshot_mode "summary" and names development_rules, skills and
+  // tool_recipes in omitted_fields, so at first paint the projection has not
+  // been sent yet -- and "No sample / No evidence" is a measured claim about a
+  // thing nobody has looked at. The owner read exactly that and asked why the
+  // rule count had gone, while the full snapshot held 20 rules the whole time.
   return [
-    '<div class="header-insight-card" id="header-development-rules" data-state="no_sample" title="Development Rules snapshot projection">',
+    '<div class="header-insight-card" id="header-development-rules" data-state="pending" title="Development Rules snapshot projection">',
     '<span class="header-storage-label">Development Rules</span>',
-    '<strong id="header-development-rules-value">No sample</strong>',
-    '<span class="header-insight-detail" id="header-development-rules-detail">No evidence</span>',
+    '<strong id="header-development-rules-value">Loading</strong>',
+    '<span class="header-insight-detail" id="header-development-rules-detail">Awaiting the full snapshot</span>',
     "</div>",
-    '<div class="header-insight-card" id="header-skills" data-state="no_sample" title="Skills snapshot projection">',
+    '<div class="header-insight-card" id="header-skills" data-state="pending" title="Skills snapshot projection">',
     '<span class="header-storage-label">Skills</span>',
-    '<strong id="header-skills-value">No sample</strong>',
-    '<span class="header-insight-detail" id="header-skills-detail">No evidence</span>',
+    '<strong id="header-skills-value">Loading</strong>',
+    '<span class="header-insight-detail" id="header-skills-detail">Awaiting the full snapshot</span>',
     "</div>",
-    '<div class="header-insight-card" id="header-tool-recipes" data-state="no_sample" title="Tool Recipes snapshot projection">',
+    '<div class="header-insight-card" id="header-tool-recipes" data-state="pending" title="Tool Recipes snapshot projection">',
     '<span class="header-storage-label">Tool Recipes</span>',
-    '<strong id="header-tool-recipes-value">No sample</strong>',
-    '<span class="header-insight-detail" id="header-tool-recipes-detail">No evidence</span>',
+    '<strong id="header-tool-recipes-value">Loading</strong>',
+    '<span class="header-insight-detail" id="header-tool-recipes-detail">Awaiting the full snapshot</span>',
     "</div>",
   ].join("");
 }
