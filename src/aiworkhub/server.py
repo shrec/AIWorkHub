@@ -1341,6 +1341,11 @@ def aiworkhub_task_create_from_template(
     risk_tier: str | None = None,
     validation: list[str] | None = None,
     validation_roles: list[str] | None = None,
+    skill_task_family: str | None = None,
+    skill_stage: str | None = None,
+    skill_triggers: list[str] | None = None,
+    skill_applicability: list[str] | None = None,
+    skill_path_scope: str | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one task from an authenticated template.
 
@@ -1352,6 +1357,18 @@ def aiworkhub_task_create_from_template(
     the generated defaults are preserved. Malformed, stale, or forged template
     IDs, unsafe paths, and incomplete validation overrides fail closed before
     ``create_task``. Provenance authenticates the final expanded contract.
+    The ``skill_*`` fields are the card's skill selection vocabulary, drawn
+    from the same closed sets ``core.create_task`` validates against
+    (``skill_registry.SELECTION_VOCABULARIES``); an unknown token is refused
+    at create rather than silently matching nothing. They are card fields,
+    not path fields: they never enter ``allowed_writes`` or
+    ``required_outputs``, so declaring one can never make an output
+    mandatory. ``skill_task_family`` defaults to the family the template
+    itself declares (``task_templates.skill_task_family`` of its declared
+    work kind), and an explicit value overrides that default;
+    ``skill_stage``, ``skill_triggers`` and ``skill_applicability`` describe
+    the occasion rather than the template genre, so no template can supply
+    them and a card that omits them selects no skill at all.
     """
     try:
         card = task_templates.expand_template(
@@ -1431,6 +1448,20 @@ def aiworkhub_task_create_from_template(
         work_kind=card["work_kind"],
         validation_roles=card["validation_roles"],
         risk_tier=risk_tier,
+        # The template's DECLARED work kind already names a real skill family
+        # (``expand_template`` resolves it before ``work_kind`` is flattened to
+        # the behavioral-contract vocabulary), so a card created from a template
+        # inherits that family and only has to declare it when overriding. It is
+        # a default, never a floor: an explicit value wins.
+        skill_task_family=(
+            skill_task_family
+            if skill_task_family is not None and str(skill_task_family).strip()
+            else (card.get("skill_task_family") or None)
+        ),
+        skill_stage=skill_stage,
+        skill_triggers=skill_triggers,
+        skill_applicability=skill_applicability,
+        skill_path_scope=skill_path_scope,
         template_provenance=provenance,
     )
     return {

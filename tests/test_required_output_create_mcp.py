@@ -11,7 +11,9 @@ from aiworkhub.task_templates import (
     REGISTRY_VERSION,
     SCHEMA_ID,
     TEMPLATE_IDS,
+    TEMPLATE_SPECS,
     TaskTemplateError,
+    skill_task_family,
     expand_template,
     template_provenance_payload,
     template_full_id,
@@ -140,6 +142,173 @@ def test_create_from_template_rejects_scope_but_accepts_validation_overrides():
         assert name not in params
     assert params["validation"].default is None
     assert params["validation_roles"].default is None
+    # The selection vocabulary is a per-card declaration on this surface too,
+    # in core's order. Exact ordered equality: a removal, a reorder or an
+    # unreviewed addition fails here.
+    assert [
+        name for name in params if name.startswith("skill_")
+    ] == _TASK_CREATE_SKILL_VOCABULARY
+    for name in _TASK_CREATE_SKILL_VOCABULARY:
+        assert params[name].default is None
+
+
+def test_every_skill_field_core_accepts_is_reachable_from_the_template_tool():
+    """Positive control for the surface cards are ACTUALLY created on.
+
+    The same control exists for ``aiworkhub_task_create``, and it did not see
+    this gap because it only ever compared that one tool against core. Cards
+    are created from templates -- ``aiworkhub_task_create`` is the legacy
+    surface -- so the template tool carrying none of the five ``skill_*``
+    dimensions is the real reason 0 of 4,628 stored cards declare the
+    vocabulary ``skill_registry.select`` matches on. Deriving the expected set
+    from ``core.create_task``'s live signature means a sixth dimension added
+    upstream fails here instead of silently becoming unreachable, exactly as
+    the fifth silently was.
+    """
+    core_skill_fields = [
+        name
+        for name in inspect.signature(core.create_task).parameters
+        if name.startswith("skill_")
+    ]
+    template_skill_fields = [
+        name
+        for name in inspect.signature(
+            server.aiworkhub_task_create_from_template
+        ).parameters
+        if name.startswith("skill_")
+    ]
+    assert core_skill_fields, "core.create_task declares no skill vocabulary"
+    assert template_skill_fields == core_skill_fields
+    assert template_skill_fields == _TASK_CREATE_SKILL_VOCABULARY
+    # Every declarable dimension is a closed selection vocabulary or a scope.
+    assert set(skill_registry.SELECTION_VOCABULARIES) | {"path_scope"} == {
+        name[len("skill_") :] for name in template_skill_fields
+    }
+
+
+def test_create_from_template_forwards_the_declared_skill_vocabulary(monkeypatch):
+    """Declared tokens reach core unchanged; core alone validates them."""
+    captured = {}
+
+    def fake_create_task(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(server.core, "create_task", fake_create_task)
+    result = server.aiworkhub_task_create_from_template(
+        task_id="TASK_TEMPLATE_SKILL_FORWARD",
+        title="Fix the leak",
+        runner="codex_worker",
+        topic="coding",
+        objective="Close the leak and add a regression.",
+        acceptance=["Leak is gone."],
+        template_id="bugfix_with_regression",
+        production_paths=["src/aiworkhub/a.py"],
+        test_paths=["tests/test_a.py"],
+        skill_task_family="refactor",
+        skill_stage="review",
+        skill_triggers=["unknown_or_empty_result"],
+        skill_applicability=["quality_gate"],
+        skill_path_scope="src/aiworkhub",
+    )
+    assert result["ok"] is True
+    # An explicit family overrides the template's declared default (bugfix).
+    assert captured["skill_task_family"] == "refactor"
+    assert captured["skill_stage"] == "review"
+    assert captured["skill_triggers"] == ["unknown_or_empty_result"]
+    assert captured["skill_applicability"] == ["quality_gate"]
+    assert captured["skill_path_scope"] == "src/aiworkhub"
+
+
+@pytest.mark.parametrize("template_id", sorted(TEMPLATE_IDS))
+def test_every_template_supplies_the_skill_family_it_declares(
+    monkeypatch, template_id
+):
+    """The template is the default; only the card can override it.
+
+    ``expand_template`` already resolves each template's DECLARED work kind to
+    a real skill family, before ``_canonical_work_kind`` flattens five of the
+    seven to ``generic``. That value was computed and thrown away here. Every
+    built-in template names a family, so no card has to repeat what its
+    template already knows.
+    """
+    captured = {}
+
+    def fake_create_task(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(server.core, "create_task", fake_create_task)
+    spec = TEMPLATE_SPECS[template_id]
+    # cross_boundary_bugfix is the one template that requires both languages.
+    cross = template_id == "cross_boundary_bugfix"
+    production = ["src/aiworkhub/a.py"] + (["src/web/a.js"] if cross else [])
+    tests = ["tests/test_a.py"] + (["tests/a.test.js"] if cross else [])
+    production = production if spec.production_path_policy.allowed else None
+    tests = tests if spec.test_path_policy.allowed else None
+    result = server.aiworkhub_task_create_from_template(
+        task_id=f"TASK_TEMPLATE_SKILL_DEFAULT_{template_id}",
+        title="Declared family flows from the template",
+        runner="codex_worker",
+        topic="coding",
+        objective="The card inherits the family its template declares.",
+        acceptance=["Family is inherited."],
+        template_id=template_id,
+        production_paths=production,
+        test_paths=tests,
+    )
+    assert result["ok"] is True
+    expected = skill_task_family(spec.work_kind)
+    assert expected, f"{template_id} declares no skill family"
+    assert captured["skill_task_family"] == expected
+    # The other four are not derivable from a template and stay unset.
+    assert captured["skill_stage"] is None
+    assert captured["skill_triggers"] is None
+    assert captured["skill_applicability"] is None
+    assert captured["skill_path_scope"] is None
+
+
+def test_declaring_skill_vocabulary_adds_no_mandatory_output(monkeypatch):
+    """A card field is not a path field.
+
+    Every path a template lists becomes a required output, and a card whose
+    listed path does not change fails. The five selection dimensions must not
+    touch that contract: the write scope, the required outputs and the
+    authenticated provenance are byte-identical with and without them.
+    """
+    captured: list[dict] = []
+
+    def fake_create_task(**kwargs):
+        captured.append(dict(kwargs))
+        return {"ok": True}
+
+    monkeypatch.setattr(server.core, "create_task", fake_create_task)
+    common = dict(
+        title="Fix the leak",
+        runner="codex_worker",
+        topic="coding",
+        objective="Close the leak and add a regression.",
+        acceptance=["Leak is gone."],
+        template_id="bugfix_with_regression",
+        production_paths=["src/aiworkhub/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    bare = server.aiworkhub_task_create_from_template(
+        task_id="TASK_TEMPLATE_SKILL_NO_OUTPUT_BARE", **common
+    )
+    declared = server.aiworkhub_task_create_from_template(
+        task_id="TASK_TEMPLATE_SKILL_NO_OUTPUT_DECLARED",
+        skill_stage="review",
+        skill_triggers=["unknown_or_empty_result"],
+        skill_applicability=["quality_gate"],
+        skill_path_scope="src/aiworkhub",
+        **common,
+    )
+    assert bare["ok"] is True and declared["ok"] is True
+    assert bare["template_provenance"] == declared["template_provenance"]
+    for field in ("allowed_writes", "required_outputs", "read_first", "validation"):
+        assert captured[0][field] == captured[1][field]
+    assert captured[1]["required_outputs"] == ["src/aiworkhub/a.py", "tests/test_a.py"]
 
 
 def test_create_from_template_bugfix_forwards_generated_fields(monkeypatch):

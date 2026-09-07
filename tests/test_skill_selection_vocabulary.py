@@ -743,3 +743,143 @@ def test_a_template_card_gets_its_family_from_its_provenance(
     assert [row["identity"] for row in payload["evidence"]["skills"]["skills"]] == [
         bugfix_record.identity
     ]
+
+
+# ---------------------------------------------------------------------------
+# 6. The surface cards are ACTUALLY created on: create_from_template
+# ---------------------------------------------------------------------------
+
+
+def _create_from_template(**overrides: object) -> dict:
+    """Create one bugfix card through the real MCP template tool."""
+    kwargs: dict = dict(
+        task_id="T_SKILL_TEMPLATE",
+        title="skill vocabulary card from a template",
+        runner="claude_coding",
+        topic="coding",
+        objective="fix the reported defect",
+        acceptance=["it works"],
+        template_id="bugfix_with_regression",
+        production_paths=["src/aiworkhub/foo.py"],
+        test_paths=["tests/test_foo.py"],
+        risk_tier="high",
+    )
+    kwargs.update(overrides)
+    return server.aiworkhub_task_create_from_template(**kwargs)
+
+
+def test_the_create_from_template_tool_can_declare_the_vocabulary(
+    coord, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole trip on the real surface: tool -> store -> packet -> bundle.
+
+    ``aiworkhub_task_create`` is the legacy surface; cards are created from
+    templates. Section 3 proved the legacy tool, and the template tool carried
+    no ``skill_*`` parameter at all -- which is why 0 of 4,628 stored cards
+    declare the vocabulary. Nothing here calls ``core.create_task``: the card
+    is created the way cards are created and read back out of the store.
+    """
+    record = _vocabulary_record()
+    skill_registry_store.put_record(coord, record)
+    _stub_context_tools(monkeypatch)
+
+    result = _create_from_template(
+        skill_stage="review",
+        skill_triggers=["unknown_or_empty_result"],
+        skill_applicability=["quality_gate"],
+        skill_path_scope="src/aiworkhub",
+    )
+    assert result["ok"] is True, result
+
+    card = task_store.get_task(coord, "T_SKILL_TEMPLATE")
+    assert card is not None
+    # The template supplied the family; the card declared the other four.
+    assert card["skill_task_family"] == "bugfix"
+    assert card["skill_stage"] == "review"
+    assert card["skill_triggers"] == ["unknown_or_empty_result"]
+    assert card["skill_applicability"] == ["quality_gate"]
+    assert card["skill_path_scope"] == "src/aiworkhub"
+
+    context = skill_registry.card_selection_context(card)
+    assert context is not None
+    assert context["task_family"] == "bugfix"
+    assert context["path_or_symbol"] == "src/aiworkhub"
+
+    candidates = skill_registry_store.load_registry(coord).records()
+    receipt = skill_registry.select(candidates, context, limit=4)
+    assert [item.identity for item in receipt.selected] == [record.identity]
+    packet = skill_registry.build_runtime_packet(candidates, receipt)
+    assert [item.identity for item in packet.skills] == [record.identity]
+    assert packet.skills[0].procedure_steps
+
+    # ... and the packet is in the bundle the worker receives. The section
+    # config is attached at launch, not by create, so it is added here; every
+    # skill field comes from the stored card untouched.
+    bundle_card = {
+        **card,
+        "project_context": {
+            "required": False,
+            "source_graph": {
+                "mode": "focus",
+                "query": "collect_project_context",
+                "budget": 16,
+                "bundle_type": "explore",
+            },
+            "session": {"topic": "skill injection", "limit": 2},
+        },
+    }
+    bundle = project_context.collect_project_context(coord, bundle_card)
+    assert bundle is not None
+    payload = json.loads(bundle.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
+    rows = payload["evidence"]["skills"]["skills"]
+    assert [row["identity"] for row in rows] == [record.identity]
+    assert rows[0]["procedure_steps"]
+
+
+def test_a_template_card_stores_the_family_its_template_declares(coord) -> None:
+    """The template default is a stored fact, not only a read-side rescue.
+
+    ``project_context`` can already recover the family from provenance, but
+    ``card_selection_context`` reads the card alone: without the stored family
+    a card that declares everything else still selects nothing.
+    """
+    result = _create_from_template(
+        task_id="T_SKILL_TEMPLATE_DEFAULT",
+        skill_stage="review",
+        skill_triggers=["unknown_or_empty_result"],
+        skill_applicability=["quality_gate"],
+        skill_path_scope="src/aiworkhub",
+    )
+    assert result["ok"] is True, result
+    card = task_store.get_task(coord, "T_SKILL_TEMPLATE_DEFAULT")
+    assert card["skill_task_family"] == task_templates.skill_task_family(
+        task_templates.TEMPLATE_SPECS["bugfix_with_regression"].work_kind
+    )
+    assert skill_registry.card_selection_context(card) is not None
+
+
+def test_an_explicit_family_overrides_the_template_default(coord) -> None:
+    """A default the card cannot override is not a default."""
+    result = _create_from_template(
+        task_id="T_SKILL_TEMPLATE_OVERRIDE",
+        skill_task_family="refactor",
+        skill_stage="review",
+        skill_triggers=["unknown_or_empty_result"],
+        skill_applicability=["quality_gate"],
+    )
+    assert result["ok"] is True, result
+    card = task_store.get_task(coord, "T_SKILL_TEMPLATE_OVERRIDE")
+    assert card["skill_task_family"] == "refactor"
+
+
+def test_the_create_from_template_tool_refuses_an_unknown_skill_token(
+    coord,
+) -> None:
+    """Validation is core's, and the template tool must not route around it."""
+    result = _create_from_template(
+        task_id="T_SKILL_TEMPLATE_BAD",
+        skill_stage="review_ready",
+    )
+    assert result["ok"] is False
+    assert "invalid_skill_vocabulary" in result["stderr"]
+    assert task_store.get_task(coord, "T_SKILL_TEMPLATE_BAD") is None
