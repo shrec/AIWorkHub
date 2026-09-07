@@ -1062,6 +1062,103 @@ def list_task_cards(root: str | Path, *, limit: int = 500) -> list[dict[str, Any
     return [_decode_task_card(row) for row in rows]
 
 
+# Terminal event names that carry a provider route outcome in their evidence.
+# ``terminal_review`` is included because a route SUCCESS is what closes a
+# failure circuit; reading failures alone would leave a circuit open forever
+# after the route recovered.
+ROUTE_OBSERVATION_EVENTS: tuple[str, ...] = (
+    "terminal_review",
+    "terminal_failure",
+    "launch_failed",
+)
+
+
+def route_terminal_observations(
+    root: str | Path,
+    *,
+    adapter_id: str,
+    model: str,
+    since_iso: str,
+    limit_per_event: int = 200,
+) -> list[dict[str, Any]]:
+    """Return retained terminal observations for one exact provider route.
+
+    The process ledger this repository keeps under
+    ``.aiworkhub/runtime/process_logs`` is pruned on a short horizon (19 rows
+    were retained when NF-2026-00655 was measured, against 31 retained
+    ``terminal_failure`` events for one dead route alone), so a circuit
+    computed from it alone reads a route that failed 31 times in a row as
+    never observed.  The canonical event log is retained for 90 days and
+    records ``evidence.adapter_id``/``evidence.model`` on every terminal
+    transition, so it is the durable answer to "what did this exact route do
+    recently".
+
+    Rows are shaped exactly like the process-ledger rows ``_route_circuit``
+    already consumes (``state``/``error``/``provider_error``/``finished_at``)
+    so one circuit implementation serves both evidence sources.  The query is
+    bounded per event name by the existing ``(event, event_id DESC)`` index
+    and then filtered to ``since_iso``; nothing scans the whole log.
+    """
+    _readiness, db_path = _require_ready(root)
+    wanted_adapter = str(adapter_id or "").strip()
+    wanted_model = str(model or "").strip()
+    if not wanted_adapter or not wanted_model:
+        return []
+    bounded = max(1, min(int(limit_per_event), 1000))
+    window_start = str(since_iso or "")
+    rows: list[dict[str, Any]] = []
+    conn = _connect(db_path, readonly=True)
+    try:
+        for event in ROUTE_OBSERVATION_EVENTS:
+            for record in conn.execute(
+                "SELECT task_id, runner, payload_json, created_at FROM task_events "
+                "WHERE event=? ORDER BY event_id DESC LIMIT ?",
+                (event, bounded),
+            ).fetchall():
+                created_at = str(record["created_at"] or "")
+                if window_start and created_at < window_start:
+                    # Rows arrive newest-first, so the first row older than the
+                    # window ends this event name's useful range.
+                    break
+                try:
+                    payload = json.loads(record["payload_json"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                evidence = payload.get("evidence")
+                if not isinstance(evidence, dict):
+                    continue
+                if str(evidence.get("adapter_id") or "").strip() != wanted_adapter:
+                    continue
+                if str(evidence.get("model") or "").strip() != wanted_model:
+                    continue
+                verification = payload.get("deterministic_verification")
+                substatus = ""
+                if isinstance(verification, dict):
+                    substatus = str(verification.get("substatus") or "").strip()
+                if not substatus:
+                    substatus = (
+                        "launch_failed" if event == "launch_failed" else "worker_failed"
+                    )
+                observation = {
+                    "task_id": str(record["task_id"] or ""),
+                    "runner": str(record["runner"] or ""),
+                    "adapter_id": wanted_adapter,
+                    "model": wanted_model,
+                    "state": substatus,
+                    "error": str(evidence.get("error") or ""),
+                    "finished_at": created_at,
+                }
+                provider_error = evidence.get("provider_error")
+                if isinstance(provider_error, dict):
+                    observation["provider_error"] = provider_error
+                rows.append(observation)
+    finally:
+        conn.close()
+    return rows
+
+
 def get_task(root: str | Path, task_id: str) -> dict[str, Any] | None:
     """Canonical detail for exactly one bounded task_id, or None if unknown."""
     _readiness, db_path = _require_ready(root)

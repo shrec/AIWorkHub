@@ -73,7 +73,14 @@ _ROUTE_SUCCESS_STATES = frozenset(
 )
 # Route-terminal kinds that fail closed after a single authenticated,
 # provider-owned terminal error rather than the transient retry threshold.
-_ROUTE_SINGLE_FAILURE_KINDS = frozenset({"auth", "quota"})
+#
+# ``model_not_found`` joins them because it is the same shape of fact as a
+# dead credential: the provider has told us, from its own sealed response,
+# that this exact route cannot serve this account.  Retrying it cannot change
+# that answer, and the measured cost of treating it as transient was 103
+# launches on one such route (``codex_cli``/``gpt-5.4``) returning 0 accepts
+# and 0 rejects -- NF-2026-00655.
+_ROUTE_SINGLE_FAILURE_KINDS = frozenset({"auth", "quota", "model_not_found"})
 # Sealed, provider-owned structured terminal error codes.  These are honoured
 # only from an error object the transport sealed itself; the free-form ``error``
 # string and any assistant/model prose are never scanned for them, so a model
@@ -86,6 +93,14 @@ _ROUTE_AUTH_ERROR_CODES = frozenset({
     "invalid_grant", "unknown_refresh_token",
     "invalid_api_key", "unauthorized",
     "authentication_failed", "authorization_failed",
+})
+# The provider says the model does not exist, or does not exist for this
+# account/subscription.  These codes are sealed by the transport that read the
+# response body; a 400 alone is NOT one of them, because a bad request is
+# usually the caller's payload rather than the route.
+_ROUTE_MODEL_ERROR_CODES = frozenset({
+    "model_not_found", "model_not_supported",
+    "unknown_model", "model_not_available",
 })
 _ROUTE_TRANSIENT_MARKERS = (
     "provider_timeout", "mcp_request_timeout", "no_terminal_event",
@@ -482,8 +497,13 @@ def _sealed_error_kind(sealed: Mapping[str, Any]) -> str:
         return "quota"
     if status_code in {401, 403} or code in _ROUTE_AUTH_ERROR_CODES:
         return "auth"
+    # Keyed on the sealed machine code only, never on the status: a bare 400
+    # is an unusable-request signal that usually belongs to the payload, while
+    # these codes are the provider naming the ROUTE as the thing that does not
+    # exist for this account.
+    if code in _ROUTE_MODEL_ERROR_CODES:
+        return "model_not_found"
     return ""
-
 
 def _route_failure_kind(process: Mapping[str, Any]) -> str:
     sealed = _sealed_provider_error(process)
@@ -549,6 +569,20 @@ def _route_circuit(
         1 if latest_kind in _ROUTE_SINGLE_FAILURE_KINDS
         else ROUTE_CIRCUIT_TRANSIENT_THRESHOLD
     )
+    # The cooldown asks "how long until this is worth trying again?", and the
+    # honest answer differs by kind.  A credential or a balance can be fixed in
+    # minutes, so the transient cooldown is right for them.  A model the
+    # provider says this account does not have is not re-provisioned in ten
+    # minutes: replayed against the real 2026-09-04 sequence, a 600s cooldown
+    # re-admitted the dead ``gpt-5.4`` route 68 times in 16.3 hours.  This kind
+    # therefore stays open for the same window the circuit already trusts its
+    # evidence over -- and a single observed SUCCESS still closes it
+    # immediately, because a success ends the consecutive run above.
+    cooldown = (
+        ROUTE_CIRCUIT_LOOKBACK_SECONDS
+        if latest_kind == "model_not_found"
+        else ROUTE_CIRCUIT_COOLDOWN_SECONDS
+    )
     failure_age = (
         max(0.0, now_epoch - latest_failure_epoch)
         if latest_failure_epoch is not None else None
@@ -557,7 +591,7 @@ def _route_circuit(
     open_now = bool(
         tripped
         and failure_age is not None
-        and failure_age < ROUTE_CIRCUIT_COOLDOWN_SECONDS
+        and failure_age < cooldown
     )
     return {
         "schema_id": "aiworkhub.route_failure_circuit.v1",
@@ -567,9 +601,212 @@ def _route_circuit(
         "consecutive_failures": consecutive,
         "threshold": threshold,
         "latest_failure_age_seconds": failure_age,
-        "cooldown_seconds": ROUTE_CIRCUIT_COOLDOWN_SECONDS,
+        "cooldown_seconds": cooldown,
         "mcp_control_plane_affected": False,
     }
+
+
+LAUNCH_ROUTE_SCHEMA_ID = "aiworkhub.launch_route_identity.v1"
+
+
+def catalog_launch_identities(
+    repo_root: Path | str,
+) -> dict[str, dict[str, Any]]:
+    """Return every runner identity this repository's catalog can construct.
+
+    Read from ``load_catalog`` (configuration plus the built-in defaults), NOT
+    from ``build_catalog``: configuration is a fact about the repository, while
+    a built catalog is a fact about the host that happens to be running -- its
+    rows appear and disappear with an editor window, and its
+    ``launch_eligible`` reads false for every ``claude_cli`` route on a machine
+    where the MCP server cannot see that CLI.  An identity vocabulary that
+    changes when a window closes is not an identity vocabulary.
+
+    Both the declared adapter and each documented transport fallback are
+    published, because a worker legitimately launches under either one.
+    """
+
+    identities: dict[str, dict[str, Any]] = {}
+    for worker in load_catalog(repo_root)["workers"]:
+        declared = str(worker.get("adapter_id") or "")
+        for adapter in (declared, *_WORKER_ADAPTER_FALLBACKS.get(declared, ())):
+            runner = execution_runner(str(worker.get("worker_id") or ""), adapter)
+            identities.setdefault(runner, {**dict(worker), "route_adapter_id": adapter})
+    return identities
+
+
+def catalog_declares_route(repo_root: Path | str, adapter_id: str, model: str) -> bool:
+    """Whether the configured catalog declares this exact (adapter, model).
+
+    Editor-discovery adapters (``_DISCOVERY_ADAPTERS``) are answered by family
+    stem rather than by exact model, because their model set is populated by
+    the live editor and cannot be enumerated from configuration at all: the
+    seed row for ``glm-5.2`` is a declaration that the GLM family comes from
+    VS Code, and ``glm-5.3`` was measured serving 6 accepted cards while being
+    absent from every configuration file.  This is the same stem rule
+    ``_discovered_family_models`` uses, reused rather than respelled.
+    """
+
+    adapter = str(adapter_id or "").strip()
+    name = str(model or "").strip()
+    if not adapter or not name:
+        return False
+    stem_match = re.match(r"[a-z]+", name.lower())
+    stem = stem_match.group(0) if stem_match else ""
+    for worker in load_catalog(repo_root)["workers"]:
+        declared = str(worker.get("adapter_id") or "")
+        adapters = (declared, *_WORKER_ADAPTER_FALLBACKS.get(declared, ()))
+        if adapter not in adapters:
+            continue
+        worker_model = str(worker.get("model") or "")
+        if name in route_model_identities(worker_model):
+            return True
+        if declared in _DISCOVERY_ADAPTERS and stem:
+            seed_stem = re.match(r"[a-z]+", worker_model.lower())
+            if seed_stem is not None and seed_stem.group(0) == stem:
+                return True
+    return False
+
+
+def resolve_launch_route(
+    repo_root: Path | str,
+    runner: str,
+    adapter_id: str,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Resolve one launch identity against the repository's catalog vocabulary.
+
+    This is the inverse of ``execution_runner`` and reports, never decides: the
+    verdict names what the runner resolved to (or that it resolved to nothing)
+    and whether the pinned model names a declared route, so a refusal upstream
+    can tell the caller what it should have said instead of returning a bare
+    no on a free-text field.
+    """
+
+    identities = catalog_launch_identities(repo_root)
+    resolved = runner_topic_policy.canonical_runner_id(runner, identities.keys())
+    entry = identities.get(resolved or "", {})
+    pinned = str(model or "").strip()
+    declared = bool(pinned) and catalog_declares_route(repo_root, adapter_id, pinned)
+    if resolved is None:
+        identity_state = "unknown_runner"
+    elif resolved != str(runner or "").strip():
+        identity_state = "resolved_variant_spelling"
+    else:
+        identity_state = "resolved"
+    return {
+        "schema_id": LAUNCH_ROUTE_SCHEMA_ID,
+        "runner": str(runner or "").strip(),
+        "adapter_id": str(adapter_id or "").strip(),
+        "model": pinned,
+        "resolved_runner": resolved or "",
+        "resolved_worker_id": str(entry.get("worker_id") or ""),
+        "resolved_model": str(entry.get("model") or ""),
+        "identity_state": identity_state,
+        "model_declared_by_catalog": declared,
+        "catalog_runners": sorted(identities),
+    }
+
+
+def route_circuit_for(
+    repo_root: Path | str,
+    adapter_id: str,
+    model: str,
+    *,
+    now_epoch: float | None = None,
+    observations: Iterable[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Evaluate the failure circuit for ANY exact route, catalog row or not.
+
+    ``build_catalog`` computes ``_route_circuit`` once per catalog row, so a
+    route with no row -- exactly the population NF-2026-00655 measured -- had
+    its circuit computed by nobody, and ``consecutive_failures`` stayed 0 no
+    matter how many identical refusals it took.  The circuit is not a property
+    of being listed; it is a property of what the route DID.  Evidence comes
+    from the 90-day canonical event log rather than the short-horizon process
+    ledger, for the reason ``task_store.route_terminal_observations``
+    documents.
+    """
+
+    observed_now = (
+        float(now_epoch)
+        if now_epoch is not None
+        else datetime.now(timezone.utc).timestamp()
+    )
+    if observations is None:
+        since = datetime.fromtimestamp(
+            observed_now - ROUTE_CIRCUIT_LOOKBACK_SECONDS, tz=timezone.utc
+        ).isoformat()
+        try:
+            observations = task_store.route_terminal_observations(
+                Path(repo_root).resolve(),
+                adapter_id=str(adapter_id or ""),
+                model=str(model or ""),
+                since_iso=since,
+            )
+        except Exception as exc:  # noqa: BLE001 - evidence unavailable is not a verdict
+            # An unreadable store is UNMEASURED, never a measured failure: a
+            # circuit derived from no evidence must not refuse a launch.
+            return {
+                "schema_id": "aiworkhub.route_failure_circuit.v1",
+                "scope": "exact_adapter_and_model",
+                "state": "unobserved",
+                "failure_kind": "",
+                "consecutive_failures": 0,
+                "threshold": ROUTE_CIRCUIT_TRANSIENT_THRESHOLD,
+                "latest_failure_age_seconds": None,
+                "cooldown_seconds": ROUTE_CIRCUIT_COOLDOWN_SECONDS,
+                "mcp_control_plane_affected": False,
+                "reason": f"route_evidence_unavailable:{type(exc).__name__}",
+            }
+    circuit = _route_circuit(observations, now_epoch=observed_now)
+    circuit["adapter_id"] = str(adapter_id or "").strip()
+    circuit["model"] = str(model or "").strip()
+    return circuit
+
+
+def launch_route_refusal_reason(
+    repo_root: Path | str, runner: str, adapter_id: str, model: str
+) -> str:
+    """Return a typed launch refusal for an extinguished route, or "".
+
+    Membership in the catalog is deliberately NOT the gate.  It was measured
+    against 11 days of this repository's own launches: a catalog-membership
+    gate would have refused ``codex_gpt-5.6-terra`` (250 claims, 30 accepted),
+    ``claude_haiku-4.5`` (26 claims, 20 accepted) and ``glm_5.3`` (65 claims,
+    6 accepted) alongside the one dead route, and 804 of 2,660 ``claim_start``
+    events -- most of them per-card reviewer identities such as
+    ``codex_qr_nf492_correctness`` that name no model at all.  What separates
+    the dead route from the working ones is outcome, not registration.
+
+    The catalog identity is still resolved and quoted, because a bare no on a
+    free-text field the caller believed was fine is not actionable: the reason
+    names the runner, what it resolved to (or that it resolved to nothing),
+    the route, the provider's own failure kind, when the route is worth trying
+    again, and what this repository does declare.
+    """
+
+    circuit = route_circuit_for(repo_root, adapter_id, model)
+    if circuit.get("state") != "open":
+        return ""
+    identity = resolve_launch_route(repo_root, runner, adapter_id, model)
+    resolved = identity["resolved_runner"] or "nothing_in_this_repository_catalog"
+    age = circuit.get("latest_failure_age_seconds")
+    remaining = (
+        int(max(0.0, float(circuit["cooldown_seconds"]) - float(age)))
+        if isinstance(age, (int, float))
+        else int(circuit["cooldown_seconds"])
+    )
+    return (
+        "route_failure_circuit_open:"
+        f"runner={runner}:resolved={resolved}:adapter={adapter_id}:model={model}"
+        f":failure_kind={circuit.get('failure_kind') or 'unknown'}"
+        f":consecutive_failures={circuit.get('consecutive_failures')}"
+        f":threshold={circuit.get('threshold')}"
+        f":cooldown_remaining_seconds={remaining}"
+        f":model_declared_by_catalog={identity['model_declared_by_catalog']}"
+        f":catalog_runners={','.join(identity['catalog_runners'][:12])}"
+    )
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:

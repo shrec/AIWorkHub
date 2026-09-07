@@ -3003,25 +3003,40 @@ def _task_context_query(
 
 
 def resolve_create_time_runner(runner: str) -> tuple[str, dict[str, Any] | None]:
-    """Fold a variant card runner spelling onto its registered launcher route.
+    """Fold a variant card runner spelling onto its registered route identity.
 
-    NF-2026-00549: a spelling that differs from a registered launcher route
-    only in case or ``-``/``_`` separators (measured: ``claude_opus_5`` and
-    ``claude_opus5`` beside ``claude_opus-5``) would die later at a
-    pinned-model launch with ``workforce_route_absent``; it folds onto the one
-    registered spelling here.  Nothing is refused: a runner that folds onto no
-    route is returned unchanged because launch resolves unpinned and non-claude
-    runners at the adapter level, and synthetic runner names are legitimate.
-    The second tuple member is reserved for a named refusal and is always
-    ``None`` today.
+    NF-2026-00549: a spelling that differs from a registered route only in case
+    or ``-``/``_`` separators (measured: ``claude_opus_5`` and ``claude_opus5``
+    beside ``claude_opus-5``) would die later at a pinned-model launch with
+    ``workforce_route_absent``; it folds onto the one registered spelling here.
+
+    NF-2026-00655 widened the fold set.  It used to be the seven-row launcher
+    table alone, which knows nothing about the repository's actual workforce,
+    so ``deepseek_v4_pro`` and ``glm-5.2`` were stored as new spellings of
+    routes the catalog already owned.  The catalog's own identities are added,
+    read from configuration rather than from a built catalog: configuration is
+    a fact about the repository, while a built catalog's rows appear and
+    disappear with an editor window.
+
+    Nothing is refused.  Measured against 11 days of this repository's
+    launches, refusing an unfoldable runner here would have refused 804 of
+    2,660 ``claim_start`` events, the great majority of them legitimate
+    per-card reviewer identities (``codex_qr_nf492_correctness`` and its
+    siblings) that name no model at all.  The second tuple member stays
+    reserved for a named refusal and is always ``None`` today.
     """
     from . import process_launcher as _launcher_routes
+    from . import workforce_catalog as _catalog
 
-    launcher_route_runners = {
+    registered_runners = {
         route_runner
         for route_runner, _adapter in _launcher_routes._CANONICAL_WORKFORCE
     }
-    folded_runner = canonical_runner_id(runner, launcher_route_runners)
+    try:
+        registered_runners |= set(_catalog.catalog_launch_identities(repo_root()))
+    except Exception:  # noqa: BLE001 - an unreadable catalog narrows the fold set only
+        pass
+    folded_runner = canonical_runner_id(runner, registered_runners)
     if folded_runner is not None:
         return folded_runner, None
     return runner, None

@@ -2349,6 +2349,116 @@ def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
     return None
 
 
+# Provider-owned envelope shapes that name the MODEL as the thing that does not
+# exist for this account.  Kept exact: a bare 400 is usually the caller's
+# payload, so a status alone never qualifies.
+_MODEL_REJECTION_STATUSES: frozenset[int] = frozenset({400, 404})
+_MODEL_REJECTION_ERROR_TYPES: frozenset[str] = frozenset({
+    "invalid_request_error", "not_found_error", "invalid_model",
+})
+_MODEL_REJECTION_ERROR_CODES: frozenset[str] = frozenset({
+    "model_not_found", "model_not_supported",
+    "unknown_model", "model_not_available",
+})
+
+
+def _provider_model_rejection_from_output(
+    path: Path, requested_model: str
+) -> dict[str, Any] | None:
+    """Return a sealed record when the provider refused the ROUTE, not the work.
+
+    NF-2026-00655 measured 103 launches on ``codex_cli``/``gpt-5.4`` returning
+    0 accepts and 0 rejects, 13 of them byte-identical: 725 bytes of stdout and
+    143 of stderr carrying
+
+        {"type":"error","status":400,"error":{"type":"invalid_request_error",
+         "message":"The 'gpt-5.4' model is not supported when using Codex with
+         a ChatGPT account."}}
+
+    ``_provider_auth_failure_from_output`` does not see it -- the envelope is a
+    top-level ``error`` object rather than a ``result``/``system`` event, and
+    400 is not a refusal status -- so it collapsed into
+    ``worker_failed:supervisor_state=exited:exit_code=1`` and killed the CARD
+    while leaving the route ready for the next 102 launches.
+
+    Two facts must both hold before this is called a route failure, and
+    together they make it unspoofable by model prose: the envelope must be the
+    provider's own error object with a model-shaped error type or code, and its
+    message must name the exact model THIS launch pinned.  A worker that echoes
+    someone else's error text cannot satisfy the second, and a genuine bad
+    request about anything other than the model cannot satisfy the first.
+    """
+
+    model = str(requested_model or "").strip()
+    if not model:
+        return None
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+        return None
+    size = int(st.st_size)
+    if size <= MAX_RECEIPT_SCAN_BYTES:
+        text = _read_byte_range(path, 0, size)
+    else:
+        half = MAX_RECEIPT_SCAN_BYTES // 2
+        text = _read_byte_range(path, 0, half) + "\n" + _read_byte_range(
+            path, size - half, half
+        )
+    for raw_line in text.splitlines():
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("type") or "").strip().lower() != "error":
+            continue
+        raw_status = event.get("status", event.get("error_status"))
+        status = (
+            raw_status
+            if isinstance(raw_status, int) and not isinstance(raw_status, bool)
+            else 0
+        )
+        if status not in _MODEL_REJECTION_STATUSES:
+            continue
+        body = event.get("error")
+        if not isinstance(body, dict):
+            continue
+        error_type = str(body.get("type") or "").strip().lower()
+        error_code = str(body.get("code") or "").strip().lower()
+        if (
+            error_type not in _MODEL_REJECTION_ERROR_TYPES
+            and error_code not in _MODEL_REJECTION_ERROR_CODES
+        ):
+            continue
+        message = str(body.get("message") or "")
+        names_model = error_code in _MODEL_REJECTION_ERROR_CODES or model in message
+        if not names_model:
+            continue
+        sealed = {
+            "schema_id": "aiworkhub.provider_route_error.v1",
+            "owner": "provider",
+            "sealed": True,
+            "code": error_code if error_code in _MODEL_REJECTION_ERROR_CODES else "model_not_supported",
+            "http_status": status,
+            "model": model,
+            "detail": message[:300],
+        }
+        return {
+            "schema_id": "aiworkhub.provider_launch_failure.v1",
+            "reason": f"provider_route_model_unavailable:model={model}",
+            "refusal_kind": "model_not_found",
+            "recoverable": False,
+            "http_status": status,
+            "error_code": str(sealed["code"]),
+            "session_id": "",
+            "provider_error": sealed,
+        }
+    return None
+
+
 def _provider_timeout_failure_from_output(path: Path) -> dict[str, Any] | None:
     """Return exact structured VS Code LM timeout evidence.
 
@@ -2907,12 +3017,26 @@ def _normalize_workforce_model(model: str | None) -> str:
     return _WORKFORCE_MODEL_ALIASES.get(stripped, stripped)
 
 
+def _launch_route_refusal(repo: Path, runner: str, adapter_id: str, model: str) -> str:
+    """Return a typed refusal for an extinguished route, or "" to allow it.
+
+    The refusal is worded by ``workforce_catalog``, which owns both the circuit
+    and the identity vocabulary it has to quote; this module only decides that
+    a launch is what asked.
+    """
+    from . import workforce_catalog  # local import: cycle-safe (core -> launcher)
+
+    return workforce_catalog.launch_route_refusal_reason(
+        repo, runner, adapter_id, model
+    )
+
 def validate_workforce_identity(
     runner: str,
     adapter_id: str,
     model: str | None,
     *,
     risk_tier: str | None = None,
+    repo: Path | str | None = None,
 ) -> str | None:
     """Validate an exact, explicitly-pinned (runner, adapter_id, model) tuple
     against the canonical workforce before any provider reservation/spawn.
@@ -2928,8 +3052,19 @@ def validate_workforce_identity(
     ``LaunchRejected`` with a typed reason for any pinned runner/adapter/model
     combination that does not resolve to exactly one canonical workforce row,
     or for a disabled, unavailable, or risk-incapable route.
+
+    ``repo`` supplies the repository whose retained route evidence decides the
+    failure circuit.  It is the launch paths that pass it, because only they
+    are about to spend a provider reservation; the pure identity assertions in
+    this module's unit surface pass none and keep their exact prior meaning.
     """
     _validate_adapter_identity(runner, adapter_id)
+    if repo is not None and str(model or "").strip():
+        refusal = _launch_route_refusal(
+            Path(repo), runner, adapter_id, str(model).strip()
+        )
+        if refusal:
+            raise LaunchRejected(refusal)
     route = _CANONICAL_WORKFORCE.get((runner, adapter_id))
     if route is None and not runner.startswith("claude_"):
         return model
@@ -7765,7 +7900,11 @@ class ProcessManager:
                     request_id=request_id,
                 )
             model = validate_workforce_identity(
-                runner, adapter_id, model, risk_tier=card.get("risk_tier")
+                runner,
+                adapter_id,
+                model,
+                risk_tier=card.get("risk_tier"),
+                repo=self.repo,
             )
             memory_admission = _memory_launch_admission()
             if not memory_admission["admit"]:
@@ -8723,7 +8862,11 @@ class ProcessManager:
             _validate_adapter_identity(runner, adapter_id)
             card = self._preflight_card(task_id, runner, topic, adapter_id)
             model = validate_workforce_identity(
-                runner, adapter_id, model, risk_tier=card.get("risk_tier")
+                runner,
+                adapter_id,
+                model,
+                risk_tier=card.get("risk_tier"),
+                repo=self.repo,
             )
             memory_admission = _memory_launch_admission()
             if not memory_admission["admit"]:
@@ -10988,6 +11131,16 @@ class ProcessManager:
                 provider_launch_failure = _provider_auth_failure_from_output(
                     provider_output_path
                 )
+                if provider_launch_failure is None:
+                    # The route, not the work: the provider named THIS launch's
+                    # pinned model as unavailable for this account.  It joins
+                    # the same refusal path below, so the card lands on the
+                    # retryable ``launch_failed`` substatus instead of dying,
+                    # while the sealed error it carries opens the route's
+                    # failure circuit after this ONE failure.
+                    provider_launch_failure = _provider_model_rejection_from_output(
+                        provider_output_path, str(metadata.get("model") or "")
+                    )
                 if provider_launch_failure is not None:
                     http_status = int(provider_launch_failure["http_status"])
                     retry_event = self._retry_claude_auth_refresh(
@@ -11128,6 +11281,20 @@ class ProcessManager:
                             "request_id": request_id,
                             "adapter_id": metadata.get("adapter_id"),
                             "model": metadata.get("model"),
+                            # The sealed, provider-owned error object, when one
+                            # was read at the boundary.  It is what
+                            # ``workforce_catalog._route_failure_kind`` trusts,
+                            # so recording it here is what lets a route's
+                            # circuit be computed from the 90-day event log
+                            # instead of the short-horizon process ledger.
+                            **(
+                                {"provider_error": provider_launch_failure["provider_error"]}
+                                if isinstance(provider_launch_failure, dict)
+                                and isinstance(
+                                    provider_launch_failure.get("provider_error"), dict
+                                )
+                                else {}
+                            ),
                             "error": _settle_terminal_failure_authority()["diagnostic"],
                             "supervisor_state": supervisor_state,
                             "exit_code": exit_code,
