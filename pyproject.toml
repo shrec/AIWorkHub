@@ -44,6 +44,9 @@ source-graph-semantic = [
 dev = [
   "mypy>=1.14,<2",
   "pytest>=8,<10",
+  # NF-2026-00639: [tool.pytest.ini_options].addopts passes -n, so xdist is a
+  # hard requirement of running this suite at all, not an optional speedup.
+  "pytest-xdist>=3.5,<4",
   "ruff>=0.9,<1",
 ]
 
@@ -79,6 +82,26 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# NF-2026-00639: this suite was running single-threaded on a 16-core host at
+# 0.34 of a core while pytest-xdist sat installed and unused. `-n auto` is
+# resolved by pytest_xdist_auto_num_workers in tests/conftest.py, which derives
+# the count from the observed core count and reserves headroom -- there is no
+# pinned worker constant here or there.
+# `--dist loadfile` keeps every test in a file on one worker, in file order.
+# That is what makes the parallel run equivalent to the serial one for the
+# tests in this repository that monkeypatch module-level state (module.os IS
+# os) or drive daemons and child processes: those interfere across tests in the
+# same file, which loadfile keeps together, not across files.
+# Pass `-n 0` to run serially: for a single test the worker startup costs more
+# than it saves, and it is the switch to reach for when isolating a failure.
+# One file is measured to misbehave distributed -- tests/test_app_server_mux.py,
+# whose sideband `ok: true` means delivered, not applied (2 failures in 8
+# whole-file runs at -n auto, 0 in 10 serial runs including 5 under 14 CPU
+# burners). CI runs it as its own serial pass. For a deterministic full run
+# locally, do the same:
+#   pytest tests/ --deselect tests/test_app_server_mux.py
+#   pytest tests/test_app_server_mux.py -n 0
+addopts = "-n auto --dist loadfile"
 
 [tool.ruff]
 target-version = "py310"

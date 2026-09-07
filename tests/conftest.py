@@ -27,6 +27,43 @@ import pytest
 _CHILD_PROBE = "import aiworkhub, sys; sys.stdout.write(getattr(aiworkhub, '__file__', '') or '')"
 
 
+def observed_cores() -> int:
+    """Cores this process may actually run on, never a hardcoded constant.
+
+    ``sched_getaffinity`` is the honest number under a cpuset or a container;
+    ``os.cpu_count()`` is the fallback where the platform has no affinity mask.
+    """
+
+    getaffinity = getattr(os, "sched_getaffinity", None)
+    if getaffinity is not None:
+        try:
+            return max(1, len(getaffinity(0)))
+        except OSError:
+            pass
+    return max(1, os.cpu_count() or 1)
+
+
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
+    """Worker count for ``-n auto`` (NF-2026-00639).
+
+    The count is derived from the observed core count and leaves headroom, so
+    a full-suite run cannot starve the interactive MCP server sharing this
+    host. Below four cores the reservation would cost more throughput than the
+    headroom is worth -- and a single-worker xdist run is slower than a plain
+    serial one -- so every core is used there instead.
+
+    Returning ``None`` defers to xdist's own resolution, which is what honours
+    an explicit ``PYTEST_XDIST_AUTO_NUM_WORKERS`` operator override.
+    """
+
+    if os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS"):
+        return None
+    cores = observed_cores()
+    if cores < 4:
+        return cores
+    return cores - max(1, cores // 8)
+
+
 @pytest.fixture(autouse=True)
 def deterministic_process_launch_capacity(monkeypatch):
     """Keep launcher tests independent of the CI host's instantaneous free RAM."""

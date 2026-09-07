@@ -13,9 +13,41 @@ const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
 const EXPECTED_MCP_PACKAGE_VERSION = "0.11.2";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
+// NF-2026-00643: this globalStorage trace directory was measured holding 1,102
+// files and 2,235,024,325 bytes (2.24 GB), largest single file 44,626,825 bytes
+// / 109,375 lines, growing ~44 MB per busy window session, with nothing
+// pruning it and an fsync on every single line.  Tracing stays ON by default:
+// it is the only post-mortem for a shared extension host that dies, and it is
+// what measured this defect in the first place.  What changes is that it is
+// now bounded on every axis it was unbounded on.
+const DEBUG_TRACE_MAX_FILE_BYTES = 4 * 1024 * 1024;
+const DEBUG_TRACE_FLUSH_MS = 2000;
+const DEBUG_TRACE_FLUSH_BYTES = 64 * 1024;
+const DEBUG_TRACE_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
+const DEBUG_TRACE_KEEP_FILES = 24;
+const DEBUG_TRACE_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+// A trace file written within this window by a live pid belongs to a window
+// that is still running; retention never touches it.
+const DEBUG_TRACE_ACTIVE_MS = 60 * 60 * 1000;
+const DEBUG_TRACE_NAME_RE = /^(?:extension|mcp)-.+\.jsonl$/;
+// Events emitted by a host that is already terminating: the buffered tail
+// would die with the process, so these -- and only these -- still flush and
+// fsync synchronously.
+const DEBUG_TRACE_DURABLE_EVENTS = new Set([
+  "host.uncaught_exception",
+  "host.unhandled_rejection",
+  "host.exit",
+  "host.signal",
+]);
 let extensionDebugTraceFile = "";
+let extensionDebugTraceBase = "";
+let extensionDebugTracePart = 0;
+let extensionDebugTraceBytes = 0;
 let mcpDebugTraceFile = "";
 let extensionDebugTraceSequence = 0;
+let debugTraceBuffer = [];
+let debugTraceBufferBytes = 0;
+let debugTraceFlushTimer = null;
 
 function initializeDebugTracing(context) {
   try {
@@ -26,12 +58,18 @@ function initializeDebugTracing(context) {
     fs.mkdirSync(traceDir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const suffix = `${stamp}-${process.pid}-${WINDOW_SCOPE_ID}`;
-    extensionDebugTraceFile = path.join(traceDir, `extension-${suffix}.jsonl`);
+    extensionDebugTraceBase = path.join(traceDir, `extension-${suffix}`);
+    extensionDebugTracePart = 0;
+    extensionDebugTraceBytes = 0;
+    extensionDebugTraceFile = `${extensionDebugTraceBase}.jsonl`;
     mcpDebugTraceFile = path.join(traceDir, `mcp-${suffix}.jsonl`);
     debugTrace("trace.initialized", { platform: process.platform, arch: process.arch });
     installHostCrashDiagnostics();
+    // Retention reads and unlinks; it is deliberately off the activation path.
+    scheduleDebugTraceRetention(traceDir);
   } catch (_err) {
     extensionDebugTraceFile = "";
+    extensionDebugTraceBase = "";
     mcpDebugTraceFile = "";
   }
 }
@@ -148,15 +186,154 @@ function debugTrace(event, fields = {}) {
       },
       ...fields,
     };
+    debugTraceAppend(`${JSON.stringify(payload)}\n`, DEBUG_TRACE_DURABLE_EVENTS.has(payload.event));
+  } catch (_err) {
+    // Diagnostics must never alter extension-host behavior.
+  }
+}
+
+// NF-2026-00643: the steady-state cost of one trace line used to be
+// open(O_APPEND) + write + fsync + close.  The fsync dominated -- roughly
+// 130 ms of blocking IO per 30 s dashboard tick at the measured line rate --
+// and it bought nothing, because a trace line is only ever read after the fact.
+// Lines are batched into one write syscall instead; the only events that still
+// pay a synchronous flush are the ones written by a host that is already dying,
+// where the buffer would die with it.
+function debugTraceAppend(line, durable = false) {
+  debugTraceBuffer.push(line);
+  debugTraceBufferBytes += Buffer.byteLength(line, "utf8");
+  if (durable || debugTraceBufferBytes >= DEBUG_TRACE_FLUSH_BYTES) {
+    flushDebugTrace(durable);
+    return;
+  }
+  if (debugTraceFlushTimer) return;
+  debugTraceFlushTimer = setTimeout(() => {
+    debugTraceFlushTimer = null;
+    flushDebugTrace(false);
+  }, DEBUG_TRACE_FLUSH_MS);
+  if (typeof debugTraceFlushTimer.unref === "function") debugTraceFlushTimer.unref();
+}
+
+function flushDebugTrace(durable = false) {
+  if (debugTraceFlushTimer) {
+    clearTimeout(debugTraceFlushTimer);
+    debugTraceFlushTimer = null;
+  }
+  if (!debugTraceBuffer.length) return;
+  const chunk = debugTraceBuffer.join("");
+  const chunkBytes = debugTraceBufferBytes;
+  debugTraceBuffer = [];
+  debugTraceBufferBytes = 0;
+  if (!extensionDebugTraceFile) return;
+  try {
+    // Rotation is the one place the steady-state path still fsyncs: the file
+    // it seals is the one a post-mortem will read, and it is sealed at most
+    // once per DEBUG_TRACE_MAX_FILE_BYTES instead of once per line.
+    // A single chunk larger than the cap has nothing to rotate away from, so
+    // rotation is conditioned on the current file already holding bytes.
+    if (extensionDebugTraceBase && extensionDebugTraceBytes > 0 &&
+        extensionDebugTraceBytes + chunkBytes > DEBUG_TRACE_MAX_FILE_BYTES) {
+      sealDebugTraceFile();
+      extensionDebugTracePart += 1;
+      extensionDebugTraceFile = `${extensionDebugTraceBase}.${extensionDebugTracePart}.jsonl`;
+      extensionDebugTraceBytes = 0;
+    }
     const fd = fs.openSync(extensionDebugTraceFile, "a", 0o600);
     try {
-      fs.writeSync(fd, `${JSON.stringify(payload)}\n`, null, "utf8");
-      fs.fsyncSync(fd);
+      fs.writeSync(fd, chunk, null, "utf8");
+      if (durable) fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
     }
+    extensionDebugTraceBytes += chunkBytes;
   } catch (_err) {
     // Diagnostics must never alter extension-host behavior.
+  }
+}
+
+function sealDebugTraceFile() {
+  try {
+    const fd = fs.openSync(extensionDebugTraceFile, "a", 0o600);
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  } catch (_err) {
+    // A rotated trace file is best-effort durable, never a control path.
+  }
+}
+
+function scheduleDebugTraceRetention(traceDir) {
+  const timer = setTimeout(() => {
+    try {
+      pruneDebugTraces(traceDir);
+    } catch (_err) {
+      // Retention never blocks or fails activation.
+    }
+  }, 0);
+  if (typeof timer.unref === "function") timer.unref();
+}
+
+// Age, count and total-byte retention over this extension's own trace
+// directory -- both the extension-host files and the MCP child files it names
+// through AIWORKHUB_DEBUG_TRACE_FILE.  Nothing pruned these before: the
+// measured directory held 1,102 files and 2,235,024,325 bytes.
+// A file whose embedded pid is still alive AND whose mtime is still fresh
+// belongs to a window that is still writing it, so it is never a candidate;
+// the freshness half of that test is what keeps a recycled pid from pinning a
+// dead window's file forever.
+function pruneDebugTraces(traceDir, now = Date.now()) {
+  const removed = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(traceDir, { withFileTypes: true });
+  } catch (_err) {
+    return removed;
+  }
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !DEBUG_TRACE_NAME_RE.test(entry.name)) continue;
+    const full = path.join(traceDir, entry.name);
+    let info;
+    try {
+      info = fs.statSync(full);
+    } catch (_err) {
+      continue;
+    }
+    const active = now - info.mtimeMs < DEBUG_TRACE_ACTIVE_MS && debugTracePidAlive(entry.name);
+    if (active) continue;
+    candidates.push({ full, name: entry.name, size: info.size, mtimeMs: info.mtimeMs });
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  let keptFiles = 0;
+  let keptBytes = 0;
+  for (const candidate of candidates) {
+    const overAge = now - candidate.mtimeMs > DEBUG_TRACE_MAX_AGE_MS;
+    const overCount = keptFiles >= DEBUG_TRACE_KEEP_FILES;
+    const overBytes = keptBytes + candidate.size > DEBUG_TRACE_MAX_TOTAL_BYTES;
+    if (overAge || overCount || overBytes) {
+      try {
+        fs.unlinkSync(candidate.full);
+        removed.push(candidate.name);
+      } catch (_err) {
+        // Another window raced us to it; that is the same outcome.
+      }
+      continue;
+    }
+    keptFiles += 1;
+    keptBytes += candidate.size;
+  }
+  return removed;
+}
+
+function debugTracePidAlive(fileName) {
+  const match = /-(\d{1,10})-window_[0-9a-f]+(?:\.\d+)?\.jsonl$/.exec(fileName);
+  if (!match) return false;
+  const pid = Number(match[1]);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return Boolean(err && err.code === "EPERM");
   }
 }
 
@@ -5251,27 +5428,35 @@ class VscodeLmBridgeHost {
     this.maxParallelRequests = VSCODE_LM_MAX_PARALLEL_REQUESTS;
     this.permissionPrompts = new Map();
     this.disposed = false;
+    this.initialHeartbeat = null;
   }
 
+  // NF-2026-00643: start() must never block its caller on the VS Code language
+  // model catalog.  Measured over 40 extension activations, that single call
+  // cost a median of 6.870 s, a p90 of 12.893 s and a maximum of 31.619 s, and
+  // activation awaited it before registering a single command.
   async start(repoInfo) {
     this.stop();
     if (!repoInfo || !REAL_REPO_ID_RE.test(String(repoInfo.repoId || ""))) return;
     this.repoInfo = { ...repoInfo };
     vscodeLmWorkerSourceGraphReadinessConsumed = false;
     armVscodeLmProviderBridgeReadiness();
-    // The broker is an optional execution route.  A malformed third-party
-    // model catalog or a transient provider failure must never abort the
-    // dashboard/MCP extension activation.  The timer retries and preflight
-    // reports the missing/stale heartbeat as bounded degraded evidence.
-    try {
-      await this.publishHeartbeat();
-    } catch (err) {
-      recordSystemLog(`[vscode lm bridge] heartbeat unavailable ${sanitizeErrorMessage(err)}`);
-    }
+    // Arm the timers before anything asks a provider for anything.  Claiming
+    // and answering a queued request needs the repo binding above, not the
+    // catalog, so the bridge is serving from here on.
     this.pollTimer = setInterval(() => this.poll().catch((err) => recordSystemLog(`[glm bridge] ERROR ${sanitizeErrorMessage(err)}`)), VSCODE_LM_POLL_MS);
     this.heartbeatTimer = setInterval(() => this.publishHeartbeat().catch(() => {}), VSCODE_LM_HEARTBEAT_MS);
     if (this.pollTimer && typeof this.pollTimer.unref === "function") this.pollTimer.unref();
     if (this.heartbeatTimer && typeof this.heartbeatTimer.unref === "function") this.heartbeatTimer.unref();
+    // The broker is an optional execution route.  A malformed third-party
+    // model catalog or a transient provider failure must never abort -- or
+    // delay -- the dashboard/MCP extension activation.  The timer retries and
+    // preflight reports the missing/stale heartbeat as bounded degraded
+    // evidence.  `initialHeartbeat` is the awaitable seam for a caller (or a
+    // test) that genuinely needs the first published catalog.
+    this.initialHeartbeat = this.publishHeartbeat().catch((err) => {
+      recordSystemLog(`[vscode lm bridge] heartbeat unavailable ${sanitizeErrorMessage(err)}`);
+    });
   }
 
   stop() {
@@ -5338,6 +5523,9 @@ class VscodeLmBridgeHost {
   async publishHeartbeat() {
     if (!this.repoInfo || this.disposed) return;
     const models = await this.models();
+    // The catalog round-trip is unbounded provider work: a stop()/dispose()
+    // that lands while it is in flight must not be published over.
+    if (!this.repoInfo || this.disposed) return;
     // The published catalog is exactly what VS Code reported, minus the
     // measured non-callable providers -- no hardcoded model list is consulted.
     const visibleModels = vscodeLmDiscoverCallableNames(models);
@@ -10084,10 +10272,6 @@ async function activate(context) {
   ensureWorkspaceMcpConfigsRepaired(context);
   debugTrace("activation.config_repair.end");
 
-  if (vscodeLmBridgeHost && activeRepoIdentity && activeRepoIdentity.root) {
-    await vscodeLmBridgeHost.start(activeRepoIdentity);
-  }
-
   // Sidebar view provider (uses legacy view ID for backward compatibility).
   context.subscriptions.push(
     vscode.window.registerWebviewPanelSerializer(PANEL_VIEW_TYPE, {
@@ -10113,6 +10297,21 @@ async function activate(context) {
     vscode.commands.registerCommand(`${EXT_ID}.selectRepository`, () => selectRepositoryCommand())
   );
   debugTrace("activation.providers_registered");
+
+  // NF-2026-00643: this bridge start used to sit ABOVE the registration block
+  // and be awaited.  The first thing it does is ask VS Code for the language
+  // model catalog, measured over 40 activations at a median of 6.870 s, a p90
+  // of 12.893 s and a maximum of 31.619 s.  Until that resolved no aiworkhub.*
+  // command existed and no dashboard panel could be created -- in an extension
+  // host shared with every other extension in the window.  Nothing above needs
+  // the catalog, so commands and providers are registered first and the
+  // catalog is resolved by the bridge's own background heartbeat.
+  if (vscodeLmBridgeHost && activeRepoIdentity && activeRepoIdentity.root) {
+    debugTrace("activation.vscode_lm_bridge.deferred");
+    vscodeLmBridgeHost.start(activeRepoIdentity).catch((err) => {
+      recordSystemLog(`[vscode lm bridge] start failed ${sanitizeErrorMessage(err)}`);
+    });
+  }
 
   // Startup activation is the callback lifecycle owner.  An initialized
   // repository must start its MCP child and dispatcher even when the user
@@ -10157,6 +10356,9 @@ async function deactivate() {
     await oldClient.stopDispatcherThenTerminate({ restart: false });
   }
   flushSystemLogs();
+  // The trace writer buffers; a reload cycle must not lose the tail that
+  // explains why this window was reloaded.
+  flushDebugTrace(true);
   // Remove ONLY this window's own route record -- never another window's.
   removeWindowRouteRecord(activeRepoIdentity);
   activeRepoIdentity = null;
@@ -10278,6 +10480,23 @@ module.exports = {
     vscodeLmToolsForRequest,
     glmTextToolProtocolPrompt,
     atomicWriteOwnerJson,
+    debugTrace,
+    initializeDebugTracing,
+    debugTraceAppend,
+    flushDebugTrace,
+    pruneDebugTraces,
+    debugTraceBufferedLineCount: () => debugTraceBuffer.length,
+    bindDebugTraceFileForTest: (filePath) => {
+      flushDebugTrace(false);
+      extensionDebugTraceBase = filePath ? String(filePath).replace(/\.jsonl$/, "") : "";
+      extensionDebugTraceFile = filePath ? String(filePath) : "";
+      extensionDebugTracePart = 0;
+      extensionDebugTraceBytes = 0;
+      debugTraceBuffer = [];
+      debugTraceBufferBytes = 0;
+      return extensionDebugTraceFile;
+    },
+    currentDebugTraceFileForTest: () => extensionDebugTraceFile,
     ownerOnlyRegularFile,
     vscodeLmRequestPathFromClaim,
     vscodeLmRequestClaimableByThisWindow,
@@ -10323,6 +10542,14 @@ module.exports = {
       VSCODE_LM_CANCEL_DECISION_SCHEMA,
       VSCODE_LM_CANCEL_POLL_MS,
       WINDOW_SCOPE_ID,
+      DEBUG_TRACE_MAX_FILE_BYTES,
+      DEBUG_TRACE_FLUSH_MS,
+      DEBUG_TRACE_FLUSH_BYTES,
+      DEBUG_TRACE_MAX_AGE_MS,
+      DEBUG_TRACE_KEEP_FILES,
+      DEBUG_TRACE_MAX_TOTAL_BYTES,
+      DEBUG_TRACE_ACTIVE_MS,
+      DEBUG_TRACE_DURABLE_EVENTS,
     },
   },
 };

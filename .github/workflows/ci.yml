@@ -81,8 +81,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install ".[source-graph-semantic]"
-          python -m pip install "pytest>=8,<10"
-          python -m pytest tests/test_platform_io.py tests/test_cross_platform_runtime.py tests/test_release_qualification_e2e.py tests/test_quality_calibration.py tests/test_source_graph_tree_sitter_semantic.py -q --tb=short --junitxml=qualification-${{ matrix.name }}.xml
+          python -m pip install "pytest>=8,<10" "pytest-xdist>=3.5,<4"
+          # Serial: see the -n 0 note on the Windows/Darwin manifests below.
+          python -m pytest tests/test_platform_io.py tests/test_cross_platform_runtime.py tests/test_release_qualification_e2e.py tests/test_quality_calibration.py tests/test_source_graph_tree_sitter_semantic.py -n 0 -q --tb=short --junitxml=qualification-${{ matrix.name }}.xml
 
       - name: Run Windows-owned nt regressions (lock/process/temp/validation)
         if: matrix.platform == 'windows'
@@ -139,7 +140,8 @@ jobs:
               f"{len(manifest)} manifest files"
           )
           PY
-          python -m pytest "${WINDOWS_NT_MANIFEST[@]}" -q --tb=short --junitxml=qualification-${{ matrix.name }}-nt.xml
+          # Serial for the same reason as the Darwin manifest below.
+          python -m pytest "${WINDOWS_NT_MANIFEST[@]}" -n 0 -q --tb=short --junitxml=qualification-${{ matrix.name }}-nt.xml
 
       - name: Run macOS-owned Darwin regressions (identity/launch/PATH/RSS/cleanup)
         if: matrix.platform == 'macos'
@@ -189,7 +191,12 @@ jobs:
               f"{len(manifest)} manifest files"
           )
           PY
-          python -m pytest "${MACOS_DARWIN_MANIFEST[@]}" -q --tb=short --junitxml=qualification-${{ matrix.name }}-darwin.xml
+          # -n 0 keeps this platform-owned manifest serial. The measured xdist
+          # win (NF-2026-00639) is in the full suite and the local loop; these
+          # five lock/process/temp files are fast serially and are the last
+          # place to introduce a scheduling variable that no one can reproduce
+          # off the runner.
+          python -m pytest "${MACOS_DARWIN_MANIFEST[@]}" -n 0 -q --tb=short --junitxml=qualification-${{ matrix.name }}-darwin.xml
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -266,12 +273,21 @@ jobs:
           . .venv-ci/bin/activate
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -e .
-          python -m pip install "pytest>=8,<10"
+          python -m pip install "pytest>=8,<10" "pytest-xdist>=3.5,<4"
 
       - name: Run Python tests
         run: |
           . .venv-ci/bin/activate
-          python -m pytest tests/ -v --tb=short -x
+          # NF-2026-00639: distributed by default (addopts). tests/test_app_server_mux.py
+          # is the one file measured to misbehave under xdist -- its sideband
+          # `ok: true` means delivered, not applied, so a turn/steer written from
+          # an xdist worker can reach the App Server child before the preceding
+          # thread/resume has been applied. Reproduced 2 of 8 whole-file runs at
+          # -n auto and 0 of 10 serially (5 idle, 5 under 14 CPU burners). It is
+          # deselected from the distributed pass and run serially straight after,
+          # so coverage is unchanged and the job is deterministic.
+          python -m pytest tests/ -v --tb=short -x --deselect tests/test_app_server_mux.py
+          python -m pytest tests/test_app_server_mux.py -n 0 -v --tb=short -x
 
   python-package:
     name: Python package

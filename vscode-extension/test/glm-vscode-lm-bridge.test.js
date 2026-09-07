@@ -1294,6 +1294,10 @@ async function malformedCatalogChecks() {
     const host = new internals.VscodeLmBridgeHost({ globalState: { get: () => false } });
     const repoInfo = { root: temp, repoId: `repo_${"e".repeat(32)}` };
     await host.start(repoInfo);
+    // NF-2026-00643: start() no longer blocks on the VS Code language-model
+    // catalog, so the first heartbeat is published in the background.
+    // `initialHeartbeat` is that publication.
+    await host.initialHeartbeat;
     const hostsDir = path.join(temp, "hosts", repoInfo.repoId);
     const files = fs.readdirSync(hostsDir);
     assert.strictEqual(files.length, 1);
@@ -1307,6 +1311,9 @@ async function malformedCatalogChecks() {
     fakeVscode.lm.selectChatModels = async () => { throw new Error("provider catalog failed"); };
     const degraded = new internals.VscodeLmBridgeHost({ globalState: { get: () => false } });
     await degraded.start(repoInfo);
+    // A provider catalog that throws must degrade in the background heartbeat,
+    // never surface out of start() and never abort the caller.
+    await degraded.initialHeartbeat;
     degraded.dispose();
   } finally {
     if (previousRoot === undefined) delete process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT;

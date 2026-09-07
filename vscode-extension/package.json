@@ -121,7 +121,7 @@
           "type": "boolean",
           "default": true,
           "scope": "window",
-          "description": "Write bounded, fsynced extension-host and MCP lifecycle traces for diagnosing hangs and crashes."
+          "description": "Write extension-host and MCP lifecycle traces for diagnosing hangs and crashes. Buffered (no per-line fsync), rotated at 4 MiB, and pruned to at most 24 files / 64 MiB / 3 days in global storage."
         }
       }
     }
