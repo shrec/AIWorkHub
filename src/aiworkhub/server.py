@@ -1224,6 +1224,11 @@ def aiworkhub_task_create(
     work_kind: str = "generic",
     validation_roles: list[str] | None = None,
     risk_tier: str | None = None,
+    skill_task_family: str | None = None,
+    skill_stage: str | None = None,
+    skill_triggers: list[str] | None = None,
+    skill_applicability: list[str] | None = None,
+    skill_path_scope: str | None = None,
     custom_template_escape: str | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
@@ -1267,6 +1272,15 @@ def aiworkhub_task_create(
     and data_ml=schema+distribution. Missing roles are rejected before launch.
     ``risk_tier`` is optional explicit routing/economic evidence. It is never
     inferred from priority or prose; omitted historical cards remain unknown.
+    It is a FLOOR: the observed write scope may escalate it, never lower it.
+    The ``skill_*`` fields are the card's skill selection vocabulary, drawn
+    from closed sets (``aiworkhub_manager_skill_mine`` and
+    ``skill_registry.SELECTION_VOCABULARIES`` name them). An unknown token is
+    refused at create rather than silently matching nothing.
+    ``skill_task_family`` and ``skill_path_scope`` are derivable from the
+    template and the write set and may be omitted; ``skill_stage``,
+    ``skill_triggers`` and ``skill_applicability`` are not derivable, and a
+    card that omits them selects no skill at all.
     Default creation is template-first: generic Python production-plus-test
     cards classify against the frozen registry, and unclassified raw cards
     fail closed unless ``custom_template_escape`` is the audited token.
@@ -1295,6 +1309,11 @@ def aiworkhub_task_create(
         work_kind=work_kind,
         validation_roles=validation_roles,
         risk_tier=risk_tier,
+        skill_task_family=skill_task_family,
+        skill_stage=skill_stage,
+        skill_triggers=skill_triggers,
+        skill_applicability=skill_applicability,
+        skill_path_scope=skill_path_scope,
         custom_template_escape=custom_template_escape,
     )
 

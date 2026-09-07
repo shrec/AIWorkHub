@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from aiworkhub import server
+from aiworkhub import core, server, skill_registry
 from aiworkhub.task_templates import (
     PROVENANCE_SCHEMA_ID,
     REGISTRY_VERSION,
@@ -46,32 +46,85 @@ def test_task_create_forwards_required_output_exception_contract(monkeypatch):
     assert captured["allow_unchanged_required_outputs"] == ["out/evidence.json"]
 
 
+# The frozen task-create contract, in order. Adding a name here is a deliberate,
+# reviewed act; the assertion below stays an exact ordered equality, so removing
+# or reordering a parameter still fails, and so does an unreviewed addition.
+_TASK_CREATE_CONTRACT = [
+    "task_id",
+    "title",
+    "runner",
+    "topic",
+    "objective",
+    "acceptance",
+    "allowed_writes",
+    "forbidden",
+    "required_outputs",
+    "allow_empty_required_outputs",
+    "allow_unchanged_required_outputs",
+    "validation",
+    "priority",
+    "task_type",
+    "depends_on",
+    "read_first",
+    "immutable_inputs",
+    "read_only",
+    "max_live_tokens",
+    "work_kind",
+    "validation_roles",
+    "risk_tier",
+]
+
+# The skill selection vocabulary a card may declare. It is listed separately
+# because it is not hand-maintained evidence: the positive control below
+# derives the same set from ``core.create_task`` and fails if the two drift.
+_TASK_CREATE_SKILL_VOCABULARY = [
+    "skill_task_family",
+    "skill_stage",
+    "skill_triggers",
+    "skill_applicability",
+    "skill_path_scope",
+]
+
+_TASK_CREATE_TAIL = ["custom_template_escape"]
+
+
 def test_task_create_schema_remains_unchanged():
     assert list(inspect.signature(server.aiworkhub_task_create).parameters) == [
-        "task_id",
-        "title",
-        "runner",
-        "topic",
-        "objective",
-        "acceptance",
-        "allowed_writes",
-        "forbidden",
-        "required_outputs",
-        "allow_empty_required_outputs",
-        "allow_unchanged_required_outputs",
-        "validation",
-        "priority",
-        "task_type",
-        "depends_on",
-        "read_first",
-        "immutable_inputs",
-        "read_only",
-        "max_live_tokens",
-        "work_kind",
-        "validation_roles",
-        "risk_tier",
-        "custom_template_escape",
+        *_TASK_CREATE_CONTRACT,
+        *_TASK_CREATE_SKILL_VOCABULARY,
+        *_TASK_CREATE_TAIL,
     ]
+
+
+def test_every_skill_selection_field_core_accepts_is_reachable_over_mcp():
+    """Positive control: the MCP surface exposes core's whole skill vocabulary.
+
+    The list above is a change detector; on its own it cannot see a selection
+    dimension that ``core.create_task`` accepts and the MCP tool never offers.
+    That is not hypothetical -- it is the measured defect this control was
+    written for: core carried all five ``skill_*`` parameters and the tool
+    carried none, so 0 of 4,628 stored cards could declare the vocabulary that
+    ``skill_registry.select`` matches on, and every selection ran against
+    nothing. Deriving the set from core means a sixth dimension added upstream
+    fails here instead of silently becoming unreachable.
+    """
+    core_skill_fields = [
+        name
+        for name in inspect.signature(core.create_task).parameters
+        if name.startswith("skill_")
+    ]
+    mcp_skill_fields = [
+        name
+        for name in inspect.signature(server.aiworkhub_task_create).parameters
+        if name.startswith("skill_")
+    ]
+    assert core_skill_fields, "core.create_task declares no skill vocabulary"
+    assert mcp_skill_fields == core_skill_fields
+    assert mcp_skill_fields == _TASK_CREATE_SKILL_VOCABULARY
+    # Every declarable dimension is a closed selection vocabulary or a scope.
+    assert set(skill_registry.SELECTION_VOCABULARIES) | {"path_scope"} == {
+        name[len("skill_") :] for name in mcp_skill_fields
+    }
 
 
 def test_create_from_template_rejects_scope_but_accepts_validation_overrides():

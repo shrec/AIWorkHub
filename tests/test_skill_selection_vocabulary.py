@@ -31,6 +31,7 @@ from aiworkhub import (  # noqa: E402
     core,
     project_context,
     quality_evidence,
+    server,
     skill_registry,
     skill_registry_store,
     task_store,
@@ -363,7 +364,66 @@ def test_create_persists_declared_skill_vocabulary(coord) -> None:
     assert card["skill_triggers"] == ["unknown_or_empty_result"]
     assert card["skill_applicability"] == ["quality_gate"]
     assert skill_registry.card_selection_context(card) is not None
+    assert skill_registry.card_selection_context(card) is not None
 
+
+def test_the_mcp_create_tool_can_declare_the_vocabulary(coord) -> None:
+    """The manager-facing tool, not only ``core.create_task``, carries it.
+
+    Every test above this one creates through ``core.create_task`` directly,
+    which is exactly why the gap survived: core accepted all five ``skill_*``
+    fields while ``aiworkhub_task_create`` offered none, so no card created the
+    only way a manager can create one could declare the vocabulary that
+    ``select`` matches on -- 0 of 4,628 stored cards did.
+    """
+    result = server.aiworkhub_task_create(
+        task_id="T_SKILL_MCP",
+        title="skill vocabulary card over MCP",
+        runner="claude_coding",
+        topic="coding",
+        objective="fix the reported defect",
+        acceptance=["it works"],
+        allowed_writes=["src/aiworkhub/foo.py"],
+        required_outputs=["src/aiworkhub/foo.py"],
+        validation=["pytest -q tests/test_foo.py"],
+        custom_template_escape="audited_custom_unclassified",
+        skill_task_family="bugfix",
+        skill_stage="review",
+        skill_triggers=["unknown_or_empty_result"],
+        skill_applicability=["quality_gate"],
+        skill_path_scope="src/aiworkhub",
+    )
+    assert result["ok"] is True, result
+    card = task_store.get_task(coord, "T_SKILL_MCP")
+    assert card["skill_task_family"] == "bugfix"
+    assert card["skill_stage"] == "review"
+    assert card["skill_triggers"] == ["unknown_or_empty_result"]
+    assert card["skill_applicability"] == ["quality_gate"]
+    assert card["skill_path_scope"] == "src/aiworkhub"
+
+    context = skill_registry.card_selection_context(card)
+    assert context is not None
+    assert context["path_or_symbol"] == "src/aiworkhub"
+
+
+def test_the_mcp_create_tool_refuses_an_unknown_skill_token(coord) -> None:
+    """Validation is core's, and the tool must not route around it."""
+    result = server.aiworkhub_task_create(
+        task_id="T_SKILL_MCP_BAD",
+        title="skill vocabulary card over MCP",
+        runner="claude_coding",
+        topic="coding",
+        objective="fix the reported defect",
+        acceptance=["it works"],
+        allowed_writes=["src/aiworkhub/foo.py"],
+        required_outputs=["src/aiworkhub/foo.py"],
+        validation=["pytest -q tests/test_foo.py"],
+        custom_template_escape="audited_custom_unclassified",
+        skill_stage="review_ready",
+    )
+    assert result["ok"] is False
+    assert "invalid_skill_vocabulary" in result["stderr"]
+    assert task_store.get_task(coord, "T_SKILL_MCP_BAD") is None
 
 # ---------------------------------------------------------------------------
 # 4. End to end: card -> select -> packet -> worker context bundle
@@ -375,6 +435,7 @@ def _vocabulary_record(
     identity: str = "unknown_or_empty_is_not_measured",
     lifecycle: skill_registry.LifecycleState = skill_registry.LifecycleState.ACTIVE,
     evidence_actors: tuple[str, ...] = ("manager.claude.7e6e8a47", "worker.codex_gpt-5.5"),
+    risk: skill_registry.RiskLevel = skill_registry.RiskLevel.HIGH,
 ) -> skill_registry.SkillRecord:
     """One ACTIVE record whose matching fields are all vocabulary tokens."""
     return skill_registry.validate_record(
@@ -384,7 +445,7 @@ def _vocabulary_record(
             scope=skill_registry.SkillScope.REPOSITORY,
             task_family="bugfix",
             path_or_symbol="src/aiworkhub/*",
-            risk=skill_registry.RiskLevel.HIGH,
+            risk=risk,
             stage="review",
             triggers=("unknown_or_empty_result", "swallowed_exception_default"),
             applicability=("observability_surface", "quality_gate"),
@@ -503,6 +564,90 @@ def test_packet_reaches_the_worker_context_bundle(
     assert section["degraded_reason"] == ""
     assert section["bytes"] > 0
     assert result.metadata["section_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 5. The declared skill tier is a FLOOR, proved through the same round trip
+# ---------------------------------------------------------------------------
+
+
+def test_a_lower_tier_skill_still_reaches_a_higher_risk_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A medium-tier rule holds on a high-risk card, and the packet says why.
+
+    This is the whole round trip -- card vocabulary -> select -> packet ->
+    worker bundle -- not a unit assertion on the comparison. Under exact
+    matching the bundle carried no skills section content at all, because a
+    card whose tier escalated (the only direction ``resolve_risk_profile``
+    moves) stopped matching the rule mined for it.
+    """
+    record = _vocabulary_record(risk=skill_registry.RiskLevel.MEDIUM)
+    repo = _skills_repo(tmp_path, record)
+    _stub_context_tools(monkeypatch)
+    card = _vocabulary_card(risk_tier="high")
+
+    context = skill_registry.card_selection_context(card)
+    assert context is not None
+    assert context["risk"] is skill_registry.RiskLevel.HIGH
+
+    candidates = skill_registry_store.load_registry(repo).records()
+    receipt = skill_registry.select(candidates, context, limit=4)
+    assert [item.identity for item in receipt.selected] == [record.identity]
+    assert "risk:at_or_above" in receipt.selected[0].reasons
+
+    result = project_context.collect_project_context(repo, card)
+    assert result is not None
+    payload = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
+    rows = payload["evidence"]["skills"]["skills"]
+    assert [row["identity"] for row in rows] == [record.identity]
+    assert "risk:at_or_above" in rows[0]["reasons"]
+    assert rows[0]["procedure_steps"]
+
+
+def test_every_tier_at_or_above_the_declared_floor_matches() -> None:
+    """Monotone in the card tier, and equality still reports ``exact``."""
+    record = _vocabulary_record(risk=skill_registry.RiskLevel.MEDIUM)
+    expected = {
+        "medium": "risk:exact",
+        "high": "risk:at_or_above",
+        "critical": "risk:at_or_above",
+    }
+    for tier, reason in expected.items():
+        context = skill_registry.card_selection_context(_vocabulary_card(risk_tier=tier))
+        assert context is not None, tier
+        receipt = skill_registry.select([record], context, limit=4)
+        assert [item.identity for item in receipt.selected] == [record.identity], tier
+        assert reason in receipt.selected[0].reasons, tier
+
+
+def test_a_higher_tier_skill_is_not_owed_by_a_lower_risk_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The relation is ordered, not symmetric: it must not match downward.
+
+    Critical-only precautions are not automatically owed by medium-risk work.
+    Without this the change would be "match anything", which is the failure
+    mode a wildcard is deliberately refused for.
+    """
+    record = _vocabulary_record(risk=skill_registry.RiskLevel.CRITICAL)
+    repo = _skills_repo(tmp_path, record)
+    _stub_context_tools(monkeypatch)
+    card = _vocabulary_card(risk_tier="medium")
+
+    context = skill_registry.card_selection_context(card)
+    assert context is not None
+    assert skill_registry.select([record], context, limit=4).selected == ()
+
+    result = project_context.collect_project_context(repo, card)
+    assert result is not None
+    payload = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
+    assert "skills" not in payload["evidence"]
+    section = next(
+        item for item in result.metadata["sections"] if item["name"] == "skills"
+    )
+    assert section["executed"] is True
+    assert section["hit_count"] == 0
 
 
 def test_zero_match_is_an_executed_suppressed_section(

@@ -896,7 +896,11 @@ _SELECT_REASON_HEAD = "lifecycle:active"
 _SELECT_REASON_KINDS = {
     "task_family": frozenset({"exact", "wildcard"}),
     "path_or_symbol": frozenset({"exact", "wildcard"}),
-    "risk": frozenset({"exact", "wildcard"}),
+    # ``risk`` is the one dimension with an ORDER, so it has a kind the other
+    # scalars do not: a skill declared at a lower tier than the card also
+    # applies. See :func:`_risk_match` for the evidence that the tier is a
+    # floor rather than a ceiling.
+    "risk": frozenset({"exact", "at_or_above", "wildcard"}),
     "stage": frozenset({"exact", "wildcard"}),
     "triggers": frozenset({"exact", "wildcard", "unconstrained"}),
     "applicability": frozenset({"exact", "wildcard", "unconstrained"}),
@@ -906,11 +910,13 @@ _SELECT_REASON_KINDS = {
 # Controlled selection vocabulary
 # ---------------------------------------------------------------------------
 #
-# ``select`` matches exactly after normalization, so free text can never be the
-# matching surface: a natural-language trigger sentence is unreachable by
-# construction. These four closed sets are the ONE vocabulary shared by a task
-# card and a skill record, and every token below is transcribed from a set this
-# repository already names -- none is invented for the matcher:
+# ``select`` matches these four dimensions on closed tokens after
+# normalization, so free text can never be the matching surface: a
+# natural-language trigger sentence is unreachable by construction. (``risk``
+# is ordered rather than tokenized -- see :func:`_risk_match`.) These four
+# closed sets are the ONE vocabulary shared by a task card and a skill record,
+# and every token below is transcribed from a set this repository already
+# names -- none is invented for the matcher:
 #
 # * ``SKILL_TASK_FAMILIES`` -- the real work families. Five are
 #   ``quality_evidence.WORK_KINDS`` minus ``generic``; five are the families the
@@ -1500,6 +1506,43 @@ def _path_match(pattern: str, value: str) -> str | None:
     return None
 
 
+def _risk_match(declared: Any, card_risk: Any) -> str | None:
+    """Match a skill's declared risk tier against the card's tier, as a FLOOR.
+
+    ``record.risk`` is the LOWEST card tier at which the skill applies, not the
+    only one. A rule that holds for medium-risk work still holds when the same
+    work is high or critical, and the higher-risk card is the one that needs it
+    most, so the relation is "at this tier or above" and never equality.
+
+    The direction is read off this repository, not assumed:
+
+    * ``quality_evidence.resolve_risk_profile`` is monotonic UPWARD -- a signal
+      raises the effective tier and a caller "cannot use ``requested_tier`` to
+      lower the floor implied by observed signals". The card risk this function
+      receives is that escalated ``effective_tier``.
+    * ``SKILL_RISK_SIGNAL_TRIGGERS`` is transcribed from
+      ``quality_evidence._RISK_SIGNAL_FLOORS``: the vocabulary a skill declares
+      alongside its tier is literally a set of floors.
+    * The tier keeps escalating after create (accept_review recomputes it from
+      the changed paths), so exact matching silently DROPS a skill the moment a
+      card escalates -- the one direction the system actually moves.
+    * :func:`_rank_key` orders candidates by DESCENDING severity, so under a
+      floor reading a bounded selection spends its slots on the tightest
+      applicable rules first. Under a ceiling reading it would hand a low-risk
+      card its critical-only guidance first, which is incoherent.
+
+    A skill declared ABOVE the card's tier does not match: critical-only
+    precautions are not automatically owed by low-risk work.
+    """
+    if card_risk == SELECT_WILDCARD or declared == SELECT_WILDCARD:
+        return "wildcard"
+    if declared == card_risk:
+        return "exact"
+    if _risk_severity(declared) < _risk_severity(card_risk):
+        return "at_or_above"
+    return None
+
+
 def _tuple_match(patterns: tuple[str, ...], values: tuple[str, ...]) -> str | None:
     if not patterns:
         return "unconstrained"
@@ -1517,12 +1560,7 @@ def _selection_reasons(record: SkillRecord, context: Mapping[str, Any]) -> tuple
     checks = (
         ("task_family", _scalar_match(record.task_family, context["task_family"])),
         ("path_or_symbol", _path_match(record.path_or_symbol, context["path_or_symbol"])),
-        (
-            "risk",
-            "wildcard"
-            if context["risk"] == SELECT_WILDCARD
-            else ("exact" if record.risk == context["risk"] else None),
-        ),
+        ("risk", _risk_match(record.risk, context["risk"])),
         ("stage", _scalar_match(record.stage, context["stage"])),
         ("triggers", _tuple_match(record.triggers, context["triggers"])),
         ("applicability", _tuple_match(record.applicability, context["applicability"])),
@@ -1554,11 +1592,13 @@ def select(
 
     Only ``LifecycleState.ACTIVE`` records are eligible. Matching is exact after
     normalization, plus the explicit wildcard ``*`` (and a trailing ``/*``
-    path prefix). Substring and fuzzy matching are not used. Ties use
-    :func:`_rank_key`. Candidate input order cannot change selected identities
-    or receipt ordering. ``limit`` must be a positive ``int`` and is clamped to
-    ``MAX_SELECT_LIMIT``. Zero matches yield an empty receipt. This function
-    never mutates records, registry state, files, or network state.
+    path prefix). The one exception is ``risk``, which is ORDERED: a record's
+    tier is the floor at which it applies, so it also matches every higher card
+    tier (:func:`_risk_match`). Substring and fuzzy matching are not used. Ties
+    use :func:`_rank_key`. Candidate input order cannot change selected
+    identities or receipt ordering. ``limit`` must be a positive ``int`` and is
+    clamped to ``MAX_SELECT_LIMIT``. Zero matches yield an empty receipt. This
+    function never mutates records, registry state, files, or network state.
     """
     limit = _validate_select_limit(limit)
     normalized = _normalize_select_context(context)
