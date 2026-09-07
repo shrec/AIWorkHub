@@ -817,9 +817,16 @@ _PROCESS_DISCIPLINE = (
     "code says; the evidence lives in receipts and the audit ledger"
 )
 _ANOTHER_GATE = (
-    "enforced outside this module by the OS-dependency ratchet in "
-    "scripts/check_os_dependency_boundary.py, which counts platform-specific "
-    "constructs outside the platform_io facade and refuses growth"
+    "partly enforced outside this module by the OS-dependency ratchet in "
+    "scripts/check_os_dependency_boundary.py, which counts eight exact "
+    "constructs -- os.name ==, os.name !=, sys.platform, creationflags, "
+    "os.killpg, def chmod_fd, def _atomic*, sqlite3.connect -- outside the "
+    "platform_io facade and refuses growth above a baseline. It does NOT see a "
+    "POSIX assumption written any other way, and on 2026-09-07 three Windows "
+    "blockers passed it: hasattr(os, \"O_DIRECTORY\") degrading a mask instead "
+    "of refusing, a literal os.O_CLOEXEC, and stat.S_IMODE(...) & 0o077 as a "
+    "privacy test on a host with no POSIX mode bits. Treat this as partial "
+    "coverage of a narrow vocabulary, not as the obligation being discharged"
 )
 _NO_DETECTOR_YET = (
     "is a static pattern this repository could read from the tree and has not "
