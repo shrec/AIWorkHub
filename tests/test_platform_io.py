@@ -1694,7 +1694,17 @@ def test_directory_descriptor_backend_names_what_the_host_can_actually_pin():
 
 
 def test_open_directory_descriptor_refuses_rather_than_degrading_on_windows(tmp_path):
-    """The Windows branch is exercised by injection from this POSIX host."""
+    """Injection selects the BRANCH; it cannot change the host's syscalls.
+
+    The Windows half is host-independent: the function decides from the
+    injected name and returns before touching the filesystem, so it asserts
+    the same thing everywhere. The POSIX half is not -- it performs a real
+    ``os.open`` on a directory, which only a POSIX host can serve. Forcing
+    ``"linux"`` on a Windows runner therefore takes the POSIX branch into a
+    syscall Windows rejects, and release qualification failed exactly there
+    with ``PermissionError: [Errno 13] ... \\locks``. That is the very defect
+    this module exists to prevent, reproduced in the test that guards it.
+    """
 
     target = tmp_path / "locks"
     target.mkdir()
@@ -1703,6 +1713,11 @@ def test_open_directory_descriptor_refuses_rather_than_degrading_on_windows(tmp_
     # ``None`` must be safe to hand straight back to the closer.
     platform_io.close_directory_descriptor(None)
 
+    if os.name == "nt":
+        # A Windows host cannot serve the POSIX branch, so the branch decision
+        # is all that can be asserted here. `directory_open_flags` is checked
+        # against its constants by its own test, on every platform.
+        return
     descriptor = platform_io.open_directory_descriptor(target, "linux")
     try:
         assert isinstance(descriptor, int)
