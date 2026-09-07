@@ -1081,6 +1081,62 @@ def build_catalog(
     }
 
 
+def default_process_rows(repo_root: Path | str, *, limit: int = 1000) -> list[dict[str, Any]]:
+    """Read one authority repository's bounded process ledger, read-only."""
+    # Imported lazily: dashboard imports this module during server bootstrap.
+    # The reader is handed the exact authority repository's process log, so it
+    # can never fall back to the ambient ProcessManager of another VS Code
+    # window and attribute another repository's runs to this one.
+    from . import dashboard
+
+    report = dashboard.read_process_runs(
+        process_log_path=(
+            Path(repo_root) / ".aiworkhub/runtime/process_logs/process_events.jsonl"
+        ),
+        limit=limit,
+    )
+    return [dict(item) for item in report.get("processes") or [] if isinstance(item, dict)]
+
+
+def build_routing_catalog(
+    repo_root: Path | str,
+    *,
+    cards: Iterable[Mapping[str, Any]] | None = None,
+    process_rows: Iterable[Mapping[str, Any]] | None = None,
+    preflight: Mapping[str, Any] | None = None,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    """Assemble the fully evidenced catalog every routing caller needs.
+
+    ``build_catalog`` defaults ``process_rows``, ``usage_rows`` and
+    ``cost_per_accepted_outcome`` to empty.  A caller that omits them therefore
+    ranks every candidate on the conservative prior and resolves the resulting
+    total tie on the lexical ``(provider, model, worker_id)`` tie-break -- a
+    routing decision reached on no evidence at all, and one that looks
+    successful from the outside.
+
+    This is the single place that joins the process ledger and the cost ledger
+    onto the catalog, so no caller has to remember to assemble three arguments
+    by hand and none can assemble only some of them.  It is strictly slower
+    than the bare ``build_catalog`` call because it reads two ledgers; the
+    point is that the evidence is present, never that ranking gets faster.
+    """
+    root = Path(repo_root).resolve()
+    rows = (
+        [dict(item) for item in process_rows]
+        if process_rows is not None
+        else default_process_rows(root)
+    )
+    ledger = cost_ledger.build_cost_ledger(repo_root=root, include_tasks=True)
+    return build_catalog(
+        root,
+        cards=cards,
+        process_rows=rows,
+        usage_rows=ledger.get("tasks") or [],
+        cost_per_accepted_outcome=ledger.get("cost_per_accepted_outcome") or {},
+        preflight=preflight,
+        now_epoch=now_epoch,
+    )
 def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *, catalog: Mapping[str, Any] | None = None) -> dict[str, Any]:
     snapshot = dict(catalog or build_catalog(repo_root))
     workers_prior: list[workforce_router.WorkerCapability] = []

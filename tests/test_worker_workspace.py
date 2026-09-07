@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import selectors
+import shlex
 import shutil
 import signal
 import stat
@@ -7013,3 +7014,416 @@ def test_pytest_validation_rejects_test_paths_outside_repo(
             },
             "glm_vscode_lm",
         )
+
+
+# ---------------------------------------------------------------------------
+# Validation lane facts established at preflight (see the module comment above
+# ``probe_sandbox_lane_capabilities``). These cover the two properties that
+# matter: the lane's capability set is MEASURED rather than asserted, and a
+# declared-command scan may report but must never refuse.
+# ---------------------------------------------------------------------------
+
+
+def _lane_repo(tmp_path: Path, body: str, name: str = "tests/test_target.py") -> Path:
+    repo = tmp_path / "lane-repo"
+    target = repo / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+    return repo
+
+
+def test_lane_probe_is_unestablished_for_unmeasured_backends() -> None:
+    """Only Landlock has been measured; the others must not invent a set."""
+    assert worker_workspace.probe_sandbox_lane_capabilities("bubblewrap") is None
+    assert (
+        worker_workspace.probe_sandbox_lane_capabilities(
+            worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND
+        )
+        is None
+    )
+
+
+def test_lane_probe_hardlink_follows_the_landlock_abi_it_enforces() -> None:
+    """``hardlink`` must track ``_LL_REFER``, not a hardcoded assumption.
+
+    ``_landlock_supported_mutations`` grants ``_LL_REFER`` from ABI 2, so a
+    static "Landlock cannot hardlink" claim is false on any modern kernel. The
+    probe and the enforcement policy must agree or a preflight report would
+    contradict what the sandbox actually does.
+    """
+    capabilities = worker_workspace.probe_sandbox_lane_capabilities("landlock")
+    assert capabilities is not None
+    abi = worker_workspace.landlock_abi_version()
+    refer_granted = bool(
+        abi and worker_workspace._landlock_supported_mutations(abi) & worker_workspace._LL_REFER
+    )
+    assert ("hardlink" in capabilities) is refer_granted
+
+
+def test_lane_probe_agrees_with_validation_runner_replay_authority() -> None:
+    """No drift between the preflight probe and the runtime replay planner."""
+    from aiworkhub import validation_runner
+
+    capabilities = worker_workspace.probe_sandbox_lane_capabilities("landlock")
+    assert capabilities is not None
+    # Exactly the pair ``plan_validation_capability_replay`` will replay for.
+    assert {"nested_landlock", "git_metadata"} <= capabilities
+    assert capabilities <= validation_runner._STRUCTURAL_CAPABILITIES
+
+
+def test_lane_plan_refuses_when_no_secure_lane_can_be_provisioned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one certainty that must move ahead of the model's token spend."""
+
+    def _no_backend() -> str:
+        raise worker_workspace.WorkspaceError("secure_sandbox_unavailable:no_landlock")
+
+    monkeypatch.setattr(worker_workspace, "select_sandbox_backend", _no_backend)
+    repo = _lane_repo(tmp_path, "import os\n")
+    plan = worker_workspace.plan_validation_lane(repo, {"validation": []})
+    assert plan.available is False
+    assert plan.reason == (
+        f"{worker_workspace.VALIDATION_UNSUPPORTED_IN_SANDBOX}"
+        ":secure_sandbox_unavailable:no_landlock"
+    )
+    # Never silently downgrade to a weaker lane to manufacture compatibility.
+    assert plan.backend == ""
+    assert plan.provided is None
+
+
+def test_preflight_reports_absent_lane_before_any_command_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Previously only ``run_validations`` discovered this, post-spend."""
+
+    def _no_backend() -> str:
+        raise worker_workspace.WorkspaceError("secure_sandbox_unavailable:no_landlock")
+
+    monkeypatch.setattr(worker_workspace, "select_sandbox_backend", _no_backend)
+    repo = _lane_repo(tmp_path, "import os\n")
+    missing = worker_workspace.preflight_validation_capabilities(
+        repo, {"validation": [], "allowed_writes": []}
+    )
+    assert any(
+        entry.startswith(
+            f"validation_lane:{worker_workspace.VALIDATION_UNSUPPORTED_IN_SANDBOX}:"
+        )
+        for entry in missing
+    ), missing
+
+
+def test_lane_scan_marks_denial_tolerant_call_sites_tolerated(tmp_path: Path) -> None:
+    """A ``try/except OSError`` guard survives the denial, so it is not a demand."""
+    repo = _lane_repo(
+        tmp_path,
+        "import os\n"
+        "def test_guarded(tmp_path):\n"
+        "    try:\n"
+        "        os.link(tmp_path / 'a', tmp_path / 'b')\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "def test_unguarded(tmp_path):\n"
+        "    os.link(tmp_path / 'c', tmp_path / 'd')\n",
+    )
+    requirements = worker_workspace.declared_validation_lane_requirements(
+        repo, ["python -m pytest -q tests/test_target.py"]
+    )
+    by_line = {item.line: item for item in requirements}
+    assert len(requirements) == 2
+    assert by_line[4].tolerated is True
+    assert by_line[8].tolerated is False
+    assert {item.capability for item in requirements} == {"hardlink"}
+
+
+def test_lane_scan_ignores_non_os_link_receivers(tmp_path: Path) -> None:
+    """``obj.link(...)`` is an ordinary method name, not a hardlink."""
+    repo = _lane_repo(
+        tmp_path,
+        "def test_link(client):\n"
+        "    client.link('a', 'b')\n"
+        "    client.symlink_to('c')\n",
+    )
+    assert (
+        worker_workspace.declared_validation_lane_requirements(
+            repo, ["python -m pytest -q tests/test_target.py"]
+        )
+        == ()
+    )
+
+
+def test_lane_scan_only_reads_explicitly_named_targets(tmp_path: Path) -> None:
+    """A whole-suite or directory command has no knowable target set."""
+    repo = _lane_repo(tmp_path, "import os\ndef test_x(p):\n    os.link(p, p)\n")
+    assert worker_workspace._declared_validation_targets(
+        repo, "python -m pytest -q tests/test_target.py"
+    ) == ("tests/test_target.py",)
+    # A pytest node id still names exactly one file.
+    assert worker_workspace._declared_validation_targets(
+        repo, "python -m pytest -q tests/test_target.py::test_x"
+    ) == ("tests/test_target.py",)
+    # A directory target and a bare runner name nothing.
+    assert worker_workspace._declared_validation_targets(
+        repo, "python -m pytest -q tests"
+    ) == ()
+    assert worker_workspace._declared_validation_targets(repo, "python -m pytest -q") == ()
+
+
+def test_lane_plan_reports_but_never_refuses_a_capability_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path-dependent gap is reported for the operator, never enforced.
+
+    Measured justification: a static refusal on the chmod/hardlink families
+    rejected 49 of 382 test files here, including sites that skip cleanly. The
+    verdict stays with ``validation_runner``, which sees real denials.
+    """
+    monkeypatch.setattr(
+        worker_workspace,
+        "probe_sandbox_lane_capabilities",
+        lambda backend: frozenset({"nested_landlock", "git_metadata"}),
+    )
+    repo = _lane_repo(
+        tmp_path, "import os\ndef test_x(p):\n    os.link(p / 'a', p / 'b')\n"
+    )
+    card = {
+        "validation": ["python -m pytest -q tests/test_target.py"],
+        "allowed_writes": [],
+    }
+    plan = worker_workspace.plan_validation_lane(repo, card, backend="landlock")
+    assert plan.exercised == ("hardlink",)
+    assert plan.unmet == ("hardlink",)
+    # Reported, but the card is still launchable: no refusal entry is emitted.
+    assert plan.available is True
+    missing = worker_workspace.preflight_validation_capabilities(repo, card)
+    assert not [entry for entry in missing if entry.startswith("validation_lane:")], missing
+
+
+def test_preflight_does_not_refuse_targets_this_lane_can_run(tmp_path: Path) -> None:
+    """Regression: the over-refusal that would have blocked 12.8% of the suite."""
+    repo = _lane_repo(
+        tmp_path, "import os\ndef test_x(p):\n    os.chmod(p, 0o600)\n    os.link(p, p)\n"
+    )
+    card = {
+        "validation": ["python -m pytest -q tests/test_target.py"],
+        "allowed_writes": [],
+    }
+    plan = worker_workspace.plan_validation_lane(repo, card, backend="landlock")
+    provided = worker_workspace.probe_sandbox_lane_capabilities("landlock")
+    assert provided is not None
+    assert set(plan.exercised) <= provided
+    assert plan.unmet == ()
+    assert not [
+        entry
+        for entry in worker_workspace.preflight_validation_capabilities(repo, card)
+        if entry.startswith("validation_lane:")
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Worker pytest output shaping (audit 2026-09-07 section 5.3).
+#
+# A worker runs its card's declared pytest command inside its own agent
+# session, so pytest's output enters the transcript and is re-sent on every
+# later turn -- largest exactly on the test-failure rejections that dominate
+# the reject population. ``_WORKER_PYTEST_ADDOPTS`` is the only place that
+# shapes it. These cases pin the three properties that make that shaping safe:
+# it reaches the worker env, it loses to a card's own ``--tb``, and it cannot
+# reach the acceptance-evidence path.
+# ---------------------------------------------------------------------------
+
+_SHAPING_FIXTURE = '''\
+def helper_c(v):
+    assert v == 99, f"deep mismatch {v}"
+
+
+def helper_b(v):
+    return helper_c(v + 1)
+
+
+def helper_a(v):
+    return helper_b(v * 2)
+
+
+def test_deep_failure():
+    payload = {"alpha": 1, "beta": 2}
+    helper_a(sum(payload.values()))
+
+
+def test_shallow_assert():
+    assert [1, 2, 9, 4] == [1, 2, 3, 4]
+
+
+def test_passes():
+    assert True
+'''
+
+
+def _worker_pytest_addopts(repo: Path) -> str:
+    """The exact ``PYTEST_ADDOPTS`` one worker launch would be given."""
+    env = worker_workspace.worker_validation_affordance_env(repo, str(repo / "tmp"))
+    return env["PYTEST_ADDOPTS"]
+
+
+def _run_shaping_fixture(tmp_path: Path, addopts: str, *argv: str) -> str:
+    """Run the fixture under an exact ``PYTEST_ADDOPTS`` and return its output."""
+    workdir = tmp_path / f"run-{abs(hash((addopts, argv)))}"
+    workdir.mkdir()
+    (workdir / "test_shaping_fixture.py").write_text(_SHAPING_FIXTURE, encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "test_shaping_fixture.py", *argv],
+        cwd=workdir,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(workdir),
+            "PYTEST_ADDOPTS": addopts,
+        },
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    return completed.stdout + completed.stderr
+
+
+def test_worker_env_carries_traceback_shaping_with_the_cache_disable(
+    tmp_path: Path,
+) -> None:
+    """The worker launch env advertises both shaping flags, parseably."""
+    addopts = _worker_pytest_addopts(tmp_path)
+    assert shlex.split(addopts) == ["-p", "no:cacheprovider", "--tb=short"]
+    # The pre-existing affordance is not regressed by the new one.
+    assert "-p no:cacheprovider" in addopts
+    assert "--tb=short" in addopts
+
+
+def test_worker_shaping_never_truncates_a_run(tmp_path: Path) -> None:
+    """Shaping may change how much is printed, never what is measured.
+
+    This repository's doctrine is that speed and presentation may change while
+    results stay identical, so no flag that ends a run early may appear here.
+    """
+    tokens = shlex.split(_worker_pytest_addopts(tmp_path))
+    for forbidden in ("-x", "--exitfirst"):
+        assert forbidden not in tokens
+    assert not [token for token in tokens if token.startswith("--maxfail")]
+    assert not [token for token in tokens if token.startswith("--deselect")]
+    assert not [token for token in tokens if token.startswith("-k")]
+
+    shaped = _run_shaping_fixture(tmp_path, _worker_pytest_addopts(tmp_path))
+    unshaped = _run_shaping_fixture(tmp_path, "-p no:cacheprovider")
+    # Identical verdict: same tests run, same tests fail.
+    assert "2 failed, 1 passed" in shaped
+    assert "2 failed, 1 passed" in unshaped
+    # Both failures remain individually named and keep their assertion diff.
+    for output in (shaped, unshaped):
+        assert "test_deep_failure" in output
+        assert "test_shallow_assert" in output
+        assert "AssertionError: deep mismatch 7" in output
+        assert "assert [1, 2, 9, 4] == [1, 2, 3, 4]" in output
+    # ...and the shaping is the smaller of the two.
+    assert len(shaped) < len(unshaped)
+
+
+def test_worker_shaping_does_not_override_a_card_declared_tb(tmp_path: Path) -> None:
+    """A card that spells its own ``--tb`` wins over the launch default.
+
+    Pytest splices ``PYTEST_ADDOPTS`` in BEFORE the command line and ``--tb``
+    is a store option, so the card's argv is last and therefore decisive.
+    """
+    addopts = _worker_pytest_addopts(tmp_path)
+
+    # The long form prints the failing function's source block; the short form
+    # prints only ``file:line: in name`` frames. That block is the discriminator.
+    long_marker = '        payload = {"alpha": 1, "beta": 2}'
+
+    default_shaped = _run_shaping_fixture(tmp_path, addopts)
+    assert long_marker not in default_shaped
+    # Every frame survives the short form -- the test frame and the frame that
+    # actually raised -- so no diagnostic depth is lost, only source echo.
+    assert ": in test_deep_failure" in default_shaped
+    assert ": in helper_c" in default_shaped
+
+    card_wants_long = _run_shaping_fixture(tmp_path, addopts, "--tb=long")
+    assert long_marker in card_wants_long
+
+    card_wants_none = _run_shaping_fixture(tmp_path, addopts, "--tb=no")
+    assert "= FAILURES =" not in card_wants_none
+    assert "2 failed, 1 passed" in card_wants_none
+
+
+def test_worker_shaping_omits_flags_a_card_could_not_override(tmp_path: Path) -> None:
+    """No count-action option may be imposed from the environment.
+
+    ``-q``/``-v`` accumulate rather than replace, so a ``-q`` here would
+    silently cancel a card's explicit ``-v`` instead of losing to it. Only
+    options a later argv occurrence can overrule belong in this string.
+    """
+    tokens = shlex.split(_worker_pytest_addopts(tmp_path))
+    for count_action in ("-q", "--quiet", "-v", "--verbose", "-vv", "-qq"):
+        assert count_action not in tokens
+
+
+def test_validation_failure_delta_packet_ignores_worker_output_shaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The successor's failure evidence is built from receipts, not shaping.
+
+    ``validation_failure_delta_packet`` normalizes the coordinator's own
+    ``run_validations`` rows. Changing the worker launch environment must not
+    move a single byte of it.
+    """
+    rows = [
+        {
+            "argv": ["python", "-m", "pytest", "-q", "tests/test_target.py"],
+            "returncode": 1,
+            "stderr_tail": "",
+            "stdout_tail": "FAILED tests/test_target.py::test_x - AssertionError",
+        }
+    ]
+
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    baseline = worker_workspace.validation_failure_delta_packet(rows)
+
+    monkeypatch.setenv("PYTEST_ADDOPTS", worker_workspace._WORKER_PYTEST_ADDOPTS)
+    shaped = worker_workspace.validation_failure_delta_packet(rows)
+
+    assert shaped == baseline
+    assert shaped["packet_sha256"] == baseline["packet_sha256"]
+    assert shaped["packet_bytes"] <= 6 * 1024
+    # The diagnostic comes from the row the coordinator recorded, verbatim.
+    receipt = shaped["receipts"][0]
+    assert receipt["diagnostic_tail"] == rows[0]["stdout_tail"]
+    assert receipt["returncode"] == 1
+
+
+def test_canonical_validation_keeps_its_own_unshaped_addopts() -> None:
+    """``run_validations`` must not inherit the worker's presentation shaping.
+
+    Its stdout/stderr tails become the failure receipts an accept or reject is
+    decided on, so it carries an independent literal. Asserted structurally so
+    the guard survives the file moving underneath it.
+    """
+    import ast
+
+    source = Path(worker_workspace.__file__).read_text(encoding="utf-8")
+    run_validations = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_validations"
+    )
+    assigned = [
+        node.value
+        for node in ast.walk(run_validations)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Subscript)
+        and isinstance(target.slice, ast.Constant)
+        and target.slice.value == "PYTEST_ADDOPTS"
+    ]
+    assert assigned, "run_validations no longer sets PYTEST_ADDOPTS"
+    for value in assigned:
+        # A literal, never a reference to the worker constant.
+        assert isinstance(value, ast.Constant) and isinstance(value.value, str)
+        assert value.value == "-p no:cacheprovider"
+        assert "--tb" not in value.value
+    assert worker_workspace._WORKER_PYTEST_ADDOPTS != "-p no:cacheprovider"

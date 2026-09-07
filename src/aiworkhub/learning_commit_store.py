@@ -27,7 +27,13 @@ from . import (
     sqlite_readonly,
     task_store,
 )
-from .learning_commit import LearningCommit, Outcome, learning_commit_from_dict, validate_repo_match
+from .learning_commit import (
+    FailureCategory,
+    LearningCommit,
+    Outcome,
+    learning_commit_from_dict,
+    validate_repo_match,
+)
 
 
 SCHEMA_ID = "aiworkhub.learning_commit.v1"
@@ -162,6 +168,40 @@ def _request_matches_candidate(card: dict[str, Any], request_id: str) -> bool:
             if str(block.get(key) or "") == request_id:
                 return True
     return False
+
+
+# Written by core.reject_review only, from structured card evidence, in the
+# same transaction that clears terminal_review.
+_REJECTION_DISPOSITION_SCHEMA_ID = "aiworkhub.rejection_disposition.v1"
+
+
+def _pinned_rejection_disposition(card: dict[str, Any], request_id: str) -> str | None:
+    """Return the failure category ``core.reject_review`` pinned for this request.
+
+    A pin belonging to a *different* episode is refused rather than borrowed:
+    a card rejected twice carries only the latest pin, and attributing the
+    newer episode's cause to an older commit would be worse than the absent
+    answer the caller already tolerates.
+    """
+    pin = card.get("rejection_disposition")
+    if not isinstance(pin, dict):
+        return None
+    if pin.get("schema_id") != _REJECTION_DISPOSITION_SCHEMA_ID:
+        return None
+    if str(pin.get("request_id") or "") != request_id:
+        return None
+    try:
+        return str(FailureCategory(str(pin.get("failure_category") or "")).value)
+    except ValueError:
+        return None
+
+
+def _rejection_failure_category(card: dict[str, Any], request_id: str) -> str:
+    """Failure category for a non-accepted outcome, pin first, card second."""
+    pinned = _pinned_rejection_disposition(card, request_id)
+    if pinned is not None:
+        return pinned
+    return str(core.classify_terminal_disposition(card).value)
 
 
 def _open(repo: Path) -> sqlite3.Connection:
@@ -424,9 +464,17 @@ def commit_learning(
     # server-side from the canonical card's own structured terminal evidence,
     # never from a manager-authored reason or root-cause candidate string, so
     # a model cannot talk its way into a false category.
+    #
+    # For a rejection that evidence is already gone by the time we run:
+    # core.reject_review's rework transition clears terminal_review from the
+    # card, so it classifies first and pins the answer. Prefer that pin when it
+    # is bound to this exact adjudicated request; otherwise fall back to
+    # re-deriving from the live card, which is still correct for an accepted or
+    # otherwise-terminal card and returns the previous (inconclusive) answer
+    # for a card rejected before the pin existed.
     normalized["failure_category"] = (
         None if outcome == Outcome.ACCEPTED
-        else core.classify_terminal_disposition(card).value
+        else _rejection_failure_category(card, request_id)
     )
     try:
         commit = learning_commit_from_dict(normalized)

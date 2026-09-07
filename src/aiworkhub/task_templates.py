@@ -34,7 +34,9 @@ Scope vs. mandatory-change contract:
   of them must change.
 * ``required_outputs`` -- the set a downstream finalizer treats as
   ``required_output_unchanged``-eligible -- defaults to the complete write
-  scope for ``bugfix_with_regression`` and to empty for every other template.
+  scope for ``bugfix_with_regression``, to the exact declared test paths
+  for ``test_only`` (so its cards stay launch-valid), and to empty for
+  every other template.
   An explicit ``mandatory_changed_outputs`` list overrides either default;
   every listed path must already be in scope or expansion fails closed.
 """
@@ -63,11 +65,14 @@ __all__ = [
     "TEMPLATE_SPECS",
     "TaskTemplateError",
     "TaskTemplateSpec",
+    "VALIDATION_EXEMPTIONS",
+    "VALIDATION_EXEMPTION_READ_ONLY",
     "classify_task_card",
     "expand_template",
     "expanded_contract_digest",
     "reject_unchanged_public_test_outputs",
     "resolve_template",
+    "resolve_validation_exemption",
     "split_command_argv",
     "template_full_id",
     "template_provenance_payload",
@@ -658,9 +663,12 @@ def expand_template(
     if set(production) & set(tests):
         raise TaskTemplateError("duplicate_path_across_fields")
     write_set: list[str] = [] if spec.read_only else [*production, *tests]
-    mandatory_default: Sequence[Any] = (
-        write_set if spec.name == "bugfix_with_regression" else ()
-    )
+    if spec.name == "bugfix_with_regression":
+        mandatory_default: Sequence[Any] = write_set
+    elif spec.name == "test_only":
+        mandatory_default = tests
+    else:
+        mandatory_default = ()
     mandatory = _bounded_paths(
         mandatory_default
         if mandatory_changed_outputs is None
@@ -988,6 +996,90 @@ def reject_unchanged_public_test_outputs(
         normalized = _canonical_repo_relative_path(item).lower()
         if _is_public_test_path(normalized) and normalized in required:
             raise TaskTemplateError("unchanged_required_public_test_output")
+
+
+# ---------------------------------------------------------------------------
+# Zero-validation gate.
+#
+# The test gate used to be opt-in: a card that declared no validation commands
+# ran zero tests and still reached ``review_ready`` with
+# ``deterministic_verification.evidence_verdict.nothing_measured = true``.  A
+# positive measured failure is short-circuited before a reviewer launch, but
+# "we did not measure" deliberately falls through to a full review, so a card
+# with nothing declared bypassed both gates.
+#
+# Every card now either declares validation commands or carries ONE explicit
+# named exemption token.  The exemption is a name, never an absence: an empty
+# list, an empty string or any non-string is refused, so a card can never
+# become exempt by declaring nothing.
+#
+# There is exactly one legitimate reason, taken from the code rather than
+# guessed.  A card with a write scope always has something to measure.  A
+# read-only card with no write scope has nothing to run: that is the
+# ``read_only_analysis`` template (the only registry template whose spec
+# generates no pytest, lint or diff-check command), and it is also the exact
+# shape every ``quality_review`` reviewer child is created with.  Reviewer
+# children reach ``create_task`` classified as ``read_only_analysis`` with
+# ``read_only=True`` and empty ``allowed_writes``/``required_outputs``, so
+# naming this one exemption keeps every reviewer launch working.
+#
+# ``docs_change`` and ``validation_replay`` need no exemption and get none:
+# ``docs_change`` always emits ``git diff --check`` and ``validation_replay``
+# requires test paths, so neither can expand to an empty command list.
+#
+# Measured 2026-09-07 against the 4,628 cards in .aiworkhub/tasking/
+# task_queue.sqlite: 1,607 declare validation, 2,982 empty-validation cards
+# match this exemption (2,930 of them reviewer children), and 39 (0.84%) do
+# not.  All 39 are legacy rows created before the ``read_only`` field existed
+# and all 39 are already terminal (22 archived, 9 superseded, 8 finished); no
+# pending or in-flight card is refused.
+VALIDATION_EXEMPTION_READ_ONLY = "read_only_no_write_scope"
+VALIDATION_EXEMPTIONS: tuple[str, ...] = (VALIDATION_EXEMPTION_READ_ONLY,)
+
+
+def resolve_validation_exemption(
+    *,
+    validation: Any,
+    read_only: Any,
+    allowed_writes: Any,
+    required_outputs: Any,
+    declared: Any = None,
+) -> str | None:
+    """Name why a card may reach review with nothing measured, or fail closed.
+
+    Returns ``None`` when the card declares validation commands, the exact
+    exemption token when the card legitimately has nothing to run, and raises
+    ``TaskTemplateError`` with a stable reason otherwise.  ``declared`` is an
+    optional caller-supplied token; when omitted the exemption is derived from
+    the card's own explicit ``read_only``/write-scope declarations and stamped
+    on the card by name, so the reason a card measured nothing is always
+    readable downstream instead of being inferred from an empty list.
+    """
+    declared_given = declared is not None
+    if declared_given and (not isinstance(declared, str) or not declared.strip()):
+        # An empty list, an empty string, ``False`` and ``0`` are all absences,
+        # not names.  Refusing them here is what stops "declare nothing" from
+        # quietly becoming "exempt from everything".
+        raise TaskTemplateError("invalid_validation_exemption_not_named")
+    if validation:
+        if declared_given:
+            raise TaskTemplateError("validation_exemption_with_validation")
+        return None
+    eligible = (
+        read_only is True
+        and not list(allowed_writes or [])
+        and not list(required_outputs or [])
+    )
+    if declared_given:
+        token = declared.strip()
+        if token not in VALIDATION_EXEMPTIONS:
+            raise TaskTemplateError("unknown_validation_exemption")
+        if token == VALIDATION_EXEMPTION_READ_ONLY and not eligible:
+            raise TaskTemplateError("validation_exemption_precondition_unmet")
+        return token
+    if eligible:
+        return VALIDATION_EXEMPTION_READ_ONLY
+    raise TaskTemplateError("validation_required")
 
 
 def validate_template_provenance(

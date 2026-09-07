@@ -34,11 +34,17 @@ from typing import Any, Callable
 from . import core
 from . import skill_registry as sr
 from . import skill_registry_store as store
+from . import task_store
 
 # The non-secret provenance identity of the manager's own lifecycle authority
-# (propose/activate). Evidence provenance is caller-supplied instead, so distinct
-# contributing actors can be recorded independently. Must match the registry's
-# actor-id shape (``[a-z][a-z0-9_.-]*``).
+# (propose/activate). Must match the registry's actor-id shape
+# (``[a-z][a-z0-9_.-]*``).
+#
+# :func:`add_evidence` takes its provenance from the CALLER, which does not by
+# itself make two entries independent: every such entry ultimately names the one
+# verified manager route, and once identities are compared canonically that is a
+# single actor however it is spelled. Genuinely distinct provenance comes from
+# :func:`add_task_evidence`, which reads the actor off a finished task card.
 _MANAGER_ACTOR = "manager"
 
 
@@ -72,6 +78,77 @@ def _manager_context() -> tuple[Path | None, str, dict[str, Any]]:
         "session_id": session_id,
         "repo": str(root),
     }
+
+# Role prefixes for a card-derived provenance identity. They are emitted first
+# and are the reason such an identity can never collide with the manager's own:
+# ``skill_registry.canonical_actor_id`` orders the role token ahead of
+# everything else, so ``worker.claude.sonnet.5`` and ``manager.claude.7e6e8a47``
+# stay two actors under every spelling of either.
+_TASK_EVIDENCE_ROLES = ("worker", "reviewer")
+_REVIEW_TOPICS = frozenset({"quality_review", "review", "security_review"})
+
+
+def _actor_subject(raw: str) -> str:
+    """Reduce a runner identity to the actor-id charset, dropping role tokens.
+
+    Role words are stripped from the subject so exactly one role token survives
+    in the finished identity. Without that, a runner literally named
+    ``claude_manager_x`` would produce a two-role id that
+    :func:`skill_registry.canonical_actor_id` refuses to parse.
+    """
+    lowered = "".join(
+        char if char.isascii() and (char.isalnum()) else "." for char in str(raw).lower()
+    )
+    tokens = [
+        token
+        for token in lowered.split(".")
+        if token and token not in sr.ACTOR_ROLE_TOKENS
+    ]
+    return ".".join(tokens)
+
+
+def _task_actor(root: Path, task_id: str) -> tuple[str, str, str]:
+    """Derive ``(role, actor_id, source_anchor)`` from one finished task card.
+
+    Fails closed through :class:`skill_registry.SkillRegistryError` -- the same
+    channel :func:`_invoke_write` already surfaces with a stable ``code`` -- when
+    the card is unknown, unfinished, or carries no runner. Each refusal means the
+    same thing: there is no actor here whose contribution can be recorded, and
+    the manager may not substitute one.
+    """
+    bounded = str(task_id or "").strip()
+    if not bounded or len(bounded) > 200:
+        raise sr.SkillRegistryError(
+            "skill_registry.invalid_evidence", "task_id must be a bounded non-empty string"
+        )
+    try:
+        card = task_store.get_task(root, bounded)
+    except Exception as exc:  # noqa: BLE001 -- any store failure is "no verified actor"
+        raise sr.SkillRegistryError(
+            "skill_registry.invalid_evidence",
+            f"task card {bounded!r} could not be read: {type(exc).__name__}",
+        ) from exc
+    if not isinstance(card, dict):
+        raise sr.SkillRegistryError(
+            "skill_registry.invalid_evidence",
+            f"task card {bounded!r} is not in the canonical task store",
+        )
+    if not str(card.get("completed_at") or "").strip():
+        raise sr.SkillRegistryError(
+            "skill_registry.invalid_evidence",
+            f"task {bounded!r} never finished; an unfinished card produces no evidence",
+        )
+    runner = str(card.get("runner") or card.get("claimed_by") or "").strip()
+    subject = _actor_subject(runner)
+    if not subject:
+        raise sr.SkillRegistryError(
+            "skill_registry.invalid_evidence",
+            f"task {bounded!r} carries no runner identity to attribute evidence to",
+        )
+    topic = str(card.get("topic") or "").strip().lower()
+    role = "reviewer" if topic in _REVIEW_TOPICS else "worker"
+    actor_id = f"{role}.{subject}"[:128].rstrip(".")
+    return role, actor_id, bounded[:128]
 
 
 def _invoke_write(
@@ -186,8 +263,7 @@ def add_evidence(
     def operation(root: Path, token: str) -> sr.SkillRecord:
         authority = sr.Authority(sr.AuthorityRole.MANAGER, actor_id=actor_id, token=token)
         registry = store.load_registry(root)
-        prior = registry.get(identity, version)
-        expected = store.state_digest(prior) if prior is not None else None
+        expected = store.stored_state_digest(root, identity, version)
         updated = registry.add_evidence(
             identity, version, {"source": source, "outcome": outcome, "note": note}, authority
         )
@@ -195,6 +271,90 @@ def add_evidence(
         return updated
 
     return _invoke_write(operation)
+
+
+def add_task_evidence(
+    *,
+    identity: str,
+    version: str,
+    task_id: str,
+    outcome: str,
+    note: str = "",
+) -> dict[str, Any]:
+    """MANAGER WRITE: append evidence whose actor is DERIVED from a finished card.
+
+    This is the second evidence source, and the reason the registry's activation
+    gate is reachable at all. :func:`add_evidence` takes ``actor_id`` as free
+    text from the manager, so every entry it can produce ultimately names the one
+    verified manager route; once identities are compared canonically, that is a
+    single actor no matter how many entries are filed, and a floor of two
+    independent actors would be unsatisfiable from that surface alone.
+
+    Here the provenance identity is not typed, it is READ. The caller names a
+    ``task_id``; the canonical task store is consulted for that exact card, and
+    the actor identity is built from the card's own ``runner`` -- the process
+    that actually did the work and whose output the manager reviewed. A card
+    that does not exist, never finished, or carries no runner yields no evidence,
+    so the manager cannot mint a contributor by choosing a string. The actor is
+    ``worker.<runner>`` (or ``reviewer.<runner>`` for a quality-review card), and
+    because :func:`skill_registry.canonical_actor_id` emits the role first, such
+    an identity can never canonicalize onto a ``manager.*`` one.
+
+    Two cards run by the SAME runner are one actor, not two: the runner is the
+    actor, the card is only the provenance anchor recorded in ``source``.
+
+    This raises the bar against format drift, accident, and evidence invented at
+    the keyboard. It is not a defence against a manager who can already write
+    ``skills.sqlite`` directly -- the store's digests are detection, not
+    authentication, and this changes nothing about that.
+    """
+    def operation(root: Path, _token: str) -> sr.SkillRecord:
+        role, actor_id, anchor = _task_actor(root, task_id)
+        authority = sr.Authority(sr.AuthorityRole.WORKER, actor_id=actor_id, token="")
+        registry = store.load_registry(root)
+        expected = store.stored_state_digest(root, identity, version)
+        updated = registry.add_evidence(
+            identity,
+            version,
+            {"source": anchor, "outcome": outcome, "note": note},
+            authority,
+        )
+        store.advance_record(root, updated, expected_state_digest=expected)
+        return updated
+
+    return _invoke_write(operation)
+
+
+def audit(*, min_accepted_evidence: int = 2) -> dict[str, Any]:
+    """MANAGER READ: report every persisted ACTIVE record against the gate.
+
+    ``accepted_count`` counts evidence ENTRIES and so reads as strong for a
+    record whose entries all came from one actor under two spellings. This
+    reports the canonical independent actor identities an activation actually
+    rests on, and whether the record still satisfies the rule in force. It never
+    writes.
+    """
+    root, _token, manager = _manager_context()
+    if root is None:
+        return manager
+    try:
+        records = store.audit_active_records(
+            root, min_accepted_evidence=min_accepted_evidence
+        )
+    except (store.SkillStoreError, OSError, sqlite3.Error) as exc:
+        return {
+            "ok": False,
+            "error": f"skill_store_failed:{type(exc).__name__}",
+            "manager": manager,
+            "surface": "manager_mcp",
+        }
+    return {
+        "ok": True,
+        "active_records": records,
+        "unverified_active": [item for item in records if not item["verified"]],
+        "manager": manager,
+        "surface": "manager_mcp",
+    }
 
 
 def activate(*, identity: str, version: str) -> dict[str, Any]:
@@ -208,8 +368,7 @@ def activate(*, identity: str, version: str) -> dict[str, Any]:
     def operation(root: Path, token: str) -> sr.SkillRecord:
         authority = sr.Authority(sr.AuthorityRole.MANAGER, actor_id=_MANAGER_ACTOR, token=token)
         registry = store.load_registry(root)
-        prior = registry.get(identity, version)
-        expected = store.state_digest(prior) if prior is not None else None
+        expected = store.stored_state_digest(root, identity, version)
         updated = registry.activate(identity, version, authority)
         store.advance_record(root, updated, expected_state_digest=expected)
         return updated

@@ -773,6 +773,280 @@ def test_disposition_reviewer_children_ignores_request_mismatched_sibling(
     assert sibling["worker_status"] == "review"
 
 
+def _record_claim_episode(
+    repo: Path, task_id: str, request_id: str, claim_epoch: int
+) -> None:
+    """Write the durable claim receipt ``claim_start_exact`` emits per episode."""
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (
+                task_id, "claim_start", "worker_p1",
+                json.dumps({"request_id": request_id, "claim_epoch": claim_epoch}),
+                "2026-08-08T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _rebind_reviewer_child(repo: Path, child_task_id: str, **binding: Any) -> None:
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", (child_task_id,)
+        ).fetchone()
+        card = json.loads(row[0])
+        card["quality_review"].update(binding)
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card), child_task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _child_events(repo: Path, child_task_id: str, event: str) -> list[dict[str, Any]]:
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT payload_json FROM task_events WHERE task_id=? AND event=? "
+            "ORDER BY event_id",
+            (child_task_id, event),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [json.loads(row[0] or "{}") for row in rows]
+
+
+def test_disposition_reviewer_children_supersedes_stale_claim_episode_child(
+    tmp_path: Path,
+) -> None:
+    """A child of a superseded launch episode is disposed, not silently skipped.
+
+    This is the orphan class: the parent was relaunched, so it carries a new
+    request id, and every reviewer still bound to the dead episode used to be
+    dropped by a bare ``continue`` with no event of any kind.
+    """
+    repo = _repo_with_reviewer_children(tmp_path)
+    _record_claim_episode(repo, "PARENT_T1", "req-parent-0", 4)
+    _record_claim_episode(repo, "PARENT_T1", "req-parent-1", 5)
+    _rebind_reviewer_child(
+        repo, "REVIEWER_S1",
+        target_request_id="req-parent-0", target_claim_epoch=4,
+    )
+
+    result = task_engine.disposition_reviewer_children(
+        repo, "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    assert result["ok"] is True
+    payload = json.loads(result["stdout"])
+    assert payload["parent_claim_epoch"] == 5
+    assert payload["stale_superseded"] == ["REVIEWER_S1"]
+    assert "REVIEWER_S1" in payload["superseded"]
+    assert payload["refused"] == []
+
+    sibling = task_store.get_task(repo, "REVIEWER_S1")
+    assert sibling is not None
+    assert sibling["status"] == "superseded"
+    assert sibling["worker_status"] == "superseded"
+    assert sibling["reviewer_disposition"]["reason"] == "stale_claim_episode"
+
+    events = _child_events(repo, "REVIEWER_S1", "reviewer_child_superseded")
+    assert len(events) == 1
+    assert events[0]["reason"] == "stale_claim_episode"
+    assert events[0]["child_target_request_id"] == "req-parent-0"
+    assert events[0]["child_target_claim_epoch"] == 4
+    assert events[0]["parent_claim_epoch"] == 5
+
+
+def test_disposition_reviewer_children_refuses_foreign_target_task(
+    tmp_path: Path,
+) -> None:
+    """A child bound to a different task is never ours, at any epoch."""
+    repo = _repo_with_reviewer_children(tmp_path)
+    _record_claim_episode(repo, "PARENT_T1", "req-parent-1", 5)
+    _rebind_reviewer_child(
+        repo, "REVIEWER_S1",
+        target_task_id="SOME_OTHER_PARENT",
+        target_request_id="req-other-1",
+        target_claim_epoch=1,
+    )
+
+    result = task_engine.disposition_reviewer_children(
+        repo, "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    assert result["ok"] is True
+    payload = json.loads(result["stdout"])
+    assert payload["refused"] == ["REVIEWER_S1:foreign_target_task"]
+    assert payload["superseded"] == []
+    assert payload["stale_superseded"] == []
+
+    sibling = task_store.get_task(repo, "REVIEWER_S1")
+    assert sibling is not None
+    assert sibling["status"] == "review"
+    assert sibling["worker_status"] == "review"
+    assert "reviewer_disposition" not in sibling
+
+    refusals = _child_events(repo, "REVIEWER_S1", "reviewer_child_disposition_refused")
+    assert len(refusals) == 1
+    assert refusals[0]["reason"] == "foreign_target_task"
+    assert refusals[0]["child_target_task_id"] == "SOME_OTHER_PARENT"
+    assert refusals[0]["child_status"] == "review"
+
+
+def test_disposition_reviewer_children_refuses_newer_claim_episode_child(
+    tmp_path: Path,
+) -> None:
+    """The rework-relaunch invariant core.py depends on stays intact.
+
+    ``reject_review`` disposes the *rejected* request while the rework relaunch
+    may already be in flight; that later episode's reviewers must survive.
+    """
+    repo = _repo_with_reviewer_children(tmp_path)
+    _record_claim_episode(repo, "PARENT_T1", "req-parent-1", 5)
+    _record_claim_episode(repo, "PARENT_T1", "req-parent-2", 6)
+    _rebind_reviewer_child(
+        repo, "REVIEWER_S1",
+        target_request_id="req-parent-2", target_claim_epoch=6,
+    )
+
+    result = task_engine.disposition_reviewer_children(
+        repo, "PARENT_T1",
+        verified_reviewer_task_ids=[],
+        parent_request_id="req-parent-1",
+        disposition="rejected",
+    )
+    assert result["ok"] is True
+    payload = json.loads(result["stdout"])
+    assert payload["refused"] == [
+        "REVIEWER_S1:child_claim_epoch_newer_than_parent_request"
+    ]
+    # The rejected episode's own reviewer is still disposed.
+    assert payload["superseded"] == ["REVIEWER_V1"]
+    assert payload["stale_superseded"] == []
+
+    sibling = task_store.get_task(repo, "REVIEWER_S1")
+    assert sibling is not None
+    assert sibling["status"] == "review"
+    assert sibling["worker_status"] == "review"
+
+    refusals = _child_events(repo, "REVIEWER_S1", "reviewer_child_disposition_refused")
+    assert len(refusals) == 1
+    assert refusals[0]["reason"] == "child_claim_epoch_newer_than_parent_request"
+
+
+def test_disposition_reviewer_children_records_unorderable_request_mismatch(
+    tmp_path: Path,
+) -> None:
+    """No episode order means no authority to dispose -- but it is still named.
+
+    This is the same input as
+    ``test_disposition_reviewer_children_ignores_request_mismatched_sibling``:
+    the card stays untouched, and now the refusal is on the record instead of
+    being a silent skip.
+    """
+    repo = _repo_with_reviewer_children(tmp_path)
+    _rebind_reviewer_child(repo, "REVIEWER_S1", target_request_id="req-other-candidate")
+
+    result = task_engine.disposition_reviewer_children(
+        repo, "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    assert result["ok"] is True
+    payload = json.loads(result["stdout"])
+    assert payload["parent_claim_epoch"] is None
+    assert payload["refused"] == ["REVIEWER_S1:child_claim_epoch_unknown"]
+
+    sibling = task_store.get_task(repo, "REVIEWER_S1")
+    assert sibling is not None
+    assert sibling["status"] == "review"
+    assert sibling["worker_status"] == "review"
+
+    refusals = _child_events(repo, "REVIEWER_S1", "reviewer_child_disposition_refused")
+    assert len(refusals) == 1
+    assert refusals[0]["reason"] == "child_claim_epoch_unknown"
+    assert refusals[0]["child_target_request_id"] == "req-other-candidate"
+
+
+def test_disposition_reviewer_children_never_finalizes_stale_episode_child(
+    tmp_path: Path,
+) -> None:
+    """A stale child named in the verified set is superseded, never finalized.
+
+    Its verdict was sealed against candidate bytes this request no longer
+    carries, so finalizing it would credit an inspection that never happened.
+    """
+    repo = _repo_with_reviewer_children(tmp_path)
+    _record_claim_episode(repo, "PARENT_T1", "req-parent-0", 4)
+    _record_claim_episode(repo, "PARENT_T1", "req-parent-1", 5)
+    _rebind_reviewer_child(
+        repo, "REVIEWER_S1",
+        target_request_id="req-parent-0", target_claim_epoch=4,
+    )
+
+    result = task_engine.disposition_reviewer_children(
+        repo, "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1", "REVIEWER_S1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    assert result["ok"] is True
+    payload = json.loads(result["stdout"])
+    assert payload["finalized"] == ["REVIEWER_V1"]
+    assert payload["stale_superseded"] == ["REVIEWER_S1"]
+
+    sibling = task_store.get_task(repo, "REVIEWER_S1")
+    assert sibling is not None
+    assert sibling["status"] == "superseded"
+    assert _child_events(repo, "REVIEWER_S1", "reviewer_child_finalized") == []
+
+
+def test_disposition_reviewer_children_stale_supersede_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_with_reviewer_children(tmp_path)
+    _record_claim_episode(repo, "PARENT_T1", "req-parent-0", 4)
+    _record_claim_episode(repo, "PARENT_T1", "req-parent-1", 5)
+    _rebind_reviewer_child(
+        repo, "REVIEWER_S1",
+        target_request_id="req-parent-0", target_claim_epoch=4,
+    )
+    kwargs: dict[str, Any] = {
+        "verified_reviewer_task_ids": ["REVIEWER_V1"],
+        "parent_request_id": "req-parent-1",
+        "disposition": "accepted",
+    }
+    first = task_engine.disposition_reviewer_children(repo, "PARENT_T1", **kwargs)
+    second = task_engine.disposition_reviewer_children(repo, "PARENT_T1", **kwargs)
+    assert first["ok"] is True and second["ok"] is True
+
+    second_payload = json.loads(second["stdout"])
+    assert second_payload["stale_superseded"] == []
+    assert second_payload["refused"] == []
+    assert "REVIEWER_S1" in second_payload["skipped"]
+
+    # One transition, one event -- a repeat sweep must not grow the log.
+    assert len(_child_events(repo, "REVIEWER_S1", "reviewer_child_superseded")) == 1
+    assert _child_events(
+        repo, "REVIEWER_S1", "reviewer_child_disposition_refused"
+    ) == []
+
 _VALID_HASH = "a" * 64
 _REQ_OLD = "req-validation-old"
 _REQ_NEW = "req-validation-new"

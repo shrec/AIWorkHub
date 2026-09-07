@@ -3206,3 +3206,348 @@ def test_coding_foundation_primary_collection_generator_limit_and_misleading_len
     assert items == list(range(limit))
     assert truncated is False
     assert total == limit
+
+
+# ---------------------------------------------------------------------------
+# Work-card outcome accounting (reviewer children, per-card counting, honest
+# denominators).
+#
+# Regression: ``outcome_counts`` counts decision EVENTS across EVERY topic, so
+# reviewer-child tasks (``topic='quality_review'``) landed in the same
+# acceptance numerator as delivered work, and one card rejected N times
+# contributed N data points. On the canonical store that made a change in how
+# reviewer children were closed look like an acceptance collapse.
+# ---------------------------------------------------------------------------
+
+
+def _seed_decision_store(repo: Path, cards) -> None:
+    """Create a canonical store with ``(task_id, topic, [events])`` cards.
+
+    Each event is ``(event, payload_json)`` and is appended in order, so the
+    highest ``event_id`` for a task is its latest decision.
+    """
+    task_store.initialize_repository(repo)
+    _readiness, db_path = task_store._require_ready(repo)
+    now = "2026-08-31T00:00:00+00:00"
+    conn = sqlite3.connect(db_path)
+    try:
+        for task_id, topic, events in cards:
+            card = {"task_id": task_id, "runner": "codex_worker", "topic": topic}
+            conn.execute(
+                "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+                "priority, objective, card_json, created_at, updated_at, claimed_by, "
+                "claimed_at, started_at) "
+                "VALUES (?, 'codex_worker', ?, 'finished', 'done', '', '', ?, ?, ?, '', '', '')",
+                (task_id, topic, json.dumps(card), now, now),
+            )
+            for event, payload in events:
+                conn.execute(
+                    "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                    "VALUES (?, ?, 'codex', ?, ?)",
+                    (task_id, event, payload, now),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_work_card_outcomes_exclude_reviewer_children_from_the_work_series(tmp_path: Path):
+    """A reviewer child's accept_review must never inflate work acceptance.
+
+    Reviewer children here are accepted 2/2 and work cards 1/2. Mixing them
+    reads as 75% acceptance; the work series must read 50% and the reviewer
+    children must still be visible as their own labelled series.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_store(
+        repo,
+        [
+            ("TASK_WORK_ACCEPTED", "task_mcp", [("accept_review", "{}")]),
+            ("TASK_WORK_REJECTED", "task_mcp", [("reject_review", '{"to":"pending"}')]),
+            ("TASK_REVIEWER_A", "quality_review", [("accept_review", "{}")]),
+            ("TASK_REVIEWER_B", "quality_review", [("accept_review", "{}")]),
+        ],
+    )
+    provider = dashboard.DashboardProvider(repo_root=repo)
+
+    counts = provider.get_work_card_decision_counts()
+
+    assert counts["measured"] is True
+    assert counts["work_cards"] == {"accepted": 1, "rejected": 1}
+    assert counts["reviewer_children"] == {"accepted": 2, "rejected": 0}
+
+    projection = dashboard._work_card_outcome_projection(counts)
+    # The numerator and denominator both exclude reviewer children.
+    assert projection["work_cards"]["accepted"] == 1
+    assert projection["work_cards"]["decided"] == 2
+    assert projection["work_cards"]["acceptance_rate"] == 50.0
+    # ... and the reviewer children are not lost, only separated.
+    assert projection["reviewer_children"]["accepted"] == 2
+    assert projection["reviewer_children"]["decided"] == 2
+    assert projection["excluded_topics"] == ["quality_review"]
+    # The mixed figure the old accounting produced (3/4 = 75%) appears nowhere
+    # in the work-card series.
+    assert projection["work_cards"]["accepted"] != 3
+    assert projection["work_cards"]["acceptance_rate"] != 75.0
+
+
+def test_work_card_outcomes_count_one_card_once_not_once_per_reject_event(tmp_path: Path):
+    """A card rejected 46 times is one card, not 46 data points."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_store(
+        repo,
+        [
+            (
+                "TASK_RETRIED",
+                "task_mcp",
+                [("reject_review", '{"to":"pending"}')] * 46,
+            ),
+            ("TASK_ACCEPTED", "task_mcp", [("accept_review", "{}")]),
+        ],
+    )
+    provider = dashboard.DashboardProvider(repo_root=repo)
+
+    counts = provider.get_work_card_decision_counts()
+
+    # Per distinct card: two cards decided, one accepted.
+    assert counts["work_cards"] == {"accepted": 1, "rejected": 1}
+    # The same population under the old per-event rule, retained so the
+    # payload can state its own inflation instead of hiding it.
+    assert counts["work_card_events"] == {"accepted": 1, "rejected": 46}
+
+    projection = dashboard._work_card_outcome_projection(counts)
+    assert projection["work_cards"]["decided"] == 2
+    assert projection["work_cards"]["acceptance_rate"] == 50.0
+    assert projection["work_cards"]["counting_unit"] == "distinct_card_latest_decision"
+    assert projection["work_card_events"]["decided"] == 47
+    assert projection["work_card_events"]["counting_unit"] == "decision_event"
+    # 47 events over 2 cards: the per-event denominator was 23.5x too large.
+    assert projection["event_to_card_multiplier"] == 23.5
+
+
+def test_work_card_outcomes_use_the_latest_decision_per_card(tmp_path: Path):
+    """A card rejected then finally accepted counts once, as accepted."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_store(
+        repo,
+        [
+            (
+                "TASK_REWORKED",
+                "task_mcp",
+                [
+                    ("reject_review", '{"to":"pending"}'),
+                    ("reject_review", '{"to":"pending"}'),
+                    ("accept_review", "{}"),
+                ],
+            ),
+        ],
+    )
+    provider = dashboard.DashboardProvider(repo_root=repo)
+
+    counts = provider.get_work_card_decision_counts()
+
+    assert counts["work_cards"] == {"accepted": 1, "rejected": 0}
+    assert counts["work_card_events"] == {"accepted": 1, "rejected": 2}
+
+
+def test_work_card_outcomes_count_review_archival_but_not_lifecycle_archival(tmp_path: Path):
+    """Only ``reject_review:`` archival is a quality judgment.
+
+    Matches ``task_store.latest_manager_decisions``: a plain lifecycle
+    archive/supersede is not a rejection and must not enter the denominator.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_store(
+        repo,
+        [
+            ("TASK_REVIEW_ARCHIVED", "task_mcp", [("archived", '{"reason":"reject_review:no"}')]),
+            ("TASK_TIDY_ARCHIVED", "task_mcp", [("archived", '{"reason":"dashboard cleanup"}')]),
+            (
+                "TASK_SUPERSEDED",
+                "task_mcp",
+                [("superseded", '{"reason":"replaced by newer card"}')],
+            ),
+        ],
+    )
+    provider = dashboard.DashboardProvider(repo_root=repo)
+
+    counts = provider.get_work_card_decision_counts()
+
+    assert counts["work_cards"] == {"accepted": 0, "rejected": 1}
+
+
+def test_work_card_outcomes_report_a_card_with_no_task_row_as_unknown_topic(tmp_path: Path):
+    """A decision whose card row is gone has no establishable population.
+
+    It must not be silently counted as delivered work.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_store(repo, [("TASK_WORK", "task_mcp", [("accept_review", "{}")])])
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES ('TASK_VANISHED', 'accept_review', 'codex', '{}', '2026-08-31T00:00:00+00:00')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    counts = dashboard.DashboardProvider(repo_root=repo).get_work_card_decision_counts()
+
+    assert counts["work_cards"] == {"accepted": 1, "rejected": 0}
+    assert counts["unknown_topic_cards"] == {"accepted": 1, "rejected": 0}
+
+
+def test_work_card_outcomes_report_unmeasured_as_unknown_never_as_zero():
+    """An absent provider must not read as "no work was accepted"."""
+    projection = dashboard._work_card_outcome_projection(None)
+
+    assert projection["measured"] is False
+    assert projection["reason"] == "provider_unavailable"
+    assert projection["absent_metrics_are_unknown_not_zero"] is True
+    for series in ("work_cards", "reviewer_children", "unknown_topic_cards", "work_card_events"):
+        assert projection[series]["accepted"] is None
+        assert projection[series]["rejected"] is None
+        assert projection[series]["decided"] is None
+        assert projection[series]["acceptance_rate"] is None
+        assert projection[series]["acceptance_rate_available"] is False
+    assert projection["event_to_card_multiplier"] is None
+
+
+def test_work_card_outcomes_distinguish_a_zero_rate_from_an_absent_rate():
+    """Nothing decided is unknown; everything rejected is a measured 0%."""
+    nothing_decided = dashboard._work_card_outcome_projection(
+        {"measured": True, "work_cards": {"accepted": 0, "rejected": 0}}
+    )
+    assert nothing_decided["measured"] is True
+    assert nothing_decided["work_cards"]["decided"] == 0
+    assert nothing_decided["work_cards"]["acceptance_rate"] is None
+    assert nothing_decided["work_cards"]["acceptance_rate_available"] is False
+
+    all_rejected = dashboard._work_card_outcome_projection(
+        {"measured": True, "work_cards": {"accepted": 0, "rejected": 4}}
+    )
+    assert all_rejected["work_cards"]["acceptance_rate"] == 0.0
+    assert all_rejected["work_cards"]["acceptance_rate_available"] is True
+
+
+def test_work_card_outcomes_state_which_population_they_exclude():
+    """A series that excludes a population must say so in the payload."""
+    projection = dashboard._work_card_outcome_projection(
+        {"measured": True, "work_cards": {"accepted": 1, "rejected": 1}}
+    )
+
+    assert projection["schema_id"] == "aiworkhub.dashboard.work_card_outcomes.v1"
+    assert projection["excluded_topics"] == ["quality_review"]
+    assert "quality_review" in projection["population_note"]
+    assert "never folded into the" in projection["population_note"]
+    assert projection["work_cards"]["counting_unit"] == "distinct_card_latest_decision"
+
+
+def test_work_card_outcomes_name_the_distorted_fields_they_correct():
+    """The correction is additive, so the payload names what it corrects.
+
+    ``outcome_counts`` and the KPI headline keep their existing per-event,
+    all-topic definitions; those definitions are declared here rather than
+    changed underneath their consumers.
+    """
+    projection = dashboard._work_card_outcome_projection(
+        {"measured": True, "work_cards": {"accepted": 1, "rejected": 1}},
+        event_counted_outcomes={"accepted": 870, "rejected": 2685},
+    )
+    distortions = projection["related_field_distortions"]
+
+    assert distortions["outcome_counts.accepted"] == {
+        "counting_unit": "decision_event",
+        "population": "all_topics_including_reviewer_children",
+        "value": 870,
+        "corrected_by": "work_card_outcomes.work_cards.accepted",
+    }
+    assert distortions["outcome_counts.rejected"]["value"] == 2685
+    headline = distortions["kpi_analytics.headline.manager_acceptance_rate"]
+    assert headline["counting_unit"] == "decision_event"
+    assert headline["corrected_by"] == "work_card_outcomes.work_cards.acceptance_rate"
+
+
+def test_snapshot_carries_work_card_outcomes_without_changing_outcome_counts():
+    """The new series ships alongside; the old field is untouched."""
+    provider = FakeProvider()
+
+    snapshot = dashboard.build_snapshot(provider)
+
+    # Unchanged: same five keys, same per-event numbers as before this fix.
+    assert snapshot["outcome_counts"] == {
+        "accepted": 7,
+        "rejected": 2,
+        "archived": 0,
+        "superseded": 0,
+        "finished": 0,
+    }
+    # FakeProvider has no ``get_work_card_decision_counts``, so the honest
+    # answer is "unknown", not "zero accepted work cards".
+    work_cards = snapshot["work_card_outcomes"]
+    assert work_cards["measured"] is False
+    assert work_cards["work_cards"]["accepted"] is None
+    assert work_cards["related_field_distortions"]["outcome_counts.accepted"]["value"] == 7
+
+
+def test_summary_and_full_snapshots_agree_on_work_card_outcomes():
+    full = dashboard.build_snapshot(FakeProvider())
+    summary = dashboard.build_snapshot(FakeProvider(), summary_only=True)
+
+    assert summary["work_card_outcomes"] == full["work_card_outcomes"]
+
+
+def test_storage_not_ready_snapshot_reports_work_card_outcomes_as_unmeasured():
+    """Zero task counts are a fail-closed contract; zero accepts is not."""
+
+    class _NotReady:
+        ready = False
+        reason = "canonical_database_missing"
+        repo_id = ""
+
+    class _Provider(FakeProvider):
+        def get_storage_readiness(self):
+            return _NotReady()
+
+    snapshot = dashboard.build_snapshot(_Provider())
+
+    assert snapshot["outcome_counts"]["accepted"] == 0
+    work_cards = snapshot["work_card_outcomes"]
+    assert work_cards["measured"] is False
+    assert work_cards["reason"] == "storage_not_ready"
+    assert work_cards["work_cards"]["accepted"] is None
+    assert work_cards["absent_metrics_are_unknown_not_zero"] is True
+
+
+def test_work_card_decision_counts_report_unready_storage_as_unmeasured(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    counts = dashboard.DashboardProvider(repo_root=repo).get_work_card_decision_counts()
+
+    assert counts["measured"] is False
+    assert counts.get("reason")
+
+
+def test_work_card_decision_counts_never_write_to_the_canonical_store(tmp_path: Path):
+    """The reader is read-only at the engine level, not only by convention."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_store(repo, [("TASK_WORK", "task_mcp", [("accept_review", "{}")])])
+    provider = dashboard.DashboardProvider(repo_root=repo)
+    provider.get_work_card_decision_counts()
+
+    conn = dashboard.sqlite_readonly.connect_readonly(task_store.canonical_db_path(repo))
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("DELETE FROM task_events")
+    finally:
+        conn.close()

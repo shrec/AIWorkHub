@@ -200,20 +200,81 @@ CODEX_INNER_SANDBOX_MODES: tuple[str, ...] = ("workspace-write", "danger-full-ac
 # replacing Source Graph. Unsupported/unindexed targets are handled by a new,
 # exact coordinator-authorized fallback card rather than by weakening a live
 # worker run.
-CLAUDE_RAW_DISCOVERY_DENIES: tuple[str, ...] = (
-    "Grep",
-    "Glob",
-    "Bash(grep *)",
-    "Bash(rg *)",
-    "Bash(find *)",
-    "Bash(tree *)",
+#
+# THE single raw-discovery command vocabulary.  Every provider tuple below is
+# derived from it, so a command is added or removed in exactly one place.  It is
+# deliberately identical to ``repo_policy.MANDATORY_RAW_DISCOVERY_DENIES`` and
+# ``tests/test_runtime_adapters.py`` fails if the two ever drift.  That module
+# cannot be imported here to share the constant: ``repo_policy`` already imports
+# this one, so the dependency may only ever run in that direction.
+RAW_DISCOVERY_DENIED_COMMANDS: tuple[str, ...] = ("grep", "rg", "find", "tree")
+
+# Native provider search tools, denied alongside the shell commands.  Claude
+# exposes them as ``Grep``/``Glob`` tool names; Copilot takes lower-case
+# ``grep``/``glob`` entries for ``--excluded-tools``.
+CLAUDE_RAW_DISCOVERY_TOOL_DENIES: tuple[str, ...] = ("Grep", "Glob")
+COPILOT_RAW_DISCOVERY_EXCLUDED_TOOLS: tuple[str, ...] = ("grep", "glob")
+
+CLAUDE_RAW_DISCOVERY_DENIES: tuple[str, ...] = CLAUDE_RAW_DISCOVERY_TOOL_DENIES + tuple(
+    f"Bash({command} *)" for command in RAW_DISCOVERY_DENIED_COMMANDS
 )
-COPILOT_RAW_DISCOVERY_EXCLUDES = "grep,glob"
-COPILOT_RAW_DISCOVERY_DENIES: tuple[str, ...] = (
-    "shell(grep:*)",
-    "shell(rg:*)",
-    "shell(find:*)",
-    "shell(tree:*)",
+COPILOT_RAW_DISCOVERY_EXCLUDES = ",".join(COPILOT_RAW_DISCOVERY_EXCLUDED_TOOLS)
+COPILOT_RAW_DISCOVERY_DENIES: tuple[str, ...] = tuple(
+    f"shell({command}:*)" for command in RAW_DISCOVERY_DENIED_COMMANDS
+)
+
+# ---------------------------------------------------------------------------
+# Raw-discovery deny ENFORCEMENT capability.
+#
+# Denying raw search is a provider-CLI argv capability, not a policy wish.  A
+# flag that does not exist cannot be passed, and a flag that is accepted and
+# then silently discarded is worse than no flag at all, because every
+# downstream reader treats the unenforced run as an enforced one.  So this
+# records what each transport can actually do, and ``build_runtime_command``
+# passes a deny only on the branches where that is true.
+#
+# Verified against the installed CLIs on 2026-09-07:
+#   claude_cli     ``claude --help`` lists
+#                  ``--disallowedTools, --disallowed-tools <tools...>``.
+#   *_copilot_cli  ``copilot --help`` lists ``--deny-tool[=tools...]`` and
+#                  ``--excluded-tools[=tools...]``.
+#   codex_cli      ``codex exec --help`` lists NO tool-deny option of any kind,
+#                  and ``codex debug prompt-input -c <unknown-key>=1`` exits 0,
+#                  so a speculative ``-c`` override would be accepted and
+#                  silently ignored rather than enforced.
+#   grok_kilo_cli  ``kilo run --help`` lists NO tool-deny option.  Its
+#                  ``--auto`` flag auto-approves "permissions that are not
+#                  explicitly denied", and that denial set is on-disk config.
+#   *_vscode_lm    builds no provider argv at all (the in-process bridge).
+#
+# Codex and Kilo can each still be constrained by an on-disk policy file (Codex
+# execpolicy ``.rules``, loaded unless ``--ignore-rules``; Kilo's config
+# permission block).  Neither is an argv concern and neither is provisioned by
+# this module, so neither is claimed here.  Routing should prefer an enforcing
+# transport for code cards until a launcher provisions such a file.
+#
+# The polarity is inverted relative to ``NO_FILE_READ_ADAPTERS`` on purpose: an
+# unlisted or unknown adapter must default to "does not enforce", so a newly
+# added transport can never inherit an enforcement claim nobody verified.
+# ---------------------------------------------------------------------------
+RAW_DISCOVERY_ENFORCING_ADAPTERS: frozenset[str] = frozenset(
+    {"claude_cli", DEEPSEEK_COPILOT_ADAPTER, GLM_COPILOT_ADAPTER}
+)
+RAW_DISCOVERY_ENFORCEMENT_UNVERIFIED = "adapter not verified for a tool-deny flag"
+_RAW_DISCOVERY_ENFORCEMENT_REASONS: Mapping[str, str] = MappingProxyType(
+    {
+        "claude_cli": "argv --disallowedTools",
+        DEEPSEEK_COPILOT_ADAPTER: "argv --excluded-tools and --deny-tool",
+        GLM_COPILOT_ADAPTER: "argv --excluded-tools and --deny-tool",
+        "codex_cli": (
+            "codex exec exposes no tool-deny flag and accepts unknown -c "
+            "overrides silently"
+        ),
+        GROK_KILO_ADAPTER: "kilo run exposes no tool-deny flag",
+        VSCODE_LM_ADAPTER: "in-process bridge builds no provider argv",
+        GLM_VSCODE_LM_ADAPTER: "in-process bridge builds no provider argv",
+        DEEPSEEK_VSCODE_LM_ADAPTER: "in-process bridge builds no provider argv",
+    }
 )
 
 # ---------------------------------------------------------------------------
@@ -310,6 +371,40 @@ def capability_set_has_file_read(tool_names: Iterable[str]) -> bool:
             if normalized.endswith("_" + candidate):
                 return True
     return False
+
+
+def adapter_enforces_raw_discovery_denies(adapter_id: str) -> bool:
+    """Return True when this adapter's launch argv actually denies raw search.
+
+    True only for a transport whose CLI was verified to expose a tool-deny
+    flag that ``build_runtime_command`` passes (see
+    ``RAW_DISCOVERY_ENFORCING_ADAPTERS``).  An unknown or unlisted adapter
+    returns False, so an unverified transport is never credited with
+    enforcement it does not perform.  This is a pure capability statement and
+    starts no process.
+    """
+
+    return adapter_id in RAW_DISCOVERY_ENFORCING_ADAPTERS
+
+
+def raw_discovery_enforcement_fact(adapter_id: str) -> dict[str, Any]:
+    """Return the launch-time raw-discovery enforcement fact for an adapter.
+
+    Inert evidence for routing and launch records: ``enforced`` says whether
+    the built argv carries the deny, and ``reason`` names the verified flag
+    that carries it, or why the transport has none.  A transport that cannot
+    deny is reported honestly rather than being handed a flag that would be
+    silently ignored.
+    """
+
+    return {
+        "adapter_id": adapter_id,
+        "enforced": adapter_enforces_raw_discovery_denies(adapter_id),
+        "reason": _RAW_DISCOVERY_ENFORCEMENT_REASONS.get(
+            adapter_id, RAW_DISCOVERY_ENFORCEMENT_UNVERIFIED
+        ),
+        "denied_commands": list(RAW_DISCOVERY_DENIED_COMMANDS),
+    }
 
 
 PathValue = str | os.PathLike[str]

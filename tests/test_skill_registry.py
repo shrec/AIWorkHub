@@ -2116,3 +2116,145 @@ def test_crafted_string_evidence_fails_closed_as_invalid_type():
     record = _bad_record(evidence="not-a-list")
     assert_fails("skill_registry.invalid_type", lambda: sr.validate_record(record))
     assert_fails("skill_registry.invalid_type", lambda: sr.skill_digest(record))
+
+
+# ---------------------------------------------------------------------------
+# Provenance identity canonicalization (independence is a property of the
+# actor, never of the string that names them)
+# ---------------------------------------------------------------------------
+
+
+def test_two_spellings_of_one_manager_count_as_one_actor():
+    # The exact pair read from this repository's live skills store: one manager
+    # (7e6e8a47) written two ways. Counting raw strings reported TWO independent
+    # actors against a floor of two, which is how the only ACTIVE skill in the
+    # repository self-certified on the evidence of a single real actor.
+    assert sr.canonical_actor_id("claude_manager_7e6e8a47") == "manager.claude.7e6e8a47"
+    assert sr.canonical_actor_id("manager.claude.7e6e8a47") == "manager.claude.7e6e8a47"
+    record = with_evidence(
+        base_record(),
+        [
+            {"source": "s1", "outcome": "accepted", "actor_id": "manager.claude.7e6e8a47"},
+            {"source": "s2", "outcome": "accepted", "actor_id": "claude_manager_7e6e8a47"},
+        ],
+    )
+    assert sr.independent_accepted_actor_ids(record) == ("manager.claude.7e6e8a47",)
+    assert sr.independent_accepted_evidence_count(record) == 1
+    decision = sr.can_activate(record, 2)
+    assert not decision.allowed
+    assert decision.reason_code == "skill_registry.insufficient_evidence"
+
+
+def test_two_genuinely_distinct_actors_still_count_as_two():
+    # A manager and a card-derived worker are two actors under every spelling of
+    # either, because the role token is emitted first and roles never collide.
+    record = with_evidence(
+        base_record(),
+        [
+            {"source": "s1", "outcome": "accepted", "actor_id": "claude_manager_7e6e8a47"},
+            {"source": "s2", "outcome": "accepted", "actor_id": "worker.claude.sonnet.5"},
+        ],
+    )
+    assert sr.independent_accepted_actor_ids(record) == (
+        "manager.claude.7e6e8a47",
+        "worker.claude.sonnet.5",
+    )
+    assert sr.independent_accepted_evidence_count(record) == 2
+    assert sr.can_activate(record, 2).allowed
+
+
+def test_distinct_subjects_of_one_role_and_provider_stay_distinct():
+    # Canonicalization normalizes FORMAT only. Two different subjects remain two
+    # identities, so it never silently merges real contributors.
+    record = with_evidence(
+        base_record(),
+        [
+            {"source": "s1", "outcome": "accepted", "actor_id": "manager.claude.aaaaaaaa"},
+            {"source": "s2", "outcome": "accepted", "actor_id": "manager.claude.bbbbbbbb"},
+        ],
+    )
+    assert sr.independent_accepted_evidence_count(record) == 2
+
+
+def test_unknown_actor_ids_stay_distinct_and_fail_closed():
+    # No role token, two role tokens, or two provider tokens: the id is returned
+    # UNCHANGED rather than guessed at, so an unparseable identity is never
+    # collapsed into a shared bucket with another unparseable identity.
+    for unknown in (
+        "h7e6e8a47.claude",
+        "claude.h7e6e8a47",
+        "manager.worker.7e6e8a47",
+        "manager.claude.codex.7e6e8a47",
+        "actor-a",
+        "x9",
+    ):
+        assert sr.canonical_actor_id(unknown) == unknown
+
+    record = with_evidence(
+        base_record(),
+        [
+            {"source": "s1", "outcome": "accepted", "actor_id": "h7e6e8a47.claude"},
+            {"source": "s2", "outcome": "accepted", "actor_id": "claude.h7e6e8a47"},
+        ],
+    )
+    # Same tokens, different order, no role token to anchor them: they stay two.
+    assert sr.independent_accepted_evidence_count(record) == 2
+
+
+def test_canonical_actor_id_preserves_subject_token_order():
+    # Only the role and provider tokens are positionally meaningless. Reordering
+    # the subject would merge two different subjects that happen to be anagrams
+    # of one another, so subject order is preserved exactly.
+    assert sr.canonical_actor_id("worker.alpha.beta") == "worker.alpha.beta"
+    assert sr.canonical_actor_id("worker.beta.alpha") == "worker.beta.alpha"
+    assert sr.canonical_actor_id("worker.alpha.beta") != sr.canonical_actor_id(
+        "worker.beta.alpha"
+    )
+
+
+def test_canonical_actor_id_is_idempotent_and_stays_a_valid_actor_id():
+    for actor_id in (
+        "manager",
+        "claude_manager_7e6e8a47",
+        "worker-claude-sonnet-5",
+        "reviewer.codex.cli",
+        "manager.worker.x",
+        "actor-a",
+    ):
+        canonical = sr.canonical_actor_id(actor_id)
+        assert sr.canonical_actor_id(canonical) == canonical
+        # The canonical form must itself be a legal provenance identity, or a
+        # record carrying it could never be validated back into the registry.
+        assert sr.EvidenceRecord(
+            source="s",
+            outcome=sr.EvidenceOutcome.ACCEPTED,
+            authority=sr.AuthorityRole.WORKER,
+            actor_id=canonical,
+        )
+        record = with_evidence(
+            base_record(), [{"source": "s", "outcome": "accepted", "actor_id": canonical}]
+        )
+        assert sr.independent_accepted_evidence_count(record) == 1
+
+
+def test_canonical_actor_id_rejects_a_malformed_identity():
+    assert_fails("skill_registry.invalid_evidence", lambda: sr.canonical_actor_id(""))
+    assert_fails("skill_registry.invalid_evidence", lambda: sr.canonical_actor_id("Manager"))
+    assert_fails("skill_registry.invalid_evidence", lambda: sr.canonical_actor_id(None))
+
+
+def test_canonicalization_never_lowers_the_activation_floor():
+    # Format normalization may only ever REMOVE apparent independence. A record
+    # that counted N distinct canonical actors can never count more than the
+    # number of raw actor strings it carries.
+    record = with_evidence(
+        base_record(),
+        [
+            {"source": "s1", "outcome": "accepted", "actor_id": "manager.claude.7e6e8a47"},
+            {"source": "s2", "outcome": "accepted", "actor_id": "claude_manager_7e6e8a47"},
+            {"source": "s3", "outcome": "accepted", "actor_id": "worker.claude.sonnet.5"},
+        ],
+    )
+    raw = {item.actor_id for item in record.evidence}
+    assert sr.independent_accepted_evidence_count(record) <= len(raw)
+    assert sr.independent_accepted_evidence_count(record) == 2

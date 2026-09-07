@@ -1511,3 +1511,195 @@ def test_summarize_card_baselines_folds_large_hash_maps_only() -> None:
     assert folded["acceptance"] == ["exact"]
     # The stored card is never mutated by the render.
     assert len(card["rework_predecessor"]["workspace"]["tree_baseline"]) == 40
+
+
+# ---------------------------------------------------------------------------
+# Zero-validation gate at card creation.
+#
+# The old gate fired only for task_type "code" with a write scope, so a
+# "research" or "data_classification" card with the same write scope declared
+# no validation, ran zero tests, and still reached review_ready carrying
+# nothing_measured -- which the reviewer short-circuit deliberately does not
+# read as a failure. A card that cannot be validated is unwinnable, so it is
+# refused at creation, where it is cheapest.
+
+
+def _manager_identity(monkeypatch):
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "window_id": "claude_vscode_123",
+        },
+    )
+
+
+def test_manager_create_rejects_research_task_with_write_scope_and_no_validation(
+    writable_repo, monkeypatch
+):
+    _manager_identity(monkeypatch)
+
+    result = core.create_task(
+        task_id="TASK_RESEARCH_WITHOUT_VALIDATION",
+        title="Research card that writes but measures nothing",
+        runner="claude_worker",
+        topic="coding",
+        objective="Would have reached review_ready with nothing measured.",
+        acceptance=["refused"],
+        allowed_writes=["src/example.py"],
+        required_outputs=["src/example.py"],
+        task_type="research",
+        custom_template_escape="audited_custom_unclassified",
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"] == "validation_required"
+    assert result["allowed_validation_exemptions"] == ["read_only_no_write_scope"]
+    assert task_store.get_task(writable_repo, "TASK_RESEARCH_WITHOUT_VALIDATION") is None
+
+
+def test_manager_create_allows_reviewer_child_shape_and_names_the_exemption(
+    writable_repo, monkeypatch
+):
+    # This is the exact shape every quality_review reviewer child is created
+    # with: read-only, no write scope, nothing to run. It must still be
+    # creatable, and the card must say by name why it measured nothing.
+    _manager_identity(monkeypatch)
+
+    created = core.create_task(
+        task_id="TASK_REVIEWER_CHILD_SHAPE",
+        title="Reviewer child",
+        runner="claude_worker",
+        topic="quality_review",
+        objective="Review the candidate and submit a report.",
+        acceptance=["report submitted"],
+        allowed_writes=[],
+        read_only=True,
+        task_type="research",
+    )
+
+    assert created["ok"] is True, created
+    card = json.loads(created["stdout"])
+    assert card["validation"] == []
+    assert card["validation_exemption"] == "read_only_no_write_scope"
+    assert task_store.get_task(writable_repo, "TASK_REVIEWER_CHILD_SHAPE") is not None
+
+
+def test_manager_create_stamps_no_exemption_when_validation_is_declared(
+    writable_repo, monkeypatch
+):
+    _manager_identity(monkeypatch)
+
+    created = core.create_task(
+        task_id="TASK_VALIDATION_DECLARED_NO_EXEMPTION",
+        title="Ordinary measured card",
+        runner="claude_worker",
+        topic="coding",
+        objective="Declares its own validation.",
+        acceptance=["measured"],
+        allowed_writes=["src/example.py"],
+        required_outputs=["src/example.py"],
+        validation=["python -m pytest -q"],
+        custom_template_escape="audited_custom_unclassified",
+    )
+
+    assert created["ok"] is True, created
+    card = json.loads(created["stdout"])
+    assert "validation_exemption" not in card
+
+
+def test_manager_create_refuses_an_empty_list_as_a_validation_exemption(
+    writable_repo, monkeypatch
+):
+    # The exemption is a name, never an absence: declaring nothing must not be
+    # a way to become exempt from everything.
+    _manager_identity(monkeypatch)
+
+    for absence in ([], "", False):
+        result = core.create_task(
+            task_id="TASK_EMPTY_EXEMPTION",
+            title="Empty exemption",
+            runner="claude_worker",
+            topic="coding",
+            objective="Must be refused before a provider runs.",
+            acceptance=["refused"],
+            allowed_writes=[],
+            read_only=True,
+            task_type="research",
+            validation_exemption=absence,
+        )
+        assert result["ok"] is False, absence
+        assert result["stderr"] == "invalid_validation_exemption_not_named", absence
+        assert task_store.get_task(writable_repo, "TASK_EMPTY_EXEMPTION") is None
+
+
+def test_manager_create_refuses_an_exemption_whose_precondition_is_unmet(
+    writable_repo, monkeypatch
+):
+    _manager_identity(monkeypatch)
+
+    result = core.create_task(
+        task_id="TASK_EXEMPTION_PRECONDITION",
+        title="Exemption claimed with a write scope",
+        runner="claude_worker",
+        topic="coding",
+        objective="A card with a write scope always has something to measure.",
+        acceptance=["refused"],
+        allowed_writes=["src/example.py"],
+        required_outputs=["src/example.py"],
+        task_type="research",
+        validation_exemption="read_only_no_write_scope",
+        custom_template_escape="audited_custom_unclassified",
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"] == "validation_exemption_precondition_unmet"
+    assert task_store.get_task(writable_repo, "TASK_EXEMPTION_PRECONDITION") is None
+
+
+def test_manager_create_refuses_an_unknown_exemption_token(
+    writable_repo, monkeypatch
+):
+    _manager_identity(monkeypatch)
+
+    result = core.create_task(
+        task_id="TASK_UNKNOWN_EXEMPTION",
+        title="Invented exemption",
+        runner="claude_worker",
+        topic="coding",
+        objective="Only the closed vocabulary is accepted.",
+        acceptance=["refused"],
+        allowed_writes=[],
+        read_only=True,
+        task_type="research",
+        validation_exemption="because_i_said_so",
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"] == "unknown_validation_exemption"
+    assert task_store.get_task(writable_repo, "TASK_UNKNOWN_EXEMPTION") is None
+
+
+def test_exempt_card_identical_retry_still_reconciles(writable_repo, monkeypatch):
+    # The stamp is derived, not caller-distinguishing, so it must not turn a
+    # legitimate lost-ack retry into a false conflict.
+    _manager_identity(monkeypatch)
+    kwargs = {
+        "task_id": "TASK_EXEMPT_RECONCILE",
+        "title": "Exempt card",
+        "runner": "claude_worker",
+        "topic": "quality_review",
+        "objective": "Retry after a lost acknowledgement.",
+        "acceptance": ["reconciled"],
+        "allowed_writes": [],
+        "read_only": True,
+        "task_type": "research",
+    }
+    created = core.create_task(**kwargs)
+    assert created["ok"] is True, created
+    reconciled = core.create_task(**kwargs)
+    assert reconciled["ok"] is True, reconciled
+    assert reconciled["reconciled"] is True
+    assert reconciled["receipt_state"] == "existing_identical"

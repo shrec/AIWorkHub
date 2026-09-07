@@ -558,3 +558,172 @@ def test_worker_temp_env_vars_is_the_frozen_temp_key_declaration() -> None:
     assert runtime_adapters.WORKER_TEMP_ENV_VARS == ("TMPDIR", "TMP", "TEMP")
     assert isinstance(runtime_adapters.WORKER_TEMP_ENV_VARS, tuple)
     assert set(runtime_adapters.WORKER_TEMP_ENV_VARS) == {"TMPDIR", "TMP", "TEMP"}
+
+
+# ---------------------------------------------------------------------------
+# Raw-discovery deny enforcement (audit 2026-09-07 §5.3).
+#
+# The deny existed only on the claude_cli and Copilot branches; codex_cli and
+# grok_kilo_cli built their argv with no deny flag at all.  Their CLIs were
+# then checked and neither exposes one, so the honest fix is a recorded
+# capability fact rather than a flag that would be silently discarded.
+# ---------------------------------------------------------------------------
+
+# The flag tokens that actually carry a deny into a provider process.
+_DENY_FLAG_MARKERS = ("--disallowedTools", "--deny-tool", "--excluded-tools")
+
+
+def _argv_carries_a_deny(argv) -> bool:
+    return any(
+        token == marker or token.startswith(marker + "=")
+        for token in argv
+        for marker in _DENY_FLAG_MARKERS
+    )
+
+
+def test_raw_discovery_vocabulary_is_single_sourced_and_matches_repo_policy():
+    """One command vocabulary feeds every provider tuple, and it is the policy's.
+
+    ``repo_policy.MANDATORY_RAW_DISCOVERY_DENIES`` used to be declarative data
+    with no adapter-level consumer.  It cannot be imported by
+    ``runtime_adapters`` (``repo_policy`` already imports that module), so the
+    binding is asserted here instead.
+    """
+    from aiworkhub import repo_policy
+
+    assert runtime_adapters.RAW_DISCOVERY_DENIED_COMMANDS == ("grep", "rg", "find", "tree")
+    assert (
+        runtime_adapters.RAW_DISCOVERY_DENIED_COMMANDS
+        == repo_policy.MANDATORY_RAW_DISCOVERY_DENIES
+    )
+    # The derivation is behaviour-preserving: these are the exact literals the
+    # branches carried before the vocabulary was single-sourced.
+    assert runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES == (
+        "Grep",
+        "Glob",
+        "Bash(grep *)",
+        "Bash(rg *)",
+        "Bash(find *)",
+        "Bash(tree *)",
+    )
+    assert runtime_adapters.COPILOT_RAW_DISCOVERY_DENIES == (
+        "shell(grep:*)",
+        "shell(rg:*)",
+        "shell(find:*)",
+        "shell(tree:*)",
+    )
+    assert runtime_adapters.COPILOT_RAW_DISCOVERY_EXCLUDES == "grep,glob"
+
+
+@pytest.mark.parametrize(
+    ("adapter_id", "binary"),
+    [
+        ("claude_cli", "claude"),
+        ("deepseek_copilot_cli", "copilot"),
+        ("glm_copilot_cli", "copilot"),
+    ],
+)
+def test_enforcing_adapter_argv_actually_carries_the_deny(adapter_id, binary, tmp_path):
+    """An adapter claiming enforcement must put a real deny flag in its argv."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, binary)
+
+    plan = runtime_adapters.build_runtime_command(
+        adapter_id,
+        "Prompt",
+        repo,
+        executable_overrides={adapter_id: executable},
+    )
+
+    assert plan.launchable is True
+    assert _argv_carries_a_deny(plan.argv)
+    assert runtime_adapters.adapter_enforces_raw_discovery_denies(adapter_id) is True
+
+    fact = runtime_adapters.raw_discovery_enforcement_fact(adapter_id)
+    assert fact["enforced"] is True
+    assert fact["reason"] != runtime_adapters.RAW_DISCOVERY_ENFORCEMENT_UNVERIFIED
+    assert fact["denied_commands"] == ["grep", "rg", "find", "tree"]
+
+
+@pytest.mark.parametrize(
+    ("adapter_id", "binary"),
+    [("codex_cli", "codex"), ("grok_kilo_cli", "kilo")],
+)
+def test_nonenforcing_adapter_records_the_fact_instead_of_faking_a_flag(
+    adapter_id, binary, tmp_path
+):
+    """``codex exec`` and ``kilo run`` expose no tool-deny flag (verified 2026-09-07).
+
+    Passing one anyway would be silently discarded -- ``codex`` accepts unknown
+    ``-c`` overrides and exits 0 -- and every downstream reader would then treat
+    an unenforced run as enforced.  So the argv stays clean and the inability is
+    recorded as a launch-time capability fact routing can act on.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, binary)
+
+    plan = runtime_adapters.build_runtime_command(
+        adapter_id,
+        "Prompt",
+        repo,
+        executable_overrides={adapter_id: executable},
+    )
+
+    assert plan.launchable is True
+    assert not _argv_carries_a_deny(plan.argv)
+    assert runtime_adapters.adapter_enforces_raw_discovery_denies(adapter_id) is False
+
+    fact = runtime_adapters.raw_discovery_enforcement_fact(adapter_id)
+    assert fact["adapter_id"] == adapter_id
+    assert fact["enforced"] is False
+    # The reason is a specific, verified statement -- never the unknown default.
+    assert fact["reason"] != runtime_adapters.RAW_DISCOVERY_ENFORCEMENT_UNVERIFIED
+    assert "no tool-deny flag" in fact["reason"]
+
+
+def test_enforcement_fact_matches_the_argv_every_local_adapter_actually_builds(tmp_path):
+    """The capability fact cannot drift from what the branches really emit.
+
+    This is the test that keeps the fact honest: it builds each local adapter's
+    argv and compares "carries a deny flag" against the declared set, so a
+    branch that loses its deny, or a set that claims one it never passes, fails
+    here rather than in a live worker run.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    observed = set()
+
+    for adapter_id in runtime_adapters.LOCAL_ADAPTERS:
+        executable = _executable(tmp_path, f"exe-{adapter_id}")
+        plan = runtime_adapters.build_runtime_command(
+            adapter_id,
+            "Prompt",
+            repo,
+            executable_overrides={adapter_id: executable},
+        )
+        if _argv_carries_a_deny(plan.argv):
+            observed.add(adapter_id)
+
+    assert observed == set(runtime_adapters.RAW_DISCOVERY_ENFORCING_ADAPTERS)
+    for adapter_id in runtime_adapters.LOCAL_ADAPTERS:
+        assert runtime_adapters.adapter_enforces_raw_discovery_denies(adapter_id) == (
+            adapter_id in observed
+        )
+
+
+def test_every_local_adapter_has_an_explicit_verified_enforcement_reason():
+    """No transport may fall through to the unverified default.
+
+    An unknown adapter must still report "does not enforce", so a transport
+    added later can never inherit an enforcement claim nobody checked.
+    """
+    for adapter_id in runtime_adapters.LOCAL_ADAPTERS:
+        fact = runtime_adapters.raw_discovery_enforcement_fact(adapter_id)
+        assert fact["reason"] != runtime_adapters.RAW_DISCOVERY_ENFORCEMENT_UNVERIFIED, adapter_id
+
+    unknown = runtime_adapters.raw_discovery_enforcement_fact("some_future_cli")
+    assert unknown["enforced"] is False
+    assert unknown["reason"] == runtime_adapters.RAW_DISCOVERY_ENFORCEMENT_UNVERIFIED
+    assert runtime_adapters.adapter_enforces_raw_discovery_denies("some_future_cli") is False

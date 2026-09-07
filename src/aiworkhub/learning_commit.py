@@ -2,8 +2,10 @@
 
 Defines a bounded distillation record containing task identity, repository area,
 outcome, evidence identities, verified root cause/invariant/lesson candidates,
-Context Graph edge candidates, and promotion eligibility. Only accepted
-manager-verified evidence may mark AI Memory or causal-edge promotion eligible.
+Context Graph edge candidates, and promotion eligibility. AI Memory and KB
+promotion require an adjudicated outcome (ACCEPTED or REJECTED) plus the
+evidence that store demands; causal-edge promotion additionally requires a
+verified acceptance.
 """
 
 from __future__ import annotations
@@ -170,6 +172,10 @@ class EdgeCandidate:
             raise ValueError("EdgeCandidate source and target must differ")
 
 
+# Outcomes a manager has actually adjudicated.  INCONCLUSIVE is not one: it
+# records that no judgement was reached, so it may never promote anywhere.
+_PROMOTABLE_OUTCOMES: FrozenSet[Outcome] = frozenset({Outcome.ACCEPTED, Outcome.REJECTED})
+
 ALLOWED_COMMIT_FIELDS: FrozenSet[str] = frozenset({
     "task_id",
     "repository_id",
@@ -316,9 +322,28 @@ class LearningCommit:
             validated_edges.append(edge)
         object.__setattr__(self, 'edge_candidates', tuple(validated_edges))
 
+        # Which OUTCOMES may promote, never what promotion demands.  A
+        # rejection is an adjudicated outcome carrying the richest defect
+        # evidence the loop produces, and AI Memory / KB are exactly two of the
+        # three stores a worker bundle reads back, so barring REJECTED by
+        # outcome made that evidence unreachable by construction.  The evidence
+        # requirement is unchanged and still applies to both outcomes: at least
+        # one evidence id here, plus a lesson for memory and an invariant for
+        # kb in ``learning_commit_store.commit_learning``.
+        #
+        # ``promotion_eligible_context_graph`` stays ACCEPTED-only on purpose.
+        # A Context Graph edge is a causal assertion that later readers
+        # traverse transitively, and only the accept path guarantees a
+        # canonical FIXED_AND_VERIFIED acceptance reference behind it
+        # (``learning_commit_store._canonical_acceptance_reference`` forces one
+        # into ``evidence_ids``).  On a rejection every evidence id is
+        # caller-supplied, and ``EdgeCandidate`` carries no evidence level of
+        # its own, so the outcome gate is the only remaining check.
         if self.promotion_eligible_ai_memory:
-            if self.outcome != Outcome.ACCEPTED:
-                raise ValueError("promotion_eligible_ai_memory requires outcome ACCEPTED")
+            if self.outcome not in _PROMOTABLE_OUTCOMES:
+                raise ValueError(
+                    "promotion_eligible_ai_memory requires outcome ACCEPTED or REJECTED"
+                )
             if not self.evidence_ids:
                 raise ValueError("promotion_eligible_ai_memory requires at least one evidence_id")
         if self.promotion_eligible_context_graph:
@@ -327,8 +352,10 @@ class LearningCommit:
             if not self.evidence_ids:
                 raise ValueError("promotion_eligible_context_graph requires at least one evidence_id")
         if self.promotion_eligible_kb:
-            if self.outcome != Outcome.ACCEPTED:
-                raise ValueError("promotion_eligible_kb requires outcome ACCEPTED")
+            if self.outcome not in _PROMOTABLE_OUTCOMES:
+                raise ValueError(
+                    "promotion_eligible_kb requires outcome ACCEPTED or REJECTED"
+                )
             if not self.evidence_ids:
                 raise ValueError("promotion_eligible_kb requires at least one evidence_id")
 

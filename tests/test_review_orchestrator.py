@@ -655,3 +655,561 @@ def test_needfix_close_survives_a_chain_whose_reviewers_were_retired(
     last = json.loads(rows[-1]["receipt_json"])
     assert last["action_type"] == "needfix_close"
     assert "obsolete_reason" not in last, "bookkeeping ran, it was not retired"
+
+
+# --- mechanical short-circuit ------------------------------------------------
+#
+# 92.3% of this repository's 2,470 reject_review events were mechanically
+# decidable, yet every one spent a quality-reviewer launch (avg 453,650 input
+# tokens) to discover. The deterministic verdict that decides them is already
+# computed and already on the card; these tests pin that the queue reads it,
+# and -- far more important -- that it reads it ONE-DIRECTIONALLY. A wrong
+# short-circuit lets defective code through unreviewed, which is much worse
+# than the token waste being fixed, so every ambiguous verdict must still
+# launch the reviewer.
+
+
+def _verdict(
+    *,
+    applicable: object = True,
+    passed: object = False,
+    claim_epoch: object = "1",
+    nothing_measured: object = False,
+    failed: object = 2,
+    missing: object = 0,
+) -> dict:
+    """Build a deterministic_verification exactly as task_fsm emits one."""
+    return {
+        "applicable": applicable,
+        "pass": passed,
+        "substatus": "review_ready",
+        "reason": "evidence_verdict_failed",
+        "claim_epoch": claim_epoch,
+        "evidence_verdict": {
+            "passed": False,
+            "nothing_measured": nothing_measured,
+            "validation_count": 3,
+            "failed_validation_count": failed,
+            "required_output_count": 1,
+            "missing_required_output_count": missing,
+        },
+    }
+
+
+def _drive(tmp_path: Path, db: str, **card_overrides: object):
+    manager = _Manager(tmp_path)
+    manager.target_status = _target_status(**card_overrides)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / db, route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    return manager, driver, driver.drain(max_actions=1, now=NOW)
+
+
+def test_mechanically_failing_candidate_never_spends_a_reviewer_launch(
+    tmp_path: Path,
+) -> None:
+    manager, _driver, result = _drive(
+        tmp_path, "mech.sqlite", deterministic_verification=_verdict()
+    )
+
+    assert manager.launches == [], "a measured red candidate must not be reviewed"
+    assert result.failed == 1
+    row = review_lifecycle.rows_for_test(tmp_path / "mech.sqlite")[0]
+    assert "mechanically_failing_candidate" in row["failure_reason"]
+    # The reason is a measurement, not a label: it names the counts it read.
+    assert "failed_validation_count=2" in row["failure_reason"]
+
+    # The target's own event stream explains the transition too.
+    event = manager.events[-1]
+    assert event["event_type"] == "review_orchestrator_mechanical_rework"
+    assert event["task_id"] == "TARGET"
+    automation = event["review_automation"]
+    assert automation["state"] == "mechanical_rework"
+    assert automation["reviewer_launched"] is False
+    assert automation["disposition"] == "return_for_rework"
+    assert "mechanically_failing_candidate" in automation["reason"]
+
+
+def test_missing_required_output_alone_short_circuits(tmp_path: Path) -> None:
+    """The 8.4% unwired/required-output-unchanged class is mechanical too."""
+    manager, _driver, result = _drive(
+        tmp_path, "missing.sqlite",
+        deterministic_verification=_verdict(failed=0, missing=3),
+    )
+
+    assert manager.launches == []
+    assert result.failed == 1
+    reason = review_lifecycle.rows_for_test(tmp_path / "missing.sqlite")[0]["failure_reason"]
+    assert "missing_required_output_count=3" in reason
+
+
+def test_verdict_on_terminal_review_is_read_like_core_reads_it(tmp_path: Path) -> None:
+    """core.py prefers terminal_review's copy; so must the queue."""
+    manager, _driver, result = _drive(
+        tmp_path, "nested.sqlite",
+        terminal_review={"deterministic_verification": _verdict()},
+    )
+
+    assert manager.launches == []
+    assert result.failed == 1
+
+
+def test_absent_verdict_still_launches_the_reviewer(tmp_path: Path) -> None:
+    """No verdict is not a failing verdict. It is no measurement at all."""
+    manager, _driver, result = _drive(tmp_path, "absent.sqlite")
+
+    assert len(manager.launches) == 1, "an unmeasured candidate must be reviewed"
+    assert result.completed == 1
+
+
+def test_nothing_measured_verdict_still_launches_the_reviewer(tmp_path: Path) -> None:
+    """The exact inversion the fail-closed doctrine forbids.
+
+    ``nothing_measured`` means no validation ran and no required output was
+    checked. Short-circuiting on it would silently convert "we did not
+    measure" into "it passed" -- and it is precisely the candidate that most
+    needs a human-grade review.
+    """
+    manager, _driver, result = _drive(
+        tmp_path, "vacuum.sqlite",
+        deterministic_verification=_verdict(
+            nothing_measured=True, failed=0, missing=0
+        ),
+    )
+
+    assert len(manager.launches) == 1
+    assert result.completed == 1
+
+
+def test_nothing_measured_still_launches_even_with_a_nonzero_count(
+    tmp_path: Path,
+) -> None:
+    """A self-contradicting verdict is unreadable, so it gets a reviewer."""
+    manager, _driver, result = _drive(
+        tmp_path, "contradiction.sqlite",
+        deterministic_verification=_verdict(nothing_measured=True, failed=5),
+    )
+
+    assert len(manager.launches) == 1
+    assert result.completed == 1
+
+
+def test_stale_verdict_from_another_claim_still_launches_the_reviewer(
+    tmp_path: Path,
+) -> None:
+    """A verdict about a PREVIOUS attempt must never decide this one.
+
+    The chain is bound to claim_epoch 1; this verdict was recorded against
+    claim_epoch 0, so it is evidence about code that has since been reworked.
+    """
+    manager, _driver, result = _drive(
+        tmp_path, "stale.sqlite",
+        deterministic_verification=_verdict(claim_epoch="0"),
+    )
+
+    assert len(manager.launches) == 1
+    assert result.completed == 1
+
+
+@pytest.mark.parametrize(
+    ("label", "verdict"),
+    [
+        ("not_a_mapping", "evidence_verdict_failed"),
+        ("empty", {}),
+        ("applicable_missing", {"pass": False, "claim_epoch": "1"}),
+        ("applicable_false", _verdict(applicable=False)),
+        ("applicable_truthy_not_true", _verdict(applicable=1)),
+        ("pass_missing", {"applicable": True, "claim_epoch": "1"}),
+        ("pass_none", _verdict(passed=None)),
+        ("pass_true", _verdict(passed=True)),
+        ("evidence_verdict_missing", {
+            "applicable": True, "pass": False, "claim_epoch": "1",
+        }),
+        ("evidence_verdict_not_a_mapping", {
+            "applicable": True, "pass": False, "claim_epoch": "1",
+            "evidence_verdict": [1, 2, 3],
+        }),
+        ("nothing_measured_missing", {
+            "applicable": True, "pass": False, "claim_epoch": "1",
+            "evidence_verdict": {"failed_validation_count": 4},
+        }),
+        ("counts_all_zero", _verdict(failed=0, missing=0)),
+        ("count_is_a_bool", _verdict(failed=True, missing=False)),
+        ("count_is_a_string", _verdict(failed="7", missing="0")),
+        ("count_is_negative", _verdict(failed=-3, missing=0)),
+        ("count_is_a_float", _verdict(failed=2.0, missing=0)),
+    ],
+)
+def test_unreadable_or_unmeasured_verdicts_always_launch(
+    tmp_path: Path, label: str, verdict: object
+) -> None:
+    """Every ambiguous shape falls through to a real review.
+
+    None of these is a positive, explicit, measured mechanical failure, so
+    none of them may spend a card's review. When in doubt, launch.
+    """
+    manager, _driver, result = _drive(
+        tmp_path, f"fallthrough-{label}.sqlite",
+        deterministic_verification=verdict,
+    )
+
+    assert len(manager.launches) == 1, f"{label} must still be reviewed"
+    assert result.completed == 1
+
+
+def test_mechanical_verdict_never_overrides_an_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    """Identity is checked first; a verdict cannot mask a tampered card."""
+    manager, _driver, result = _drive(
+        tmp_path, "identity-first.sqlite",
+        candidate_sha256="c" * 64,
+        deterministic_verification=_verdict(),
+    )
+
+    assert manager.launches == []
+    assert result.failed == 1
+    reason = review_lifecycle.rows_for_test(
+        tmp_path / "identity-first.sqlite"
+    )[0]["failure_reason"]
+    assert "target_candidate_identity_invalid" in reason
+    assert "mechanically_failing_candidate" not in reason
+
+
+def test_mechanical_verdict_is_not_read_before_the_card_is_review_ready(
+    tmp_path: Path,
+) -> None:
+    """A still-running card's verdict describes an unfinished attempt."""
+    manager, _driver, result = _drive(
+        tmp_path, "not-ready.sqlite",
+        deterministic_verification=_verdict(),
+    )
+    assert result.failed == 1  # sanity: review_ready by default
+
+    manager2 = _Manager(tmp_path)
+    manager2.target_status = _target_status(
+        state="processing", deterministic_verification=_verdict()
+    )
+    driver2 = review_orchestrator.ReviewOrchestrator(
+        manager2, db_path=tmp_path / "processing.sqlite", route_selector=_route
+    )
+    driver2.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    pending = driver2.drain(max_actions=1, now=NOW)
+
+    assert pending.pending == 1, "not-ready must defer, not mechanically reject"
+    assert manager2.launches == []
+    assert manager2.events[-1]["review_automation"]["reason"] == "target_not_review_ready"
+
+
+def test_mechanical_failure_reason_is_pure_and_total() -> None:
+    """The predicate never raises and never mutates, on any input."""
+    reason = review_orchestrator.mechanical_failure_reason
+    for hostile in (None, "", 0, [], (), object(), {"terminal_review": 5}):
+        assert reason(hostile, "1") == ""
+    card = {"deterministic_verification": _verdict()}
+    snapshot = json.dumps(card, sort_keys=True)
+    assert reason(card, "1").startswith("mechanically_failing_candidate:")
+    assert json.dumps(card, sort_keys=True) == snapshot, "input was mutated"
+    # An empty bound epoch must never match a recorded one.
+    assert reason(card, "") == ""
+
+
+def test_unknown_readiness_outcome_never_falls_through_to_a_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed on a readiness vocabulary the launch branch cannot read."""
+    manager = _Manager(tmp_path)
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "unknown.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    monkeypatch.setattr(
+        review_orchestrator.ReviewOrchestrator,
+        "_launch_readiness",
+        lambda self, action: {"outcome": "a_new_idea", "reason": "whatever"},
+    )
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert manager.launches == []
+    assert result.failed == 1
+    reason = review_lifecycle.rows_for_test(tmp_path / "unknown.sqlite")[0]["failure_reason"]
+    assert "launch_readiness_outcome_unknown:a_new_idea" in reason
+
+
+# --- returning the mechanically failing card for rework -----------------------
+#
+# Refusing to spend a reviewer is only half the fix: the card still has to
+# LEAVE review, or the manager has to dispose of every one of them by hand.
+# The orchestrator has no canonical write surface of its own -- importing core
+# here would be circular -- so it asks the manager, which delegates to
+# core.reject_review. Every test below is about the half that can go wrong: a
+# rejection that is refused, that raises, or that the manager cannot perform at
+# all. The one outcome none of them may produce is a card that left review with
+# nothing saying why, or a card believed returned that was not.
+
+
+class _RejectingManager(_Manager):
+    """A manager whose ``reject_review`` really returns the card to pending."""
+
+    def __init__(
+        self, repo: Path, *, result: object = None, raises: bool = False
+    ) -> None:
+        super().__init__(repo)
+        self.rejects: list[tuple] = []
+        self.card = {"task_id": "TARGET", "status": "review", "worker_status": "review"}
+        self._result = result
+        self._raises = raises
+
+    def reject_review(self, task_id, reason, *, to="pending"):
+        self.rejects.append((task_id, reason, to))
+        if self._raises:
+            raise RuntimeError("canonical store is locked")
+        if self._result is not None:
+            return self._result
+        self.card = {"task_id": task_id, "status": to, "worker_status": "unclaimed"}
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout": json.dumps(self.card),
+            "task_id": task_id,
+            "to": to,
+            "learning_commit_owed": {"outcome": "rejected"},
+        }
+
+
+def _drive_rejecting(tmp_path: Path, db: str, manager, monkeypatch, **card_overrides):
+    """Drive one mechanically failing chain against a live-ish card reader."""
+    monkeypatch.setattr(
+        review_orchestrator.task_engine,
+        "show_task",
+        lambda _repo, task_id: (
+            {"returncode": 0, "stdout": json.dumps(manager.card)}
+            if task_id == "TARGET"
+            else {"returncode": 1, "stdout": ""}
+        ),
+    )
+    manager.target_status = _target_status(
+        deterministic_verification=_verdict(), **card_overrides
+    )
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / db, route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+    return driver
+
+
+def _failure_reason(db_path: Path) -> str:
+    return str(review_lifecycle.rows_for_test(db_path)[0]["failure_reason"] or "")
+
+
+def test_a_mechanically_failing_candidate_is_returned_to_pending_for_rework(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The card leaves review by itself, with the measurement as its reason."""
+    manager = _RejectingManager(tmp_path)
+    driver = _drive_rejecting(tmp_path, "returned.sqlite", manager, monkeypatch)
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert manager.launches == [], "a measured red candidate must not be reviewed"
+    assert len(manager.rejects) == 1, "exactly one rejection, never a retry storm"
+    task_id, reason, to = manager.rejects[0]
+    assert task_id == "TARGET"
+    assert to == "pending", "rework, not blocked -- blocked is not a quality signal"
+    # The reason handed to the canonical store is the measurement itself.
+    assert reason.startswith("mechanically_failing_candidate:")
+    assert "failed_validation_count=2" in reason
+    assert manager.card["status"] == "pending"
+
+    # Both durable surfaces still explain the transition.
+    assert result.failed == 1
+    outbox = _failure_reason(tmp_path / "returned.sqlite")
+    assert "failed_validation_count=2" in outbox
+    assert "returned_for_rework=returned" in outbox
+    automation = manager.events[-1]["review_automation"]
+    assert automation["rework_return"] == {"state": "returned", "detail": "pending"}
+    assert automation["disposition"] == "return_for_rework"
+
+
+def test_a_refused_rejection_still_records_the_reason_and_keeps_the_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejection that did not happen must never be reported as one.
+
+    core refuses any move whose row is not still ``worker_status='review'``.
+    When it does, the card stays exactly where it was and the manager disposes
+    of it -- which costs one reviewer launch. Believing a refused rejection
+    instead would leave the card in review with the chain saying it left, and
+    a reader would have no way to tell. The refusal detail is carried verbatim.
+    """
+    manager = _RejectingManager(
+        tmp_path,
+        result={
+            "ok": False,
+            "returncode": 1,
+            "stderr": "reject_not_reviewable:task_id=TARGET",
+            "error": "reject_not_reviewable:task_id=TARGET",
+        },
+    )
+    driver = _drive_rejecting(tmp_path, "refused.sqlite", manager, monkeypatch)
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert len(manager.rejects) == 1
+    assert manager.card["status"] == "review", "a refused rejection moves nothing"
+    assert manager.launches == []
+    assert result.failed == 1
+    outbox = _failure_reason(tmp_path / "refused.sqlite")
+    assert "failed_validation_count=2" in outbox, "the measurement is never lost"
+    assert "returned_for_rework=refused" in outbox
+    assert "reject_not_reviewable:task_id=TARGET" in outbox
+    assert manager.events[-1]["review_automation"]["rework_return"]["state"] == "refused"
+
+
+def test_a_raising_rejection_is_a_refusal_and_never_a_lost_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store fault must not replace the mechanical reason with a traceback."""
+    manager = _RejectingManager(tmp_path, raises=True)
+    driver = _drive_rejecting(tmp_path, "raising.sqlite", manager, monkeypatch)
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert manager.card["status"] == "review"
+    assert manager.launches == []
+    assert result.failed == 1
+    outbox = _failure_reason(tmp_path / "raising.sqlite")
+    assert "failed_validation_count=2" in outbox
+    assert "returned_for_rework=error" in outbox
+    assert "RuntimeError" in outbox
+    assert manager.events[-1]["review_automation"]["rework_return"]["state"] == "error"
+
+
+def test_a_manager_with_no_reject_surface_still_records_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The short-circuit predates the reject surface and must outlive its absence."""
+    manager = _Manager(tmp_path)
+    manager.card = {"task_id": "TARGET", "status": "review"}
+    driver = _drive_rejecting(tmp_path, "no-surface.sqlite", manager, monkeypatch)
+    assert not hasattr(manager, "reject_review")
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert manager.launches == []
+    assert result.failed == 1
+    outbox = _failure_reason(tmp_path / "no-surface.sqlite")
+    assert "failed_validation_count=2" in outbox
+    assert "returned_for_rework=unavailable" in outbox
+
+
+def test_a_reviewable_candidate_is_never_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One-directional in both halves: no verdict means review, never reject.
+
+    The rejection is reachable ONLY from a positive, measured, in-epoch
+    mechanical failure. Every other card gets its reviewer, and none of them
+    may be moved out of review by this queue.
+    """
+    manager = _RejectingManager(tmp_path)
+    monkeypatch.setattr(
+        review_orchestrator.task_engine,
+        "show_task",
+        lambda _repo, _task_id: {"returncode": 0, "stdout": json.dumps(manager.card)},
+    )
+    manager.target_status = _target_status()  # no deterministic verdict at all
+    driver = review_orchestrator.ReviewOrchestrator(
+        manager, db_path=tmp_path / "healthy.sqlite", route_selector=_route
+    )
+    driver.ensure_chain(
+        target_task_id="TARGET", target_request_id="target-request", claim_epoch=1,
+        packet_sha256="a" * 64, candidate_sha256="b" * 64, now=NOW,
+    )
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.completed == 1
+    assert len(manager.launches) == 1
+    assert manager.rejects == [], "an unmeasured candidate is reviewed, not rejected"
+    assert manager.card["status"] == "review"
+
+
+def test_a_raising_event_surface_never_replaces_the_mechanical_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The outbox row must carry the measurement even if the event write fails.
+
+    _record_mechanical_rework is documented best-effort, but it only handled a
+    manager with NO event surface. One that raises let the append error escape
+    and become the outbox failure_reason, erasing the very explanation the
+    method exists to record.
+    """
+    manager = _RejectingManager(tmp_path)
+
+    def _boom(_event):
+        raise OSError("event log is full")
+
+    monkeypatch.setattr(manager, "_append_event", _boom)
+    driver = _drive_rejecting(tmp_path, "noisy-events.sqlite", manager, monkeypatch)
+
+    result = driver.drain(max_actions=1, now=NOW)
+
+    assert result.failed == 1
+    outbox = _failure_reason(tmp_path / "noisy-events.sqlite")
+    assert "failed_validation_count=2" in outbox
+    assert "returned_for_rework=returned" in outbox
+    assert "event log is full" not in outbox
+    assert manager.card["status"] == "pending", "the rejection still happened"
+
+
+def test_returning_a_target_to_pending_does_not_retire_the_rest_of_its_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Measured, not assumed: a returned card does NOT drain its own chain.
+
+    ``reject_review(to="pending")`` moves the target out of ``review``, but
+    ``pending`` is deliberately inside REVIEWABLE_TARGET_STATUSES -- it is a
+    status a target can still be driven through review FROM -- so
+    ``_target_left_review`` reads "" and cannot retire the queued actions. The
+    launch action fails with the mechanical reason and the remaining eleven
+    stay parked, exactly as they did before any rejection existed.
+
+    Pinned here rather than "fixed", because forcing the retirement would
+    carry the chain on to ``needfix_close``, which resolves every linked
+    NeedFix row with "automatic review lifecycle accepted and archived task
+    <id>". That sentence is false about a card that was REJECTED. Trading a
+    parked chain for a fabricated acceptance record is not an improvement,
+    and this repository's worst defect class is exactly the state transition
+    whose record does not match what happened.
+    """
+    assert "pending" in review_orchestrator.REVIEWABLE_TARGET_STATUSES
+    manager = _RejectingManager(tmp_path)
+    driver = _drive_rejecting(tmp_path, "chain.sqlite", manager, monkeypatch)
+
+    first = driver.drain(max_actions=12, now=NOW)
+
+    assert manager.card["status"] == "pending", "the target did leave review"
+    assert driver._target_left_review("TARGET") == "", (
+        "pending is still a drivable status, so nothing is retired"
+    )
+    assert first.attempted == 1 and first.failed == 1
+    rows = review_lifecycle.rows_for_test(tmp_path / "chain.sqlite")
+    assert [row["state"] for row in rows] == ["failed"] + ["pending"] * 11
+
+    # And the chain is genuinely parked: a second pass reserves nothing.
+    assert driver.drain(max_actions=12, now=NOW).attempted == 0

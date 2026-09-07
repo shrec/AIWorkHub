@@ -42,6 +42,7 @@ record round-trips byte-for-byte with both digests unchanged.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import sqlite3
@@ -438,11 +439,102 @@ def list_records(
     return [_row_to_record(row) for row in rows]
 
 
+def stored_state_digest(
+    repo_root: str | Path, identity: str, version: str
+) -> str | None:
+    """Return the ``state_digest`` column of one stored row, or ``None``.
+
+    :func:`state_digest` recomputes the token from a record in memory, which is
+    the right token only while the loaded record is byte-identical to the stored
+    row. :func:`load_registry` may adopt a persisted ``active`` record whose own
+    evidence does not support activation as ``proposed`` instead, so the record a
+    caller holds is deliberately NOT the stored payload and its recomputed token
+    would never match. This reads the token the row actually carries, so a
+    compare-and-swap advance still refuses a genuine concurrent write while a
+    demoted record stays advanceable.
+    """
+    path = _db_path(repo_root)
+    if not path.exists():
+        return None
+    conn = connect_readonly(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT state_digest FROM skill_records WHERE identity=? AND version=?",
+            (identity, version),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return str(row["state_digest"])
+
+
+def activation_supported(record: SkillRecord, min_accepted_evidence: int = 2) -> bool:
+    """Whether a record's OWN evidence still supports an ``active`` lifecycle.
+
+    The stored digests are unkeyed and live beside the payload they cover, so
+    they detect corruption and hand-editing, never a forged record (see this
+    module's docstring). This check is a different question and one the digests
+    cannot answer even in principle: does the evidence the record itself carries
+    meet the activation rule that is in force NOW? A record activated under an
+    earlier, weaker reading of independence answers no.
+    """
+    if record.lifecycle_state is not skill_registry.LifecycleState.ACTIVE:
+        return True
+    if skill_registry.unresolved_negative_evidence(record):
+        return False
+    count = skill_registry.independent_accepted_evidence_count(record)
+    return count >= min_accepted_evidence
+
+
+def audit_active_records(
+    repo_root: str | Path,
+    *,
+    min_accepted_evidence: int = 2,
+    limit: int = DEFAULT_LOAD_LIMIT,
+) -> list[dict[str, Any]]:
+    """Report every persisted ``active`` record against the activation rule.
+
+    Read-only and non-mutating: it never rewrites a row, so an unverified
+    activation is surfaced for a manager to act on rather than repaired behind
+    their back. Each entry names the canonical actor identities the activation
+    actually rests on, which is the fact a raw ``accepted_count`` hides.
+    """
+    report: list[dict[str, Any]] = []
+    for record in list_records(repo_root, limit=limit):
+        if record.lifecycle_state is not skill_registry.LifecycleState.ACTIVE:
+            continue
+        actors = skill_registry.independent_accepted_actor_ids(record)
+        report.append(
+            {
+                "identity": record.identity,
+                "version": record.version,
+                "accepted_count": record.accepted_count,
+                "independent_accepted_actors": len(actors),
+                "actor_ids": list(actors),
+                "raw_actor_ids": sorted(
+                    {
+                        item.actor_id
+                        for item in record.evidence
+                        if item.outcome is skill_registry.EvidenceOutcome.ACCEPTED
+                    }
+                ),
+                "min_accepted_evidence": int(min_accepted_evidence),
+                "verified": activation_supported(record, min_accepted_evidence),
+            }
+        )
+    return report
+
+
 def load_registry(
     repo_root: str | Path,
     *,
     min_accepted_evidence: int = 2,
     limit: int = DEFAULT_LOAD_LIMIT,
+    demote_unverified_active: bool = True,
 ) -> SkillRegistry:
     """Load persisted records into a :class:`SkillRegistry`.
 
@@ -450,9 +542,30 @@ def load_registry(
     so the dashboard never fails on a repository that has no skills. A stored
     record whose digest is tampered still fails closed (via :func:`list_records`)
     -- it is dropped from no registry, it aborts the whole load.
+
+    A stored ``active`` record whose own evidence does not meet the activation
+    rule in force is adopted as ``proposed`` instead. It is loaded, not lost:
+    every content field, evidence entry and counter is preserved and the content
+    digest is unchanged, because ``lifecycle_state`` is runtime state and not a
+    content field. Only its eligibility changes, and only in the safe direction
+    -- :func:`skill_registry.select` serves ACTIVE records exclusively, so a
+    record that self-certified under a weaker reading of independence stops
+    being injected into worker context while it stays fully available for a
+    manager to re-evaluate, re-evidence and legitimately re-activate. The stored
+    row is NOT rewritten by this; use :func:`audit_active_records` to see it.
+
+    ``demote_unverified_active=False`` loads the persisted lifecycle verbatim.
+    It exists for audit and migration callers that must observe the stored state
+    exactly as written, and must not be used to serve runtime selection.
     """
     registry = SkillRegistry(min_accepted_evidence=min_accepted_evidence)
     for record in list_records(repo_root, limit=limit):
+        if demote_unverified_active and not activation_supported(
+            record, min_accepted_evidence
+        ):
+            record = dataclasses.replace(
+                record, lifecycle_state=skill_registry.LifecycleState.PROPOSED
+            )
         # These records were reconstructed and digest-verified on read; adopt them
         # through the public API rather than ``propose`` (which admits only
         # evidence-free proposed records and would reject a persisted

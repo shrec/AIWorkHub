@@ -208,13 +208,31 @@ class TestPromotionEligibility:
         )
         assert c.promotion_eligible_ai_memory is True
 
-    def test_rejected_disallows_promotion(self):
-        with pytest.raises(ValueError, match="requires outcome ACCEPTED"):
-            LearningCommit(
-                task_id="t", repo_area="r", outcome=Outcome.REJECTED,
-                evidence_ids=["file:ev.json"],
-                promotion_eligible_ai_memory=True,
-            )
+    def test_rejected_with_evidence_allows_memory_and_kb_promotion(self):
+        """A rejection is an adjudicated outcome and AI Memory / KB are two of
+        the three stores a worker bundle reads back; barring REJECTED by
+        outcome made the loop's richest defect evidence unreachable there by
+        construction.  The evidence requirement is unchanged.
+        """
+        c = LearningCommit(
+            task_id="t", repo_area="r", outcome=Outcome.REJECTED,
+            evidence_ids=["file:ev.json"],
+            promotion_eligible_ai_memory=True,
+            promotion_eligible_kb=True,
+        )
+        assert c.promotion_eligible_ai_memory is True
+        assert c.promotion_eligible_kb is True
+
+    def test_rejected_promotion_still_requires_evidence(self):
+        """Widening WHICH outcomes may promote never weakens WHAT promotion
+        demands: the evidence requirement is the authority boundary.
+        """
+        for field_name in ("promotion_eligible_ai_memory", "promotion_eligible_kb"):
+            with pytest.raises(ValueError, match="requires at least one evidence_id"):
+                LearningCommit(
+                    task_id="t", repo_area="r", outcome=Outcome.REJECTED,
+                    **{field_name: True},
+                )
 
     def test_inconclusive_disallows_promotion(self):
         with pytest.raises(ValueError, match="requires outcome ACCEPTED"):
@@ -223,6 +241,20 @@ class TestPromotionEligibility:
                 evidence_ids=["file:ev.json"],
                 promotion_eligible_context_graph=True,
             )
+
+    def test_inconclusive_disallows_memory_and_kb_promotion(self):
+        """INCONCLUSIVE records that no judgement was reached, so it promotes
+        nowhere -- widening the gate covers REJECTED only.
+        """
+        for field_name in ("promotion_eligible_ai_memory", "promotion_eligible_kb"):
+            with pytest.raises(
+                ValueError, match="requires outcome ACCEPTED or REJECTED"
+            ):
+                LearningCommit(
+                    task_id="t", repo_area="r", outcome=Outcome.INCONCLUSIVE,
+                    evidence_ids=["file:ev.json"],
+                    **{field_name: True},
+                )
 
     def test_promotion_without_evidence_rejected(self):
         with pytest.raises(ValueError, match="requires at least one evidence_id"):
@@ -238,13 +270,24 @@ class TestPromotionEligibility:
         )
         assert c.outcome == Outcome.ACCEPTED
 
-    def test_context_graph_promotion_same_gating(self):
-        with pytest.raises(ValueError):
-            LearningCommit(
-                task_id="t", repo_area="r", outcome=Outcome.REJECTED,
-                evidence_ids=["file:x"],
-                promotion_eligible_context_graph=True,
-            )
+    def test_context_graph_promotion_stays_accepted_only(self):
+        """A Context Graph edge is a causal assertion traversed transitively by
+        later readers, and only the accept path forces a canonical
+        FIXED_AND_VERIFIED acceptance reference into ``evidence_ids``.  On a
+        rejection every evidence id is caller-supplied and ``EdgeCandidate``
+        carries no evidence level of its own, so this outcome gate is the only
+        remaining check and must not move with the other two.
+        """
+        for outcome in (Outcome.REJECTED, Outcome.INCONCLUSIVE):
+            with pytest.raises(
+                ValueError,
+                match="promotion_eligible_context_graph requires outcome ACCEPTED$",
+            ):
+                LearningCommit(
+                    task_id="t", repo_area="r", outcome=outcome,
+                    evidence_ids=["file:x"],
+                    promotion_eligible_context_graph=True,
+                )
 
 
 class TestCrossRepoValidation:

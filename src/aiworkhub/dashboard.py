@@ -35,6 +35,7 @@ from aiworkhub import (
     process_launcher,
     repo_policy,
     source_graph_daemon,
+    sqlite_readonly,
     storage_observability,
     task_plan,
     task_store,
@@ -61,6 +62,84 @@ ACTIVE_STATUSES = ("pending", "processing", "review")
 # for exact whole-queue totals -- independent of any bounded row limit.
 ALL_CANONICAL_STATUSES = ("pending", "processing", "review", "blocked", "superseded", "finished", "archived")
 _CODING_FOUNDATION_KEYS = ("development_rules", "skills", "tool_recipes")
+
+# Reviewer children are launched by the quality-review machinery to review a
+# work card; they are machine lifecycle, not delivered work. ``cost_ledger``
+# already treats this topic as the reviewer role
+# ("quality_review_topic_is_reviewer_otherwise_worker") and ``dashboard_kpis``
+# already excludes it from actionable review_ready; ``work_card_outcomes``
+# applies the same rule to the accept/reject series.
+WORK_CARD_EXCLUDED_TOPICS = ("quality_review",)
+WORK_CARD_OUTCOMES_SCHEMA_ID = "aiworkhub.dashboard.work_card_outcomes.v1"
+# Bound the ledger scan so one dashboard refresh can never materialize an
+# unbounded decision history.
+WORK_CARD_DECISION_EVENT_LIMIT = 200_000
+
+# A card's topic lives in the ``tasks`` row, falling back to the stored card
+# JSON -- the same expression ``task_store.list_tasks`` uses.
+_TASK_TOPIC_SQL = "COALESCE(NULLIF(t.topic, ''), json_extract(t.card_json, '$.topic'), '')"
+# A missing ``tasks`` row means the population cannot be established. It is
+# reported as ``unknown_topic``, never folded into the work-card series.
+_DECISION_POPULATION_SQL = f"""
+    CASE
+        WHEN t.task_id IS NULL THEN 'unknown_topic'
+        WHEN {_TASK_TOPIC_SQL} = ? THEN 'reviewer_child'
+        ELSE 'work_card'
+    END
+"""
+# Only these rows are review decisions. An archived/superseded row counts as a
+# rejection solely when its durable reason is a ``reject_review:`` disposition
+# -- identical to ``task_store.latest_manager_decisions``.
+_DECISION_ROW_SQL = """
+    event IN ('accept_review', 'reject_review')
+    OR (
+        event IN ('archived', 'superseded')
+        AND json_extract(payload_json, '$.reason') LIKE 'reject_review:%'
+    )
+"""
+# One vote per DISTINCT card: its most recent qualifying decision.
+_WORK_CARD_DECISION_CARD_SQL = f"""
+WITH decision_events AS (
+    SELECT task_id, event_id, event
+    FROM task_events
+    WHERE {_DECISION_ROW_SQL}
+    ORDER BY event_id DESC
+    LIMIT ?
+),
+latest_decision AS (
+    SELECT d.task_id, d.event
+    FROM decision_events d
+    JOIN (
+        SELECT task_id, MAX(event_id) AS event_id
+        FROM decision_events GROUP BY task_id
+    ) newest ON newest.task_id = d.task_id AND newest.event_id = d.event_id
+)
+SELECT
+    {_DECISION_POPULATION_SQL} AS population,
+    SUM(CASE WHEN l.event = 'accept_review' THEN 1 ELSE 0 END) AS accepted,
+    SUM(CASE WHEN l.event <> 'accept_review' THEN 1 ELSE 0 END) AS rejected
+FROM latest_decision l
+LEFT JOIN tasks t ON t.task_id = l.task_id
+GROUP BY population
+"""
+# The same population under the OLD per-event rule, so the payload can state
+# its own inflation factor instead of asking a reader to assume one.
+_WORK_CARD_DECISION_EVENT_SQL = f"""
+WITH decision_events AS (
+    SELECT task_id, event_id, event
+    FROM task_events
+    WHERE {_DECISION_ROW_SQL}
+    ORDER BY event_id DESC
+    LIMIT ?
+)
+SELECT
+    {_DECISION_POPULATION_SQL} AS population,
+    SUM(CASE WHEN e.event = 'accept_review' THEN 1 ELSE 0 END) AS accepted,
+    SUM(CASE WHEN e.event <> 'accept_review' THEN 1 ELSE 0 END) AS rejected
+FROM decision_events e
+LEFT JOIN tasks t ON t.task_id = e.task_id
+GROUP BY population
+"""
 _DIGEST_PREFIX_LEN = 12
 _PROJECTION_LIST_LIMIT = 8
 _PROJECTION_TEXT_LIMIT = 80
@@ -1991,8 +2070,86 @@ class DashboardProvider:
         return exact_status_counts(self.repo_root)
 
     def get_manager_decision_counts(self) -> dict[str, int]:
-        """Exact explicit accept/reject totals from canonical task events."""
+        """Exact explicit accept/reject totals from canonical task events.
+
+        Counts decision EVENTS across every topic, including reviewer
+        children. Kept exactly as-is because ``outcome_counts`` and the KPI
+        headline are defined on it; see ``get_work_card_decision_counts`` for
+        the per-distinct-work-card series.
+        """
         return task_store.manager_decision_counts(self.repo_root)
+
+    def get_work_card_decision_counts(self) -> dict[str, Any]:
+        """Latest review decision per DISTINCT card, split by population.
+
+        Returns one bounded aggregate row set -- never task rows -- so a
+        dashboard refresh stays small. Three populations are reported
+        separately and never summed into one work-card figure:
+
+        * ``work_cards``       -- delivered work (topic not in
+          ``WORK_CARD_EXCLUDED_TOPICS``)
+        * ``reviewer_children`` -- ``topic='quality_review'``, the reviewer
+          lifecycle
+        * ``unknown_topic_cards`` -- a decision whose ``tasks`` row is gone,
+          so its population cannot be established; never silently counted as
+          work.
+
+        ``work_card_events`` repeats the work-card population under the OLD
+        per-event rule so the payload carries the inflation factor itself.
+
+        Decision semantics match ``task_store.latest_manager_decisions``: an
+        ``archived``/``superseded`` row counts as a rejection only when its
+        durable reason is a ``reject_review:`` disposition; other lifecycle
+        archival is not a quality judgment.
+        """
+        readiness = task_store.storage_readiness(self.repo_root)
+        if not getattr(readiness, "ready", False):
+            return {
+                "measured": False,
+                "reason": str(getattr(readiness, "reason", "storage_not_ready")),
+            }
+        conn = sqlite_readonly.connect_readonly(
+            task_store.canonical_db_path(self.repo_root)
+        )
+        try:
+            conn.row_factory = None
+            card_rows = conn.execute(
+                _WORK_CARD_DECISION_CARD_SQL,
+                (WORK_CARD_DECISION_EVENT_LIMIT, WORK_CARD_EXCLUDED_TOPICS[0]),
+            ).fetchall()
+            event_rows = conn.execute(
+                _WORK_CARD_DECISION_EVENT_SQL,
+                (WORK_CARD_DECISION_EVENT_LIMIT, WORK_CARD_EXCLUDED_TOPICS[0]),
+            ).fetchall()
+        finally:
+            conn.close()
+        populations = {
+            "work_card": "work_cards",
+            "reviewer_child": "reviewer_children",
+            "unknown_topic": "unknown_topic_cards",
+        }
+        result: dict[str, Any] = {
+            "measured": True,
+            "decision_event_limit": WORK_CARD_DECISION_EVENT_LIMIT,
+            "work_cards": {"accepted": 0, "rejected": 0},
+            "reviewer_children": {"accepted": 0, "rejected": 0},
+            "unknown_topic_cards": {"accepted": 0, "rejected": 0},
+            "work_card_events": {"accepted": 0, "rejected": 0},
+        }
+        for population, accepted, rejected in card_rows:
+            key = populations.get(str(population))
+            if key is not None:
+                result[key] = {
+                    "accepted": int(accepted or 0),
+                    "rejected": int(rejected or 0),
+                }
+        for population, accepted, rejected in event_rows:
+            if str(population) == "work_card":
+                result["work_card_events"] = {
+                    "accepted": int(accepted or 0),
+                    "rejected": int(rejected or 0),
+                }
+        return result
 
     def get_needfix_snapshot(self) -> dict[str, Any]:
         """NeedFix view derived from this dashboard snapshot's task cards."""
@@ -3153,6 +3310,222 @@ def _coding_foundation_projections(
     }
 
 
+# ---------------------------------------------------------------------------
+# Work-card outcome accounting
+#
+# ``outcome_counts.accepted``/``rejected`` come from
+# ``task_store.manager_decision_counts``, which counts decision EVENTS across
+# EVERY topic.  Two distortions follow from that, and both were measured on
+# the canonical store:
+#
+#   1. Reviewer-child tasks (``topic='quality_review'``) are machine
+#      lifecycle, not delivered work, yet their accept_review rows land in the
+#      same numerator.  529 of the 870 recorded accepts -- 60.8% -- are
+#      reviewer children.  When those children stopped being closed with
+#      accept_review, the published acceptance figure fell off a cliff while
+#      real delivery was unchanged.
+#   2. One card rejected N times contributes N data points.  On the canonical
+#      store 2,621 work-card reject events came from 805 distinct rejected
+#      cards -- a 3.3x multiplier on the denominator of a "quality" rate.
+#
+# ``work_card_outcomes`` is the corrected series: one vote per distinct card,
+# reviewer children reported separately rather than mixed in.  It never
+# renames or renumbers ``outcome_counts``; it names that field's distortion
+# so a reader cannot mistake one for the other.
+# ---------------------------------------------------------------------------
+
+
+def _decision_series(
+    accepted: Any,
+    rejected: Any,
+    *,
+    counting_unit: str,
+) -> dict[str, Any]:
+    """One decision series with its denominator and rate stated explicitly.
+
+    ``acceptance_rate`` is ``None`` -- never ``0.0`` -- when nothing was
+    decided, and ``acceptance_rate_available`` says which of the two it is.
+    A zero rate and an absent rate are different facts.
+    """
+    accepted_count = _bounded_int(accepted)
+    rejected_count = _bounded_int(rejected)
+    decided = accepted_count + rejected_count
+    return {
+        "accepted": accepted_count,
+        "rejected": rejected_count,
+        "decided": decided,
+        "counting_unit": counting_unit,
+        "acceptance_rate": (
+            round(100.0 * accepted_count / decided, 2) if decided else None
+        ),
+        "acceptance_rate_available": decided > 0,
+    }
+
+
+def _work_card_outcomes_unmeasured(
+    reason: str,
+    *,
+    event_counted_outcomes: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Unmeasured work-card outcomes: unknown, explicitly not zero.
+
+    Every count is ``None`` rather than ``0`` so an unavailable provider, a
+    failed read or unready storage can never render as "no work was
+    ``absent_metrics_are_unknown_not_zero`` contract.  The distorted fields
+    are still named with their current values, so a reader can see what the
+    dashboard is showing even when the corrected series is unavailable.
+    """
+    return {
+        "schema_id": WORK_CARD_OUTCOMES_SCHEMA_ID,
+        "measured": False,
+        "reason": str(reason or "unknown"),
+        "absent_metrics_are_unknown_not_zero": True,
+        "excluded_topics": list(WORK_CARD_EXCLUDED_TOPICS),
+        "work_cards": {
+            "accepted": None,
+            "rejected": None,
+            "decided": None,
+            "counting_unit": "distinct_card_latest_decision",
+            "acceptance_rate": None,
+            "acceptance_rate_available": False,
+        },
+        "reviewer_children": {
+            "accepted": None,
+            "rejected": None,
+            "decided": None,
+            "counting_unit": "distinct_card_latest_decision",
+            "acceptance_rate": None,
+            "acceptance_rate_available": False,
+        },
+        "unknown_topic_cards": {
+            "accepted": None,
+            "rejected": None,
+            "decided": None,
+            "counting_unit": "distinct_card_latest_decision",
+            "acceptance_rate": None,
+            "acceptance_rate_available": False,
+        },
+        "work_card_events": {
+            "accepted": None,
+            "rejected": None,
+            "decided": None,
+            "counting_unit": "decision_event",
+            "acceptance_rate": None,
+            "acceptance_rate_available": False,
+        },
+        "event_to_card_multiplier": None,
+        "population_note": (
+            "work_cards excludes reviewer-child tasks with topic in "
+            f"{list(WORK_CARD_EXCLUDED_TOPICS)}; they are reported as their "
+            "own reviewer_children series and are never folded into the "
+            "work-card numerator or denominator"
+        ),
+        "related_field_distortions": _work_card_related_field_distortions(
+            event_counted_outcomes
+        ),
+    }
+
+
+def _work_card_related_field_distortions(
+    event_counted_outcomes: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Name, in the payload, which shipped fields are the distorted ones.
+
+    The correction is additive: ``outcome_counts`` and
+    ``kpi_analytics.headline.manager_acceptance_rate`` keep their existing
+    definitions so no consumer silently changes meaning.  Their definitions
+    are stated here instead, next to the corrected numbers, so a reader
+    comparing the two cannot mistake one for the other.
+    """
+    return {
+        "outcome_counts.accepted": {
+            "counting_unit": "decision_event",
+            "population": "all_topics_including_reviewer_children",
+            "value": (
+                _bounded_int(event_counted_outcomes.get("accepted"))
+                if isinstance(event_counted_outcomes, Mapping)
+                else None
+            ),
+            "corrected_by": "work_card_outcomes.work_cards.accepted",
+        },
+        "outcome_counts.rejected": {
+            "counting_unit": "decision_event",
+            "population": "all_topics_including_reviewer_children",
+            "value": (
+                _bounded_int(event_counted_outcomes.get("rejected"))
+                if isinstance(event_counted_outcomes, Mapping)
+                else None
+            ),
+            "corrected_by": "work_card_outcomes.work_cards.rejected",
+        },
+        "kpi_analytics.headline.manager_acceptance_rate": {
+            "counting_unit": "decision_event",
+            "population": "all_topics_including_reviewer_children",
+            "corrected_by": "work_card_outcomes.work_cards.acceptance_rate",
+        },
+    }
+
+
+def _work_card_outcome_projection(
+    raw: Mapping[str, Any] | None,
+    *,
+    event_counted_outcomes: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize one provider reading into the work-card outcome payload."""
+    if not isinstance(raw, Mapping):
+        return _work_card_outcomes_unmeasured(
+            "provider_unavailable",
+            event_counted_outcomes=event_counted_outcomes,
+        )
+    if not raw.get("measured", True):
+        return _work_card_outcomes_unmeasured(
+            str(raw.get("reason") or "provider_reported_unmeasured"),
+            event_counted_outcomes=event_counted_outcomes,
+        )
+
+    def series(key: str, counting_unit: str) -> dict[str, Any]:
+        bucket = raw.get(key)
+        bucket = bucket if isinstance(bucket, Mapping) else {}
+        return _decision_series(
+            bucket.get("accepted"),
+            bucket.get("rejected"),
+            counting_unit=counting_unit,
+        )
+
+    work_cards = series("work_cards", "distinct_card_latest_decision")
+    reviewer_children = series("reviewer_children", "distinct_card_latest_decision")
+    unknown_topic = series("unknown_topic_cards", "distinct_card_latest_decision")
+    work_card_events = series("work_card_events", "decision_event")
+    decided_cards = work_cards["decided"]
+    decided_events = work_card_events["decided"]
+    return {
+        "schema_id": WORK_CARD_OUTCOMES_SCHEMA_ID,
+        "measured": True,
+        "absent_metrics_are_unknown_not_zero": True,
+        "excluded_topics": list(WORK_CARD_EXCLUDED_TOPICS),
+        "decision_event_limit": _bounded_int(
+            raw.get("decision_event_limit") or WORK_CARD_DECISION_EVENT_LIMIT
+        ),
+        "work_cards": work_cards,
+        "reviewer_children": reviewer_children,
+        "unknown_topic_cards": unknown_topic,
+        "work_card_events": work_card_events,
+        # How much the old per-event denominator inflated the per-card one.
+        "event_to_card_multiplier": (
+            round(decided_events / decided_cards, 2) if decided_cards else None
+        ),
+        "population_note": (
+            "work_cards excludes reviewer-child tasks with topic in "
+            f"{list(WORK_CARD_EXCLUDED_TOPICS)}; they are reported as their "
+            "own reviewer_children series and are never folded into the "
+            "work-card numerator or denominator"
+        ),
+        "related_field_distortions": _work_card_related_field_distortions(
+            event_counted_outcomes
+        ),
+    }
+
+
 def _build_summary_snapshot(
     data_provider: Any,
     *,
@@ -3221,6 +3594,14 @@ def _build_summary_snapshot(
             "message": "manager decision counts provider returned a non-object",
         })
         manager_decision_totals = {}
+    # Per-distinct-card decisions, split by population. ``None`` (missing
+    # provider method, or a read failure) means unmeasured, not zero.
+    work_card_decision_totals = _safe_read(
+        "work_card_decision_counts",
+        getattr(data_provider, "get_work_card_decision_counts", lambda: None),
+        errors,
+        None,
+    )
 
     stale_tasks = [
         dict(item)
@@ -3270,6 +3651,8 @@ def _build_summary_snapshot(
     status_counts["active"] = sum(
         status_counts[status] for status in ACTIVE_STATUSES
     )
+    # Unchanged definition on purpose -- see the identical note in the full
+    # builder. ``work_card_outcomes`` carries the corrected series.
     outcome_counts = {
         "accepted": _bounded_int(manager_decision_totals.get("accepted")),
         "rejected": _bounded_int(manager_decision_totals.get("rejected")),
@@ -3277,6 +3660,10 @@ def _build_summary_snapshot(
         "superseded": status_counts.get("superseded", 0),
         "finished": status_counts.get("finished", 0),
     }
+    work_card_outcomes = _work_card_outcome_projection(
+        work_card_decision_totals,
+        event_counted_outcomes=outcome_counts,
+    )
 
     row_counts: dict[str, dict[str, Any]] = {}
     for status in ACTIVE_STATUSES:
@@ -3339,6 +3726,7 @@ def _build_summary_snapshot(
         },
         "status_counts": status_counts,
         "outcome_counts": outcome_counts,
+        "work_card_outcomes": work_card_outcomes,
         "row_counts": row_counts,
         "read_bounds": read_bounds,
         "warnings": {
@@ -3425,6 +3813,11 @@ def build_snapshot(
             "health": {"ok": False, "degraded": True, "provider_error_count": 0},
             "status_counts": zero_counts,
             "outcome_counts": zero_outcomes,
+            # Storage is not ready, so nothing was measured. Reporting zero
+            # accepted work cards here would read as a measured collapse.
+            "work_card_outcomes": _work_card_outcomes_unmeasured(
+                "storage_not_ready"
+            ),
             "row_counts": {
                 status: {"returned": 0, "exact": 0, "truncated": False} for status in ALL_CANONICAL_STATUSES
             },
@@ -3546,6 +3939,14 @@ def build_snapshot(
             "manager_decision_counts",
             getattr(data_provider, "get_manager_decision_counts", lambda: {}),
             {},
+        ),
+        # Separate read: per-distinct-card decisions split by population. A
+        # provider that cannot supply it yields ``None`` here, which the
+        # projection reports as unmeasured -- never as zero decisions.
+        "work_card_decision_counts": (
+            "work_card_decision_counts",
+            getattr(data_provider, "get_work_card_decision_counts", lambda: None),
+            None,
         ),
         "needfix": (
             "needfix",
@@ -3764,6 +4165,11 @@ def build_snapshot(
     manager_decision_counts = reads["manager_decision_counts"]
     if not isinstance(manager_decision_counts, Mapping):
         manager_decision_counts = {}
+    # ``outcome_counts`` is deliberately left exactly as it was: decision
+    # EVENTS, every topic. The Webview summary strip and existing consumers
+    # read these five numbers, so their definition is not changed under them.
+    # ``work_card_outcomes`` below is the correctly-defined series and names
+    # the distortion in these fields explicitly.
     outcome_counts = {
         "accepted": _bounded_int(manager_decision_counts.get("accepted")),
         "rejected": _bounded_int(manager_decision_counts.get("rejected")),
@@ -3771,6 +4177,10 @@ def build_snapshot(
         "superseded": status_counts.get("superseded", 0),
         "finished": status_counts.get("finished", 0),
     }
+    work_card_outcomes = _work_card_outcome_projection(
+        reads["work_card_decision_counts"],
+        event_counted_outcomes=outcome_counts,
+    )
 
     # Bounded-row-list truncation metadata: how many rows the returned
     # snapshot actually carries per status vs. the exact authoritative
@@ -3865,6 +4275,7 @@ def build_snapshot(
         },
         "status_counts": status_counts,
         "outcome_counts": outcome_counts,
+        "work_card_outcomes": work_card_outcomes,
         "row_counts": row_counts,
         "read_bounds": read_bounds,
         "tasks": {

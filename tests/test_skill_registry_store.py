@@ -415,3 +415,149 @@ def test_advance_record_uses_only_public_registry_api():
     source = inspect.getsource(store.advance_record)
     assert "_entries" not in source
     assert "DELETE" not in source
+
+
+# ---------------------------------------------------------------------------
+# A persisted ACTIVE record is re-verified against the rule in force
+# ---------------------------------------------------------------------------
+
+
+def _self_certified_active(repo_root, identity="drift-skill", version="1.0.0"):
+    """Persist an ``active`` record whose two actors are ONE actor, spelled twice.
+
+    This is the exact shape found in this repository's live skills store: the
+    activation passed a floor of two because two spellings of one manager were
+    counted as two independent provenance identities.
+    """
+    registry = sr.SkillRegistry(min_accepted_evidence=2)
+    registry.propose(base_record(identity=identity, version=version), WORKER)
+    for actor_id in ("manager.claude.7e6e8a47", "claude_manager_7e6e8a47"):
+        registry.add_evidence(
+            identity,
+            version,
+            {"source": f"src-{actor_id}", "outcome": "accepted"},
+            sr.Authority(sr.AuthorityRole.MANAGER, actor_id=actor_id, token="tok"),
+        )
+    record = registry.get(identity, version)
+    # Persist it already ACTIVE, exactly as the live row is stored. The registry
+    # would refuse to activate it now, so the state is written directly.
+    record = sr.replace(record, lifecycle_state=sr.LifecycleState.ACTIVE)
+    store.put_record(repo_root, record)
+    return record
+
+
+def test_audit_active_records_names_the_actors_an_activation_rests_on(tmp_path):
+    _self_certified_active(tmp_path)
+    report = store.audit_active_records(tmp_path)
+    assert len(report) == 1
+    entry = report[0]
+    # accepted_count counts ENTRIES and reads as strong; the canonical actor set
+    # is the fact it hides.
+    assert entry["accepted_count"] == 2
+    assert entry["independent_accepted_actors"] == 1
+    assert entry["actor_ids"] == ["manager.claude.7e6e8a47"]
+    assert entry["raw_actor_ids"] == [
+        "claude_manager_7e6e8a47",
+        "manager.claude.7e6e8a47",
+    ]
+    assert entry["verified"] is False
+
+
+def test_audit_active_records_is_read_only(tmp_path):
+    record = _self_certified_active(tmp_path)
+    before = _stored_digest(tmp_path, record.identity, record.version)
+    store.audit_active_records(tmp_path)
+    assert _stored_digest(tmp_path, record.identity, record.version) == before
+    # The stored lifecycle is untouched; the audit reports, it does not repair.
+    verbatim = store.load_registry(tmp_path, demote_unverified_active=False)
+    assert verbatim.get(record.identity, record.version).lifecycle_state is (
+        sr.LifecycleState.ACTIVE
+    )
+
+
+def test_load_registry_demotes_an_unverified_active_record(tmp_path):
+    record = _self_certified_active(tmp_path)
+    loaded = store.load_registry(tmp_path).get(record.identity, record.version)
+    assert loaded.lifecycle_state is sr.LifecycleState.PROPOSED
+    # Demotion is not data loss: every content field, evidence entry and counter
+    # survives, and the content digest is unchanged because lifecycle_state is
+    # runtime state and not a content field.
+    assert loaded.accepted_count == 2
+    assert len(loaded.evidence) == 2
+    assert sr.skill_digest(loaded) == sr.skill_digest(record)
+
+
+def test_a_demoted_record_is_never_served_to_runtime_selection(tmp_path):
+    _self_certified_active(tmp_path)
+    context = {
+        "task_family": "*",
+        "path_or_symbol": "*",
+        "risk": "*",
+        "stage": "*",
+        "triggers": ["*"],
+        "applicability": ["*"],
+    }
+    # select() serves ACTIVE records exclusively, so the safe direction of the
+    # demotion is the whole point: a self-certified skill stops being injected.
+    assert store.load_registry(tmp_path).select(context).selected == ()
+    verbatim = store.load_registry(tmp_path, demote_unverified_active=False)
+    assert len(verbatim.select(context).selected) == 1
+
+
+def test_load_registry_keeps_a_legitimately_active_record_active(tmp_path):
+    record = active_record()
+    store.put_record(tmp_path, record)
+    loaded = store.load_registry(tmp_path).get(record.identity, record.version)
+    assert loaded.lifecycle_state is sr.LifecycleState.ACTIVE
+    assert store.audit_active_records(tmp_path)[0]["verified"] is True
+
+
+def test_activation_supported_reports_unresolved_negative_evidence(tmp_path):
+    record = active_record()
+    record = sr.replace(
+        record,
+        evidence=record.evidence
+        + (
+            sr.EvidenceRecord(
+                source="incident",
+                outcome=sr.EvidenceOutcome.NEGATIVE,
+                authority=sr.AuthorityRole.WORKER,
+                actor_id="actor-c",
+            ),
+        ),
+        negative_count=1,
+    )
+    assert store.activation_supported(record, 2) is False
+    # A non-active record is never second-guessed by this check.
+    proposed = sr.replace(record, lifecycle_state=sr.LifecycleState.PROPOSED)
+    assert store.activation_supported(proposed, 2) is True
+
+
+def test_stored_state_digest_keeps_a_demoted_record_advanceable(tmp_path):
+    record = _self_certified_active(tmp_path)
+    identity, version = record.identity, record.version
+
+    # The in-memory token of the DEMOTED record cannot match the stored row --
+    # that is exactly why the compare-and-swap reads the row instead.
+    demoted = store.load_registry(tmp_path).get(identity, version)
+    stored_token = store.stored_state_digest(tmp_path, identity, version)
+    assert store.state_digest(demoted) != stored_token
+
+    registry = store.load_registry(tmp_path)
+    advanced = registry.add_evidence(
+        identity,
+        version,
+        {"source": "task-1", "outcome": "accepted"},
+        sr.Authority(sr.AuthorityRole.WORKER, actor_id="worker.claude.sonnet.5", token=""),
+    )
+    store.advance_record(tmp_path, advanced, expected_state_digest=stored_token)
+
+    # A genuine concurrent write is still refused: the token has moved on.
+    with pytest.raises(store.SkillStoreConflictError):
+        store.advance_record(tmp_path, advanced, expected_state_digest=stored_token)
+
+
+def test_stored_state_digest_is_none_for_an_absent_store_or_row(tmp_path):
+    assert store.stored_state_digest(tmp_path, "nope", "1.0.0") is None
+    _self_certified_active(tmp_path)
+    assert store.stored_state_digest(tmp_path, "nope", "1.0.0") is None

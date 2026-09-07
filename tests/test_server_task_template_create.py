@@ -284,6 +284,39 @@ def _from_template_kwargs(**overrides: object) -> dict[str, object]:
     return payload
 
 
+def test_from_template_test_only_persists_test_paths_as_required_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _ready_repo(tmp_path, monkeypatch)
+    result = server.aiworkhub_task_create_from_template(
+        **_from_template_kwargs(
+            task_id="TASK_NF656_TEST_ONLY",
+            title="Test only regression",
+            objective="Add regression tests only",
+            template_id="test_only",
+            production_paths=None,
+            test_paths=["tests/test_nf656.py"],
+        )
+    )
+    assert result["ok"] is True
+    assert result["template_provenance"]["template_name"] == "test_only"
+    stored = task_store.get_task(repo, "TASK_NF656_TEST_ONLY")
+    assert stored is not None
+    assert stored["required_outputs"] == ["tests/test_nf656.py"]
+    assert stored["allowed_writes"] == ["tests/test_nf656.py"]
+    rejected = server.aiworkhub_task_create_from_template(
+        **_from_template_kwargs(
+            task_id="TASK_NF656_TEST_ONLY_EMPTY",
+            template_id="test_only",
+            production_paths=None,
+            test_paths=[],
+        )
+    )
+    assert rejected["ok"] is False
+    assert rejected["stderr"] == "missing_test_paths"
+    assert task_store.get_task(repo, "TASK_NF656_TEST_ONLY_EMPTY") is None
+
+
 def _assert_lifecycle_error(result: dict[str, object], stderr: str) -> None:
     assert result["ok"] is False
     assert result["returncode"] == 2

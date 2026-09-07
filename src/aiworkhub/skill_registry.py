@@ -50,6 +50,37 @@ _VERSION_RE = re.compile(
 )
 _ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _ACTOR_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
+_ACTOR_TOKEN_SPLIT_RE = re.compile(r"[._-]+")
+
+# Closed vocabularies used to canonicalize a provenance identity. A role token
+# and a provider token carry no positional information -- ``manager.claude.7e``
+# and ``claude_manager_7e`` name the SAME actor -- so they are lifted out of the
+# token stream and re-emitted in a fixed order. Everything else is the actor's
+# subject and keeps its original relative order, so two subjects that differ
+# only in token ORDER are never merged.
+ACTOR_ROLE_TOKENS = frozenset(
+    {"manager", "worker", "reviewer", "coordinator", "agent", "owner"}
+)
+ACTOR_PROVIDER_TOKENS = frozenset(
+    {
+        "anthropic",
+        "claude",
+        "codex",
+        "deepseek",
+        "gemini",
+        "glm",
+        "google",
+        "gpt",
+        "grok",
+        "kimi",
+        "llama",
+        "mistral",
+        "openai",
+        "qwen",
+        "xai",
+        "zhipu",
+    }
+)
 
 _E = TypeVar("_E", bound=Enum)
 
@@ -668,12 +699,76 @@ def skill_digest(record: SkillRecord) -> str:
     return hashlib.sha256(canonical_payload(record)).hexdigest()
 
 
-def independent_accepted_evidence_count(record: SkillRecord) -> int:
-    """Count distinct non-secret provenance identities with accepted evidence."""
+def canonical_actor_id(actor_id: str) -> str:
+    """Return the canonical form of a provenance identity, or the id unchanged.
+
+    A provenance identity is written by hand and drifts in FORMAT while naming
+    the same actor: ``manager.claude.7e6e8a47`` and ``claude_manager_7e6e8a47``
+    are one manager spelled two ways. Counting raw strings therefore reported
+    two "independent" actors for one, which is exactly how the repository's sole
+    ACTIVE skill self-certified past a floor of two.
+
+    The rule is deliberately narrow. The id is split on ``.``/``_``/``-``; a
+    single token from the closed role vocabulary and at most one token from the
+    closed provider vocabulary are lifted out and re-emitted first, in that
+    fixed order, and every remaining token keeps its ORIGINAL relative order as
+    the actor's subject. Two ids therefore merge only when they carry the same
+    role, the same provider and the same ordered subject.
+
+    It fails closed: an id with no role token, with more than one role token, or
+    with more than one provider token is returned UNCHANGED, so an unparseable
+    or unfamiliar identity stays distinct from every other identity instead of
+    collapsing into a shared bucket. Canonicalization raises the bar against
+    format drift and accident; it is not, and cannot be, a defence against a
+    caller who deliberately picks two different subjects.
+    """
+    _validate_actor_id(actor_id, "skill_registry.invalid_evidence")
+    tokens = [token for token in _ACTOR_TOKEN_SPLIT_RE.split(actor_id) if token]
+    roles = [token for token in tokens if token in ACTOR_ROLE_TOKENS]
+    providers = [token for token in tokens if token in ACTOR_PROVIDER_TOKENS]
+    if len(roles) != 1 or len(providers) > 1:
+        return actor_id
+    lifted_role = False
+    lifted_provider = False
+    subject: list[str] = []
+    for token in tokens:
+        if not lifted_role and token in ACTOR_ROLE_TOKENS:
+            lifted_role = True
+            continue
+        if not lifted_provider and token in ACTOR_PROVIDER_TOKENS:
+            lifted_provider = True
+            continue
+        subject.append(token)
+    return ".".join(roles + providers + subject)
+
+
+def independent_accepted_actor_ids(record: SkillRecord) -> tuple[str, ...]:
+    """Return the sorted canonical provenance identities with accepted evidence.
+
+    This is the exact set :func:`independent_accepted_evidence_count` measures,
+    exposed so a reviewer can see WHICH actors an activation rests on rather
+    than only how many the gate counted.
+    """
     record = validate_record(record)
-    return len(
-        {item.actor_id for item in record.evidence if item.outcome is EvidenceOutcome.ACCEPTED}
+    return tuple(
+        sorted(
+            {
+                canonical_actor_id(item.actor_id)
+                for item in record.evidence
+                if item.outcome is EvidenceOutcome.ACCEPTED
+            }
+        )
     )
+
+
+def independent_accepted_evidence_count(record: SkillRecord) -> int:
+    """Count distinct non-secret provenance identities with accepted evidence.
+
+    Identities are compared in their :func:`canonical_actor_id` form, so two
+    spellings of one actor count once. Independence is a property of the actor,
+    never of the string that names them.
+    """
+    return len(independent_accepted_actor_ids(record))
 
 
 def unresolved_negative_evidence(record: SkillRecord) -> tuple[EvidenceRecord, ...]:
@@ -1792,6 +1887,8 @@ class SkillRegistry:
 
 
 __all__ = [
+    "ACTOR_PROVIDER_TOKENS",
+    "ACTOR_ROLE_TOKENS",
     "Authority",
     "AuthorityRole",
     "DEFAULT_SELECT_LIMIT",
@@ -1820,8 +1917,10 @@ __all__ = [
     "can_activate",
     "can_promote",
     "can_retire",
+    "canonical_actor_id",
     "canonical_json",
     "canonical_payload",
+    "independent_accepted_actor_ids",
     "independent_accepted_evidence_count",
     "normalize",
     "rank",

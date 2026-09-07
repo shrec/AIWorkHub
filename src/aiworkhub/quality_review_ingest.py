@@ -235,15 +235,71 @@ def _no_report_reason(result: IngestResult) -> str:
     return "no_provider_final"
 
 
-def _normalize_review_finding_aliases(report: Mapping[str, Any]) -> dict[str, Any]:
-    """Translate only supported provider aliases without changing review authority."""
+def _normalize_review_finding_aliases(
+    report: Mapping[str, Any], *, index_offset: int = 0
+) -> dict[str, Any]:
+    """Translate only supported provider aliases without changing review authority.
+
+    ``index_offset`` numbers the diagnostics from the caller's own position, so
+    a single finding can be normalized in isolation and still name itself with
+    the index the provider actually gave it.
+    """
     normalized_report = dict(report)
     normalized_findings: list[Any] = []
-    for index, raw_finding in enumerate(report.get("findings") or []):
+    for index, raw_finding in enumerate(
+        report.get("findings") or [], start=index_offset
+    ):
         if not isinstance(raw_finding, Mapping):
             normalized_findings.append(raw_finding)
             continue
         finding = dict(raw_finding)
+        finding.pop("verdict", None)
+        if "file" in finding:
+            file_value = finding.pop("file")
+            if not isinstance(file_value, str) or not file_value:
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_file_invalid"
+                )
+            if "path" in finding and finding["path"] != file_value:
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_file_conflict:path"
+                )
+            finding["path"] = file_value
+        if "line" in finding:
+            line_value = finding.pop("line")
+            if type(line_value) is not int or line_value < 1 or line_value > 1_000_000:
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_line_invalid"
+                )
+            for line_key in ("line_start", "line_end"):
+                if line_key in finding and finding[line_key] != line_value:
+                    raise ReviewProtocolError(
+                        f"structured_report_invalid:review_finding_{index}_line_conflict:{line_key}"
+                    )
+            finding["line_start"] = line_value
+            finding["line_end"] = line_value
+        if "failure_scenario" in finding:
+            reproduction_value = finding.pop("failure_scenario")
+            if not isinstance(reproduction_value, str) or not reproduction_value:
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_failure_scenario_invalid"
+                )
+            if "reproduction" in finding and finding["reproduction"] != reproduction_value:
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_failure_scenario_conflict:reproduction"
+                )
+            finding["reproduction"] = reproduction_value
+        if "short_summary" in finding:
+            summary_value = finding.pop("short_summary")
+            if not isinstance(summary_value, str) or not summary_value:
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_short_summary_invalid"
+                )
+            if "summary" in finding and finding["summary"] != summary_value:
+                raise ReviewProtocolError(
+                    f"structured_report_invalid:review_finding_{index}_short_summary_conflict:summary"
+                )
+            finding["summary"] = summary_value
         if "actionable" in finding:
             if type(finding["actionable"]) is not bool:
                 raise ReviewProtocolError(
@@ -340,6 +396,121 @@ def _normalize_review_finding_aliases(report: Mapping[str, Any]) -> dict[str, An
     return normalized_report
 
 
+MAX_RECORDED_DROP_REASONS = 20
+
+
+def _finding_ingress_keys() -> frozenset[str]:
+    """Read the canonical ingress allowlist lazily; this module never re-declares it."""
+    from . import quality_reviewer
+
+    return frozenset(quality_reviewer.QUALITY_REVIEW_FINDING_INGRESS_KEYS)
+
+
+def _review_finding_error_index(reason: str) -> int | None:
+    """Recover the finding position from a canonical ``review_finding_<n>_*`` reason."""
+    prefix = "review_finding_"
+    if not reason.startswith(prefix):
+        return None
+    tail = reason[len(prefix):]
+    digits = ""
+    for char in tail:
+        if char not in "0123456789":
+            break
+        digits += char
+    if not digits or not tail[len(digits):].startswith("_"):
+        return None
+    return int(digits)
+
+
+def _dropped_reasons(record: Iterable[Mapping[str, Any]]) -> str:
+    """Name the dropped findings so a wholly unusable report explains itself."""
+    reasons = [
+        f"{entry.get('index')}:{entry.get('dropped')}"
+        for entry in record
+        if entry.get("dropped")
+    ]
+    return ",".join(reasons[:MAX_RECORDED_DROP_REASONS]) or "no_findings_retained"
+
+
+def normalize_review_findings(
+    report: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[int]]:
+    """Repair each finding's schema shape independently and record every change.
+
+    Schema shape is not review authority.  A competent finding named with a
+    provider tool's own keys is translated, a key the canonical schema cannot
+    carry is stripped, and an unusable finding is dropped alone instead of
+    taking the valid findings beside it.  A stripped key is gone before any
+    validator sees it, so it can never reach or influence the verdict, and the
+    returned record names per finding exactly what was coerced or dropped.
+    """
+    ingress_keys = _finding_ingress_keys()
+    normalized_report = dict(report)
+    normalized_findings: list[dict[str, Any]] = []
+    record: list[dict[str, Any]] = []
+    kept_indices: list[int] = []
+    for index, raw_finding in enumerate(report.get("findings") or []):
+        if not isinstance(raw_finding, Mapping):
+            record.append(
+                {"index": index, "dropped": f"review_finding_{index}_not_object"}
+            )
+            continue
+        try:
+            single = _normalize_review_finding_aliases(
+                {"findings": [raw_finding]}, index_offset=index
+            )
+        except ReviewProtocolError as exc:
+            record.append({"index": index, "dropped": exc.category})
+            continue
+        finding = single["findings"][0]
+        coerced = sorted(set(raw_finding) - set(finding))
+        stripped = sorted(set(finding) - ingress_keys)
+        for key in stripped:
+            finding.pop(key)
+        entry: dict[str, Any] = {"index": index}
+        if coerced:
+            entry["coerced"] = coerced
+        if stripped:
+            entry["stripped"] = stripped
+        if len(entry) > 1:
+            record.append(entry)
+        kept_indices.append(index)
+        normalized_findings.append(finding)
+    normalized_report["findings"] = normalized_findings
+    return normalized_report, record, kept_indices
+
+
+def _packet_findings_dropping_invalid(
+    packet: Mapping[str, Any], *, lens: str, findings: list[dict[str, Any]],
+    positions: list[int], record: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Validate every finding, dropping only the ones the canonical rules refuse.
+
+    ``normalize_packet_findings`` names the first unusable finding and stops, so
+    one malformed row used to discard an entire competent review.  Re-running
+    that same canonical validator without the named row -- never a private
+    re-implementation of it -- leaves every surviving finding under exactly the
+    evidence requirements it was always held to.
+    """
+    from . import quality_reviewer
+
+    remaining = list(findings)
+    remaining_positions = list(positions)
+    while True:
+        try:
+            return quality_reviewer.normalize_packet_findings(
+                packet, lens=lens, findings=remaining
+            )
+        except quality_reviewer.ReviewerEvidenceError as exc:
+            reason = str(exc)
+            position = _review_finding_error_index(reason)
+            if position is None or position >= len(remaining):
+                raise
+            record.append({"index": remaining_positions[position], "dropped": reason})
+            del remaining[position]
+            del remaining_positions[position]
+
+
 def supervisor_ingest(
     *, metadata: Mapping[str, Any], workspace: Any, packet: Mapping[str, Any],
     packet_path: Path, request_id: str, expected_lens: str,
@@ -377,15 +548,28 @@ def supervisor_ingest(
         raise ReviewProtocolError("provider_events_unavailable")
     events: Iterable[str] = () if not valid_stdout else stdout.open(encoding="utf-8")
 
+    normalization: list[dict[str, Any]] = []
+
     def normalize(report: dict[str, Any]) -> dict[str, Any]:
+        supplied = list(report.get("findings") or [])
+        normalized_report, record, positions = normalize_review_findings(report)
         try:
-            normalized_report = _normalize_review_finding_aliases(report)
-            findings = quality_reviewer.normalize_packet_findings(
+            findings = _packet_findings_dropping_invalid(
                 packet, lens=expected_lens,
                 findings=list(normalized_report.get("findings") or []),
+                positions=positions, record=record,
             )
         except quality_reviewer.ReviewerEvidenceError as exc:
             raise ReviewProtocolError(f"structured_report_invalid:{exc}") from exc
+        finally:
+            normalization.extend(record)
+        if supplied and not findings:
+            # Every finding was refused, so this review cannot be represented as
+            # a clean one; fail closed and name why each finding was dropped.
+            raise ReviewProtocolError(
+                "structured_report_invalid:review_findings_all_invalid:"
+                f"{_dropped_reasons(record)}"
+            )
         return {"lens": expected_lens, "findings": findings}
 
     def submit(report: dict[str, Any]) -> None:
@@ -415,4 +599,10 @@ def supervisor_ingest(
         close = getattr(events, "close", None)
         if callable(close):
             close()
-    return verify()
+    audit, verified_payloads = verify()
+    if normalization:
+        # The manager reviews the repair, never just its result: this names the
+        # keys coerced or dropped per finding, additively and only when a
+        # provider report actually needed repairing.
+        audit["review_finding_normalization"] = normalization
+    return audit, verified_payloads

@@ -49,6 +49,37 @@ CONSERVATIVE_PRIORS: Mapping[str, float] = {
     "p95_latency_seconds": 14_400.0,
     "estimated_tokens": 100_000.0,
 }
+# Minimum decided outcomes before an observed rate may displace the prior.
+#
+# The router's null hypothesis is CONSERVATIVE_PRIORS["accepted_rate"] == 0.50.
+# A unanimous run of n decided outcomes therefore carries an exact one-sided
+# binomial p of 0.5**n: n=4 gives p=0.0625 and cannot reject the prior at the
+# 95% level, n=5 gives p=0.03125 and can.  Five is the smallest sample at which
+# ANY observation is significant against the prior, so below it no observed
+# rate is admissible evidence however extreme it looks -- a 2-for-2 record is
+# consistent with a 35% model (Wilson 95%: 0.342-1.000) and must not outrank a
+# candidate held at the prior.
+#
+# Checked against this repository's own catalog partition for code/medium: it
+# withholds the one-sample and two-sample records and admits every worker with
+# a real track record (n = 5, 10, 11, 12, 14).
+MIN_OUTCOME_SAMPLES: int = 5
+# Pseudo-count strength of the prior when an admissible rate is weighted: the
+# prior is worth exactly one minimum-admissible sample, so the evidence weight
+# n / (n + OUTCOME_PRIOR_STRENGTH) is 0.5 at the floor and rises monotonically.
+OUTCOME_PRIOR_STRENGTH: float = float(MIN_OUTCOME_SAMPLES)
+# Evidence fields that are statistics over decided tasks and are therefore
+# subject to MIN_OUTCOME_SAMPLES.  Cost, token and tool-discipline evidence is
+# excluded on purpose: a single billed run reports a true rate.
+SAMPLE_GATED_EVIDENCE_FIELDS: frozenset[str] = frozenset(
+    {
+        "accepted_rate",
+        "review_ready_rate",
+        "validation_failure_rate",
+        "p50_latency_seconds",
+        "p95_latency_seconds",
+    }
+)
 
 
 def _clean_token(value: str) -> str:
@@ -184,48 +215,74 @@ class OutcomeEvidence:
     sample_count: int = 0
 
     def normalized(self) -> tuple[dict[str, float | None], dict[str, str]]:
+        # Minimum-evidence gate.  Outcome rates and latencies are statistics over
+        # decided tasks; below MIN_OUTCOME_SAMPLES they are noise, so the
+        # conservative prior is kept and the source is labelled
+        # "insufficient_samples" rather than "observed".  Fail-closed: an
+        # inadmissible observation never displaces the prior, whichever direction
+        # it points.  Cost, token and tool-discipline evidence is deliberately
+        # NOT gated -- a single billed run reports a true rate, it is not a
+        # sample statistic about outcomes.
+        admissible = self.sample_count >= MIN_OUTCOME_SAMPLES
+        gated: dict[str, Any] = {
+            "accepted_rate": self.accepted_rate if admissible else None,
+            "review_ready_rate": self.review_ready_rate if admissible else None,
+            "validation_failure_rate": (
+                self.validation_failure_rate if admissible else None
+            ),
+            "p50_latency_seconds": self.p50_latency_seconds if admissible else None,
+            "p95_latency_seconds": self.p95_latency_seconds if admissible else None,
+            "cost_usd_per_1k_tokens": self.cost_usd_per_1k_tokens,
+            "estimated_tokens": self.estimated_tokens,
+            "tool_discipline_score": self.tool_discipline_score,
+        }
         values = {
             "accepted_rate": _bounded_rate(
-                self.accepted_rate, CONSERVATIVE_PRIORS["accepted_rate"]
+                gated["accepted_rate"], CONSERVATIVE_PRIORS["accepted_rate"]
             ),
             "review_ready_rate": _bounded_rate(
-                self.review_ready_rate, CONSERVATIVE_PRIORS["review_ready_rate"]
+                gated["review_ready_rate"], CONSERVATIVE_PRIORS["review_ready_rate"]
             ),
             "validation_failure_rate": _bounded_rate(
-                self.validation_failure_rate,
+                gated["validation_failure_rate"],
                 CONSERVATIVE_PRIORS["validation_failure_rate"],
             ),
             "p50_latency_seconds": _bounded_positive(
-                self.p50_latency_seconds,
+                gated["p50_latency_seconds"],
                 CONSERVATIVE_PRIORS["p50_latency_seconds"],
             ),
             "p95_latency_seconds": _bounded_positive(
-                self.p95_latency_seconds,
+                gated["p95_latency_seconds"],
                 CONSERVATIVE_PRIORS["p95_latency_seconds"],
             ),
             "cost_usd_per_1k_tokens": (
-                _bounded_positive(self.cost_usd_per_1k_tokens, 0.0)
-                if self.cost_usd_per_1k_tokens is not None
+                _bounded_positive(gated["cost_usd_per_1k_tokens"], 0.0)
+                if gated["cost_usd_per_1k_tokens"] is not None
                 else None
             ),
             "estimated_tokens": _bounded_positive(
-                float(self.estimated_tokens) if self.estimated_tokens is not None else None,
+                float(gated["estimated_tokens"])
+                if gated["estimated_tokens"] is not None
+                else None,
                 CONSERVATIVE_PRIORS["estimated_tokens"],
             ),
             "tool_discipline_score": (
-                max(0.0, min(100.0, float(self.tool_discipline_score)))
-                if self.tool_discipline_score is not None
+                max(0.0, min(100.0, float(gated["tool_discipline_score"])))
+                if gated["tool_discipline_score"] is not None
                 else None
             ),
         }
-        sources = {
-            key: (
-                "observed"
-                if getattr(self, key if key != "estimated_tokens" else "estimated_tokens") is not None
-                else "conservative_prior"
-            )
-            for key in values
-        }
+        sources: dict[str, str] = {}
+        for key in values:
+            if gated[key] is not None:
+                sources[key] = "observed"
+            elif key in SAMPLE_GATED_EVIDENCE_FIELDS and getattr(self, key) is not None:
+                # A real observation was withheld by the floor.  Naming that
+                # separately keeps "we have nothing" distinguishable from "we
+                # have too little to trust".
+                sources[key] = "insufficient_samples"
+            else:
+                sources[key] = "conservative_prior"
         if self.cost_usd_per_1k_tokens is None:
             sources["cost_usd_per_1k_tokens"] = "unknown"
         return values, sources
@@ -413,6 +470,24 @@ def _exclusion_reasons(task: TaskRequirements, worker: WorkerCapability) -> list
     return reasons
 
 
+def _evidence_weight(sample_count: int | None) -> float:
+    """Weight an admissible observed rate against the conservative prior.
+
+    Returns 0.0 below MIN_OUTCOME_SAMPLES: an inadmissible observation carries
+    no weight at all, so the prior stands.  At and above the floor the weight is
+    ``n / (n + OUTCOME_PRIOR_STRENGTH)`` -- 0.5 at the floor, rising with
+    evidence and never reaching 1.0, so an observed rate can approach but never
+    fully escape the prior.
+    """
+    try:
+        count = max(0, int(sample_count or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if count < MIN_OUTCOME_SAMPLES:
+        return 0.0
+    return count / (count + OUTCOME_PRIOR_STRENGTH)
+
+
 def _score_components(task: TaskRequirements, worker: WorkerCapability) -> dict[str, Any]:
     values, sources = worker.evidence.normalized()
     observed_success = min(values["accepted_rate"], values["review_ready_rate"])
@@ -420,6 +495,26 @@ def _score_components(task: TaskRequirements, worker: WorkerCapability) -> dict[
     manager_adjusted_success = max(
         0.0,
         min(1.0, effective_success + (worker.manager_score_adjustment / 100.0)),
+    )
+    # Evidence weighting shrinks the observed part of the success rate toward the
+    # prior-derived floor by how many decided outcomes back it, then applies the
+    # manager adjustment at full strength.  A manager adjustment is an explicit
+    # human override, not a sample statistic, so it is never diluted by count.
+    # Below the floor the weight is 0.0 and normalized() has already substituted
+    # the prior, so both mechanisms agree at the boundary.
+    evidence_weight = _evidence_weight(worker.evidence.sample_count)
+    prior_success = max(
+        0.0,
+        CONSERVATIVE_PRIORS["accepted_rate"] - CONSERVATIVE_PRIORS["validation_failure_rate"],
+    )
+    evidence_weighted_success = max(
+        0.0,
+        min(
+            1.0,
+            prior_success
+            + (evidence_weight * (effective_success - prior_success))
+            + (worker.manager_score_adjustment / 100.0),
+        ),
     )
     cost_rate = values["cost_usd_per_1k_tokens"]
     estimated_tokens = float(values["estimated_tokens"] or 0.0)
@@ -437,6 +532,10 @@ def _score_components(task: TaskRequirements, worker: WorkerCapability) -> dict[
         "validation_failure_rate": values["validation_failure_rate"],
         "effective_success_rate": round(effective_success, 6),
         "manager_adjusted_success_rate": round(manager_adjusted_success, 6),
+        "evidence_weighted_success_rate": round(evidence_weighted_success, 6),
+        "outcome_evidence_weight": round(evidence_weight, 6),
+        "outcome_evidence_admissible": evidence_weight > 0.0,
+        "min_outcome_samples": MIN_OUTCOME_SAMPLES,
         "manager_score_adjustment": worker.manager_score_adjustment,
         "p50_latency_seconds": values["p50_latency_seconds"],
         "p95_latency_seconds": values["p95_latency_seconds"],
@@ -468,8 +567,20 @@ def _candidate_sort_key(candidate: CandidateRecord) -> tuple[Any, ...]:
     return (
         int(candidate.excluded),
         components.get("deadline_penalty", 0),
+        # Cost keeps its place ahead of quality: this module's contract is
+        # "cheapest capable".  A null cost is never silently treated as a tie --
+        # an unknown cost sorts behind every cost-bearing candidate as (1, inf)
+        # and can never look free.  When cost is unknown fleet-wide both keys are
+        # uniform across all candidates and so contribute nothing, which is
+        # exactly what skipping them would do; the tie that follows comes from
+        # the outcome keys falling back to priors, not from these two.
         int(estimated_cost is None),
         float(estimated_cost) if estimated_cost is not None else float("inf"),
+        # Quality before speed.  evidence_weighted_success_rate is the observed
+        # success rate shrunk toward the conservative prior in proportion to how
+        # many decided outcomes back it, so a worker that returns unusable output
+        # quickly can never outrank one with a measured record.
+        -components.get("evidence_weighted_success_rate", 0.0),
         -components.get("manager_adjusted_success_rate", 0.0),
         -(
             components.get("tool_discipline_score")
@@ -477,6 +588,11 @@ def _candidate_sort_key(candidate: CandidateRecord) -> tuple[Any, ...]:
             else -1.0
         ),
         components.get("validation_failure_rate", 1.0),
+        # Evidence volume outranks latency.  Without this key a candidate with
+        # zero decided outcomes but a measured p50 beats every candidate still
+        # held at the 3600s conservative prior, which makes latency the de facto
+        # model selector whenever outcome evidence is thin.
+        -int(components.get("sample_count") or 0),
         components.get("p50_latency_seconds", CONSERVATIVE_PRIORS["p50_latency_seconds"]),
         components.get("p95_latency_seconds", CONSERVATIVE_PRIORS["p95_latency_seconds"]),
         candidate.provider,

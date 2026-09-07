@@ -48,6 +48,7 @@ class Manager(Protocol):
     def _append_event(self, event: Mapping[str, Any]) -> None: ...
     def launch_quality_reviewer(self, **kwargs: Any) -> dict[str, Any]: ...
     def accept_review(self, request_id: str, task_id: str, **kwargs: Any) -> dict[str, Any]: ...
+    def reject_review(self, task_id: str, reason: str, *, to: str = ...) -> dict[str, Any]: ...
     def status(self, request_id: str) -> dict[str, Any]: ...
 
 
@@ -84,6 +85,93 @@ def select_reviewer_route(repo: Path, reviewer_task_id: str, lens: str) -> Mappi
         raise RuntimeError("review_route_identity_invalid")
     return route
 
+
+# --- mechanical short-circuit -------------------------------------------
+#
+# Measured on this repository's canonical ledger: of 2,470 reject_review
+# events, 92.3% were mechanically decidable (69.3% red tests/regression,
+# 8.4% unwired/required output unchanged, 7.9% receipt conformance, 5.1%
+# workspace/infra, 1.5% lint ratchet, 0.1% scope) and only 3.0% needed a
+# model to judge semantic correctness. Every one of those still consumed a
+# quality-reviewer launch to discover, at an average 453,650 input tokens
+# per reviewer usage record.
+#
+# The verdict that decides this is ALREADY computed and already on the card:
+# task_store._mark_terminal_review_transaction writes
+# card["deterministic_verification"] (task_store.py:2155) and the same object
+# into card["terminal_review"]["deterministic_verification"] (task_store.py:2120)
+# from task_fsm.deterministic_verification (task_fsm.py:394). Nothing in the
+# review queue read it. This is the read.
+#
+# Every rule below is one-directional. A positive, explicit, in-epoch
+# mechanical failure short-circuits; ABSOLUTELY EVERYTHING ELSE -- absent,
+# malformed, stale, nothing_measured, unreadable, or merely asserted without
+# a measured count -- falls through to the normal reviewer launch. Skipping a
+# review because evidence was missing would convert "we did not measure" into
+# "it passed", the exact inversion this project's fail-closed doctrine
+# forbids, and a defect let through unreviewed costs far more than the tokens
+# this saves.
+MECHANICAL_FAILURE_COUNT_FIELDS = (
+    "failed_validation_count",
+    "missing_required_output_count",
+)
+
+
+def _positive_count(verdict: Mapping[str, Any], key: str) -> int:
+    """Return a trustworthy non-negative count, or 0 when it is not one.
+
+    A bool is not a count (``True`` is not "one failure"), and neither is a
+    string, a float or a negative. Anything unreadable contributes nothing,
+    so it can only ever make the short-circuit LESS likely to fire.
+    """
+    value = verdict.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def mechanical_failure_reason(card: Any, claim_epoch: str) -> str:
+    """Name the positive mechanical failure on this card, or "" to review it.
+
+    Pure and total: never raises, never mutates, and returns "" for every
+    input that is not an explicit, measured, in-epoch mechanical failure.
+    ``claim_epoch`` is the chain's bound epoch; a verdict recorded against a
+    different claim is STALE evidence about a previous attempt and must never
+    decide this one.
+    """
+    if not isinstance(card, Mapping):
+        return ""
+    # Same precedence core.py:3939-3941 uses when it gates mark-done on this
+    # verdict: the terminal_review copy is the one bound to the outcome, and
+    # the hoisted top-level copy is the fallback.
+    terminal = card.get("terminal_review")
+    verdict = terminal.get("deterministic_verification") if isinstance(terminal, Mapping) else None
+    if not isinstance(verdict, Mapping):
+        verdict = card.get("deterministic_verification")
+    if not isinstance(verdict, Mapping):
+        return ""
+    # `is True` / `is False`, never truthiness: a missing key, None, 0 or ""
+    # must read as "no verdict", not as a verdict that failed.
+    if verdict.get("applicable") is not True or verdict.get("pass") is not False:
+        return ""
+    if str(verdict.get("claim_epoch") or "") != str(claim_epoch or ""):
+        return ""
+    evidence = verdict.get("evidence_verdict")
+    if not isinstance(evidence, Mapping):
+        return ""
+    # "Nothing measured" is not "nothing wrong" -- task_fsm.evidence_verdict
+    # exists precisely to keep those apart. An unmeasured candidate is the
+    # one that most needs a reviewer, so it always gets one.
+    if evidence.get("nothing_measured") is not False:
+        return ""
+    # The decisive requirement: a POSITIVE measured count. `pass: False` alone
+    # is an assertion; a non-zero failed/missing count is a measurement. Only
+    # a measurement may spend a card's review.
+    counts = {key: _positive_count(evidence, key) for key in MECHANICAL_FAILURE_COUNT_FIELDS}
+    if not any(counts.values()):
+        return ""
+    detail = ",".join(f"{key}={counts[key]}" for key in MECHANICAL_FAILURE_COUNT_FIELDS)
+    return "mechanically_failing_candidate:" + detail
 
 def register_finalized_candidate(
     manager: Manager,
@@ -390,8 +478,31 @@ class ReviewOrchestrator:
             readiness = self._launch_readiness(action)
             if readiness["outcome"] == "deferred":
                 raise _DeferredLaunch(str(readiness["reason"]), readiness)
+            if readiness["outcome"] == "mechanical_rework":
+                # The candidate is already measurably failing, so no reviewer
+                # is spent on it. Return it to `pending` for rework, then fail
+                # this action carrying BOTH the mechanical reason and what the
+                # rejection actually did. The rejection is total: a refused one
+                # simply leaves the card in `review` for the manager, and the
+                # reason is still durable in two independent places -- the
+                # target's event stream and the outbox row. Neither outcome
+                # leaves a state transition unexplained, and neither can drop
+                # a card on a rejection that did not happen.
+                rejection = self._return_target_for_rework(action, readiness)
+                self._record_mechanical_rework(action, readiness, rejection)
+                detail = str(rejection.get("detail") or "")
+                raise RuntimeError(
+                    str(readiness["reason"])
+                    + ":returned_for_rework=" + str(rejection["state"])
+                    + ((":" + detail) if detail else "")
+                )
             if readiness["outcome"] == "terminal":
                 raise RuntimeError(str(readiness["reason"]))
+            if readiness["outcome"] != "ready":
+                # Fail closed on a vocabulary this branch does not know. An
+                # unhandled outcome must never fall through into a launch.
+                raise RuntimeError("launch_readiness_outcome_unknown:"
+                                   + str(readiness["outcome"]))
             route = dict(self.route_selector(self.manager.repo, reviewer_task, action.lens))
             runner = str(route.get("runner") or "")
             adapter_id = str(route.get("adapter_id") or "")
@@ -538,6 +649,16 @@ class ReviewOrchestrator:
             return self._readiness_receipt(action, "terminal", "target_candidate_identity_invalid")
         if str(status.get("state") or "") != "review_ready":
             return self._readiness_receipt(action, "deferred", "target_not_review_ready")
+        # Every immutable identity above has matched and the card is genuinely
+        # at review_ready, so its deterministic verdict is about THIS claim of
+        # THIS candidate. Read it before spending a reviewer launch. Placed
+        # ahead of the workspace/partition gates deliberately: those exist to
+        # get a REVIEWER started, and a mechanically failing candidate is not
+        # going to be reviewed, so waiting on a Source Graph partition it will
+        # never use would defer it forever instead of returning it for rework.
+        mechanical = mechanical_failure_reason(card, str(identity["claim_epoch"]))
+        if mechanical:
+            return self._readiness_receipt(action, "mechanical_rework", mechanical)
         workspace = str(card.get("workspace_identity") or "")
         if not workspace:
             return self._readiness_receipt(action, "deferred", "target_workspace_identity_missing")
@@ -589,6 +710,78 @@ class ReviewOrchestrator:
             "outcome": outcome,
             "reason": reason,
         }
+
+    def _return_target_for_rework(
+        self, action: review_lifecycle.ReviewAction, readiness: Mapping[str, Any]
+    ) -> dict[str, str]:
+        """Return a mechanically failing target to ``pending`` for rework.
+
+        Total by construction: a manager with no reject surface, a refused
+        rejection and a raising one all resolve to a named outcome rather than
+        an exception. The caller fails this action either way, so the only
+        result that must never occur is a card that left ``review`` with
+        nothing saying why -- and a refusal cannot produce one, because it
+        leaves the card exactly where it was, in ``review``, for the manager
+        to dispose of. That is the safe side of this decision: a rejection
+        that did not happen costs one reviewer launch, while a rejection
+        wrongly believed to have happened loses a completed review.
+        """
+        identity = action.descriptor["chain_identity"]
+        target_task = str(identity["target_task_id"])
+        reject = getattr(self.manager, "reject_review", None)
+        if not callable(reject):
+            return {"state": "unavailable", "detail": "manager_has_no_reject_review"}
+        try:
+            result = reject(target_task, str(readiness["reason"]), to="pending")
+        except Exception as exc:  # noqa: BLE001 -- a refusal, never a crash
+            return {"state": "error", "detail": f"{type(exc).__name__}:{exc}"[:160]}
+        if not isinstance(result, Mapping):
+            return {"state": "refused", "detail": "reject_result_not_a_mapping"}
+        if result.get("ok") is not True:
+            detail = str(result.get("error") or result.get("stderr") or "unknown")
+            return {"state": "refused", "detail": detail[:160]}
+        return {"state": "returned", "detail": "pending"}
+
+    def _record_mechanical_rework(
+        self,
+        action: review_lifecycle.ReviewAction,
+        readiness: Mapping[str, Any],
+        rejection: Mapping[str, str] | None = None,
+    ) -> None:
+        """Record on the target why no reviewer was spent on this candidate.
+
+        The action itself is failed with the same reason immediately after, so
+        the mechanical verdict is durable in two independent places: the
+        target's event stream and the review outbox row. Best-effort by
+        design -- a manager without an event surface must not turn a correct
+        short-circuit into a crash, and the outbox reason still explains it.
+        A manager whose event surface *raises* must not either: letting that
+        escape would replace the mechanical reason on the outbox row with an
+        append error, which is exactly the unexplained transition this method
+        exists to prevent.
+        """
+        append = getattr(self.manager, "_append_event", None)
+        if not callable(append):
+            return
+        identity = action.descriptor["chain_identity"]
+        try:
+            append({
+                "event_type": "review_orchestrator_mechanical_rework",
+                "request_id": identity["target_request_id"],
+                "task_id": identity["target_task_id"],
+                "review_automation": {
+                    "state": "mechanical_rework",
+                    "reason": str(readiness["reason"]),
+                    "action_id": action.action_id,
+                    "lens": action.lens,
+                    "reviewer_launched": False,
+                    "disposition": "return_for_rework",
+                    "rework_return": dict(rejection or {}),
+                    "readiness_receipt": dict(readiness),
+                },
+            })
+        except Exception:  # noqa: BLE001 -- the outbox row still carries the reason
+            return
 
     def _record_deferred_wait(
         self, action: review_lifecycle.ReviewAction, deferred: _DeferredLaunch, now: datetime

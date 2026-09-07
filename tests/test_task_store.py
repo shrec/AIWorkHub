@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -869,4 +870,121 @@ def test_mark_terminal_failure_stamps_relaunch_guard_identity(tmp_path: Path) ->
             reworked, runner="codex_worker_b891", adapter_id="codex_cli"
         )
         == ""
+    )
+
+
+# --- the review-feedback authentication axis --------------------------------
+#
+# ``CARD_CONTENT_IDENTITY_KEYS`` excludes ``review_feedback`` on the written
+# claim that it "is authenticated on its own axis (review_feedback_identity), so
+# the two relaunch-guard inputs stay independent instead of collapsing into one
+# hash".  These tests execute that claim against the shape the writer actually
+# emits, which is where it was previously false.
+
+
+def _rework_feedback(instruction: str) -> dict:
+    """The object ``core.reject_review`` really stores on a reworked card."""
+    return {
+        "schema_id": "aiworkhub.rework_feedback_delta.v1",
+        "instruction": instruction,
+        "reason_identity": {
+            "bytes": len(instruction.encode("utf-8")),
+            "sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+            "truncated": False,
+        },
+        "predecessor_request_id": "req-prev",
+        "predecessor_changed_paths": [],
+        "residual_identities": [],
+    }
+
+
+def test_review_feedback_identity_distinguishes_two_manager_instructions() -> None:
+    """Two different rework instructions must not share one feedback identity.
+
+    Previously ``_review_feedback_reasons`` looked only for ``reason``/``code``,
+    keys the writer never emits, so every card the system produced digested the
+    same empty list and the axis was a constant.
+    """
+    first = {"review_feedback": _rework_feedback("fix the guarded transaction")}
+    second = {"review_feedback": _rework_feedback("revert and re-scope the card")}
+
+    assert task_store.review_feedback_identity(
+        first
+    ) != task_store.review_feedback_identity(second)
+
+    # And the axis is stable for the same instruction.
+    same = {"review_feedback": _rework_feedback("fix the guarded transaction")}
+    assert task_store.review_feedback_identity(
+        first
+    ) == task_store.review_feedback_identity(same)
+
+
+def test_review_feedback_identity_is_not_constant_across_written_cards() -> None:
+    """The regression itself, stated precisely.
+
+    The old reader was not constant over *everything* -- it still separated "no
+    feedback" (``[]``) from "some feedback" (``[""]``).  What it could not do is
+    separate one written instruction from another: every card the writer
+    produced digested to that same ``[""]``.  So the property under test is
+    cardinality across DISTINCT instructions, not merely difference from empty.
+    """
+    instructions = [
+        "fix the guarded transaction",
+        "revert and re-scope the card",
+        "add the inverse scan",
+    ]
+    identities = {
+        task_store.review_feedback_identity({"review_feedback": _rework_feedback(text)})
+        for text in instructions
+    }
+    assert len(identities) == len(instructions)
+    assert task_store.review_feedback_identity({}) not in identities
+
+
+def test_review_feedback_identity_separates_instructions_sharing_a_prefix() -> None:
+    """``reason_identity`` outranks ``instruction`` because it is unbounded.
+
+    ``instruction`` is the truncated reason; two instructions that agree up to
+    the byte cap would share it.  The digest of the full pre-truncation bytes
+    keeps them apart.
+    """
+    shared_prefix = "x" * 64
+    first = {
+        "review_feedback": {
+            "schema_id": "aiworkhub.rework_feedback_delta.v1",
+            "instruction": shared_prefix,
+            "reason_identity": {"sha256": "a" * 64, "bytes": 200, "truncated": True},
+        }
+    }
+    second = {
+        "review_feedback": {
+            "schema_id": "aiworkhub.rework_feedback_delta.v1",
+            "instruction": shared_prefix,
+            "reason_identity": {"sha256": "b" * 64, "bytes": 200, "truncated": True},
+        }
+    }
+    assert task_store.review_feedback_identity(
+        first
+    ) != task_store.review_feedback_identity(second)
+
+
+def test_review_feedback_identity_still_reads_legacy_rows() -> None:
+    """Rows written before the delta schema authenticate on what they carry."""
+    assert task_store.review_feedback_identity(
+        {"review_feedback": [{"reason": "validation_failed", "detail": "one"}]}
+    ) == task_store.review_feedback_identity(
+        {"review_feedback": [{"reason": "validation_failed", "detail": "two"}]}
+    )
+    assert task_store.review_feedback_identity(
+        {"review_feedback": [{"reason": "validation_failed"}]}
+    ) != task_store.review_feedback_identity(
+        {"review_feedback": [{"reason": "scope_violation"}]}
+    )
+    # ``code`` remains the fallback when ``reason`` is absent or null.
+    assert task_store.review_feedback_identity(
+        {"review_feedback": [{"reason": None, "code": "E_SCOPE"}]}
+    ) == task_store.review_feedback_identity({"review_feedback": [{"code": "E_SCOPE"}]})
+    # Absent and empty stay indistinguishable, as before.
+    assert task_store.review_feedback_identity({}) == task_store.review_feedback_identity(
+        {"review_feedback": None}
     )

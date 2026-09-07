@@ -153,15 +153,66 @@ def test_test_only_requires_tests_and_rejects_production_paths():
             test_paths=["tests/test_a.py"],
         )
     card = expand_template("test_only", test_paths=["tests/test_a.py"])
-    assert card["required_outputs"] == []
+    assert card["required_outputs"] == ["tests/test_a.py"]
     assert card["allowed_writes"] == ["tests/test_a.py"]
-    assert card["allowed_writes"] == ["tests/test_a.py"]
+    assert card["write_set"] == ["tests/test_a.py"]
     assert card["read_first"] == ["tests/test_a.py"]
     assert card["validation"] == [
         "python -m pytest -q tests/test_a.py",
         "python -m ruff check tests/test_a.py",
         "git diff --check",
     ]
+
+
+def test_test_only_required_outputs_exactly_cover_test_paths_in_order():
+    card = expand_template(
+        "test_only",
+        test_paths=["tests/test_b.py", "tests/test_a.py"],
+    )
+    assert card["required_outputs"] == ["tests/test_b.py", "tests/test_a.py"]
+    assert card["allowed_writes"] == ["tests/test_b.py", "tests/test_a.py"]
+    assert card["write_set"] == ["tests/test_b.py", "tests/test_a.py"]
+
+
+def test_test_only_empty_test_scope_fails_closed():
+    with pytest.raises(TaskTemplateError, match="missing_test_paths"):
+        expand_template("test_only", test_paths=[])
+    with pytest.raises(TaskTemplateError, match="missing_test_paths"):
+        expand_template("test_only")
+    with pytest.raises(TaskTemplateError, match="missing_test_paths"):
+        expand_template(
+            "test_only",
+            production_paths=[],
+            test_paths=[],
+            mandatory_changed_outputs=["tests/test_a.py"],
+        )
+
+
+def test_test_only_explicit_mandatory_outputs_stay_authoritative():
+    card = expand_template(
+        "test_only",
+        test_paths=["tests/test_a.py", "tests/test_b.py"],
+        mandatory_changed_outputs=["tests/test_b.py"],
+    )
+    assert card["required_outputs"] == ["tests/test_b.py"]
+    with pytest.raises(
+        TaskTemplateError, match="mandatory_changed_output_out_of_scope"
+    ):
+        expand_template(
+            "test_only",
+            test_paths=["tests/test_a.py"],
+            mandatory_changed_outputs=["tests/test_c.py"],
+        )
+
+
+def test_non_test_only_templates_keep_empty_default_required_outputs():
+    card = expand_template(
+        "implementation_with_tests",
+        production_paths=["src/a.py"],
+        test_paths=["tests/test_a.py"],
+    )
+    assert card["required_outputs"] == []
+    assert card["allowed_writes"] == ["src/a.py", "tests/test_a.py"]
 
 
 def test_docs_change_requires_docs_paths_and_rejects_test_paths():
@@ -2143,3 +2194,139 @@ def test_code_card_digest_uses_canonical_minimality_when_implicit():
     assert absent_provenance == task_templates_module._custom_escape_provenance(
         dict(custom_card)
     )
+
+
+# ---------------------------------------------------------------------------
+# Zero-validation gate: a card that declares no validation commands runs zero
+# tests and reaches review_ready with nothing_measured. Every card must either
+# declare validation or carry ONE explicit named exemption.
+
+
+def test_declared_validation_needs_no_exemption():
+    assert (
+        task_templates_module.resolve_validation_exemption(
+            validation=["python -m pytest -q tests/test_x.py"],
+            read_only=False,
+            allowed_writes=["src/aiworkhub/x.py"],
+            required_outputs=["src/aiworkhub/x.py"],
+        )
+        is None
+    )
+
+
+def test_write_scope_without_validation_is_refused():
+    # The exact hole: a card with a write scope always has something to
+    # measure, whatever its task_type.
+    with pytest.raises(TaskTemplateError) as exc:
+        task_templates_module.resolve_validation_exemption(
+            validation=[],
+            read_only=False,
+            allowed_writes=["src/aiworkhub/x.py"],
+            required_outputs=[],
+        )
+    assert str(exc.value) == "validation_required"
+
+    with pytest.raises(TaskTemplateError) as exc:
+        task_templates_module.resolve_validation_exemption(
+            validation=[],
+            read_only=False,
+            allowed_writes=[],
+            required_outputs=["docs/x.md"],
+        )
+    assert str(exc.value) == "validation_required"
+
+
+def test_read_only_card_without_write_scope_is_exempt_by_name():
+    # The reviewer-child / read_only_analysis shape: nothing to run, and the
+    # reason is a name on the card rather than an unexplained empty list.
+    assert task_templates_module.resolve_validation_exemption(
+        validation=[],
+        read_only=True,
+        allowed_writes=[],
+        required_outputs=[],
+    ) == task_templates_module.VALIDATION_EXEMPTION_READ_ONLY
+
+
+def test_exemption_can_never_be_an_absence():
+    # An empty list, an empty string, False and 0 are absences, not names.
+    for absence in ([], "", "   ", False, 0, (), {}):
+        with pytest.raises(TaskTemplateError) as exc:
+            task_templates_module.resolve_validation_exemption(
+                validation=[],
+                read_only=True,
+                allowed_writes=[],
+                required_outputs=[],
+                declared=absence,
+            )
+        assert str(exc.value) == "invalid_validation_exemption_not_named", absence
+
+
+def test_unknown_exemption_token_is_refused():
+    with pytest.raises(TaskTemplateError) as exc:
+        task_templates_module.resolve_validation_exemption(
+            validation=[],
+            read_only=True,
+            allowed_writes=[],
+            required_outputs=[],
+            declared="because_i_said_so",
+        )
+    assert str(exc.value) == "unknown_validation_exemption"
+
+
+def test_declared_exemption_must_meet_its_own_precondition():
+    with pytest.raises(TaskTemplateError) as exc:
+        task_templates_module.resolve_validation_exemption(
+            validation=[],
+            read_only=False,
+            allowed_writes=["src/aiworkhub/x.py"],
+            required_outputs=[],
+            declared=task_templates_module.VALIDATION_EXEMPTION_READ_ONLY,
+        )
+    assert str(exc.value) == "validation_exemption_precondition_unmet"
+
+
+def test_exemption_alongside_declared_validation_is_refused():
+    with pytest.raises(TaskTemplateError) as exc:
+        task_templates_module.resolve_validation_exemption(
+            validation=["python -m pytest -q tests/test_x.py"],
+            read_only=True,
+            allowed_writes=[],
+            required_outputs=[],
+            declared=task_templates_module.VALIDATION_EXEMPTION_READ_ONLY,
+        )
+    assert str(exc.value) == "validation_exemption_with_validation"
+
+
+def test_read_only_analysis_expansion_is_the_named_exemption():
+    # read_only_analysis is the only registry template whose spec generates no
+    # pytest, lint or diff-check command, so it is the only one that can
+    # expand to an empty validation list.
+    card = expand_template("read_only_analysis", production_paths=["docs/PLAN.md"])
+    assert card["validation"] == []
+    assert task_templates_module.resolve_validation_exemption(
+        validation=card["validation"],
+        read_only=card["read_only"],
+        allowed_writes=card["allowed_writes"],
+        required_outputs=card["required_outputs"],
+    ) == task_templates_module.VALIDATION_EXEMPTION_READ_ONLY
+
+
+def test_writable_templates_never_expand_to_zero_validation():
+    # docs_change always emits git diff --check and validation_replay always
+    # requires test paths, so neither needs an exemption.
+    docs = expand_template("docs_change", production_paths=["docs/PLAN.md"])
+    assert docs["validation"]
+    replay = expand_template(
+        "validation_replay", test_paths=["tests/test_task_templates.py"]
+    )
+    assert replay["validation"]
+    for card in (docs, replay):
+        assert (
+            task_templates_module.resolve_validation_exemption(
+                validation=card["validation"],
+                read_only=card["read_only"],
+                allowed_writes=card["allowed_writes"],
+                required_outputs=card["required_outputs"],
+            )
+            is None
+        )

@@ -21,6 +21,7 @@ sandbox grants ``node`` is adapter policy this module cannot observe.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -28,7 +29,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from aiworkhub import toolchain_authority  # noqa: E402
+from aiworkhub import toolchain_authority, worker_workspace  # noqa: E402
 
 
 TRACKED = frozenset(
@@ -174,6 +175,87 @@ def test_resolver_is_total_on_unparseable_and_hostile_commands(tmp_path):
             )
             == ()
         )
+
+
+def _system_executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\nexit 0\n")
+    return path
+
+
+# NF-2026-00625 M2: the measured residual blocker was bare ``npm`` -- canonical
+# preflight trusted only git/node, so the exact ``npm --prefix
+# vscode-extension test`` card shape fell through as an unresolved bare Path
+# and NF633 stayed blocked even though node itself resolved cleanly. node,
+# npm and npx are now one trusted system-tool family in
+# ``worker_workspace._TRUSTED_VALIDATION_SYSTEM_EXECUTABLES``.
+@pytest.mark.parametrize("tool", ["node", "npm", "npx"])
+def test_node_family_resolves_to_an_immutable_absolute_path(
+    tool: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system_tool = _system_executable(tmp_path / "system" / tool)
+    monkeypatch.setattr(
+        worker_workspace.shutil,
+        "which",
+        lambda name: str(system_tool) if name == tool else None,
+    )
+
+    resolved = worker_workspace._resolve_trusted_system_validation_executable(tool)
+
+    assert resolved == system_tool.resolve()
+    assert resolved.is_absolute()
+
+
+def test_npm_prefix_card_becomes_launch_capable_when_npm_is_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Outside ``tmp_path`` (the repo passed below): a system tool resolved
+    # from inside the repository is repository-owned and must stay rejected,
+    # so a real trusted host tool has to live elsewhere.
+    system_npm = _system_executable(tmp_path.parent / "system" / "npm")
+    monkeypatch.setattr(
+        worker_workspace.shutil,
+        "which",
+        lambda name: str(system_npm) if name == "npm" else None,
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "_declared_workspace_seed_closure",
+        lambda *args: ((), (), ()),
+    )
+
+    missing = worker_workspace.preflight_validation_capabilities(
+        tmp_path,
+        {
+            "allowed_writes": ["vscode-extension/test/bridge.test.js"],
+            "validation": ["npm --prefix vscode-extension test"],
+        },
+    )
+
+    assert missing == ()
+
+
+def test_npm_prefix_card_stays_blocked_when_npm_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker_workspace.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        worker_workspace,
+        "_declared_workspace_seed_closure",
+        lambda *args: ((), (), ()),
+    )
+
+    missing = worker_workspace.preflight_validation_capabilities(
+        tmp_path,
+        {
+            "allowed_writes": ["vscode-extension/test/bridge.test.js"],
+            "validation": ["npm --prefix vscode-extension test"],
+        },
+    )
+
+    assert missing == ("executable:validation_executable_unavailable:npm",)
 
 
 def test_repository_tracked_paths_reads_this_repository(tmp_path):

@@ -6,6 +6,8 @@ import hashlib
 import json
 import re
 import shlex
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -291,3 +293,121 @@ def _provider_read_efficiency_from_output(path: Path) -> dict[str, Any]:
         "recognized_read_events": len(read_events),
         "recognized_source_graph_events": len(graph_events),
     }
+
+
+# ---------------------------------------------------------------------------
+# Durable per-task read-efficiency records (audit 2026-09-07 s5.3).
+#
+# The v2 record above is computed once per finished worker process and then
+# only ever stored in the live process report, so every aggregate over it is
+# computed from the handful of rows that report still holds -- 14 at the time
+# of the audit. Archived tasks contribute nothing, which makes any fleet claim
+# from that window unsupportable and keeps the gate in quality_evidence
+# non-blocking.
+#
+# This is the durable sink. It is deliberately explicit: the parser above stays
+# pure and the launcher must ask for a write, naming the task the record
+# belongs to. A record with no task identity is not attributable evidence and
+# is refused rather than written under a placeholder.
+# ---------------------------------------------------------------------------
+
+PROVIDER_READ_EFFICIENCY_RECORD_SCHEMA_ID = (
+    "aiworkhub.provider_read_efficiency_record.v2"
+)
+READ_EFFICIENCY_RECORD_FILENAME = "read_efficiency.v2.jsonl"
+_READ_EFFICIENCY_RECORD_READ_CAP_BYTES = 32 * 1024 * 1024
+
+
+def persist_provider_read_efficiency(
+    record: Mapping[str, Any] | None,
+    *,
+    destination_dir: Path,
+    task_id: str,
+    request_id: str = "",
+    runner: str = "",
+    adapter_id: str = "",
+    recorded_at: str | None = None,
+) -> dict[str, Any]:
+    """Append one attributable read-efficiency record as JSONL.
+
+    Returns a receipt saying whether the append happened and why not when it
+    did not. Never raises: a finalizing worker must not fail because an
+    observability sink is unwritable.
+    """
+
+    if not isinstance(record, Mapping) or not record:
+        return {"persisted": False, "reason": "no_record"}
+    identity = str(task_id or "").strip()
+    if not identity:
+        return {"persisted": False, "reason": "missing_task_id"}
+
+    payload = {
+        "schema_id": PROVIDER_READ_EFFICIENCY_RECORD_SCHEMA_ID,
+        "task_id": identity[:200],
+        "request_id": str(request_id or "")[:200],
+        "runner": str(runner or "")[:200],
+        "adapter_id": str(adapter_id or "")[:200],
+        "recorded_at": str(
+            recorded_at
+            or datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        )[:64],
+        "read_efficiency": {
+            key: value
+            for key, value in record.items()
+            if key != "events"  # per-event rows carry paths; the sink stays path-free
+        },
+    }
+    try:
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return {"persisted": False, "reason": "unserializable_record"}
+
+    target = Path(destination_dir) / READ_EFFICIENCY_RECORD_FILENAME
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError as error:
+        return {
+            "persisted": False,
+            "reason": "write_failed",
+            "error": type(error).__name__,
+        }
+    return {"persisted": True, "path": str(target), "bytes_written": len(line) + 1}
+
+
+def load_provider_read_efficiency_records(
+    destination_dir: Path,
+    *,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    """Return the persisted records, newest last, bounded and never raising.
+
+    Malformed lines are skipped rather than failing the read: a truncated tail
+    from a crashed finalizer must not hide every earlier record.
+    """
+
+    target = Path(destination_dir) / READ_EFFICIENCY_RECORD_FILENAME
+    try:
+        if not target.is_file() or target.is_symlink():
+            return []
+        if target.stat().st_size > _READ_EFFICIENCY_RECORD_READ_CAP_BYTES:
+            return []
+        raw = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("schema_id") == PROVIDER_READ_EFFICIENCY_RECORD_SCHEMA_ID
+        ):
+            records.append(parsed)
+    bounded = max(0, int(limit))
+    return records[-bounded:] if bounded else []

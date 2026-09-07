@@ -680,8 +680,8 @@ def test_pytest_uses_the_trusted_module_validator_authority() -> None:
 def test_git_uses_the_trusted_system_tool_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    system_git = tmp_path.parent / "system" / "git"
-    system_git.parent.mkdir()
+    system_git = tmp_path.parent / f"system-{tmp_path.name}" / "git"
+    system_git.parent.mkdir(parents=True)
     system_git.write_text("#!/bin/sh\n", encoding="utf-8")
     system_git.chmod(0o755)
     monkeypatch.setattr(worker_workspace.shutil, "which", lambda name: str(system_git))
@@ -717,6 +717,208 @@ def test_node_uses_system_authority_and_publishes_nvm_runtime_root(
 
     assert normalized == [str(system_node.resolve()), "test/check.js"]
     assert roots == (runtime_root.resolve(),)
+
+
+@pytest.mark.parametrize("tool", ["npm", "npx"])
+def test_npm_family_uses_system_authority_and_publishes_nvm_runtime_root(
+    tool: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    runtime_root = tmp_path / ".nvm" / "versions" / "node" / "v24.15.0"
+    system_tool = _executable(runtime_root / "bin" / tool)
+    monkeypatch.setattr(
+        worker_workspace.shutil,
+        "which",
+        lambda name: str(system_tool) if name == tool else None,
+    )
+
+    normalized, roots = (
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            [tool, "--prefix", "vscode-extension", "test"], repo
+        )
+    )
+
+    assert normalized == [
+        str(system_tool.resolve()),
+        "--prefix",
+        "vscode-extension",
+        "test",
+    ]
+    assert roots == (runtime_root.resolve(),)
+
+
+def test_distro_npm_does_not_publish_a_widened_sandbox_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    distro_npm = _executable(tmp_path / "usr" / "bin" / "npm")
+    monkeypatch.setattr(
+        worker_workspace.shutil,
+        "which",
+        lambda name: str(distro_npm) if name == "npm" else None,
+    )
+
+    normalized, roots = (
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            ["npm", "test"], repo
+        )
+    )
+
+    assert normalized == [str(distro_npm.resolve()), "test"]
+    assert roots == ()
+
+
+def test_bubblewrap_publishes_nvm_root_for_npm_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    (workspace.path / ".git").write_text(
+        "gitdir: /nonexistent/npm-nvm\n", encoding="utf-8"
+    )
+    home = (tmp_path / "fake-home").resolve()
+    home.mkdir()
+    runtime_root = home / ".nvm" / "versions" / "node" / "v24.15.0"
+    npm = _executable(runtime_root / "bin" / "npm")
+    monkeypatch.setattr(worker_workspace.Path, "home", lambda: home)
+
+    argv = worker_workspace.sandbox_argv(
+        workspace,
+        "validation",
+        [str(npm.resolve()), "--prefix", "vscode-extension", "test"],
+        backend="bubblewrap",
+    )
+
+    bind_index = argv.index(str(runtime_root.resolve()))
+    assert argv[bind_index - 1] == "--ro-bind"
+    assert argv[bind_index + 1] == str(runtime_root.resolve())
+
+
+def test_bubblewrap_does_not_publish_a_root_for_distro_npm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    (workspace.path / ".git").write_text(
+        "gitdir: /nonexistent/npm-distro\n", encoding="utf-8"
+    )
+    home = tmp_path / "fake-home"
+    home.mkdir()
+    distro_npm = _executable(tmp_path / "usr" / "bin" / "npm")
+    monkeypatch.setattr(worker_workspace.Path, "home", lambda: home)
+
+    argv = worker_workspace.sandbox_argv(
+        workspace,
+        "validation",
+        [str(distro_npm.resolve()), "test"],
+        backend="bubblewrap",
+    )
+
+    # Present exactly once, as the executed command -- never as an extra
+    # ``--ro-bind`` mount target, since a distro-owned command lives beneath
+    # the already-published ``/usr`` bind and needs no extra sandbox root.
+    assert argv.count(str(distro_npm.resolve())) == 1
+    assert argv[-2:] == [str(distro_npm.resolve()), "test"]
+
+
+def test_npm_capability_preflight_prefix_card_becomes_launch_capable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system_npm = _executable(tmp_path.parent / "system" / "npm")
+    monkeypatch.setattr(
+        worker_workspace.shutil,
+        "which",
+        lambda name: str(system_npm) if name == "npm" else None,
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "_declared_workspace_seed_closure",
+        lambda *args: ((), (), ()),
+    )
+
+    assert worker_workspace.preflight_validation_capabilities(
+        tmp_path,
+        {
+            "allowed_writes": [],
+            "validation": ["npm --prefix vscode-extension test"],
+        },
+    ) == ()
+
+
+def test_npm_capability_preflight_reports_exact_failure_when_untrusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker_workspace.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        worker_workspace,
+        "_declared_workspace_seed_closure",
+        lambda *args: ((), (), ()),
+    )
+
+    missing = worker_workspace.preflight_validation_capabilities(
+        tmp_path,
+        {
+            "allowed_writes": [],
+            "validation": ["npm --prefix vscode-extension test"],
+        },
+    )
+
+    assert missing == ("executable:validation_executable_unavailable:npm",)
+
+
+def test_npm_family_nvm_root_rejects_foreign_owner_and_world_writable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    runtime_root = tmp_path / ".nvm" / "versions" / "node" / "v24.15.0"
+    system_npx = _executable(runtime_root / "bin" / "npx")
+    monkeypatch.setattr(
+        worker_workspace.shutil,
+        "which",
+        lambda name: str(system_npx) if name == "npx" else None,
+    )
+    monkeypatch.setattr(
+        worker_workspace, "stat_owned_by_current_user", lambda _info: False
+    )
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_executable_runtime_root_untrusted_owner",
+    ):
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            ["npx", "mocha"], repo
+        )
+
+    monkeypatch.setattr(
+        worker_workspace, "stat_owned_by_current_user", lambda _info: True
+    )
+    monkeypatch.setattr(
+        worker_workspace, "posix_path_modes_supported", lambda _platform=None: True
+    )
+    monkeypatch.setattr(worker_workspace.stat, "S_IMODE", lambda mode: 0o002)
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_executable_runtime_root_world_writable",
+    ):
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            ["npx", "mocha"], repo
+        )
+
+
+def test_npm_system_tool_authority_rejects_repository_owned_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_npm = _executable(tmp_path / "bin" / "npm")
+    monkeypatch.setattr(worker_workspace.shutil, "which", lambda name: str(repo_npm))
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_executable_repository_owned",
+    ):
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            ["npm", "test"], tmp_path
+        )
 
 
 def test_node_capability_preflight_uses_the_same_system_authority(

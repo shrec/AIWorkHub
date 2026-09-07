@@ -3666,6 +3666,361 @@ def _declared_workspace_seed_closure(
     return live_seeded, support_seeded, seeded
 
 
+# ---- validation lane facts, established BEFORE the worker runs --------------
+#
+# ``compatible_validation_lane_unavailable`` and ``metadata_broker_denial`` were
+# only ever reached through ``validation_runner.plan_validation_capability_replay``
+# -- i.e. AFTER a worker had executed the card's declared commands, and therefore
+# after the model had already been paid for.  Measured over four days: 13 of 84
+# ``finalize_failed`` terminal events were ``validation_environment_blocked``, a
+# family previously audited at 70.8M tokens and $36.02.  That taxonomy is correct
+# and is preserved unchanged here; what was wrong is only WHEN the lane's
+# limitations become visible.
+#
+# Two things about the lane are genuinely knowable before a token is spent, and
+# both are established here:
+#   * whether a secure lane can be provisioned on this host at all, and
+#   * what that lane's structural capabilities actually MEASURE as.
+#
+# What is NOT knowable is deliberately not decided here.  Measured on this host
+# (Landlock ABI 4): ``_landlock_supported_mutations`` grants ``_LL_REFER`` from
+# ABI 2, so hardlinks are permitted and only fail when a specific source or
+# destination falls outside the granted write scope; and the chmod family, though
+# listed in ``_SECCOMP_DENIED_SYSCALLS``, is MEDIATED by the metadata broker,
+# which allows the mutation on targets it owns.  Both denials are therefore
+# path-dependent, not lane-wide.  A static "this lane cannot chmod/hardlink"
+# refusal was built and then measured against the suite: it refused 49 of 382
+# test files (12.8%), against 7 files that the live evidence actually implicates,
+# and it refused call sites such as ``tests/test_task_liveness_reconciler.py``
+# line 1185 that are wrapped in ``try/except OSError: pytest.skip(...)`` and so
+# tolerate the denial cleanly.  Blocking correct work on an unmeasurable
+# prediction is a worse defect than the late discovery it would replace, so the
+# declared-demand scan below REPORTS and never refuses; ``validation_runner``
+# keeps sole authority over the verdict, from real denials.
+
+
+def probe_sandbox_lane_capabilities(backend: str) -> frozenset[str] | None:
+    """Measure what this host's lane can actually do, or ``None`` if unestablished.
+
+    Every member is read from a live host fact, never asserted:
+
+    * ``hardlink`` -- ``landlock_abi_version()`` decides it, because
+      ``_landlock_supported_mutations`` adds ``_LL_REFER`` (the right governing
+      hardlink and cross-directory rename) only from ABI 2.  On an ABI-1 kernel
+      the lane cannot link at all; from ABI 2 it can, within granted scope.
+    * ``chmod`` -- present when the metadata broker brokers the chmod family,
+      which is what turns an otherwise unconditional ``_SECCOMP_DENIED_SYSCALLS``
+      entry into a mediated (and frequently permitted) operation.
+    * ``nested_landlock`` / ``git_metadata`` -- exactly the pair
+      ``validation_runner.plan_validation_capability_replay`` will authorize a
+      least-privilege replay for.  ``tests/test_worker_workspace.py`` asserts the
+      agreement so the two cannot drift.
+
+    ``None`` means this lane has not been established by measurement, and callers
+    must not draw any conclusion from it.
+    """
+
+    if backend != "landlock":
+        # bubblewrap and the VS Code in-process lane have not been measured on
+        # this axis. Reporting "unestablished" is the honest answer; inventing a
+        # capability set for them would be exactly the unmeasured bound this
+        # module exists to avoid.
+        return None
+    capabilities = {"nested_landlock", "git_metadata"}
+    try:
+        abi = landlock_abi_version()
+    except Exception:  # pragma: no cover - defensive: probe must never raise
+        abi = 0
+    if abi and _landlock_supported_mutations(abi) & _LL_REFER:
+        capabilities.add("hardlink")
+    if _METADATA_BROKER_SYSCALLS:
+        capabilities.add("chmod")
+    return frozenset(capabilities)
+
+
+# Denied metadata operation -> the ``validation_runner`` capability name it
+# demands.  Limited to the two capabilities that taxonomy carries for a declared
+# command (``chmod`` and ``hardlink``); the chown/utime/xattr families are denied
+# too but surface at runtime as an unresolved ``oserror_eperm`` with no capability
+# name, so naming them here could never be corroborated by the runtime verdict.
+# ``symlink``/``symlink_to`` are deliberately absent: ``_LL_MAKE_SYM`` is granted.
+_LANE_CAPABILITY_BY_OPERATION: Mapping[str, str] = types.MappingProxyType(
+    {
+        "chmod": "chmod",
+        "fchmod": "chmod",
+        "lchmod": "chmod",
+        "fchmodat": "chmod",
+        "link": "hardlink",
+        "linkat": "hardlink",
+        "link_to": "hardlink",
+        "hardlink_to": "hardlink",
+    }
+)
+# ``link``/``linkat`` are ordinary English words and a plain ``obj.link(...)``
+# says nothing about hardlinks, so they count only as ``os.link``/``os.linkat``.
+# The rest are unambiguous on any receiver (``os`` and ``pathlib.Path`` are the
+# only things that define them).
+_LANE_OS_ONLY_OPERATIONS = frozenset({"link", "linkat"})
+# Exception types whose handler proves the call site tolerates a sandbox denial.
+_LANE_TOLERATED_EXCEPTIONS = frozenset(
+    {"OSError", "PermissionError", "EnvironmentError", "Exception", "BaseException"}
+)
+
+
+@dataclass(frozen=True)
+class ValidationLaneRequirement:
+    """One statically located call site that would exercise a lane capability."""
+
+    capability: str
+    command: str
+    target: str
+    line: int
+    operation: str
+    tolerated: bool
+
+
+@dataclass(frozen=True)
+class ValidationLanePlan:
+    """The lane a card's declared validation would run in, established at preflight.
+
+    ``reason`` is non-empty ONLY for a certainty: no securable lane exists on this
+    host.  ``unmet`` is the advisory set -- capabilities the declared commands
+    would exercise that the lane does not measure as providing.  It is reported,
+    never enforced, because a denial is path-dependent (see the module comment
+    above) and ``validation_runner`` decides the verdict from real denials.
+    """
+
+    backend: str
+    provided: tuple[str, ...] | None
+    exercised: tuple[str, ...]
+    unmet: tuple[str, ...]
+    requirements: tuple[ValidationLaneRequirement, ...]
+    reason: str
+
+    @property
+    def available(self) -> bool:
+        return not self.reason
+
+
+def _lane_operation_capability(node: ast.Call) -> tuple[str, str] | None:
+    """Name the capability a call site would exercise, or ``None`` for anything else."""
+
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    operation = func.attr
+    capability = _LANE_CAPABILITY_BY_OPERATION.get(operation)
+    if capability is None:
+        return None
+    on_os = isinstance(func.value, ast.Name) and func.value.id == "os"
+    if operation in _LANE_OS_ONLY_OPERATIONS and not on_os:
+        return None
+    return capability, f"{'os.' if on_os else ''}{operation}"
+
+
+def _lane_tolerated_lines(tree: ast.AST) -> set[int]:
+    """Line numbers inside a ``try`` that catches a sandbox denial.
+
+    A call guarded by ``except OSError``/``PermissionError`` (or a bare
+    ``except``) demonstrably survives the denial -- several tests in this
+    repository do exactly that and then ``pytest.skip``.  Counting such a site as
+    a lane demand is a false positive, so it is marked tolerated instead.
+    """
+
+    tolerated: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        catches = False
+        for handler in node.handlers:
+            if handler.type is None:
+                catches = True
+                break
+            names = (
+                handler.type.elts
+                if isinstance(handler.type, ast.Tuple)
+                else [handler.type]
+            )
+            for entry in names:
+                label = (
+                    entry.id
+                    if isinstance(entry, ast.Name)
+                    else entry.attr
+                    if isinstance(entry, ast.Attribute)
+                    else ""
+                )
+                if label in _LANE_TOLERATED_EXCEPTIONS:
+                    catches = True
+                    break
+            if catches:
+                break
+        if not catches:
+            continue
+        for guarded in node.body:
+            for inner in ast.walk(guarded):
+                line = getattr(inner, "lineno", None)
+                if line is not None:
+                    tolerated.add(line)
+    return tolerated
+
+
+def _declared_validation_targets(repo: Path, command: str) -> tuple[str, ...]:
+    """Repository ``.py`` files a command names EXPLICITLY -- never an expansion.
+
+    A bare ``pytest``, a directory target or a ``-k`` selection yields nothing, so
+    the scan only ever speaks about exact files whose contents are readable right
+    now.  A whole-suite command's real target set is not knowable without
+    collecting it, and is deliberately out of scope.
+    """
+
+    try:
+        argv, _components, _tmpdir, cwd_relative = _parse_validation_command_detailed(
+            command
+        )
+    except (ValueError, WorkspaceError):
+        return ()
+    base = repo if cwd_relative is None else repo / cwd_relative
+    targets: list[str] = []
+    for token in argv[1:]:
+        if token.startswith("-"):
+            continue
+        # pytest node ids ("tests/x.py::test_y") name the same file.
+        path_part = token.split("::", 1)[0]
+        if not path_part.endswith(".py"):
+            continue
+        candidate = Path(path_part)
+        resolved = candidate if candidate.is_absolute() else base / candidate
+        try:
+            resolved = resolved.resolve(strict=True)
+            relative = resolved.relative_to(repo.resolve())
+        except (OSError, ValueError):
+            continue
+        if not resolved.is_file():
+            continue
+        targets.append(relative.as_posix())
+    return tuple(dict.fromkeys(targets))
+
+
+def declared_validation_lane_requirements(
+    repo: Path, commands: Iterable[str]
+) -> tuple[ValidationLaneRequirement, ...]:
+    """Lane capabilities the declared validation would exercise, with evidence.
+
+    Read from the declared targets' own syntax -- the same authority
+    ``validation_runner.derive_validation_capability_profile`` already trusts for
+    a declaration ("authoritative declared test metadata, never candidate
+    stderr"), consulted before the run instead of after it.  Nothing here reads a
+    candidate's output, so it cannot turn a genuine gate failure into an
+    environment verdict: at preflight no candidate has run at all.
+
+    Deliberately sequential.  Measured on this repository's largest declared
+    target (``tests/test_worker_workspace.py``, 270KB / 7015 lines) ``ast.parse``
+    takes 47.5ms and the whole scan 78ms, so a card's handful of commands stays
+    well under the ~50-100ms per-worker startup a process pool would add for this
+    CPU-bound (GIL-holding) parse.
+    """
+
+    requirements: list[ValidationLaneRequirement] = []
+    parsed: dict[str, list[tuple[str, int, str, bool]]] = {}
+    for command in commands:
+        if not isinstance(command, str) or not command.strip():
+            continue
+        for target in _declared_validation_targets(repo, command):
+            if target not in parsed:
+                found: list[tuple[str, int, str, bool]] = []
+                try:
+                    tree = ast.parse((repo / target).read_text(encoding="utf-8"))
+                except (OSError, SyntaxError, ValueError, UnicodeDecodeError):
+                    # An unreadable or unparseable target proves nothing about
+                    # the lane; leave it to the runtime classifier.
+                    parsed[target] = []
+                    continue
+                tolerated = _lane_tolerated_lines(tree)
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    resolved = _lane_operation_capability(node)
+                    if resolved is not None:
+                        found.append(
+                            (
+                                resolved[0],
+                                node.lineno,
+                                resolved[1],
+                                node.lineno in tolerated,
+                            )
+                        )
+                parsed[target] = found
+            for capability, line, operation, is_tolerated in parsed[target]:
+                requirements.append(
+                    ValidationLaneRequirement(
+                        capability=capability,
+                        command=command,
+                        target=target,
+                        line=line,
+                        operation=operation,
+                        tolerated=is_tolerated,
+                    )
+                )
+    return tuple(requirements)
+
+
+def plan_validation_lane(
+    repo: Path, card: Mapping[str, Any], *, backend: str | None = None
+) -> ValidationLanePlan:
+    """Establish, before any worker runs, the lane this card would validate in.
+
+    Security note: this NEVER shops for a more permissive lane.  The backend is
+    the one ``select_sandbox_backend`` already chose (or the one the caller was
+    given); if that lane cannot supply something, the answer is to report it,
+    never to downgrade to weaker isolation.  An environment that cannot run the
+    work is the platform's problem to fix, and silently relaxing the sandbox to
+    manufacture a "compatible" lane would trade a costed, visible failure for an
+    invisible loss of containment.
+    """
+
+    if backend:
+        selected = backend
+    else:
+        try:
+            selected = select_sandbox_backend()
+        except WorkspaceError as exc:
+            # A certainty, knowable with zero tokens and no card input at all.
+            # Previously this surfaced only from inside ``run_validations``,
+            # after the model had been paid for.
+            return ValidationLanePlan(
+                backend="",
+                provided=None,
+                exercised=(),
+                unmet=(),
+                requirements=(),
+                # ``VALIDATION_UNSUPPORTED_IN_SANDBOX`` is the name the runtime
+                # path already gives this exact restriction, so the preflight
+                # fact and the terminal event read identically and route to the
+                # same recoverable bucket. ``exc`` already carries its own
+                # restriction token, so it is not re-prefixed.
+                reason=f"{VALIDATION_UNSUPPORTED_IN_SANDBOX}:{exc}",
+            )
+    provided = probe_sandbox_lane_capabilities(selected)
+    commands = tuple(
+        value
+        for value in (card.get("validation") or [])
+        if isinstance(value, str) and value.strip()
+    )
+    requirements = declared_validation_lane_requirements(repo, commands)
+    exercised = tuple(
+        sorted({item.capability for item in requirements if not item.tolerated})
+    )
+    unmet = () if provided is None else tuple(sorted(set(exercised) - set(provided)))
+    return ValidationLanePlan(
+        backend=selected,
+        provided=None if provided is None else tuple(sorted(provided)),
+        exercised=exercised,
+        unmet=unmet,
+        requirements=requirements,
+        reason="",
+    )
+
+
 def preflight_validation_capabilities(
     repo: Path, card: Mapping[str, Any]
 ) -> tuple[str, ...]:
@@ -3724,6 +4079,16 @@ def preflight_validation_capabilities(
             )
         except WorkspaceError as exc:
             missing.add(f"repository_input:{exc}")
+    # Whether this host can provision a secure lane at all is knowable now, and
+    # was previously discovered only inside ``run_validations`` -- after the model
+    # had been paid for.  Emitting it here makes it a named, non-defect,
+    # re-armable preflight requirement (the caller turns each entry into a
+    # ``MissingRequirement`` BEFORE a worker is launched) rather than a terminal
+    # event.  Only this certainty refuses; the lane's capability gaps are
+    # path-dependent and are reported by ``plan_validation_lane`` instead.
+    plan = plan_validation_lane(repo, card)
+    if not plan.available:
+        missing.add(f"validation_lane:{plan.reason}")
     return tuple(sorted(missing))
 
 
@@ -5781,7 +6146,12 @@ def select_sandbox_backend() -> str:
 # a packaged server therefore reported ``module:pytest`` and rejected otherwise
 # runnable cards before launch.
 _TRUSTED_VALIDATION_BARE_EXECUTABLES = frozenset({"pytest", "ruff", "mypy"})
-_TRUSTED_VALIDATION_SYSTEM_EXECUTABLES = frozenset({"git", "node"})
+# node, npm and npx are one trusted system-tool family: an nvm install places
+# all three beneath the same ``versions/node/vX.Y.Z/bin`` root, and a card
+# that runs ``npm --prefix <dir> test`` is exactly as launch-capable as one
+# that runs ``node`` directly once that family is trusted (NF-2026-00625 M2).
+_NODE_FAMILY_SYSTEM_EXECUTABLES = frozenset({"node", "npm", "npx"})
+_TRUSTED_VALIDATION_SYSTEM_EXECUTABLES = frozenset({"git"}) | _NODE_FAMILY_SYSTEM_EXECUTABLES
 SANDBOX_VALIDATION_EXECUTABLE_ROOT = "/validation-executable-root"
 
 
@@ -6096,7 +6466,39 @@ def _normalize_validation_interpreter_argv(
 CANONICAL_PYTHON_ENV = "AIWORKHUB_CANONICAL_PYTHON"
 CANONICAL_RUFF_ENV = "AIWORKHUB_CANONICAL_RUFF"
 CANONICAL_MYPY_ENV = "AIWORKHUB_CANONICAL_MYPY"
-_WORKER_PYTEST_ADDOPTS = "-p no:cacheprovider"
+# Worker pytest output shaping (audit 2026-09-07 section 5.3).  A worker runs
+# its card's declared pytest command inside its own agent session, so every
+# byte pytest prints lands in a tool result, enters the transcript, and is
+# re-sent on every later turn -- and it is largest exactly when the run FAILS,
+# which is the ~69% of rejections that are test failures.  ``--tb=short``
+# drops the repeated source listing and frame separators of pytest's default
+# ``--tb=auto`` while keeping every stack frame (file:line plus its source
+# line), the whole ``E`` assertion diff, the short-summary index and the
+# counts line: measured 1515 -> 1106 bytes and 42 -> 25 lines on a
+# two-failure run that already passed ``-q``, with the per-failure saving
+# growing linearly in the failure count.  It shapes, never truncates -- no
+# ``--maxfail``, because ending a run early would change WHAT is measured.
+#
+# Composition is why this is safe to impose.  Pytest splices
+# ``PYTEST_ADDOPTS`` in BEFORE the command line (``ini addopts`` +
+# ``PYTEST_ADDOPTS`` + argv) and ``--tb`` is a store option, so a card that
+# spells its own ``--tb=long``/``--tb=no`` wins outright; this is only the
+# default for a card that expressed no preference.  ``pyproject.toml`` sets
+# no ``addopts``, so this string is the sole pre-argv source.
+#
+# Deliberately NOT included: ``-q`` (verbosity is a COUNT option, so a ``-q``
+# here would silently cancel a card's explicit ``-v`` instead of losing to
+# it), ``--no-header`` (measured zero effect -- the declared commands already
+# pass ``-q``, which suppresses that header), and ``-rN`` (saves 233 bytes
+# but deletes the short-summary index, the most compact statement of which
+# tests failed).
+#
+# Acceptance evidence is untouched: the coordinator re-runs canonical
+# validation after worker exit via ``run_validations``, which builds its own
+# environment with an independent ``PYTEST_ADDOPTS`` literal, and
+# ``task_fsm.evidence_verdict`` consumes only those machine-produced records
+# -- never free-text worker output.
+_WORKER_PYTEST_ADDOPTS = "-p no:cacheprovider --tb=short"
 
 
 def _sandbox_visible_repo_path(
@@ -6755,12 +7157,17 @@ def _normalize_trusted_validation_executable_argv_with_authority(
         return [sys.executable, *argv[1:]], (), None
     if head in _TRUSTED_VALIDATION_SYSTEM_EXECUTABLES:
         executable = _resolve_trusted_system_validation_executable(head, repo)
-        # Node is commonly installed through nvm outside /usr.  Bubblewrap
-        # cannot execute that absolute path unless the immutable version root
-        # is explicitly bound.  Preserve the normal system-tool path for a
-        # distro Node, while carrying the exact nvm version root for sandbox
-        # publication when applicable.
-        node_root = _node_install_root(str(executable)) if head == "node" else None
+        # node/npm/npx are commonly installed through nvm outside /usr.
+        # Bubblewrap cannot execute that absolute path unless the immutable
+        # version root is explicitly bound.  Preserve the normal system-tool
+        # path for a distro-owned command (``_node_install_root`` returns
+        # ``None`` for it, so no extra root is published), while carrying the
+        # exact nvm version root for sandbox publication when applicable.
+        node_root = (
+            _node_install_root(str(executable))
+            if head in _NODE_FAMILY_SYSTEM_EXECUTABLES
+            else None
+        )
         if node_root is not None:
             resolved_root = node_root.resolve(strict=True)
             root_info = resolved_root.stat()

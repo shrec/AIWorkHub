@@ -12,6 +12,16 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.0 — 2026-09-07
+
+- Process launcher and worker workspace record terminal-failure evidence
+  support and handle validation prerequisite/toolchain availability.
+- Quality review ingest normalizes review finding aliases, failing closed on
+  unrecognized keys.
+- Task template required-output parity is aligned in tests only, with no
+  implementation change. Deferred NF658 (semantic-edit authority) is not part
+  of the canonical tree and is not claimed here.
+
 ## What's new in 0.10.99 — 2026-09-06
 
 - Source Graph reuses computed symbol metrics instead of recomputing them, and

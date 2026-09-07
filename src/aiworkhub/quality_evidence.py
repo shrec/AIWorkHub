@@ -520,6 +520,211 @@ def derive_risk_signals(
             signals.add("destructive_change")
             break
     return sorted(signals)
+
+
+# ---------------------------------------------------------------------------
+# Read-efficiency gate (audit 2026-09-07 s5.3).
+#
+# ``read_efficiency.analyze_read_efficiency`` and the provider parser in
+# ``process_launcher_read_efficiency`` have measured worker read discipline
+# since 0.10.x, but nothing consumed the record: it reached one dashboard tile
+# and stopped. This section turns that record into a reported gate signal.
+#
+# The gate is deliberately non-blocking by default. The record is produced per
+# finished worker process and, until it is persisted, the aggregate window is
+# only the live process report -- far too small a denominator to justify
+# refusing a candidate. ``blocking`` is a separate, explicitly-off switch; the
+# default path can only ever report.
+#
+# An unobserved or under-sampled run reports rates of ``None`` and status
+# not_available. It never reports 0.0, because "no evidence" and "measured
+# zero" are different facts and a gate that conflates them is worse than no
+# gate at all.
+# ---------------------------------------------------------------------------
+
+READ_EFFICIENCY_GATE_SCHEMA_ID = "aiworkhub.read_efficiency_gate.v1"
+
+# Sample: 250 provider stdout logs under
+# .aiworkhub/runtime/process_logs/processes (2026-09-07), of which 131 carried
+# read evidence and 105 carried at least READ_EFFICIENCY_MIN_MEASURED_READS
+# reads. Measured percentiles over those 105 runs:
+#   unbounded_read_rate      p50 22.2  p75 40.0  p90 66.7
+#   unknown_repetition_rate  p50 60.0  p75 75.0  p90 80.0
+# Thresholds are set near p90 rather than p75 so the signal marks the clearly
+# worst runs instead of a whole quartile: at these values the unbounded signal
+# fires on 14/105 runs (13.3%) and the repetition signal on 13/105 (12.4%).
+READ_EFFICIENCY_UNBOUNDED_READ_RATE_THRESHOLD = 60.0
+READ_EFFICIENCY_UNKNOWN_REPETITION_RATE_THRESHOLD = 80.0
+
+# Below this many observed reads a percentage is sampling noise, not
+# discipline: one unbounded read in a two-read run is already 50%. Chosen from
+# the same sample -- p50/p75 of both rates are unstable under 5 reads and
+# stable from 5 upward.
+READ_EFFICIENCY_MIN_MEASURED_READS = 5
+
+# The blocking switch. Off means the gate can only ever report.
+READ_EFFICIENCY_BLOCKING_DEFAULT = False
+
+READ_EFFICIENCY_MEASUREMENT_LABEL = (
+    "observed_provider_read_events_only_no_token_or_cost_claim"
+)
+READ_EFFICIENCY_STATE_MEASURED = "measured"
+READ_EFFICIENCY_STATE_UNOBSERVED = "unobserved"
+READ_EFFICIENCY_STATE_BELOW_MINIMUM_SAMPLE = "below_minimum_sample"
+READ_EFFICIENCY_SIGNAL_UNBOUNDED = "unbounded_read_rate_above_threshold"
+READ_EFFICIENCY_SIGNAL_UNKNOWN_REPETITION = (
+    "unknown_repetition_rate_above_threshold"
+)
+
+
+def _read_efficiency_rate(numerator: Any, denominator: int) -> float | None:
+    """Return a percentage, or ``None`` when the numerator is not a count."""
+
+    if denominator <= 0:
+        return None
+    if isinstance(numerator, bool) or not isinstance(numerator, int):
+        return None
+    if numerator < 0:
+        return None
+    return round(100.0 * numerator / denominator, 1)
+
+
+def evaluate_read_efficiency_gate(
+    read_efficiency: Mapping[str, Any] | None,
+    *,
+    blocking: bool = READ_EFFICIENCY_BLOCKING_DEFAULT,
+    unbounded_read_rate_threshold: float = (
+        READ_EFFICIENCY_UNBOUNDED_READ_RATE_THRESHOLD
+    ),
+    unknown_repetition_rate_threshold: float = (
+        READ_EFFICIENCY_UNKNOWN_REPETITION_RATE_THRESHOLD
+    ),
+    minimum_measured_reads: int = READ_EFFICIENCY_MIN_MEASURED_READS,
+) -> dict[str, Any]:
+    """Report worker read discipline as one honest gate signal.
+
+    ``read_efficiency`` is a ``aiworkhub.provider_read_efficiency.v2`` record
+    as stored in the process report. Absent, malformed or under-sampled
+    evidence yields ``measured=False``, ``None`` rates and status
+    not_available -- never a measured zero, and never a block.
+    """
+
+    record: Mapping[str, Any] = (
+        read_efficiency if isinstance(read_efficiency, Mapping) else {}
+    )
+    raw_total = record.get("total_reads")
+    total_reads = (
+        raw_total
+        if isinstance(raw_total, int) and not isinstance(raw_total, bool)
+        else 0
+    )
+    total_reads = max(0, total_reads)
+    evidence_observed = bool(record.get("evidence_observed"))
+
+    if not record or not evidence_observed or total_reads <= 0:
+        state = READ_EFFICIENCY_STATE_UNOBSERVED
+    elif total_reads < max(1, int(minimum_measured_reads)):
+        state = READ_EFFICIENCY_STATE_BELOW_MINIMUM_SAMPLE
+    else:
+        state = READ_EFFICIENCY_STATE_MEASURED
+
+    measured = state == READ_EFFICIENCY_STATE_MEASURED
+    unbounded_rate = (
+        _read_efficiency_rate(record.get("unbounded_reads"), total_reads)
+        if measured
+        else None
+    )
+    unknown_rate = (
+        _read_efficiency_rate(record.get("unknown_repetitions"), total_reads)
+        if measured
+        else None
+    )
+
+    signals: list[str] = []
+    if unbounded_rate is not None and unbounded_rate >= unbounded_read_rate_threshold:
+        signals.append(READ_EFFICIENCY_SIGNAL_UNBOUNDED)
+    if (
+        unknown_rate is not None
+        and unknown_rate >= unknown_repetition_rate_threshold
+    ):
+        signals.append(READ_EFFICIENCY_SIGNAL_UNKNOWN_REPETITION)
+
+    blocking_enabled = bool(blocking)
+    # A signal blocks only when the switch is on. With the switch off the gate
+    # is an observation and the fold must not see a failure.
+    blocked = bool(signals) and blocking_enabled
+    if not measured:
+        status = STATUS_NOT_AVAILABLE
+        verdict = "unmeasured"
+    elif signals:
+        status = STATUS_FAILED if blocked else STATUS_PASSED
+        verdict = "above_threshold"
+    else:
+        status = STATUS_PASSED
+        verdict = "within_threshold"
+
+    if not measured:
+        summary = (
+            "read efficiency unmeasured "
+            f"({state}; observed reads={total_reads}, "
+            f"minimum={max(1, int(minimum_measured_reads))})"
+        )
+    else:
+        summary = (
+            f"read efficiency over {total_reads} observed reads: "
+            f"unbounded {unbounded_rate}% "
+            f"(threshold {unbounded_read_rate_threshold}%), "
+            f"unknown repetition {unknown_rate}% "
+            f"(threshold {unknown_repetition_rate_threshold}%)"
+        )
+
+    return {
+        "schema_id": READ_EFFICIENCY_GATE_SCHEMA_ID,
+        "measured": measured,
+        "measurement_state": state,
+        "measurement_label": READ_EFFICIENCY_MEASUREMENT_LABEL,
+        "evidence_observed": evidence_observed,
+        # The honest denominator travels with every rate.
+        "observed_reads": total_reads,
+        "minimum_measured_reads": max(1, int(minimum_measured_reads)),
+        "unbounded_read_rate": unbounded_rate,
+        "unknown_repetition_rate": unknown_rate,
+        "unbounded_read_rate_threshold": float(unbounded_read_rate_threshold),
+        "unknown_repetition_rate_threshold": float(unknown_repetition_rate_threshold),
+        "signals": signals,
+        "verdict": verdict,
+        "status": status,
+        "blocking_enabled": blocking_enabled,
+        "blocked": blocked,
+        "disposition": (
+            FINDING_DISPOSITION_DEFECT
+            if blocked
+            else FINDING_DISPOSITION_OBSERVATION
+        ),
+        "summary": summary,
+    }
+
+
+def read_efficiency_evidence_check(
+    read_efficiency: Mapping[str, Any] | None,
+    *,
+    blocking: bool = READ_EFFICIENCY_BLOCKING_DEFAULT,
+    **thresholds: Any,
+) -> EvidenceCheck:
+    """Return the read-efficiency gate as one canonical evidence-schema row."""
+
+    gate = evaluate_read_efficiency_gate(
+        read_efficiency, blocking=blocking, **thresholds
+    )
+    return EvidenceCheck(
+        check_id="read_efficiency",
+        kind="observability",
+        status=str(gate["status"]),
+        summary=str(gate["summary"]),
+        provenance=READ_EFFICIENCY_MEASUREMENT_LABEL,
+    )
+
+
 _RISK_PROFILES: dict[str, dict[str, Any]] = {
     RISK_LOW: {
         "required_reviewer_lenses": (),

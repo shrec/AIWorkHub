@@ -24,6 +24,7 @@ whose canonical SQLite row always wins over any stale ``card_json`` copy.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -34,6 +35,7 @@ from typing import Any
 
 from . import callback_store
 from . import core
+from . import db_writer
 from . import task_store
 
 
@@ -79,8 +81,38 @@ def claim_start_exact(
     now = datetime.now(timezone.utc).isoformat()
     try:
         _readiness, db_path = task_store._require_ready(repo)
+    except task_store.TaskStoreError as exc:
+        return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
+    # One serialized writer per database, ACROSS PROCESSES. The claim CAS below
+    # is the exact statement the measured launch-path traceback dies on
+    # (process_launcher._launch_isolated -> task_engine.claim_start_exact ->
+    # conn.execute -> sqlite3.OperationalError: database is locked), and its
+    # competing writers are separate supervisor OS processes -- 169 distinct
+    # pids, up to 12 alive at once -- so an in-process queue could not have
+    # made them take turns. The lease changes the failure mode from
+    # "lock -> fail -> retry" to "queue -> transaction -> commit"; it does not
+    # change the transaction, the preimage CAS, or the error contract below.
+    #
+    # The lease is taken BEFORE _connect deliberately: _connect issues
+    # "PRAGMA journal_mode=WAL", which is itself a write and does raise
+    # "database is locked" under contention (callback_store.open_db already
+    # retries that exact statement). Connecting outside the lease would leave
+    # the first statement of the claim path unserialized.
+    lease_stack = contextlib.ExitStack()
+    try:
+        lease_stack.enter_context(db_writer.write_lease(db_path))
+    except db_writer.WriteLeaseError as exc:
+        return {
+            "ok": False,
+            "returncode": 1,
+            "command": command,
+            "stdout": "",
+            "stderr": f"task_queue_write_lease_unavailable:{exc}",
+        }
+    try:
         conn = task_store._connect(db_path)
     except task_store.TaskStoreError as exc:
+        lease_stack.close()
         return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
     try:
         row = conn.execute(
@@ -252,7 +284,10 @@ def claim_start_exact(
         )
         conn.commit()
     finally:
-        conn.close()
+        try:
+            conn.close()
+        finally:
+            lease_stack.close()
     card = task_store.get_task(repo, task_id)
     stdout = json.dumps(card, ensure_ascii=False, default=str) if card else ""
     return {"ok": True, "returncode": 0, "command": command, "stdout": stdout, "stderr": ""}
@@ -954,6 +989,121 @@ def archive_task(
     }
 
 
+_REVIEWER_CHILD_TERMINAL_STATUSES = ("finished", "done", "archived", "superseded")
+
+
+def _claim_epoch_for_request(conn: Any, task_id: str, request_id: str) -> int | None:
+    """Resolve the claim epoch of one exact launch episode of ``task_id``.
+
+    ``claim_start_exact`` writes ``{"request_id": ..., "claim_epoch": ...}`` on
+    every ``claim_start``/``launch_attach`` event, and ``claim_epoch`` is only
+    ever incremented for a new episode (never reset, never reused), so those
+    events are a durable total order over one task's launch episodes.  Returns
+    ``None`` when the episode was never recorded -- never a guess.
+    """
+    if not task_id or not request_id:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT payload_json FROM task_events "
+            "WHERE task_id=? AND event IN ('claim_start','launch_attach') "
+            "ORDER BY event_id DESC",
+            (task_id,),
+        ).fetchall()
+    except Exception:
+        return None
+    for row in rows:
+        try:
+            payload = json.loads(row[0] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("request_id") or "") != request_id:
+            continue
+        epoch = payload.get("claim_epoch")
+        if type(epoch) is int:
+            return epoch
+    return None
+
+
+def _parent_claim_epoch(conn: Any, task_id: str, request_id: str) -> int | None:
+    """Claim epoch of ``request_id`` on ``task_id``, or ``None`` if unknowable.
+
+    The event log is authority.  The card is consulted only when it names this
+    exact request as the live episode: a card epoch paired with a *different*
+    ``launch_request_id`` describes a later relaunch and proves nothing about
+    the request being disposed.
+    """
+    epoch = _claim_epoch_for_request(conn, task_id, request_id)
+    if epoch is not None:
+        return epoch
+    try:
+        row = conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    try:
+        card = json.loads(row[0] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(card, dict):
+        return None
+    if str(card.get("launch_request_id") or "") != request_id:
+        return None
+    epoch = card.get("claim_epoch")
+    return epoch if type(epoch) is int else None
+
+
+def _reviewer_child_mismatch_reason(
+    target_task_id: str,
+    target_request_id: str,
+    target_claim_epoch: Any,
+    *,
+    parent_task_id: str,
+    parent_request_id: str,
+    parent_claim_epoch: int | None,
+) -> str | None:
+    """Name why a mismatched reviewer child may not be disposed, or ``None``.
+
+    ``None`` means exactly one thing: the child is bound to *this* parent task
+    at a strictly earlier launch episode.  Its review packet was sealed against
+    candidate bytes that this request no longer carries, so its verdict can
+    never be verified against this or any later request -- superseding it is
+    the only honest disposition, and re-binding it to the current request would
+    credit an inspection that never happened.
+
+    Every other mismatch is refused by name:
+
+    * ``foreign_target_task`` -- another parent's child; never ours to touch.
+    * ``child_claim_epoch_newer_than_parent_request`` -- a *later* episode's
+      reviewer.  ``reject_review`` disposes the rejected request while a rework
+      relaunch may already be in flight, and that relaunch's reviewers must
+      survive (see ``_finalize_bound_reviewers`` in ``core.py``).
+    * ``child_claim_epoch_equal_request_conflict`` -- one episode cannot carry
+      two request ids; the binding is not trustworthy enough to act on.
+    * ``*_unknown``/``*_unresolved`` -- no order, so no authority to dispose.
+    """
+    if target_task_id != parent_task_id:
+        return "foreign_target_task"
+    if not target_request_id:
+        return "child_request_id_missing"
+    if target_request_id == parent_request_id:
+        return None
+    if type(target_claim_epoch) is not int:
+        return "child_claim_epoch_unknown"
+    if parent_claim_epoch is None:
+        return "parent_claim_epoch_unresolved"
+    if target_claim_epoch > parent_claim_epoch:
+        return "child_claim_epoch_newer_than_parent_request"
+    if target_claim_epoch == parent_claim_epoch:
+        return "child_claim_epoch_equal_request_conflict"
+    return None
+
+
 def disposition_reviewer_children(
     repo: Path,
     parent_task_id: str,
@@ -972,8 +1122,11 @@ def disposition_reviewer_children(
       not counted in future dashboard KPIs yet remain in history.
 
     Idempotent: a repeat call with the same verified set updates nothing already
-    finalized or superseded.  Fail-closed: any child whose target binding does
-    not match this parent is left untouched and reported.
+    finalized or superseded.  Fail-closed on identity: a child bound to another
+    task, or to an episode of this task whose order cannot be established, is
+    left untouched and reported by name in ``refused`` *and* as a
+    ``reviewer_child_disposition_refused`` event.  A child bound to this task at
+    a strictly earlier claim epoch is superseded as ``stale_claim_episode``.
     """
     verified_set = frozenset(str(tid) for tid in (verified_reviewer_task_ids or []))
     command = [
@@ -996,9 +1149,15 @@ def disposition_reviewer_children(
         conn.close()
         return {"ok": False, "returncode": 1, "command": command, "stdout": "",
                 "stderr": "reviewer_children_query_failed"}
+    # One durable episode order for this parent, resolved once.  A reviewer
+    # child bound to a strictly earlier episode is provably stale; nothing else
+    # is, so nothing else may be disposed on identity grounds.
+    parent_claim_epoch = _parent_claim_epoch(conn, parent_task_id, parent_request_id)
     finalized: list[str] = []
     superseded: list[str] = []
+    stale_superseded: list[str] = []
     skipped: list[str] = []
+    refused: list[str] = []
     errors: list[str] = []
     for row in rows:
         child_task_id = str(row["task_id"] or "")
@@ -1033,14 +1192,64 @@ def disposition_reviewer_children(
         binding = terminal_binding or root_binding
         target = str(binding.get("target_task_id") or "")
         target_request = str(binding.get("target_request_id") or "")
-        if target != parent_task_id or target_request != parent_request_id:
-            continue
+        target_epoch = binding.get("target_claim_epoch")
         child_status = str(row["status"] or "")
-        if child_status in ("finished", "done", "archived", "superseded"):
+        child_runner = str(row["runner"] or "")
+        stale_episode = False
+        if target != parent_task_id or target_request != parent_request_id:
+            # NF: this branch used to be a bare ``continue``.  A reviewer bound
+            # to a *superseded launch episode* of this same parent was skipped
+            # with no row change, no list entry and no event: the transition
+            # that never happened was also never explained, and the children of
+            # every relaunch were stranded in review until a human cleared them
+            # by hand.  Classify the mismatch instead, and act only where the
+            # durable episode order proves the child is stale.
+            reason = _reviewer_child_mismatch_reason(
+                target,
+                target_request,
+                target_epoch,
+                parent_task_id=parent_task_id,
+                parent_request_id=parent_request_id,
+                parent_claim_epoch=parent_claim_epoch,
+            )
+            if reason is not None:
+                if child_status in _REVIEWER_CHILD_TERMINAL_STATUSES:
+                    # Already terminal: its own disposition event explains it,
+                    # and re-emitting here would grow the log without adding a
+                    # fact.
+                    skipped.append(child_task_id)
+                    continue
+                # Refusing to dispose is itself a decision about a live card.
+                # Record it by name so the stranded population is measurable.
+                conn.execute(
+                    "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        child_task_id, "reviewer_child_disposition_refused", child_runner,
+                        json.dumps({
+                            "parent_task_id": parent_task_id,
+                            "parent_request_id": parent_request_id,
+                            "parent_claim_epoch": parent_claim_epoch,
+                            "child_target_task_id": target,
+                            "child_target_request_id": target_request,
+                            "child_target_claim_epoch": target_epoch,
+                            "child_status": child_status,
+                            "disposition": disposition,
+                            "reason": reason,
+                        }, ensure_ascii=False, default=str, sort_keys=True),
+                        now,
+                    ),
+                )
+                refused.append(f"{child_task_id}:{reason}")
+                continue
+            stale_episode = True
+        if child_status in _REVIEWER_CHILD_TERMINAL_STATUSES:
             skipped.append(child_task_id)
             continue
-        child_runner = str(row["runner"] or "")
-        if child_task_id in verified_set:
+        # A stale-episode child is never finalized even if it appears in the
+        # verified set: its verdict was authenticated against candidate bytes
+        # this request no longer carries.
+        if child_task_id in verified_set and not stale_episode:
             card["reviewer_disposition"] = {
                 "parent_task_id": parent_task_id,
                 "parent_request_id": parent_request_id,
@@ -1068,12 +1277,22 @@ def disposition_reviewer_children(
             )
             finalized.append(child_task_id)
         else:
+            supersede_reason = (
+                "stale_claim_episode" if stale_episode else "redundant_sibling"
+            )
             card["reviewer_disposition"] = {
                 "parent_task_id": parent_task_id,
                 "parent_request_id": parent_request_id,
                 "disposition": "superseded",
+                "reason": supersede_reason,
                 "disposed_at": now,
             }
+            if stale_episode:
+                card["reviewer_disposition"].update(
+                    parent_claim_epoch=parent_claim_epoch,
+                    child_target_request_id=target_request,
+                    child_target_claim_epoch=target_epoch,
+                )
             # Durable superseded status must remain visible through task_store.canonical_status.
             conn.execute(
                 "UPDATE tasks SET status='superseded', worker_status='superseded', "
@@ -1088,12 +1307,18 @@ def disposition_reviewer_children(
                     json.dumps({
                         "parent_task_id": parent_task_id,
                         "parent_request_id": parent_request_id,
+                        "parent_claim_epoch": parent_claim_epoch,
+                        "child_target_request_id": target_request,
+                        "child_target_claim_epoch": target_epoch,
                         "disposition": "superseded",
+                        "reason": supersede_reason,
                     }, ensure_ascii=False, default=str, sort_keys=True),
                     now,
                 ),
             )
             superseded.append(child_task_id)
+            if stale_episode:
+                stale_superseded.append(child_task_id)
     conn.commit()
     conn.close()
     return {
@@ -1102,9 +1327,13 @@ def disposition_reviewer_children(
         "command": command,
         "stdout": json.dumps({
             "parent_task_id": parent_task_id,
+            "parent_request_id": parent_request_id,
+            "parent_claim_epoch": parent_claim_epoch,
             "finalized": finalized,
             "superseded": superseded,
+            "stale_superseded": stale_superseded,
             "skipped": skipped,
+            "refused": refused,
             "errors": errors,
         }, ensure_ascii=False),
         "stderr": "",

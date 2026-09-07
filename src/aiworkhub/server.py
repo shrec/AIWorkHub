@@ -2414,6 +2414,15 @@ def aiworkhub_completion_inbox(
     return result
 
 
+_VALIDATION_REPLAY_AUTO_RECOVERY_REASONS = frozenset(
+    {
+        "validation_only_replay_claim_binding_invalid",
+        "validation_only_replay_claim_epoch_mismatch",
+        "validation_only_replay_predecessor_mismatch",
+    }
+)
+
+
 @mcp.tool()
 @_serialize_task_lifecycle_write
 def aiworkhub_agent_launch_task(
@@ -2438,15 +2447,41 @@ def aiworkhub_agent_launch_task(
     """
 
     core.scrub_coordinator_capability_from_environment()
-    result = process_launcher.default_manager().launch(
-        task_id=task_id,
-        runner=runner,
-        topic=topic,
-        adapter_id=adapter_id,
-        model=model,
-        owner_prompt=owner_prompt,
-        timeout_seconds=timeout_seconds,
+    manager = process_launcher.default_manager()
+    launch_kwargs = {
+        "task_id": task_id,
+        "runner": runner,
+        "topic": topic,
+        "adapter_id": adapter_id,
+        "model": model,
+        "owner_prompt": owner_prompt,
+        "timeout_seconds": timeout_seconds,
+    }
+    result = manager.launch(
+        **launch_kwargs,
     )
+    blocked_reason = (
+        str(result.get("blocked_reason") or result.get("stderr") or "")
+        if isinstance(result, dict)
+        else ""
+    )
+    if blocked_reason in _VALIDATION_REPLAY_AUTO_RECOVERY_REASONS:
+        recovery = core.recover_blocked_rework(
+            task_id,
+            feedback_reason=(
+                "Automatic one-shot rebind after authenticated validation-only "
+                f"replay launch blocker: {blocked_reason}"
+            ),
+            validation_only_replay=True,
+        )
+        if recovery.get("ok") is True:
+            result = manager.launch(**launch_kwargs)
+        if isinstance(result, dict):
+            result["automatic_validation_replay_recovery"] = {
+                "attempted": True,
+                "succeeded": recovery.get("ok") is True,
+                "reason": blocked_reason,
+            }
     if isinstance(result, dict):
         result["timeout_seconds"] = timeout_seconds
         result["timeout_enforced"] = False

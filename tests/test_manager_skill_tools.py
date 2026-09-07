@@ -12,6 +12,8 @@ record unchanged.
 from __future__ import annotations
 
 import inspect
+import json
+import sqlite3
 
 import pytest
 
@@ -19,6 +21,7 @@ import aiworkhub.core as core
 import aiworkhub.skill_registry as sr
 from aiworkhub import manager_skill_tools as mst
 from aiworkhub import skill_registry_store as store
+from aiworkhub import task_store
 
 BASE = {
     "identity": "commit-msg-check",
@@ -179,3 +182,194 @@ def test_persists_only_through_public_store_and_registry_api():
     # No private registry state is touched.
     assert "_entries" not in source
     assert "_digest_index" not in source
+
+
+# ---------------------------------------------------------------------------
+# The second evidence source: an actor identity READ from a finished card
+# ---------------------------------------------------------------------------
+
+
+def _seed_card(
+    root,
+    task_id,
+    *,
+    runner="claude_sonnet-5",
+    topic="code",
+    completed_at="2026-01-01T00:10:00+00:00",
+):
+    """Write one card into the repository's REAL canonical task store."""
+    task_store.initialize_repository(root)
+    db = root / ".aiworkhub" / "tasking" / "task_queue.sqlite"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "INSERT INTO tasks (task_id,runner,topic,mode,status,worker_status,priority,"
+            "objective,card_json,created_at,updated_at,claimed_by,claimed_at,started_at,"
+            "completed_at,origin_thread_id,archived_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                task_id,
+                runner,
+                topic,
+                "",
+                "done",
+                "done",
+                "normal",
+                "objective",
+                json.dumps({"task_id": task_id, "runner": runner, "topic": topic}),
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:10:00+00:00",
+                runner,
+                "2026-01-01T00:01:00+00:00",
+                "2026-01-01T00:01:00+00:00",
+                completed_at,
+                "thread-1",
+                "",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _loaded(root, identity="commit-msg-check", version="1.0.0"):
+    return store.load_registry(root).get(identity, version)
+
+
+def test_task_evidence_derives_its_actor_from_the_card_not_the_caller(manager):
+    _propose()
+    _seed_card(manager, "AIWORKHUB_01085_V1", runner="claude_sonnet-5")
+    result = mst.add_task_evidence(
+        identity=BASE["identity"],
+        version=BASE["version"],
+        task_id="AIWORKHUB_01085_V1",
+        outcome="accepted",
+        note="fixed the ledger attribution",
+    )
+    assert result["ok"] is True
+
+    record = _loaded(manager)
+    entry = record.evidence[-1]
+    # The identity was read from the card's runner, never supplied by the caller,
+    # and the card id is recorded as the verifiable provenance anchor.
+    assert entry.actor_id == "worker.claude.sonnet.5"
+    assert entry.authority is sr.AuthorityRole.WORKER
+    assert entry.source == "AIWORKHUB_01085_V1"
+
+
+def test_a_quality_review_card_yields_a_reviewer_actor(manager):
+    _propose()
+    _seed_card(manager, "QR_1", runner="codex_cli", topic="quality_review")
+    assert mst.add_task_evidence(
+        identity=BASE["identity"], version=BASE["version"], task_id="QR_1", outcome="accepted"
+    )["ok"] is True
+    assert _loaded(manager).evidence[-1].actor_id == "reviewer.codex.cli"
+
+
+def test_a_card_derived_actor_can_never_collide_with_the_manager(manager):
+    # The role token is emitted first by canonical_actor_id, so a card-derived
+    # identity is structurally distinct from the manager's own -- even when the
+    # runner is literally named after a manager.
+    _propose()
+    _seed_card(manager, "T_ODD", runner="claude_manager_7e6e8a47")
+    assert mst.add_task_evidence(
+        identity=BASE["identity"], version=BASE["version"], task_id="T_ODD", outcome="accepted"
+    )["ok"] is True
+    actor = _loaded(manager).evidence[-1].actor_id
+    assert actor == "worker.claude.7e6e8a47"
+    assert sr.canonical_actor_id(actor) != sr.canonical_actor_id("manager.claude.7e6e8a47")
+
+
+def test_two_cards_run_by_one_runner_are_one_actor(manager):
+    # The runner is the actor; the card is only the provenance anchor. Filing
+    # two cards from one runner must not manufacture independence.
+    _propose()
+    _seed_card(manager, "T_A", runner="claude_sonnet-5")
+    _seed_card(manager, "T_B", runner="claude_sonnet-5")
+    for task_id in ("T_A", "T_B"):
+        assert mst.add_task_evidence(
+            identity=BASE["identity"],
+            version=BASE["version"],
+            task_id=task_id,
+            outcome="accepted",
+        )["ok"] is True
+
+    record = _loaded(manager)
+    assert record.accepted_count == 2
+    assert sr.independent_accepted_evidence_count(record) == 1
+    assert mst.activate(identity=BASE["identity"], version=BASE["version"])["ok"] is False
+
+
+def test_activation_is_reachable_through_the_new_source(manager):
+    # The ordering that makes the fix safe: a second legitimate evidence source
+    # exists, so canonicalizing provenance narrows what counts as independent
+    # without making activation unsatisfiable.
+    _propose()
+    # One manager entry -- and a second manager entry under a DIFFERENT spelling
+    # of the same identity, which no longer buys independence.
+    _accept("manager.claude.7e6e8a47")
+    _accept("claude_manager_7e6e8a47")
+    assert sr.independent_accepted_evidence_count(_loaded(manager)) == 1
+    denied = mst.activate(identity=BASE["identity"], version=BASE["version"])
+    assert denied["ok"] is False
+    assert denied["reason_code"] == "skill_registry.insufficient_evidence"
+
+    # A card-derived worker is a genuinely distinct actor, and the gate opens.
+    _seed_card(manager, "T_REAL", runner="claude_sonnet-5")
+    assert mst.add_task_evidence(
+        identity=BASE["identity"], version=BASE["version"], task_id="T_REAL", outcome="accepted"
+    )["ok"] is True
+    assert sr.independent_accepted_evidence_count(_loaded(manager)) == 2
+
+    activated = mst.activate(identity=BASE["identity"], version=BASE["version"])
+    assert activated["ok"] is True
+    assert activated["lifecycle_state"] == "active"
+    # And the activation survives a reload, so it was not a demoted read.
+    assert _loaded(manager).lifecycle_state is sr.LifecycleState.ACTIVE
+
+
+@pytest.mark.parametrize(
+    "task_id,seed",
+    [
+        ("MISSING", None),
+        ("UNFINISHED", {"completed_at": ""}),
+        ("NO_RUNNER", {"runner": ""}),
+    ],
+)
+def test_task_evidence_fails_closed_without_a_verified_actor(manager, task_id, seed):
+    _propose()
+    task_store.initialize_repository(manager)
+    if seed is not None:
+        _seed_card(manager, task_id, **seed)
+    result = mst.add_task_evidence(
+        identity=BASE["identity"], version=BASE["version"], task_id=task_id, outcome="accepted"
+    )
+    assert result["ok"] is False
+    assert result["reason_code"] == "skill_registry.invalid_evidence"
+    # Nothing was appended: no actor, no evidence.
+    assert _loaded(manager).evidence == ()
+
+
+def test_audit_reports_an_unverified_active_record_without_repairing_it(manager):
+    _propose()
+    _accept("manager.claude.7e6e8a47")
+    _seed_card(manager, "T_REAL", runner="claude_sonnet-5")
+    mst.add_task_evidence(
+        identity=BASE["identity"], version=BASE["version"], task_id="T_REAL", outcome="accepted"
+    )
+    mst.activate(identity=BASE["identity"], version=BASE["version"])
+
+    report = mst.audit()
+    assert report["ok"] is True
+    assert report["unverified_active"] == []
+    entry = report["active_records"][0]
+    assert entry["independent_accepted_actors"] == 2
+    assert entry["actor_ids"] == ["manager.claude.7e6e8a47", "worker.claude.sonnet.5"]
+    assert entry["verified"] is True
+
+
+def test_task_evidence_uses_only_public_store_and_task_api():
+    source = inspect.getsource(mst)
+    assert "sqlite3.connect" not in source
+    assert "_decode_task_card" not in source
+    assert "task_store.get_task" in source

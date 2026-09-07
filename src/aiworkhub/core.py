@@ -3053,6 +3053,7 @@ def create_task(
     risk_tier: str | None = None,
     template_provenance: Mapping[str, Any] | None = None,
     custom_template_escape: str | None = None,
+    validation_exemption: str | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -3197,6 +3198,27 @@ def create_task(
         return _lifecycle_error("read_only_declaration_required", 2)
     if task_type == "code" and (writes2 or outputs2) and not validation2:
         return _lifecycle_error("code_task_validation_required", 2)
+    # The gate above is opt-in twice over: it fires only for task_type "code",
+    # and only when the card has a write scope.  A "research" or
+    # "data_classification" card with the same write scope declared zero
+    # validation, ran zero tests, and still reached review_ready carrying
+    # nothing_measured -- which the reviewer short-circuit deliberately does
+    # not treat as a failure.  Close that by requiring every card to either
+    # declare validation or carry one explicit named exemption.
+    try:
+        validation_exemption2 = task_templates.resolve_validation_exemption(
+            validation=validation2,
+            read_only=read_only,
+            allowed_writes=writes2,
+            required_outputs=outputs2,
+            declared=validation_exemption,
+        )
+    except task_templates.TaskTemplateError as exc:
+        result = _lifecycle_error(str(exc), 2)
+        result["allowed_validation_exemptions"] = list(
+            task_templates.VALIDATION_EXEMPTIONS
+        )
+        return result
     from . import quality_evidence
 
     try:
@@ -3448,6 +3470,18 @@ def create_task(
         "immutable_inputs": immutable_inputs2,
         "validation": validation2,
         "validation_roles": validation_roles2,
+        # Why this card is allowed to reach review having measured nothing,
+        # by name.  Absent whenever the card declares validation commands, so
+        # a downstream reader can tell "exempt for a named reason" apart from
+        # "nobody declared anything".  Deliberately NOT part of the
+        # create-idempotency payload below: it is derived from read_only and
+        # the write scope, which are already compared there, so stamping it
+        # cannot turn a legitimate same-payload retry into a false conflict.
+        **(
+            {"validation_exemption": validation_exemption2}
+            if validation_exemption2
+            else {}
+        ),
         "work_kind": work_kind,
         **({"risk_tier": risk_tier} if risk_tier is not None else {}),
         "depends_on": depends_on2,
@@ -4915,6 +4949,11 @@ def reject_review(
         "sha256": hashlib.sha256(reason_bytes).hexdigest(),
         "truncated": reason_truncated,
     }
+    # Last point at which the rejection's structured cause is readable at all:
+    # begin_claim_episode() below erases terminal_review/terminal_substatus from
+    # the card, so classifying later -- which is when a learning commit runs --
+    # can only ever answer "inconclusive". Classify now, pin the answer below.
+    terminal_disposition = classify_terminal_disposition(card).value
     actor = _verified_manager_actor()
     command = [
         "reject-review", task_id, "--runner", actor, "--topic", str(live_topic),
@@ -5074,6 +5113,27 @@ def reject_review(
             )[:256],
             "residual_identities": normalized_residuals,
         }
+    # begin_claim_episode() clears terminal_review/terminal_substatus from the
+    # card in this same transition, and a learning commit runs long after it.
+    # Re-deriving the failure taxonomy from the card at learning time therefore
+    # always read a card whose only structured cause evidence had already been
+    # erased, and answered "inconclusive" for every rework rejection. Pin the
+    # classification computed above -- while that evidence was still on the
+    # card -- under the exact request identity this rejection adjudicated, so a
+    # later commit can bind it to the right episode instead of guessing.
+    #
+    # Deliberately NOT a task_store.CURRENT_EPISODE_CARD_FIELDS member: it
+    # describes the episode that just ended, not the one about to start, so the
+    # next genuine claim must not clear it. It is written here by the canonical
+    # rejection path from structured evidence only, never by a worker or from
+    # manager prose.
+    card["rejection_disposition"] = {
+        "schema_id": "aiworkhub.rejection_disposition.v1",
+        "failure_category": terminal_disposition,
+        "request_id": pred_request_id,
+        "to": disposition,
+        "pinned_at": now,
+    }
     prior_episode = task_store.begin_claim_episode(card)
     if disposition == "blocked":
         card.update(status="blocked", worker_status="blocked")
@@ -5117,6 +5177,7 @@ def reject_review(
                         "topic": live_topic,
                         "reason": bounded_reason,
                         "reason_identity": reason_identity,
+                        "terminal_disposition": terminal_disposition,
                         "to": disposition,
                         "prior_episode": prior_episode,
                         "rework_delta_reuse_error": rework_delta_reuse_error,

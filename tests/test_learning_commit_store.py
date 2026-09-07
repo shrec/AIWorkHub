@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import sqlite3
+import stat
 from pathlib import Path
 
 from _taskdb_compat import upsert_card
@@ -497,4 +500,251 @@ def test_rework_rejection_is_a_committable_adjudicated_outcome():
     # A non-mapping section must not raise or match.
     assert not learning_commit_store._request_matches_candidate(
         {"rework_predecessor": "not-a-mapping"}, request_id
+    )
+
+
+def _coordinator_env(root: Path, tmp_path: Path, monkeypatch) -> None:
+    """Grant the in-process write gate the coordinator capability that the
+    canonical rejection path requires, so these tests exercise the real
+    ``core.reject_review`` rather than a stand-in.
+    """
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    token = tmp_path / "coordinator.token"
+    token.write_text("coord-token\n", encoding="utf-8")
+    os.chmod(token, stat.S_IRUSR | stat.S_IWUSR)
+    monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN_FILE", str(token))
+    monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN", "coord-token")
+
+
+def _rejectable_card(
+    root: Path, *, task_id: str, request_id: str, substatus: str,
+) -> None:
+    """Seed a card in review whose only cause evidence is structured."""
+    con = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    con.row_factory = sqlite3.Row
+    try:
+        upsert_card(con, {
+            "task_id": task_id,
+            "runner": "claude_coding",
+            "topic": "coding",
+            "mode": "solo",
+            "status": "review",
+            "worker_status": "review",
+            "terminal_review": {
+                "substatus": substatus,
+                "evidence": {"request_identity": {"request_id": request_id}},
+            },
+        })
+    finally:
+        con.close()
+
+
+def test_rework_rejection_pins_failure_category_before_its_input_is_erased(
+    tmp_path, monkeypatch,
+):
+    """``reject_review`` clears ``terminal_review`` in the same transition that
+    rejects, and a learning commit runs long afterwards.  Re-deriving the
+    category then read a card whose only structured cause evidence was already
+    gone, so the one machine-readable cause field on a learning record answered
+    ``inconclusive`` for every rework rejection.  The classification is now
+    computed while that evidence is still on the card and pinned.
+    """
+    root = _setup_repo(tmp_path, monkeypatch)
+    _coordinator_env(root, tmp_path, monkeypatch)
+    task_id = "TASK-REWORK-PIN-1"
+    request_id = "request-rework-pin-0001"
+    _rejectable_card(
+        root, task_id=task_id, request_id=request_id, substatus="review_ready",
+    )
+
+    rejected = core.reject_review(task_id, "the new path is never called", to="pending")
+    assert rejected["ok"] is True, rejected
+
+    card = task_store.get_task(root, task_id)
+    assert card is not None
+    # The transition really does destroy the classifier's only input ...
+    assert card.get("terminal_review") is None
+    assert not card.get("terminal_substatus")
+    assert (
+        core.classify_terminal_disposition(card)
+        is learning_commit.FailureCategory.INCONCLUSIVE
+    )
+    # ... and the pin is what survives it, bound to the adjudicated request.
+    pin = card["rejection_disposition"]
+    assert pin["schema_id"] == "aiworkhub.rejection_disposition.v1"
+    assert pin["failure_category"] == "candidate_code"
+    assert pin["request_id"] == request_id
+    assert pin["to"] == "pending"
+
+    result = manager_ai_tools.learning_commit(
+        task_id=task_id,
+        request_id=request_id,
+        repo_area="src/aiworkhub",
+        outcome="rejected",
+        evidence_ids=["file:tests/test_learning_commit_store.py"],
+        idempotency_key="learning-manager-rework-pin-0001",
+        provenance="rework rejection classification regression",
+    )
+    assert result["ok"] is True, result
+    assert result["failure_category"] == "candidate_code"
+
+
+def test_reject_review_event_carries_the_disposition_it_classified(
+    tmp_path, monkeypatch,
+):
+    """The same structured answer is written to the append-only event, so the
+    ledger keeps it even if the card is later archived or purged.
+    """
+    root = _setup_repo(tmp_path, monkeypatch)
+    _coordinator_env(root, tmp_path, monkeypatch)
+    task_id = "TASK-REWORK-EVENT-1"
+    request_id = "request-rework-event-0001"
+    _rejectable_card(
+        root, task_id=task_id, request_id=request_id, substatus="finalize_failed",
+    )
+
+    assert core.reject_review(task_id, "environment failed", to="blocked")["ok"] is True
+
+    con = sqlite3.connect(str(task_store.canonical_db_path(root)))
+    try:
+        payloads = [
+            json.loads(row[0])
+            for row in con.execute(
+                "SELECT payload_json FROM task_events "
+                "WHERE task_id=? AND event='reject_review'",
+                (task_id,),
+            )
+        ]
+    finally:
+        con.close()
+    assert len(payloads) == 1
+    assert payloads[0]["terminal_disposition"] == "validation_environment"
+
+
+def test_a_pin_from_another_episode_is_refused_not_borrowed(tmp_path, monkeypatch):
+    """A card rejected twice keeps only the newest pin.  Attributing that
+    episode's cause to an older commit would be worse than the absent answer
+    the caller already tolerates, so a request mismatch falls back rather than
+    borrowing.
+    """
+    root = _setup_repo(tmp_path, monkeypatch)
+    _coordinator_env(root, tmp_path, monkeypatch)
+    task_id = "TASK-REWORK-PIN-2"
+    first_request = "request-rework-pin-0002a"
+    second_request = "request-rework-pin-0002b"
+    _rejectable_card(
+        root, task_id=task_id, request_id=first_request, substatus="review_ready",
+    )
+    assert core.reject_review(task_id, "first rejection", to="pending")["ok"] is True
+    # Second episode: a different request, classified differently.
+    _rejectable_card(
+        root, task_id=task_id, request_id=second_request, substatus="cancelled",
+    )
+    assert core.reject_review(task_id, "second rejection", to="pending")["ok"] is True
+
+    card = task_store.get_task(root, task_id)
+    assert card is not None
+    assert card["rejection_disposition"]["request_id"] == second_request
+    assert (
+        learning_commit_store._rejection_failure_category(card, second_request)
+        == "cancellation_or_timeout"
+    )
+    # The superseded episode gets the honest absent answer, never the new one.
+    assert (
+        learning_commit_store._rejection_failure_category(card, first_request)
+        == "inconclusive"
+    )
+    # A pin with a foreign schema id is not a pin.
+    forged = dict(card)
+    forged["rejection_disposition"] = {
+        "schema_id": "not.aiworkhub.rejection_disposition.v1",
+        "failure_category": "candidate_code",
+        "request_id": second_request,
+    }
+    assert (
+        learning_commit_store._rejection_failure_category(forged, second_request)
+        == "inconclusive"
+    )
+
+
+def test_rejection_may_promote_to_ai_memory_and_kb_but_never_context_graph(
+    tmp_path, monkeypatch,
+):
+    """AI Memory and KB are two of the three stores a worker bundle reads back,
+    and a rejection is an adjudicated outcome, so it may reach them under the
+    unchanged evidence requirement (lesson for memory, invariant for kb).
+    Context Graph stays accept-only: an edge is a causal assertion traversed
+    transitively, and only the accept path forces a canonical
+    FIXED_AND_VERIFIED acceptance reference into ``evidence_ids``.
+    """
+    root = _setup_repo(tmp_path, monkeypatch)
+    _coordinator_env(root, tmp_path, monkeypatch)
+    task_id = "TASK-REJECT-PROMOTE-1"
+    request_id = "request-reject-promote-0001"
+    _rejectable_card(
+        root, task_id=task_id, request_id=request_id, substatus="validation_failed",
+    )
+    assert core.reject_review(task_id, "validation is red", to="pending")["ok"] is True
+
+    promoted = manager_ai_tools.learning_commit(
+        task_id=task_id,
+        request_id=request_id,
+        repo_area="src/aiworkhub",
+        outcome="rejected",
+        evidence_ids=["file:tests/test_learning_commit_store.py"],
+        idempotency_key="learning-manager-reject-promote-0001",
+        provenance="rejection promotion regression",
+        lesson_candidate="run the declared validation before marking review",
+        invariant_candidate="a card in review has a green declared validation",
+        promote_ai_memory=True,
+        promote_kb=True,
+    )
+    assert promoted["ok"] is True, promoted
+    assert promoted["failure_category"] == "candidate_code"
+    assert promoted["projections"]["ai_memory"]["state"] == "applied"
+    assert promoted["projections"]["kb"]["state"] == "applied"
+    assert promoted["projections"]["context_graph"]["state"] == "not_requested"
+
+    memory = manager_ai_tools.ai_memory_get(
+        key=f"learning.{task_id}.{promoted['commit_id'][:12]}"
+    )
+    kb = manager_ai_tools.kb_get(
+        key=f"learning-contract.{task_id}.{promoted['commit_id'][:12]}"
+    )
+    assert memory["ok"] is True and memory["hit_count"] == 1
+    assert kb["ok"] is True and kb["hit_count"] == 1
+
+    # The evidence requirement is untouched: no lesson, no memory promotion.
+    no_lesson = manager_ai_tools.learning_commit(
+        task_id=task_id,
+        request_id=request_id,
+        repo_area="src/aiworkhub",
+        outcome="rejected",
+        evidence_ids=["file:tests/test_learning_commit_store.py"],
+        idempotency_key="learning-manager-reject-promote-0002",
+        provenance="rejection promotion negative",
+        promote_ai_memory=True,
+    )
+    assert no_lesson["ok"] is False
+    assert no_lesson["error"] == "learning_commit_memory_promotion_requires_lesson"
+
+    # And a rejection still may not assert a causal edge.
+    graph = manager_ai_tools.learning_commit(
+        task_id=task_id,
+        request_id=request_id,
+        repo_area="src/aiworkhub",
+        outcome="rejected",
+        evidence_ids=["file:tests/test_learning_commit_store.py"],
+        idempotency_key="learning-manager-reject-promote-0003",
+        provenance="rejection promotion negative",
+        edge_candidates=[{
+            "source": "red validation", "target": "rejected candidate",
+            "relation": "CAUSED_BY",
+        }],
+        promote_context_graph=True,
+    )
+    assert graph["ok"] is False
+    assert "promotion_eligible_context_graph requires outcome ACCEPTED" in str(
+        graph.get("error")
     )

@@ -137,6 +137,17 @@ h3 { margin: 0 0 .65rem; font-size: 1.18rem; }
 }
 .architecture-map a, .architecture-map img { display: block; width: 100%; }
 .architecture-map figcaption { padding: .8rem 1rem; color: var(--muted); font-size: .82rem; }
+.diagram-gallery { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; margin-top: 1rem; }
+.architecture-diagram {
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid rgb(56 189 248 / 32%);
+  border-radius: 1rem;
+  background: #02070c;
+  box-shadow: 0 20px 60px rgb(0 0 0 / 34%);
+}
+.architecture-diagram a, .architecture-diagram img { display: block; width: 100%; height: auto; }
+.architecture-diagram figcaption { padding: .75rem 1rem; color: var(--muted); font-size: .82rem; }
 .capability-map { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1rem; }
 .capability-state { padding: 1.25rem; border: 1px solid var(--line); border-radius: 1rem; background: rgb(7 19 29 / 78%); }
 .capability-state > span { display: inline-flex; margin-bottom: .75rem; font-size: .72rem; font-weight: 850; letter-spacing: .12em; text-transform: uppercase; }
@@ -206,7 +217,8 @@ code { padding: .12rem .35rem; border: 1px solid var(--line); border-radius: .35
 
 @media (max-width: 820px) {
   .hero-grid, .article-layout { grid-template-columns: 1fr; }
-  .grid-3, .flow, .capability-map { grid-template-columns: 1fr 1fr; }
+  .grid-3, .flow, .capability-map, .diagram-gallery { grid-template-columns: 1fr 1fr; }
+  .diagram-gallery { grid-template-columns: 1fr; }
   .side-nav { position: static; }
   .nav-links a:not(.button) { display: none; }
   .pilot-metrics { grid-template-columns: 1fr 1fr; }

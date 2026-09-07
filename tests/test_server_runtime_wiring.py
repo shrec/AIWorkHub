@@ -125,6 +125,59 @@ def test_runtime_tools_delegate_to_single_manager(monkeypatch):
     ]
 
 
+def test_launch_rebinds_stale_validation_replay_once(monkeypatch):
+    fake = _FakeManager()
+    launch_results = iter(
+        [
+            {
+                "ok": False,
+                "state": "blocked",
+                "blocked_reason": "validation_only_replay_predecessor_mismatch",
+            },
+            {"ok": True, "request_id": "r2", "state": "running"},
+        ]
+    )
+
+    def launch(**kwargs):
+        fake.calls.append(("launch", kwargs))
+        return next(launch_results)
+
+    recoveries = []
+
+    def recover(task_id, **kwargs):
+        recoveries.append((task_id, kwargs))
+        return {"ok": True}
+
+    fake.launch = launch
+    monkeypatch.setattr(process_launcher, "default_manager", lambda: fake)
+    monkeypatch.setattr(core, "recover_blocked_rework", recover)
+
+    result = server.aiworkhub_agent_launch_task(
+        "T1", "claude_t1", "task_mcp", "claude_cli", model="sonnet"
+    )
+
+    assert result["ok"] is True
+    assert result["request_id"] == "r2"
+    assert result["automatic_validation_replay_recovery"] == {
+        "attempted": True,
+        "succeeded": True,
+        "reason": "validation_only_replay_predecessor_mismatch",
+    }
+    assert len([call for call in fake.calls if call[0] == "launch"]) == 2
+    assert recoveries == [
+        (
+            "T1",
+            {
+                "feedback_reason": (
+                    "Automatic one-shot rebind after authenticated validation-only "
+                    "replay launch blocker: validation_only_replay_predecessor_mismatch"
+                ),
+                "validation_only_replay": True,
+            },
+        )
+    ]
+
+
 def test_list_processes_summary_is_bounded_deterministic_and_truthful(monkeypatch):
     fake = _FakeManager()
     rows = [

@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-07
+
+### Fixed
+
+- Record terminal-failure evidence support and handle validation
+  prerequisite/toolchain availability in the process launcher and worker
+  workspace.
+- Normalize review finding aliases in quality review ingest, failing closed on
+  unrecognized keys.
+- Align task template required-output parity (test-only; no implementation
+  change).
+
+### Changed
+
+- Advance the canonical release line to 0.11.0. Deferred NF658 (semantic-edit
+  authority) is not part of the canonical tree and is not claimed here.
+
 ## [0.10.99] - 2026-09-06
 
 ### Fixed

@@ -15,6 +15,8 @@ that still require implementation or measurement.
 | R6 | [Graph-scoped audit](GRAPH_SCOPED_AUDIT_REVIEW_2026-08-06.md) | Bounded reviewing |
 | R7 | [UltrafastSecp256k1 proof point](ULTRAFAST_SECP256K1_PROOF_POINT_REVIEW_2026-08-06.md) | Case study and assurance |
 | R8 | [UltrafastSecp256k1 assurance port](ULTRAFAST_SECP256K1_ASSURANCE_PORT_REVIEW_2026-08-06.md) | Assurance-as-code |
+| R9 | [External product review gap analysis](EXTERNAL_REVIEW_GAP_ANALYSIS_2026-08-18.md) | Qualification corpus, onboarding, adapter SDK |
+| R9r | [Maintainer response to the external review](RESPONSE_TO_EXTERNAL_REVIEW_2026-08-18.md) ([.docx](RESPONSE_TO_EXTERNAL_REVIEW_2026-08-18.docx)) | Review dispositions |
 
 The canonical execution status remains in `docs/PRODUCT_ROADMAP.md`. Estimated
 percentages and ratings in assessments are hypotheses unless a repository

@@ -1147,6 +1147,14 @@ def database_identity(root: str | Path) -> dict[str, Any]:
 # module now refuses to create and can explicitly repair.
 _ARCHIVE_TERMINAL_STATUSES: frozenset[str] = frozenset({"archived", "superseded", "finished"})
 
+# The two values ``archive_task`` actually WRITES into the ``status`` column.
+# Strictly narrower than ``_ARCHIVE_TERMINAL_STATUSES``, which also admits
+# ``finished`` -- the ordinary end state of a card that was never archived.
+# The inverse scan (status archive-written while ``archived_at`` is empty) must
+# key on this set: keyed on the wider one it would flag every finished card in
+# the repository as drift.
+_ARCHIVE_WRITTEN_STATUSES: frozenset[str] = frozenset({"archived", "superseded"})
+
 
 def _launch_reservation_held(
     row: Mapping[str, Any], card: Mapping[str, Any]
@@ -1252,6 +1260,11 @@ def archive_task(
             if canonical_status(dict(row)) == "processing":
                 return False, "archive_processing_forbidden"
         source_status = str(row["status"] or "")
+        # Captured alongside ``status`` because the archive event carries both
+        # as the restore preimage.  ``archive_task`` never writes
+        # ``worker_status`` itself -- recording it anyway means a restore does
+        # not have to depend on that remaining true.
+        source_worker_status = str(row["worker_status"] or "")
         now = datetime.now(timezone.utc).isoformat()
         try:
             card = json.loads(str(row["card_json"] or "{}"))
@@ -1291,6 +1304,16 @@ def archive_task(
                     json.dumps(
                         {
                             "reason": reason[:200],
+                            # The pre-archive lifecycle columns, written in the
+                            # SAME transaction as the archive that overwrites
+                            # them, so the preimage can never disagree with the
+                            # row it describes.  ``restore_task`` reads this
+                            # back to reverse the archive exactly instead of
+                            # guessing a prior state it was never told.
+                            "preimage": {
+                                "status": source_status,
+                                "worker_status": source_worker_status,
+                            },
                             **(
                                 {"superseded_by": str(superseded_by).strip()}
                                 if operation == "superseded"
@@ -1550,23 +1573,43 @@ def _rework_pinned_predecessor_request_ids(conn: sqlite3.Connection) -> set[str]
 
 
 def find_archive_inconsistencies(root: str | Path) -> list[dict[str, Any]]:
-    """Detect rows whose archive half-applied: ``archived_at`` is set while the
-    raw ``status`` column is still non-terminal.  Pure read; never mutates.
+    """Detect rows where the two archive signals -- the ``archived_at`` stamp and
+    the raw ``status`` column -- disagree.  Pure read; never mutates.
 
-    Each returned item also carries ``has_archive_event`` -- whether the audit
-    trail holds an ``archived``/``superseded`` event for the row.  That flag is
-    the affirmative proof the archive actually happened: ``archive_task`` writes
+    Both directions are scanned, and every item carries a ``kind``:
+
+    * ``half_archived`` -- ``archived_at`` is set while ``status`` is still
+      non-terminal.  The archive half-applied.
+    * ``half_restored`` -- ``status`` still holds an archive-written value
+      (``archived``/``superseded``) while ``archived_at`` is empty.  The archive
+      was half-UNDONE.  This direction was previously unscanned, which is why a
+      ``restore_task`` that reversed only ``archived_at`` produced a class of
+      row no repair tool could see: :func:`canonical_status` reads ``archived``
+      from ``archived_at`` alone, so with that cleared the row projects as
+      healthy everywhere while raw-column claim predicates match zero rows.
+
+    ``half_restored`` is deliberately keyed on ``_ARCHIVE_WRITTEN_STATUSES`` and
+    not on ``_ARCHIVE_TERMINAL_STATUSES``: the latter also contains ``finished``,
+    which is the ordinary end state of a card that was never archived at all.
+    Scanning for it would flag every completed card in the repository.
+
+    Each item also carries ``has_archive_event`` -- whether the audit trail holds
+    an ``archived``/``superseded`` event for the row.  That flag is the
+    affirmative proof the archive actually happened: ``archive_task`` writes
     ``archived_at``, the terminal ``status`` and the archive event in one
     transaction, so a genuinely half-archived row always still bears the event.
     A row carrying ``archived_at`` with *no* such event was set by some path
-    other than an archive and must be excluded from repair.
+    other than an archive and must be excluded from repair.  The flag does the
+    same work on the inverse side, where it separates a genuinely half-restored
+    archive from the ``reviewer_child_superseded`` disposal path, which writes
+    ``status='superseded'`` with no ``archived_at`` and no archive event by
+    design and is not drift at all.
     """
     _readiness, db_path = _require_ready(root)
     conn = _connect(db_path, readonly=True)
     try:
         rows = conn.execute(
-            "SELECT task_id, status, worker_status, archived_at FROM tasks "
-            "WHERE COALESCE(archived_at, '') <> ''"
+            "SELECT task_id, status, worker_status, archived_at FROM tasks"
         ).fetchall()
         events = {
             str(event_row["task_id"])
@@ -1579,12 +1622,21 @@ def find_archive_inconsistencies(root: str | Path) -> list[dict[str, Any]]:
         conn.close()
     inconsistent: list[dict[str, Any]] = []
     for row in rows:
-        if str(row["status"] or "").strip().lower() in _ARCHIVE_TERMINAL_STATUSES:
+        archived_at = str(row["archived_at"] or "").strip()
+        status = str(row["status"] or "").strip().lower()
+        if archived_at:
+            if status in _ARCHIVE_TERMINAL_STATUSES:
+                continue
+            kind = "half_archived"
+        elif status in _ARCHIVE_WRITTEN_STATUSES:
+            kind = "half_restored"
+        else:
             continue
         task_id = str(row["task_id"])
         inconsistent.append(
             {
                 "task_id": task_id,
+                "kind": kind,
                 "status": str(row["status"] or ""),
                 "worker_status": str(row["worker_status"] or ""),
                 "archived_at": str(row["archived_at"] or ""),
@@ -1712,7 +1764,12 @@ def repair_archive_inconsistencies(
     """
     live = is_task_live if callable(is_task_live) else (lambda _task_id: False)
     metrics_before = archive_inconsistency_report(root)
-    detected = find_archive_inconsistencies(root)
+    # Only the half-archived class is repairable here; the inverse class is
+    # split out so the repair's guarded UPDATE (which requires a set
+    # ``archived_at``) is never handed a row it must skip as a conflict.
+    scanned = find_archive_inconsistencies(root)
+    detected = [item for item in scanned if item["kind"] == "half_archived"]
+    half_restored = [item for item in scanned if item["kind"] == "half_restored"]
 
     _readiness, db_path = _require_ready(root)
     conn = _connect(db_path)
@@ -1749,6 +1806,12 @@ def repair_archive_inconsistencies(
             "excluded_no_archive_event": excluded_no_archive_event,
             "excluded_live": excluded_live,
             "excluded_rework_pinned": excluded_rework_pinned,
+            # The inverse class: observed and named, never repaired here.  A
+            # half-restored row's correct ``status`` is a question about the
+            # archive that was undone, which ``restore_task`` answers from the
+            # recorded preimage; this repair only knows how to finish an
+            # archive, so guessing here would be inventing a lifecycle state.
+            "observed_half_restored": [item["task_id"] for item in half_restored],
             "metrics_before": metrics_before,
         }
         if dry_run or not reconcilable:
@@ -2543,6 +2606,40 @@ def card_content_identity(card: Mapping[str, Any] | None) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _review_feedback_reason(item: Any) -> str:
+    """The rework instruction identity carried by one ``review_feedback`` entry.
+
+    Four sources, most authoritative first.  The first two are what the current
+    writer actually emits: ``core.reject_review`` stores a
+    ``aiworkhub.rework_feedback_delta.v1`` object holding ``instruction`` and a
+    ``reason_identity`` digest of the full pre-truncation reason bytes.  Reading
+    only the legacy ``reason``/``code`` keys -- which that writer never emits --
+    made this axis a constant for every card the system produces, collapsing the
+    two-axis relaunch guard onto ``card_content_identity`` alone.
+
+    ``reason_identity.sha256`` outranks ``instruction`` because ``instruction``
+    is the *bounded* reason: two rework instructions that agree for the first
+    ``_MAX_REWORK_FEEDBACK_BYTES`` bytes and diverge after would share an
+    ``instruction`` but not a digest.  ``reason``/``code`` are retained so rows
+    written before that schema still authenticate on the value they do carry.
+    """
+    if not isinstance(item, dict):
+        return str(item)
+    identity = item.get("reason_identity")
+    if isinstance(identity, dict):
+        digest = str(identity.get("sha256") or "").strip()
+        if digest:
+            # Namespaced so a stored digest can never collide with a literal
+            # reason string that happens to look like one.
+            return f"sha256:{digest}"
+    for key in ("instruction", "reason", "code"):
+        if key in item:
+            value = item[key]
+            if value is not None:
+                return str(value)
+    return ""
+
+
 def _review_feedback_reasons(card: Mapping[str, Any] | None) -> list[str]:
     raw = None if card is None else card.get("review_feedback")
     if raw is None:
@@ -2551,16 +2648,7 @@ def _review_feedback_reasons(card: Mapping[str, Any] | None) -> list[str]:
         items = list(raw)
     else:
         items = [raw]
-    reasons: list[str] = []
-    for item in items:
-        if isinstance(item, dict):
-            reason = item.get("reason")
-            if reason is None:
-                reason = item.get("code")
-            reasons.append("" if reason is None else str(reason))
-            continue
-        reasons.append(str(item))
-    return reasons
+    return [_review_feedback_reason(item) for item in items]
 
 
 def review_feedback_identity(card: Mapping[str, Any] | None) -> str:
@@ -4356,6 +4444,40 @@ def recover_blocked_rework(
         conn.close()
 
 
+def _latest_archive_preimage(conn: Any, task_id: str) -> dict[str, str] | None:
+    """The pre-archive lifecycle columns recorded by the newest archive event.
+
+    Only the single most recent ``archived``/``superseded`` event is consulted.
+    A row archived, restored and archived again must be undone with the newest
+    archive's preimage; falling back to an older event would restore a state
+    two transitions stale, so an archive event without a preimage returns
+    ``None`` rather than reaching further back.
+    """
+    row = conn.execute(
+        "SELECT payload_json FROM task_events "
+        "WHERE task_id=? AND event IN ('archived', 'superseded') "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row["payload_json"] or "{}"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    preimage = payload.get("preimage")
+    if not isinstance(preimage, dict):
+        return None
+    if "status" not in preimage:
+        return None
+    return {
+        "status": str(preimage.get("status") or ""),
+        "worker_status": str(preimage.get("worker_status") or ""),
+    }
+
+
 def restore_task(
     root: str | Path,
     task_id: str,
@@ -4363,17 +4485,54 @@ def restore_task(
     actor: str = "dashboard",
     reason: str = "",
 ) -> tuple[bool, str]:
-    """Restore one archived task in the bound canonical queue."""
+    """Restore one archived task in the bound canonical queue.
+
+    The exact inverse of :func:`archive_task`, applied the same way: the whole
+    reversal -- ``archived_at``, the raw ``status`` column, ``worker_status``
+    and ``card_json`` -- moves in ONE preimage-guarded UPDATE inside one
+    transaction, and the row is re-read after commit so the reported outcome is
+    what is actually stored rather than what this function meant to write.
+
+    Reversing ``archived_at`` alone is not a restore.  ``archive_task``
+    overwrites the ``status`` column too, so undoing half of it leaves the
+    impossible ``status='archived'`` / ``archived_at=''`` row:
+    :func:`canonical_status` returns ``archived`` only from ``archived_at``, so
+    with that cleared the row projects as healthy on every surface while the
+    raw-column claim predicates match zero rows.  The card then reads fine and
+    can never be claimed again.
+
+    The prior ``status`` is recovered, never guessed, and the emitted
+    ``restored`` event always names which of two sources was used:
+
+    * ``recorded_preimage`` -- the archive event carries the pre-archive
+      ``status``/``worker_status`` written in the archiving transaction.  The
+      exact prior values are put back.
+    * ``derived_canonical`` -- the row was archived before that preimage was
+      persisted, so its prior ``status`` was never recorded anywhere and this
+      function will not invent one.  ``worker_status`` needs no source:
+      ``archive_task`` never writes that column, so the stored value still IS
+      the pre-archive one.  The raw ``status`` is then set to this module's own
+      projection of the un-archived row (:func:`canonical_status`) -- the value
+      every surface already reports for it -- so the column agrees with the
+      projection instead of contradicting it.  That is weaker than a recorded
+      preimage and is labelled as such, but it is the truthful reading of the
+      evidence the row actually carries, and it is strictly better than leaving
+      the row in a state the schema says is impossible.
+    """
     _readiness, db_path = _require_ready(root)
     conn = _connect(db_path)
     try:
         row = conn.execute(
-            "SELECT archived_at, card_json FROM tasks WHERE task_id=?", (task_id,)
+            "SELECT status, worker_status, archived_at, card_json FROM tasks WHERE task_id=?",
+            (task_id,),
         ).fetchone()
         if row is None:
             return False, "task_not_found"
-        if not str(row["archived_at"] or "").strip():
+        source_archived_at = str(row["archived_at"] or "")
+        if not source_archived_at.strip():
             return True, "not_archived"
+        source_status = str(row["status"] or "")
+        source_worker_status = str(row["worker_status"] or "")
         now = datetime.now(timezone.utc).isoformat()
         try:
             card = json.loads(str(row["card_json"] or "{}"))
@@ -4381,17 +4540,81 @@ def restore_task(
             card = {}
         if not isinstance(card, dict):
             card = {}
+        preimage = _latest_archive_preimage(conn, task_id)
+        if preimage is None:
+            preimage_source = "derived_canonical"
+            restored_worker_status = source_worker_status
+            # The archive-written ``status`` is deliberately dropped rather than
+            # fed back in: it is the value being undone, and projecting from it
+            # would carry the archive forward into its own reversal.
+            restored_status = canonical_status(
+                {
+                    "archived_at": "",
+                    "status": "",
+                    "worker_status": source_worker_status,
+                }
+            )
+        else:
+            preimage_source = "recorded_preimage"
+            restored_status = preimage["status"]
+            restored_worker_status = preimage["worker_status"]
         card.pop("archived_at", None)
-        conn.execute(
-            "UPDATE tasks SET archived_at='', updated_at=?, card_json=? WHERE task_id=?",
-            (now, json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
-        )
-        conn.execute(
-            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
-            "VALUES (?, 'restored', ?, ?, ?)",
-            (task_id, actor, json.dumps({"reason": reason[:200]}, sort_keys=True), now),
-        )
-        conn.commit()
+        card["status"] = restored_status
+        try:
+            cur = conn.execute(
+                "UPDATE tasks SET archived_at='', status=?, worker_status=?, "
+                "updated_at=?, card_json=? "
+                "WHERE task_id=? AND COALESCE(archived_at, '')=? AND status=? "
+                "AND COALESCE(worker_status, '')=?",
+                (
+                    restored_status,
+                    restored_worker_status,
+                    now,
+                    json.dumps(card, ensure_ascii=False, sort_keys=True),
+                    task_id,
+                    source_archived_at,
+                    source_status,
+                    source_worker_status,
+                ),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False, "restore_write_conflict"
+            conn.execute(
+                "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                "VALUES (?, 'restored', ?, ?, ?)",
+                (
+                    task_id,
+                    actor,
+                    json.dumps(
+                        {
+                            "reason": reason[:200],
+                            "preimage_source": preimage_source,
+                            "prior_status": source_status,
+                            "prior_worker_status": source_worker_status,
+                            "restored_status": restored_status,
+                            "restored_worker_status": restored_worker_status,
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 -- a partial restore must never persist
+            conn.rollback()
+            return False, f"restore_write_failed:{type(exc).__name__}"
+        stored = conn.execute(
+            "SELECT archived_at, status, worker_status FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if (
+            stored is None
+            or str(stored["archived_at"] or "").strip()
+            or str(stored["status"] or "") != restored_status
+            or str(stored["worker_status"] or "") != restored_worker_status
+        ):
+            return False, "restore_not_persisted"
         return True, "restored"
     finally:
         conn.close()
