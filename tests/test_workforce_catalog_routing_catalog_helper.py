@@ -100,9 +100,23 @@ def test_helper_reads_the_process_log_of_the_named_authority_repo(repo, monkeypa
             captured["limit"] = limit
             return {"processes": [{"task_id": "T9", "model": "gpt-5.5"}, "not-a-dict"]}
 
+    # `default_process_rows` resolves the fake through `from . import dashboard`,
+    # and that statement does NOT always consult sys.modules: once
+    # `aiworkhub.dashboard` has been imported anywhere in the process, the name
+    # is bound as an ATTRIBUTE of the parent package and the import returns
+    # that. So patching sys.modules alone works only while this file runs
+    # before anything that imports the dashboard -- it passed in isolation and
+    # failed after tests/test_dashboard_parallel_snapshot.py with a bare
+    # KeyError, because the real module ran and the fake never did. Under
+    # `--dist loadfile` which files share a worker is not fixed, so that was a
+    # coin flip in CI. Both resolution paths are patched, and monkeypatch
+    # restores both.
+    import aiworkhub
+
     monkeypatch.setitem(
         __import__("sys").modules, "aiworkhub.dashboard", FakeDashboard
     )
+    monkeypatch.setattr(aiworkhub, "dashboard", FakeDashboard, raising=False)
 
     rows = workforce_catalog.default_process_rows(repo)
 
