@@ -50,6 +50,10 @@ from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
+# skill_registry is a pure, standalone, side-effect-free module (no filesystem,
+# store, or lifecycle import), so this keeps the self-contained contract above.
+from . import skill_registry
+
 __all__ = [
     "AUDITED_CUSTOM_ESCAPE",
     "CANONICAL_MINIMALITY_CONTRACT",
@@ -73,6 +77,7 @@ __all__ = [
     "reject_unchanged_public_test_outputs",
     "resolve_template",
     "resolve_validation_exemption",
+    "skill_task_family",
     "split_command_argv",
     "template_full_id",
     "template_provenance_payload",
@@ -474,6 +479,23 @@ def _canonical_work_kind(work_kind: str) -> str:
     return "generic"
 
 
+def skill_task_family(work_kind: str) -> str:
+    """Return the skill task family a template's DECLARED work kind names.
+
+    ``work_kind`` on the card is the behavioral-contract key, constrained to
+    ``quality_evidence.WORK_KINDS``; five of the seven built-in templates
+    declare a work kind outside that set, so ``_canonical_work_kind`` flattens
+    ``analysis``, ``implementation``, ``test``, ``docs`` and ``replay`` to
+    ``generic``. That flattening is correct for the behavioral contract and
+    fatal for skill selection, because ``generic`` is not a family any skill
+    can be about. This reads the declared value instead, before the flattening,
+    and answers "" for anything the skill vocabulary does not name -- an absent
+    family selects nothing rather than selecting everything.
+    """
+    declared = str(work_kind or "").strip().lower()
+    return declared if declared in skill_registry.SKILL_TASK_FAMILIES else ""
+
+
 def _validation_roles_for(work_kind: str, validation: Sequence[str]) -> list[str]:
     """Seed a one-to-one role list for the live expansion path.
 
@@ -703,6 +725,11 @@ def expand_template(
         ),
         "task_type": spec.task_type,
         "work_kind": work_kind,
+        # The family the template DECLARES, before work_kind is flattened to
+        # the behavioral-contract vocabulary. Additive: expanded_contract_digest
+        # hashes an explicit field whitelist, which this key is not part of, so
+        # every stored template provenance keeps authenticating unchanged.
+        "skill_task_family": skill_task_family(spec.work_kind),
         "read_only": spec.read_only,
         "read_first": read_first,
         "allowed_writes": list(write_set),

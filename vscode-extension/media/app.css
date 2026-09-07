@@ -22,6 +22,30 @@
   --archived: var(--vscode-charts-purple, #9b8fc0);
   --archived-soft: color-mix(in srgb, var(--archived) 18%, var(--canvas));
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+
+  /* Terminal-outcome chart palette.
+     Fills are keyed by the OUTCOME, never by its position in a list. The
+     previous chart derived each hue from the list index with a golden-angle
+     formula, which painted review_ready (the successful outcome) red and
+     validation_failed / scope_rejected green -- the two signals that matter
+     were exactly inverted, and the generated set failed the lightness band
+     on 4 of 9 slots.
+     Four identity hues carry the four things an operator does differently
+     (good / decided / failed / waiting); failure severity is ordinal, so it
+     is ONE hue in three lightness steps toward the panel surface rather than
+     three competing hues; everything rarer folds into a single neutral.
+     Every fill is a var(--vscode-charts-*) theme token, so the panel follows
+     the user's VS Code theme. The hexes below are fallbacks only, taken from
+     the dataviz reference palette, and are the exact values the palette
+     validator was run against on the real panel surface
+     (--vscode-editorWidget-background: #202020 dark, #f8f8f8 light).
+     Both modes pass: identity slots clear every categorical check, the
+     failure ramp clears the ordinal gate, and the worst pair that actually
+     touches in the stack measures CVD dE 15.9 / normal dE 17.0. */
+  --outcome-good: var(--vscode-charts-green, #008300);
+  --outcome-decided: var(--vscode-charts-purple, #9085e9);
+  --outcome-failed: var(--vscode-charts-red, #e66767);
+  --outcome-waiting: var(--vscode-charts-blue, #3987e5);
   font-family: var(--vscode-font-family, system-ui, sans-serif);
 
   /* Type scale. Every font size in this panel derives from the editor's
@@ -49,19 +73,41 @@ html {
   background: var(--canvas);
 }
 
+/* Light themes need their own steps of the same four hues, not an automatic
+   flip: the fallbacks above sit in the dark lightness band and would be too
+   light on a light panel. VS Code stamps vscode-light / vscode-high-contrast-light
+   on the webview body, so the override lands on <body>. Only the FALLBACK
+   changes -- when the theme defines --vscode-charts-*, the theme still wins in
+   both modes. */
+body.vscode-light,
+body.vscode-high-contrast-light {
+  --outcome-decided: var(--vscode-charts-purple, #4a3aa7);
+  --outcome-failed: var(--vscode-charts-red, #e34948);
+  --outcome-waiting: var(--vscode-charts-blue, #2a78d6);
+}
+
 body {
   min-height: 100vh;
   margin: 0;
   color: var(--ink);
   background: var(--canvas);
   line-height: 1.45;
+
+  /* Derived from the four identity hues, and declared on <body> rather than
+     :root so they resolve against whichever step the theme class above put in
+     effect -- a custom property substitutes var() using the values on its own
+     element, so deriving these on :root would freeze them at the dark step. */
+  --outcome-failed-2: color-mix(in srgb, var(--outcome-failed) 78%, var(--surface-subtle));
+  --outcome-failed-3: color-mix(in srgb, var(--outcome-failed) 59%, var(--surface-subtle));
+  --outcome-other: color-mix(in srgb, var(--vscode-charts-foreground, #898781) 75%, var(--surface-subtle));
 }
 
+/* No max-height and no scroller: this block already sits inside #detail-content,
+   which is the detail panel's one scroll region. Bounding it here only added a
+   second scrollbar beside the first. */
 .live-output-summary {
   display: grid;
   gap: 10px;
-  max-height: 560px;
-  overflow: auto;
 }
 
 .live-output-result-header {
@@ -101,8 +147,6 @@ body {
   margin: 0 0 6px;
   color: var(--ink-soft);
   font-size: var(--fs-xs);
-  letter-spacing: .04em;
-  text-transform: uppercase;
 }
 
 .live-output-section-body,
@@ -134,7 +178,6 @@ body {
 .live-output-metric span {
   color: var(--muted);
   font-size: var(--fs-2xs);
-  text-transform: uppercase;
 }
 
 .live-output-raw {
@@ -147,10 +190,17 @@ body {
   font-size: var(--fs-sm);
 }
 
+/* Raw provider output is unbounded, so this stays a scroll region -- but it is
+   opt-in (behind a collapsed <details>), it reserves its gutter so opening it
+   never reflows the panel, and overscroll-behavior stops a wheel that reaches
+   the end of the log from continuing into the panel behind it. That
+   chain-scroll is the other half of what the operator sees as "jumping". */
 .live-output-raw pre,
 #detail-live-output-stderr {
   max-height: 260px;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   white-space: pre-wrap;
 }
 
@@ -171,12 +221,22 @@ button {
   cursor: pointer;
 }
 
+/* 2px, not 1px: at the panel densities here a hairline ring is easy to lose
+   against a row border. Applies to labels too, because most settings controls
+   are a checkbox inside a <label> and the visible affordance is the label. */
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
+a:focus-visible,
+summary:focus-visible,
 [tabindex]:focus-visible {
-  outline: 1px solid var(--vscode-focusBorder);
+  outline: 2px solid var(--vscode-focusBorder);
   outline-offset: 2px;
+}
+
+.settings-row:has(:focus-visible) {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
 }
 
 [hidden] {
@@ -230,11 +290,17 @@ select:focus-visible,
   padding: 8px 14px;
 }
 
+/* Intrinsic: the strip reflows on how much room a card needs, not on a list of
+   window widths. This replaced two hard breakpoints (900px and 560px). */
 .header-insights {
+  /* Self-contained band: nothing inside it is meant to escape, and containing
+     its paint stops the strip own layout overflow from adding a horizontal
+     scrollbar to the whole window (measured: 39px of page overflow at 380px). */
+  contain: paint;
   display: grid;
-  grid-template-columns: repeat(7, minmax(120px, 1fr));
-  gap: 8px;
-  padding: 6px 14px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 132px), 1fr));
+  gap: 1px;
+  padding: 0;
   background: var(--surface-subtle);
   border-top: 1px solid var(--line);
 }
@@ -314,15 +380,16 @@ select:focus-visible,
   flex-direction: column;
   width: 100%;
   min-width: 0;
-  min-height: 54px;
+  min-height: 52px;
   align-items: center;
   justify-content: center;
-  gap: 2px;
-  padding: 6px 10px;
+  gap: 1px;
+  padding: 7px 10px;
   color: var(--ink);
   background: var(--surface-subtle);
-  border: 1px solid var(--line);
-  border-radius: 5px;
+  border: 0;
+  /* Same hairline-per-cell rule as the metric field, for the same reason. */
+  box-shadow: 1px 0 0 var(--line), 0 1px 0 var(--line);
   text-align: center;
 }
 
@@ -346,9 +413,7 @@ select:focus-visible,
   margin: 14px 0 7px;
   color: var(--muted);
   font-size: var(--fs-xs);
-  font-weight: 700;
-  letter-spacing: .08em;
-  text-transform: uppercase;
+  font-weight: 400;
 }
 
 .telemetry-mode-grid {
@@ -395,6 +460,33 @@ select:focus-visible,
   color: var(--pending);
 }
 
+/* Figures align in a column and never shift width as they update: an operator
+   scanning a list of counts should be reading position, not re-reading digits.
+   Applied by role rather than one declaration at a time, so a new numeric
+   surface inherits it instead of being forgotten. */
+.workforce-score,
+.settings-metric-card strong,
+.return-pagination,
+.needfix-event-heading time,
+.kpi-legend-item b,
+.summary-note,
+.stat-breakdown,
+.live-output-metric strong,
+.header-insight-card strong,
+.telemetry-mode-badge strong,
+td,
+th {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Units and qualifiers sit smaller and lighter than the value they qualify. */
+.kpi-card-detail,
+.header-insight-detail,
+.usage-label,
+.storage-label {
+  font-weight: 400;
+}
+
 .kpi-heading {
   display: flex;
   align-items: center;
@@ -402,11 +494,55 @@ select:focus-visible,
   margin-bottom: 10px;
 }
 
-.kpi-title,
+/* Three levels, from scale and weight rather than from more boxes:
+   section title, panel title, then muted labels at the smallest step. */
+.kpi-title {
+  margin: 0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+
 .kpi-chart-title {
   margin: 0;
   font-size: var(--fs-sm);
+  font-weight: 600;
 }
+
+/* The failure taxonomy is the panel this dashboard is built around, so it is
+   the one that gets the extra column and the only raised surface. Everything
+   else stays a quiet single. */
+.kpi-failure-panel {
+  border-color: color-mix(in srgb, var(--outcome-failed) 38%, var(--line));
+}
+
+.kpi-chart-note {
+  margin: -4px 0 12px;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Success and the decisions, collapsed to one line each under the failures:
+   present, countable, and given no more room than the part of the picture that
+   needs no action deserves. */
+.kpi-outcome-rest {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 14px;
+  margin-top: 4px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+}
+
+.kpi-outcome-rest-item { display: inline-flex; flex: 0 1 auto; max-width: 100%; align-items: baseline; gap: 5px; }
+.kpi-outcome-rest-item i { width: 8px; height: 8px; align-self: center; flex-shrink: 0; background: var(--outcome-other); border-radius: 2px; }
+.kpi-outcome-rest-item b { color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 600; }
+.kpi-outcome-rest-item.state-review_ready i { background: var(--outcome-good); }
+.kpi-outcome-rest-item.state-decided i { background: var(--outcome-decided); }
+.kpi-outcome-rest-item.state-blocked i { background: var(--outcome-waiting); }
+.kpi-outcome-rest-item.state-other i { background: var(--outcome-other); }
 
 .kpi-subtitle {
   margin: 2px 0 0;
@@ -414,61 +550,109 @@ select:focus-visible,
   font-size: var(--fs-xs);
 }
 
+/* A ruled metric field, not twenty-two identical cards. The 1px grid gap is
+   the rule: the field colour shows through it, so the separators cost no
+   border, no radius and no shadow, and the cells sit flush like an instrument
+   panel rather than floating like a marketing page. */
 .kpi-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
-  gap: 8px;
-  margin-bottom: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 158px), 1fr));
+  gap: 1px;
+  margin-bottom: 12px;
+  border: 1px solid var(--line);
 }
 
 .kpi-card {
   display: grid;
-  gap: 3px;
-  min-height: 78px;
-  padding: 10px;
-  background: var(--surface-subtle);
-  border: 1px solid var(--line);
-  border-top: 3px solid var(--muted);
-  border-radius: 5px;
+  align-content: start;
+  gap: 2px;
+  min-height: 70px;
+  padding: 9px 11px;
+  background: var(--surface);
+  /* Each cell paints its own hairline into the 1px gap, rather than the grid
+     painting a field colour behind everything. Painting the field showed
+     through as a solid block wherever auto-fit left a track empty -- on High
+     Contrast Light, where the border colour is near-black, that was a black
+     rectangle sitting under the last row. Zero blur: this is a rule, not a
+     drop shadow. */
+  box-shadow: 1px 0 0 var(--line), 0 1px 0 var(--line);
+  /* A status gutter that only appears when the status is worth an operator
+     turning their head. Every card used to wear a coloured top rule, which
+     meant none of them said anything. */
+  border-left: 2px solid transparent;
 }
 
-.kpi-card.good { border-top-color: var(--review); }
-.kpi-card.bad { border-top-color: var(--blocked); }
-.kpi-card.accent { border-top-color: var(--processing); }
-.kpi-card-label,
-.kpi-card-detail { color: var(--muted); font-size: var(--fs-2xs); }
-.kpi-card-label { font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
-.kpi-card-value { font-size: var(--fs-lg); font-variant-numeric: tabular-nums; }
+.kpi-card.good { border-left-color: var(--review); }
+.kpi-card.bad { border-left-color: var(--blocked); }
+/* Reserves two lines so every figure in a row sits on the same baseline. A
+   metric field an operator scans down is only scannable if the numbers line
+   up; letting a long label push one value down breaks the column. */
+.kpi-card-label {
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  font-weight: 400;
+  min-height: calc(var(--fs-2xs) * 2.7);
+  line-height: 1.35;
+}
+.kpi-card-detail { color: var(--muted); font-size: var(--fs-2xs); line-height: 1.35; }
+.kpi-card-value { font-size: var(--fs-lg); font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; line-height: 1.15; }
+/* Not a figure: an unmeasured cell is set as prose in muted ink so it can
+   never be scanned as a number in a column of numbers. */
+.kpi-card.is-unmeasured .kpi-card-value { color: var(--muted); font-size: var(--fs-sm); font-weight: 400; letter-spacing: 0; }
 
+/* Intrinsic, not a breakpoint: the panel folds to one column when a column can
+   no longer hold 300px, whatever the window is doing. min() keeps the track
+   from exceeding the container on a narrow editor pane, which is what the old
+   fixed `repeat(2, minmax(260px, 1fr))` could not do without a media query. */
 .kpi-chart-grid {
+  container-type: inline-size;
   display: grid;
-  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
   gap: 10px;
 }
 
+/* Boldness, spent once. "Daily worker outcomes" is the one panel that answers
+   "is the line healthy right now", so wherever the grid has more than one
+   column it gets two of them and every other panel stays a quiet single. The
+   query is on the grid itself, so this follows the panel's real width instead
+   of another window breakpoint. */
+@container (min-width: 640px) {
+  .kpi-chart-grid > .kpi-chart-panel:first-child { grid-column: span 2; }
+}
+
+/* Keeps --surface-subtle deliberately: that is the surface the outcome palette
+   was validated against in both themes. Radius and card chrome go; the frame
+   is a hairline. */
 .kpi-chart-panel {
   min-width: 0;
-  padding: 10px;
+  padding: 12px 12px 11px;
   background: var(--surface-subtle);
   border: 1px solid var(--line);
-  border-radius: 5px;
 }
 
 .kpi-chart-title { margin-bottom: 10px; }
 
+/* The daily outcome chart is the one place this panel spends any boldness.
+   Everything else in the dashboard is hairlines and ink; this is the object
+   the operator actually reads a day off, so it gets the height, the baseline
+   and the only saturated colour on screen. */
 .kpi-daily-chart {
   display: flex;
-  height: 150px;
+  height: clamp(132px, 22vh, 208px);
   align-items: flex-end;
-  gap: 5px;
-  padding: 10px 4px 0;
-  border-bottom: 1px solid var(--line);
+  gap: clamp(2px, 0.6cqi, 6px);
+  padding: 14px 0 0;
+  /* A real baseline, derived from the theme ink rather than the widget border,
+     so it reads as the chart axis in a high-contrast theme too. */
+  border-bottom: 1px solid color-mix(in srgb, var(--ink) 32%, transparent);
 }
+
+.kpi-chart-panel { container-type: inline-size; }
 
 .kpi-day-column {
   display: flex;
   height: 100%;
-  min-width: 14px;
+  min-width: 6px;
   flex: 1 1 0;
   flex-direction: column;
   align-items: stretch;
@@ -482,25 +666,78 @@ select:focus-visible,
   flex-direction: column;
   justify-content: flex-end;
   overflow: hidden;
-  border-radius: 3px 3px 0 0;
+  /* 4px rounded data-end, anchored to the baseline. */
+  border-radius: 4px 4px 0 0;
 }
 
-.kpi-day-segment { display: block; flex-shrink: 0; min-height: 0; background: var(--muted); }
-.kpi-day-label { overflow: hidden; color: var(--muted); font-size: var(--fs-2xs); text-align: center; white-space: nowrap; }
+.kpi-day-segment { display: block; flex-shrink: 0; min-height: 0; background: var(--outcome-other); }
 
-.kpi-legend { display: flex; flex-wrap: wrap; gap: 6px 10px; max-width: 100%; margin-top: 8px; color: var(--muted); font-size: var(--fs-2xs); }
-.kpi-legend-item { display: inline-flex; flex: 0 1 auto; max-width: 100%; align-items: center; gap: 4px; }
-.kpi-legend-item i { width: 7px; height: 7px; flex-shrink: 0; background: var(--muted); border-radius: 2px; }
+/* A 2px surface gap between stacked fills, so two segments that share a folded
+   colour are still countable. box-shadow, not a border or flex gap: it paints
+   without taking layout space, so a one-pixel segment can never be pushed
+   past the stack it belongs to. */
+.kpi-day-segment + .kpi-day-segment { box-shadow: inset 0 2px 0 var(--surface-subtle); }
+
+.kpi-day-segment.state-review_ready { background: var(--outcome-good); }
+.kpi-day-segment.state-decided { background: var(--outcome-decided); }
+.kpi-day-segment.state-validation_failed { background: var(--outcome-failed); }
+.kpi-day-segment.state-worker_failed { background: var(--outcome-failed-2); }
+.kpi-day-segment.state-run_failed { background: var(--outcome-failed-3); }
+.kpi-day-segment.state-blocked { background: var(--outcome-waiting); }
+.kpi-day-segment.state-other { background: var(--outcome-other); }
+
+.kpi-day-label { color: var(--muted); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; text-align: center; white-space: nowrap; }
+
+/* Selective ticks, not a label under every column. A month of columns in a
+   300px panel gives each one about ten pixels, which is not a date -- so the
+   axis labels every fifth day and lets those breathe into the space the hidden
+   ones vacate. The full date stays on every column's tooltip and accessible
+   name, so nothing is lost, only unprinted. Queried per column, so it responds
+   to the column's real width rather than to a guess about the window. */
+.kpi-day-column { container-type: inline-size; }
+
+@container (max-width: 38px) {
+  .kpi-day-label { visibility: hidden; }
+}
+
+.kpi-day-column:nth-child(5n + 1) .kpi-day-label { visibility: visible; }
+
+/* The legend is not a colour key bolted on the side -- it is the table view
+   for this chart. It names every state, carries the count and the share, and
+   is what makes the identity readable without colour at all. */
+.kpi-legend { display: flex; flex-wrap: wrap; gap: 5px 14px; max-width: 100%; margin-top: 10px; color: var(--muted); font-size: var(--fs-2xs); }
+.kpi-legend-item { display: inline-flex; flex: 0 1 auto; max-width: 100%; align-items: baseline; gap: 5px; }
+.kpi-legend-item i { width: 8px; height: 8px; align-self: center; flex-shrink: 0; background: var(--outcome-other); border-radius: 2px; }
+.kpi-legend-item b { color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 600; }
+.kpi-legend-share { color: var(--muted); font-variant-numeric: tabular-nums; }
+.kpi-legend-item.state-review_ready i { background: var(--outcome-good); }
+.kpi-legend-item.state-decided i { background: var(--outcome-decided); }
+.kpi-legend-item.state-validation_failed i { background: var(--outcome-failed); }
+.kpi-legend-item.state-worker_failed i { background: var(--outcome-failed-2); }
+.kpi-legend-item.state-run_failed i { background: var(--outcome-failed-3); }
+.kpi-legend-item.state-blocked i { background: var(--outcome-waiting); }
+.kpi-legend-item.state-other i { background: var(--outcome-other); }
 
 .kpi-bar-row { display: grid; gap: 4px; margin-bottom: 9px; }
 .kpi-bar-heading { display: flex; min-width: 0; align-items: baseline; justify-content: space-between; gap: 8px; }
 .kpi-bar-label { overflow: hidden; font-size: var(--fs-xs); text-overflow: ellipsis; white-space: nowrap; }
-.kpi-bar-value { color: var(--muted); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.kpi-bar-track { height: 6px; overflow: hidden; background: color-mix(in srgb, var(--line) 55%, transparent); border-radius: 999px; }
+.kpi-bar-value { color: var(--ink); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+/* The qualifier, one step down in both weight and colour from the value. */
+.kpi-bar-unit { margin-left: 6px; color: var(--muted); font-weight: 400; }
+.kpi-bar-track { height: 6px; overflow: hidden; background: color-mix(in srgb, var(--line) 28%, transparent); border-radius: 999px; }
 .kpi-bar-fill { display: block; height: 100%; background: var(--muted); border-radius: inherit; }
 .kpi-bar-fill.good { background: var(--review); }
 .kpi-bar-fill.bad { background: var(--blocked); }
 .kpi-bar-fill.accent { background: var(--processing); }
+/* Outcome mix reads from the same entity->colour map as the daily chart, so a
+   state is the same colour wherever the operator meets it. */
+.kpi-bar-fill.state-review_ready { background: var(--outcome-good); }
+.kpi-bar-fill.state-decided { background: var(--outcome-decided); }
+.kpi-bar-fill.state-validation_failed { background: var(--outcome-failed); }
+.kpi-bar-fill.state-worker_failed { background: var(--outcome-failed-2); }
+.kpi-bar-fill.state-run_failed { background: var(--outcome-failed-3); }
+.kpi-bar-fill.state-blocked { background: var(--outcome-waiting); }
+.kpi-bar-fill.state-other { background: var(--outcome-other); }
 
 .kpi-disclosure {
   margin-top: 10px;
@@ -512,10 +749,6 @@ select:focus-visible,
 }
 
 .kpi-disclosure.warning { border-left-color: var(--pending); }
-
-@media (max-width: 820px) {
-  .kpi-chart-grid { grid-template-columns: 1fr; }
-}
 
 .header-tool-use {
   text-align: center;
@@ -539,12 +772,17 @@ select:focus-visible,
   margin-bottom: 10px;
 }
 
+/* The one scroll strip kept on purpose: a dependency DAG genuinely has a long
+   axis, and it is the only scroller on that axis. It reserves its gutter so the
+   layer columns do not resize the moment the bar appears. */
 .plan-dag-grid {
   display: grid;
   grid-auto-columns: minmax(180px, 1fr);
   grid-auto-flow: column;
   gap: 10px;
   overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-gutter: stable;
   padding-bottom: 8px;
 }
 
@@ -591,7 +829,6 @@ select:focus-visible,
   margin: 0 0 6px;
   padding: 5px 2px;
   background: var(--surface);
-  text-transform: uppercase;
 }
 
 .plan-node {
@@ -611,8 +848,17 @@ select:focus-visible,
   padding: 7px 8px;
 }
 
-.plan-node:hover,
-.plan-node:focus-visible { border-color: var(--accent); background: var(--accent-soft); outline: none; }
+.plan-node:hover { border-color: var(--accent); background: var(--accent-soft); }
+
+/* Keeps the focus ring. This rule used to end in `outline: none`, which left a
+   keyboard user navigating the plan DAG with only a faint border tint to tell
+   them where they were. */
+.plan-node:focus-visible {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
 
 .plan-node.ready { border-left-color: var(--processing); }
 .plan-node.blocked { border-left-color: var(--blocked); }
@@ -666,9 +912,7 @@ select:focus-visible,
 .header-storage-label {
   color: var(--muted);
   font-size: var(--fs-2xs);
-  font-weight: 700;
-  letter-spacing: .04em;
-  text-transform: uppercase;
+  font-weight: 400;
 }
 
 .header-storage strong {
@@ -787,7 +1031,7 @@ select:focus-visible,
   background: var(--vscode-button-background);
   border: 1px solid var(--vscode-button-border, transparent);
   font-size: var(--fs-sm);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .primary-button:hover {
@@ -803,9 +1047,10 @@ main {
   width: 100%;
 }
 
+/* Intrinsic, replacing the 560px breakpoint that used to re-column it. */
 .summary-strip {
   display: grid;
-  grid-template-columns: repeat(6, minmax(84px, 1fr)) minmax(130px, 1.3fr);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 116px), 1fr));
   background: var(--surface);
   border-bottom: 1px solid var(--line);
 }
@@ -847,7 +1092,7 @@ main {
 .summary-note {
   color: var(--muted);
   font-size: var(--fs-xs);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .summary-note {
@@ -951,7 +1196,7 @@ main {
   place-items: center;
   border: 1px solid currentColor;
   border-radius: 50%;
-  font-weight: 800;
+  font-weight: 700;
   cursor: pointer;
   list-style: none;
   user-select: none;
@@ -996,7 +1241,7 @@ main {
 .identity-info-panel dt {
   color: var(--muted);
   font-size: var(--fs-2xs);
-  font-weight: 700;
+  font-weight: 400;
 }
 
 .identity-info-panel dd {
@@ -1032,7 +1277,7 @@ main {
 
 .target-selector span {
   color: var(--muted);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .target-selector button {
@@ -1054,7 +1299,7 @@ main {
   min-width: 160px;
   color: var(--ink-soft);
   font-size: var(--fs-sm);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .repo-router {
@@ -1070,7 +1315,7 @@ main {
 
 .repo-router > span {
   color: var(--muted);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 #repo-router-list {
@@ -1118,14 +1363,16 @@ main {
   padding: 12px;
 }
 
+/* No drop shadow. These panels are flush regions of one instrument surface,
+   not paper stacked on a desk, and a black shadow under every panel is the
+   first thing that reads as generic on a light theme. */
 .task-workspace,
 .detail-panel,
 .operations-panel {
   min-width: 0;
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 5px;
-  box-shadow: var(--shadow);
+  border-radius: 4px;
 }
 
 .task-workspace {
@@ -1164,12 +1411,14 @@ main {
   font-variant-numeric: tabular-nums;
 }
 
+/* Wraps rather than scrolling: this chip row lives inside the page scroll, and
+   a horizontal strip that hides half its filters behind its own scrollbar is
+   both a second scroll container and a place to lose a control. */
 .status-filters {
   display: flex;
   min-width: 0;
+  flex-wrap: wrap;
   gap: 3px;
-  overflow-x: auto;
-  scrollbar-width: thin;
 }
 
 .status-filter {
@@ -1180,7 +1429,7 @@ main {
   background: transparent;
   border: 1px solid transparent;
   font-size: var(--fs-xs);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .status-filter:hover {
@@ -1196,7 +1445,7 @@ main {
 
 .filter-bar {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(110px, 0.55fr) minmax(110px, 0.55fr) minmax(110px, 0.45fr);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 148px), 1fr));
   gap: 8px;
   padding: 8px 10px;
   background: var(--surface-subtle);
@@ -1225,11 +1474,14 @@ main {
 }
 
 .table-shell {
+  contain: paint;
   position: relative;
   width: 100%;
   min-height: 240px;
   max-height: 60vh;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 table {
@@ -1252,9 +1504,8 @@ th {
   color: var(--muted);
   border-bottom: 1px solid var(--line-strong);
   font-size: var(--fs-2xs);
-  font-weight: 700;
+  font-weight: 400;
   text-align: left;
-  text-transform: uppercase;
 }
 
 th:nth-child(1) { width: 90px; }
@@ -1324,7 +1575,7 @@ tbody tr.is-selected td:first-child {
   border: 0;
   font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
   font-size: var(--fs-xs);
-  font-weight: 650;
+  font-weight: 600;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1419,8 +1670,7 @@ tbody tr.is-selected td:first-child {
   margin-bottom: 2px;
   color: var(--muted);
   font-size: var(--fs-2xs);
-  font-weight: 700;
-  text-transform: uppercase;
+  font-weight: 400;
 }
 
 .detail-empty,
@@ -1440,9 +1690,12 @@ tbody tr.is-selected td:first-child {
 }
 
 #detail-content {
+  contain: paint;
   max-height: 50vh;
   min-height: 160px;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .task-objective {
@@ -1451,7 +1704,7 @@ tbody tr.is-selected td:first-child {
   color: var(--ink);
   border-bottom: 1px solid var(--line);
   font-size: var(--fs-sm);
-  font-weight: 550;
+  font-weight: 600;
   overflow-wrap: anywhere;
 }
 
@@ -1476,8 +1729,7 @@ tbody tr.is-selected td:first-child {
 .metadata-grid dt {
   color: var(--muted);
   font-size: var(--fs-2xs);
-  font-weight: 700;
-  text-transform: uppercase;
+  font-weight: 400;
 }
 
 .metadata-grid dd {
@@ -1502,8 +1754,7 @@ tbody tr.is-selected td:first-child {
   margin: 0 0 6px;
   color: var(--ink-soft);
   font-size: var(--fs-2xs);
-  font-weight: 700;
-  text-transform: uppercase;
+  font-weight: 400;
 }
 
 .subheading-row {
@@ -1514,8 +1765,7 @@ tbody tr.is-selected td:first-child {
 .validation-label {
   color: var(--muted);
   font-size: var(--fs-2xs);
-  font-weight: 700;
-  text-transform: uppercase;
+  font-weight: 400;
 }
 
 .validation-label.pass { color: var(--review); }
@@ -1526,6 +1776,8 @@ tbody tr.is-selected td:first-child {
   margin: 0;
   padding: 8px;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   color: var(--ink);
   background: var(--vscode-textCodeBlock-background, var(--surface-subtle));
   border: 1px solid var(--line);
@@ -1537,11 +1789,12 @@ tbody tr.is-selected td:first-child {
   white-space: pre-wrap;
 }
 
+/* A card's allowed-writes list is short and is the thing a reviewer most needs
+   to read in full; it scrolls with the detail panel rather than inside a 100px
+   window of its own. */
 .path-list {
-  max-height: 100px;
   margin: 0;
   padding: 0;
-  overflow: auto;
   list-style: none;
 }
 
@@ -1573,8 +1826,6 @@ tbody tr.is-selected td:first-child {
   margin: 0 0 8px;
   color: var(--vscode-descriptionForeground);
   font-size: var(--fs-sm);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .review-evidence-section p {
@@ -1671,18 +1922,19 @@ tbody tr.is-selected td:first-child {
   padding-bottom: 0;
 }
 
+/* Same rule as the other strips: wrap, never nest a scrollbar inside the
+   panel's own scroll region. */
 .tab-list {
   display: flex;
+  flex-wrap: wrap;
   gap: 0;
   margin-top: 7px;
-  overflow-x: auto;
-  scrollbar-width: thin;
 }
 
 .tab-list button {
   min-width: 0;
   height: 27px;
-  flex: 1 0 48px;
+  flex: 1 1 48px;
   padding: 0 4px;
   overflow: hidden;
   color: var(--muted);
@@ -1706,9 +1958,12 @@ tbody tr.is-selected td:first-child {
 }
 
 .tab-panel {
+  contain: paint;
   min-height: 190px;
   max-height: 260px;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .stat-list,
@@ -1759,8 +2014,6 @@ tbody tr.is-selected td:first-child {
   color: var(--ink);
   font-size: var(--fs-2xs);
   font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .storage-component-row,
@@ -1909,7 +2162,7 @@ tbody tr.is-selected td:first-child {
 }
 
 .callback-observability > span:last-child { border-right: 0; }
-.callback-observability small { color: var(--muted); font-size: var(--fs-2xs); text-transform: uppercase; }
+.callback-observability small { color: var(--muted); font-size: var(--fs-2xs); }
 .callback-observability strong { overflow: hidden; font-size: var(--fs-xs); text-overflow: ellipsis; white-space: nowrap; }
 .callback-observability.is-degraded strong:last-child { color: var(--blocked); }
 
@@ -1949,8 +2202,7 @@ tbody tr.is-selected td:first-child {
 
 .activity-peek-label {
   color: var(--muted);
-  font-weight: 700;
-  text-transform: uppercase;
+  font-weight: 400;
 }
 
 .activity-peek-message {
@@ -1978,6 +2230,9 @@ tbody tr.is-selected td:first-child {
   gap: 4px;
 }
 
+/* No hover transition. Feedback in a tool this dense should be immediate;
+   easing every hover is decoration, and motion here is reserved for something
+   actually changing state. */
 .activity-peek .diagnostic-icon-button {
   display: inline-flex;
   min-height: 24px;
@@ -1985,7 +2240,6 @@ tbody tr.is-selected td:first-child {
   gap: 5px;
   padding: 3px 7px;
   border-color: color-mix(in srgb, var(--line) 82%, var(--accent));
-  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
 }
 
 .activity-peek .diagnostic-icon-button:hover {
@@ -2072,11 +2326,14 @@ tbody tr.is-selected td:first-child {
 }
 
 .operations-dialog .tab-panel:not([hidden]) {
+  contain: paint;
   box-sizing: border-box;
   min-height: 0;
   max-height: none;
   flex: 1;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding: 12px;
 }
 
@@ -2102,8 +2359,11 @@ tbody tr.is-selected td:first-child {
 }
 
 .diagnostic-dialog .system-log-terminal {
+  contain: paint;
   height: calc(100% - 83px);
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .dialog-search {
@@ -2113,22 +2373,30 @@ tbody tr.is-selected td:first-child {
   padding: 7px 9px;
   border: 1px solid var(--line);
   border-radius: 3px;
-  outline: none;
   background: var(--surface-subtle);
   color: var(--ink);
 }
 
-.dialog-search:focus {
+.dialog-search:focus-visible {
   border-color: var(--accent);
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
 }
 
 .memory-list {
+  contain: paint;
   height: calc(100% - 105px);
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding: 0 10px 10px;
 }
 
+/* The one dialog that still scrolls itself: below 820px its workspace goes to
+   auto height on purpose, so the dialog takes over the scrolling. It reserves
+   the gutter so gaining that scrollbar does not resize the toolbar above it. */
 .needfix-dialog {
+  scrollbar-gutter: stable;
   width: min(1180px, calc(100vw - 32px));
   max-width: 1180px;
   height: min(820px, calc(100vh - 40px));
@@ -2205,8 +2473,11 @@ tbody tr.is-selected td:first-child {
 
 .needfix-list,
 .needfix-detail {
+  contain: paint;
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding: 10px;
 }
 
@@ -2289,7 +2560,7 @@ tbody tr.is-selected td:first-child {
   border-radius: 4px;
   color: var(--vscode-button-secondaryForeground, #ffffff);
   background: var(--vscode-button-secondaryBackground, #3a3d41);
-  font-weight: 650;
+  font-weight: 600;
   line-height: 1.25;
   cursor: pointer;
 }
@@ -2319,16 +2590,22 @@ tbody tr.is-selected td:first-child {
   border-color: var(--vscode-button-border, var(--vscode-focusBorder, #4daafc));
 }
 
+/* Was #ffffff text on a colour baked with #4b1111, plus a hard #ffffff hover
+   border: three literals that overrode the theme, and on a light theme the
+   white hover border simply disappeared. The destructive action still reads as
+   destructive, but every value now comes from the theme -- the hover step
+   mixes toward the theme ink, so it darkens on a light theme and lightens on a
+   dark one instead of assuming which one it is looking at. */
 .needfix-controls .danger-button {
-  color: #ffffff;
-  background: color-mix(in srgb, var(--blocked) 78%, #4b1111);
+  color: var(--vscode-button-foreground, #ffffff);
+  background: var(--blocked);
   border-color: var(--blocked);
 }
 
 .needfix-controls .danger-button:hover {
-  color: #ffffff;
-  background: var(--blocked);
-  border-color: #ffffff;
+  color: var(--vscode-button-foreground, #ffffff);
+  background: color-mix(in srgb, var(--blocked) 82%, var(--ink));
+  border-color: var(--accent);
 }
 
 .needfix-conversion {
@@ -2379,7 +2656,7 @@ tbody tr.is-selected td:first-child {
 .json-field-key {
   color: var(--ink-soft);
   font-size: var(--fs-xs);
-  font-weight: 700;
+  font-weight: 400;
 }
 
 .json-field-value {
@@ -2475,6 +2752,14 @@ tbody tr.is-selected td:first-child {
 }
 
 .settings-list {
+  /* contain: paint is what actually keeps this a nested scroll region rather
+     than a leak. Without it the content of this box still contributes to the
+     scrollable overflow of the <dialog>/page above it, so the ancestor grows a
+     SECOND vertical scrollbar that tracks this content -- measured at 1038px of
+     phantom range with six model providers enabled, and a 271px jump when
+     toggling one off collapsed that range and the browser clamped scrollTop.
+     Containing the paint means only one box on this axis can scroll. */
+  contain: paint;
   box-sizing: border-box;
   align-self: stretch;
   min-width: 0;
@@ -2491,20 +2776,24 @@ tbody tr.is-selected td:first-child {
   min-height: 320px;
 }
 
+/* Wraps, never scrolls. This strip sits inside .settings-list, which is itself
+   a scroll region inside a <dialog>: giving it overflow-x made it the third
+   scroll container on one chain, so reaching a tab could mean scrolling a
+   scrollbar inside a scrollbar. Four tabs wrap onto a second line instead. */
 .settings-tabs {
   position: sticky;
   top: -10px;
   z-index: 2;
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
-  overflow-x: auto;
   padding: 10px;
   margin: -10px -10px 8px;
   background: var(--surface);
   border-bottom: 1px solid var(--line);
 }
 
-.settings-tab { flex: 0 0 auto; }
+.settings-tab { flex: 0 1 auto; }
 
 .settings-tab {
   padding: 6px 9px;
@@ -2530,12 +2819,21 @@ tbody tr.is-selected td:first-child {
   background: var(--accent-soft);
 }
 
+/* A model route is indented with padding, not with a margin plus width maths.
+   It used to read `width: calc(100% - 18px); margin-left: 18px`, but
+   `.settings-row { width: 100% }` is declared later at the same specificity
+   and won, so every route row rendered 18px wider than the list it lives in.
+   That overflow escaped the settings list and turned the <dialog> itself into
+   a second vertical scroll region that grew with every model enabled -- the
+   "mass of scrollbars", and the jump when its scroll range collapsed again.
+   Padding cannot desynchronise from the width, so the whole class of bug is
+   gone rather than patched. */
 .settings-model-route {
-  box-sizing: border-box;
-  width: calc(100% - 18px);
   min-height: 50px;
-  margin-left: 18px;
+  padding-left: 30px;
   border-left: 2px solid var(--line);
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
 }
 
 .settings-metric-grid {
@@ -2581,7 +2879,7 @@ tbody tr.is-selected td:first-child {
     max-height: calc(100vh - 24px);
   }
   .settings-row { align-items: flex-start; gap: 10px; padding: 9px; }
-  .settings-model-route { width: calc(100% - 8px); margin-left: 8px; }
+  .settings-model-route { padding-left: 17px; }
   .switch-control { flex: 0 0 auto; margin-top: 2px; }
   .settings-footnote { overflow-wrap: anywhere; }
   .settings-metric-grid,
@@ -2649,9 +2947,10 @@ tbody tr.is-selected td:first-child {
   background: var(--surface-subtle);
 }
 
+/* Scrolls with .memory-list, the dialog's one scroll region, instead of
+   opening a 180px window inside it. */
 .context-entry .memory-value {
-  max-height: 180px;
-  overflow: auto;
+  max-height: none;
 }
 
 .memory-entry-heading {
@@ -2669,7 +2968,6 @@ tbody tr.is-selected td:first-child {
 .memory-scope {
   color: var(--accent);
   font-size: var(--fs-2xs);
-  text-transform: uppercase;
 }
 
 .memory-value {
@@ -2703,8 +3001,7 @@ tbody tr.is-selected td:first-child {
 .usage-label {
   color: var(--muted);
   font-size: var(--fs-2xs);
-  font-weight: 700;
-  text-transform: uppercase;
+  font-weight: 400;
 }
 
 .usage-metric strong {
@@ -2744,7 +3041,7 @@ tbody tr.is-selected td:first-child {
   overflow: hidden;
   color: var(--ink-soft);
   font-size: var(--fs-xs);
-  font-weight: 650;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2821,7 +3118,7 @@ tbody tr.is-selected td:first-child {
   color: var(--ink);
   font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
   font-size: var(--fs-2xs);
-  font-weight: 650;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2876,9 +3173,8 @@ tbody tr.is-selected td:first-child {
   overflow: hidden;
   color: var(--muted);
   font-size: var(--fs-xs);
-  font-weight: 700;
+  font-weight: 400;
   text-overflow: ellipsis;
-  text-transform: uppercase;
   white-space: nowrap;
 }
 
@@ -2903,15 +3199,10 @@ tbody tr.is-selected td:first-child {
   font-size: var(--fs-sm);
 }
 
+/* The header strip and the summary strip are intrinsic now, so this breakpoint
+   only carries what genuinely depends on viewport HEIGHT rather than on how
+   much room a component needs. */
 @media (max-width: 900px) {
-  .header-insights {
-    grid-template-columns: repeat(3, minmax(130px, 1fr));
-  }
-
-  .inspector {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
   #detail-content {
     max-height: 420px;
   }
@@ -2926,34 +3217,16 @@ tbody tr.is-selected td:first-child {
     padding: 0;
   }
 
-  .header-main,
-  .header-insights {
+  .header-main {
     padding-right: 10px;
     padding-left: 10px;
-  }
-
-  .header-insights {
-    grid-template-columns: 1fr;
-  }
-
-  .summary-strip {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .summary-item:nth-child(2n) {
-    border-right: 0;
   }
 
   .workspace {
     padding: 8px;
   }
 
-  .filter-bar {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .search-field,
-  .filter-bar label:last-child {
+  .search-field {
     grid-column: 1 / -1;
   }
 }
@@ -2964,6 +3237,8 @@ tbody tr.is-selected td:first-child {
   *::after {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
   }
 }
 
@@ -3012,7 +3287,6 @@ tbody tr.is-selected td:first-child {
 .live-output-row-state {
   color: var(--vscode-descriptionForeground, #8b949e);
   font-size: var(--fs-sm);
-  text-transform: uppercase;
 }
 
 .live-output-row-label {
@@ -3042,6 +3316,8 @@ tbody tr.is-selected td:first-child {
 .live-output-row-raw > pre {
   max-height: 220px;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }

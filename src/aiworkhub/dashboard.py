@@ -30,6 +30,7 @@ from aiworkhub import (
     cost_ledger,
     dashboard_kpis,
     deepseek_credentials,
+    history_series,
     needfix_ingest,
     needfix_store,
     process_launcher,
@@ -2151,6 +2152,17 @@ class DashboardProvider:
                 }
         return result
 
+    def get_history_series(self) -> dict[str, Any]:
+        """Bounded canonical-store history for a charts page.
+
+        ``kpi_analytics`` is computed over the live process report, so its own
+        window reports 37 observed runs and ``truncated: true`` while the
+        canonical store holds 6,232 terminal outcomes over 43 days. This read
+        goes to the store instead, and caches on the database's
+        ``(size, mtime_ns)`` so an unchanged store never rescans it.
+        """
+        return history_series.build_history_series(self.repo_root)
+
     def get_needfix_snapshot(self) -> dict[str, Any]:
         """NeedFix view derived from this dashboard snapshot's task cards."""
         task_cards = self._task_cards()
@@ -3838,6 +3850,9 @@ def build_snapshot(
             "work_card_outcomes": _work_card_outcomes_unmeasured(
                 "storage_not_ready"
             ),
+            "history_series": history_series.history_series_unmeasured(
+                "storage_not_ready"
+            ),
             "row_counts": {
                 status: {"returned": 0, "exact": 0, "truncated": False} for status in ALL_CANONICAL_STATUSES
             },
@@ -3966,6 +3981,15 @@ def build_snapshot(
         "work_card_decision_counts": (
             "work_card_decision_counts",
             getattr(data_provider, "get_work_card_decision_counts", lambda: None),
+            None,
+        ),
+        # Canonical-store history for a charts page. ``kpi_analytics`` above
+        # is bounded to the live process report (37 runs); this read reaches
+        # the 44-day store history instead. A provider that cannot supply it
+        # yields ``None``, reported as unmeasured -- never as an empty history.
+        "history_series": (
+            "history_series",
+            getattr(data_provider, "get_history_series", lambda: None),
             None,
         ),
         "needfix": (
@@ -4201,6 +4225,18 @@ def build_snapshot(
         reads["work_card_decision_counts"],
         event_counted_outcomes=outcome_counts,
     )
+    # A provider that returned nothing, or a payload that is not an object,
+    # is unmeasured history -- never an empty one. Rendering zero days here
+    # would read as "the system did no work", which is the exact failure the
+    # canonical-store series exists to correct.
+    history = reads["history_series"]
+    if not isinstance(history, Mapping) or not history.get("measured", False):
+        reason = "provider_unavailable"
+        if isinstance(history, Mapping):
+            reason = str(history.get("reason") or "provider_reported_unmeasured")
+        history = history_series.history_series_unmeasured(reason)
+    else:
+        history = dict(history)
 
     # Bounded-row-list truncation metadata: how many rows the returned
     # snapshot actually carries per status vs. the exact authoritative
@@ -4296,6 +4332,9 @@ def build_snapshot(
         "status_counts": status_counts,
         "outcome_counts": outcome_counts,
         "work_card_outcomes": work_card_outcomes,
+        # New top-level key. Existing keys keep their exact shape; the VS Code
+        # webview renders those and a charts page reads this one.
+        "history_series": history,
         "row_counts": row_counts,
         "read_bounds": read_bounds,
         "tasks": {

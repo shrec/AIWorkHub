@@ -146,7 +146,19 @@ test("KPI visualizations include responsive chart and bar primitives", () => {
   assert.match(cssSource, /\.kpi-chart-grid/);
   assert.match(cssSource, /\.kpi-daily-chart/);
   assert.match(cssSource, /\.kpi-bar-track/);
-  assert.match(cssSource, /@media \(max-width: 820px\)/);
+  // This used to assert `@media (max-width: 820px)`, which stopped meaning
+  // anything the moment an unrelated rule elsewhere in the file also matched
+  // that string. The chart grid is intrinsic now: it reflows on how much room
+  // a panel needs, not on a list of window widths, so what is asserted is the
+  // sizing itself.
+  const chartGridRule = cssSource.match(/\n\.kpi-chart-grid \{([^}]*)\}/)[1];
+  assert.match(chartGridRule, /grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(min\(100%,\s*\d+px\),\s*1fr\)\)/,
+    "the chart grid must size intrinsically, and min() must stop a track exceeding a narrow container");
+  assert.doesNotMatch(chartGridRule, /repeat\(\s*\d+\s*,/,
+    "a fixed column count is what forced the breakpoint this replaced");
+  // The one panel that answers "is the line healthy right now" gets the extra
+  // column, and it asks the grid's own width rather than the window's.
+  assert.match(cssSource, /@container \(min-width: \d+px\) \{\s*\.kpi-chart-grid > \.kpi-chart-panel:first-child \{ grid-column: span 2; \}/);
 });
 
 test("KPI v4 renders Source Graph workflow, generations, call gaps and byte economics", () => {
@@ -203,7 +215,74 @@ test("Daily worker outcomes chart no longer collapses states into a review/faile
   assert.doesNotMatch(cssSource, /\.kpi-legend-item i\.neutral/);
 });
 
-test("Daily worker outcomes chart renders every observed state as its own accessible, distinctly colored segment", () => {
+// ── Outcome colour contract ────────────────────────────────────────────────
+// These five tests used to assert the OPPOSITE of what they assert now, and
+// the change is deliberate. They pinned a golden-angle formula that derived
+// each state's hue from its position in the list, and required every state to
+// receive its own unique generated colour. That formula painted review_ready
+// -- the successful outcome and 58.7% of 6,232 measured terminal runs -- pure
+// red, and painted validation_failed and scope_rejected green. The old tests
+// were green the whole time the chart was telling the operator the opposite of
+// the truth, because "distinct" was the only property they checked.
+//
+// What is asserted instead is what actually matters: colour follows the
+// entity, the successful outcome reads as success, no failure wears the
+// success colour, and identity never depends on colour at all. What survived
+// unchanged: no state is dropped or collapsed, every state keeps its own
+// segment, tooltip and accessible label, ordering is locale-independent, and
+// nothing is sized by a height percentage.
+
+const SLOT_OF = {
+  review_ready: "review_ready",
+  cancelled: "decided",
+  scope_rejected: "decided",
+  validation_failed: "validation_failed",
+  worker_failed: "worker_failed",
+  launch_failed: "run_failed",
+  timed_out: "run_failed",
+  exited: "run_failed",
+  finalize_failed: "run_failed",
+  liveness_lost: "run_failed",
+  output_budget_exceeded: "run_failed",
+  token_budget_exceeded: "run_failed",
+};
+
+// The fixed slot order. It is declared in app.js rather than derived from the
+// payload because the order decides which fills touch inside a stacked column,
+// and those touching pairs are the ones the palette validator was run on.
+const SLOT_ORDER = [
+  "review_ready",
+  "decided",
+  "validation_failed",
+  "worker_failed",
+  "run_failed",
+  "blocked",
+  "other",
+];
+
+function slotOfSegment(segment) {
+  const match = /\bstate-([a-z_]+)\b/.exec(segment.className || "");
+  assert.ok(match, `segment must carry an entity-keyed slot class, got: ${segment.className}`);
+  return match[1];
+}
+
+test("outcome colours are keyed by the state, never generated from its list position", () => {
+  assert.doesNotMatch(appSource, /137\.508/,
+    "the golden-angle hue formula must be gone -- it is what made review_ready red");
+  assert.doesNotMatch(appSource, /hsl\(\$\{hue/,
+    "no generated hue may remain");
+  assert.doesNotMatch(appSource, /const stateColor = \(index\)/,
+    "colour must not be a function of an index");
+  assert.match(appSource, /const slotForState = \(name\)/,
+    "colour must be a function of the state name");
+  // A fill written into element.style would override the user's VS Code theme.
+  assert.doesNotMatch(appSource, /segment\.style\.background/,
+    "segment fills must come from a themed CSS token, not an inline colour");
+  assert.doesNotMatch(appSource, /swatch\.style\.background/,
+    "legend swatches must come from a themed CSS token, not an inline colour");
+});
+
+test("Daily worker outcomes chart renders every observed state as its own labelled segment in its own semantic slot", () => {
   const counts = dayStates({
     review_ready: 1,
     validation_failed: 1,
@@ -226,38 +305,86 @@ test("Daily worker outcomes chart renders every observed state as its own access
   assert.equal(chart.attrs.role, "img");
   assert.match(chart.attrs["aria-label"], /11 states/);
 
-  const expectedOrder = [...DAILY_TERMINAL_STATE_ORDER, "pending", "processing"];
-
   const [column] = chart.children;
   const [stack] = column.children;
-  assert.equal(stack.children.length, expectedOrder.length, "no state should be dropped or collapsed");
-  assert.deepEqual(stack.children.map((segment) => segment.attrs["aria-label"].split(":")[0]),
-    expectedOrder.map((state) => state.replaceAll("_", " ")));
+
+  // Nothing is dropped or merged away: 11 observed states, 11 segments.
+  assert.equal(stack.children.length, 11, "no state should be dropped or collapsed");
+
   for (const segment of stack.children) {
-    assert.match(segment.style.background, /^hsl\([\d.]+ 65% 55%\)$/);
+    assert.equal(segment.style.background, undefined,
+      "fills must be themed CSS tokens, never an inline colour that overrides the user's VS Code theme");
     assert.equal(segment.style.height, undefined,
       "segments must not be sized by a height percentage -- that is what let many low-count states overflow past 100%");
     assert.ok(Number(segment.style.flexGrow) > 0, "segments must be sized by a flex weight");
     assert.equal(segment.style.flexBasis, "0%");
     assert.ok(segment.title.includes("2026-08-01"));
+    // Identity is never colour-alone: the exact state name is on every
+    // segment, for the tooltip and for a screen reader, even where the fill is
+    // shared with another state in the same slot.
     assert.ok(segment.attrs["aria-label"].includes("2026-08-01"));
   }
-  const distinctColors = new Set(stack.children.map((segment) => segment.style.background));
-  assert.equal(distinctColors.size, expectedOrder.length, "every observed state must get a distinct color");
 
-  assert.equal(legend.children.length, expectedOrder.length);
-  assert.deepEqual(legend.children.map((item) => item.attrs["aria-label"]),
-    expectedOrder.map((state) => state.replaceAll("_", " ")));
-  for (let index = 0; index < legend.children.length; index += 1) {
-    const item = legend.children[index];
-    const swatch = item.children[0];
-    assert.equal(swatch.attrs["aria-hidden"], "true");
-    assert.equal(swatch.style.background, stack.children[index].style.background,
-      "legend swatch color must match the chart segment color for the same state");
+  const bySlot = stack.children.map(slotOfSegment);
+  const byState = stack.children.map((s) => s.attrs["aria-label"].split(":")[0].replaceAll(" ", "_"));
+
+  // Every canonical state lands in the slot its meaning demands.
+  for (let i = 0; i < byState.length; i += 1) {
+    const expected = SLOT_OF[byState[i]] || (byState[i] === "blocked" ? "blocked" : "other");
+    assert.equal(bySlot[i], expected, `${byState[i]} must render in the ${expected} slot`);
   }
+
+  // The successful outcome owns the success slot, and nothing else may enter it.
+  const successSegments = stack.children.filter((s) => slotOfSegment(s) === "review_ready");
+  assert.equal(successSegments.length, 1);
+  assert.equal(successSegments[0].attrs["aria-label"].split(":")[0], "review ready");
+
+  // No failure may wear the success colour. This is the exact inversion the
+  // generated palette shipped: validation_failed at 137 degrees was green.
+  for (const failure of ["validation_failed", "worker_failed", "launch_failed", "timed_out", "exited"]) {
+    assert.notEqual(SLOT_OF[failure], "review_ready", `${failure} must never share the success slot`);
+  }
+  // A cancellation is a human decision, not a failure.
+  assert.equal(SLOT_OF.cancelled, "decided");
+  assert.notEqual(SLOT_OF.cancelled, "validation_failed");
+  assert.notEqual(SLOT_OF.cancelled, "worker_failed");
+  assert.notEqual(SLOT_OF.cancelled, "run_failed");
+
+  // Fills render in the fixed slot order, so the pairs that touch inside a
+  // column are the pairs the palette was validated on.
+  const ranks = bySlot.map((slot) => SLOT_ORDER.indexOf(slot));
+  assert.ok(ranks.every((r) => r >= 0), `every slot must be a declared one: ${bySlot.join(",")}`);
+  assert.deepEqual(ranks, [...ranks].sort((a, b) => a - b),
+    "segments must render in the fixed slot order that the palette was validated against");
+
+  // ONE LEGEND ROW PER STATE, never one per colour. The ordinal gate admits
+  // exactly three lightness steps for failure severity (a four-step ramp fails
+  // the adjacent-dL floor in both modes -- measured), so several failure modes
+  // necessarily share a band. Sharing a band must not cost a mode its name:
+  // every one gets its own row, its own count and its own share, and nothing
+  // is ever collapsed into an anonymous "other".
+  assert.equal(legend.children.length, stack.children.length,
+    "one legend row per observed state -- a failure mode must never be anonymous");
+  assert.deepEqual(
+    legend.children.map((item) => item.attrs["aria-label"].split(":")[0].replaceAll(" ", "_")),
+    byState,
+    "legend rows name every state, in the order they render",
+  );
+  for (const item of legend.children) {
+    assert.match(item.attrs["aria-label"], /^[a-z ]+: \d+ outcomes, [\d.]+%$/,
+      "every legend row carries its count and share, so the legend is the chart's table view");
+    assert.ok(item.children[0].attrs["aria-hidden"] === "true", "the swatch is decorative");
+    assert.equal(item.children[0].style.background, undefined,
+      "swatch colour is a themed CSS class, not an inline colour");
+  }
+  // The modes that share the run-failure band each keep a row of their own.
+  const sharedBand = legend.children.filter((i) => i.className.includes("state-run_failed"));
+  assert.deepEqual(sharedBand.map((i) => i.attrs["aria-label"].split(":")[0]),
+    ["launch failed", "timed out", "exited"],
+    "three modes share one lightness band and keep three separate identities");
 });
 
-test("Daily worker outcomes chart assigns every one of 13+ observed states its own non-repeating color", () => {
+test("Daily worker outcomes chart still renders 13+ observed states, folding the unrecognised ones rather than inventing hues", () => {
   const counts = dayStates({
     review_ready: 1,
     validation_failed: 1,
@@ -281,10 +408,39 @@ test("Daily worker outcomes chart assigns every one of 13+ observed states its o
   const [stack] = column.children;
 
   assert.equal(stack.children.length, 13, "all 13 observed states must render, none dropped or collapsed");
-  const colors = stack.children.map((segment) => segment.style.background);
-  assert.equal(new Set(colors).size, 13,
-    "the 13th and later states must not repeat an earlier state's color from a fixed-size swatch pool");
-  assert.equal(new Set(legend.children.map((item) => item.children[0].style.background)).size, 13);
+
+  // The measured tail is what justifies folding: over 6,232 terminal outcomes
+  // the top three states are 93.3% and nothing else clears 3%. A 3% state is a
+  // sliver at the segment floor, so eight more unique hues would be eight
+  // slivers no reader can separate -- the ninth series folds, it never gets a
+  // generated hue.
+  const slots = new Set(stack.children.map(slotOfSegment));
+  assert.ok(slots.size <= SLOT_ORDER.length,
+    `13 states must fold into at most ${SLOT_ORDER.length} slots, got ${slots.size}`);
+  for (const slot of slots) {
+    assert.ok(SLOT_ORDER.includes(slot), `unexpected slot ${slot}`);
+  }
+
+  // An unrecognised state is neutral, not a guessed alarm...
+  const custom = stack.children.filter((s) => s.attrs["aria-label"].startsWith("custom "));
+  assert.equal(custom.length, 4);
+  for (const segment of custom) {
+    assert.equal(slotOfSegment(segment), "other",
+      "an unrecognised state takes the neutral fold, never a failure colour it did not earn");
+  }
+  // ...unless it names itself a failure in the convention the backend already
+  // uses for every failure it emits.
+  const named = renderDailyPanel(buildKpis([{
+    date: "2026-08-01",
+    runs: 2,
+    states: [{ state: "review_ready", count: 1 }, { state: "finalize_failed", count: 1 }],
+  }]));
+  const namedSegments = named.children[1].children[0].children[0].children;
+  assert.equal(slotOfSegment(namedSegments[1]), "run_failed");
+
+  // Thirteen states, thirteen legend rows: folding a colour band never folds
+  // an identity.
+  assert.equal(legend.children.length, 13);
 });
 
 test("Daily worker outcomes ordering of unknown states is deterministic and does not depend on locale collation", () => {
@@ -294,15 +450,25 @@ test("Daily worker outcomes ordering of unknown states is deterministic and does
   const kpis = buildKpis([{ date: "2026-08-01", runs: 3, states: statesList(counts) }]);
 
   const panel = renderDailyPanel(kpis);
-  const [, , legend] = panel.children;
-  const nonterminalLabels = legend.children
-    .map((item) => item.attrs["aria-label"])
+  const [, chart, legend] = panel.children;
+  const [stack] = chart.children[0].children;
+
+  const nonterminal = stack.children
+    .map((segment) => segment.attrs["aria-label"].split(":")[0])
     .filter((label) => label.includes("custom"));
 
   // Ordinal (code-point) order: uppercase "B" (0x42) sorts before lowercase
   // "a" (0x61) -- a locale-aware compare (e.g. localeCompare) would instead
   // put "alpha custom" first, which is exactly the drift this guards against.
-  assert.deepEqual(nonterminalLabels, ["Beta custom", "alpha custom"]);
+  // Slot folding does not disturb it: both states fold into the same slot, so
+  // their relative order is still the payload's.
+  assert.deepEqual(nonterminal, ["Beta custom", "alpha custom"]);
+
+  // The legend names both of them individually, in the same order.
+  assert.deepEqual(
+    legend.children.map((item) => item.attrs["aria-label"].split(":")[0]).filter((l) => l.includes("custom")),
+    ["Beta custom", "alpha custom"],
+  );
 });
 
 test("Daily worker outcomes chart hides zero-count states per day but keeps them in the shared legend once observed", () => {
@@ -322,12 +488,13 @@ test("Daily worker outcomes chart hides zero-count states per day but keeps them
   assert.equal(column1.children[0].children.length, 3, "only nonzero states render as segments for day 1");
   assert.equal(column2.children[0].children.length, 1, "only nonzero states render as segments for day 2");
 
-  assert.deepEqual(legend.children.map((item) => item.attrs["aria-label"]), [
-    "review ready",
-    "validation failed",
-    "custom nonterminal alpha",
-    "custom nonterminal beta",
-  ]);
+  // The legend spans the whole window, so a state observed on any day stays in
+  // it, one row per state, carrying the window totals and shares.
+  assert.deepEqual(legend.children.map((item) => item.attrs["aria-label"].split(":")[0]),
+    ["review ready", "validation failed", "custom nonterminal alpha", "custom nonterminal beta"]);
+  assert.equal(legend.children[0].attrs["aria-label"], "review ready: 2 outcomes, 28.6%");
+  assert.equal(legend.children[1].attrs["aria-label"], "validation failed: 3 outcomes, 42.9%");
+  assert.equal(legend.children[2].attrs["aria-label"], "custom nonterminal alpha: 1 outcomes, 14.3%");
 });
 
 test("Daily worker outcomes chart sources its terminal order from the backend KPI payload with no independent hardcoded copy", () => {
@@ -343,37 +510,44 @@ test("Daily worker outcomes chart sources its terminal order from the backend KP
     /paletteIndex\.has\(name\)\s*\?\s*paletteIndex\.get\(name\)\s*:\s*-1/,
     "colorForState must not carry an unreachable fallback -- every rendered name is always present in paletteOrder",
   );
-  assert.doesNotMatch(
-    appSource,
-    /const safeIndex = index >= 0 \? index : 0;/,
-    "stateColor must not carry an unreachable defensive branch for a negative index that colorForState never produces",
-  );
 });
 
-test("Daily worker outcomes chart renders in whatever terminal order the backend supplies, not a fixed default", () => {
-  // A deliberately reversed order proves rendering follows the *supplied*
-  // kpis.daily_state_order value rather than any order baked into app.js.
-  const reversedOrder = [...DAILY_TERMINAL_STATE_ORDER].reverse();
-  const counts = dayStates({ review_ready: 1, exited: 1, blocked: 1 });
-  const kpis = buildKpis(
-    [{ date: "2026-08-01", runs: 3, states: statesList(counts) }],
-    reversedOrder,
-  );
+test("the payload keeps authority over which states exist and over their order inside a slot", () => {
+  // The palette fixes the order BETWEEN slots, because that order is what
+  // makes the colours safe. It must not take over the order WITHIN a slot --
+  // that still belongs to the payload, and a state the backend has never
+  // mentioned must still render.
+  const forwardOrder = ["launch_failed", "timed_out", "exited"];
+  const build = (order) => {
+    const panel = renderDailyPanel(buildKpis(
+      [{
+        date: "2026-08-01",
+        runs: 4,
+        states: [
+          { state: "review_ready", count: 1 },
+          { state: "launch_failed", count: 1 },
+          { state: "timed_out", count: 1 },
+          { state: "exited", count: 1 },
+        ],
+      }],
+      ["review_ready", ...order],
+    ));
+    return panel.children[1].children[0].children[0].children
+      .map((segment) => segment.attrs["aria-label"].split(":")[0].replaceAll(" ", "_"));
+  };
 
-  const panel = renderDailyPanel(kpis);
-  const [, chart, legend] = panel.children;
-  const [column] = chart.children;
-  const [stack] = column.children;
+  assert.deepEqual(build(forwardOrder), ["review_ready", ...forwardOrder]);
+  const reversed = [...forwardOrder].reverse();
+  assert.deepEqual(build(reversed), ["review_ready", ...reversed],
+    "three states that share one colour slot must still render in the order the payload supplied");
 
-  assert.deepEqual(
-    stack.children.map((segment) => segment.attrs["aria-label"].split(":")[0]),
-    ["exited", "blocked", "review ready"],
-    "segment order must follow the supplied backend order (reversed), not the canonical default order",
-  );
-  assert.deepEqual(
-    legend.children.map((item) => item.attrs["aria-label"]),
-    ["exited", "blocked", "review ready"],
-  );
+  // A state absent from daily_state_order entirely still renders.
+  const panel = renderDailyPanel(buildKpis(
+    [{ date: "2026-08-01", runs: 2, states: [{ state: "review_ready", count: 1 }, { state: "brand_new_state", count: 1 }] }],
+    ["review_ready"],
+  ));
+  const labels = panel.children[1].children[0].children[0].children.map((s) => s.attrs["aria-label"].split(":")[0]);
+  assert.deepEqual(labels, ["review ready", "brand new state"]);
 });
 
 test("Daily worker outcomes legend wraps responsively instead of relying on fixed-width layout", () => {

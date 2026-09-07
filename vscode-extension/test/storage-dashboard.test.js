@@ -89,6 +89,19 @@ assert.ok(
 assert.ok(css.includes(".storage-row"), "storage dashboard styling is missing");
 assert.ok(css.includes(".storage-section-title"), "storage section styling is missing");
 assert.ok(css.includes(".storage-batch-row"), "storage quarantine styling is missing");
-assert.ok(css.includes("grid-template-columns: repeat(6"), "AI infrastructure cards must share one full-width row");
-assert.ok(css.includes("align-items: center"), "AI infrastructure cards must be centered");
+// This used to be `css.includes("grid-template-columns: repeat(6")`, which
+// never touched the AI-infrastructure strip at all -- it matched
+// `.summary-strip { grid-template-columns: repeat(6, ...) }` further down the
+// file. The strip it names is `.header-insights`, and it now sizes
+// intrinsically: the cards share one full-width row whenever a row can hold
+// them, and wrap instead of overflowing when it cannot, without a breakpoint.
+const headerInsights = css.match(/\.header-insights \{([^}]*)\}/);
+assert.ok(headerInsights, "the AI infrastructure strip must exist");
+assert.ok(
+  /grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(min\(100%,\s*\d+px\),\s*1fr\)\)/.test(headerInsights[1]),
+  "AI infrastructure cards must fill one row intrinsically, not at a fixed column count",
+);
+const insightCard = css.match(/\.header-insight-card \{([^}]*)\}/);
+assert.ok(insightCard, "the AI infrastructure card rule must exist");
+assert.ok(/align-items:\s*center/.test(insightCard[1]), "AI infrastructure cards must be centered");
 console.log("storage dashboard contract: ok");

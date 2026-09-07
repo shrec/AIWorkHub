@@ -142,7 +142,7 @@ def test_an_unevaluable_invariant_reports_itself_rather_than_passing(monkeypatch
     assert any("could not be evaluated" in v["detail"] for v in report["violations"])
 
 
-def test_exception_with_broken_string_still_fails_closed(monkeypatch, capsys):
+def test_exception_with_broken_string_still_fails_closed(monkeypatch, capsys, tmp_path):
     class UnformattableError(Exception):
         def __str__(self) -> str:
             raise RuntimeError("diagnostic formatting failed")
@@ -159,13 +159,13 @@ def test_exception_with_broken_string_still_fails_closed(monkeypatch, capsys):
     assert report["violations"][0]["path"] == str(_PACKAGE)
     assert report["violations"][0]["detail"].endswith("UnformattableError")
 
-    assert di.main(["--src", str(_PACKAGE)]) == 1
+    assert di.main(["--src", str(_PACKAGE), "--repo", str(tmp_path)]) == 1
     cli_report = json.loads(capsys.readouterr().out)
     assert cli_report["passed"] is False
     assert cli_report["violations"][0]["detail"].endswith("UnformattableError")
 
 
-def test_an_unevaluable_tree_invariant_is_json_and_nonzero(monkeypatch, capsys):
+def test_an_unevaluable_tree_invariant_is_json_and_nonzero(monkeypatch, capsys, tmp_path):
     def _explode(_root: Path) -> list[di.Violation]:
         raise RuntimeError("tree index unavailable")
 
@@ -173,7 +173,10 @@ def test_an_unevaluable_tree_invariant_is_json_and_nonzero(monkeypatch, capsys):
         di, "_TREE_INVARIANTS", (("module_level_caches_are_bounded", _explode),)
     )
 
-    assert di.main(["--src", str(_PACKAGE)]) == 1
+    # --repo names a directory that owns no canonical store, so the count below
+    # is the tree verdict alone and not a reading of whatever task database the
+    # machine running the suite happens to have.
+    assert di.main(["--src", str(_PACKAGE), "--repo", str(tmp_path)]) == 1
     report = json.loads(capsys.readouterr().out)
     assert report["passed"] is False
     assert report["violation_count"] == 1
@@ -228,17 +231,19 @@ def test_invalid_utf8_and_syntax_errors_fail_closed(tmp_path: Path):
 
 
 def test_the_cli_exit_code_follows_the_verdict(tmp_path: Path, capsys):
+    # --repo is pinned at a directory that owns no canonical store, so this
+    # asserts the tree verdict and never the developer's live task database.
     pkg = tmp_path / "src" / "aiworkhub"
     pkg.mkdir(parents=True)
     (pkg / "clean.py").write_text("VALUE = 1\n", encoding="utf-8")
-    assert di.main(["--src", str(pkg)]) == 0
+    assert di.main(["--src", str(pkg), "--repo", str(tmp_path)]) == 0
 
     (pkg / "leaky.py").write_text("_X_CACHE: dict = {}\n", encoding="utf-8")
-    assert di.main(["--src", str(pkg)]) == 1
+    assert di.main(["--src", str(pkg), "--repo", str(tmp_path)]) == 1
 
     capsys.readouterr()
     missing = tmp_path / "missing"
-    assert di.main(["--src", str(missing)]) == 1
+    assert di.main(["--src", str(missing), "--repo", str(tmp_path)]) == 1
     report = json.loads(capsys.readouterr().out)
     assert report["src_root"] == str(missing)
     assert "source root is not a directory" in report["violations"][0]["detail"]
@@ -248,3 +253,213 @@ def test_the_cli_exit_code_follows_the_verdict(tmp_path: Path, capsys):
 def test_every_invariant_is_named_in_the_report(name):
     report = di.check(_PACKAGE)
     assert name in {row["invariant"] for row in report["invariants"]}
+
+
+# --------------------------------------------------------------------------- #
+# the learning duty is discharged
+#
+# The duty was named at the decision (`accept_review` and `reject_review` return
+# `learning_commit_owed`), measured in health (`learning_coverage`), and enforced
+# nowhere. Measured on this repository on 2026-09-07: 105 decided cards in the
+# 14-day window, 23 with a lesson, and the runs without one, newest first, are
+# 6, 15, 1, 2, 14, 6, 38 -- lessons arrive in bursts and then stop. These tests
+# pin the enforcement: a run past the limit is a violation, one lesson for one of
+# the newest decisions clears it, a repository that decided nothing owes nothing,
+# and a root with no store reports itself unevaluated rather than clean.
+# --------------------------------------------------------------------------- #
+
+# Seeding a canonical store is the same job in both files; sharing it keeps one
+# definition of what a decided card looks like.
+from test_learning_coverage_is_measured import _card, _repo, _seed  # noqa: E402
+
+
+def _decided(root: Path, count: int, *, lessons: list[str]) -> None:
+    """``count`` decided cards, newest first as ``D0``, ``D1``, ..."""
+    _seed(
+        root,
+        [
+            _card(f"D{i}", status="finished", topic="coding", age_days=1 + i)
+            for i in range(count)
+        ],
+        lessons=lessons,
+    )
+
+
+def _learning_row(report: dict) -> dict:
+    rows = [
+        row for row in report["invariants"]
+        if row["invariant"] == "recent_decisions_record_a_lesson"
+    ]
+    assert len(rows) == 1, "the invariant must be reported exactly once"
+    return rows[0]
+
+
+def test_a_run_of_decisions_recording_no_lesson_is_a_violation(tmp_path: Path):
+    root = _repo(tmp_path)
+    _decided(root, di.MAX_DECISIONS_WITHOUT_A_LESSON + 1, lessons=[])
+
+    report = di.check(_PACKAGE, repo_root=root)
+
+    assert not report["passed"]
+    breach = [
+        v for v in report["violations"]
+        if v["invariant"] == "recent_decisions_record_a_lesson"
+    ]
+    assert len(breach) == 1
+    detail = breach[0]["detail"]
+    assert "3 most recently decided cards recorded no lesson" in detail
+    # It names the cards that can clear it, so the manager is not left guessing
+    # which decision the gate is about.
+    assert "D0" in detail and "aiworkhub_manager_learning_commit" in detail
+    assert _learning_row(report)["evaluated"] is True
+
+
+def test_one_lesson_for_the_newest_decision_clears_the_run(tmp_path: Path):
+    """Reachability is the whole design: a gate nobody can clear is a wedge."""
+    root = _repo(tmp_path)
+    _decided(root, 40, lessons=["D0"])
+
+    report = di.check(_PACKAGE, repo_root=root)
+
+    assert report["passed"], report["violations"]
+
+
+def test_a_skip_inside_the_limit_is_not_accused(tmp_path: Path):
+    """1 and 2 are what a deliberate skip measured like; 6 and up are not."""
+    root = _repo(tmp_path)
+    _decided(root, 6, lessons=["D2", "D3", "D4", "D5"])
+
+    report = di.check(_PACKAGE, repo_root=root)
+
+    assert report["passed"], report["violations"]
+
+
+def test_a_repository_that_has_decided_nothing_owes_nothing(tmp_path: Path):
+    """An absent denominator must never read as zero coverage."""
+    root = _repo(tmp_path)
+    _seed(root, [_card("RUNNING", status="processing", topic="coding", age_days=1)], [])
+
+    report = di.check(_PACKAGE, repo_root=root)
+
+    assert report["passed"], report["violations"]
+    assert _learning_row(report)["evaluated"] is True
+
+
+def test_a_root_with_no_canonical_store_reports_unevaluated_not_clean(tmp_path: Path):
+    """A worker's worktree holds src/ and tests/ and never owed this duty."""
+    report = di.check(_PACKAGE, repo_root=tmp_path)
+
+    assert report["passed"], report["violations"]
+    row = _learning_row(report)
+    assert row["evaluated"] is False
+    assert row["reason"].startswith("not_an_aiworkhub_repository:")
+    assert report["unevaluated"] == [
+        {"invariant": "recent_decisions_record_a_lesson", "reason": row["reason"]}
+    ]
+
+
+def test_no_repository_root_is_reported_rather_than_silently_skipped():
+    report = di.check(_PACKAGE)
+
+    row = _learning_row(report)
+    assert row["evaluated"] is False
+    assert row["reason"] == "no_repository_root_supplied"
+    assert report["repo_root"] == ""
+
+
+def test_a_store_that_cannot_be_measured_fails_closed(tmp_path: Path, monkeypatch):
+    """'Could not measure' must not be indistinguishable from 'duty discharged'."""
+    root = _repo(tmp_path)
+    _decided(root, 5, lessons=[])
+
+    from aiworkhub import learning_commit_store
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("canonical store unreadable")
+
+    monkeypatch.setattr(learning_commit_store, "coverage", _explode)
+    report = di.check(_PACKAGE, repo_root=root)
+
+    assert not report["passed"]
+    assert any(
+        v["invariant"] == "recent_decisions_record_a_lesson"
+        and "could not be evaluated" in v["detail"]
+        for v in report["violations"]
+    )
+
+
+def test_only_a_missing_manifest_makes_the_duty_not_applicable(tmp_path: Path, monkeypatch):
+    """The applicability probe must not swallow a repository that is simply broken.
+
+    "There is no repository here" and "this repository's manifest cannot be
+    read" are different facts, and only the first is not applicable. A probe
+    that catches everything turns the second into a clean report.
+    """
+    root = _repo(tmp_path)
+    _decided(root, 5, lessons=[])
+
+    from aiworkhub import task_store
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("manifest unreadable")
+
+    monkeypatch.setattr(task_store, "inspect_repository", _explode)
+    report = di.check(_PACKAGE, repo_root=root)
+
+    assert not report["passed"], "a repository that cannot be probed is not clean"
+    assert report["unevaluated"] == []
+    assert any(
+        v["invariant"] == "recent_decisions_record_a_lesson"
+        and "could not be evaluated" in v["detail"]
+        for v in report["violations"]
+    )
+
+
+def test_an_absent_denominator_wins_over_any_run(tmp_path: Path, monkeypatch):
+    """No decided cards means no duty, whatever else the measurement carries.
+
+    A repository that has decided nothing must never read as zero coverage, and
+    the rule has to be stated where the verdict is made rather than left to fall
+    out of how the run happens to be counted today.
+    """
+    root = _repo(tmp_path)
+
+    from aiworkhub import learning_commit_store
+
+    monkeypatch.setattr(
+        learning_commit_store,
+        "coverage",
+        lambda *_a, **_k: {
+            "decided_cards": 0,
+            "consecutive_recent_without_lesson": 99,
+            "recent_without_lesson": [],
+            "coverage_percent": None,
+            "window_days": 14,
+        },
+    )
+
+    assert di.recent_decisions_record_a_lesson(root) == []
+
+
+def test_the_checker_never_writes_a_lesson(tmp_path: Path):
+    """Authorship stays with the manager: a fabricated lesson is worse than none."""
+    import sqlite3
+
+    from aiworkhub import task_store
+
+    root = _repo(tmp_path)
+    _decided(root, 5, lessons=["D4"])
+    db = task_store.canonical_db_path(root)
+
+    def _rows() -> list[tuple]:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            return conn.execute(
+                "SELECT commit_id, task_id, payload_sha256 FROM learning_commits"
+                " ORDER BY commit_id"
+            ).fetchall()
+
+    before = _rows()
+    report = di.check(_PACKAGE, repo_root=root)
+
+    assert not report["passed"], "this fixture is in breach; the test is about writes"
+    assert _rows() == before

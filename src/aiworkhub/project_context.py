@@ -36,7 +36,12 @@ TOOL_CAPS: dict[str, dict[str, int]] = {
     "session_current_state": {"bytes": 6 * 1024, "rows": 12},
     "ai_memory": {"bytes": 4 * 1024, "rows": 8},
     "kb": {"bytes": 4 * 1024, "rows": 8},
+    # skill_registry already bounds a runtime packet to MAX_PACKET_BYTES (8 KiB)
+    # and MAX_PACKET_SELECTED rows; this is the section's own independent cap.
+    "skills": {"bytes": 8 * 1024, "rows": 32},
 }
+SKILL_PACKET_SCHEMA_ID = "aiworkhub.task_mcp.skill_runtime_packet.v1"
+SKILL_SELECT_LIMIT = 4
 SOURCE_GRAPH_MODES = (
     "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
     "impact", "trace", "deps", "bundle",
@@ -462,13 +467,26 @@ def _suppress_irrelevant_sections(sections: list[dict[str, Any]]) -> list[dict[s
         if (
             optimized.get("executed")
             and not relevant
-            and name in {"ai_memory", "kb"}
+            and name in {"ai_memory", "kb", "skills"}
         ):
             optimized["content"] = ""
             optimized["content_suppressed"] = True
             optimized["suppression_reason"] = "zero_hit_optional_tool"
             optimized["bytes_before_suppression"] = int(section.get("bytes") or 0)
-            optimized.update(_safe_tool_result(name, "", truncated=False))
+            # Carry the degraded reason through suppression. Emptying the
+            # content must not also erase WHY it is empty: "the tool ran and
+            # found nothing" and "the tool failed" are different facts, and a
+            # reader that cannot tell them apart reads a failure as a clean
+            # zero. The other suppression branch below applies only to a
+            # relevant, non-degraded duplicate, so it has no reason to carry.
+            optimized.update(
+                _safe_tool_result(
+                    name,
+                    "",
+                    truncated=False,
+                    degraded=str(section.get("degraded_reason") or ""),
+                )
+            )
         elif relevant and not required_source and content_sha and content_sha in seen_relevant:
             optimized["content"] = ""
             optimized["content_suppressed"] = True
@@ -739,6 +757,143 @@ def _degrade_or_raise(required: bool, reason: str) -> tuple[str, bool, str]:
     return "", False, reason
 
 
+def _template_skill_task_family(card: dict[str, Any]) -> str:
+    """Return the skill family the card's authenticated template declares.
+
+    A card created from a built-in template records ``template_provenance``
+    naming that template. The template's DECLARED work kind is a real family
+    (``analysis``, ``implementation``, ``test``, ``docs``, ``replay``,
+    ``bugfix``) that ``_canonical_work_kind`` flattens to ``generic`` on the
+    card itself, which is why reading ``work_kind`` here would match no skill.
+    Resolving it on the read side keeps card shape and create-idempotency
+    untouched, and gives every already-created template card a real family.
+    """
+    provenance = card.get("template_provenance")
+    if not isinstance(provenance, dict):
+        return ""
+    name = provenance.get("template_name")
+    if not isinstance(name, str) or not name:
+        return ""
+    from . import task_templates
+
+    spec = task_templates.TEMPLATE_SPECS.get(name)
+    if spec is None:
+        return ""
+    return task_templates.skill_task_family(spec.work_kind)
+
+
+def _production_path_scope(card: dict[str, Any]) -> str:
+    """Return the scope of a card whose write set spans production AND tests.
+
+    A card that writes ``src/aiworkhub/x.py`` and ``tests/test_x.py`` shares no
+    directory prefix at all, so the whole-write-set reduction answers "". Its
+    scope is nonetheless not ambiguous: the tests follow the code, and the code
+    is where the card is about. Measured over the 4,628 live cards, adding this
+    fallback takes the share with a single derivable scope from 5% to 30%; the
+    remaining cards genuinely span several production roots and must declare
+    ``skill_path_scope`` themselves rather than be given a wildcard.
+    """
+    from . import skill_registry, task_templates
+
+    paths = [
+        item
+        for item in (card.get("allowed_writes") or card.get("read_first") or [])
+        if isinstance(item, str)
+    ]
+    production, _tests = task_templates._partition_write_set(paths)
+    return skill_registry.common_path_scope(production)
+
+
+def _skill_selection_context(card: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the card's selection context, or ``None`` when it declares none."""
+    from . import skill_registry
+
+    resolved = dict(card)
+    if not str(resolved.get("skill_task_family") or "").strip():
+        family = _template_skill_task_family(card)
+        if family:
+            resolved["skill_task_family"] = family
+    if not str(resolved.get("skill_path_scope") or "").strip():
+        scope = skill_registry.common_path_scope(
+            resolved.get("allowed_writes") or []
+        ) or _production_path_scope(resolved)
+        if scope:
+            resolved["skill_path_scope"] = scope
+    return skill_registry.card_selection_context(resolved)
+
+
+def _skills_section(repo: Path, card: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the bounded skill runtime packet section, or ``None``.
+
+    ``None`` means the card declared no selection vocabulary, so no selection
+    ran -- the same shape as an absent ``ai_memory``/``kb`` contract. A card
+    that DID declare vocabulary always produces a section, even with zero
+    matches, so the zero-hit suppression rule can record that the surface
+    looked and found nothing instead of hiding that it ran at all.
+    """
+    from . import skill_registry
+
+    try:
+        context = _skill_selection_context(card)
+    except skill_registry.SkillRegistryError as exc:
+        # A stored card carrying a token this build no longer knows must not
+        # take the worker's whole context bundle down with it.
+        return _section(
+            name="skills",
+            content="",
+            truncated=False,
+            degraded=f"skill_vocabulary_rejected:{exc.code}",
+            hit_count=0,
+        )
+    if context is None:
+        return None
+
+    from . import skill_registry_store
+
+    try:
+        # load_registry, never list_records: it applies the demotion rule, so a
+        # record that self-certified under a weaker reading of independence is
+        # loaded as proposed and select() -- which serves ACTIVE only -- will
+        # not inject it.
+        candidates = skill_registry_store.load_registry(repo).records()
+        receipt = skill_registry.select(candidates, context, limit=SKILL_SELECT_LIMIT)
+        packet = skill_registry.build_runtime_packet(candidates, receipt)
+    except (
+        skill_registry.SkillRegistryError,
+        skill_registry_store.SkillStoreError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+    ) as exc:
+        # Named, not swallowed: the failing type reaches the worker and the
+        # metadata as degraded_reason, so a zero packet is never mistaken for
+        # "the store had nothing to say".
+        return _section(
+            name="skills",
+            content="",
+            truncated=False,
+            degraded=f"skill_selection_failed:{type(exc).__name__}",
+            hit_count=0,
+        )
+    payload = {"schema_id": SKILL_PACKET_SCHEMA_ID, **packet.as_mapping()}
+    content = (
+        ""
+        if not packet.skills
+        else json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+    return _section(
+        name="skills",
+        task_family=str(context["task_family"]),
+        stage=str(context["stage"]),
+        content=content,
+        truncated=False,
+        # The packet row count is the hit count. It is taken from the packet
+        # rather than inferred from the JSON shape, so an empty packet reads as
+        # zero hits instead of one non-empty object.
+        hit_count=len(packet.skills),
+    )
+
+
 def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextResult | None:
     """Return a compact trusted bundle, or ``None`` when no contract exists."""
 
@@ -858,6 +1013,16 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
             degraded=degraded,
             hit_count=kb_hit_count,
         ))
+
+    # Repository skill packet: the card's declared selection vocabulary, run
+    # against the ACTIVE records in the skills store. Absent vocabulary means
+    # no section at all (like an absent ai_memory/kb contract); declared
+    # vocabulary with zero matches means an executed, zero-hit section that the
+    # same suppression rule empties. Never raises: a worker's context bundle
+    # does not depend on the skills store being present or well-formed.
+    skills_section = _skills_section(authority_repo, card)
+    if skills_section is not None:
+        sections.append(skills_section)
 
     if required and not any(s["content"].strip() for s in sections):
         raise ProjectContextError("project_context_required_empty_evidence")

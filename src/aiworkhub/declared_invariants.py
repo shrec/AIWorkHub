@@ -30,9 +30,19 @@ the measurement that found it. None is a general style preference:
     ``chmod_fd`` and ``chmod_path`` decided "do POSIX mode bits apply here" by two
     different rules, and only one of them was testable.
 
-The checker reads source text and the canonical modules. It performs no writes,
-imports nothing from the repository beyond what it inspects, and reports a
-violation as a named, bounded record rather than raising.
+``recent_decisions_record_a_lesson``
+    The learning duty was named at the decision, measured in health, and enforced
+    nowhere: ``accept_review`` and ``reject_review`` returned the exact arguments
+    for the lesson they owed, and skipping it cost nothing. Measured: 21.9 percent
+    coverage, 48 lessons arriving in bursts separated by runs of 6, 14, 15 and 38
+    decisions with none. This is the one invariant about what the repository DID
+    rather than what its source says, so it needs a repository root; without one
+    it reports itself unevaluated rather than clean.
+
+The tree and runtime invariants read source text and the canonical modules; the
+repository invariants additionally read the canonical stores, read-only. The
+checker performs no writes, imports nothing from the repository beyond what it
+inspects, and reports a violation as a named, bounded record rather than raising.
 """
 
 from __future__ import annotations
@@ -281,6 +291,102 @@ def sqlite_context_managers_close(src_root: Path) -> list[Violation]:
 
 
 # --------------------------------------------------------------------------- #
+# the learning duty is discharged
+# --------------------------------------------------------------------------- #
+
+# How many decisions in a row may record no lesson before the omission is a
+# violation rather than a number.
+#
+# Derived from this repository's own record, not chosen. Reading the decided
+# cards newest first on 2026-09-07, the runs that recorded no lesson are
+# 6, 15, 1, 2, 14, 6 and 38. The two short runs are what a deliberate skip looks
+# like -- a card that taught nothing -- and every other run is six or longer,
+# which is what walking away looks like. Two is the largest limit that accuses
+# none of the observed deliberate skips, so the third consecutive omission is
+# the first one this can call a defect.
+#
+# Reachable by construction: only the head run counts, so filing one lesson for
+# one of the newest decisions resets it to zero. There is no state in which a
+# manager doing the right thing now cannot clear it -- which is the difference
+# between a duty that costs something and an acceptance gate that wedges. If a
+# repository ever reaches a state where none of the head-run cards can still be
+# committed against, raising this constant is one reviewable edit; silently
+# skipping the duty is not.
+MAX_DECISIONS_WITHOUT_A_LESSON = 2
+
+
+def recent_decisions_record_a_lesson(repo_root: Path) -> list[Violation]:
+    """A run of decisions that recorded no lesson is a defect, not a statistic.
+
+    ``accept_review`` and ``reject_review`` already hand the manager
+    ``learning_commit_owed`` -- the repo area, the evidence id in the form the
+    store accepts, the exact tool to call -- at the one moment the lesson is
+    cheap to write. Nothing followed when it was skipped, and the record shows
+    what "nothing follows" produces: 48 lessons arriving in bursts separated by
+    runs of 6, 14, 15 and 38 decisions with none, and 21.9 percent coverage that
+    moved 0.2 points across a full day of work. The duty was named, measured,
+    and enforced nowhere.
+
+    Measures the head run rather than the percentage on purpose. A percentage
+    cannot be moved by the decision in hand, so it can never say "this one";
+    the head run can, and one lesson clears it.
+
+    Reads only. It never writes and never composes a lesson: authorship is the
+    manager's judgement, and a lesson invented to clear a gate is worth less
+    than an honest gap. This makes the omission cost what every other defect in
+    this repository costs -- a red gate -- and nothing more.
+    """
+
+    # Local import: this module must stay importable on its own, and this is
+    # the one invariant that reaches a canonical store rather than source text.
+    from . import learning_commit_store
+
+    root = Path(repo_root)
+    measured = learning_commit_store.coverage(root)
+    if not int(measured["decided_cards"]):
+        # An absent denominator is not zero coverage. A repository that has
+        # decided nothing owes nothing, and a gate that fires on day one of
+        # every repository is a gate people learn to route around.
+        return []
+    streak = int(measured["consecutive_recent_without_lesson"])
+    if streak <= MAX_DECISIONS_WITHOUT_A_LESSON:
+        return []
+    clearing = measured["recent_without_lesson"][: MAX_DECISIONS_WITHOUT_A_LESSON + 1]
+    return [Violation(
+        "recent_decisions_record_a_lesson",
+        str(root),
+        f"the {streak} most recently decided cards recorded no lesson "
+        f"(limit {MAX_DECISIONS_WITHOUT_A_LESSON}; "
+        f"{measured['window_days']}-day coverage "
+        f"{measured['coverage_percent']}%). Clear it by committing the lesson "
+        f"one of these already owes, through aiworkhub_manager_learning_commit "
+        f"with the learning_commit_owed payload its decision returned: "
+        + ", ".join(clearing),
+    )]
+
+
+def _canonical_store_reason(repo_root: Path) -> str:
+    """Empty when this root owns a canonical task store, else why it does not.
+
+    A worker's validation worktree holds ``src/``, ``tests/`` and no
+    ``.aiworkhub`` at all, so "there is no repository here" is genuinely not
+    applicable and must not fail a card for a duty that root never owed. Any
+    other failure -- a root that IS an AIWorkHub repository whose store cannot
+    be read -- is deliberately not caught here, so it reaches ``check`` as an
+    unevaluable violation: "could not check" and "checked and clean" must never
+    look the same.
+    """
+
+    from . import task_store
+
+    try:
+        task_store.inspect_repository(repo_root)
+    except task_store.RepositoryStateError as exc:
+        return f"not_an_aiworkhub_repository:{type(exc).__name__}"
+    return ""
+
+
+# --------------------------------------------------------------------------- #
 # entry point
 # --------------------------------------------------------------------------- #
 
@@ -294,8 +400,18 @@ _RUNTIME_INVARIANTS: tuple[tuple[str, Callable[[], list[Violation]]], ...] = (
     ("one_policy_one_predicate", one_policy_one_predicate),
 )
 
+# Invariants about what the repository DID, not about what its source says.
+# Separate from the tree family because they need the canonical stores, which
+# the sparse worktree a worker validates in does not contain.
+_REPOSITORY_INVARIANTS: tuple[tuple[str, Callable[[Path], list[Violation]]], ...] = (
+    ("recent_decisions_record_a_lesson", recent_decisions_record_a_lesson),
+)
+
 INVARIANT_NAMES: tuple[str, ...] = tuple(
-    sorted(name for name, _ in (*_TREE_INVARIANTS, *_RUNTIME_INVARIANTS))
+    sorted(
+        name
+        for name, _ in (*_TREE_INVARIANTS, *_RUNTIME_INVARIANTS, *_REPOSITORY_INVARIANTS)
+    )
 )
 
 
@@ -313,35 +429,76 @@ def _unevaluable(name: str, root: Path, exc: Exception) -> Violation:
     return Violation(name, str(affected), detail)
 
 
-def check(src_root: Path | str) -> dict[str, Any]:
+def check(
+    src_root: Path | str, *, repo_root: Path | str | None = None
+) -> dict[str, Any]:
     """Return every declared invariant's verdict over ``src_root``.
 
     Never raises for a repository-shaped problem: an invariant that cannot be
     evaluated reports itself as a violation, because "could not check" and
     "checked and clean" must never look the same.
+
+    ``repo_root`` is the repository whose canonical stores the repository
+    invariants measure, and is separate from ``src_root`` deliberately. The
+    tree invariants read source text and run anywhere, including the sparse
+    worktree a worker validates in; a repository invariant needs a canonical
+    store that such a worktree does not contain. A repository invariant with
+    nothing to measure reports ``evaluated: false`` with the reason and is
+    listed in ``unevaluated`` -- it is never folded into the clean count.
     """
 
     root = Path(src_root)
+    repo = Path(repo_root) if repo_root is not None else None
     results: list[dict[str, Any]] = []
     violations: list[Violation] = []
+    unevaluated: list[dict[str, str]] = []
+
+    def evaluated(name: str, found: list[Violation]) -> None:
+        violations.extend(found)
+        results.append(
+            {"invariant": name, "violations": len(found), "evaluated": True}
+        )
+
     for name, tree_check in _TREE_INVARIANTS:
         try:
             found = tree_check(root)
         except Exception as exc:  # noqa: BLE001 - unevaluable is a violation
             found = [_unevaluable(name, root, exc)]
-        violations.extend(found)
-        results.append({"invariant": name, "violations": len(found)})
+        evaluated(name, found)
     for name, runtime_check in _RUNTIME_INVARIANTS:
         try:
             found = runtime_check()
         except Exception as exc:  # noqa: BLE001 - unevaluable is a violation
             found = [_unevaluable(name, root, exc)]
-        violations.extend(found)
-        results.append({"invariant": name, "violations": len(found)})
+        evaluated(name, found)
+    for name, repository_check in _REPOSITORY_INVARIANTS:
+        try:
+            reason = (
+                "no_repository_root_supplied"
+                if repo is None
+                else _canonical_store_reason(repo)
+            )
+            if reason:
+                results.append(
+                    {
+                        "invariant": name,
+                        "violations": 0,
+                        "evaluated": False,
+                        "reason": reason,
+                    }
+                )
+                unevaluated.append({"invariant": name, "reason": reason})
+                continue
+            found = repository_check(repo)
+        except Exception as exc:  # noqa: BLE001 - unevaluable is a violation
+            found = [_unevaluable(name, repo if repo is not None else root, exc)]
+        evaluated(name, found)
     return {
         "schema_id": SCHEMA_ID,
         "src_root": str(root),
+        "repo_root": str(repo) if repo is not None else "",
         "invariants": results,
+        "unevaluated": unevaluated,
         "violation_count": len(violations),
         "violations": [v.to_dict() for v in violations[:MAX_VIOLATIONS_PER_INVARIANT]],
         "passed": not violations,
@@ -358,8 +515,16 @@ def main(argv: Iterable[str] | None = None) -> int:
         "--src", default=str(Path(__file__).resolve().parent),
         help="package root to check (defaults to this package)",
     )
+    parser.add_argument(
+        "--repo", default=str(Path.cwd()),
+        help=(
+            "repository whose canonical stores the repository invariants "
+            "measure (defaults to the working directory; a root with no "
+            "AIWorkHub manifest reports them not evaluated, with the reason)"
+        ),
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
-    report = check(Path(args.src))
+    report = check(Path(args.src), repo_root=Path(args.repo))
     json.dump(report, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
     return 0 if report["passed"] else 1

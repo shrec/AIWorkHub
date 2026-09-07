@@ -1490,14 +1490,104 @@ def advisory_lock_backend() -> str:
     return "flock"
 
 
-def open_lock_file(path: Path) -> int:
-    """Open (creating if needed) a lock file and return its descriptor.
+# Directory-authority vocabulary. Naming what the host can actually provide is
+# the same contract :func:`advisory_lock_backend` states one function above:
+# ``"none"`` means the host offers no such primitive, so a caller records the
+# degradation instead of assuming a guarantee it does not hold.
+DIRECTORY_DESCRIPTOR_BACKEND_POSIX = "posix_directory_descriptor"
+DIRECTORY_DESCRIPTOR_BACKEND_NONE = "none"
 
-    The flag set is platform knowledge and belongs here, not at a call site.
+
+def directory_descriptor_backend(platform_name: str | None = None) -> str:
+    """Name the primitive this host offers for pinning an open directory.
+
+    Windows is ``"none"``, and every part of that is load-bearing: it defines
+    neither ``O_DIRECTORY`` nor ``O_NOFOLLOW``, ``os.open`` on a directory
+    raises ``PermissionError`` there, and ``os.supports_dir_fd`` is empty so a
+    ``dir_fd=`` open was never reachable either.  A caller that assembles its
+    own mask with ``hasattr(os, "O_DIRECTORY")`` therefore does not degrade
+    gracefully -- it degrades to a bare ``O_RDONLY`` open of a directory, which
+    fails on EVERY Windows attempt and can never succeed.
+
+    ``platform_name`` selects the branch explicitly, so the Windows answer is
+    observable from a POSIX host instead of being asserted untested.
+    """
+
+    if is_windows(platform_name):
+        return DIRECTORY_DESCRIPTOR_BACKEND_NONE
+    return DIRECTORY_DESCRIPTOR_BACKEND_POSIX
+
+
+def nofollow_open_flag() -> int:
+    """``O_NOFOLLOW`` where the host defines it, else ``0``.
+
+    Read at call time and never captured at import, so a caller that removes
+    the constant to exercise the degraded branch is observed by every reader.
+    """
+
+    return int(getattr(os, "O_NOFOLLOW", 0))
+
+
+def directory_open_flags() -> int:
+    """The ``O_`` mask for opening a directory without following a symlink."""
+
+    return int(os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow_open_flag())
+
+
+def lock_file_open_flags(*, nofollow: bool = False) -> int:
+    """The ``O_`` mask for opening a lock file read/write.
+
     ``O_CLOEXEC`` is POSIX-only and ``O_BINARY`` is Windows-only; each resolves
     to 0 where the platform does not define it, and 0 is a no-op inside the
     mask, so one call serves every platform. CI caught the inline version of
-    this on Windows: ``os.O_CLOEXEC`` simply does not exist there.
+    this on Windows: ``os.O_CLOEXEC`` simply does not exist there.  ``O_BINARY``
+    matters as much: without it Windows opens the descriptor in text mode and
+    rewrites ``\\n`` on the way out, so a lock file's own bytes differ by host.
+
+    ``nofollow`` adds ``O_NOFOLLOW`` for a caller that must refuse a symlinked
+    lock path outright rather than detect the substitution afterwards.
+    """
+
+    return int(
+        os.O_CREAT
+        | os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+        | (nofollow_open_flag() if nofollow else 0)
+    )
+
+
+def open_directory_descriptor(
+    path: Path | str, platform_name: str | None = None
+) -> int | None:
+    """Open a pinned, non-following descriptor on one existing directory.
+
+    Returns ``None`` -- never a descriptor built from a silently degraded flag
+    mask -- where :func:`directory_descriptor_backend` reports ``"none"``, so
+    the caller chooses an honest weaker check instead of issuing an open that
+    cannot succeed on that host.
+    """
+
+    if (
+        directory_descriptor_backend(platform_name)
+        == DIRECTORY_DESCRIPTOR_BACKEND_NONE
+    ):
+        return None
+    return os.open(str(path), directory_open_flags())
+
+
+def close_directory_descriptor(descriptor: int | None) -> None:
+    """Close what :func:`open_directory_descriptor` returned, ``None`` included."""
+
+    if descriptor is not None:
+        os.close(descriptor)
+
+
+def open_lock_file(path: Path) -> int:
+    """Open (creating if needed) a lock file and return its descriptor.
+
+    The flag set is platform knowledge and belongs here, not at a call site;
+    :func:`lock_file_open_flags` is the one place that mask is written.
 
     The descriptor is opened for WRITING because :func:`lock_fd` needs a
     writable fd on Windows -- ``msvcrt.locking`` locks a byte range that has to
@@ -1505,13 +1595,7 @@ def open_lock_file(path: Path) -> int:
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    flags = (
-        os.O_CREAT
-        | os.O_RDWR
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_BINARY", 0)
-    )
-    return os.open(str(path), flags, 0o600)
+    return os.open(str(path), lock_file_open_flags(), 0o600)
 
 
 def _prepare_windows_lock_byte(fd: int) -> None:

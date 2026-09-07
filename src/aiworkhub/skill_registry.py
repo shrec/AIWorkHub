@@ -902,6 +902,287 @@ _SELECT_REASON_KINDS = {
     "applicability": frozenset({"exact", "wildcard", "unconstrained"}),
 }
 
+# ---------------------------------------------------------------------------
+# Controlled selection vocabulary
+# ---------------------------------------------------------------------------
+#
+# ``select`` matches exactly after normalization, so free text can never be the
+# matching surface: a natural-language trigger sentence is unreachable by
+# construction. These four closed sets are the ONE vocabulary shared by a task
+# card and a skill record, and every token below is transcribed from a set this
+# repository already names -- none is invented for the matcher:
+#
+# * ``SKILL_TASK_FAMILIES`` -- the real work families. Five are
+#   ``quality_evidence.WORK_KINDS`` minus ``generic``; five are the families the
+#   ``task_templates`` specs actually DECLARE (``analysis``, ``implementation``,
+#   ``test``, ``docs``, ``replay``) and that ``_canonical_work_kind`` then
+#   flattens to ``generic`` because ``work_kind`` doubles as the
+#   behavioral-contract key. ``generic`` is deliberately absent: it is the
+#   absence of a family, and an absent family selects nothing.
+# * ``SKILL_STAGES`` -- the worker workflow stages this repository already
+#   enforces on every Source Graph call, minus ``unspecified``, which names the
+#   absence of a stage rather than a stage. This is the skill-stage vocabulary,
+#   never the card ``status``.
+# * ``SKILL_TRIGGERS`` -- observable conditions. Ten are transcribed from
+#   ``quality_evidence._RISK_SIGNAL_FLOORS``; its ``quality_policy_self_weakened``
+#   is a candidate-diff observation that cannot be true when a card is created,
+#   so it is not declarable here. Five are the defect shapes the records already
+#   in the store carry as free-text trigger sentences.
+# * ``SKILL_APPLICABILITY`` -- surface kinds. Four are the surfaces the records
+#   already in the store carry as free-text applicability sentences; six are the
+#   surface families ``quality_evidence.derive_risk_signals`` already recognises
+#   by path marker.
+#
+# ``tests/test_skill_selection_vocabulary.py`` locks the transcribed subsets to
+# their upstream definitions, so a token added there and not here is a test
+# failure rather than a silent selection miss.
+
+SKILL_TASK_FAMILIES: frozenset[str] = frozenset(
+    {
+        "analysis",
+        "bugfix",
+        "data_ml",
+        "docs",
+        "implementation",
+        "performance",
+        "refactor",
+        "replay",
+        "security",
+        "test",
+    }
+)
+SKILL_STAGES: frozenset[str] = frozenset(
+    {
+        "orientation",
+        "implementation",
+        "validation",
+        "review",
+        "rework",
+    }
+)
+# Transcribed from quality_evidence._RISK_SIGNAL_FLOORS.
+SKILL_RISK_SIGNAL_TRIGGERS: frozenset[str] = frozenset(
+    {
+        "authority_boundary",
+        "code_change",
+        "combined_change",
+        "concurrency",
+        "destructive_change",
+        "missing_validation",
+        "public_api",
+        "release",
+        "schema_migration",
+        "security_sensitive",
+    }
+)
+# One token per free-text trigger sentence carried by the stored records.
+SKILL_DEFECT_SHAPE_TRIGGERS: frozenset[str] = frozenset(
+    {
+        "clean_verdict_without_input_check",
+        "silently_bounded_population",
+        "single_bucket_aggregate",
+        "swallowed_exception_default",
+        "unknown_or_empty_result",
+    }
+)
+SKILL_TRIGGERS: frozenset[str] = SKILL_RISK_SIGNAL_TRIGGERS | SKILL_DEFECT_SHAPE_TRIGGERS
+# One token per free-text applicability sentence carried by the stored records.
+SKILL_STORED_APPLICABILITY: frozenset[str] = frozenset(
+    {
+        "aggregation_reader",
+        "observability_surface",
+        "quality_gate",
+        "readiness_preflight",
+    }
+)
+# One token per surface family derive_risk_signals recognises by path marker.
+SKILL_PATH_MARKER_APPLICABILITY: frozenset[str] = frozenset(
+    {
+        "authority_boundary_surface",
+        "concurrency_surface",
+        "public_api_surface",
+        "release_surface",
+        "security_surface",
+        "storage_schema_surface",
+    }
+)
+SKILL_APPLICABILITY: frozenset[str] = (
+    SKILL_STORED_APPLICABILITY | SKILL_PATH_MARKER_APPLICABILITY
+)
+
+SELECTION_VOCABULARIES: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "task_family": SKILL_TASK_FAMILIES,
+        "stage": SKILL_STAGES,
+        "triggers": SKILL_TRIGGERS,
+        "applicability": SKILL_APPLICABILITY,
+    }
+)
+MAX_DECLARED_VOCABULARY_TOKENS = 16
+
+
+def vocabulary_for(field: str) -> frozenset[str]:
+    """Return the closed token set for one selection field."""
+    try:
+        return SELECTION_VOCABULARIES[field]
+    except KeyError:
+        _fail("skill_registry.unknown_key", f"no selection vocabulary for {field!r}")
+
+
+def validate_vocabulary_token(value: Any, field: str) -> str:
+    """Return one canonical token, or fail closed.
+
+    An unknown token is a refusal and never a silent miss: a card that misspells
+    a trigger must be told so at creation, not quietly matched against nothing.
+    The explicit wildcard is refused here as well -- ``*`` on the dimensions that
+    decide relevance is inject-everything, not selection.
+    """
+    if isinstance(value, bool) or not isinstance(value, str):
+        _fail("skill_registry.invalid_type", f"{field} token must be a string")
+    token = value.strip().lower()
+    if not token:
+        _fail("skill_registry.invalid_value", f"{field} token must not be blank")
+    if token == SELECT_WILDCARD:
+        _fail(
+            "skill_registry.wildcard_not_declarable",
+            f"{field}: '*' is not a declarable token; it disables selection",
+        )
+    if token not in vocabulary_for(field):
+        _fail(
+            "skill_registry.unknown_vocabulary_token",
+            f"{field}: unknown token {token!r}",
+        )
+    return token
+
+
+def validate_vocabulary_tokens(values: Any, field: str) -> tuple[str, ...]:
+    """Return canonical, de-duplicated, order-stable tokens for a list field."""
+    if values is None:
+        return ()
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
+        _fail("skill_registry.invalid_type", f"{field} must be a list/tuple of strings")
+    if len(values) > MAX_DECLARED_VOCABULARY_TOKENS:
+        _fail(
+            "skill_registry.packet_limit",
+            f"{field}: at most {MAX_DECLARED_VOCABULARY_TOKENS} tokens",
+        )
+    seen: dict[str, None] = {}
+    for item in values:
+        seen[validate_vocabulary_token(item, field)] = None
+    return tuple(seen)
+
+
+def validate_path_scope(value: Any) -> str:
+    """Return one safe, relative path scope for a selection context, or fail."""
+    return _validate_path_or_symbol(value)
+
+
+def common_path_scope(paths: Any) -> str:
+    """Return the longest shared ``/``-separated directory prefix of ``paths``.
+
+    A selection context carries ONE path scalar while a card carries a write
+    set, and the only truthful scalar reduction of a set for a prefix matcher is
+    the directory prefix they all share. A single path reduces to itself. Paths
+    that share no directory (``src/...`` next to ``tests/...``) reduce to the
+    empty string, which means "this card has no single scope"; the caller then
+    treats the dimension as undeclared instead of inventing one.
+    """
+    if isinstance(paths, (str, bytes)) or not isinstance(paths, (list, tuple)):
+        return ""
+    cleaned: list[str] = []
+    for item in paths:
+        if isinstance(item, bool) or not isinstance(item, str):
+            continue
+        text = item.strip().replace("\\", "/").strip("/")
+        if text:
+            cleaned.append(text)
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    split = [entry.split("/") for entry in cleaned]
+    shared: list[str] = []
+    for parts in zip(*split):
+        first = parts[0]
+        if any(part != first for part in parts):
+            break
+        shared.append(first)
+    # The last shared component of a single full path is a file name, not a
+    # directory; two paths only share a directory prefix, so this is already
+    # a directory whenever more than one distinct path took part.
+    if len(set(cleaned)) == 1:
+        return cleaned[0]
+    return "/".join(shared)
+
+
+def build_selection_context(
+    *,
+    task_family: Any,
+    stage: Any,
+    triggers: Any,
+    applicability: Any,
+    path_or_symbol: Any,
+    risk: Any,
+) -> dict[str, Any] | None:
+    """Return an exact selection context, or ``None`` when nothing is declared.
+
+    Every dimension must be present and drawn from the closed vocabulary. A card
+    that declares nothing yields ``None`` and therefore selects nothing; the
+    wildcard is never emitted, so matching is never made unconditional. An
+    unknown token raises :class:`SkillRegistryError` -- the declaration is wrong
+    and the author has to be told.
+    """
+    declared_family = "" if task_family is None else str(task_family).strip()
+    declared_stage = "" if stage is None else str(stage).strip()
+    declared_path = "" if path_or_symbol is None else str(path_or_symbol).strip()
+    declared_risk = "" if risk is None else str(risk).strip()
+    if not declared_family or not declared_stage:
+        return None
+    if not declared_path or not declared_risk:
+        return None
+    trigger_tokens = validate_vocabulary_tokens(triggers, "triggers")
+    applicability_tokens = validate_vocabulary_tokens(applicability, "applicability")
+    if not trigger_tokens or not applicability_tokens:
+        # Triggers and applicability are the two dimensions that decide
+        # relevance. With neither declared there is nothing to be relevant to.
+        return None
+    return {
+        "task_family": validate_vocabulary_token(declared_family, "task_family"),
+        "path_or_symbol": _validate_path_or_symbol(declared_path),
+        "risk": _coerce_enum(
+            declared_risk.lower(), RiskLevel, "risk", "skill_registry.invalid_risk"
+        ),
+        "stage": validate_vocabulary_token(declared_stage, "stage"),
+        "triggers": trigger_tokens,
+        "applicability": applicability_tokens,
+    }
+
+
+def card_selection_context(card: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Build a selection context from one task card, or ``None``.
+
+    The card is a plain mapping, so this stays inside the module's purity
+    invariant: no filesystem, no store, no task-system import. An existing card
+    that carries none of these fields returns ``None`` -- absent vocabulary
+    means "selects no skill", never an error.
+    """
+    if not isinstance(card, Mapping):
+        return None
+    scope = card.get("skill_path_scope")
+    if not isinstance(scope, str) or not scope.strip():
+        writes = card.get("allowed_writes") or []
+        scope = common_path_scope(writes) or common_path_scope(
+            card.get("read_first") or []
+        )
+    return build_selection_context(
+        task_family=card.get("skill_task_family"),
+        stage=card.get("skill_stage"),
+        triggers=card.get("skill_triggers"),
+        applicability=card.get("skill_applicability"),
+        path_or_symbol=scope,
+        risk=card.get("risk_tier"),
+    )
+
 RUNTIME_PACKET_VERSION = "1.0.0"
 MAX_PACKET_SELECTED = 32
 MAX_PACKET_LIST_ITEMS = 16

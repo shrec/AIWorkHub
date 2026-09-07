@@ -16,7 +16,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
 
-from . import roadmap_store, task_store
+from . import roadmap_store, skill_registry_store, task_store, tool_recipes_store
 from .tool_recovery import unknown_tool_message
 
 _MCP_SDK_AVAILABLE = True
@@ -473,6 +473,7 @@ from . import launch_queue_persist
 from . import known_bug_scanner
 from . import learning_commit_store
 from . import manager_ai_tools
+from . import manager_recipe_tools
 from . import manager_skill_tools
 from . import process_launcher
 from . import review_summarizer
@@ -1027,6 +1028,63 @@ def aiworkhub_manager_skill_activate(identity: str, version: str) -> dict[str, A
     """
 
     return manager_skill_tools.activate(identity=identity, version=version)
+
+
+@mcp.tool()
+def aiworkhub_manager_recipe_register(manifest: dict[str, Any]) -> dict[str, Any]:
+    """MANAGER WRITE: register and persist one caller-defined tool recipe.
+
+    ``manifest`` is the caller's complete recipe payload -- the exact shape
+    ``aiworkhub_manager_recipe_show`` returns -- and no field of it is inferred
+    or generated. An invalid manifest is refused with the tool_recipes module's
+    own stable ``reason_code`` before any write, and a ``(id, version)`` that is
+    already stored is refused without touching the stored row: a recipe version
+    is immutable.
+
+    This registers a DESCRIPTION of an invocation. It never runs one.
+    """
+
+    return manager_recipe_tools.register(manifest=manifest)
+
+
+@mcp.tool()
+def aiworkhub_manager_recipe_seed_canonical() -> dict[str, Any]:
+    """MANAGER WRITE: install the catalogue of this repository's own invocations.
+
+    Each entry of ``manager_recipe_tools.CANONICAL_RECIPES`` describes an argv
+    vector AIWorkHub genuinely builds (the card validation commands, the worker
+    worktree provisioning sequence, the finalization Git probes), naming its
+    call site in its purpose. Idempotent: an entry already stored is reported as
+    ``already_registered`` and its row is left untouched.
+    """
+
+    return manager_recipe_tools.seed_canonical()
+
+
+@mcp.tool()
+def aiworkhub_manager_recipe_list(limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    """MANAGER READ: bounded identity/contract listing of persisted recipes.
+
+    Returns each manifest's identity, digest, purpose, risk, capabilities and
+    parameter signature -- never its argv template. An empty store is a
+    legitimate repository state and returns ``registry_count`` zero.
+    """
+
+    return manager_recipe_tools.list_registered(limit=limit, offset=offset)
+
+
+@mcp.tool()
+def aiworkhub_manager_recipe_show(
+    recipe_id: str, version: str | None = None
+) -> dict[str, Any]:
+    """MANAGER READ: one persisted recipe in its exact canonical manifest form.
+
+    With ``version`` omitted the highest stored version wins, ordered by the
+    registry's own version key. The returned ``manifest`` is exactly the payload
+    the recipe digest hashes, so the reported digest is independently checkable.
+    """
+
+    return manager_recipe_tools.show(recipe_id=recipe_id, version=version)
 
 
 @mcp.tool()
@@ -3123,6 +3181,22 @@ def main() -> None:
         # Roadmap is additive; keep diagnostics/NeedFix/task control alive and
         # let the bounded Roadmap tools report the concrete storage failure.
         pass
+    # The two coding-foundation stores had an initializer and no caller: nothing
+    # in any bootstrap path called ``skill_registry_store.initialize_repository``
+    # or ``tool_recipes_store.initialize_repository``, so neither database
+    # existed until something happened to write to it. A dashboard read then
+    # could not distinguish "this repository has registered nothing" from "this
+    # repository was never provisioned for skills/recipes at all". Both
+    # initializers are additive, idempotent and schema-only -- the same shape
+    # and the same startup site as the Roadmap call directly above.
+    for _foundation_store in (skill_registry_store, tool_recipes_store):
+        try:
+            _foundation_store.initialize_repository(root)
+        except Exception:
+            # Schema provisioning is additive; a store that cannot be opened
+            # must not take MCP down. Its own bounded tools report the concrete
+            # failure when they are called.
+            pass
     # Every independently launched manager MCP child owns its repository's
     # in-process Source Graph daemon.  Dashboard activation already calls the
     # public ensure tool, but Codex/Claude/Copilot may start this stdio server

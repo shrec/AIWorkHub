@@ -350,6 +350,12 @@ def _summary(commit_id: str, request_id: str, commit: LearningCommit) -> dict[st
 # rather than current practice.
 COVERAGE_WINDOW_DAYS = 14
 
+# How many of the newest decisions the head-run scan reads. The run this bounds
+# is only ever compared against a small threshold, so the bound cannot change a
+# verdict; it exists so a repository with a long uncommitted history reads a
+# bounded number of rows rather than the whole window.
+RECENT_DECISION_SCAN_LIMIT = 200
+
 
 def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> dict[str, Any]:
     """Measure how much of what was decided recently produced a lesson.
@@ -367,6 +373,15 @@ def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> di
     mechanism, not a decision about code, and a lesson drawn from one would be
     a lesson about reviewing. Left in, they dominated the denominator -- every
     one of the five most recent uncommitted cards was a reviewer child.
+
+    Two numbers, because they answer different questions.
+    ``coverage_percent`` says what the practice has been; it moves by about a
+    point per lesson and no single decision can be held to it.
+    ``consecutive_recent_without_lesson`` says whether the practice is running
+    right now, counts only the newest decisions, and is reset to zero by filing
+    one lesson for the decision in hand. It is the one an invariant can hold a
+    manager to. ``None`` for ``coverage_percent`` means no decided cards in the
+    window -- an absent denominator, never zero coverage.
     """
 
     _readiness, db_path = task_store._require_ready(root)
@@ -405,6 +420,31 @@ def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> di
             "ORDER BY t.updated_at DESC LIMIT 5",
             (cutoff,),
         ).fetchall()
+        # The run of most-recently-decided cards that recorded no lesson.
+        #
+        # An aggregate percentage cannot be moved by the decision in hand: one
+        # lesson shifts it by a point, so it can never say "this decision". The
+        # head run can. Measured on this repository, newest first, the runs of
+        # decided-without-lesson are 6, 15, 1, 2, 14, 6, 38 -- lessons arrive in
+        # bursts and then stop, which is what a number nobody is answerable for
+        # looks like.
+        if has_store:
+            head = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM learning_commits l "
+                "WHERE l.task_id = t.task_id) AS has_lesson FROM tasks t "
+                "WHERE t.updated_at >= ? "
+                "AND t.topic <> 'quality_review' "
+                "AND (t.status='finished' OR t.status LIKE 'blocked%') "
+                "ORDER BY t.updated_at DESC LIMIT ?",
+                (cutoff, RECENT_DECISION_SCAN_LIMIT),
+            ).fetchall()
+            streak = 0
+            for row in head:
+                if row["has_lesson"]:
+                    break
+                streak += 1
+        else:
+            streak = min(int(decided), RECENT_DECISION_SCAN_LIMIT)
     decided = int(decided)
     with_lesson = int(with_lesson)
     return {
@@ -417,6 +457,12 @@ def coverage(root: str | Path, *, window_days: int = COVERAGE_WINDOW_DAYS) -> di
             round(with_lesson / decided * 100.0, 1) if decided else None
         ),
         "recent_without_lesson": [str(row["task_id"]) for row in missing],
+        "consecutive_recent_without_lesson": streak,
+        # A streak reported at the scan limit is a floor, not a total. Saying so
+        # keeps a bound from reading as a measurement.
+        "consecutive_recent_without_lesson_capped": (
+            streak >= RECENT_DECISION_SCAN_LIMIT
+        ),
     }
 
 

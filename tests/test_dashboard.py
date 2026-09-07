@@ -3551,3 +3551,198 @@ def test_work_card_decision_counts_never_write_to_the_canonical_store(tmp_path: 
             conn.execute("DELETE FROM task_events")
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# history_series: the canonical-store history a charts page renders.
+#
+# ``kpi_analytics`` is computed over the LIVE PROCESS REPORT -- its own window
+# reports ``observed_runs: 37`` and ``truncated: true`` -- while the canonical
+# store holds 6,232 terminal outcomes across 43 distinct days. Without this
+# key a charts page draws 37 runs instead of 44 days.
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_ships_a_history_series_key(tmp_path: Path):
+    """The new top-level key is present and measured from the store."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_store(
+        repo,
+        [
+            ("TASK_WORK", "task_mcp", [("accept_review", "{}")]),
+            ("TASK_REVIEWER", "quality_review", [("accept_review", "{}")]),
+        ],
+    )
+    provider = dashboard.DashboardProvider(repo_root=repo)
+
+    snapshot = dashboard.build_snapshot(provider)
+
+    history = snapshot["history_series"]
+    assert history["measured"] is True
+    assert history["schema_id"] == "aiworkhub.dashboard.history_series.v1"
+    # The reviewer child is separated here exactly as in work_card_outcomes.
+    totals = history["daily_decisions"]["totals"]
+    assert totals["work_card"]["accepted"] == 1
+    assert totals["reviewer_child"]["accepted"] == 1
+
+
+def test_snapshot_history_series_does_not_change_existing_key_shapes(tmp_path: Path):
+    """The VS Code webview renders the existing keys; they must not move."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_store(repo, [("TASK_WORK", "task_mcp", [("accept_review", "{}")])])
+    provider = dashboard.DashboardProvider(repo_root=repo)
+
+    snapshot = dashboard.build_snapshot(provider)
+
+    # Every key the extension already consumes is still present, and the two
+    # decision series that existed before keep their exact shapes.
+    for key in (
+        "status_counts",
+        "outcome_counts",
+        "work_card_outcomes",
+        "kpi_analytics",
+        "cost_usage",
+        "tasks",
+        "row_counts",
+    ):
+        assert key in snapshot, key
+    assert set(snapshot["outcome_counts"]) == {
+        "accepted",
+        "rejected",
+        "archived",
+        "superseded",
+        "finished",
+    }
+    assert snapshot["work_card_outcomes"]["schema_id"] == (
+        "aiworkhub.dashboard.work_card_outcomes.v1"
+    )
+
+
+def test_snapshot_history_series_is_unmeasured_when_the_provider_cannot_supply_it():
+    """FakeProvider has no ``get_history_series``; that is unknown, not empty."""
+    snapshot = dashboard.build_snapshot(FakeProvider())
+
+    history = snapshot["history_series"]
+    assert history["measured"] is False
+    assert history["reason"] == "provider_unavailable"
+    assert history["absent_metrics_are_unknown_not_zero"] is True
+    # An empty history would read as "the system did no work".
+    assert history["window"]["observed_days"] is None
+
+
+def test_snapshot_history_series_is_unmeasured_when_storage_is_not_ready():
+    snapshot = dashboard.build_snapshot(_NotReadyProvider())
+
+    history = snapshot["history_series"]
+    assert history["measured"] is False
+    assert history["reason"] == "storage_not_ready"
+    assert history["daily_outcomes"]["measured"] is False
+
+
+def test_snapshot_history_series_rejects_a_provider_reported_unmeasured_payload():
+    """A provider that answers ``measured: False`` is not rendered as data."""
+
+    class _UnmeasuredHistoryProvider(FakeProvider):
+        def get_history_series(self):
+            return {"measured": False, "reason": "store_unreadable:OperationalError"}
+
+    snapshot = dashboard.build_snapshot(_UnmeasuredHistoryProvider())
+
+    assert snapshot["history_series"]["measured"] is False
+    assert snapshot["history_series"]["reason"] == "store_unreadable:OperationalError"
+
+
+def test_provider_history_series_never_counts_a_reviewer_child_as_work(tmp_path: Path):
+    """The exclusion that cost a full engineering day, asserted at the provider.
+
+    529 of 870 lifetime accepts were reviewer children. Summing them into the
+    work numerator manufactured an acceptance collapse that never happened.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_store(
+        repo,
+        [
+            ("TASK_WORK_OK", "task_mcp", [("accept_review", "{}")]),
+            ("TASK_WORK_NO", "task_mcp", [("reject_review", "{}")]),
+            ("TASK_REVIEWER_A", "quality_review", [("accept_review", "{}")]),
+            ("TASK_REVIEWER_B", "quality_review", [("accept_review", "{}")]),
+        ],
+    )
+
+    history = dashboard.DashboardProvider(repo_root=repo).get_history_series()
+
+    totals = history["daily_decisions"]["totals"]
+    assert totals["work_card"] == {
+        "accepted": 1,
+        "rejected": 1,
+        "decided": 2,
+        "acceptance_rate": 0.5,
+    }
+    assert totals["reviewer_child"]["accepted"] == 2
+    # The mixed 3/4 = 75% figure appears in no work-card series.
+    assert totals["work_card"]["accepted"] != 3
+    assert totals["work_card"]["acceptance_rate"] != 0.75
+    # ... and every other work-card series excludes them too.
+    work_decided = sum(
+        row["decided"] for row in history["model_outcomes"]["work_card"]["runners"]
+    )
+    assert work_decided == 2
+    assert history["retry_economics"]["rejection_depth"]["by_population"][
+        "reviewer_child"
+    ]["0"]["cards"] == 2
+
+
+def test_provider_history_series_reaches_more_history_than_kpi_analytics(tmp_path: Path):
+    """The gap this key closes, asserted directly.
+
+    ``kpi_analytics`` is bounded to the live process report; the history
+    series reads the canonical store, so it sees days the process report
+    never held.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        for index in range(12):
+            day = f"2026-08-{index + 1:02d}"
+            created = f"{day}T00:00:00+00:00"
+            conn.execute(
+                "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+                "priority, objective, card_json, created_at, updated_at) "
+                "VALUES (?, 'codex_worker', 'task_mcp', 'finished', 'done', '', "
+                "'', '{}', ?, ?)",
+                (f"T{index}", created, created),
+            )
+            conn.execute(
+                "INSERT INTO task_events(task_id, event, runner, payload_json, "
+                "created_at) VALUES (?, 'terminal_review', 'codex', ?, ?)",
+                (f"T{index}", '{"substatus": "review_ready"}', created),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    history = dashboard.DashboardProvider(repo_root=repo).get_history_series()
+
+    assert history["window"]["observed_days"] == 12
+    assert history["daily_outcomes"]["day_count"] == 12
+    assert history["terminal_composition"]["events"] == 12
+    assert history["terminal_composition"]["baseline"]["events"] == 12
+
+
+def test_provider_history_series_never_writes_to_the_canonical_store(tmp_path: Path):
+    """Read-only at the engine level, not only by convention."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_store(repo, [("TASK_WORK", "task_mcp", [("accept_review", "{}")])])
+    db_path = task_store.canonical_db_path(repo)
+    before = Path(db_path).read_bytes()
+
+    dashboard.DashboardProvider(repo_root=repo).get_history_series()
+
+    assert Path(db_path).read_bytes() == before

@@ -302,6 +302,35 @@ function numberValue(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+// "We did not measure this" is not "we measured zero", and the panel must not
+// flatten the two. The payload already keeps them apart -- a metric arrives as
+// a number, or as one of these sentinels, or not at all -- and an operator who
+// reads "we never sampled the callback backlog" as "the backlog is 0" has been
+// told the opposite of the truth. numberValue() coerces every one of those to
+// 0, so anything that could be absent goes through isMeasured() first.
+const NO_MEASUREMENT_STATES = new Set([
+  "unknown",
+  "no_sample",
+  "not_available",
+  "unavailable",
+  "not_measured",
+  "not_applicable",
+]);
+
+// A word, not a digit and not a bare dash: in a column of figures a dash still
+// scans as a value, and this must never be mistaken for one.
+const NO_MEASUREMENT_LABEL = "not measured";
+
+function isMeasured(value) {
+  if (value === null || value === undefined || value === "") return false;
+  if (typeof value === "string" && NO_MEASUREMENT_STATES.has(value.trim().toLowerCase())) return false;
+  return Number.isFinite(Number(value));
+}
+
+function measuredCount(value) {
+  return isMeasured(value) ? formatCount(value) : NO_MEASUREMENT_LABEL;
+}
+
 function formatCount(value) {
   return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(numberValue(value));
 }
@@ -1208,20 +1237,22 @@ function renderToolUse(snapshot) {
 }
 
 function kpiPercent(value) {
-  return value === null || value === undefined || !Number.isFinite(Number(value))
-    ? "—"
-    : `${Number(value).toFixed(1)}%`;
+  return isMeasured(value) ? `${Number(value).toFixed(1)}%` : NO_MEASUREMENT_LABEL;
 }
 
-function kpiBarRow(label, value, maximum, tone = "neutral", detail = "") {
+function kpiBarRow(label, value, maximum, tone = "neutral", detail = "", unit = "") {
   const safeValue = Math.max(0, numberValue(value));
   const safeMaximum = Math.max(0, numberValue(maximum));
   const row = createElement("div", "kpi-bar-row");
   const heading = createElement("div", "kpi-bar-heading");
-  heading.append(
-    createElement("span", "kpi-bar-label", label),
-    createElement("strong", "kpi-bar-value", detail || formatCount(safeValue)),
-  );
+  // The value carries the weight; whatever qualifies it sits beside it,
+  // smaller and lighter, as its own element. Joining the two with a middle dot
+  // made them look like one string and gave the qualifier equal billing.
+  const figure = createElement("strong", "kpi-bar-value", detail || formatCount(safeValue));
+  if (unit) {
+    figure.append(createElement("span", "kpi-bar-unit", unit));
+  }
+  heading.append(createElement("span", "kpi-bar-label", label), figure);
   const track = createElement("div", "kpi-bar-track");
   const fill = createElement("span", `kpi-bar-fill ${tone}`);
   fill.style.width = `${safeMaximum ? Math.max(safeValue ? 2 : 0, Math.round((safeValue / safeMaximum) * 100)) : 0}%`;
@@ -1263,14 +1294,14 @@ function renderKpis(snapshot) {
     ? [
       "Delivery overhead",
       kpiPercent(headline.context_expansion_rate),
-      `${formatCount(headline.estimated_context_bytes_added)} estimated bytes added`,
+      `${measuredCount(headline.estimated_context_bytes_added)} estimated bytes added`,
       "bad",
     ]
     : contextDirection === "compressed"
       ? [
         "Delivery reduction",
         kpiPercent(headline.context_compression_rate),
-        `${formatCount(headline.estimated_context_bytes_avoided)} estimated bytes avoided`,
+        `${measuredCount(headline.estimated_context_bytes_avoided)} estimated bytes avoided`,
         "accent",
       ]
       : contextDirection === "unchanged"
@@ -1309,17 +1340,17 @@ function renderKpis(snapshot) {
   const skillSample = skillInvocation.state === "measured" && skillInvocations > 0;
   const skillLifecycleDetail = `${formatCount(skillLifecycle.proposed)} proposed · ${formatCount(skillLifecycle.active)} active · ${formatCount(skillLifecycle.retired)} retired`;
   const cardValues = [
-    ["Manager acceptance rate", kpiPercent(headline.manager_acceptance_rate), `${formatCount(headline.accepted_decisions)}/${formatCount(headline.manager_decisions)} all-time explicit manager decisions accepted`, "good"],
-    ["Actionable review-ready", kpiPercent(headline.actionable_review_ready_rate), `${formatCount(headline.actionable_review_ready_runs)}/${formatCount(headline.terminal_runs)} terminal outcomes in ${windowInfo.label || "bounded process window"}`, "good"],
-    ["Validation failure (recent window)", kpiPercent(headline.validation_failed_rate), `${formatCount(headline.validation_failed_runs)}/${formatCount(headline.terminal_runs)} terminal outcomes in ${windowInfo.label || "bounded process window"}`, numberValue(headline.validation_failed_runs) ? "bad" : "good"],
-    ["Callback delivery / backlog", kpiPercent(headline.callback_delivery_rate), `${formatCount(headline.callback_backlog)} current backlog · ${formatCount(headline.callback_dead_letters)} dead letters`, numberValue(headline.callback_dead_letters) ? "bad" : "good"],
+    ["Manager acceptance rate", kpiPercent(headline.manager_acceptance_rate), `${measuredCount(headline.accepted_decisions)}/${measuredCount(headline.manager_decisions)} all-time explicit manager decisions accepted`, "good"],
+    ["Actionable review-ready", kpiPercent(headline.actionable_review_ready_rate), `${measuredCount(headline.actionable_review_ready_runs)}/${measuredCount(headline.terminal_runs)} terminal outcomes in ${windowInfo.label || "bounded process window"}`, "good"],
+    ["Validation failure (recent window)", kpiPercent(headline.validation_failed_rate), `${measuredCount(headline.validation_failed_runs)}/${measuredCount(headline.terminal_runs)} terminal outcomes in ${windowInfo.label || "bounded process window"}`, numberValue(headline.validation_failed_runs) ? "bad" : "good"],
+    ["Callback delivery / backlog", kpiPercent(headline.callback_delivery_rate), `${measuredCount(headline.callback_backlog)} current backlog · ${measuredCount(headline.callback_dead_letters)} dead letters`, numberValue(headline.callback_dead_letters) ? "bad" : "good"],
     ["Skill lifecycle", skillSample ? formatCount(skillInvocations) : "No sample", skillSample ? `${skillLifecycleDetail} · ${formatCount(skillSelections)} selections · ${formatCount(skillInvocations)} invocations · ${formatCount(skillOutcomes)} outcomes` : `${skillLifecycleDetail} · ${formatCount(skillSelections)} selections · no invocation evidence; efficacy unavailable`, skillSample ? "accent" : "neutral"],
     ["Source Graph live", kpiPercent(headline.source_graph_live_rate), "authenticated live-task rate", "accent"],
     ["SG call success", kpiPercent(headline.source_graph_useful_call_rate), "calls without a recorded failure", "accent"],
     ["SG workflow stages", kpiPercent(headline.source_graph_stage_attribution_rate), "calls carrying authenticated workflow-stage metadata", "accent"],
     ["SG call gap p95", headline.source_graph_call_gap_p95_seconds == null ? "—" : formatDuration(numberValue(headline.source_graph_call_gap_p95_seconds) * 1000), "time between authenticated Source Graph calls", "accent"],
-    ["SG long gaps", formatCount(headline.source_graph_long_call_gap_count), `${kpiPercent(headline.source_graph_long_call_gap_rate)} at or above the informational threshold`, numberValue(headline.source_graph_long_call_gap_count) ? "bad" : "good"],
-    ["SG evidence rows", formatCount(numberValue(headline.source_graph_entity_rows) + numberValue(headline.source_graph_edge_rows) + numberValue(headline.source_graph_file_rows)), `${formatCount(headline.source_graph_entity_rows)} entities · ${formatCount(headline.source_graph_edge_rows)} edges · ${formatCount(headline.source_graph_file_rows)} files`, "accent"],
+    ["SG long gaps", measuredCount(headline.source_graph_long_call_gap_count), `${kpiPercent(headline.source_graph_long_call_gap_rate)} at or above the informational threshold`, numberValue(headline.source_graph_long_call_gap_count) ? "bad" : "good"],
+    ["SG evidence rows", formatCount(numberValue(headline.source_graph_entity_rows) + numberValue(headline.source_graph_edge_rows) + numberValue(headline.source_graph_file_rows)), `${measuredCount(headline.source_graph_entity_rows)} entities · ${measuredCount(headline.source_graph_edge_rows)} edges · ${measuredCount(headline.source_graph_file_rows)} files`, "accent"],
     ["Read trace coverage", kpiPercent(readEvidenceRate), `${formatCount(readEvidenceTasks)}/${formatCount(readObservedTasks)} current tasks · ${formatCount(readEfficiency ? readEfficiency.legacy_evidence_tasks : 0)} legacy excluded`, "accent"],
     ["Bounded file reads", recognizedReads ? kpiPercent(readEfficiency.bounded_read_rate) : "—", `${formatCount(readEfficiency ? readEfficiency.bounded_reads : 0)}/${formatCount(recognizedReads)} recognized reads`, "accent"],
     ["Exact rereads", readEfficiency ? formatCount(readEfficiency.exact_rereads) : "—", `${formatBytes(readEfficiency ? readEfficiency.exact_reread_bytes : 0)} observed redundant bytes`, numberValue(readEfficiency && readEfficiency.exact_rereads) ? "bad" : "good"],
@@ -1342,17 +1373,25 @@ function renderKpis(snapshot) {
       "accent",
     ],
     contextDeltaCard,
-    ["Optional suppression", headline.optimization_reduction_rate == null ? "—" : kpiPercent(headline.optimization_reduction_rate), `${formatCount(headline.optimization_bytes_removed)} section bytes removed`, "accent"],
-    ["Envelope overhead", headline.envelope_overhead_rate == null ? "—" : kpiPercent(headline.envelope_overhead_rate), `${formatCount(headline.envelope_bytes_added)} serialization bytes added`, numberValue(headline.envelope_bytes_added) ? "neutral" : "good"],
-    ["Provider cache hit", kpiPercent(headline.provider_cache_hit_rate), `${formatCount(headline.provider_measured_tasks)} provider-measured tasks`, "accent"],
+    ["Optional suppression", headline.optimization_reduction_rate == null ? "—" : kpiPercent(headline.optimization_reduction_rate), `${measuredCount(headline.optimization_bytes_removed)} section bytes removed`, "accent"],
+    ["Envelope overhead", headline.envelope_overhead_rate == null ? "—" : kpiPercent(headline.envelope_overhead_rate), `${measuredCount(headline.envelope_bytes_added)} serialization bytes added`, numberValue(headline.envelope_bytes_added) ? "neutral" : "good"],
+    ["Provider cache hit", kpiPercent(headline.provider_cache_hit_rate), `${measuredCount(headline.provider_measured_tasks)} provider-measured tasks`, "accent"],
     ["Cost / review-ready", headline.cost_per_review_ready_usd == null ? "—" : `$${Number(headline.cost_per_review_ready_usd).toFixed(4)}`, "provider-reported cost only", "neutral"],
-    ["Observed cost", `$${Number(headline.cost_usd || 0).toFixed(2)}`, `${formatCount(headline.total_tokens)} recorded tokens`, "neutral"],
+    ["Observed cost", `$${Number(headline.cost_usd || 0).toFixed(2)}`, `${measuredCount(headline.total_tokens)} recorded tokens`, "neutral"],
   ];
+  // A cell with no measurement is styled as prose, not as a figure, so it
+  // cannot be scanned as a number in a column of numbers.
+  const UNMEASURED_VALUES = new Set([NO_MEASUREMENT_LABEL, "No sample"]);
   for (const [label, value, detail, tone] of cardValues) {
-    const card = createElement("div", `kpi-card ${tone}`);
+    const unmeasured = UNMEASURED_VALUES.has(value);
+    const card = createElement("div", `kpi-card ${tone}${unmeasured ? " is-unmeasured" : ""}`);
+    const figure = createElement("strong", "kpi-card-value", value);
+    if (unmeasured) {
+      figure.setAttribute("title", "No measurement in this window — this is not a value of zero");
+    }
     card.append(
       createElement("span", "kpi-card-label", label),
-      createElement("strong", "kpi-card-value", value),
+      figure,
       createElement("span", "kpi-card-detail", detail),
     );
     cards.appendChild(card);
@@ -1370,14 +1409,78 @@ function renderKpis(snapshot) {
   // unknown-state ordering is identical regardless of the Webview host's
   // configured locale.
   const byCodePoint = (left, right) => (left < right ? -1 : left > right ? 1 : 0);
-  // Golden-angle hue stepping gives every palette index its own hue, so
-  // colors never cycle back to an earlier state's color no matter how many
-  // distinct states are observed -- there is no fixed-size swatch pool to
-  // wrap around.
-  const stateColor = (index) => {
-    const hue = (index * 137.508) % 360;
-    return `hsl(${hue.toFixed(2)} 65% 55%)`;
-  };
+
+  // Outcome colour slots: fixed, keyed by the STATE, and ordered.
+  //
+  // The previous chart derived each hue from the state's position in the list
+  // with a golden-angle formula. That painted review_ready -- the successful
+  // outcome, 58.7% of all terminal runs -- pure red, and painted
+  // validation_failed and scope_rejected green. The two signals that matter
+  // most were exactly inverted, and the generated set failed the palette
+  // validator's lightness band on 4 of its 9 slots.
+  //
+  // Colour now follows the entity and never its rank. The slot ORDER is also
+  // declared here rather than taken from the payload, because the order decides
+  // which fills end up touching inside a stacked column, and those touching
+  // pairs are what the palette was validated on.
+  //
+  // This is not a second copy of the backend's daily terminal order: it never
+  // decides which states exist, which render, or in what order a payload lists
+  // them. A state the backend adds later still renders, still carries its own
+  // tooltip and its own accessible label, and folds into a failure or neutral
+  // slot instead of being dropped or handed an invented hue.
+  //
+  // How the resolution is spent. review_ready is the largest slice (58.7%) and
+  // the least informative -- it is the baseline, what happens when nothing goes
+  // wrong. The 41.3% that did not land is the whole signal, and a rare failure
+  // mode is rare, not unimportant: seven of them sit at or under 0.5% and each
+  // one names a different thing for the operator to go and fix. So success
+  // takes ONE colour and is never subdivided, and no resolution is spent
+  // subdividing it.
+  //
+  // A stacked column cannot carry the failure taxonomy, and that is measured,
+  // not assumed: severity here is ordinal, so it is one hue in lightness
+  // steps, and the ordinal gate (adjacent dL >= 0.06, light end >= 2:1 on the
+  // panel surface) admits exactly THREE steps -- a four-step ramp fails the dL
+  // floor in both light and dark. Nine failure modes will not fit in three
+  // fills at any lightness.
+  //
+  // The answer is not to merge them into an anonymous "other". It is that the
+  // failure taxonomy gets its own composition: the "Failure modes" panel below
+  // ranks every failure mode individually, uncapped, one row each, so a
+  // six-event mode gets the same row as a sixteen-hundred-event one. This
+  // stack is the TREND; that panel is the taxonomy. And the legend here names
+  // every state individually too, so a mode that shares a lightness step with
+  // another is never anonymous -- it shares a band, not an identity.
+  const OUTCOME_SLOTS = [
+    ["review_ready", "Review ready", ["review_ready"]],
+    ["decided", "Cancelled or rejected", ["cancelled", "scope_rejected"]],
+    ["validation_failed", "Validation failed", ["validation_failed"]],
+    ["worker_failed", "Worker failed", ["worker_failed"]],
+    ["run_failed", "Run failures", [
+      "launch_failed", "timed_out", "exited", "finalize_failed",
+      "liveness_lost", "output_budget_exceeded", "token_budget_exceeded",
+    ]],
+    ["blocked", "Blocked", ["blocked"]],
+    ["other", "Other outcomes", []],
+  ];
+  // Slots whose members are failures. Used to keep the failure side of the
+  // panel unfolded and uncapped wherever a chart form can carry it.
+  const FAILURE_SLOTS = new Set(["validation_failed", "worker_failed", "run_failed"]);
+  const SLOT_RANK = new Map(OUTCOME_SLOTS.map(([slot], index) => [slot, index]));
+  const SLOT_OF_STATE = new Map();
+  for (const [slot, , states] of OUTCOME_SLOTS) {
+    for (const state of states) {
+      SLOT_OF_STATE.set(state, slot);
+    }
+  }
+  // An unrecognised state counts as a failure only when it says so in the
+  // naming convention the backend already uses for every failure it emits
+  // (`*_failed`). Anything else takes the neutral slot rather than being
+  // guessed into a red one -- a wrong alarm is worse than an honest "other".
+  const slotForState = (name) => SLOT_OF_STATE.get(name)
+    || (/_failed$/.test(String(name)) ? "run_failed" : "other");
+  const isFailureState = (name) => FAILURE_SLOTS.has(slotForState(name));
 
   const dailyPanel = createElement("section", "kpi-chart-panel");
   dailyPanel.appendChild(createElement("h3", "kpi-chart-title", "Daily worker outcomes"));
@@ -1395,14 +1498,18 @@ function renderKpis(snapshot) {
     const nonterminalObserved = Array.from(stateTotals.keys())
       .filter((name) => !DAILY_STATE_ORDER.includes(name))
       .sort(byCodePoint);
-    const paletteOrder = [...DAILY_STATE_ORDER, ...nonterminalObserved];
+    const supplied = [...DAILY_STATE_ORDER, ...nonterminalObserved];
+    const suppliedRank = new Map(supplied.map((name, index) => [name, index]));
+    // Fills render in slot order so the pairs that touch in a column are the
+    // pairs the palette was validated on; the payload still decides the order
+    // of states *within* a slot, so nothing here overrides backend authority
+    // over the states themselves.
+    const paletteOrder = [...supplied].sort((left, right) => (
+      (SLOT_RANK.get(slotForState(left)) - SLOT_RANK.get(slotForState(right)))
+      || (suppliedRank.get(left) - suppliedRank.get(right))
+    ));
     const orderedStateNames = paletteOrder.filter((name) => numberValue(stateTotals.get(name)) > 0);
     const paletteIndex = new Map(paletteOrder.map((name, index) => [name, index]));
-    // Every name in stateTotals is guaranteed to be in paletteOrder above
-    // (it is either a canonical terminal state or was folded into
-    // nonterminalObserved), so paletteIndex always has an entry here --
-    // there is no unmatched-name case left to fall back for.
-    const colorForState = (name) => stateColor(paletteIndex.get(name));
 
     const chart = createElement("div", "kpi-daily-chart");
     chart.setAttribute("role", "img");
@@ -1430,10 +1537,12 @@ function renderKpis(snapshot) {
       for (const entry of dayStates) {
         const count = numberValue(entry.count);
         const label = humanizeState(entry.state);
-        const segment = createElement("span", "kpi-day-segment");
+        // The fill is a class, not an inline colour: the actual value is a
+        // var(--vscode-charts-*) theme token in app.css, so the chart follows
+        // the user's VS Code theme instead of hard-coding a colour over it.
+        const segment = createElement("span", `kpi-day-segment state-${slotForState(entry.state)}`);
         segment.style.flexGrow = String(Math.max(count, minShare));
         segment.style.flexBasis = "0%";
-        segment.style.background = colorForState(entry.state);
         segment.title = `${day.date}: ${count} ${label}`;
         segment.setAttribute("aria-label", `${label}: ${count} on ${day.date}`);
         stack.appendChild(segment);
@@ -1442,16 +1551,36 @@ function renderKpis(snapshot) {
       chart.appendChild(column);
     }
     dailyPanel.appendChild(chart);
+    // The legend is this chart's table view, not a colour key: ONE ROW PER
+    // STATE -- never one row per colour. Three fills is all the ordinal gate
+    // allows for failure severity, so several failure modes share a lightness
+    // band; sharing a band must not mean losing a name. Every mode appears
+    // here with its own label, its own count and its own share, so identity
+    // survives a greyscale print, a colour-blind reader and a screen reader,
+    // and nothing is ever folded away into an anonymous "other".
     const legend = createElement("div", "kpi-legend");
+    const observedTotal = orderedStateNames.reduce(
+      (sum, name) => sum + numberValue(stateTotals.get(name)),
+      0,
+    );
     for (const name of orderedStateNames) {
+      const slot = slotForState(name);
       const label = humanizeState(name);
-      const item = createElement("span", "kpi-legend-item");
-      item.title = label;
-      item.setAttribute("aria-label", label);
+      const count = numberValue(stateTotals.get(name));
+      const share = observedTotal ? Math.round((count / observedTotal) * 1000) / 10 : 0;
+      const item = createElement("span", `kpi-legend-item state-${slot}`);
+      item.title = `${label}: ${count} of ${observedTotal} observed outcomes`;
+      item.setAttribute("aria-label", `${label}: ${count} outcomes, ${share}%`);
       const swatch = createElement("i");
-      swatch.style.background = colorForState(name);
       swatch.setAttribute("aria-hidden", "true");
-      item.append(swatch, document.createTextNode(label));
+      // Value first and heaviest, the unit that qualifies it smaller and
+      // lighter beside it.
+      item.append(
+        swatch,
+        document.createTextNode(label),
+        createElement("b", "", String(count)),
+        createElement("span", "kpi-legend-share", `${share}%`),
+      );
       legend.appendChild(item);
     }
     dailyPanel.appendChild(legend);
@@ -1460,19 +1589,89 @@ function renderKpis(snapshot) {
   }
   chartGrid.appendChild(dailyPanel);
 
-  const outcomePanel = createElement("section", "kpi-chart-panel");
-  outcomePanel.appendChild(createElement("h3", "kpi-chart-title", "Outcome mix"));
+  // ── Failure modes ────────────────────────────────────────────────────────
+  // The failure taxonomy, uncapped and unfolded, and the panel that carries
+  // this dashboard's weight.
+  //
+  // It replaces an "Outcome mix" list that ranked every outcome together and
+  // then cut it off at `.slice(0, 8)`. Ranked by count, the eight survivors
+  // were led by review_ready -- the outcome that needs no action -- and the
+  // rows the cut removed were precisely the rare failure modes: the budget
+  // states, liveness_lost, and anything new the backend started emitting. The
+  // panel was truncating the only rows worth reading.
+  //
+  // A ranked bar is the right form here because a row is a row: a six-event
+  // mode gets the same height, the same label and the same legibility as a
+  // sixteen-hundred-event one. Rare is not the same as unimportant, and each
+  // of these names a different thing to go and fix -- validation_failed means
+  // the work was wrong, launch_failed means the route was wrong, timed_out
+  // means it hung, finalize_failed means the work survived but the ledger did
+  // not.
+  //
+  // All bars wear one hue on purpose. Identity is carried by the row label, so
+  // spending the colour channel on it as well would re-encode what the label
+  // and the bar length already say.
   const outcomes = asArray(kpis.outcome_mix);
-  const outcomeMax = Math.max(1, ...outcomes.map((item) => numberValue(item.count)));
-  if (outcomes.length) {
-    for (const item of outcomes.slice(0, 8)) {
-      const tone = item.state === "review_ready" ? "good" : item.state === "validation_failed" ? "bad" : "neutral";
-      outcomePanel.appendChild(kpiBarRow(String(item.state || "unknown").replaceAll("_", " "), item.count, outcomeMax, tone));
+  const failureOutcomes = outcomes.filter((item) => isFailureState(String(item.state || "")));
+  const otherOutcomes = outcomes.filter((item) => !isFailureState(String(item.state || "")));
+  const failureTotal = failureOutcomes.reduce((sum, item) => sum + numberValue(item.count), 0);
+  const outcomeTotal = outcomes.reduce((sum, item) => sum + numberValue(item.count), 0);
+
+  const failurePanel = createElement("section", "kpi-chart-panel kpi-failure-panel");
+  failurePanel.appendChild(createElement("h3", "kpi-chart-title", "Failure modes"));
+  if (failureOutcomes.length) {
+    failurePanel.appendChild(createElement(
+      "p",
+      "kpi-chart-note",
+      `${failureTotal} of ${outcomeTotal} terminal outcomes did not reach review ready`,
+    ));
+    // Shares are of the failures, not of everything: this panel answers "which
+    // way does it break", and measuring each mode against the successful runs
+    // it is not competing with would flatten every one of them to a rounding
+    // error.
+    const failureMax = Math.max(1, ...failureOutcomes.map((item) => numberValue(item.count)));
+    for (const item of failureOutcomes) {
+      const count = numberValue(item.count);
+      const share = failureTotal ? Math.round((count / failureTotal) * 1000) / 10 : 0;
+      failurePanel.appendChild(kpiBarRow(
+        String(item.state || "unknown").replaceAll("_", " "),
+        count,
+        failureMax,
+        `state-${slotForState(String(item.state || ""))}`,
+        String(count),
+        `${share}%`,
+      ));
     }
+  } else if (outcomes.length) {
+    failurePanel.appendChild(createElement("div", "panel-list-empty compact", "No failed outcomes in this window"));
   } else {
-    outcomePanel.appendChild(createElement("div", "panel-list-empty", "No process outcomes"));
+    failurePanel.appendChild(createElement("div", "panel-list-empty", "No process outcomes"));
   }
-  chartGrid.appendChild(outcomePanel);
+  // Success and the decisions collapse to a quiet footer: one line each, no
+  // subdivision, no resolution spent on the part of the chart that needs no
+  // action. This is the only place anything folds, and it folds on the side
+  // that is not a failure.
+  if (otherOutcomes.length) {
+    const rest = createElement("div", "kpi-outcome-rest");
+    for (const item of otherOutcomes) {
+      const count = numberValue(item.count);
+      const share = outcomeTotal ? Math.round((count / outcomeTotal) * 1000) / 10 : 0;
+      const row = createElement("span", `kpi-outcome-rest-item state-${slotForState(String(item.state || ""))}`);
+      const swatch = createElement("i");
+      swatch.setAttribute("aria-hidden", "true");
+      row.append(
+        swatch,
+        document.createTextNode(String(item.state || "unknown").replaceAll("_", " ")),
+        createElement("b", "", String(count)),
+        createElement("span", "kpi-legend-share", `${share}%`),
+      );
+      rest.appendChild(row);
+    }
+    failurePanel.appendChild(rest);
+  }
+  // First in the grid, so this is the panel that gets the extra column and the
+  // operator's first look. The daily trend keeps a single column behind it.
+  chartGrid.insertBefore(failurePanel, chartGrid.firstChild);
 
   const adapterPanel = createElement("section", "kpi-chart-panel");
   adapterPanel.appendChild(createElement("h3", "kpi-chart-title", "Worker effectiveness"));
@@ -1484,7 +1683,8 @@ function renderKpis(snapshot) {
         item.review_ready_rate,
         100,
         "good",
-        `${kpiPercent(item.review_ready_rate)} · ${formatCount(item.terminal_runs)} terminal`,
+        kpiPercent(item.review_ready_rate),
+        `${formatCount(item.terminal_runs)} terminal`,
       ));
     }
   } else {
@@ -1546,7 +1746,8 @@ function renderKpis(snapshot) {
         item.review_ready_rate,
         100,
         item.name === "continuous_use" ? "good" : "neutral",
-        `${kpiPercent(item.review_ready_rate)} · ${formatCount(item.terminal_runs)} terminal`,
+        kpiPercent(item.review_ready_rate),
+        `${formatCount(item.terminal_runs)} terminal`,
       ));
     }
   } else {
@@ -1562,7 +1763,8 @@ function renderKpis(snapshot) {
       item.execution_rate,
       100,
       numberValue(item.degraded_tasks) ? "bad" : "accent",
-      `${kpiPercent(item.execution_rate)} · ${formatCount(item.hit_count)} hits`,
+      kpiPercent(item.execution_rate),
+      `${formatCount(item.hit_count)} hits`,
     ));
   }
   chartGrid.appendChild(contextPanel);
@@ -1607,7 +1809,8 @@ function renderKpis(snapshot) {
         observed,
         tasks,
         observed ? "accent" : "neutral",
-        `${observed}/${tasks} tasks · ${formatCount(item.total_reads)} reads`,
+        `${observed}/${tasks} tasks`,
+        `${formatCount(item.total_reads)} reads`,
       ));
     }
   } else {
@@ -3954,8 +4157,11 @@ function timelineEventsFromText(decoded) {
 }
 
 function formatDuration(milliseconds) {
+  // A measured 0 is a real duration and renders as one; only a genuinely
+  // absent value says so. The old `if (!value) return "—"` made both the same
+  // cell, in both directions.
+  if (!isMeasured(milliseconds)) return NO_MEASUREMENT_LABEL;
   const value = numberValue(milliseconds);
-  if (!value) return "—";
   if (value < 1000) return `${Math.round(value)} ms`;
   const seconds = value / 1000;
   if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} s`;

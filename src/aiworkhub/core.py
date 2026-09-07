@@ -3051,6 +3051,11 @@ def create_task(
     work_kind: str = "generic",
     validation_roles: list[str] | None = None,
     risk_tier: str | None = None,
+    skill_task_family: str | None = None,
+    skill_stage: str | None = None,
+    skill_triggers: list[str] | None = None,
+    skill_applicability: list[str] | None = None,
+    skill_path_scope: str | None = None,
     template_provenance: Mapping[str, Any] | None = None,
     custom_template_escape: str | None = None,
     validation_exemption: str | None = None,
@@ -3234,6 +3239,79 @@ def create_task(
             quality_evidence.VALIDATION_ROLES
         )
         return result
+
+    # Risk tier at CREATE, not only at accept.
+    #
+    # The computation already existed but ran only in accept_review, against
+    # the candidate diff: quality_evidence.derive_risk_signals over the changed
+    # paths, folded by resolve_risk_profile into an effective tier. Every input
+    # it needs is present here -- task_type, validation, and allowed_writes,
+    # which IS the card's declared change set -- so the same two functions are
+    # called on the same data, earlier. Nothing is re-implemented; a divergence
+    # between the create-time and accept-time tier could only come from the
+    # candidate touching paths outside its declared write scope, which the
+    # write gate already refuses.
+    #
+    # A caller-declared tier is a floor, never a ceiling: resolve_risk_profile
+    # is monotonic, so a declaration can raise the tier and can never lower the
+    # floor the paths imply.
+    declared_risk_tier = risk_tier
+    try:
+        risk_signals = quality_evidence.derive_risk_signals(
+            {"task_type": task_type, "validation": validation2},
+            writes2,
+        )
+        risk_tier = quality_evidence.resolve_risk_profile(
+            declared_risk_tier or quality_evidence.RISK_LOW,
+            signals=risk_signals,
+        )["effective_tier"]
+    except quality_evidence.MalformedConfigError as exc:
+        return _lifecycle_error(f"invalid_risk_signals:{exc}", 2)
+    risk_tier_origin = "declared" if declared_risk_tier is not None else "derived"
+
+    # Skill selection vocabulary. Closed sets shared with skill_registry; an
+    # unknown token is refused here rather than silently matching nothing.
+    from . import skill_registry as _skill_registry
+
+    try:
+        skill_task_family2 = (
+            _skill_registry.validate_vocabulary_token(skill_task_family, "task_family")
+            if skill_task_family is not None and str(skill_task_family).strip()
+            else ""
+        )
+        skill_stage2 = (
+            _skill_registry.validate_vocabulary_token(skill_stage, "stage")
+            if skill_stage is not None and str(skill_stage).strip()
+            else ""
+        )
+        skill_triggers2 = list(
+            _skill_registry.validate_vocabulary_tokens(skill_triggers, "triggers")
+        )
+        skill_applicability2 = list(
+            _skill_registry.validate_vocabulary_tokens(
+                skill_applicability, "applicability"
+            )
+        )
+    except _skill_registry.SkillRegistryError as exc:
+        result = _lifecycle_error(f"invalid_skill_vocabulary:{exc.code}", 2)
+        result["reason_detail"] = str(exc)[:200]
+        result["allowed_skill_task_families"] = sorted(
+            _skill_registry.SKILL_TASK_FAMILIES
+        )
+        result["allowed_skill_stages"] = sorted(_skill_registry.SKILL_STAGES)
+        result["allowed_skill_triggers"] = sorted(_skill_registry.SKILL_TRIGGERS)
+        result["allowed_skill_applicability"] = sorted(
+            _skill_registry.SKILL_APPLICABILITY
+        )
+        return result
+    skill_path_scope2 = str(skill_path_scope or "").strip()
+    if skill_path_scope2:
+        try:
+            skill_path_scope2 = _skill_registry.validate_path_scope(skill_path_scope2)
+        except _skill_registry.SkillRegistryError as exc:
+            result = _lifecycle_error(f"invalid_skill_path_scope:{exc.code}", 2)
+            result["reason_detail"] = str(exc)[:200]
+            return result
     # Parse every validation command before persisting the card.  The worker
     # uses this exact fail-closed parser later, so accepting syntax here that
     # can never reach execution only burns a provider run before ending in
@@ -3483,7 +3561,23 @@ def create_task(
             else {}
         ),
         "work_kind": work_kind,
-        **({"risk_tier": risk_tier} if risk_tier is not None else {}),
+        # Always present now: the tier is computed here from the declared write
+        # scope rather than waiting for accept_review to discover it from the
+        # candidate diff. ``risk_tier_origin`` says which of the two produced
+        # the value, and ``risk_signals`` shows the exact observations behind
+        # it, so a reader never has to guess whether a tier was declared.
+        "risk_tier": risk_tier,
+        "risk_tier_origin": risk_tier_origin,
+        "risk_signals": list(risk_signals),
+        **({"skill_task_family": skill_task_family2} if skill_task_family2 else {}),
+        **({"skill_stage": skill_stage2} if skill_stage2 else {}),
+        **({"skill_triggers": skill_triggers2} if skill_triggers2 else {}),
+        **(
+            {"skill_applicability": skill_applicability2}
+            if skill_applicability2
+            else {}
+        ),
+        **({"skill_path_scope": skill_path_scope2} if skill_path_scope2 else {}),
         "depends_on": depends_on2,
         "token_budget": (
             {
@@ -3529,7 +3623,16 @@ def create_task(
         "validation": validation2,
         "validation_roles": validation_roles2,
         "work_kind": work_kind,
-        "risk_tier": risk_tier,
+        # The CALLER-declared tier, not the derived one. Idempotency compares
+        # what was requested; a pre-existing card created before create-time
+        # derivation carries no tier at all, and a same-payload retry of it must
+        # still reconcile instead of failing as a payload conflict.
+        "risk_tier": declared_risk_tier,
+        "skill_task_family": skill_task_family2,
+        "skill_stage": skill_stage2,
+        "skill_triggers": skill_triggers2,
+        "skill_applicability": skill_applicability2,
+        "skill_path_scope": skill_path_scope2,
         "priority": priority,
         "task_type": task_type,
         "depends_on": depends_on2,
@@ -3688,10 +3791,29 @@ def create_task(
                 existing_card.get("work_kind")
                 or quality_evidence.WORK_KIND_GENERIC
             ),
+            # Read back the DECLARED tier, mirroring requested_payload. A card
+            # whose tier this module derived carries origin "derived" and was
+            # never declared, so it reads back as None; a card written before
+            # create-time derivation carries no origin at all and keeps the
+            # original behaviour exactly.
             "risk_tier": (
-                str(existing_card.get("risk_tier") or "").strip().lower()
-                or None
+                None
+                if str(existing_card.get("risk_tier_origin") or "").strip().lower()
+                == "derived"
+                else (
+                    str(existing_card.get("risk_tier") or "").strip().lower()
+                    or None
+                )
             ),
+            "skill_task_family": str(
+                existing_card.get("skill_task_family") or ""
+            ),
+            "skill_stage": str(existing_card.get("skill_stage") or ""),
+            "skill_triggers": list(existing_card.get("skill_triggers") or []),
+            "skill_applicability": list(
+                existing_card.get("skill_applicability") or []
+            ),
+            "skill_path_scope": str(existing_card.get("skill_path_scope") or ""),
             "priority": str(existing_card.get("priority") or "normal"),
             "task_type": str(existing_context.get("task_type") or "code"),
             "depends_on": existing_card.get("depends_on") or [],

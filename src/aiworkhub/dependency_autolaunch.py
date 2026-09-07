@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ast
+import fnmatch
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -18,19 +21,215 @@ SCHEMA_ID = "aiworkhub.dependency_autolaunch_outcome.v1"
 # whose reason is deterministic for the current card configuration can only
 # repeat, so it holds until the card row changes; anything else backs off
 # exponentially instead of retrying on the next trigger.
-DETERMINISTIC_DENIAL_PREFIXES = (
-    "card_scoped_task_unresolved",
-    "card_scoped_identity_mismatch",
-    "workforce_route_absent",
-    "workforce_model_mismatch",
-    "workforce_route_disabled",
-    "workforce_route_unavailable",
-    "workforce_route_risk_incapable",
-    "runner_mismatch",
-    "malformed_topic",
-    "topic_mismatch",
-    "identical_relaunch_blocked",
-    "repo_policy",
+#
+# 2026-09-07: that vocabulary described the dominant denial class of its day
+# and was never revisited.  Measured against the 286 launch_blocked events in
+# the canonical store it engaged on 5 of them -- 1.7%.  It was also matched by
+# bare substring containment, which fails in both directions: `runner_mismatch`
+# did not cover `runner_adapter_mismatch` (a near-miss that silently cost
+# coverage), while `topic_mismatch` did cover the unrelated
+# `quality_review_binding_topic_mismatch` (an accidental claim).  Matching is
+# now identifier-exact, and every reason a declared producer can mint must be
+# either claimed here or explicitly disclaimed below --
+# `test_every_launch_denial_reason_in_the_codebase_is_classified` fails on any
+# reason that is neither, so a new denial can never again be silently absent.
+#
+# Classification rule -- read the code that RAISES the reason, never its name:
+#   deterministic: every operand is a field of THIS card's row, so an identical
+#                  relaunch can only reproduce the identical denial, and only a
+#                  card-row change can clear it.
+#   transient:     at least one operand lives outside the card row (another
+#                  card's lifecycle, the filesystem, an installed executable, a
+#                  live service), so a later identical attempt may succeed.
+# Fail closed: a reason that cannot be PROVEN deterministic is disclaimed as
+# transient.  Holding a transient denial strands a card that would have
+# succeeded; leaving a deterministic one out only costs the retry it would
+# have saved.
+DETERMINISTIC_DENIAL_REASONS = frozenset(
+    {
+        # Card-identity write gate, core.py:1619-1636, reached on every
+        # reconcile through claim_start_exact -> _canonical_write_gate.  Each
+        # check compares the card row against itself.
+        "card_scoped_task_unresolved",
+        "card_scoped_identity_mismatch",
+        # core.py:1621/1624/1630 -- one guard, _is_malformed_identity_token,
+        # over three card fields.  Only `malformed_topic` had been claimed; its
+        # two siblings were the same near-miss as runner_adapter_mismatch.
+        "malformed_runner",
+        "malformed_task_id",
+        "malformed_topic",
+        # Workforce route identity, resolved from the card's runner/model.
+        "workforce_route_absent",
+        "workforce_model_mismatch",
+        "workforce_route_disabled",
+        "workforce_route_unavailable",
+        "workforce_route_risk_incapable",
+        # process_launcher.py:2812-2837 _validate_adapter_identity is a total
+        # pure function of (runner, adapter_id) over hardcoded allow-tuples:
+        # no I/O, no clock, no external state.  `runner_adapter_mismatch` is
+        # that same predicate and was missed only by prefix shape.
+        "runner_mismatch",
+        "runner_adapter_mismatch",
+        "topic_mismatch",
+        "identical_relaunch_blocked",
+        # process_launcher.py:4085-4099.  Raised iff the card's topic and the
+        # caller's binding disagree.  LaunchFn here is Callable[[str, str, str,
+        # str], ...] and structurally cannot carry a binding, so a
+        # quality_review card denies identically until its topic changes;
+        # the documented recovery is launch_quality_reviewer, not a retry.
+        "quality_review_binding_required",
+        "quality_review_binding_topic_mismatch",
+        # launch_replay_guard.py:25-83.  Every check compares two fields of the
+        # SAME card (validation_only_replay_authorization against
+        # rework_predecessor and claim_epoch).  No filesystem, no task events,
+        # no service call -- the purest deterministic family in the set.
+        "validation_only_replay_authorization_invalid",
+        "validation_only_replay_episode_binding_missing",
+        "validation_only_replay_task_mismatch",
+        "validation_only_replay_actor_mismatch",
+        "validation_only_replay_predecessor_missing",
+        "validation_only_replay_predecessor_mismatch",
+        "validation_only_replay_hash_manifest_mismatch",
+        "validation_only_replay_hash_manifest_invalid",
+        "validation_only_replay_claim_epoch_invalid",
+        "validation_only_replay_claim_epoch_mismatch",
+    }
+)
+# Reason families whose concrete suffix is minted by the producer.  A family
+# matches an identifier equal to it or extending it across a `_` boundary.
+DETERMINISTIC_DENIAL_FAMILIES: tuple[str, ...] = ("repo_policy",)
+
+# Explicitly disclaimed: seen, read at the raise site, and NOT proven to depend
+# only on this card's row.  Listing them is what makes drift visible -- a new
+# reason belongs to neither set and fails the classification test.
+#
+# The seven measured production reasons deliberately left transient, with the
+# event that clears them (none of which is a card-row change):
+#   collision_guard_failed (62/286)  process_launcher.py:5454-5456.
+#       task_plan.py:668-674 and 757-760 state it outright: a point-in-time
+#       pre-claim result that must be re-projected, because "an
+#       archived/finished contender leaves ready_capacity at zero forever even
+#       though an exact launch would now pass its live guard".  It clears when
+#       the OTHER card finishes.  Holding it would strand the largest bucket.
+#   task_contract_unwinnable (18)    process_launcher.py:5436-5444.
+#       AuthoritySnapshot.available is `not missing`, and `missing` is missing
+#       executables/modules -- environment, not card.  repair() states it
+#       "cannot invoke a package manager ... unresolved external requirements
+#       remain unresolved", so installing the tool clears it without touching
+#       the card.
+#   workspace_required_input_missing (16)  worker_workspace.py:1233-1243.
+#       Card-declared path AND repo filesystem existence.  A sibling card's
+#       accept can promote the file into the canonical tree, clearing it.
+#   unexpected_launch_error (16)     process_launcher.py:8552-8572.
+#       The else-branch for exceptions NOT in the expected tuple: an
+#       unbounded, unanticipated exception type.  Unknowable by construction.
+#   quality_review_candidate_mismatch (16) worker_workspace.py:5158-5165.
+#       Compares observed against retained candidate workspace content, which
+#       changes under retention/restore without the card changing.
+#   workspace_exists (8)             worker_workspace.py:4326-4331.
+#       A leftover worktree directory.  Stranded-worktree recovery removes it
+#       and never touches the card row, so a deterministic hold would outlive
+#       the repair.
+#   vscode_lm_initial_source_graph_prefetch_failed (8)
+#       process_launcher.py:8022-8035.  A live Source Graph MCP call; the
+#       server can be down, restarting or indexing.
+TRANSIENT_DENIAL_REASONS = frozenset(
+    {
+        # -- measured in production; see the note above for why each is here.
+        "collision_guard_failed",
+        "task_contract_unwinnable",
+        "workspace_required_input_missing",
+        "unexpected_launch_error",
+        "quality_review_candidate_mismatch",
+        "workspace_exists",
+        "vscode_lm_initial_source_graph_prefetch_failed",
+        # -- card contract shape.  These read the card, but the launcher also
+        # rewrites contract fields during preflight, and a repaired card is a
+        # card-row change that releases any hold anyway; claiming them buys
+        # nothing and risks stranding.
+        "allow_empty_not_in_allowed_writes",
+        "allow_empty_not_in_required_outputs",
+        "allow_empty_required_outputs_invalid",
+        "allow_empty_required_outputs_requires_required_outputs",
+        "allow_unchanged_not_in_allowed_writes",
+        "allow_unchanged_not_in_required_outputs",
+        "allow_unchanged_required_outputs_invalid",
+        "allow_unchanged_required_outputs_requires_required_outputs",
+        "allowed_write_outside_repo",
+        "allowed_writes_empty",
+        "allowed_writes_invalid",
+        "allowed_writes_missing",
+        "contradictory_task_path_contract",
+        "git_metadata_write_forbidden",
+        "read_only_declaration_required",
+        "required_output_not_allowed",
+        "required_output_path_invalid",
+        "required_outputs_invalid",
+        # -- lifecycle and claim races.  Every one of these depends on who else
+        # is holding the row right now, which is exactly what a retry resolves.
+        "card_scoped_action_not_allowed",
+        "card_scoped_claim_start_ineligible",
+        "card_scoped_claimed_by_mismatch",
+        "card_scoped_codex_forbidden",
+        "card_scoped_launch_blocker_ineligible",
+        "card_scoped_review_ineligible",
+        "card_scoped_task_id_required",
+        "card_scoped_usage_ineligible",
+        "runner_and_topic_required_for_card_scoped_authority",
+        "claim_receipt_invalid",
+        "claim_start_failed",
+        "concurrency_limit_reached",
+        "coordinator_runner_cannot_launch_worker",
+        "duplicate_live_task",
+        "duplicate_persisted_task",
+        "duplicate_reserved_task",
+        "memory_launch_capacity_denied",
+        "task_already_claimed",
+        "task_claim_owner_mismatch",
+        "task_identity_mismatch",
+        "task_launch_already_attached",
+        "task_lookup_failed",
+        "task_lookup_invalid_json",
+        "task_not_launchable",
+        "task_not_unclaimed",
+        # -- credentials, providers and live bridges: all resolved outside the
+        # card, all restorable without touching it.
+        "claude_authentication_unavailable",
+        "deepseek_credential_missing",
+        "deepseek_model_rejected",
+        "deepseek_vscode_lm_unavailable",
+        "glm_credential_missing",
+        "glm_model_rejected",
+        "glm_vscode_lm_unavailable",
+        "grok_kilo_auth_unavailable",
+        "grok_kilo_model_rejected",
+        "vscode_lm_model_required",
+        "vscode_lm_unavailable",
+        "quality_review_source_graph_authority_unverified",
+        "quality_review_source_graph_prewarm_failed",
+        # -- host, filesystem and external roots.
+        "external_readonly_root_not_directory",
+        "external_readonly_root_unavailable",
+        "external_readonly_source_invalid",
+        "external_readonly_source_not_absolute",
+        "external_readonly_source_not_file_or_dir",
+        "external_readonly_source_outside_roots",
+        "external_readonly_source_unavailable",
+        "external_readonly_sources_invalid",
+        "external_readonly_sources_requires_deepseek_copilot_cli",
+        "ledger_snapshot_unproven",
+        "supervisor_pid_identity_unavailable",
+        "windows_launch_cwd_unavailable",
+        "worker_supervisor_script_missing",
+        # -- replay grants that read task EVENTS or worker MCP gate receipts
+        # rather than card fields.  Deliberately split from the card-pure
+        # launch_replay_guard family claimed above: a terminal event or a gate
+        # receipt can appear later with no card-row change.
+        "validation_only_replay_committed_grant_mismatch",
+        "validation_only_replay_predecessor_terminal_event_missing",
+        "validation_only_replay_predecessor_worker_mcp_gate_missing",
+        "validation_only_replay_predecessor_worker_mcp_gate_unsatisfied",
+    }
 )
 TRANSIENT_BACKOFF_BASE_SECONDS = 5.0
 TRANSIENT_BACKOFF_MAX_SECONDS = 300.0
@@ -139,12 +338,173 @@ def _ensure_holds_table(conn: sqlite3.Connection) -> None:
     )
 
 
-def _denial_kind(reason: str) -> str:
-    text = str(reason or "").strip()
-    for prefix in DETERMINISTIC_DENIAL_PREFIXES:
-        if prefix in text:
+_REASON_TOKEN_RE = re.compile(r"[a-z0-9_]+")
+
+
+def denial_reason_tokens(reason: str) -> tuple[str, ...]:
+    """Return the maximal identifier runs inside one denial string.
+
+    A denial never arrives bare.  ``claim_start_exact`` wraps the write-gate
+    verdict as ``"runner/topic allowlist denied: card_scoped_identity_mismatch"``
+    and a launcher rejection appends detail as
+    ``"runner_adapter_mismatch:runner=...:got=..."``.  The reason is therefore
+    matched as a whole identifier anywhere in the string, never as a bare
+    substring: substring containment is what let ``topic_mismatch`` silently
+    claim the unrelated ``quality_review_binding_topic_mismatch`` while
+    ``runner_mismatch`` silently failed to cover ``runner_adapter_mismatch``.
+    """
+    return tuple(_REASON_TOKEN_RE.findall(str(reason or "").strip().lower()))
+
+
+def classify_denial(reason: str) -> str:
+    """Classify one launch denial as ``deterministic`` or ``transient``.
+
+    Fail closed.  Only a reason proven to depend solely on this card's row is
+    deterministic; everything else -- including a reason nobody has classified
+    yet -- backs off and is retried.  Holding a transient denial strands a card
+    that would have succeeded, while leaving a deterministic one out costs only
+    the retry it would have saved.
+    """
+    for token in denial_reason_tokens(reason):
+        if token in DETERMINISTIC_DENIAL_REASONS:
             return "deterministic"
+        for family in DETERMINISTIC_DENIAL_FAMILIES:
+            if token == family or token.startswith(family + "_"):
+                return "deterministic"
     return "transient"
+
+
+def _denial_kind(reason: str) -> str:
+    return classify_denial(reason)
+
+
+# ---------------------------------------------------------------------------
+# Anti-drift: the vocabulary above must not silently fall behind production.
+#
+# The producers below are the exact places a launch denial reason is minted.
+# ``discover_launch_denial_reasons`` enumerates their literals straight from
+# source so a test can refuse any reason this module neither claims nor
+# disclaims.  Adding a producer means adding it here; adding a reason inside an
+# existing producer is caught with no edit at all.
+LAUNCH_DENIAL_RAISE_PRODUCERS: tuple[tuple[str, str], ...] = (
+    # LaunchRejected exists only to deny a launch, wherever it is raised.
+    ("*.py", "LaunchRejected"),
+    # The validation-only replay grant fails closed with a plain ValueError.
+    ("launch_replay_guard.py", "ValueError"),
+)
+# Write-gate authority returns its verdict as a dict rather than raising.
+LAUNCH_DENIAL_DECISION_PRODUCERS: tuple[tuple[str, str], ...] = (
+    ("core.py", "_check_card_scoped_write_authority"),
+    ("core.py", "check_runner_topic_allowlist"),
+)
+
+
+def _static_head(node: ast.AST) -> str | None:
+    """Return the leading static text of a reason expression, if it has one."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        first = node.values[0] if node.values else None
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return first.value
+        return None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _static_head(node.left)
+    return None
+
+
+def _reason_token(text: str) -> str | None:
+    """Reduce ``reason:detail`` to its reason token.
+
+    A head that ends in ``_`` is an f-string stem such as ``f"malformed_{label}"``:
+    it names no single reason, so its concrete values are classified instead.
+    """
+    token = text.split(":", 1)[0].strip()
+    return token if token and not token.endswith("_") else None
+
+
+def _called_name(call: ast.Call) -> str:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    return getattr(func, "attr", "")
+
+
+def discover_launch_denial_reasons(
+    package_root: Path | str,
+) -> dict[str, tuple[str, ...]]:
+    """Return ``{reason_token: (file:line, ...)}`` for every declared producer."""
+    root = Path(package_root)
+    found: dict[str, list[str]] = {}
+
+    def record(token: str, path: Path, lineno: int) -> None:
+        found.setdefault(token, []).append(f"{path.name}:{lineno}")
+
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        exception_names = {
+            name
+            for pattern, name in LAUNCH_DENIAL_RAISE_PRODUCERS
+            if fnmatch.fnmatch(path.name, pattern)
+        }
+        if exception_names:
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Raise):
+                    continue
+                if not isinstance(node.exc, ast.Call) or not node.exc.args:
+                    continue
+                if _called_name(node.exc) not in exception_names:
+                    continue
+                head = _static_head(node.exc.args[0])
+                token = _reason_token(head) if head else None
+                if token:
+                    record(token, path, node.lineno)
+        decision_functions = {
+            function
+            for module, function in LAUNCH_DENIAL_DECISION_PRODUCERS
+            if module == path.name
+        }
+        if not decision_functions:
+            continue
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if function.name not in decision_functions:
+                continue
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Dict):
+                    continue
+                fields = {
+                    key.value: value
+                    for key, value in zip(node.keys, node.values)
+                    if isinstance(key, ast.Constant)
+                }
+                allowed = fields.get("allowed")
+                if not (isinstance(allowed, ast.Constant) and allowed.value is False):
+                    continue
+                reason = fields.get("reason")
+                head = _static_head(reason) if reason is not None else None
+                token = _reason_token(head) if head else None
+                if token:
+                    record(token, path, node.lineno)
+    return {token: tuple(sites) for token, sites in sorted(found.items())}
+
+
+def unclassified_denial_reasons(package_root: Path | str) -> dict[str, tuple[str, ...]]:
+    """Return discovered reasons this module neither claims nor disclaims."""
+    return {
+        token: sites
+        for token, sites in discover_launch_denial_reasons(package_root).items()
+        if token not in DETERMINISTIC_DENIAL_REASONS
+        and token not in TRANSIENT_DENIAL_REASONS
+        and not any(
+            token == family or token.startswith(family + "_")
+            for family in DETERMINISTIC_DENIAL_FAMILIES
+        )
+    }
 
 
 def _hold_for(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] | None:

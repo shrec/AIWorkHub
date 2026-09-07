@@ -134,3 +134,80 @@ def test_the_uncommitted_sample_is_bounded(tmp_path: Path):
     result = learning_commit_store.coverage(root)
     assert result["decided_cards"] == 20
     assert len(result["recent_without_lesson"]) == 5
+
+
+# --------------------------------------------------------------------------- #
+# the head run
+#
+# A percentage says what the practice has been; it moves about a point per
+# lesson, so no single decision can be held to it. The run of most-recently
+# decided cards that recorded no lesson can be: filing one lesson for the newest
+# decision resets it to zero. That is what `declared_invariants` enforces, and
+# these pin the measurement it enforces on.
+# --------------------------------------------------------------------------- #
+
+
+def _aged(task_id: str, days: float) -> tuple:
+    return _card(task_id, status="finished", topic="coding", age_days=days)
+
+
+def test_the_head_run_counts_only_the_newest_decisions(tmp_path: Path):
+    """The 38-decision run behind a lesson is history, not the run in progress."""
+    root = _repo(tmp_path)
+    _seed(root, [
+        _aged("NEW_2", 1), _aged("NEW_1", 2),
+        _aged("COMMITTED", 3),
+        _aged("OLD_1", 4), _aged("OLD_2", 5), _aged("OLD_3", 6),
+    ], lessons=["COMMITTED"])
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["consecutive_recent_without_lesson"] == 2
+    assert result["cards_without_lesson"] == 5, "the aggregate still counts them all"
+
+
+def test_one_lesson_for_the_newest_decision_resets_the_head_run(tmp_path: Path):
+    root = _repo(tmp_path)
+    rows = [_aged(f"T{i}", 1 + i) for i in range(10)]
+
+    _seed(root, rows, lessons=[])
+    assert learning_commit_store.coverage(root)["consecutive_recent_without_lesson"] == 10
+
+    _seed(root, rows, lessons=["T0"])
+    assert learning_commit_store.coverage(root)["consecutive_recent_without_lesson"] == 0
+
+
+def test_a_repository_that_never_recorded_a_lesson_has_no_store_and_a_true_run(
+    tmp_path: Path,
+):
+    """The table is created lazily, so "no table" must measure, not raise."""
+    root = _repo(tmp_path)
+    _seed(root, [_aged("A", 1), _aged("B", 2)], lessons=[])
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["consecutive_recent_without_lesson"] == 2
+    assert result["consecutive_recent_without_lesson_capped"] is False
+
+
+def test_a_run_reported_at_the_scan_limit_says_it_is_a_floor(tmp_path: Path, monkeypatch):
+    """A bound must never read as a total."""
+    monkeypatch.setattr(learning_commit_store, "RECENT_DECISION_SCAN_LIMIT", 3)
+    root = _repo(tmp_path)
+    _seed(root, [_aged(f"T{i}", 1 + i) for i in range(5)], lessons=[])
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["consecutive_recent_without_lesson"] == 3
+    assert result["consecutive_recent_without_lesson_capped"] is True
+
+
+def test_an_undecided_repository_reports_no_run_and_no_percentage(tmp_path: Path):
+    root = _repo(tmp_path)
+    _seed(root, [_card("RUNNING", status="processing", topic="coding", age_days=1)], [])
+
+    result = learning_commit_store.coverage(root)
+
+    assert result["decided_cards"] == 0
+    assert result["consecutive_recent_without_lesson"] == 0
+    assert result["coverage_percent"] is None
