@@ -9330,6 +9330,12 @@ function getHtmlForWebview(webview, extensionUri) {
         <strong id="header-preflight-value">Checking</strong>
         <span class="header-insight-detail" id="header-preflight-detail">No evidence</span>
       </div>
+
+      <button class="header-insight-card" id="header-history" type="button" title="Open the canonical-store history charts">
+        <span class="header-storage-label">History</span>
+        <strong id="header-history-value">Loading</strong>
+        <span class="header-insight-detail" id="header-history-detail">not carried by the summary snapshot</span>
+      </button>
       ${codingFoundationHeaderMarkup()}
     </div>
   </header>
@@ -9458,6 +9464,9 @@ function getHtmlForWebview(webview, extensionUri) {
         </button>
         <button class="diagnostic-icon-button" type="button" id="open-operations" title="Open repository operations" aria-label="Open repository operations">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V11h3v8zm6 0V5h3v14zm6 0V8h3v11M2 21h20"/></svg><span>Operations</span>
+        </button>
+        <button class="diagnostic-icon-button" type="button" id="open-history" title="Open canonical-store history charts" aria-label="Open canonical-store history charts">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20h18M4 16l4-5 4 3 5-8 3 4"/></svg><span>History</span>
         </button>
         <button class="diagnostic-icon-button" type="button" id="open-tool-use" title="Open model tool-use telemetry" aria-label="Open model tool-use telemetry">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9m5 10V5m6 14v-7m5 7V3M2 21h20"/></svg><span>Telemetry</span>
@@ -9676,6 +9685,25 @@ function getHtmlForWebview(webview, extensionUri) {
       </aside>
     </div>
   </main>
+
+  <dialog class="diagnostic-dialog history-dialog" id="history-dialog">
+    <section class="history-frame" aria-labelledby="history-heading">
+      <div class="dialog-heading">
+        <div><h2 id="history-heading">History</h2><span>Eight canonical-store series. Failure modes, coverage gaps and retry cost first; the baseline outcome gets one number.</span></div>
+        <span class="history-heading-actions">
+          <label class="history-population-label" for="history-population">Population</label>
+          <select id="history-population" class="compact-select" aria-label="Card population">
+            <option value="work_card" selected>Work cards</option>
+            <option value="reviewer_child">Reviewer children</option>
+            <option value="unknown_topic">Unknown topic</option>
+            <option value="all">All populations</option>
+          </select>
+          <button type="button" class="dialog-close" data-close-dialog="history-dialog">Close</button>
+        </span>
+      </div>
+      <div class="history-body" id="history-body" aria-live="polite"></div>
+    </section>
+  </dialog>
 
   <dialog class="diagnostic-dialog" id="system-log-dialog">
     <div class="dialog-heading">

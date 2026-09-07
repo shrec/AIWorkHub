@@ -61,6 +61,11 @@ const state = {
   returnTopic: "all",
   returnRunner: "all",
   returnPageSize: 20,
+  // The history series is never carried by the fast summary snapshot, so the
+  // page starts as NOT-YET-LOADED. "pending" and "absent" are different
+  // sentences and the page prints different words for them (NF-2026-00675).
+  historySeries: null,
+  historyState: "pending",
 };
 
 let readyRetryTimer = null;
@@ -125,6 +130,9 @@ const elements = {
   headerPreflight: document.querySelector("#header-preflight"),
   headerPreflightValue: document.querySelector("#header-preflight-value"),
   headerPreflightDetail: document.querySelector("#header-preflight-detail"),
+  headerHistory: document.querySelector("#header-history"),
+  headerHistoryValue: document.querySelector("#header-history-value"),
+  headerHistoryDetail: document.querySelector("#header-history-detail"),
   sourceAlert: document.querySelector("#source-alert"),
   sourceAlertTitle: document.querySelector("#source-alert-title"),
   sourceAlertMessage: document.querySelector("#source-alert-message"),
@@ -199,6 +207,10 @@ const elements = {
   sessionsList: document.querySelector("#sessions-list"),
   openKb: document.querySelector("#open-kb"),
   openOperations: document.querySelector("#open-operations"),
+  openHistory: document.querySelector("#open-history"),
+  historyDialog: document.querySelector("#history-dialog"),
+  historyBody: document.querySelector("#history-body"),
+  historyPopulation: document.querySelector("#history-population"),
   openToolUse: document.querySelector("#open-tool-use"),
   operationsDialog: document.querySelector("#operations-dialog"),
   kbDialog: document.querySelector("#kb-dialog"),
@@ -624,6 +636,10 @@ function renderSummaryProjection(snapshot) {
       : formatBytes(storage.managed_total_bytes);
     elements.headerStorageFree.textContent = `Free ${formatBytes(storage.disk_free_bytes)}`;
   }
+  // The summary deliberately omits history_series. Telling the History page
+  // so is what keeps it saying "loading" instead of asserting an
+  // unavailability that was never measured.
+  applyHistorySnapshot(snapshot);
 }
 
 function renderSourceHealth(snapshot) {
@@ -3127,6 +3143,10 @@ function renderSnapshot(snapshot) {
   renderReturns(snapshot);
   renderRuns(snapshot);
   renderWarnings(snapshot);
+  // Cheap by construction: it stores a reference and writes two header
+  // strings. The twelve panels are built only when the page is open, so the
+  // snapshot render never waits on the charts page.
+  applyHistorySnapshot(snapshot);
   if (state.selectedTaskId && !state.tasks.some((task) => String(task.task_id) === state.selectedTaskId)) {
     clearTaskDetail();
   }
@@ -4750,6 +4770,1091 @@ function renderSettings(payload, options = {}) {
   }
 }
 
+// ═══ HISTORY_PAGE_BEGIN ═══════════════════════════════════════════════════
+// The History page: eight canonical-store series, rendered on their own
+// surface rather than folded into the live KPI panel.
+//
+// WHY A SEPARATE PAGE. `kpi_analytics` is computed over the LIVE PROCESS
+// REPORT -- it reports 37 observed runs and truncated: true. `history_series`
+// reads the canonical store: 6,232 terminal events across 43 observed days.
+// The two answer different questions ("what is happening now" vs "what has
+// this system done"), and putting the second inside the first would make the
+// live panel wait on a 2.9 s cold canonical read. This page renders only when
+// it is opened, and the snapshot render never blocks on it.
+//
+// WHAT THE PAGE LEADS WITH. Every problematic metric is worth more than a
+// successful one, because the problematic ones are what the system learns
+// from. So the failure taxonomy, the transports that report no telemetry at
+// all, the rejection depth and the coverage gaps get panels and room; the
+// baseline outcome gets one number and a footer line. That is the same
+// decision the KPI "Failure modes" panel already made, for the same reason.
+//
+// THE ONE RULE THAT OUTRANKS THE OTHERS: UNKNOWN IS NOT ZERO. The payload says
+// so itself -- `absent_metrics_are_unknown_not_zero: true`, a null
+// `cost_usd_total`, `measured: false` blocks with a reason, an
+// `acceptance_rate` of null over an empty denominator, and day rows that
+// simply do not exist for days the store has no events for. Nothing on this
+// page plots an absent value at zero. A day with no row renders as a GAP
+// column with a dashed axis segment under it; an unmeasured rate renders as
+// the words "not measured"; an unknown share renders as a dashed, unfilled
+// track. Solid fill means measured. That is the whole visual grammar.
+
+// The same entity -> fill map the KPI panel uses, by slot id. It is declared
+// again here rather than shared because the KPI map is function-scoped inside
+// renderKpis(); `history-charts.test.js` parses BOTH declarations out of this
+// file and fails if they ever disagree, so this is a checked mirror and not a
+// second source of truth. Colour follows the ENTITY, never its rank: filtering
+// the page to one population changes which series are drawn and never which
+// fill any survivor wears.
+const HISTORY_SLOT_STATES = [
+  ["review_ready", ["review_ready"]],
+  ["decided", ["cancelled", "scope_rejected"]],
+  ["validation_failed", ["validation_failed"]],
+  ["worker_failed", ["worker_failed"]],
+  ["run_failed", [
+    "launch_failed", "timed_out", "exited", "finalize_failed",
+    "liveness_lost", "output_budget_exceeded", "token_budget_exceeded",
+  ]],
+  ["blocked", ["blocked"]],
+  ["other", []],
+];
+
+const HISTORY_SLOT_OF_STATE = new Map();
+for (const [slot, states] of HISTORY_SLOT_STATES) {
+  for (const state of states) HISTORY_SLOT_OF_STATE.set(state, slot);
+}
+
+// An unrecognised substatus folds into a failure slot only when it says so in
+// the naming convention the backend uses for every failure it emits; anything
+// else takes the neutral slot rather than being guessed into an alarm colour.
+function historySlotForState(name) {
+  const key = String(name || "");
+  return HISTORY_SLOT_OF_STATE.get(key) || (/_failed$/.test(key) ? "run_failed" : "other");
+}
+
+// Entities this page draws that are not terminal substatuses. `rejected` takes
+// the DECISION colour, not the failure colour: a manager rejecting a card is a
+// decision, exactly like `cancelled` and `scope_rejected`, and the palette
+// already reserves red for the machine failing. Painting a review verdict red
+// would say the run broke, which is not what happened.
+const HISTORY_ENTITY_SLOT = new Map([
+  ["accepted", "review_ready"],
+  ["rejected", "decided"],
+  ["evidence_measured", "review_ready"],
+  ["nothing_measured", "other"],
+  // verdict_absent is not a pass and not a failure -- the payload's own legend
+  // says "unknown". It gets the unknown treatment, never a fill.
+  ["verdict_absent", "unknown"],
+]);
+
+function historyEntityClass(entity) {
+  const key = String(entity || "");
+  if (HISTORY_ENTITY_SLOT.has(key)) return `entity-${HISTORY_ENTITY_SLOT.get(key)}`;
+  return `entity-${historySlotForState(key)}`;
+}
+
+const HISTORY_POPULATIONS = ["work_card", "reviewer_child", "unknown_topic"];
+const HISTORY_POPULATION_LABEL = {
+  work_card: "Work cards",
+  reviewer_child: "Reviewer children",
+  unknown_topic: "Unknown topic",
+};
+// Mirrors history_series.MAX_DAY_BUCKETS. A span wider than this is bounded
+// here rather than minting thousands of DOM columns.
+const HISTORY_MAX_DAY_COLUMNS = 400;
+const HISTORY_DAY_MS = 86400000;
+
+const historyLabel = (name) => String(name || "unknown").replaceAll("_", " ");
+
+// NF-2026-00675. The default snapshot is snapshot_mode "summary": the server
+// keeps a bounded field set, names the rest in omitted_fields, and the
+// extension then asks for the full shape. A field the server DELIBERATELY DID
+// NOT SEND is not a field the server COULD NOT PRODUCE, and rendering the two
+// identically makes a panel assert an unavailability nobody ever measured --
+// this repository's own forbidden shape, on the operator-facing surface.
+//
+// "present" -> the payload carries it. "pending" -> this payload was never
+// going to carry it and the full snapshot is still on its way. "absent" ->
+// only when a full snapshot genuinely does not carry it.
+//
+// omitted_fields is honoured when it names the field but is never required:
+// measured against the live server, history_series is missing from the summary
+// AND missing from its own omitted_fields list, so a check that trusted only
+// that list would call it "absent" and print exactly the wrong word.
+// snapshot_mode is the authority.
+function snapshotFieldState(snapshot, key) {
+  if (!snapshot || typeof snapshot !== "object") return "pending";
+  const value = snapshot[key];
+  if (value !== undefined && value !== null) return "present";
+  const mode = String(snapshot.snapshot_mode || "").trim().toLowerCase();
+  if (mode === "summary") return "pending";
+  if (asArray(snapshot.omitted_fields).map(String).includes(String(key))) return "pending";
+  if (snapshot.full_snapshot_available === true) return "pending";
+  return "absent";
+}
+
+// ── Small formatters. Each one has an unmeasured answer that is a WORD ──────
+function historyRate(value) {
+  return isMeasured(value) ? `${(Number(value) * 100).toFixed(1)}%` : NO_MEASUREMENT_LABEL;
+}
+
+function historyExactCount(value) {
+  return isMeasured(value) ? new Intl.NumberFormat().format(Number(value)) : NO_MEASUREMENT_LABEL;
+}
+
+function historyDuration(seconds) {
+  if (!isMeasured(seconds)) return NO_MEASUREMENT_LABEL;
+  const total = Math.max(0, Math.round(Number(seconds)));
+  if (total < 60) return `${total}s`;
+  if (total < 3600) return `${Math.floor(total / 60)}m ${total % 60}s`;
+  if (total < 86400) return `${Math.floor(total / 3600)}h ${Math.floor((total % 3600) / 60)}m`;
+  return `${Math.floor(total / 86400)}d ${Math.floor((total % 86400) / 3600)}h`;
+}
+
+// ── Building blocks ────────────────────────────────────────────────────────
+function historyPanel(title, note) {
+  const panel = createElement("section", "history-panel");
+  panel.appendChild(createElement("h3", "history-panel-title", title));
+  if (note) panel.appendChild(createElement("p", "history-panel-note", note));
+  return panel;
+}
+
+function historyStat(label, value, detail) {
+  const tile = createElement("div", "history-stat");
+  tile.appendChild(createElement("span", "history-stat-label", label));
+  tile.appendChild(createElement("strong", "history-stat-value", value));
+  if (detail) tile.appendChild(createElement("span", "history-stat-detail", detail));
+  tile.title = `${label}: ${value}${detail ? ` · ${detail}` : ""}`;
+  return tile;
+}
+
+function historyEmpty(panel, message) {
+  panel.appendChild(createElement("div", "history-empty", message));
+  return panel;
+}
+
+// Up to four series are direct-labelled as well as legended, so identity never
+// has to travel through the colour channel at all.
+function historyDirectLabels(parts) {
+  const strip = createElement("div", "history-direct-labels");
+  const total = parts.reduce((sum, part) => sum + Math.max(0, numberValue(part.count)), 0);
+  for (const part of parts) {
+    const count = Math.max(0, numberValue(part.count));
+    const share = total ? Math.round((count / total) * 1000) / 10 : 0;
+    strip.appendChild(createElement(
+      "span",
+      `history-direct-label ${historyEntityClass(part.entity)}`,
+      `${part.label} ${share}%`,
+    ));
+  }
+  return strip;
+}
+
+// One series needs no legend -- the panel title already names it. Two or more
+// always get one, and up to four are direct-labelled as well, so identity is
+// never carried by colour alone. The legend is the chart's table view: one row
+// per ENTITY with its own name, count and share, so it survives greyscale, a
+// colour-blind reader and a screen reader.
+function historyLegend(entries) {
+  const legend = createElement("div", "history-legend");
+  const total = entries.reduce((sum, entry) => sum + Math.max(0, numberValue(entry.count)), 0);
+  for (const entry of entries) {
+    const count = numberValue(entry.count);
+    const share = total ? Math.round((count / total) * 1000) / 10 : 0;
+    const item = createElement("span", `history-legend-item ${historyEntityClass(entry.entity)}`);
+    const swatch = createElement("i");
+    swatch.setAttribute("aria-hidden", "true");
+    item.append(
+      swatch,
+      createElement("span", "history-legend-name", entry.label),
+      createElement("b", "", historyExactCount(count)),
+      createElement("span", "history-legend-share", `${share}%`),
+    );
+    item.title = `${entry.label}: ${historyExactCount(count)} of ${historyExactCount(total)}`;
+    item.setAttribute("aria-label", `${entry.label}: ${count}, ${share}%`);
+    legend.appendChild(item);
+  }
+  return legend;
+}
+
+// A ranked row: label, figure, and a track that is FILLED when the value was
+// measured and left DASHED AND EMPTY when it was not. The dashed empty track
+// is the page's one way of drawing an unknown, and it is used identically for
+// a missing day, an unmeasured rate and an uncovered population.
+function historyBarRow(options) {
+  const measured = options.measured !== false;
+  const row = createElement("div", `history-row${measured ? "" : " is-unknown"}`);
+  const heading = createElement("div", "history-row-heading");
+  const figure = createElement("strong", "history-row-value", measured ? options.value : NO_MEASUREMENT_LABEL);
+  if (options.unit) figure.append(createElement("span", "history-row-unit", options.unit));
+  heading.append(createElement("span", "history-row-label", options.label), figure);
+  const track = createElement("div", "history-row-track");
+  if (measured) {
+    const fill = createElement("span", `history-row-fill ${historyEntityClass(options.entity || "other")}`);
+    const maximum = Math.max(0, numberValue(options.maximum));
+    const magnitude = Math.max(0, numberValue(options.magnitude));
+    fill.style.width = `${maximum ? Math.max(magnitude ? 2 : 0, Math.round((magnitude / maximum) * 100)) : 0}%`;
+    track.appendChild(fill);
+  }
+  row.append(heading, track);
+  row.title = `${options.label}: ${measured ? options.value : NO_MEASUREMENT_LABEL}${options.unit ? ` ${options.unit}` : ""}`;
+  return row;
+}
+
+// A proportional composition strip. Segments are flex weights, never height or
+// width percentages, so they can never sum past the strip no matter how many
+// share it; an unknown part is drawn as a dashed empty segment, present in the
+// composition and visibly not a measurement.
+function historyCompositionBar(parts, ariaLabel) {
+  const bar = createElement("div", "history-composition");
+  bar.setAttribute("role", "img");
+  bar.setAttribute("aria-label", ariaLabel);
+  const total = parts.reduce((sum, part) => sum + Math.max(0, numberValue(part.count)), 0);
+  for (const part of parts) {
+    const count = Math.max(0, numberValue(part.count));
+    if (!count) continue;
+    const share = total ? Math.round((count / total) * 1000) / 10 : 0;
+    const unknown = historyEntityClass(part.entity) === "entity-unknown";
+    const segment = createElement("span", `history-composition-part ${historyEntityClass(part.entity)}${unknown ? " is-unknown" : ""}`);
+    segment.style.flexGrow = String(count);
+    segment.style.flexBasis = "0%";
+    segment.title = `${part.label}: ${historyExactCount(count)} (${share}%)`;
+    segment.setAttribute("aria-label", `${part.label}: ${count}, ${share}%`);
+    bar.appendChild(segment);
+  }
+  return bar;
+}
+
+// Every calendar day in the observed span, so a day the canonical store holds
+// no row for becomes a VISIBLE GAP rather than silently closing up and letting
+// the neighbours touch. Closing the gap is the lie: it draws 43 days of
+// continuous work over a span that has five days nobody measured.
+function historyDayKeys(firstDay, lastDay) {
+  const start = Date.parse(`${String(firstDay)}T00:00:00Z`);
+  const end = Date.parse(`${String(lastDay)}T00:00:00Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return [];
+  const days = [];
+  for (let at = start; at <= end && days.length < HISTORY_MAX_DAY_COLUMNS; at += HISTORY_DAY_MS) {
+    days.push(new Date(at).toISOString().slice(0, 10));
+  }
+  return days;
+}
+
+function historySpan(rows, window_) {
+  const observed = rows.map((row) => String(row.day || "")).filter(Boolean).sort();
+  const first = (window_ && window_.first_day) || observed[0] || "";
+  const last = (window_ && window_.last_day) || observed[observed.length - 1] || "";
+  const keys = historyDayKeys(first, last);
+  return keys.length ? keys : observed;
+}
+
+// A stacked column per day. Columns are keyed by DAY, not by array position:
+// a day with no row gets a column whose axis segment is dashed and whose stack
+// is empty, and whose accessible name says "not measured" -- never a zero-height
+// bar, which in a column chart still reads as a measured zero.
+function historyColumnChart(columns, ariaLabel) {
+  const chart = createElement("div", "history-columns");
+  chart.setAttribute("role", "img");
+  chart.setAttribute("aria-label", ariaLabel);
+  const maximum = Math.max(1, ...columns.map((column) => Math.max(0, numberValue(column.total))));
+  for (const column of columns) {
+    const measured = column.measured !== false;
+    const cell = createElement("div", `history-column${measured ? "" : " is-gap"}`);
+    if (measured) {
+      // A measured zero is allowed to draw nothing -- but its axis segment
+      // stays SOLID. The dashed segment under a gap column is what separates
+      // "we measured no events that day" from "we have no row for that day".
+      const total = Math.max(0, numberValue(column.total));
+      const stack = createElement("div", "history-stack");
+      stack.style.height = `${total ? Math.max(4, Math.round((total / maximum) * 100)) : 0}%`;
+      const floor = total * 0.03;
+      for (const segment of asArray(column.segments)) {
+        const count = Math.max(0, numberValue(segment.count));
+        if (!count) continue;
+        const piece = createElement("span", `history-segment ${historyEntityClass(segment.entity)}`);
+        piece.style.flexGrow = String(Math.max(count, floor));
+        piece.style.flexBasis = "0%";
+        piece.title = `${column.day}: ${historyExactCount(count)} ${segment.label}`;
+        piece.setAttribute("aria-label", `${segment.label}: ${count} on ${column.day}`);
+        stack.appendChild(piece);
+      }
+      cell.appendChild(stack);
+      cell.title = `${column.day}: ${historyExactCount(total)} ${column.unit || "events"}`;
+      cell.setAttribute("aria-label", `${column.day}: ${total} ${column.unit || "events"}`);
+    } else {
+      cell.appendChild(createElement("div", "history-stack"));
+      cell.title = `${column.day}: ${NO_MEASUREMENT_LABEL}`;
+      cell.setAttribute("aria-label", `${column.day}: ${NO_MEASUREMENT_LABEL}`);
+    }
+    cell.appendChild(createElement("span", "history-column-label", String(column.day || "").slice(5)));
+    chart.appendChild(cell);
+  }
+  return chart;
+}
+
+// Accepted above the axis, rejected below it. Polarity is the honest encoding
+// for a decision: the two are opposite outcomes of the same event, and a
+// stacked column would make the day's height read as throughput instead.
+// Both halves are the same unit and the same scale, so this is one chart, not
+// two measures sharing an axis.
+function historyDivergingChart(columns, ariaLabel) {
+  const chart = createElement("div", "history-diverging");
+  chart.setAttribute("role", "img");
+  chart.setAttribute("aria-label", ariaLabel);
+  const maximum = Math.max(1, ...columns.map((column) => Math.max(
+    Math.abs(numberValue(column.up)),
+    Math.abs(numberValue(column.down)),
+  )));
+  for (const column of columns) {
+    const measured = column.measured !== false;
+    const cell = createElement("div", `history-diverging-column${measured ? "" : " is-gap"}`);
+    const upper = createElement("div", "history-diverging-up");
+    const lower = createElement("div", "history-diverging-down");
+    if (measured) {
+      const up = Math.max(0, numberValue(column.up));
+      const down = Math.max(0, numberValue(column.down));
+      if (up) {
+        const bar = createElement("span", `history-diverging-bar ${historyEntityClass("accepted")}`);
+        bar.style.height = `${Math.max(3, Math.round((up / maximum) * 100))}%`;
+        bar.title = `${column.day}: ${historyExactCount(up)} accepted`;
+        bar.setAttribute("aria-label", `accepted: ${up} on ${column.day}`);
+        upper.appendChild(bar);
+      }
+      if (down) {
+        const bar = createElement("span", `history-diverging-bar ${historyEntityClass("rejected")}`);
+        bar.style.height = `${Math.max(3, Math.round((down / maximum) * 100))}%`;
+        bar.title = `${column.day}: ${historyExactCount(down)} rejected`;
+        bar.setAttribute("aria-label", `rejected: ${down} on ${column.day}`);
+        lower.appendChild(bar);
+      }
+      cell.title = `${column.day}: ${historyExactCount(up)} accepted, ${historyExactCount(down)} rejected`;
+      cell.setAttribute("aria-label", `${column.day}: ${up} accepted, ${down} rejected`);
+    } else {
+      cell.title = `${column.day}: ${NO_MEASUREMENT_LABEL}`;
+      cell.setAttribute("aria-label", `${column.day}: ${NO_MEASUREMENT_LABEL}`);
+    }
+    cell.append(upper, lower, createElement("span", "history-column-label", String(column.day || "").slice(5)));
+    chart.appendChild(cell);
+  }
+  return chart;
+}
+
+// ── The panels ─────────────────────────────────────────────────────────────
+
+// Series 1 + 3, composition. STAT TILES, not a chart: a share of a total is
+// one number, and a chart with one point is a table that took a panel.
+function historyOverviewPanel(series) {
+  const panel = historyPanel("Measured history", "");
+  const strip = createElement("div", "history-stat-strip");
+  const window_ = (series && series.window) || {};
+  const composition = (series && series.terminal_composition) || {};
+  const decisions = (series && series.daily_decisions) || {};
+  const totals = (decisions && decisions.totals) || {};
+  const retry = (series && series.retry_economics) || {};
+  const usage = (series && series.usage) || {};
+  const cost = (usage && usage.cost_quality) || {};
+  const risk = ((series && series.risk_tier_distribution) || {}).by_population || {};
+  const latency = (series && series.latency) || {};
+  const anomalies = (latency && latency.anomalies) || {};
+
+  strip.appendChild(historyStat(
+    "Observed days",
+    historyExactCount(window_.observed_days),
+    `${window_.first_day || "?"} to ${window_.last_day || "?"} · ${historyExactCount(window_.days)}-day window`,
+  ));
+  strip.appendChild(historyStat(
+    "Terminal events",
+    historyExactCount(composition.events),
+    `${historyRate((composition.failures || {}).share)} did not reach ${composition.baseline ? historyLabel(composition.baseline.substatus) : "the baseline"}`,
+  ));
+  const work = totals.work_card || {};
+  strip.appendChild(historyStat(
+    "Work-card acceptance",
+    historyRate(work.acceptance_rate),
+    `${historyExactCount(work.accepted)} of ${historyExactCount(work.decided)} decided cards`,
+  ));
+  const child = totals.reviewer_child || {};
+  strip.appendChild(historyStat(
+    "Reviewer-child acceptance",
+    historyRate(child.acceptance_rate),
+    `${historyExactCount(child.accepted)} of ${historyExactCount(child.decided)} · never counted as work`,
+  ));
+  strip.appendChild(historyStat(
+    "Retry share of tokens",
+    historyRate((retry.retry_share || {}).of_tokens),
+    `${historyRate((retry.retry_share || {}).of_records)} of usage records are retries`,
+  ));
+  // The cost total is UNKNOWN, not the observed sum. Printing the observed sum
+  // as "total spend" would understate it by whatever the 79.7% of records that
+  // carry no cost actually cost.
+  strip.appendChild(historyStat(
+    "Cost observed",
+    isMeasured(cost.cost_usd_observed) ? formatMoney(cost.cost_usd_observed) : NO_MEASUREMENT_LABEL,
+    `lower bound · ${historyRate(cost.coverage)} of records priced · total ${NO_MEASUREMENT_LABEL}`,
+  ));
+  const workRisk = risk.work_card || {};
+  strip.appendChild(historyStat(
+    "Risk-tier coverage",
+    historyRate(workRisk.coverage),
+    `${historyExactCount(workRisk.risk_tier_unknown)} work cards carry no tier`,
+  ));
+  strip.appendChild(historyStat(
+    "Negative durations",
+    historyExactCount(anomalies.negative_run),
+    "run durations whose end precedes their start; never clamped",
+  ));
+  panel.appendChild(strip);
+  return panel;
+}
+
+// Series 1, the taxonomy. A ranked bar per failure class, UNCAPPED and
+// unfolded: a six-event class gets the same row, the same label and the same
+// legibility as a sixteen-hundred-event one, because each one names a
+// different thing to go and fix. One hue on purpose -- identity is carried by
+// the row label, so spending the colour channel on it too would re-encode what
+// the label and the bar length already say.
+function historyFailurePanel(series, population) {
+  const composition = (series && series.terminal_composition) || {};
+  if (composition.measured === false) {
+    return historyEmpty(historyPanel("Failure modes", ""), `Terminal composition ${NO_MEASUREMENT_LABEL}`);
+  }
+  const scoped = population === "all"
+    ? { baseline: (composition.baseline || {}).events, failures: (composition.failures || {}).by_substatus || {} }
+    : (composition.by_population || {})[population] || { baseline: 0, failures: {} };
+  const entries = Object.keys(scoped.failures || {})
+    .map((name) => ({ name, count: numberValue(scoped.failures[name]) }))
+    .filter((entry) => entry.count > 0)
+    .sort((left, right) => right.count - left.count || (left.name < right.name ? -1 : 1));
+  const failureTotal = entries.reduce((sum, entry) => sum + entry.count, 0);
+  const baseline = numberValue(scoped.baseline);
+  const panel = historyPanel(
+    "Failure modes",
+    `${historyExactCount(failureTotal)} of ${historyExactCount(failureTotal + baseline)} terminal events did not reach ${historyLabel((composition.baseline || {}).substatus || "review_ready")}`,
+  );
+  if (!entries.length) {
+    return historyEmpty(panel, "No failed terminal events in this population");
+  }
+  const maximum = Math.max(1, ...entries.map((entry) => entry.count));
+  for (const entry of entries) {
+    const share = failureTotal ? Math.round((entry.count / failureTotal) * 1000) / 10 : 0;
+    const causes = ((composition.evidence_cause_by_substatus || {})[entry.name]) || {};
+    const causeText = Object.keys(causes)
+      .sort((left, right) => numberValue(causes[right]) - numberValue(causes[left]))
+      .map((cause) => `${historyExactCount(causes[cause])} ${historyLabel(cause)}`)
+      .join(", ");
+    const row = historyBarRow({
+      label: historyLabel(entry.name),
+      value: historyExactCount(entry.count),
+      unit: `${share}%`,
+      magnitude: entry.count,
+      maximum,
+      entity: entry.name,
+    });
+    if (causeText) row.title = `${historyLabel(entry.name)}: ${historyExactCount(entry.count)} (${share}% of failures) · ${causeText}`;
+    panel.appendChild(row);
+  }
+  // The baseline collapses to one quiet line. It is the largest slice and the
+  // least informative -- what happens when nothing goes wrong -- and no
+  // resolution is spent subdividing it.
+  const footer = createElement("div", "history-footer");
+  const swatch = createElement("i", historyEntityClass("review_ready"));
+  swatch.setAttribute("aria-hidden", "true");
+  footer.append(
+    swatch,
+    createElement("span", "", historyLabel((composition.baseline || {}).substatus || "review_ready")),
+    createElement("b", "", historyExactCount(baseline)),
+  );
+  panel.appendChild(footer);
+  return panel;
+}
+
+// Series 1, the coverage question underneath the taxonomy. Three named parts
+// of one whole -- a composition, so one 100% strip with a legend, not three
+// bars that invite a comparison between them. `verdict_absent` is the reason
+// the panel exists: the payload's own legend calls it "unknown, not a pass and
+// not a failure", so it is drawn as an unknown and never as a fill.
+function historyEvidencePanel(series) {
+  const composition = (series && series.terminal_composition) || {};
+  const causes = composition.evidence_cause_by_substatus || {};
+  const legend = composition.evidence_cause_legend || {};
+  const names = Object.keys(legend).length
+    ? Object.keys(legend)
+    : ["evidence_measured", "nothing_measured", "verdict_absent"];
+  const totals = new Map(names.map((name) => [name, 0]));
+  for (const substatus of Object.keys(causes)) {
+    for (const cause of Object.keys(causes[substatus] || {})) {
+      totals.set(cause, numberValue(totals.get(cause)) + numberValue(causes[substatus][cause]));
+    }
+  }
+  const parts = Array.from(totals.entries())
+    .map(([entity, count]) => ({ entity, label: historyLabel(entity), count }))
+    .filter((part) => part.count > 0);
+  const panel = historyPanel(
+    "Evidence verdict coverage",
+    String(legend.verdict_absent || "no deterministic verdict was recorded on the event"),
+  );
+  if (!parts.length) return historyEmpty(panel, `Evidence verdicts ${NO_MEASUREMENT_LABEL}`);
+  const total = parts.reduce((sum, part) => sum + part.count, 0);
+  panel.appendChild(historyCompositionBar(
+    parts,
+    `Evidence verdict coverage across ${total} terminal events: ${parts.map((part) => part.label).join(", ")}`,
+  ));
+  panel.appendChild(historyDirectLabels(parts));
+  panel.appendChild(historyLegend(parts.map((part) => ({
+    entity: part.entity,
+    label: part.label,
+    count: part.count,
+  }))));
+  return panel;
+}
+
+// Series 3, the trend. Stacked columns over a CONTINUOUS day axis: the five
+// days between 2026-07-23 and 2026-09-07 the store holds no row for are drawn
+// as gaps with a dashed axis segment, because the payload declares that an
+// absent metric is unknown and not zero, and a closed-up axis would claim 43
+// consecutive days of measured work.
+function historyDailyOutcomesPanel(series, population) {
+  const daily = (series && series.daily_outcomes) || {};
+  const panel = historyPanel(
+    "Terminal outcomes by day",
+    `${historyExactCount(daily.events)} events · ${historyExactCount(daily.day_count)} observed days${daily.truncated ? " · oldest days dropped" : ""}`,
+  );
+  if (daily.measured === false) return historyEmpty(panel, `Daily outcomes ${NO_MEASUREMENT_LABEL}`);
+  const rows = asArray(daily.days);
+  if (!rows.length) return historyEmpty(panel, "No terminal outcomes in this window");
+  const byDay = new Map(rows.map((row) => [String(row.day || ""), row]));
+  const populations = population === "all" ? HISTORY_POPULATIONS : [population];
+  const totals = new Map();
+  const columns = historySpan(rows, series && series.window).map((day) => {
+    const row = byDay.get(day);
+    if (!row) return { day, measured: false };
+    const segments = [];
+    let total = 0;
+    for (const key of populations) {
+      const baseline = numberValue((row.baseline || {})[key]);
+      if (baseline > 0) {
+        segments.push({ entity: "review_ready", label: historyLabel((series.baseline_substatus) || "review_ready"), count: baseline });
+        totals.set("review_ready", numberValue(totals.get("review_ready")) + baseline);
+        total += baseline;
+      }
+      const failures = (row.failures || {})[key] || {};
+      for (const name of Object.keys(failures)) {
+        const count = numberValue(failures[name]);
+        if (count <= 0) continue;
+        segments.push({ entity: name, label: historyLabel(name), count });
+        totals.set(name, numberValue(totals.get(name)) + count);
+        total += count;
+      }
+    }
+    // Fills render in slot order so the pairs that touch inside a column are
+    // the pairs the palette was validated on.
+    const rank = HISTORY_SLOT_STATES.map(([slot]) => slot);
+    segments.sort((left, right) => (
+      rank.indexOf(historySlotForState(left.entity)) - rank.indexOf(historySlotForState(right.entity))
+    ));
+    return { day, measured: true, total, segments, unit: "terminal events" };
+  });
+  const observed = columns.filter((column) => column.measured).length;
+  const missing = columns.length - observed;
+  panel.appendChild(historyColumnChart(
+    columns,
+    `Terminal outcomes across ${observed} measured days and ${missing} days with no measurement`,
+  ));
+  if (missing) {
+    panel.appendChild(createElement(
+      "p",
+      "history-panel-note history-gap-note",
+      `${missing} day${missing === 1 ? "" : "s"} in this span carry no row and are drawn as gaps: ${NO_MEASUREMENT_LABEL}, not zero`,
+    ));
+  }
+  const legendEntries = Array.from(totals.entries())
+    .map(([entity, count]) => ({ entity, label: historyLabel(entity), count }))
+    .sort((left, right) => right.count - left.count);
+  if (legendEntries.length >= 2) panel.appendChild(historyLegend(legendEntries));
+  return panel;
+}
+
+// Series 2. Diverging columns: accepted above the axis, rejected below. One
+// vote per distinct card per day -- a card rejected 46 times in one day is one
+// card, which is the counting unit the payload declares.
+function historyDecisionsPanel(series, population) {
+  const decisions = (series && series.daily_decisions) || {};
+  const panel = historyPanel("Decisions by day", String(decisions.counting_note || ""));
+  if (decisions.measured === false) return historyEmpty(panel, `Daily decisions ${NO_MEASUREMENT_LABEL}`);
+  const rows = asArray(decisions.days);
+  if (!rows.length) return historyEmpty(panel, "No decided cards in this window");
+  const byDay = new Map(rows.map((row) => [String(row.day || ""), row]));
+  const populations = population === "all" ? HISTORY_POPULATIONS : [population];
+  let accepted = 0;
+  let rejected = 0;
+  const columns = historySpan(rows, series && series.window).map((day) => {
+    const row = byDay.get(day);
+    if (!row) return { day, measured: false };
+    let up = 0;
+    let down = 0;
+    for (const key of populations) {
+      up += numberValue((row[key] || {}).accepted);
+      down += numberValue((row[key] || {}).rejected);
+    }
+    accepted += up;
+    rejected += down;
+    return { day, measured: true, up, down };
+  });
+  const missing = columns.filter((column) => column.measured === false).length;
+  panel.appendChild(historyDivergingChart(
+    columns,
+    `Accepted above and rejected below the axis across ${columns.length - missing} measured days and ${missing} days with no measurement`,
+  ));
+  // Two series: direct-labelled AND legended, so identity never depends on
+  // which side of the axis a reader is looking at.
+  const axis = createElement("div", "history-axis-labels");
+  axis.append(
+    createElement("span", `history-axis-label ${historyEntityClass("accepted")}`, "accepted"),
+    createElement("span", `history-axis-label ${historyEntityClass("rejected")}`, "rejected"),
+  );
+  panel.appendChild(axis);
+  if (missing) {
+    panel.appendChild(createElement(
+      "p",
+      "history-panel-note history-gap-note",
+      `${missing} day${missing === 1 ? "" : "s"} in this span carry no decision and are drawn as gaps: ${NO_MEASUREMENT_LABEL}, not zero`,
+    ));
+  }
+  panel.appendChild(historyLegend([
+    { entity: "accepted", label: "accepted", count: accepted },
+    { entity: "rejected", label: "rejected", count: rejected },
+  ]));
+  return panel;
+}
+
+// Series 6. One row per runner, ranked by decided cards, with the accepted and
+// rejected halves as a single proportional strip so the ROW LENGTH is sample
+// size and the SPLIT is the verdict. sample_count travels with every rate,
+// because an acceptance rate over one decided card is not an acceptance rate.
+function historyRunnerPanel(series, population) {
+  const outcomes = (series && series.model_outcomes) || {};
+  const scope = population === "all" ? "work_card" : population;
+  const block = outcomes[scope] || {};
+  const runners = asArray(block.runners);
+  const panel = historyPanel(
+    `Acceptance by runner · ${HISTORY_POPULATION_LABEL[scope] || scope}`,
+    String(outcomes.sample_note || ""),
+  );
+  if (outcomes.measured === false) return historyEmpty(panel, `Model outcomes ${NO_MEASUREMENT_LABEL}`);
+  if (!runners.length) return historyEmpty(panel, "No decided cards for this population");
+  const maximum = Math.max(1, ...runners.map((runner) => numberValue(runner.decided)));
+  for (const runner of runners) {
+    const decided = numberValue(runner.decided);
+    const acceptedCount = numberValue(runner.accepted);
+    const rejectedCount = numberValue(runner.rejected);
+    const row = createElement("div", "history-row");
+    const heading = createElement("div", "history-row-heading");
+    const figure = createElement("strong", "history-row-value", historyRate(runner.acceptance_rate));
+    figure.append(createElement("span", "history-row-unit", `${historyExactCount(runner.sample_count)} sampled`));
+    heading.append(createElement("span", "history-row-label", String(runner.runner || "unknown")), figure);
+    const track = createElement("div", "history-row-track");
+    const strip = createElement("div", "history-split");
+    strip.style.width = `${Math.max(decided ? 2 : 0, Math.round((decided / maximum) * 100))}%`;
+    for (const [entity, label, count] of [["accepted", "accepted", acceptedCount], ["rejected", "rejected", rejectedCount]]) {
+      if (count <= 0) continue;
+      const part = createElement("span", `history-split-part ${historyEntityClass(entity)}`);
+      part.style.flexGrow = String(count);
+      part.style.flexBasis = "0%";
+      part.title = `${runner.runner}: ${historyExactCount(count)} ${label}`;
+      part.setAttribute("aria-label", `${runner.runner}: ${count} ${label}`);
+      strip.appendChild(part);
+    }
+    track.appendChild(strip);
+    row.append(heading, track);
+    row.title = `${runner.runner}: ${historyExactCount(acceptedCount)} accepted, ${historyExactCount(rejectedCount)} rejected, ${historyExactCount(decided)} decided · ${historyRate(runner.acceptance_rate)}`;
+    panel.appendChild(row);
+  }
+  if (block.truncated) {
+    panel.appendChild(createElement(
+      "p",
+      "history-panel-note",
+      `${historyExactCount(block.runner_count)} runners decided cards; the rarest rows beyond the bound are not shown`,
+    ));
+  }
+  panel.appendChild(historyLegend([
+    { entity: "accepted", label: "accepted", count: runners.reduce((sum, runner) => sum + numberValue(runner.accepted), 0) },
+    { entity: "rejected", label: "rejected", count: runners.reduce((sum, runner) => sum + numberValue(runner.rejected), 0) },
+  ]));
+  return panel;
+}
+
+// Series 5. Two measures at different scales -- how many cards sit at each
+// rejection depth, and how many of them were ever accepted -- so they are two
+// stacked rows per depth rather than one chart with two axes. Depth is the
+// ordinal axis and every OBSERVED depth keeps its own row, including the long
+// tail out to 50, because the tail is where the retry cost lives.
+function historyRejectionDepthPanel(series, population) {
+  const retry = (series && series.retry_economics) || {};
+  const depth = (retry.rejection_depth || {}).by_population || {};
+  const scope = population === "all" ? "work_card" : population;
+  const buckets = depth[scope] || {};
+  const keys = Object.keys(buckets)
+    .map((key) => ({ key, depth: Number(key) }))
+    .filter((entry) => Number.isFinite(entry.depth))
+    .sort((left, right) => left.depth - right.depth);
+  const panel = historyPanel(
+    `Rejection depth · ${HISTORY_POPULATION_LABEL[scope] || scope}`,
+    String((retry.rejection_depth || {}).note || ""),
+  );
+  if (retry.measured === false) return historyEmpty(panel, `Retry economics ${NO_MEASUREMENT_LABEL}`);
+  if (!keys.length) return historyEmpty(panel, "No decided cards for this population");
+  const maximum = Math.max(1, ...keys.map((entry) => numberValue(buckets[entry.key].cards)));
+  for (const entry of keys) {
+    const bucket = buckets[entry.key] || {};
+    const cards = numberValue(bucket.cards);
+    panel.appendChild(historyBarRow({
+      label: entry.depth === 0 ? "0 rejections" : `${entry.depth} rejection${entry.depth === 1 ? "" : "s"}`,
+      value: historyExactCount(cards),
+      unit: "cards",
+      magnitude: cards,
+      maximum,
+      entity: "rejected",
+    }));
+    panel.appendChild(historyBarRow({
+      label: "eventually accepted",
+      measured: isMeasured(bucket.eventual_acceptance_rate),
+      value: historyRate(bucket.eventual_acceptance_rate),
+      unit: `${historyExactCount(bucket.eventually_accepted)} of ${historyExactCount(cards)}`,
+      magnitude: numberValue(bucket.eventual_acceptance_rate) * 100,
+      maximum: 100,
+      entity: "accepted",
+    }));
+  }
+  return panel;
+}
+
+// Series 4, the trend. Tokens per day on the same continuous day axis. Two
+// days in this span carry terminal events but no usage record at all, and
+// those are gaps here even though the outcome chart has a column for them --
+// which is exactly the point: the two series measure different things and a
+// missing usage row is not a day of zero tokens.
+function historyTokensByDayPanel(series) {
+  const usage = (series && series.usage) || {};
+  const panel = historyPanel(
+    "Tokens by day",
+    `${historyExactCount(usage.total_tokens)} tokens across ${historyExactCount(usage.records)} usage records`,
+  );
+  if (usage.measured === false) return historyEmpty(panel, `Usage ${NO_MEASUREMENT_LABEL}`);
+  const rows = asArray(usage.by_day);
+  if (!rows.length) return historyEmpty(panel, "No usage records in this window");
+  const byDay = new Map(rows.map((row) => [String(row.day || ""), row]));
+  const columns = historySpan(rows, series && series.window).map((day) => {
+    const row = byDay.get(day);
+    if (!row) return { day, measured: false };
+    const tokens = numberValue(row.total_tokens);
+    return {
+      day,
+      measured: true,
+      total: tokens,
+      unit: "tokens",
+      segments: [{ entity: "other", label: "tokens", count: tokens }],
+    };
+  });
+  const missing = columns.filter((column) => column.measured === false).length;
+  // One series, so no legend: the panel title names it.
+  panel.appendChild(historyColumnChart(
+    columns,
+    `Tokens per day across ${columns.length - missing} measured days and ${missing} days with no usage record`,
+  ));
+  if (missing) {
+    panel.appendChild(createElement(
+      "p",
+      "history-panel-note history-gap-note",
+      `${missing} day${missing === 1 ? "" : "s"} in this span carry no usage record and are drawn as gaps: ${NO_MEASUREMENT_LABEL}, not zero`,
+    ));
+  }
+  return panel;
+}
+
+// Series 4, the problematic half. 39.9% of usage records arrived with no token
+// telemetry at all, and four transports report none for every record they
+// carry. Those records are counted here rather than dropped from the cost
+// series, so the cost figures are lower bounds and say so.
+function historyTelemetryPanel(series) {
+  const usage = (series && series.usage) || {};
+  const absence = usage.telemetry_absence || {};
+  const adapters = asArray(absence.by_adapter);
+  const panel = historyPanel(
+    "Transports reporting no token telemetry",
+    String(absence.note || ""),
+  );
+  if (usage.measured === false) return historyEmpty(panel, `Usage ${NO_MEASUREMENT_LABEL}`);
+  if (!adapters.length) return historyEmpty(panel, "Every usage record carried token telemetry");
+  const ranked = adapters
+    .slice()
+    .sort((left, right) => numberValue(right.zero_token_records) - numberValue(left.zero_token_records));
+  const maximum = Math.max(1, ...ranked.map((entry) => numberValue(entry.zero_token_records)));
+  for (const entry of ranked) {
+    const zero = numberValue(entry.zero_token_records);
+    panel.appendChild(historyBarRow({
+      label: `${String(entry.provider || "unknown")} · ${String(entry.adapter_id || "unknown")}`,
+      value: historyExactCount(zero),
+      unit: `${historyRate(entry.zero_token_share)} of ${historyExactCount(entry.records)}`,
+      magnitude: zero,
+      maximum,
+      entity: "validation_failed",
+    }));
+  }
+  panel.appendChild(createElement(
+    "p",
+    "history-panel-note",
+    `${historyExactCount(absence.zero_token_records)} of ${historyExactCount(usage.records)} records (${historyRate(absence.share_of_records)}) reported no tokens; their tokens and cost are ${NO_MEASUREMENT_LABEL}, never zero`,
+  ));
+  return panel;
+}
+
+// Series 4, by model. Ranked bars, one hue, identity in the label. Cost
+// coverage rides on every row: a model whose transport never reported a price
+// shows an unknown cost, not a free one.
+function historyModelUsagePanel(series) {
+  const usage = (series && series.usage) || {};
+  const byModel = usage.by_model && typeof usage.by_model === "object" ? usage.by_model : {};
+  const models = Object.keys(byModel)
+    .map((name) => ({ name, ...(byModel[name] || {}) }))
+    .sort((left, right) => numberValue(right.total_tokens) - numberValue(left.total_tokens));
+  const panel = historyPanel("Tokens by model", "");
+  if (usage.measured === false) return historyEmpty(panel, `Usage ${NO_MEASUREMENT_LABEL}`);
+  if (!models.length) return historyEmpty(panel, "No usage records in this window");
+  const maximum = Math.max(1, ...models.map((entry) => numberValue(entry.total_tokens)));
+  for (const entry of models) {
+    const tokens = numberValue(entry.total_tokens);
+    const priced = numberValue(entry.cost_observed_records) > 0;
+    panel.appendChild(historyBarRow({
+      label: entry.name,
+      value: formatCount(tokens),
+      unit: priced
+        ? `${formatMoney(entry.cost_usd_observed)}${entry.cost_is_lower_bound ? "+" : ""} · ${historyRate(entry.cost_coverage)} priced`
+        : `cost ${NO_MEASUREMENT_LABEL}`,
+      magnitude: tokens,
+      maximum,
+      entity: "other",
+    }));
+  }
+  return panel;
+}
+
+// Series 7. A percentile block is four numbers, not a distribution, so this is
+// a stat row per percentile scaled inside its own panel -- and queue latency
+// and run latency get SEPARATE panels because their scales differ by two
+// orders of magnitude (a 307,237 s queue maximum against a 5,404 s run
+// maximum) and a shared axis would flatten one of them to nothing.
+function historyLatencyPanel(series, population, kind, title) {
+  const latency = (series && series.latency) || {};
+  const block = latency[kind] || {};
+  const scope = population === "all" ? "work_card" : population;
+  const measured = (block.by_population || {})[scope] || {};
+  const panel = historyPanel(
+    `${title} · ${HISTORY_POPULATION_LABEL[scope] || scope}`,
+    String(block.definition || ""),
+  );
+  if (latency.measured === false) return historyEmpty(panel, `Latency ${NO_MEASUREMENT_LABEL}`);
+  if (measured.measured === false) {
+    panel.appendChild(historyBarRow({
+      label: "sample",
+      measured: false,
+      value: NO_MEASUREMENT_LABEL,
+      unit: String(measured.reason || "no observed durations"),
+      magnitude: 0,
+      maximum: 1,
+      entity: "other",
+    }));
+    return panel;
+  }
+  const maximum = Math.max(1, numberValue(measured.max_seconds));
+  for (const [key, label] of [["p50_seconds", "p50"], ["p90_seconds", "p90"], ["p95_seconds", "p95"], ["max_seconds", "max"]]) {
+    panel.appendChild(historyBarRow({
+      label,
+      measured: isMeasured(measured[key]),
+      value: historyDuration(measured[key]),
+      magnitude: numberValue(measured[key]),
+      maximum,
+      entity: "other",
+    }));
+  }
+  panel.appendChild(createElement(
+    "p",
+    "history-panel-note",
+    `${historyExactCount(measured.samples)} sampled durations${(latency.anomalies || {}).note ? ` · ${latency.anomalies.note}` : ""}`,
+  ));
+  return panel;
+}
+
+// Series 8. The story is coverage, not the tiers: risk_tier became a
+// create-time field partway through, so 674 of 1,681 work cards carry none and
+// 2,936 of 2,947 reviewer children carry none. Those cards are IN the
+// composition as an explicit unknown band rather than excluded from the
+// denominator, which is the only way the 59.9% coverage figure stays readable
+// next to the tier counts.
+function historyRiskPanel(series, population) {
+  const risk = (series && series.risk_tier_distribution) || {};
+  const scope = population === "all" ? "work_card" : population;
+  const block = (risk.by_population || {})[scope] || {};
+  const tiers = block.tiers && typeof block.tiers === "object" ? block.tiers : {};
+  const panel = historyPanel(
+    `Risk tier coverage · ${HISTORY_POPULATION_LABEL[scope] || scope}`,
+    String(risk.coverage_note || ""),
+  );
+  if (risk.measured === false) return historyEmpty(panel, `Risk tiers ${NO_MEASUREMENT_LABEL}`);
+  const unknown = numberValue(block.risk_tier_unknown);
+  // Severity order, not count order: the axis of a risk tier is ordinal, and
+  // sorting it by size would put the tier an operator cares most about
+  // wherever this week's counts happen to place it.
+  const ordered = ["critical", "high", "medium", "low"];
+  const extra = Object.keys(tiers).filter((tier) => !ordered.includes(tier)).sort();
+  const rows = [...ordered, ...extra]
+    .filter((tier) => numberValue(tiers[tier]) > 0)
+    .map((tier) => ({ entity: "other", label: tier, count: numberValue(tiers[tier]) }));
+  if (!rows.length && !unknown) return historyEmpty(panel, "No cards in this population");
+  // The cards with no tier are a MEASURED count of an UNKNOWN classification,
+  // so the row carries its real number and the fill carries the unknown
+  // treatment. Leaving them out of the panel would make the tier counts look
+  // like the whole population.
+  if (unknown > 0) rows.push({ entity: "verdict_absent", label: "no tier recorded", count: unknown });
+  // One hue for the tiers: identity is the row label, and five same-sized
+  // swatches would only re-encode what the labels already say. The unknown row
+  // is the one that looks different, because it is the one that is different.
+  const maximum = Math.max(1, ...rows.map((row) => row.count));
+  for (const row of rows) {
+    panel.appendChild(historyBarRow({
+      label: row.label,
+      value: historyExactCount(row.count),
+      unit: "cards",
+      magnitude: row.count,
+      maximum,
+      entity: row.entity,
+    }));
+  }
+  panel.appendChild(createElement(
+    "p",
+    "history-panel-note",
+    `${historyRate(block.coverage)} of ${historyExactCount(block.cards)} cards carry a tier; the rest are ${NO_MEASUREMENT_LABEL}, never defaulted into one`,
+  ));
+  return panel;
+}
+
+// ── The page ───────────────────────────────────────────────────────────────
+function historyPopulation() {
+  const chosen = elements.historyPopulation && elements.historyPopulation.value;
+  return HISTORY_POPULATIONS.includes(String(chosen)) ? String(chosen) : "all";
+}
+
+function renderHistoryPage() {
+  if (!elements.historyBody) return;
+  const body = elements.historyBody;
+  // "Not yet loaded" and "not there" are different sentences. The summary
+  // snapshot never carries history_series, so a page that has not yet seen a
+  // full snapshot says it is loading -- it never asserts an unavailability
+  // nobody measured (NF-2026-00675).
+  if (state.historyState === "pending") {
+    body.replaceChildren(createElement(
+      "div",
+      "history-empty",
+      "Loading the full snapshot. The history series is not carried by the fast summary snapshot.",
+    ));
+    return;
+  }
+  if (state.historyState === "absent") {
+    body.replaceChildren(createElement(
+      "div",
+      "history-empty",
+      "This snapshot carries no history series.",
+    ));
+    return;
+  }
+  const series = state.historySeries;
+  if (!series || typeof series !== "object") {
+    body.replaceChildren(createElement("div", "history-empty", "Loading the full snapshot."));
+    return;
+  }
+  if (series.measured === false) {
+    body.replaceChildren(createElement(
+      "div",
+      "history-empty",
+      `History ${NO_MEASUREMENT_LABEL}: ${String(series.reason || "unknown")}. Unknown is not zero, so nothing is drawn.`,
+    ));
+    return;
+  }
+  const population = historyPopulation();
+  const page = createElement("div", "history-page");
+  page.appendChild(historyOverviewPanel(series));
+  const grid = createElement("div", "history-grid");
+  for (const panel of [
+    historyFailurePanel(series, population),
+    historyEvidencePanel(series),
+    historyDailyOutcomesPanel(series, population),
+    historyDecisionsPanel(series, population),
+    historyRunnerPanel(series, population),
+    historyRejectionDepthPanel(series, population),
+    historyTokensByDayPanel(series),
+    historyTelemetryPanel(series),
+    historyModelUsagePanel(series),
+    historyLatencyPanel(series, population, "queue_latency", "Queue latency"),
+    historyLatencyPanel(series, population, "run_latency", "Run latency"),
+    historyRiskPanel(series, population),
+  ]) {
+    grid.appendChild(panel);
+  }
+  page.appendChild(grid);
+  const footer = createElement("div", "history-provenance");
+  footer.append(
+    createElement("p", "history-panel-note", String(series.population_note || "")),
+    createElement("p", "history-panel-note", String(series.resolution_note || "")),
+    createElement("p", "history-panel-note", `Excluded topics: ${asArray(series.excluded_topics).join(", ") || "none"} · read in ${historyExactCount((series.query_cost || {}).total_ms)} ms across ${historyExactCount((series.query_cost || {}).query_count)} canonical queries`),
+  );
+  page.appendChild(footer);
+  body.replaceChildren(page);
+}
+
+// Called from BOTH snapshot paths, and cheap in both: it stores a reference,
+// writes two strings into the header card and returns. The page itself is
+// rendered only when it is open, so a 30-second refresh never pays for twelve
+// panels nobody is looking at, and the snapshot render never waits on them.
+function applyHistorySnapshot(snapshot) {
+  const fieldState = snapshotFieldState(snapshot, "history_series");
+  if (fieldState === "present") {
+    state.historySeries = snapshot.history_series;
+    state.historyState = "present";
+  } else if (fieldState === "pending") {
+    // A summary refresh must never blank a panel it was never carrying: keep
+    // the last measured series and stay "present".
+    state.historyState = state.historySeries ? "present" : "pending";
+  } else {
+    state.historyState = "absent";
+  }
+  updateHistoryHeader();
+  if (elements.historyDialog && elements.historyDialog.open) renderHistoryPage();
+}
+
+function updateHistoryHeader() {
+  if (!elements.headerHistoryValue || !elements.headerHistoryDetail) return;
+  if (state.historyState === "pending") {
+    elements.headerHistoryValue.textContent = "Loading";
+    elements.headerHistoryDetail.textContent = "not carried by the summary snapshot";
+    return;
+  }
+  if (state.historyState === "absent") {
+    elements.headerHistoryValue.textContent = "No series";
+    elements.headerHistoryDetail.textContent = "this snapshot carries none";
+    return;
+  }
+  const series = state.historySeries || {};
+  if (series.measured === false) {
+    elements.headerHistoryValue.textContent = NO_MEASUREMENT_LABEL;
+    elements.headerHistoryDetail.textContent = String(series.reason || "unknown");
+    return;
+  }
+  const window_ = series.window || {};
+  const events = (series.terminal_composition || {}).events;
+  elements.headerHistoryValue.textContent = `${historyExactCount(window_.observed_days)} days`;
+  elements.headerHistoryDetail.textContent = `${historyExactCount(events)} terminal events`;
+}
+// ═══ HISTORY_PAGE_END ═════════════════════════════════════════════════════
+
 // ── Fixed-enum inbound message handling from the extension host ───────────
 window.addEventListener("message", (event) => {
   const message = event.data;
@@ -5258,6 +6363,22 @@ document.addEventListener("keydown", (event) => {
 elements.openOperations.addEventListener("click", () => {
   if (!elements.operationsDialog.open) elements.operationsDialog.showModal();
 });
+
+// The charts page renders on OPEN, never on snapshot arrival. Twelve panels
+// over 43 days, 6,232 events and 6,511 usage records is real DOM work, and no
+// 30-second dashboard refresh should pay for it while the page is shut.
+function openHistoryDialog() {
+  if (!elements.historyDialog) return;
+  if (!elements.historyDialog.open) elements.historyDialog.showModal();
+  renderHistoryPage();
+}
+
+if (elements.openHistory) elements.openHistory.addEventListener("click", openHistoryDialog);
+if (elements.headerHistory) elements.headerHistory.addEventListener("click", openHistoryDialog);
+// Changing the population changes WHICH series are drawn. It never changes
+// which fill any survivor wears: every fill is keyed by the entity, so the
+// chart does not repaint itself around whoever is left.
+if (elements.historyPopulation) elements.historyPopulation.addEventListener("change", renderHistoryPage);
 
 elements.openSettings.addEventListener("click", () => {
   elements.settingsDialog.showModal();

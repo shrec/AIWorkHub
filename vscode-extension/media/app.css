@@ -3328,3 +3328,316 @@ tbody tr.is-selected td:first-child {
   gap: 8px;
   margin: 0 0 12px;
 }
+
+/* ── History page ─────────────────────────────────────────────────────────
+   The charts page for the eight canonical-store series.
+
+   ONE FILL MAP FOR THE WHOLE PAGE. Every mark -- a stacked segment, a bar, a
+   composition part, a legend swatch, a direct label's rule -- reads the same
+   `--history-fill` custom property, and that property is set by an
+   `entity-*` class keyed to WHAT THE MARK IS, never to where it landed in a
+   sorted list. Filtering the page to one population changes which series are
+   drawn and cannot change the colour of any survivor, because nothing on this
+   page derives a colour from an index.
+
+   The four identity hues and the three-step failure ramp are the ones the
+   palette validator was already run against on this panel surface; this file
+   adds no new hue and generates none.
+
+   THE UNKNOWN TREATMENT. A dashed, unfilled shape means "not measured", and it
+   is the only thing on the page that is drawn without a fill: a gap column's
+   axis segment, an unmeasured rate's track, and the band of cards whose risk
+   tier was never recorded. Solid fill means measured. A reader never has to
+   ask whether an empty space is a zero. */
+.entity-review_ready { --history-fill: var(--outcome-good); }
+.entity-decided { --history-fill: var(--outcome-decided); }
+.entity-validation_failed { --history-fill: var(--outcome-failed); }
+.entity-worker_failed { --history-fill: var(--outcome-failed-2); }
+.entity-run_failed { --history-fill: var(--outcome-failed-3); }
+.entity-blocked { --history-fill: var(--outcome-waiting); }
+.entity-other { --history-fill: var(--outcome-other); }
+/* Not a colour: the absence of one. */
+.entity-unknown { --history-fill: transparent; }
+
+.history-dialog {
+  width: min(1180px, calc(100vw - 32px));
+  max-width: 1180px;
+  height: min(820px, calc(100vh - 40px));
+}
+
+.history-frame {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+}
+
+.history-frame > .dialog-heading { flex: 0 0 auto; }
+
+.history-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.history-population-label {
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+}
+
+/* The page's ONE scroll region. It reserves its gutter so gaining a scrollbar
+   costs no reflow, and contains its paint so its content can never become a
+   second scroll range on the <dialog> above it -- the exact shape that turned
+   the model selector into a mass of scrollbars. */
+.history-body {
+  contain: paint;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 10px;
+}
+
+.history-page { display: grid; gap: 10px; }
+
+.history-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 10px;
+}
+
+.history-panel {
+  container-type: inline-size;
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.history-panel-title { margin: 0 0 2px; font-size: var(--fs-sm); }
+.history-panel-note { margin: 0 0 8px; color: var(--muted); font-size: var(--fs-2xs); }
+.history-empty { padding: 12px 0; color: var(--muted); font-size: var(--fs-xs); }
+
+/* A ruled field, not a row of floating cards: the 1px grid gap shows the field
+   colour through, so the separators cost no border and no shadow. */
+.history-stat-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
+  gap: 1px;
+  background: var(--line);
+}
+
+.history-stat { display: grid; gap: 1px; padding: 8px 10px; background: var(--surface-subtle); }
+.history-stat-label { color: var(--muted); font-size: var(--fs-2xs); }
+.history-stat-value { font-size: var(--fs-md); font-variant-numeric: tabular-nums; }
+.history-stat-detail { color: var(--muted); font-size: var(--fs-2xs); }
+
+/* Stacked columns over a continuous day axis. The axis lives on each column's
+   own stack, so a day with no row carries a DASHED segment of axis under an
+   empty space, and a measured zero carries a SOLID one. That single difference
+   is what keeps "nobody measured this day" from reading as "nothing happened
+   that day". */
+.history-columns {
+  display: flex;
+  height: clamp(130px, 20vh, 200px);
+  align-items: flex-end;
+  gap: clamp(2px, 0.6cqi, 6px);
+  padding: 12px 0 0;
+}
+
+.history-column {
+  container-type: inline-size;
+  display: flex;
+  height: 100%;
+  min-width: 5px;
+  flex: 1 1 0;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-end;
+  gap: 5px;
+}
+
+.history-stack {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  justify-content: flex-end;
+  overflow: hidden;
+  border-bottom: 1px solid color-mix(in srgb, var(--ink) 32%, transparent);
+  border-radius: 3px 3px 0 0;
+}
+
+.history-column.is-gap .history-stack {
+  border-bottom-style: dashed;
+  border-bottom-color: color-mix(in srgb, var(--muted) 90%, transparent);
+}
+
+.history-segment { display: block; flex-shrink: 0; min-height: 0; background: var(--history-fill, var(--outcome-other)); }
+
+/* A 2px surface gap between stacked fills, so two segments that share a folded
+   colour are still countable. box-shadow, not a border or a flex gap: it paints
+   without taking layout space, so a one-pixel segment can never be pushed past
+   the stack it belongs to. */
+.history-segment + .history-segment { box-shadow: inset 0 2px 0 var(--surface-subtle); }
+
+.history-column-label {
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* Selective ticks, not a label under every column: six weeks of columns in a
+   320px panel gives each one about seven pixels, which is not a date. The full
+   date stays on every column's tooltip and accessible name. */
+@container (max-width: 38px) {
+  .history-column-label { visibility: hidden; }
+}
+
+.history-column:nth-child(5n + 1) .history-column-label { visibility: visible; }
+.history-diverging-column:nth-child(5n + 1) .history-column-label { visibility: visible; }
+
+/* Accepted above the axis, rejected below. Same unit, same scale, one chart. */
+.history-diverging {
+  display: flex;
+  height: clamp(140px, 22vh, 210px);
+  align-items: stretch;
+  gap: clamp(2px, 0.6cqi, 6px);
+  padding: 8px 0 0;
+}
+
+.history-diverging-column {
+  container-type: inline-size;
+  display: flex;
+  min-width: 5px;
+  flex: 1 1 0;
+  flex-direction: column;
+}
+
+.history-diverging-up { display: flex; flex: 1 1 50%; align-items: flex-end; }
+
+.history-diverging-down {
+  display: flex;
+  flex: 1 1 50%;
+  align-items: flex-start;
+  border-top: 1px solid color-mix(in srgb, var(--ink) 32%, transparent);
+}
+
+.history-diverging-column.is-gap .history-diverging-down {
+  border-top-style: dashed;
+  border-top-color: color-mix(in srgb, var(--muted) 90%, transparent);
+}
+
+.history-diverging-bar { width: 100%; background: var(--history-fill, var(--outcome-other)); }
+.history-diverging-up .history-diverging-bar { border-radius: 3px 3px 0 0; }
+.history-diverging-down .history-diverging-bar { border-radius: 0 0 3px 3px; }
+
+.history-row { display: grid; gap: 3px; margin-bottom: 8px; }
+
+.history-row-heading {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.history-row-label { overflow: hidden; font-size: var(--fs-xs); text-overflow: ellipsis; white-space: nowrap; }
+.history-row-value { color: var(--ink); font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+/* The qualifier, one step down in both weight and colour from the value. */
+.history-row-unit { margin-left: 6px; color: var(--muted); font-weight: 400; }
+
+.history-row-track {
+  height: 7px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--line) 28%, transparent);
+  border-radius: 999px;
+}
+
+.history-row-fill { display: block; height: 100%; background: var(--history-fill, var(--outcome-other)); border-radius: inherit; }
+
+/* An unmeasured value gets no track fill and no track ground: the dashed
+   outline is the whole mark, and it can never be mistaken for a short bar. */
+.history-row.is-unknown .history-row-track {
+  background: transparent;
+  border: 1px dashed color-mix(in srgb, var(--muted) 90%, transparent);
+}
+
+.history-row-fill.entity-unknown {
+  background: transparent;
+  border: 1px dashed color-mix(in srgb, var(--muted) 90%, transparent);
+}
+
+.history-split { display: flex; height: 100%; overflow: hidden; border-radius: inherit; }
+.history-split-part { display: block; height: 100%; background: var(--history-fill, var(--outcome-other)); }
+.history-split-part + .history-split-part { box-shadow: inset 2px 0 0 var(--surface-subtle); }
+
+.history-composition { display: flex; height: 12px; overflow: hidden; border-radius: 3px; }
+.history-composition-part { display: block; height: 100%; background: var(--history-fill, var(--outcome-other)); }
+.history-composition-part + .history-composition-part { box-shadow: inset 2px 0 0 var(--surface-subtle); }
+
+.history-composition-part.entity-unknown {
+  background: transparent;
+  border: 1px dashed color-mix(in srgb, var(--muted) 90%, transparent);
+}
+
+/* The legend is the chart's table view, not a colour key: one row per entity,
+   with its own name, count and share, so identity survives greyscale, colour
+   blindness and a screen reader. */
+.history-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  max-width: 100%;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+}
+
+.history-legend-item { display: inline-flex; flex: 0 1 auto; max-width: 100%; align-items: baseline; gap: 5px; }
+.history-legend-item i { width: 8px; height: 8px; align-self: center; flex-shrink: 0; background: var(--history-fill, var(--outcome-other)); border-radius: 2px; }
+.history-legend-item.entity-unknown i { background: transparent; border: 1px dashed var(--muted); }
+.history-legend-item b { color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 600; }
+.history-legend-share { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.history-direct-labels { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 5px; font-size: var(--fs-2xs); }
+.history-direct-label { display: inline-flex; align-items: baseline; gap: 5px; color: var(--muted); }
+.history-direct-label::before { content: ""; width: 10px; height: 3px; align-self: center; background: var(--history-fill, var(--outcome-other)); }
+.history-direct-label.entity-unknown::before { height: 0; background: transparent; border-top: 1px dashed var(--muted); }
+
+.history-axis-labels { display: flex; justify-content: space-between; margin-top: 4px; font-size: var(--fs-2xs); }
+.history-axis-label { display: inline-flex; align-items: baseline; gap: 5px; color: var(--muted); }
+.history-axis-label::before { content: ""; width: 8px; height: 8px; align-self: center; background: var(--history-fill, var(--outcome-other)); border-radius: 2px; }
+
+/* The baseline outcome, collapsed to one line: present, countable, and given
+   no more room than the part of the picture that needs no action deserves. */
+.history-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  margin-top: 4px;
+  padding-top: 9px;
+  align-items: baseline;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+}
+
+.history-footer i { width: 8px; height: 8px; align-self: center; background: var(--history-fill, var(--outcome-other)); border-radius: 2px; }
+.history-footer b { color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 600; }
+.history-gap-note { margin: 6px 0 0; }
+
+.history-provenance {
+  display: grid;
+  gap: 4px;
+  padding: 8px 12px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.history-provenance .history-panel-note { margin: 0; }
