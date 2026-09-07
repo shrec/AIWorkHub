@@ -1222,6 +1222,215 @@ def test_write_connection_excludes_another_process(tmp_path: Path) -> None:
     assert outcome == "timed_out"
 
 
+# --------------------------------------------------------------------------
+# Every canonical write path takes the lease
+# --------------------------------------------------------------------------
+# The five terminal-transition helpers were leased first because they carried
+# all 549 measured lock events.  These ten are the remaining writers on the
+# canonical database.  They were left unleased on purpose while the evidence
+# named only the terminal transitions; they are leased now because leaving a
+# writer outside the queue reintroduces exactly the aggregate ``busy_timeout``
+# exhaustion the lease removes -- no single long holder is needed, twelve short
+# ones are enough.  ``append_live_usage_event`` is the one that would have gone
+# next on its own: it is called from ``process_launcher`` once per provider
+# turn, which is the highest write rate in the system and the same supervisor
+# process population that produced the measured events.
+
+_LEASED_CANONICAL_WRITE_PATHS = (
+    "archive_task",
+    "restore_task",
+    "force_terminalize",
+    "retry_finalize_failed",
+    "recover_blocked_rework",
+    "reconcile_dead_processing_claim",
+    "repair_archive_inconsistencies",
+    "enqueue_terminal_callback",
+    "append_usage_capture_event",
+    "append_live_usage_event",
+)
+
+
+def _canonical_write_call(name: str, repo: Path):
+    """One invocation per write path that reaches its write connection.
+
+    Each reaches the connection and stops at its own guard, so the probe
+    observes the lease without depending on a fixture for ten different
+    lifecycle states -- the guards themselves are pinned by their own tests.
+    """
+    usage_note = "task_mcp_request:" + "0" * 32
+    calls = {
+        "archive_task": lambda: task_store.archive_task(repo, "T_LEASE_PROBE"),
+        "restore_task": lambda: task_store.restore_task(repo, "T_LEASE_PROBE"),
+        "force_terminalize": lambda: task_store.force_terminalize(
+            repo, "T_LEASE_PROBE", reason="lease probe"
+        ),
+        "retry_finalize_failed": lambda: task_store.retry_finalize_failed(
+            repo, "T_LEASE_PROBE", runner="codex_worker_b891", request_id="req-lease"
+        ),
+        "recover_blocked_rework": lambda: task_store.recover_blocked_rework(
+            repo, "T_LEASE_PROBE"
+        ),
+        "reconcile_dead_processing_claim": (
+            lambda: task_store.reconcile_dead_processing_claim(
+                repo,
+                "T_LEASE_PROBE",
+                request_id="req-lease",
+                claim_epoch=1,
+                terminal_evidence={"state": "terminal_blocked"},
+                actor="reconciler",
+            )
+        ),
+        "repair_archive_inconsistencies": (
+            lambda: task_store.repair_archive_inconsistencies(repo)
+        ),
+        "enqueue_terminal_callback": lambda: task_store.enqueue_terminal_callback(
+            repo, "T_LEASE_PROBE", substatus="finalize_failed"
+        ),
+        "append_usage_capture_event": lambda: task_store.append_usage_capture_event(
+            repo,
+            "T_LEASE_PROBE",
+            "codex_worker_b891",
+            {"note": usage_note, "source": "task_mcp_launcher"},
+        ),
+        "append_live_usage_event": lambda: task_store.append_live_usage_event(
+            repo,
+            "T_LEASE_PROBE",
+            "codex_worker_b891",
+            request_id="req-lease",
+            claimed_by="codex_worker_b891",
+            claim_epoch=1,
+            payload={},
+        ),
+    }
+    return calls[name]
+
+
+@pytest.mark.parametrize("path_name", _LEASED_CANONICAL_WRITE_PATHS)
+def test_canonical_write_path_takes_the_lease_before_it_connects(
+    path_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two separate claims, both of which a regression can break on its own:
+
+    * the lease is taken at all, on the canonical database; and
+    * the write connection is opened INSIDE it -- ``_connect`` issues
+      ``PRAGMA journal_mode=WAL``, itself a write that can fail on a lock, so a
+      connection opened before the lease leaves the first statement of the
+      write path unserialized.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _insert_task(repo, "T_LEASE_PROBE", status="pending")
+    _readiness, db_path = task_store._require_ready(repo)
+
+    order: list[tuple[str, str]] = []
+    real_lease = task_store.db_writer.write_lease
+    real_connect = task_store._connect
+
+    import contextlib as _contextlib
+
+    @_contextlib.contextmanager
+    def traced_lease(path, **kwargs):  # type: ignore[no-untyped-def]
+        order.append(("lease", str(path)))
+        with real_lease(path, **kwargs) as receipt:
+            yield receipt
+
+    def traced_connect(path, **kwargs):  # type: ignore[no-untyped-def]
+        if not kwargs.get("readonly"):
+            order.append(("connect", str(path)))
+        return real_connect(path, **kwargs)
+
+    monkeypatch.setattr(task_store.db_writer, "write_lease", traced_lease)
+    monkeypatch.setattr(task_store, "_connect", traced_connect)
+
+    _canonical_write_call(path_name, repo)()
+
+    assert ("lease", str(db_path)) in order, (
+        f"{path_name} wrote the canonical store without taking the write lease: {order}"
+    )
+    assert any(
+        order[index] == ("lease", str(db_path))
+        and index + 1 < len(order)
+        and order[index + 1] == ("connect", str(db_path))
+        for index in range(len(order))
+    ), f"{path_name} opened its write connection outside the lease: {order}"
+
+
+def test_the_write_lease_is_re_entrant_on_one_thread_and_path(tmp_path: Path) -> None:
+    """``db_writer`` documents the lease as re-entrant per (thread, path).
+
+    Verified here rather than trusted: if it were not, any future nesting of
+    two leased canonical helpers would self-deadlock for the whole bounded
+    timeout instead of proceeding.  The receipt must also SAY it was
+    re-entrant, because that is what distinguishes a nested acquisition from a
+    second lease taken after a lost release.
+    """
+    database = tmp_path / "task.sqlite"
+
+    with task_store.db_writer.write_lease(database) as outer:
+        assert outer["reentrant"] is False
+        with task_store.db_writer.write_lease(database, timeout_s=0.05) as inner:
+            assert inner["reentrant"] is True
+            assert inner["waited_s"] == 0.0
+
+    # The nested exit released only its own depth: a fresh acquisition after
+    # the block is a first acquisition again, not a still-held one.
+    with task_store.db_writer.write_lease(database, timeout_s=0.05) as after:
+        assert after["reentrant"] is False
+
+
+def test_nested_write_connections_on_one_path_do_not_deadlock(tmp_path: Path) -> None:
+    """No leased canonical helper calls another today, and this is what keeps
+    that from becoming a latent deadlock: nesting ``_write_connection`` on one
+    path from one thread proceeds, and both connections work."""
+    database = tmp_path / "task.sqlite"
+
+    with task_store._write_connection(database) as outer:
+        outer.execute("CREATE TABLE IF NOT EXISTS probe(id INTEGER PRIMARY KEY)")
+        with task_store._write_connection(database, timeout_s=1.0) as inner:
+            assert inner is not outer
+            inner.execute("INSERT INTO probe(id) VALUES (1)")
+            inner.commit()
+
+    check = sqlite3.connect(database)
+    try:
+        assert check.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 1
+    finally:
+        check.close()
+
+
+def test_a_nested_write_transaction_fails_loudly_instead_of_hanging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The honest limit of the re-entrant lease, pinned so it cannot be
+    mistaken for full re-entrancy.
+
+    The LEASE is re-entrant; SQLite's writer lock is not.  A nested
+    ``_write_connection`` whose outer connection already holds an open write
+    transaction is a second writer on the same database, and it surfaces as a
+    bounded ``database is locked`` -- never as a silent hang, and never as an
+    unserialized write.  This is why every leased helper opens exactly one
+    write connection, and why a future one that nests must join the outer
+    transaction rather than open its own.
+    """
+    real_connect = task_store._connect
+
+    def impatient_connect(path, **kwargs):  # type: ignore[no-untyped-def]
+        # Bounded so the proof costs milliseconds; the store's own 5000ms
+        # default would make this test a five-second sleep.
+        kwargs.setdefault("busy_timeout_ms", 50)
+        return real_connect(path, **kwargs)
+
+    monkeypatch.setattr(task_store, "_connect", impatient_connect)
+    database = tmp_path / "task.sqlite"
+
+    with task_store._write_connection(database) as outer:
+        task_store._begin_immediate(outer)
+        outer.execute("CREATE TABLE IF NOT EXISTS probe(id INTEGER PRIMARY KEY)")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            with task_store._write_connection(database, timeout_s=1.0) as inner:
+                task_store._begin_immediate(inner)
+
+
 def test_mark_terminal_review_runs_inside_an_explicit_write_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -155,7 +155,7 @@ def test_reconcile_card_json_preimage_swap_fails_without_mutation(tmp_path, monk
         def __getattr__(self, name):
             return getattr(conn, name)
 
-    def connect(_db, *, readonly=False):
+    def connect(_db, *, readonly=False, **kwargs):
         if readonly:
             return real_connect(_db, readonly=True)
         return ConcurrentSwapConnection()
@@ -191,7 +191,7 @@ def test_reconcile_unrelated_operational_error_remains_write_failure(
         def __getattr__(self, name):
             return getattr(conn, name)
 
-    def connect(_db, *, readonly=False):
+    def connect(_db, *, readonly=False, **kwargs):
         if readonly:
             return real_connect(_db, readonly=True)
         return FailingConnection()
@@ -238,7 +238,7 @@ def test_reconcile_unrelated_wal_writer_remains_write_failure(
         def __getattr__(self, name):
             return getattr(conn, name)
 
-    def connect(_db, *, readonly=False):
+    def connect(_db, *, readonly=False, **kwargs):
         if readonly:
             return real_connect(_db, readonly=True)
         return UnrelatedWriterConnection()

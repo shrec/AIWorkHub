@@ -1354,8 +1354,15 @@ def archive_task(
     """
     _readiness, db_path = _require_ready(root)
     terminal_status = "superseded" if operation == "superseded" else "archived"
-    conn = _connect(db_path)
-    try:
+    # Serialized on the same lease as the terminal transitions. Reachable from
+    # four separate process classes -- the CLI (``core``), the dashboard MCP
+    # server, ``task_engine`` and ``task_retention`` -- so its contention is
+    # cross-process, not merely cross-thread. ``_begin_immediate`` puts the
+    # disposal guards (reservation held, canonical processing) in the SAME
+    # transaction as the preimage-guarded UPDATE that acts on them; the guards
+    # themselves are untouched, and the ``WHERE`` clause remains the authority.
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
         row = conn.execute(
             "SELECT status, worker_status, archived_at, card_json, started_at "
             "FROM tasks WHERE task_id=?",
@@ -1468,8 +1475,6 @@ def archive_task(
         ):
             return False, "archive_not_persisted"
         return True, operation
-    finally:
-        conn.close()
 
 
 def reconcile_dead_processing_claim(
@@ -1485,110 +1490,115 @@ def reconcile_dead_processing_claim(
     if not request_id or not _is_bool_safe_int(claim_epoch):
         return False, "reconcile_identity_invalid"
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
-        # Establish a read snapshot without reserving the writer slot. The
-        # card_json predicate then remains the write authority: a competing
-        # authenticated update either makes the CAS miss or makes this stale
-        # WAL snapshot fail with SQLITE_BUSY/SQLITE_LOCKED.
-        conn.execute("BEGIN")
-        row = conn.execute(
-            "SELECT status, worker_status, card_json FROM tasks WHERE task_id=?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return False, "task_not_found"
-        raw_card_json = row["card_json"]
+    # Serialized on the same lease as the terminal transitions. The
+    # reconciler is its own long-lived process racing live supervisors for
+    # the same row, which is the cross-process shape the lease exists for.
+    # The DEFERRED ``BEGIN`` below is kept exactly as it was: the lease
+    # excludes other LEASED writers, while ``task_engine``'s unleased sites
+    # can still invalidate this snapshot, so the BUSY/LOCKED verification
+    # path stays reachable and stays the write authority.
+    with _write_connection(db_path) as conn:
         try:
-            card = json.loads(str(raw_card_json or "{}"))
-        except json.JSONDecodeError:
-            return False, "card_json_invalid"
-        if not isinstance(card, dict):
-            return False, "card_json_invalid"
-        prior = card.get("dead_process_reconciliation")
-        if isinstance(prior, Mapping):
-            if (str(prior.get("request_id") or "") == request_id
-                    and prior.get("claim_epoch") == claim_epoch):
-                return True, "already_reconciled"
-            return False, "reconcile_identity_mismatch"
-        if canonical_status(dict(row)) != "processing" or str(row["worker_status"] or "") != "claimed":
-            return False, "task_not_processing_claimed"
-        if str(card.get("launch_request_id") or "") != request_id:
-            return False, "request_id_mismatch"
-        if card.get("claim_epoch") != claim_epoch:
-            return False, "claim_epoch_mismatch"
-        now = datetime.now(timezone.utc).isoformat()
-        evidence = dict(terminal_evidence)
-        terminal_error = evidence.get("error")
-        reason = (
-            terminal_error[:500]
-            if isinstance(terminal_error, str) and terminal_error
-            else str(evidence.get("state") or "terminal_blocked")[:500]
-        )
-        card["dead_process_reconciliation"] = {
-            "request_id": request_id, "claim_epoch": claim_epoch,
-            "reason": reason,
-            "evidence": evidence, "reconciled_at": now,
-        }
-        card["terminal_substatus"] = "dead_process_reconciled"
-        card["blocker_reason"] = card["dead_process_reconciliation"]["reason"]
-        card["status"] = "blocked"
-        card["worker_status"] = "blocked"
-        card["claimed_by"] = ""
-        card.pop("launch_request_id", None)
-        try:
-            cur = conn.execute(
-                "UPDATE tasks SET status='blocked', worker_status='blocked', claimed_by=NULL, "
-                "claimed_at=NULL, completed_at=?, updated_at=?, card_json=? "
-                "WHERE task_id=? AND status=? AND worker_status='claimed' AND card_json=?",
-                (
-                    now, now, json.dumps(card, ensure_ascii=False, sort_keys=True),
-                    task_id, str(row["status"]), raw_card_json,
-                ),
+            # Establish a read snapshot without reserving the writer slot. The
+            # card_json predicate then remains the write authority: a competing
+            # authenticated update either makes the CAS miss or makes this stale
+            # WAL snapshot fail with SQLITE_BUSY/SQLITE_LOCKED.
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT status, worker_status, card_json FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False, "task_not_found"
+            raw_card_json = row["card_json"]
+            try:
+                card = json.loads(str(raw_card_json or "{}"))
+            except json.JSONDecodeError:
+                return False, "card_json_invalid"
+            if not isinstance(card, dict):
+                return False, "card_json_invalid"
+            prior = card.get("dead_process_reconciliation")
+            if isinstance(prior, Mapping):
+                if (str(prior.get("request_id") or "") == request_id
+                        and prior.get("claim_epoch") == claim_epoch):
+                    return True, "already_reconciled"
+                return False, "reconcile_identity_mismatch"
+            if canonical_status(dict(row)) != "processing" or str(row["worker_status"] or "") != "claimed":
+                return False, "task_not_processing_claimed"
+            if str(card.get("launch_request_id") or "") != request_id:
+                return False, "request_id_mismatch"
+            if card.get("claim_epoch") != claim_epoch:
+                return False, "claim_epoch_mismatch"
+            now = datetime.now(timezone.utc).isoformat()
+            evidence = dict(terminal_evidence)
+            terminal_error = evidence.get("error")
+            reason = (
+                terminal_error[:500]
+                if isinstance(terminal_error, str) and terminal_error
+                else str(evidence.get("state") or "terminal_blocked")[:500]
             )
-        except sqlite3.OperationalError as exc:
-            error_code = getattr(exc, "sqlite_errorcode", None)
-            if (
-                isinstance(error_code, int)
-                and error_code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
-            ):
-                conn.rollback()
-                # BUSY/LOCKED can be caused by any writer invalidating this
-                # deferred transaction's WAL snapshot.  It proves a CAS
-                # conflict only when a fresh snapshot shows that this exact
-                # target's authenticated preimage drifted.
-                verify = _connect(db_path, readonly=True)
-                try:
-                    current = verify.execute(
-                        "SELECT status, worker_status, card_json "
-                        "FROM tasks WHERE task_id=?",
-                        (task_id,),
-                    ).fetchone()
-                finally:
-                    verify.close()
+            card["dead_process_reconciliation"] = {
+                "request_id": request_id, "claim_epoch": claim_epoch,
+                "reason": reason,
+                "evidence": evidence, "reconciled_at": now,
+            }
+            card["terminal_substatus"] = "dead_process_reconciled"
+            card["blocker_reason"] = card["dead_process_reconciliation"]["reason"]
+            card["status"] = "blocked"
+            card["worker_status"] = "blocked"
+            card["claimed_by"] = ""
+            card.pop("launch_request_id", None)
+            try:
+                cur = conn.execute(
+                    "UPDATE tasks SET status='blocked', worker_status='blocked', claimed_by=NULL, "
+                    "claimed_at=NULL, completed_at=?, updated_at=?, card_json=? "
+                    "WHERE task_id=? AND status=? AND worker_status='claimed' AND card_json=?",
+                    (
+                        now, now, json.dumps(card, ensure_ascii=False, sort_keys=True),
+                        task_id, str(row["status"]), raw_card_json,
+                    ),
+                )
+            except sqlite3.OperationalError as exc:
+                error_code = getattr(exc, "sqlite_errorcode", None)
                 if (
-                    current is None
-                    or str(current["status"]) != str(row["status"])
-                    or str(current["worker_status"]) != str(row["worker_status"])
-                    or current["card_json"] != raw_card_json
+                    isinstance(error_code, int)
+                    and error_code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
                 ):
-                    return False, "reconcile_write_conflict"
-            raise
-        if cur.rowcount != 1:
+                    conn.rollback()
+                    # BUSY/LOCKED can be caused by any writer invalidating this
+                    # deferred transaction's WAL snapshot.  It proves a CAS
+                    # conflict only when a fresh snapshot shows that this exact
+                    # target's authenticated preimage drifted.
+                    verify = _connect(db_path, readonly=True)
+                    try:
+                        current = verify.execute(
+                            "SELECT status, worker_status, card_json "
+                            "FROM tasks WHERE task_id=?",
+                            (task_id,),
+                        ).fetchone()
+                    finally:
+                        verify.close()
+                    if (
+                        current is None
+                        or str(current["status"]) != str(row["status"])
+                        or str(current["worker_status"]) != str(row["worker_status"])
+                        or current["card_json"] != raw_card_json
+                    ):
+                        return False, "reconcile_write_conflict"
+                raise
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False, "reconcile_write_conflict"
+            conn.execute(
+                "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) VALUES(?,?,?,?,?)",
+                (task_id, "dead_process_reconciled", actor,
+                 json.dumps(card["dead_process_reconciliation"], sort_keys=True), now),
+            )
+            conn.commit()
+            return True, "reconciled"
+        except Exception as exc:  # noqa: BLE001
             conn.rollback()
-            return False, "reconcile_write_conflict"
-        conn.execute(
-            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) VALUES(?,?,?,?,?)",
-            (task_id, "dead_process_reconciled", actor,
-             json.dumps(card["dead_process_reconciliation"], sort_keys=True), now),
-        )
-        conn.commit()
-        return True, "reconciled"
-    except Exception as exc:  # noqa: BLE001
-        conn.rollback()
-        return False, f"reconcile_write_failed:{type(exc).__name__}"
-    finally:
-        conn.close()
+            return False, f"reconcile_write_failed:{type(exc).__name__}"
 
 
 _ARCHIVE_AUDIT_EVENTS: frozenset[str] = frozenset({"archived", "superseded"})
@@ -1899,8 +1909,14 @@ def repair_archive_inconsistencies(
     half_restored = [item for item in scanned if item["kind"] == "half_restored"]
 
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
+    # Serialized on the same lease as the terminal transitions. This is the
+    # longest-holding writer in the module -- one transaction spanning an
+    # UPDATE and an event INSERT per reconciled row -- so under contention it
+    # is the holder most able to push other waiters past their busy_timeout,
+    # and the one that most needs other writers to take turns behind it rather
+    # than race it. The lease is taken here; the transaction opens later, at
+    # the first write.
+    with _write_connection(db_path) as conn:
         pinned_request_ids = _rework_pinned_predecessor_request_ids(conn)
         reconcilable: list[dict[str, Any]] = []
         excluded_no_archive_event: list[str] = []
@@ -1955,6 +1971,11 @@ def repair_archive_inconsistencies(
 
         repaired: list[str] = []
         skipped_conflict: list[str] = []
+        # Opened HERE, not at the top of the block: the classification above is
+        # read-only and the ``dry_run``/nothing-to-do exits must not have held a
+        # write transaction. From this point the whole repair is one
+        # transaction, which is the contract this function states.
+        _begin_immediate(conn)
         for item in reconcilable:
             task_id = item["task_id"]
             now = datetime.now(timezone.utc).isoformat()
@@ -2002,8 +2023,6 @@ def repair_archive_inconsistencies(
                 verified.append(task_id)
             else:
                 reverted.append(task_id)
-    finally:
-        conn.close()
 
     metrics_after = archive_inconsistency_report(root)
     return {
@@ -2066,8 +2085,14 @@ def force_terminalize(
     exhausted means terminal, not another attempt.
     """
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
+    # Serialized on the same lease as the terminal transitions it stands in
+    # for. This is the manual exit a finalizer takes when its retries are
+    # exhausted -- i.e. exactly when the store is contended -- so it must not
+    # be the one write that still races. ``_begin_immediate`` keeps the
+    # already-terminal idempotence check and the preimage CAS that enforces it
+    # inside one transaction.
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
         row = conn.execute(
             "SELECT status, worker_status, archived_at, card_json FROM tasks WHERE task_id=?",
             (task_id,),
@@ -2139,8 +2164,6 @@ def force_terminalize(
         if stored is None or canonical_status({"status": str(stored["status"] or "")}) != "blocked":
             return False, "force_terminalize_not_persisted"
         return True, "blocked"
-    finally:
-        conn.close()
 
 
 # The canonical callback-delivery classes an atomic terminal enqueue may write.
@@ -3184,8 +3207,15 @@ def enqueue_terminal_callback(
         if episode is None:
             return False
         _readiness, db_path = _require_ready(root)
-        conn = _connect(db_path)
-        try:
+        # Serialized on the same lease as the terminal transition this callback
+        # is owed for. Deliberately WITHOUT ``_begin_immediate``:
+        # ``callback_store.enqueue_callback`` owns the transaction on the
+        # connection it is handed -- it commits and rolls back itself, and
+        # ``append_event`` runs after that commit -- so an outer transaction
+        # here would give one connection two transaction owners. Under the
+        # ``explicit_txn`` connection its INSERT and that event stay two
+        # single-statement transactions, exactly the grouping they already had.
+        with _write_connection(db_path) as conn:
             callback_store.init_db(conn)
             origin_thread_id = (
                 callback_store.read_origin_thread(conn, task_id)
@@ -3202,9 +3232,13 @@ def enqueue_terminal_callback(
             )
             conn.commit()
             return bool(enqueued)
-        finally:
-            conn.close()
-    except (TaskStoreError, sqlite3.Error):
+    except (TaskStoreError, sqlite3.Error, db_writer.WriteLeaseTimeout):
+        # ``WriteLeaseTimeout`` is contained with the SQLite errors on purpose:
+        # it is the lease's typed spelling of exactly this world -- the row
+        # could not be written YET -- and letting it escape would turn a
+        # contained contention report into an exception out of a function whose
+        # whole contract is that a callback which could not be written never
+        # displaces the terminal transition that was.
         # ``sqlite3.OperationalError("database is locked")`` is the ordinary
         # shape of a contended store and is no more evidence about the claim
         # than an unreadable one; both are reported as "not written yet".
@@ -3442,8 +3476,14 @@ def retry_finalize_failed(
     ordinary product/test failures remain terminal and require rework.
     """
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
+    # Serialized on the same lease as the terminal transitions it reverses: it
+    # is the coordinator's re-entry into an episode a supervisor process just
+    # terminalized, so the two write the same row from different processes.
+    # ``_begin_immediate`` keeps the whole eligibility check -- runner, status,
+    # request id, terminal record and evidence -- inside the transaction whose
+    # ``card_json`` CAS enforces it.
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
         row = conn.execute(
             "SELECT runner, status, worker_status, claimed_by, card_json "
             "FROM tasks WHERE task_id=?",
@@ -3544,8 +3584,6 @@ def retry_finalize_failed(
         )
         conn.commit()
         return True, "processing"
-    finally:
-        conn.close()
 
 
 def recover_blocked_rework(
@@ -3595,8 +3633,15 @@ def recover_blocked_rework(
     authorization once when its predecessor is demonstrably missing.
     """
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
+    # Serialized on the same lease as the terminal transitions. Its four
+    # ``conn.commit()`` calls are MUTUALLY EXCLUSIVE branch exits, not four
+    # sequential transactions -- every one is immediately followed by a
+    # ``return`` -- so a single ``_begin_immediate`` here reproduces each
+    # branch's one-transaction semantics exactly. The only filesystem work
+    # done under it is path resolution and ``exists()`` stats; nothing spawns
+    # a subprocess, so the hold stays on the order of the SQLite work.
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
         row = conn.execute(
             "SELECT task_id, runner, topic, status, worker_status, claimed_by, "
             "claimed_at, card_json FROM tasks WHERE task_id=?",
@@ -4575,8 +4620,6 @@ def recover_blocked_rework(
         )
         conn.commit()
         return True, "recovered"
-    finally:
-        conn.close()
 
 
 def _latest_archive_preimage(conn: Any, task_id: str) -> dict[str, str] | None:
@@ -4655,8 +4698,15 @@ def restore_task(
       the row in a state the schema says is impossible.
     """
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
+    # Serialized on the same lease as ``archive_task``, whose exact inverse this
+    # is: both are reachable from the CLI, the dashboard MCP server, the task
+    # engine and retention -- four separate process classes -- so they contend
+    # across processes, not merely across threads. ``_begin_immediate`` puts the
+    # preimage SELECT, the ``_latest_archive_preimage`` lookup and the guarded
+    # UPDATE in one transaction, so the preimage this restore reverses cannot
+    # have been rewritten between reading it and using it.
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
         row = conn.execute(
             "SELECT status, worker_status, archived_at, card_json FROM tasks WHERE task_id=?",
             (task_id,),
@@ -4751,8 +4801,6 @@ def restore_task(
         ):
             return False, "restore_not_persisted"
         return True, "restored"
-    finally:
-        conn.close()
 
 
 def get_task_events(root: str | Path, task_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -4827,8 +4875,15 @@ def append_usage_capture_event(
         "terminal_log_backfill",
     }:
         return False, "usage_capture_source_invalid"
-    conn = _connect(db_path)
-    try:
+    # Serialized on the same lease as the live usage writer it reconciles
+    # against: terminal-log backfill runs from a maintenance process while
+    # supervisors are still writing, so the two reach this table concurrently
+    # from different processes. ``_begin_immediate`` also puts the
+    # already-recorded probe and the INSERT it guards in ONE transaction --
+    # under the driver's implicit handling the transaction opened only at the
+    # INSERT, leaving the idempotence check outside the write it protects.
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
         task = conn.execute(
             "SELECT runner FROM tasks WHERE task_id=?", (task_id,)
         ).fetchone()
@@ -4856,8 +4911,6 @@ def append_usage_capture_event(
         )
         conn.commit()
         return True, "recorded"
-    finally:
-        conn.close()
 
 
 def _bool_safe_positive_int(value: Any) -> bool:
@@ -4897,9 +4950,15 @@ def append_live_usage_event(
         return False, "usage_live_request_spoof"
 
     _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    # The highest-frequency canonical writer: one row per provider turn, from
+    # the same supervisor process population that produced the measured lock
+    # class (``process_launcher`` records usage in-line with the launch it
+    # supervises). It also holds the writer slot across every identity check
+    # and the ``json_extract`` idempotence probe below, so it is the next
+    # aggregate ``busy_timeout`` exhaustion waiting to happen. Serialized on
+    # the same lease as the terminal transitions; see ``_write_connection``.
+    with _write_connection(db_path) as conn:
+        _begin_immediate(conn)
         # archived_at is part of the lifecycle: canonical_status reads it FIRST
         # and it was never selected, so an archived card could not be
         # recognised as archived here at all. The check that excluded closed
@@ -4985,8 +5044,6 @@ def append_live_usage_event(
         )
         conn.commit()
         return True, "recorded"
-    finally:
-        conn.close()
 
 
 def manager_decision_counts(root: str | Path) -> dict[str, Any]:

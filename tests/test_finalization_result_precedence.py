@@ -605,6 +605,25 @@ _RETENTION_FIELDS = {
 }
 
 
+def _retention_census_modules(primary_tree: ast.AST):
+    """Every module holding ``ProcessManager`` retention call sites.
+
+    ``accept_review`` was extracted out of ``process_launcher`` into its own
+    module; its two retention constructions went with it.  The guarantee is
+    about the code, not about one file, so the census follows the code.  A
+    further extraction adds its module here.
+    """
+    from aiworkhub import process_launcher_accept_review
+
+    yield "process_launcher", primary_tree, True
+    for module in (process_launcher_accept_review,):
+        yield (
+            module.__name__.rsplit(".", 1)[-1],
+            ast.parse(Path(module.__file__).read_text(encoding="utf-8")),
+            False,
+        )
+
+
 def test_every_retention_event_is_single_sourced_through_the_constructor():
     """Structural guarantee, not a remembered one: the disposition vocabulary
     lives in ONE constructor, and every ``_append_event`` carrying a retention
@@ -631,26 +650,33 @@ def test_every_retention_event_is_single_sourced_through_the_constructor():
     ))
     assert kw_defaults["disposition"] is None, "disposition must have no default"
 
-    def _inside_ctor(node: ast.AST) -> bool:
-        return ctor.lineno <= node.lineno <= ctor.end_lineno
+    def _inside_ctor(node: ast.AST, *, primary: bool) -> bool:
+        # Only ``process_launcher`` holds the constructor, so a same-numbered
+        # line in an extracted module is never "inside" it.
+        return primary and ctor.lineno <= node.lineno <= ctor.end_lineno
 
-    offenders: list[int] = []
+    offenders: list[str] = []
     retention_event_calls = 0
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
-            continue
-        if node.func.attr == "_retention_event":
-            retention_event_calls += 1
-            continue
-        if node.func.attr != "_append_event":
-            continue
-        if not (node.args and isinstance(node.args[0], ast.Dict)):
-            continue
-        literal_keys = {
-            key.value for key in node.args[0].keys if isinstance(key, ast.Constant)
-        }
-        if literal_keys & _RETENTION_FIELDS and not _inside_ctor(node):
-            offenders.append(node.lineno)
+    for module, module_tree, primary in _retention_census_modules(tree):
+        for node in ast.walk(module_tree):
+            if not (
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            ):
+                continue
+            if node.func.attr == "_retention_event":
+                retention_event_calls += 1
+                continue
+            if node.func.attr != "_append_event":
+                continue
+            if not (node.args and isinstance(node.args[0], ast.Dict)):
+                continue
+            literal_keys = {
+                key.value for key in node.args[0].keys if isinstance(key, ast.Constant)
+            }
+            if literal_keys & _RETENTION_FIELDS and not _inside_ctor(
+                node, primary=primary
+            ):
+                offenders.append(f"{module}:{node.lineno}")
 
     assert offenders == [], (
         "these _append_event calls carry a retention field but bypass "

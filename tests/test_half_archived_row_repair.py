@@ -123,16 +123,25 @@ class _ConnProxy:
 
     def rollback(self) -> None:
         self._inner.rollback()
-
     def close(self) -> None:
+        self._inner.close()
+
+    def __getattr__(self, name: str):
+        # ``in_transaction`` in particular: the leased write paths ask the real
+        # connection whether a transaction is already open before issuing
+        # BEGIN IMMEDIATE, so a proxy that answered for itself would report the
+        # wrong transaction state to the code under test.
+        return getattr(self._inner, name)
         self._inner.close()
 
 
 def _patch_write_connection(monkeypatch, proxy_cls) -> None:
     real_connect = task_store._connect
 
-    def fake_connect(path, *, readonly: bool = False):
-        conn = real_connect(path, readonly=readonly)
+    def fake_connect(path, *, readonly: bool = False, **kwargs):
+        # ``explicit_txn`` must be forwarded, not dropped: the leased write
+        # paths open their connection with it and state their own transaction.
+        conn = real_connect(path, readonly=readonly, **kwargs)
         if readonly:
             return conn
         return proxy_cls(conn)
