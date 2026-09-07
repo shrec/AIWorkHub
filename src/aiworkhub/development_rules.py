@@ -187,6 +187,7 @@ class DevelopmentRulesManifest:
     languages: tuple[str, ...]
     rules: tuple[DevelopmentRule, ...]
     os_dependency_boundary: "OSDependencyBoundary | None" = None
+    single_definition_boundary: "SingleDefinitionBoundary | None" = None
 
 
 OS_DEPENDENCY_PATTERN_IDENTITIES = (
@@ -218,6 +219,39 @@ class OSDependencyBoundary:
     reference_total: int
     current_total: int
     accepted_predecessor_delta: int
+
+
+# The forbidden tokens of the ``single_definition`` rule that this repository has
+# an executable detector for. ``restated_vocabulary`` and ``two_predicates_one_policy``
+# are the other two the rule forbids; they are detected by identity assertions
+# over named objects rather than by a tree-wide scan, so they carry no ratchet.
+SINGLE_DEFINITION_PATTERN_IDENTITIES = ("copied_helper", "parallel_implementation")
+
+
+@dataclass(frozen=True, slots=True)
+class SingleDefinitionBaselineEntry:
+    path: str
+    pattern: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SingleDefinitionBoundary:
+    scan_root: str
+    min_body_nodes: tuple[tuple[str, int], ...]
+    patterns: tuple[str, ...]
+    baseline: tuple[SingleDefinitionBaselineEntry, ...]
+    reference_commit: str
+    reference_total: int
+    current_total: int
+    accepted_predecessor_delta: int
+
+    def threshold(self, pattern: str) -> int:
+        """Return the minimum body size in AST nodes for ``pattern``."""
+        for name, value in self.min_body_nodes:
+            if name == pattern:
+                return value
+        raise KeyError(pattern)
 
 
 @dataclass(frozen=True, slots=True)
@@ -506,7 +540,9 @@ def _parse_rule(mapping: object, *, path: str, known_languages: frozenset[str]) 
     )
 
 
-_TOP_LEVEL_KEYS = frozenset({"schema", "schema_version", "languages", "rules", "os_dependency_boundary"})
+_TOP_LEVEL_KEYS = frozenset(
+    {"schema", "schema_version", "languages", "rules", "os_dependency_boundary", "single_definition_boundary"}
+)
 
 
 def _parse_os_dependency_boundary(value: object) -> OSDependencyBoundary:
@@ -553,6 +589,82 @@ def _parse_os_dependency_boundary(value: object) -> OSDependencyBoundary:
     return OSDependencyBoundary(scan_root, public_facade, modules, patterns, tuple(sorted(entries, key=lambda entry: (entry.path, entry.pattern))), commit, reference_total, current_total, delta)
 
 
+def _parse_single_definition_boundary(
+    value: object, *, declared_rules: tuple[DevelopmentRule, ...]
+) -> SingleDefinitionBoundary:
+    """Parse the descending ratchet for the ``single_definition`` rule.
+
+    Same shape as ``os_dependency_boundary``: a per-(path, pattern) baseline the
+    count may never exceed, plus a measurement block whose totals must agree with
+    the baseline it claims to summarise. The pattern identities are not free
+    text -- they must be exactly the tokens the ``single_definition`` rule
+    forbids and that this repository has an executable detector for, so a
+    baseline cannot quietly ratchet something the rule never declared.
+    """
+
+    path = "$.single_definition_boundary"
+    keys = frozenset({"scan_root", "min_body_nodes", "patterns", "baseline", "measurement"})
+    mapping = _check_keys(value, keys, required=keys, path=path)
+    scan_root = _validate_path_selector(mapping["scan_root"], path=f"{path}.scan_root")
+    if scan_root != "src/aiworkhub":
+        raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{path}.scan_root: canonical package root is required")
+    patterns = _validate_identifier_tuple(mapping["patterns"], path=f"{path}.patterns", allow_empty=False)
+    if patterns != SINGLE_DEFINITION_PATTERN_IDENTITIES:
+        raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{path}.patterns: exact fixed identities required")
+    rule = next((candidate for candidate in declared_rules if candidate.id == "single_definition"), None)
+    if rule is None:
+        raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{path}: no single_definition rule is declared")
+    undeclared = sorted(set(patterns) - set(rule.forbid))
+    if undeclared:
+        raise ManifestValidationError(
+            ReasonCode.CONTRADICTORY_RULE,
+            f"{path}.patterns: not forbidden by the single_definition rule: {undeclared}",
+        )
+    raw_thresholds = _check_keys(mapping["min_body_nodes"], frozenset(patterns), required=frozenset(patterns), path=f"{path}.min_body_nodes")
+    thresholds = tuple(
+        (name, _validate_bounded_int(raw_thresholds[name], path=f"{path}.min_body_nodes.{name}", minimum=1, maximum=100_000))
+        for name in patterns
+    )
+    raw_baseline = mapping["baseline"]
+    if not isinstance(raw_baseline, list):
+        raise ManifestValidationError(ReasonCode.WRONG_TYPE, f"{path}.baseline: expected array")
+    entries: list[SingleDefinitionBaselineEntry] = []
+    identities: set[tuple[str, str]] = set()
+    for index, raw in enumerate(raw_baseline):
+        item_path = f"{path}.baseline[{index}]"
+        item = _check_keys(raw, frozenset({"path", "pattern", "count"}), required=frozenset({"path", "pattern", "count"}), path=item_path)
+        file_path = _validate_path_selector(item["path"], path=f"{item_path}.path")
+        pattern = _validate_identifier(item["pattern"], path=f"{item_path}.pattern")
+        count = _validate_bounded_int(item["count"], path=f"{item_path}.count", minimum=1, maximum=1_000_000)
+        if not file_path.startswith("src/aiworkhub/") or pattern not in SINGLE_DEFINITION_PATTERN_IDENTITIES:
+            raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{item_path}: unknown baseline identity")
+        identity = (file_path, pattern)
+        if identity in identities:
+            raise ManifestValidationError(ReasonCode.DUPLICATE_IDENTIFIER, f"{item_path}: duplicate baseline identity")
+        identities.add(identity)
+        entries.append(SingleDefinitionBaselineEntry(file_path, pattern, count))
+    measurement_keys = frozenset({"reference_commit", "reference_total", "current_total", "accepted_predecessor_delta"})
+    measurement = _check_keys(mapping["measurement"], measurement_keys, required=measurement_keys, path=f"{path}.measurement")
+    commit = measurement["reference_commit"]
+    if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise ManifestValidationError(ReasonCode.WRONG_TYPE, f"{path}.measurement.reference_commit: expected 40 lowercase hex characters")
+    reference_total = _validate_bounded_int(measurement["reference_total"], path=f"{path}.measurement.reference_total", minimum=0, maximum=1_000_000)
+    current_total = _validate_bounded_int(measurement["current_total"], path=f"{path}.measurement.current_total", minimum=0, maximum=1_000_000)
+    delta = _expect_int_strict(measurement["accepted_predecessor_delta"], path=f"{path}.measurement.accepted_predecessor_delta")
+    if sum(entry.count for entry in entries) != current_total or current_total - reference_total != delta:
+        raise ManifestValidationError(ReasonCode.CONTRADICTORY_RULE, f"{path}.measurement: totals or predecessor delta are inconsistent")
+    return SingleDefinitionBoundary(
+        scan_root,
+        thresholds,
+        patterns,
+        tuple(sorted(entries, key=lambda entry: (entry.path, entry.pattern))),
+        commit,
+        reference_total,
+        current_total,
+        delta,
+    )
+
+
 def parse_manifest(mapping: object) -> DevelopmentRulesManifest:
     """Parse and validate an explicit mapping into an immutable manifest. Fails closed."""
     mapping = _check_keys(mapping, _TOP_LEVEL_KEYS, required=frozenset({"schema", "schema_version", "languages", "rules"}), path="$")
@@ -584,7 +696,19 @@ def parse_manifest(mapping: object) -> DevelopmentRulesManifest:
         rules.append(rule)
     rules_sorted = tuple(sorted(rules, key=lambda r: r.id))
     boundary = _parse_os_dependency_boundary(mapping["os_dependency_boundary"]) if "os_dependency_boundary" in mapping else None
-    return DevelopmentRulesManifest(schema=schema, schema_version=schema_version, languages=languages, rules=rules_sorted, os_dependency_boundary=boundary)
+    single_definition = (
+        _parse_single_definition_boundary(mapping["single_definition_boundary"], declared_rules=rules_sorted)
+        if "single_definition_boundary" in mapping
+        else None
+    )
+    return DevelopmentRulesManifest(
+        schema=schema,
+        schema_version=schema_version,
+        languages=languages,
+        rules=rules_sorted,
+        os_dependency_boundary=boundary,
+        single_definition_boundary=single_definition,
+    )
 
 
 def parse_manifest_bytes(data: bytes) -> DevelopmentRulesManifest:
@@ -607,10 +731,13 @@ def _to_canonical(obj: object) -> object:
             "languages": list(obj.languages),
             "rules": [_to_canonical(rule) for rule in obj.rules],
             **({"os_dependency_boundary": _to_canonical(obj.os_dependency_boundary)} if obj.os_dependency_boundary else {}),
+            **({"single_definition_boundary": _to_canonical(obj.single_definition_boundary)} if obj.single_definition_boundary else {}),
         }
     if isinstance(obj, OSDependencyBoundary):
         return {"scan_root": obj.scan_root, "public_facade": obj.public_facade, "sanctioned_modules": list(obj.sanctioned_modules), "patterns": list(obj.patterns), "baseline": [_to_canonical(entry) for entry in obj.baseline], "measurement": {"reference_commit": obj.reference_commit, "reference_total": obj.reference_total, "current_total": obj.current_total, "accepted_predecessor_delta": obj.accepted_predecessor_delta}}
-    if isinstance(obj, OSDependencyBaselineEntry):
+    if isinstance(obj, SingleDefinitionBoundary):
+        return {"scan_root": obj.scan_root, "min_body_nodes": {name: value for name, value in obj.min_body_nodes}, "patterns": list(obj.patterns), "baseline": [_to_canonical(entry) for entry in obj.baseline], "measurement": {"reference_commit": obj.reference_commit, "reference_total": obj.reference_total, "current_total": obj.current_total, "accepted_predecessor_delta": obj.accepted_predecessor_delta}}
+    if isinstance(obj, (OSDependencyBaselineEntry, SingleDefinitionBaselineEntry)):
         return {"path": obj.path, "pattern": obj.pattern, "count": obj.count}
     if isinstance(obj, DevelopmentRule):
         return {

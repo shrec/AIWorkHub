@@ -990,5 +990,309 @@
       "current_total": 143,
       "accepted_predecessor_delta": -18
     }
+  },
+  "single_definition_boundary": {
+    "scan_root": "src/aiworkhub",
+    "min_body_nodes": {
+      "copied_helper": 20,
+      "parallel_implementation": 40
+    },
+    "patterns": [
+      "copied_helper",
+      "parallel_implementation"
+    ],
+    "baseline": [
+      {
+        "path": "src/aiworkhub/app_server_mux.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/app_server_mux.py",
+        "pattern": "parallel_implementation",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/assurance_claims.py",
+        "pattern": "parallel_implementation",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/callback_bridge.py",
+        "pattern": "copied_helper",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/callback_store.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/context_capture.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/context_capture.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/context_graph.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/context_write_intents.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/context_writes.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/core.py",
+        "pattern": "parallel_implementation",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/dashboard.py",
+        "pattern": "parallel_implementation",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/dashboard_mcp_app.py",
+        "pattern": "parallel_implementation",
+        "count": 11
+      },
+      {
+        "path": "src/aiworkhub/deepseek_credentials.py",
+        "pattern": "copied_helper",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/deepseek_credentials.py",
+        "pattern": "parallel_implementation",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/development_rules.py",
+        "pattern": "parallel_implementation",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/fresh_task_store.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/glm_credentials.py",
+        "pattern": "copied_helper",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/glm_credentials.py",
+        "pattern": "parallel_implementation",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/manager_transcript_capture.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/manager_transcript_capture.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/needfix_store.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/process_launcher.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/project_context.py",
+        "pattern": "copied_helper",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/project_context.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/quality_reviewer.py",
+        "pattern": "copied_helper",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/quality_reviewer.py",
+        "pattern": "parallel_implementation",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/release_evidence_pack.py",
+        "pattern": "parallel_implementation",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/repository_state.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/roadmap_store.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/route_identity.py",
+        "pattern": "copied_helper",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/server.py",
+        "pattern": "copied_helper",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/server.py",
+        "pattern": "parallel_implementation",
+        "count": 9
+      },
+      {
+        "path": "src/aiworkhub/skill_registry.py",
+        "pattern": "parallel_implementation",
+        "count": 4
+      },
+      {
+        "path": "src/aiworkhub/skill_registry_store.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/skill_registry_store.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/source_graph.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/source_graph.py",
+        "pattern": "parallel_implementation",
+        "count": 8
+      },
+      {
+        "path": "src/aiworkhub/source_graph_ast.py",
+        "pattern": "parallel_implementation",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/source_graph_daemon.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/source_graph_migration.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/source_graph_migration.py",
+        "pattern": "parallel_implementation",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/stdio_fastmcp.py",
+        "pattern": "copied_helper",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/stdio_fastmcp.py",
+        "pattern": "parallel_implementation",
+        "count": 5
+      },
+      {
+        "path": "src/aiworkhub/storage_retention.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/task_engine.py",
+        "pattern": "parallel_implementation",
+        "count": 2
+      },
+      {
+        "path": "src/aiworkhub/task_reconciler.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/task_store.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/task_store.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/terminal_log_retention.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/tool_recipes_store.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/tool_recipes_store.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/worker_ai_tools_mcp.py",
+        "pattern": "copied_helper",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/worker_ai_tools_mcp.py",
+        "pattern": "parallel_implementation",
+        "count": 3
+      },
+      {
+        "path": "src/aiworkhub/worker_supervisor.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/worker_workspace.py",
+        "pattern": "copied_helper",
+        "count": 1
+      },
+      {
+        "path": "src/aiworkhub/workforce_router.py",
+        "pattern": "parallel_implementation",
+        "count": 1
+      }
+    ],
+    "measurement": {
+      "reference_commit": "a86934dbfcca6389595c5e0fa5cbbf74e9537fb4",
+      "reference_total": 119,
+      "current_total": 119,
+      "accepted_predecessor_delta": 0
+    }
   }
 }

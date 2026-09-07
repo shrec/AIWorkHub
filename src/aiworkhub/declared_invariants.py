@@ -5,6 +5,19 @@ a rule nobody executes is a comment. This module states the same things as
 predicates over the tree and returns violations, so a claim like "one concept has
 one definition" is a gate rather than an aspiration.
 
+``check`` reads that manifest and reports, for every rule it declares, whether an
+executable predicate covers it. It did not always: it hardcoded its own list,
+named the manifest only in a comment, and returned ``unevaluated: []`` with
+``passed: true`` while 15 of the 20 declared rules had no detector at all. A gate
+that silently covers a quarter of what it is trusted for is worse than no gate,
+so the honest split is now in the report itself -- ``RULE_DETECTORS`` maps each
+rule's forbidden tokens to the detectors that execute them, every token that does
+not execute is listed by name in ``unevaluated`` with the reason, and
+``all_declared_obligations_checked`` says plainly that the answer today is 5 of
+63. A rule added to the manifest with no detector and no written reason fails
+this module immediately, the way
+``dependency_autolaunch.unclassified_denial_reasons`` fails on a new reason.
+
 Every invariant here is the shape of a defect this repository actually had, with
 the measurement that found it. None is a general style preference:
 
@@ -30,6 +43,19 @@ the measurement that found it. None is a general style preference:
     ``chmod_fd`` and ``chmod_path`` decided "do POSIX mode bits apply here" by two
     different rules, and only one of them was testable.
 
+``copied_helpers_have_one_definition`` and ``parallel_implementations_have_one_owner``
+    The other two things ``single_definition`` forbids, and the only two that
+    cannot be checked by listing sites: they are claims about every definition
+    against every other. Measured over all 4,427 definitions in the package: 37
+    are byte-identical copies of another body, and 82 more share a body's exact
+    shape with a different implementation of it -- ``_connect`` written out three
+    times, ``credential_path`` and ``bootstrap_credential`` in both credential
+    modules, four separate pairs across ``server`` and ``stdio_fastmcp``. Both
+    are ratchets against a declared baseline rather than hard failures, because
+    the first exhaustive scan of a 161,710-line package finds the accumulated
+    history of the package and failing on all of it would block every card.
+    The count may not grow, and shrinks.
+
 ``recent_decisions_record_a_lesson``
     The learning duty was named at the decision, measured in health, and enforced
     nowhere: ``accept_review`` and ``reject_review`` returned the exact arguments
@@ -48,7 +74,10 @@ inspects, and reports a violation as a named, bounded record rather than raising
 from __future__ import annotations
 
 import ast
+import hashlib
+import os
 import re
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -158,6 +187,307 @@ def one_policy_one_predicate() -> list[Violation]:
             ))
     return violations
 
+
+# --------------------------------------------------------------------------- #
+# one concept, one definition: duplication across the whole package
+# --------------------------------------------------------------------------- #
+#
+# ``single_definition`` forbids four things. ``restated_vocabulary`` and
+# ``two_predicates_one_policy`` are checked above by asserting identity between
+# named objects: both are about three or four sites someone can list. The other
+# two are not -- ``copied_helper`` and ``parallel_implementation`` are claims
+# about every definition in the package against every other, so the only honest
+# detector is an exhaustive pass.
+#
+# Source Graph has a ``duplicates`` lens, and it is not usable as a gate: it caps
+# at 200 eligible symbols per query and samples rather than enumerates. A gate
+# that reads a sample reports "clean" for everything the sample missed. This
+# reads all 4,427 function and method definitions in the package, every time.
+#
+# The comparison is exact structural equality of the AST, in two strengths:
+#
+#   copied_helper           the ``ast.dump`` of the body, docstring removed and
+#                           line numbers excluded, is byte-identical. Every name,
+#                           attribute, call and literal must match. This is a
+#                           literal copy, renamed at most in the def line.
+#
+#   parallel_implementation the same dump with every identifier and every
+#                           literal erased is identical, while the strict dump
+#                           is not. Same algorithm, independently written or
+#                           since drifted -- the shape ``deepseek_credentials``
+#                           and ``glm_credentials`` are in, and ``server`` and
+#                           ``stdio_fastmcp``.
+#
+# What this provably catches: any duplicate whose statement structure is
+# identical, including one renamed throughout, across the whole package rather
+# than a sample.
+#
+# What it provably does not catch, measured on this tree:
+#   * anything below the node thresholds below -- including 14 separate copies
+#     of a ``datetime.now(timezone.utc)`` helper, which is real duplication this
+#     deliberately does not report;
+#   * a copy with one statement added, removed or reordered. This is exact
+#     structural equality, not similarity: there is no edit distance, so a
+#     near-copy is invisible rather than partially reported;
+#   * two implementations of one concept written with different structure -- a
+#     loop against a comprehension computes the same thing and shares no shape;
+#   * duplicated data. A restated constant table is not a function body;
+#     ``restated_vocabulary`` covers three declared identities and no more;
+#   * JavaScript and TypeScript. The manifest rule applies to all three
+#     languages and this reads Python only, which is why ``single_definition``
+#     reports as partially covered rather than covered.
+
+
+@dataclass(frozen=True)
+class _Definition:
+    """One function or method definition, reduced to what duplication compares."""
+
+    path: str
+    qualname: str
+    line: int
+    exact: str
+    shape: str
+    nodes: int
+
+
+# Which field of which node holds a bare name or literal rather than a child
+# node. Keyed by node type and not by field name alone: ``value`` is the literal
+# on ``Constant`` but the whole right-hand side on ``Assign`` and ``Return``, and
+# erasing it by name collapsed every return statement in the package to one
+# shape. Measured on this tree: that mistake reported 324 duplicate definitions
+# where reading the fields exactly finds 82.
+_ERASED_FIELDS: dict[type, frozenset[str]] = {
+    ast.Name: frozenset({"id"}),
+    ast.Attribute: frozenset({"attr"}),
+    ast.arg: frozenset({"arg"}),
+    ast.keyword: frozenset({"arg"}),
+    ast.alias: frozenset({"name", "asname"}),
+    ast.ImportFrom: frozenset({"module"}),
+    ast.Constant: frozenset({"value", "kind"}),
+    ast.FunctionDef: frozenset({"name"}),
+    ast.AsyncFunctionDef: frozenset({"name"}),
+    ast.ClassDef: frozenset({"name"}),
+    ast.ExceptHandler: frozenset({"name"}),
+    ast.Global: frozenset({"names"}),
+    ast.Nonlocal: frozenset({"names"}),
+}
+
+
+def _shape_dump(node: Any) -> str:
+    """Serialise an AST by structure alone, with every name and literal erased.
+
+    Built as its own walk rather than by mutating and re-``ast.dump``-ing:
+    erasing an outer function in place would destroy the nested definitions
+    whose own digests have not been taken yet.
+    """
+
+    if isinstance(node, ast.AST):
+        erased = _ERASED_FIELDS.get(type(node), frozenset())
+        fields = []
+        for name, value in ast.iter_fields(node):
+            fields.append(f"{name}=_" if name in erased else f"{name}={_shape_dump(value)}")
+        return f"{type(node).__name__}({','.join(fields)})"
+    if isinstance(node, list):
+        return "[" + ",".join(_shape_dump(item) for item in node) + "]"
+    return repr(node)
+
+
+def _body_without_docstring(node: ast.AST) -> list[ast.stmt]:
+    body = list(getattr(node, "body", []))
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        return body[1:]
+    return body
+
+
+def scan_definitions(path: str, relative: str) -> list[_Definition]:
+    """Return every definition in one module. Module level so a pool can call it."""
+
+    source = _read(Path(path))
+    tree = ast.parse(source, filename=path)
+    found: list[_Definition] = []
+    scope: list[str] = []
+
+    def walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                scope.append(child.name)
+                walk(child)
+                scope.pop()
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                body = _body_without_docstring(child)
+                if body:
+                    module = ast.Module(body=body, type_ignores=[])
+                    exact = hashlib.sha256(
+                        ast.dump(module, annotate_fields=True, include_attributes=False).encode("utf-8")
+                    ).hexdigest()
+                    shape = hashlib.sha256(_shape_dump(module).encode("utf-8")).hexdigest()
+                    nodes = sum(1 for _ in ast.walk(module))
+                    found.append(_Definition(
+                        relative, ".".join((*scope, child.name)), child.lineno, exact, shape, nodes,
+                    ))
+                scope.append(child.name)
+                walk(child)
+                scope.pop()
+            else:
+                walk(child)
+
+    walk(tree)
+    return found
+
+
+# Measured on this repository, 2026-09-07, 16 cores, 152 modules / 161,710 lines:
+#
+#   sequential      2949 ms
+#   threads(8)      3328 ms   -- slower: ast.parse holds the GIL, so threads only
+#   threads(12)     3440 ms      add contention to work that never releases it
+#   processes(8)     827 ms
+#   processes(12)    667 ms   -- 4.4x
+#
+# Processes, then, because the work is CPU-bound parsing. Twelve of sixteen
+# cores leaves four, so a scan cannot starve the interactive MCP server sharing
+# this machine; the count is derived from the observed cores, never a constant.
+#
+# Below the crossover the pool costs more than it saves: measured pool start plus
+# shutdown is 12-29 ms on fork, and far more on the spawn platforms macOS and
+# Windows use, where each worker re-imports the package. At the measured 19 ms
+# per module, 24 modules is ~450 ms of work, which dominates even a pessimistic
+# spawn start. Under it, sequential.
+_PARALLEL_SCAN_MIN_MODULES = 24
+_SCAN_CORE_HEADROOM = 4
+
+
+def _scan_workers(module_count: int) -> int:
+    """Return the worker count for a scan of ``module_count`` modules."""
+
+    if module_count < _PARALLEL_SCAN_MIN_MODULES:
+        return 1
+    cores = os.cpu_count() or 1
+    return max(1, min(module_count, cores - _SCAN_CORE_HEADROOM))
+
+
+def collect_definitions(src_root: Path) -> list[_Definition]:
+    """Return every definition under ``src_root``, exhaustively.
+
+    Parallel is a speed decision only: the pool maps the same module-level
+    function over the same sorted file list, and the result is re-sorted, so it
+    is identical to the sequential list. A pool that cannot start falls back
+    rather than returning a shorter answer, because a duplication scan that
+    quietly reads fewer files reports a cleaner tree than there is.
+    """
+
+    root = src_root.parent.parent
+    jobs = [(str(path), path.relative_to(root).as_posix()) for path in _python_sources(src_root)]
+    workers = _scan_workers(len(jobs))
+    collected: list[_Definition] = []
+    if workers > 1:
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                for batch in pool.map(scan_definitions, *zip(*jobs), chunksize=8):
+                    collected.extend(batch)
+        except Exception:  # noqa: BLE001 - a pool failure must not shrink the scan
+            collected = []
+            workers = 1
+    if workers == 1:
+        for path, relative in jobs:
+            collected.extend(scan_definitions(path, relative))
+    return sorted(collected, key=lambda d: (d.path, d.line, d.qualname))
+
+
+def duplicate_definition_counts(
+    src_root: Path, thresholds: dict[str, int]
+) -> dict[str, dict[str, int]]:
+    """Return, per pattern, how many definitions each module has in a duplicate group."""
+
+    definitions = collect_definitions(src_root)
+    by_exact: dict[str, list[_Definition]] = {}
+    by_shape: dict[str, list[_Definition]] = {}
+    for definition in definitions:
+        by_exact.setdefault(definition.exact, []).append(definition)
+        by_shape.setdefault(definition.shape, []).append(definition)
+
+    counts: dict[str, dict[str, int]] = {"copied_helper": {}, "parallel_implementation": {}}
+    copied_minimum = thresholds["copied_helper"]
+    for group in by_exact.values():
+        if len(group) < 2 or group[0].nodes < copied_minimum:
+            continue
+        for definition in group:
+            counts["copied_helper"][definition.path] = counts["copied_helper"].get(definition.path, 0) + 1
+    parallel_minimum = thresholds["parallel_implementation"]
+    for group in by_shape.values():
+        # A group with one exact digest is a copy, already counted above; two or
+        # more distinct bodies sharing one shape is the parallel implementation.
+        if len(group) < 2 or group[0].nodes < parallel_minimum:
+            continue
+        if len({definition.exact for definition in group}) < 2:
+            continue
+        for definition in group:
+            key = "parallel_implementation"
+            counts[key][definition.path] = counts[key].get(definition.path, 0) + 1
+    return counts
+
+
+def _ratchet_violations(
+    invariant: str, pattern: str, current: dict[str, int], baseline: dict[str, int]
+) -> list[Violation]:
+    """Report only growth against the declared baseline: a descending ratchet.
+
+    The first exhaustive scan of a package this size finds a great deal, and
+    failing on all of it would block every card rather than improve anything.
+    So the declared baseline is what exists, the count may never rise, and a
+    module that was clean and stops being clean is a new identity, not a
+    tolerated delta -- the same shape ``os_dependency_boundary`` uses.
+    """
+
+    violations: list[Violation] = []
+    for path in sorted(current):
+        count = current[path]
+        allowed = baseline.get(path)
+        if allowed is None:
+            violations.append(Violation(
+                invariant, path,
+                f"{count} definition(s) newly enter a {pattern} group in a module "
+                "the manifest baseline records as having none",
+            ))
+        elif count > allowed:
+            violations.append(Violation(
+                invariant, path,
+                f"{pattern} definitions grew from {allowed} to {count}; this "
+                "ratchet may only descend",
+            ))
+        if len(violations) >= MAX_VIOLATIONS_PER_INVARIANT:
+            return violations
+    return violations
+
+
+def copied_helpers_have_one_definition(
+    counts: dict[str, dict[str, int]], baseline: dict[str, dict[str, int]]
+) -> list[Violation]:
+    """No module may gain a byte-identical copy of another definition's body."""
+
+    return _ratchet_violations(
+        "copied_helpers_have_one_definition", "copied_helper",
+        counts["copied_helper"], baseline.get("copied_helper", {}),
+    )
+
+
+def parallel_implementations_have_one_owner(
+    counts: dict[str, dict[str, int]], baseline: dict[str, dict[str, int]]
+) -> list[Violation]:
+    """No module may gain a second independent implementation of one shape."""
+
+    return _ratchet_violations(
+        "parallel_implementations_have_one_owner", "parallel_implementation",
+        counts["parallel_implementation"], baseline.get("parallel_implementation", {}),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# bounded caches
 
 # --------------------------------------------------------------------------- #
 # bounded caches
@@ -407,12 +737,264 @@ _REPOSITORY_INVARIANTS: tuple[tuple[str, Callable[[Path], list[Violation]]], ...
     ("recent_decisions_record_a_lesson", recent_decisions_record_a_lesson),
 )
 
+# Invariants that need the tree AND the declared ratchet baseline from the
+# manifest. Separate again because a missing manifest must make them report
+# themselves unevaluated rather than clean.
+_RATCHET_INVARIANTS: tuple[
+    tuple[str, Callable[[dict[str, dict[str, int]], dict[str, dict[str, int]]], list[Violation]]], ...
+] = (
+    ("copied_helpers_have_one_definition", copied_helpers_have_one_definition),
+    ("parallel_implementations_have_one_owner", parallel_implementations_have_one_owner),
+)
+
 INVARIANT_NAMES: tuple[str, ...] = tuple(
     sorted(
         name
-        for name, _ in (*_TREE_INVARIANTS, *_RUNTIME_INVARIANTS, *_REPOSITORY_INVARIANTS)
+        for name, _ in (
+            *_TREE_INVARIANTS,
+            *_RUNTIME_INVARIANTS,
+            *_RATCHET_INVARIANTS,
+            *_REPOSITORY_INVARIANTS,
+        )
     )
 )
+
+
+# --------------------------------------------------------------------------- #
+# what the manifest declares, and what actually executes
+# --------------------------------------------------------------------------- #
+#
+# ``development_rules.json`` declares 20 rules. This module executes seven
+# detectors. Before RM-2026-00048 the two facts never met: ``check`` hardcoded
+# its own list, named the manifest only in a comment, and returned
+# ``unevaluated: []`` with ``passed: true`` -- so a report that covered a
+# fraction of the declared rules was indistinguishable from one that covered
+# them all. A gate trusted for more than it checks is worse than no gate.
+#
+# The unit of coverage is not the rule but the forbidden token, because one rule
+# forbids several distinct things: ``single_definition`` alone forbids four, and
+# a detector for one of them says nothing about the other three.
+#
+# This map is the declaration. It is explicit and checked, never inferred from
+# name similarity: ``rule_detector_coverage`` verifies every rule id here exists
+# in the manifest, every token is one that rule actually forbids, and every
+# detector named is one this module actually runs.
+RULE_DETECTORS: dict[str, dict[str, str]] = {
+    "single_definition": {
+        "restated_vocabulary": "terminal_vocabulary_has_one_owner",
+        "two_predicates_one_policy": "one_policy_one_predicate",
+        "copied_helper": "copied_helpers_have_one_definition",
+        "parallel_implementation": "parallel_implementations_have_one_owner",
+    },
+    "cache_discipline": {
+        "cache_without_bound": "module_level_caches_are_bounded",
+    },
+}
+
+# Forbidden tokens this repository has decided, in writing, that it does not yet
+# detect -- each with the reason, so an unchecked rule is an acknowledged debt
+# rather than an oversight. The shape is deliberate: a token that is neither
+# detected nor listed here is a hard failure, so adding a rule to the manifest
+# breaks this gate until someone either writes the detector or writes the reason.
+# This is the same construction as ``dependency_autolaunch.unclassified_denial_reasons``.
+# Why a declared token does not execute. Five reasons, none of them "we forgot":
+_NOT_A_SOURCE_PROPERTY = (
+    "names a property of a run -- a process that outlived its parent, a release "
+    "cut on red CI, two cards writing one file -- and not a pattern in source "
+    "text; reading the tree cannot decide it"
+)
+_NEEDS_MEASUREMENT = (
+    "is a claim about measured behaviour, not about what the source says; "
+    "deciding it needs a profile or a hit-rate, and a static reading that "
+    "guessed would be a detector this repository could not trust"
+)
+_NOT_THIS_LANGUAGE = (
+    "the rule declares languages c, cpp, cuda and rust; this package is Python, "
+    "so there is no code here for the rule to govern"
+)
+_PROCESS_DISCIPLINE = (
+    "governs how a manager or worker conducts a task, not what the resulting "
+    "code says; the evidence lives in receipts and the audit ledger"
+)
+_ANOTHER_GATE = (
+    "enforced outside this module by the OS-dependency ratchet in "
+    "scripts/check_os_dependency_boundary.py, which counts platform-specific "
+    "constructs outside the platform_io facade and refuses growth"
+)
+_NO_DETECTOR_YET = (
+    "is a static pattern this repository could read from the tree and has not "
+    "written a detector for; this is real debt, not an exemption"
+)
+
+ACCEPTED_UNDETECTED: dict[str, str] = {
+    "cache_discipline:authority_cached_with_result": _NO_DETECTOR_YET,
+    "cache_discipline:stale_generation_retention": _NO_DETECTOR_YET,
+    "cache_discipline:unmeasured_cache": _NEEDS_MEASUREMENT,
+    "coding_baseline:ambient_authority": _NO_DETECTOR_YET,
+    "coding_baseline:silent_fallback": _NO_DETECTOR_YET,
+    "coding_baseline:unbounded_work": _NEEDS_MEASUREMENT,
+    "coding_baseline:unnamed_refusal": _NO_DETECTOR_YET,
+    "cross_platform_contract:platform_only_side_effect": _ANOTHER_GATE,
+    "cross_platform_contract:posix_only_assumption": _ANOTHER_GATE,
+    "cross_platform_contract:shell_string_command": _NO_DETECTOR_YET,
+    "cross_platform_contract:untestable_platform_branch": _NO_DETECTOR_YET,
+    "cross_platform_contract:windows_path_guess": _NO_DETECTOR_YET,
+    "detector_evidence:fixture_only_validation": _PROCESS_DISCIPLINE,
+    "fail_closed_default:unknown_maps_to_success": _NO_DETECTOR_YET,
+    "fail_closed_default:unreadable_input_disables_check": _NO_DETECTOR_YET,
+    "fail_closed_default:vacuous_pass_on_empty_evidence": _NO_DETECTOR_YET,
+    "graph_cpu_parallelism:hardcoded_worker_count": _NO_DETECTOR_YET,
+    "graph_cpu_parallelism:shared_mutable_partition_state": _NO_DETECTOR_YET,
+    "graph_cpu_parallelism:single_core_full_rebuild": _NEEDS_MEASUREMENT,
+    "hot_path_allocation:allocation_in_hot_loop": _NEEDS_MEASUREMENT,
+    "hot_path_allocation:full_copy_in_hot_loop": _NEEDS_MEASUREMENT,
+    "hot_path_allocation:materialize_unbounded_collection": _NEEDS_MEASUREMENT,
+    "hot_path_allocation:repeated_decode_in_hot_loop": _NEEDS_MEASUREMENT,
+    "incremental_state:copy_full_canonical_graph": _NO_DETECTOR_YET,
+    "incremental_state:full_rescan_without_change": _NEEDS_MEASUREMENT,
+    "incremental_state:recompute_unchanged_storage": _NEEDS_MEASUREMENT,
+    "incremental_state:write_in_place_generation": _NO_DETECTOR_YET,
+    "mechanical_work_off_model:model_recomputes_recorded_evidence": _PROCESS_DISCIPLINE,
+    "mechanical_work_off_model:model_retypes_relocated_text": _PROCESS_DISCIPLINE,
+    "model_execution_policy:elapsed_time_model_kill": _NO_DETECTOR_YET,
+    "model_execution_policy:implicit_output_budget": _NO_DETECTOR_YET,
+    "model_execution_policy:implicit_token_budget": _NO_DETECTOR_YET,
+    "model_execution_policy:silent_provider_fallback": _NO_DETECTOR_YET,
+    "native_ownership:manual_lifetime_pair": _NOT_THIS_LANGUAGE,
+    "native_ownership:owning_raw_pointer": _NOT_THIS_LANGUAGE,
+    "native_ownership:unbounded_stack_buffer": _NOT_THIS_LANGUAGE,
+    "parallelism_fallback:hardcoded_worker_count": _NO_DETECTOR_YET,
+    "parallelism_fallback:unmeasured_sequential_hot_path": _NEEDS_MEASUREMENT,
+    "performance_evidence:performance_claim_without_measurement": _PROCESS_DISCIPLINE,
+    "release_evidence:release_with_red_ci": _NOT_A_SOURCE_PROPERTY,
+    "release_evidence:release_without_artifact_verification": _NOT_A_SOURCE_PROPERTY,
+    "runtime_io_parallelism:global_lock_during_io": _NO_DETECTOR_YET,
+    "runtime_io_parallelism:serial_independent_io": _NEEDS_MEASUREMENT,
+    "runtime_io_parallelism:unbounded_thread_creation": _NO_DETECTOR_YET,
+    "self_hosting_break_glass:continued_use_of_known_broken_plugin": _PROCESS_DISCIPLINE,
+    "self_hosting_break_glass:scope_expansion_during_break_glass": _PROCESS_DISCIPLINE,
+    "self_hosting_break_glass:silent_task_system_bypass": _PROCESS_DISCIPLINE,
+    "self_hosting_break_glass:unmeasured_break_glass": _PROCESS_DISCIPLINE,
+    "sqlite_concurrency:database_lock_without_owner": _NO_DETECTOR_YET,
+    "sqlite_concurrency:long_write_transaction": _NEEDS_MEASUREMENT,
+    "sqlite_concurrency:network_db_dependency": _NO_DETECTOR_YET,
+    "subprocess_lifecycle:elapsed_time_worker_kill": _NO_DETECTOR_YET,
+    "subprocess_lifecycle:orphan_process": _NOT_A_SOURCE_PROPERTY,
+    "subprocess_lifecycle:system_temp_leak": _NO_DETECTOR_YET,
+    "subprocess_lifecycle:unreleased_lock": _NOT_A_SOURCE_PROPERTY,
+    "task_atomicity:overlapping_parallel_writes": _NOT_A_SOURCE_PROPERTY,
+    "task_atomicity:review_queue_accumulation": _NOT_A_SOURCE_PROPERTY,
+    "task_atomicity:whole_file_regeneration": _NOT_A_SOURCE_PROPERTY,
+}
+
+# The invariant that has no manifest rule to answer to. Declared here rather than
+# silently ignored, so the mapping is total in both directions.
+_DETECTORS_WITHOUT_A_DECLARED_RULE: dict[str, str] = {
+    "sqlite_context_managers_close":
+        "no manifest rule forbids relying on Connection.__exit__ to close; the "
+        "invariant predates the rule set and measured nine real call sites",
+    "recent_decisions_record_a_lesson":
+        "measures what the repository DID, not what its source says; the "
+        "manifest declares rules about code, and this one has no code to name",
+}
+
+
+def _obligations(manifest: Any) -> list[tuple[str, str]]:
+    """Return every (rule id, forbidden token) the manifest declares."""
+
+    return sorted(
+        (rule.id, token) for rule in manifest.rules for token in rule.forbid
+    )
+
+
+def rule_detector_coverage(manifest: Any) -> dict[str, Any]:
+    """Return, for every declared rule, which forbidden tokens execute.
+
+    Raises ``ValueError`` if ``RULE_DETECTORS`` and the manifest disagree, because
+    a coverage claim resting on a stale map is exactly the false comfort this
+    exists to remove.
+    """
+
+    declared = {rule.id: set(rule.forbid) for rule in manifest.rules}
+    for rule_id, tokens in RULE_DETECTORS.items():
+        if rule_id not in declared:
+            raise ValueError(f"RULE_DETECTORS names rule {rule_id!r}, which the manifest does not declare")
+        unknown = sorted(set(tokens) - declared[rule_id])
+        if unknown:
+            raise ValueError(f"RULE_DETECTORS claims tokens {rule_id} does not forbid: {unknown}")
+        missing = sorted(set(tokens.values()) - set(INVARIANT_NAMES))
+        if missing:
+            raise ValueError(f"RULE_DETECTORS names detectors that do not run: {missing}")
+
+    detected: list[dict[str, str]] = []
+    accepted: list[dict[str, str]] = []
+    undetected: list[dict[str, str]] = []
+    for rule_id, token in _obligations(manifest):
+        detector = RULE_DETECTORS.get(rule_id, {}).get(token)
+        if detector is not None:
+            detected.append({"rule": rule_id, "forbids": token, "detector": detector})
+        elif f"{rule_id}:{token}" in ACCEPTED_UNDETECTED:
+            accepted.append({
+                "rule": rule_id, "forbids": token,
+                "reason": ACCEPTED_UNDETECTED[f"{rule_id}:{token}"],
+            })
+        else:
+            undetected.append({
+                "rule": rule_id, "forbids": token,
+                "reason": "no executable detector and no declared reason for its absence",
+            })
+
+    covered = {row["rule"] for row in detected}
+    uncovered = {row["rule"] for row in (*accepted, *undetected)}
+    return {
+        "declared_rules": len(declared),
+        "obligations": len(detected) + len(accepted) + len(undetected),
+        "detected": detected,
+        "accepted_undetected": accepted,
+        "undetected": undetected,
+        "rules_fully_covered": sorted(covered - uncovered),
+        "rules_partly_covered": sorted(covered & uncovered),
+        "rules_not_covered": sorted(uncovered - covered),
+        "detectors_without_a_declared_rule": sorted(_DETECTORS_WITHOUT_A_DECLARED_RULE),
+    }
+
+
+def undetected_obligations(manifest: Any) -> list[str]:
+    """Return declared obligations that neither execute nor carry a written reason.
+
+    Empty by construction today. A rule added to the manifest lands here the
+    moment it is added, which is the point: silence about a new rule is a
+    failure, not a pass.
+    """
+
+    return [f"{row['rule']}:{row['forbids']}" for row in rule_detector_coverage(manifest)["undetected"]]
+
+
+def _manifest_path(src_root: Path, repo_root: Path | None) -> Path:
+    root = repo_root if repo_root is not None else src_root.parent.parent
+    return root / ".aiworkhub" / "config" / "development_rules.json"
+
+
+def load_manifest(src_root: Path, repo_root: Path | None) -> tuple[Any, str, str]:
+    """Return ``(manifest, reason, status)`` for the repository's rules manifest.
+
+    ``status`` separates two things that must not be confused. ``absent`` means
+    this tree is not a repository that declares rules -- the sparse worktree a
+    worker validates in, or a fixture -- and the coverage question does not
+    apply, exactly as a repository invariant with no canonical store does not
+    apply. ``unreadable`` means a repository DOES declare rules and they cannot
+    be read, which is a defect and fails closed.
+    """
+
+    path = _manifest_path(src_root, repo_root)
+    if not path.is_file():
+        return None, f"no development rules manifest at {path.as_posix()}", "absent"
+    try:
+        from .development_rules import parse_manifest_bytes
+
+        return parse_manifest_bytes(path.read_bytes()), "", "ok"
+    except Exception as exc:  # noqa: BLE001 - a declared but unreadable manifest blocks
+        return None, f"manifest could not be parsed: {type(exc).__name__}", "unreadable"
 
 
 def _unevaluable(name: str, root: Path, exc: Exception) -> Violation:
@@ -437,6 +1019,15 @@ def check(
     Never raises for a repository-shaped problem: an invariant that cannot be
     evaluated reports itself as a violation, because "could not check" and
     "checked and clean" must never look the same.
+
+    Two booleans, and they mean different things. ``passed`` says no detector
+    that ran found a breach. ``all_declared_obligations_checked`` says whether
+    the detectors that ran cover everything ``development_rules.json`` declares
+    -- and on this repository it is False, because 5 of 63 declared obligations
+    execute. Before RM-2026-00048 only ``passed`` existed and it read as the
+    second claim while meaning the first: 15 of 20 declared rules were unchecked
+    and the report said ``unevaluated: []``. Every obligation that does not
+    execute is now listed in ``unevaluated`` by name, with the reason.
 
     ``repo_root`` is the repository whose canonical stores the repository
     invariants measure, and is separate from ``src_root`` deliberately. The
@@ -493,14 +1084,115 @@ def check(
         except Exception as exc:  # noqa: BLE001 - unevaluable is a violation
             found = [_unevaluable(name, repo if repo is not None else root, exc)]
         evaluated(name, found)
+
+    # The manifest is what the repository DECLARES; everything above is what it
+    # EXECUTES. Reading it here is the whole point of RM-2026-00048: a report
+    # that never opens the manifest cannot know what it is failing to check.
+    manifest, manifest_reason, manifest_status = load_manifest(root, repo)
+    if manifest is None:
+        coverage: dict[str, Any] = {
+            "status": "not_applicable" if manifest_status == "absent" else "unavailable",
+            "reason": manifest_reason,
+        }
+        for name, _ in _RATCHET_INVARIANTS:
+            results.append({
+                "invariant": name, "violations": 0, "evaluated": False, "reason": manifest_reason,
+            })
+            unevaluated.append({"invariant": name, "reason": manifest_reason})
+    else:
+        try:
+            coverage = {"status": "evaluated", "reason": "", **rule_detector_coverage(manifest)}
+        except Exception as exc:  # noqa: BLE001 - a stale map must block, never pass
+            coverage = {
+                "status": "unavailable",
+                "reason": f"detector map disagrees with the manifest: {type(exc).__name__}: {exc}",
+            }
+        boundary = manifest.single_definition_boundary
+        if boundary is None:
+            reason = "manifest declares no single_definition_boundary ratchet"
+            for name, _ in _RATCHET_INVARIANTS:
+                results.append({
+                    "invariant": name, "violations": 0, "evaluated": False, "reason": reason,
+                })
+                unevaluated.append({"invariant": name, "reason": reason})
+        else:
+            thresholds = {pattern: boundary.threshold(pattern) for pattern in boundary.patterns}
+            baseline: dict[str, dict[str, int]] = {}
+            for entry in boundary.baseline:
+                baseline.setdefault(entry.pattern, {})[entry.path] = entry.count
+            try:
+                counts = duplicate_definition_counts(root, thresholds)
+            except Exception as exc:  # noqa: BLE001 - an unreadable tree is not a clean tree
+                counts = None
+                for name, _ in _RATCHET_INVARIANTS:
+                    evaluated(name, [_unevaluable(name, root, exc)])
+            if counts is not None:
+                for name, ratchet_check in _RATCHET_INVARIANTS:
+                    found = ratchet_check(counts, baseline)
+                    violations.extend(found)
+                    pattern = (
+                        "copied_helper"
+                        if name == "copied_helpers_have_one_definition"
+                        else "parallel_implementation"
+                    )
+                    results.append({
+                        "invariant": name,
+                        "violations": len(found),
+                        "evaluated": True,
+                        "measurement": {
+                            "pattern": pattern,
+                            "modules": len(counts[pattern]),
+                            "definitions": sum(counts[pattern].values()),
+                            "baseline_definitions": sum(baseline.get(pattern, {}).values()),
+                        },
+                    })
+
+    # An obligation that neither executes nor carries a written reason is a hard
+    # failure: a rule added to the manifest with no detector must break this, not
+    # widen the silence it was added to end.
+    unclassified = list(coverage.get("undetected", []))
+    for row in unclassified:
+        violations.append(Violation(
+            "declared_rules_are_all_classified",
+            ".aiworkhub/config/development_rules.json",
+            f"rule {row['rule']} forbids {row['forbids']}, which no detector "
+            "executes and ACCEPTED_UNDETECTED does not explain",
+        ))
+    # Every obligation this repository does not check is named in the report with
+    # its reason, so `passed` can never be read as "all declared rules hold".
+    for row in coverage.get("accepted_undetected", []):
+        unevaluated.append({
+            "invariant": f"{row['rule']}:{row['forbids']}",
+            "reason": row["reason"],
+        })
+    if coverage["status"] == "unavailable":
+        # A repository that DECLARES rules and cannot read them is broken; one
+        # that declares none is simply not this kind of repository.
+        violations.append(Violation(
+            "declared_rules_are_all_classified",
+            ".aiworkhub/config/development_rules.json",
+            f"declared-rule coverage could not be determined: {coverage['reason']}",
+        ))
+
     return {
         "schema_id": SCHEMA_ID,
         "src_root": str(root),
         "repo_root": str(repo) if repo is not None else "",
         "invariants": results,
         "unevaluated": unevaluated,
+        "rule_coverage": coverage,
+        # False whenever any declared obligation does not execute. It is False on
+        # this repository today -- 5 of 63 obligations execute -- and saying so is
+        # the difference between a gate and a gate people believe.
+        "all_declared_obligations_checked": (
+            coverage["status"] == "evaluated"
+            and not coverage["accepted_undetected"]
+            and not coverage["undetected"]
+        ),
         "violation_count": len(violations),
         "violations": [v.to_dict() for v in violations[:MAX_VIOLATIONS_PER_INVARIANT]],
+        # "no detector that ran found a breach", NOT "every declared rule holds".
+        # Read it with all_declared_obligations_checked, never alone.
         "passed": not violations,
     }
 

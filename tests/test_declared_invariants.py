@@ -19,7 +19,8 @@ and "checked and clean" must never look the same.
 """
 
 from __future__ import annotations
-
+import ast
+import json
 import json
 import sys
 from pathlib import Path
@@ -353,9 +354,11 @@ def test_a_root_with_no_canonical_store_reports_unevaluated_not_clean(tmp_path: 
     row = _learning_row(report)
     assert row["evaluated"] is False
     assert row["reason"].startswith("not_an_aiworkhub_repository:")
-    assert report["unevaluated"] == [
-        {"invariant": "recent_decisions_record_a_lesson", "reason": row["reason"]}
-    ]
+    # `unevaluated` also carries the manifest-scoped obligations now, and a root
+    # with no canonical store has no manifest either, so assert membership.
+    assert {"invariant": "recent_decisions_record_a_lesson", "reason": row["reason"]} in (
+        report["unevaluated"]
+    )
 
 
 def test_no_repository_root_is_reported_rather_than_silently_skipped():
@@ -406,8 +409,12 @@ def test_only_a_missing_manifest_makes_the_duty_not_applicable(tmp_path: Path, m
     monkeypatch.setattr(task_store, "inspect_repository", _explode)
     report = di.check(_PACKAGE, repo_root=root)
 
-    assert not report["passed"], "a repository that cannot be probed is not clean"
-    assert report["unevaluated"] == []
+    # The point is that the learning duty is a VIOLATION here rather than being
+    # excused as unevaluated; other invariants may legitimately be unevaluated.
+    assert not any(
+        row["invariant"] == "recent_decisions_record_a_lesson"
+        for row in report["unevaluated"]
+    )
     assert any(
         v["invariant"] == "recent_decisions_record_a_lesson"
         and "could not be evaluated" in v["detail"]
@@ -463,3 +470,308 @@ def test_the_checker_never_writes_a_lesson(tmp_path: Path):
 
     assert not report["passed"], "this fixture is in breach; the test is about writes"
     assert _rows() == before
+
+
+# --------------------------------------------------------------------------- #
+# RM-2026-00048: the manifest is read, and the report says what it does not check
+# --------------------------------------------------------------------------- #
+
+_MANIFEST_RELATIVE = Path(".aiworkhub") / "config" / "development_rules.json"
+_CANONICAL_MANIFEST = Path(__file__).resolve().parents[1] / _MANIFEST_RELATIVE
+
+
+def _manifest_mapping() -> dict:
+    return json.loads(_CANONICAL_MANIFEST.read_text(encoding="utf-8"))
+
+
+def _parsed_manifest():
+    from aiworkhub.development_rules import parse_manifest
+
+    return parse_manifest(_manifest_mapping())
+
+
+# A body large enough to clear both declared thresholds (66 AST nodes), so these
+# fixtures test the detector rather than the threshold.
+_HELPER = '''\
+def normalise(value, *, limit):
+    text = str(value).strip()
+    if not text:
+        return ""
+    if len(text) > limit:
+        text = text[:limit]
+    parts = [p for p in text.split(",") if p]
+    return ",".join(sorted(parts))
+'''
+
+# Identical structure, every identifier renamed: a parallel implementation, not
+# a copy.
+_HELPER_RENAMED = '''\
+def collapse(item, *, ceiling):
+    body = str(item).strip()
+    if not body:
+        return ""
+    if len(body) > ceiling:
+        body = body[:ceiling]
+    pieces = [q for q in body.split(",") if q]
+    return ",".join(sorted(pieces))
+'''
+
+
+def _repo_with_manifest(tmp_path: Path, baseline: list[dict] | None = None) -> Path:
+    """A repository whose manifest declares the given duplication baseline."""
+    root = tmp_path / "repo"
+    package = root / "src" / "aiworkhub"
+    package.mkdir(parents=True)
+    mapping = _manifest_mapping()
+    entries = list(baseline or [])
+    total = sum(entry["count"] for entry in entries)
+    mapping["single_definition_boundary"] = {
+        "scan_root": "src/aiworkhub",
+        "min_body_nodes": {"copied_helper": 20, "parallel_implementation": 40},
+        "patterns": ["copied_helper", "parallel_implementation"],
+        "baseline": entries,
+        "measurement": {
+            "reference_commit": "0" * 40,
+            "reference_total": total,
+            "current_total": total,
+            "accepted_predecessor_delta": 0,
+        },
+    }
+    manifest_path = root / _MANIFEST_RELATIVE
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps(mapping), encoding="utf-8")
+    return root
+
+
+def _duplication_violations(report: dict, invariant: str) -> list[dict]:
+    return [v for v in report["violations"] if v["invariant"] == invariant]
+
+
+def test_every_declared_rule_is_either_detected_or_explained():
+    """The gate this module now IS: a rule with no detector and no reason fails.
+
+    Empty by construction today, exactly like
+    ``dependency_autolaunch.unclassified_denial_reasons``. Adding a rule to
+    ``development_rules.json`` makes this fail until someone writes the detector
+    or writes down why there is none.
+    """
+    assert di.undetected_obligations(_parsed_manifest()) == []
+
+
+def test_a_new_manifest_rule_with_no_detector_is_visible_immediately():
+    """Silence about a newly declared rule must be a failure, not a pass."""
+    from aiworkhub.development_rules import parse_manifest
+
+    mapping = _manifest_mapping()
+    mapping["rules"].append({
+        "id": "freshly_invented_rule",
+        "topic": "freshly_invented_rule",
+        "kind": "forbidden_pattern",
+        "applicability": {"languages": ["python"]},
+        "allow": [],
+        "forbid": ["a_thing_nobody_checks"],
+        "payload": {"severity": "error", "rationale_id": "invented"},
+    })
+    undetected = di.undetected_obligations(parse_manifest(mapping))
+
+    assert undetected == ["freshly_invented_rule:a_thing_nobody_checks"]
+
+
+def test_the_detector_map_is_checked_against_the_manifest_not_inferred():
+    """A map that claims a token the rule does not forbid must refuse, not guess."""
+    from aiworkhub.development_rules import parse_manifest
+
+    manifest = parse_manifest(_manifest_mapping())
+    original = dict(di.RULE_DETECTORS["single_definition"])
+    try:
+        di.RULE_DETECTORS["single_definition"]["not_a_declared_token"] = (
+            "terminal_vocabulary_has_one_owner"
+        )
+        with pytest.raises(ValueError, match="does not forbid"):
+            di.rule_detector_coverage(manifest)
+    finally:
+        di.RULE_DETECTORS["single_definition"] = original
+
+
+def test_the_detector_map_refuses_a_detector_that_does_not_run():
+    from aiworkhub.development_rules import parse_manifest
+
+    manifest = parse_manifest(_manifest_mapping())
+    original = dict(di.RULE_DETECTORS["single_definition"])
+    try:
+        di.RULE_DETECTORS["single_definition"]["copied_helper"] = "no_such_detector"
+        with pytest.raises(ValueError, match="detectors that do not run"):
+            di.rule_detector_coverage(manifest)
+    finally:
+        di.RULE_DETECTORS["single_definition"] = original
+
+
+def test_the_report_names_every_obligation_it_does_not_check():
+    """`passed` must never be readable as "every declared rule holds"."""
+    repo = Path(__file__).resolve().parents[1]
+    report = di.check(_PACKAGE, repo_root=repo)
+    coverage = report["rule_coverage"]
+
+    assert coverage["status"] == "evaluated"
+    # The honest split, stated rather than implied.
+    assert report["all_declared_obligations_checked"] is False
+    assert coverage["obligations"] == len(coverage["detected"]) + len(
+        coverage["accepted_undetected"]
+    ) + len(coverage["undetected"])
+    assert coverage["declared_rules"] == 20
+
+    named = {row["invariant"] for row in report["unevaluated"]}
+    for row in coverage["accepted_undetected"]:
+        assert f"{row['rule']}:{row['forbids']}" in named
+        assert row["reason"], "an unchecked obligation must carry a reason"
+
+
+def test_a_copied_helper_is_caught(tmp_path: Path):
+    repo = _repo_with_manifest(tmp_path)
+    package = repo / "src" / "aiworkhub"
+    (package / "one.py").write_text(_HELPER, encoding="utf-8")
+    (package / "two.py").write_text(_HELPER, encoding="utf-8")
+
+    report = di.check(package, repo_root=repo)
+
+    found = _duplication_violations(report, "copied_helpers_have_one_definition")
+    assert not report["passed"]
+    assert {v["path"] for v in found} == {
+        "src/aiworkhub/one.py", "src/aiworkhub/two.py",
+    }
+
+
+def test_a_parallel_implementation_is_caught(tmp_path: Path):
+    """Same structure, every name different: a re-implementation, not a copy."""
+    repo = _repo_with_manifest(tmp_path)
+    package = repo / "src" / "aiworkhub"
+    (package / "one.py").write_text(_HELPER, encoding="utf-8")
+    (package / "two.py").write_text(_HELPER_RENAMED, encoding="utf-8")
+
+    report = di.check(package, repo_root=repo)
+
+    assert not report["passed"]
+    assert _duplication_violations(report, "parallel_implementations_have_one_owner")
+    # A renamed twin is NOT a byte-identical copy, and must not be reported as one.
+    assert not _duplication_violations(report, "copied_helpers_have_one_definition")
+
+
+def test_a_body_below_the_declared_threshold_is_not_reported(tmp_path: Path):
+    """Bodies whose shape is forced by their signature are not duplication.
+
+    Measured on this repository: below 20 nodes the groups are ``return self``,
+    a ``now()`` wrapper, a property getter. Reporting them would bury the 37
+    real copies in noise.
+    """
+    repo = _repo_with_manifest(tmp_path)
+    package = repo / "src" / "aiworkhub"
+    (package / "one.py").write_text("def handle(self):\n    return self._handle\n", encoding="utf-8")
+    (package / "two.py").write_text("def handle(self):\n    return self._handle\n", encoding="utf-8")
+
+    report = di.check(package, repo_root=repo)
+
+    assert report["passed"], report["violations"]
+
+
+def test_the_declared_baseline_is_permitted_and_growth_is_not(tmp_path: Path):
+    """The ratchet's whole purpose: today's duplication passes, tomorrow's does not."""
+    repo = _repo_with_manifest(tmp_path, baseline=[
+        {"path": "src/aiworkhub/one.py", "pattern": "copied_helper", "count": 1},
+        {"path": "src/aiworkhub/two.py", "pattern": "copied_helper", "count": 1},
+    ])
+    package = repo / "src" / "aiworkhub"
+    (package / "one.py").write_text(_HELPER, encoding="utf-8")
+    (package / "two.py").write_text(_HELPER, encoding="utf-8")
+
+    assert di.check(package, repo_root=repo)["passed"]
+
+    # A third copy is growth in a module the baseline already knows about.
+    (package / "two.py").write_text(_HELPER + "\n" + _HELPER.replace("normalise", "normalise2"), encoding="utf-8")
+    grown = di.check(package, repo_root=repo)
+    assert not grown["passed"]
+    assert any(
+        "may only descend" in v["detail"]
+        for v in _duplication_violations(grown, "copied_helpers_have_one_definition")
+    )
+
+
+def test_a_clean_module_that_becomes_duplicated_is_a_new_identity(tmp_path: Path):
+    repo = _repo_with_manifest(tmp_path, baseline=[
+        {"path": "src/aiworkhub/one.py", "pattern": "copied_helper", "count": 1},
+        {"path": "src/aiworkhub/two.py", "pattern": "copied_helper", "count": 1},
+    ])
+    package = repo / "src" / "aiworkhub"
+    (package / "one.py").write_text(_HELPER, encoding="utf-8")
+    (package / "two.py").write_text(_HELPER, encoding="utf-8")
+    (package / "three.py").write_text(_HELPER, encoding="utf-8")
+
+    report = di.check(package, repo_root=repo)
+
+    assert not report["passed"]
+    assert any(
+        v["path"] == "src/aiworkhub/three.py" and "baseline records as having none" in v["detail"]
+        for v in _duplication_violations(report, "copied_helpers_have_one_definition")
+    )
+
+
+def test_the_canonical_tree_matches_its_own_declared_baseline():
+    """The baseline must describe this tree exactly, or the ratchet is fiction."""
+    manifest = _parsed_manifest()
+    boundary = manifest.single_definition_boundary
+    assert boundary is not None
+
+    thresholds = {p: boundary.threshold(p) for p in boundary.patterns}
+    counts = di.duplicate_definition_counts(_PACKAGE, thresholds)
+    declared: dict[str, dict[str, int]] = {}
+    for entry in boundary.baseline:
+        declared.setdefault(entry.pattern, {})[entry.path] = entry.count
+
+    assert counts["copied_helper"] == declared.get("copied_helper", {})
+    assert counts["parallel_implementation"] == declared.get("parallel_implementation", {})
+    assert sum(
+        sum(v.values()) for v in counts.values()
+    ) == boundary.current_total
+
+
+def test_a_parallel_scan_and_a_sequential_scan_agree(monkeypatch):
+    """Parallelism may change how fast, never what is measured."""
+    parallel = di.collect_definitions(_PACKAGE)
+    monkeypatch.setattr(di, "_scan_workers", lambda count: 1)
+    sequential = di.collect_definitions(_PACKAGE)
+
+    assert parallel == sequential
+    assert len(parallel) > 1000, "the scan must be exhaustive, not a sample"
+
+
+def test_the_worker_count_is_derived_and_leaves_headroom(monkeypatch):
+    """Derived from the observed cores, never a constant, and never all of them."""
+    monkeypatch.setattr(di.os, "cpu_count", lambda: 16)
+    assert di._scan_workers(500) == 16 - di._SCAN_CORE_HEADROOM
+
+    monkeypatch.setattr(di.os, "cpu_count", lambda: 64)
+    assert di._scan_workers(500) == 64 - di._SCAN_CORE_HEADROOM
+
+    # A machine too small to spare a core still runs, sequentially.
+    monkeypatch.setattr(di.os, "cpu_count", lambda: 2)
+    assert di._scan_workers(500) == 1
+
+    # And a scan too small to pay for the pool does not start one.
+    monkeypatch.setattr(di.os, "cpu_count", lambda: 16)
+    assert di._scan_workers(di._PARALLEL_SCAN_MIN_MODULES - 1) == 1
+
+
+def test_shape_erasure_keeps_child_nodes(tmp_path: Path):
+    """Erasing ``value`` by field name collapsed every return in the package.
+
+    ``Constant.value`` is a literal; ``Return.value`` and ``Assign.value`` are
+    whole subtrees. Erasing by name reported 324 duplicate definitions where
+    reading the fields exactly finds 82, so this pins the distinction.
+    """
+    returns_a_call = ast.parse("def f():\n    return helper(1, 2)\n").body[0]
+    returns_an_attribute = ast.parse("def g():\n    return thing.field\n").body[0]
+
+    assert di._shape_dump(returns_a_call) != di._shape_dump(returns_an_attribute)
+
+    # A pure rename, though, must still share a shape.
+    renamed = ast.parse("def h():\n    return other(1, 2)\n").body[0]
+    assert di._shape_dump(returns_a_call) == di._shape_dump(renamed)
