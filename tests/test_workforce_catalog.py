@@ -11,6 +11,8 @@ from aiworkhub import (
     learning_commit,
     model_settings,
     process_launcher,
+    provider_route_contracts,
+    repo_policy,
     runner_topic_policy,
     workforce_catalog,
     workforce_router,
@@ -1770,3 +1772,321 @@ def test_launcher_route_absent_for_an_enabled_model_fails_the_suite() -> None:
         assert str(exc).startswith("workforce_route_absent:")
     else:  # pragma: no cover - explicit assertion without pytest dependency
         raise AssertionError("missing launcher route did not raise route-absent")
+
+
+# ---------------------------------------------------------------------------
+# One question, one predicate (NF-2026-00669).
+#
+# Two surfaces publish a verdict about the same route.  Preflight answers "can
+# this route be STARTED here?"; the catalog answers "has a round trip been
+# OBSERVED on it?".  Both answers can be true at once, and the owner reported
+# twice that they read as a contradiction because neither said which question
+# it had answered and because the catalog called a route with 53 decided tasks
+# "unobserved".  These tests hold both halves of that fix.
+# ---------------------------------------------------------------------------
+
+
+def _glm_route_economics(*, matched: int, accepted: int) -> dict:
+    """A cost-ledger view carrying decided outcomes for the live GLM route."""
+    return {
+        "routes": {
+            "glm-5.2": {
+                "glm_vscode_lm": {
+                    "code": {
+                        "unknown": {
+                            "matched_decided_tasks": matched,
+                            "accepted_outcomes": accepted,
+                            "state": "UNKNOWN",
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+def test_route_with_decided_history_is_never_published_as_never_observed(
+    tmp_path: Path,
+) -> None:
+    """The owner's exact case: 53 decided tasks reported as `route_unobserved`."""
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight=_preflight(),
+        cost_per_accepted_outcome=_glm_route_economics(matched=53, accepted=23),
+        now_epoch=2_000_000_000.0,
+    )
+    glm = next(row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2")
+
+    # The verdict stays negative -- nothing recent proves the route still
+    # works -- but it must not claim the route was never observed.
+    assert glm["available"] is False
+    assert glm["readiness_status"] == "route_unobserved_in_window"
+
+    observation = glm["route_observation"]
+    assert observation["reason"] == repo_policy.ROUTE_OBSERVATION_OUTSIDE_WINDOW
+    assert observation["prior_observation_count"] == 53
+    assert (
+        observation["evidence_class"]
+        == provider_route_contracts.EVIDENCE_OBSERVED_ROUND_TRIP
+    )
+    # Measured-but-stale is `unknown`, never `supported` and never
+    # `unsupported`: nothing measured this route failing.
+    assert observation["state"] == provider_route_contracts.CAPABILITY_UNKNOWN
+    assert snapshot["summary"]["decided_history_outside_observation_window"] >= 1
+
+
+def test_route_with_no_history_stays_unobserved_and_never_borrows_evidence(
+    tmp_path: Path,
+) -> None:
+    """Fail-closed in the other direction: unmeasured must stay unmeasured."""
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight=_preflight(),
+        now_epoch=2_000_000_000.0,
+    )
+    glm = next(row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2")
+
+    assert glm["available"] is False
+    assert glm["readiness_status"] == "route_unobserved"
+    observation = glm["route_observation"]
+    assert observation["reason"] == repo_policy.ROUTE_OBSERVATION_NEVER_RECORDED
+    assert observation["prior_observation_count"] == 0
+    assert (
+        observation["evidence_class"] == provider_route_contracts.EVIDENCE_UNVERIFIED
+    )
+    assert observation["state"] == provider_route_contracts.CAPABILITY_UNKNOWN
+
+
+def test_a_stale_terminal_execution_still_counts_as_a_prior_observation(
+    tmp_path: Path,
+) -> None:
+    """A success older than the window is evidence; only its recency lapsed."""
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+
+    def success_at(epoch: float) -> dict:
+        return {
+            "request_id": "ok-1",
+            "task_id": "task-ok-1",
+            "adapter_id": "deepseek_vscode_lm",
+            "model": "deepseek-v4-pro",
+            "state": "accepted",
+            "error": "",
+            "finished_at": datetime.fromtimestamp(
+                epoch, tz=timezone.utc
+            ).isoformat(),
+        }
+
+    fresh = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[success_at(now - 60)],
+        preflight=_deepseek_preflight(), now_epoch=now,
+    )
+    pro = next(
+        row for row in fresh["workers"] if row["worker_id"] == "deepseek-v4-pro"
+    )
+    assert pro["available"] is True
+    assert pro["availability_reason"] == ""
+    assert (
+        pro["route_observation"]["state"]
+        == provider_route_contracts.CAPABILITY_SUPPORTED
+    )
+    assert pro["route_observation"]["reason"] == repo_policy.ROUTE_OBSERVATION_IN_WINDOW
+
+    stale_epoch = now - workforce_catalog.ROUTE_CIRCUIT_LOOKBACK_SECONDS - 60
+    stale = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[success_at(stale_epoch)],
+        preflight=_deepseek_preflight(), now_epoch=now,
+    )
+    stale_pro = next(
+        row for row in stale["workers"] if row["worker_id"] == "deepseek-v4-pro"
+    )
+    # `supported` must decay out of the window -- an old success cannot keep
+    # asserting the route works today.
+    assert stale_pro["available"] is False
+    assert (
+        stale_pro["route_observation"]["state"]
+        == provider_route_contracts.CAPABILITY_UNKNOWN
+    )
+    # ...but the route was observed, so it is not reported as never run.
+    assert stale_pro["readiness_status"] == "route_unobserved_in_window"
+    assert stale_pro["route_observation"]["prior_observation_count"] == 1
+    assert (
+        stale_pro["route_observation"]["evidence_class"]
+        == provider_route_contracts.EVIDENCE_OBSERVED_ROUND_TRIP
+    )
+
+
+def test_every_unavailable_route_names_an_exact_actionable_blocker(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight={
+            "providers": [
+                {
+                    "adapter_id": "claude_cli",
+                    "launchable": False,
+                    "status": "not_installed",
+                }
+            ]
+        },
+    )
+    assert snapshot["workers"]
+    for row in snapshot["workers"]:
+        if row["available"]:
+            assert row["availability_reason"] == "", row["worker_id"]
+        else:
+            # `available=false` is never a bare no.
+            assert row["availability_reason"], row["worker_id"]
+
+    opus = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "claude-opus-5"
+    )
+    assert opus["available"] is False
+    # The blocker belongs to the OTHER surface, so this row quotes that
+    # surface's question and its own status instead of inventing a second
+    # word for the same fact.  This is what stops the two contradicting.
+    assert opus["availability_reason"] == (
+        f"{repo_policy.ROUTE_QUESTION_STARTABLE}:not_installed"
+    )
+
+
+def test_the_two_surfaces_answer_named_and_different_questions(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    # Real preflight on whatever host runs this: the question tokens are host
+    # independent even though the readiness verdicts are not, so nothing here
+    # forces a platform.
+    preflight = repo_policy.build_preflight(root)
+    assert preflight["providers"]
+    for row in preflight["providers"]:
+        assert row["route_question"] == repo_policy.ROUTE_QUESTION_STARTABLE
+
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=_preflight()
+    )
+    assert snapshot["workers"]
+    for row in snapshot["workers"]:
+        assert row["route_question"] == repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED
+        assert row["route_observation"]["question"] == row["route_question"]
+
+    # The two surfaces must not be answering the same question -- if they
+    # were, one of them would be redundant and they could genuinely conflict.
+    assert (
+        repo_policy.ROUTE_QUESTION_STARTABLE
+        != repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED
+    )
+    assert (
+        snapshot["truth_contract"]["route_question"]
+        == repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED
+    )
+    assert (
+        snapshot["truth_contract"]["startability_question_answered_by"]
+        == "repo_policy.build_preflight"
+    )
+
+
+def test_preflight_declares_both_questions_and_disclaims_the_one_it_cannot_answer(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    questions = repo_policy.build_preflight(root)["provider_summary"][
+        "route_status_questions"
+    ]
+    assert questions["answered_here"]["question"] == (
+        repo_policy.ROUTE_QUESTION_STARTABLE
+    )
+    assert questions["answered_by_workforce_catalog"]["question"] == (
+        repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED
+    )
+    # A reader of preflight alone is told, on the surface itself, that
+    # `launchable` is not availability.
+    assert "never completed" not in questions["answered_here"]["asserts"]
+    assert questions["answered_here"]["does_not_assert"]
+    assert questions["answered_by_workforce_catalog"]["does_not_assert"]
+
+
+def test_rank_task_carries_the_exact_reason_an_excluded_route_was_dropped(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight=_preflight(),
+        cost_per_accepted_outcome=_glm_route_economics(matched=53, accepted=23),
+    )
+    task = workforce_router.TaskRequirements.build(
+        task_id="reason-propagation",
+        repo_id="repo",
+        kinds=["code"],
+        risk="medium",
+        tool_needs=["source-graph"],
+    )
+    decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
+    glm = next(
+        item for item in decision["candidates"] if item["worker_id"] == "glm-5.2"
+    )
+    assert glm["excluded"] is True
+    assert "worker_unavailable" in glm["exclusion_reasons"]
+    # The router only knows "unavailable"; the catalog knows why.  A reader of
+    # the decision must not have to go back to the catalog to find out.
+    assert glm["availability_reason"] == (
+        repo_policy.ROUTE_OBSERVATION_OUTSIDE_WINDOW
+    )
+    assert glm["route_observation"]["prior_observation_count"] == 53
+
+
+def test_availability_predicate_says_which_questions_decided_the_verdict(
+    tmp_path: Path,
+) -> None:
+    """`available` is a conjunction; the row must say which one it used.
+
+    Pinning every row to the round-trip question would be a second wrong
+    label: a non-gated route's `available` is decided by startability alone,
+    which is the question preflight already answers.
+    """
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=[], preflight=_preflight()
+    )
+    by_id = {row["worker_id"]: row for row in snapshot["workers"]}
+
+    gated = by_id["glm-5.2"]
+    assert gated["observation_gated_route"] is True
+    assert gated["availability_predicate"] == [
+        repo_policy.ROUTE_QUESTION_STARTABLE,
+        repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED,
+    ]
+
+    ungated = by_id["claude-opus-5"]
+    assert ungated["observation_gated_route"] is False
+    # Startability alone -- the same question preflight answers, decided from
+    # preflight's own verdict, so the two surfaces share one predicate here.
+    assert ungated["availability_predicate"] == [
+        repo_policy.ROUTE_QUESTION_STARTABLE
+    ]
+    assert ungated["available"] is ungated["launch_eligible"]
+
+    for row in snapshot["workers"]:
+        # Whatever the conjunction, the round-trip fact is reported for every
+        # row, so no route is ever silently unmeasured.
+        assert row["route_observation"]["question"] == (
+            repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED
+        )
+        assert row["route_observation"]["state"] in {
+            provider_route_contracts.CAPABILITY_SUPPORTED,
+            provider_route_contracts.CAPABILITY_UNSUPPORTED,
+            provider_route_contracts.CAPABILITY_UNKNOWN,
+        }

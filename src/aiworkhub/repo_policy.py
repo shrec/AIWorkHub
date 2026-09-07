@@ -52,6 +52,35 @@ MANDATORY_RAW_DISCOVERY_DENIES = ("grep", "rg", "find", "tree")
 READINESS_READY = "ready"
 READINESS_READY_UNVERIFIED = "ready_unverified"
 QUOTA_STATE_UNAVAILABLE = "unavailable_from_provider_api"
+
+# ── Which question a route-status surface answered ─────────────────────────
+# Two AIWorkHub surfaces publish a verdict about the same route and they do
+# NOT answer the same question.  ``build_preflight`` measures whether the
+# route can be STARTED here: a binary resolves, a credential file exists, an
+# editor host answered, consent was granted.  ``workforce_catalog`` measures
+# whether a round trip on that route has been OBSERVED to complete inside a
+# bounded window.  Neither fact implies the other -- a startable route may
+# never have completed anything, and a route that completed work yesterday
+# may be unstartable today -- so a verdict shown without its question cannot
+# be acted on, and two verdicts shown without their questions read to an
+# operator as a contradiction (NF-2026-00669: `launchable=true,
+# ready_unverified` beside `available=false, route_unobserved`).  Each
+# surface now names the question it answered, so both facts can be true at
+# once without either being wrong.
+ROUTE_QUESTION_STARTABLE = "route_startable_here"
+ROUTE_QUESTION_ROUND_TRIP_OBSERVED = "route_round_trip_observed_in_window"
+
+# Exact reasons for a round-trip verdict.  "Never observed" and "observed,
+# but not inside the window" are different facts calling for different
+# operator actions: the first says nobody has ever run this route, the second
+# says the route has a decided history and has merely gone quiet.  Reporting
+# the second as the first is precisely the defect these tokens exist to
+# prevent -- measured evidence must never be published as unmeasured.
+ROUTE_OBSERVATION_NEVER_RECORDED = "no_terminal_execution_ever_recorded"
+ROUTE_OBSERVATION_OUTSIDE_WINDOW = "no_terminal_execution_inside_observation_window"
+ROUTE_OBSERVATION_IN_WINDOW = "terminal_execution_observed_inside_observation_window"
+ROUTE_OBSERVATION_CIRCUIT_OPEN = "route_failure_circuit_open"
+
 _FINALIZATION_PREFLIGHT_WARMUP_SECONDS = 1.0
 
 DEFAULT_POLICY: dict[str, Any] = {
@@ -320,6 +349,13 @@ def _provider_status(
     )
     result: dict[str, Any] = {
         "adapter_id": adapter_id,
+        # Name the question this row answers.  Every field below is a fact
+        # about the route being STARTABLE from this host -- a resolved
+        # binary, a present credential, an answering editor host, a granted
+        # consent.  None of them is a fact about a round trip completing, so
+        # a reader must never take `launchable` for "this route works"; the
+        # workforce catalog answers that separate question and says so.
+        "route_question": ROUTE_QUESTION_STARTABLE,
         "policy_allowed": policy_allowed,
         # Coverage describes routes this host and repository can actually
         # support. Windows native CLI routes remain fail-closed until an
@@ -488,6 +524,75 @@ def _provider_status(
         result["status"] = "repository_model_policy_disabled"
         result["reason"] = "route_disabled_by_repository_model_settings"
     return result
+
+
+def route_observation_verdict(
+    *,
+    observed_in_window: bool,
+    prior_observation_count: int,
+    observation_window_seconds: float,
+    circuit_open_failure_kind: str = "",
+) -> dict[str, Any]:
+    """Answer ``ROUTE_QUESTION_ROUND_TRIP_OBSERVED`` for exactly one route.
+
+    Every surface that reports whether a route has been seen to work calls
+    this, so the question has one predicate, one answer shape and one set of
+    reasons.  A second surface computing "is it available" its own way is how
+    the control plane came to contradict itself in the first place.
+
+    ``prior_observation_count`` is how many terminal executions and decided
+    tasks this exact route has on record AT ANY TIME, not only inside the
+    window.  It is the number that separates a route nobody has ever run from
+    one that has run and gone quiet.
+
+    The three-valued state and the evidence classes are deliberately the
+    repository's existing capability vocabulary from
+    ``provider_route_contracts``: "measured and negative" versus "never
+    measured" is exactly the distinction that module was added to carry, and
+    a second spelling of it here would be the ``single_definition`` violation
+    it exists to prevent.
+
+    Fail-closed.  ``supported`` is returned ONLY for a round trip observed
+    inside the window.  A route with a long history but nothing recent is
+    ``unknown`` -- not ``supported`` (nothing recent proves it still works)
+    and not ``unsupported`` either (nothing measured it failing).  Its
+    evidence class is still ``observed_round_trip`` and the count travels with
+    it, so a reader can tell "this route has never run" from "this route has
+    53 decided tasks and has gone quiet" without going looking for the number.
+    """
+
+    window = max(0.0, float(observation_window_seconds))
+    observed_before = max(0, int(prior_observation_count))
+    if circuit_open_failure_kind:
+        # Measured, and negative: an authenticated failure tripped the
+        # circuit.  This is the one genuinely ``unsupported`` case.
+        state = provider_route_contracts.CAPABILITY_UNSUPPORTED
+        evidence_class = provider_route_contracts.EVIDENCE_OBSERVED_ROUND_TRIP
+        reason = f"{ROUTE_OBSERVATION_CIRCUIT_OPEN}:{str(circuit_open_failure_kind)[:64]}"
+    elif observed_in_window:
+        state = provider_route_contracts.CAPABILITY_SUPPORTED
+        evidence_class = provider_route_contracts.EVIDENCE_OBSERVED_ROUND_TRIP
+        reason = ROUTE_OBSERVATION_IN_WINDOW
+    elif observed_before:
+        # The route HAS been observed; the observation is simply older than
+        # the window.  Calling this "unobserved" publishes measured evidence
+        # as unmeasured, which is the inverse of the repository doctrine and
+        # the exact bug the owner reported twice.
+        state = provider_route_contracts.CAPABILITY_UNKNOWN
+        evidence_class = provider_route_contracts.EVIDENCE_OBSERVED_ROUND_TRIP
+        reason = ROUTE_OBSERVATION_OUTSIDE_WINDOW
+    else:
+        state = provider_route_contracts.CAPABILITY_UNKNOWN
+        evidence_class = provider_route_contracts.EVIDENCE_UNVERIFIED
+        reason = ROUTE_OBSERVATION_NEVER_RECORDED
+    return {
+        "question": ROUTE_QUESTION_ROUND_TRIP_OBSERVED,
+        "state": state,
+        "evidence_class": evidence_class,
+        "reason": reason,
+        "observation_window_seconds": window,
+        "prior_observation_count": observed_before,
+    }
 
 
 def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dict[str, Any]:
@@ -875,6 +980,37 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
                 )
                 for capability in provider_route_contracts.CAPABILITY_VOCABULARY
             },
+            # The control plane answers TWO questions about every route and
+            # they must never be read as one.  Naming both here, on the
+            # surface that answers only the first, is what stops a reader
+            # taking `launchable`/`ready_unverified` for availability and
+            # then seeing the workforce catalog's answer to the OTHER
+            # question as a contradiction.
+            "route_status_questions": {
+                "answered_here": {
+                    "question": ROUTE_QUESTION_STARTABLE,
+                    "fields": ["launchable", "status", "access_observed"],
+                    "asserts": (
+                        "the route can be started from this host: launch "
+                        "target resolved, credential or editor host present, "
+                        "consent granted and repository policy allows it"
+                    ),
+                    "does_not_assert": (
+                        "that any unit of work has ever completed on this route"
+                    ),
+                },
+                "answered_by_workforce_catalog": {
+                    "question": ROUTE_QUESTION_ROUND_TRIP_OBSERVED,
+                    "fields": ["available", "route_observation", "route_health"],
+                    "asserts": (
+                        "a terminal execution on this exact route completed "
+                        "inside the catalog's bounded observation window"
+                    ),
+                    "does_not_assert": (
+                        "that the route can be started right now"
+                    ),
+                },
+            },
         },
         "selected_adapter": selected,
     }
@@ -1242,6 +1378,12 @@ __all__ = [
     "QUOTA_STATE_UNAVAILABLE",
     "READINESS_READY",
     "READINESS_READY_UNVERIFIED",
+    "ROUTE_OBSERVATION_CIRCUIT_OPEN",
+    "ROUTE_OBSERVATION_IN_WINDOW",
+    "ROUTE_OBSERVATION_NEVER_RECORDED",
+    "ROUTE_OBSERVATION_OUTSIDE_WINDOW",
+    "ROUTE_QUESTION_ROUND_TRIP_OBSERVED",
+    "ROUTE_QUESTION_STARTABLE",
     "RepoPolicyError",
     "SCHEMA_ID",
     "WORKFORCE_SCHEMA_ID",
@@ -1257,7 +1399,7 @@ __all__ = [
     "policy_path",
     "provider_observability_report",
     "resolve_workforce_cap",
-    "validate_launch",
+    "route_observation_verdict",
     "validate_policy",
     "workforce_admission",
 ]

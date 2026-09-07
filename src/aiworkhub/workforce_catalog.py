@@ -24,6 +24,7 @@ from . import (
     cost_ledger,
     learning_commit,
     model_settings,
+    provider_route_contracts,
     repo_policy,
     runner_topic_policy,
     runtime_adapters,
@@ -52,7 +53,16 @@ _MODEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,127}$")
 ROUTE_CIRCUIT_COOLDOWN_SECONDS = 600.0
 ROUTE_CIRCUIT_LOOKBACK_SECONDS = 86_400.0
 ROUTE_CIRCUIT_TRANSIENT_THRESHOLD = 2
-# validation_failed, finalize_failed and review_ready are downstream gate
+# Providers whose routes must show a LIVE round trip before the catalog will
+# call them available.  Their routes reach the model over the editor bridge or
+# a BYOK CLI, and for those families `provider_route_contracts` declares no
+# evidence that a unit of work can be carried end to end -- bridge presence is
+# a fact about the transport being up, never about a job finishing
+# (NF-2026-00669).  Membership is unchanged from 0.11.2 and is deliberately
+# not derived from the registry's declared capabilities: doing so would also
+# gate `kilo_xai_cli`, and changing which routes may be selected is a routing
+# decision that needs its own measurement, not a side effect of relabelling.
+_OBSERVATION_GATED_PROVIDERS: frozenset[str] = frozenset({"deepseek", "zhipu"})
 # outcomes: the provider returned a usable result, so they close (never open)
 # a route circuit and are never counted as provider-route failures.
 _ROUTE_SUCCESS_STATES = frozenset(
@@ -956,22 +966,6 @@ def build_catalog(
             and 0.0 <= observed_now_epoch - epoch <= ROUTE_CIRCUIT_LOOKBACK_SECONDS
             for process in matched
         )
-        verified_provider_route = worker["provider"] in {"deepseek", "zhipu"}
-        if (
-            verified_provider_route
-            and not exact_route_success_observed
-            and route_health["state"] == "closed"
-        ):
-            route_health = {
-                **route_health,
-                "state": "unobserved",
-                "reason": "no_recent_terminal_execution",
-            }
-        availability_observed = (
-            exact_route_success_observed
-            if verified_provider_route
-            else access_observed or bool(sample_count > 0)
-        )
         model_routes = economics_by_model.get(worker["model"])
         if not isinstance(model_routes, Mapping):
             model_routes = {}
@@ -980,6 +974,91 @@ def build_catalog(
             model_economics = model_routes.get(worker["adapter_id"])
         if not isinstance(model_economics, Mapping):
             model_economics = {}
+        # How much history this exact route already has, at ANY time -- not
+        # only inside the window.  Three independent ledgers can each show the
+        # route ran: a terminal process event, a decided task card, and the
+        # cost ledger's matched decided-task partitions.  Taking the largest
+        # fails closed in the honest direction, because an under-count is what
+        # lets a route with real history be published as never observed, which
+        # is the defect being fixed.
+        route_terminal_executions = sum(
+            1 for process in matched if _process_event_epoch(process) is not None
+        )
+        prior_observation_count = max(
+            len(matched_cards),
+            route_terminal_executions,
+            sum(
+                int(partition.get("matched_decided_tasks") or 0)
+                for family in model_economics.values()
+                if isinstance(family, Mapping)
+                for partition in family.values()
+                if isinstance(partition, Mapping)
+            ),
+        )
+        # Which routes must show a live round trip before they may be called
+        # available.  The membership is unchanged from 0.11.2 -- widening or
+        # narrowing it is a routing decision, not a labelling one -- but it is
+        # no longer an unexplained pair of provider names: these are the
+        # editor-bridge and BYOK families whose contract declares no evidence
+        # that they can carry a unit of work end to end, so bridge presence
+        # alone must not stand in for a completed round trip (NF-2026-00669).
+        observation_gated_route = worker["provider"] in _OBSERVATION_GATED_PROVIDERS
+        route_family = provider_route_contracts.route_family_for_adapter(
+            effective_adapter
+        )
+        if (
+            observation_gated_route
+            and not exact_route_success_observed
+            and route_health["state"] == "closed"
+        ):
+            route_health = {
+                **route_health,
+                "state": "unobserved",
+                "reason": "no_recent_terminal_execution",
+            }
+        # ONE predicate, shared with the preflight surface, for "has a round
+        # trip been observed on this route?".  It reports state and evidence
+        # class in the repository's existing capability vocabulary, so a
+        # reader can tell a route that has never run from one that has 53
+        # decided tasks and has merely gone quiet -- the two were previously
+        # both published as `route_unobserved`.
+        route_observation = repo_policy.route_observation_verdict(
+            observed_in_window=exact_route_success_observed,
+            prior_observation_count=prior_observation_count,
+            observation_window_seconds=ROUTE_CIRCUIT_LOOKBACK_SECONDS,
+            circuit_open_failure_kind=(
+                str(route_health.get("failure_kind") or "")
+                if not route_available
+                else ""
+            ),
+        )
+        availability_observed = (
+            exact_route_success_observed
+            if observation_gated_route
+            else access_observed or bool(sample_count > 0)
+        )
+        available = bool(
+            launch_eligible
+            and (exact_route_success_observed if observation_gated_route else True)
+        )
+        # `available=false` must never be a bare no.  Each branch names the
+        # exact fact that blocked selection, and when the blocker belongs to
+        # the OTHER surface the row quotes that surface's own verdict rather
+        # than inventing a second word for it -- which is how the two stop
+        # contradicting each other.
+        if available:
+            availability_reason = ""
+        elif not worker["enabled"]:
+            availability_reason = "worker_disabled_in_workforce_catalog"
+        elif not policy_enabled:
+            availability_reason = "route_disabled_by_repository_model_settings"
+        elif not adapter_ready.get("launchable"):
+            availability_reason = (
+                f"{repo_policy.ROUTE_QUESTION_STARTABLE}:"
+                f"{str(adapter_ready.get('status') or 'unknown')[:64]}"
+            )
+        else:
+            availability_reason = str(route_observation["reason"])
         rows.append({
             "execution_runner": execution_runner(
                 worker["worker_id"], effective_adapter
@@ -993,21 +1072,47 @@ def build_catalog(
             "effective_adapter_id": effective_adapter,
             "adapter_fallback_used": effective_adapter != worker["adapter_id"],
             "launch_eligible": launch_eligible,
-            "available": bool(
-                launch_eligible
-                and (
-                    exact_route_success_observed
-                    if verified_provider_route
-                    else True
-                )
+            "available": available,
+            # `route_question` names the question `route_observation` answers,
+            # which is the round-trip one for every row.
+            #
+            # `available` is a different matter and must not be mislabelled:
+            # it is a conjunction, and which questions it conjoins depends on
+            # whether this route is observation gated.  For a gated route
+            # `available` requires BOTH a startable transport and an observed
+            # round trip; for every other route it requires startability
+            # alone -- which is the same question preflight answers, decided
+            # from preflight's own `launchable`, so the two surfaces share one
+            # predicate there rather than each computing a rival answer.
+            # Publishing the conjunction is what lets a reader check that.
+            "route_question": repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED,
+            "availability_predicate": (
+                [
+                    repo_policy.ROUTE_QUESTION_STARTABLE,
+                    repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED,
+                ]
+                if observation_gated_route
+                else [repo_policy.ROUTE_QUESTION_STARTABLE]
             ),
+            "route_family": route_family,
+            "observation_gated_route": observation_gated_route,
+            "availability_reason": availability_reason,
+            "route_observation": route_observation,
             "availability_observed": availability_observed,
             "readiness_status": (
                 "route_circuit_open"
                 if not route_available
                 else (
-                    "route_unobserved"
-                    if verified_provider_route
+                    (
+                        # A route with prior terminal executions or decided
+                        # tasks HAS been observed.  Saying otherwise publishes
+                        # measured evidence as unmeasured; only a route with
+                        # no history at all is honestly `route_unobserved`.
+                        "route_unobserved_in_window"
+                        if prior_observation_count
+                        else "route_unobserved"
+                    )
+                    if observation_gated_route
                     and not exact_route_success_observed
                     else str(adapter_ready.get("status") or "unobserved")
                 )
@@ -1065,6 +1170,33 @@ def build_catalog(
             "enabled": sum(1 for item in rows if item["enabled"]),
             "available": sum(1 for item in rows if item["available"]),
             "observed": sum(1 for item in rows if item["outcomes"]["sample_count"]),
+            # The two facts the operator needs, side by side.  A route can be
+            # startable and never have completed anything; both counts being
+            # different is normal and is no longer readable as the control
+            # plane disagreeing with itself.
+            "startable": sum(1 for item in rows if item["launch_eligible"]),
+            "round_trip_observed_in_window": sum(
+                1
+                for item in rows
+                if item["route_observation"]["state"]
+                == provider_route_contracts.CAPABILITY_SUPPORTED
+            ),
+            "startable_without_observed_round_trip": sum(
+                1
+                for item in rows
+                if item["launch_eligible"]
+                and item["route_observation"]["state"]
+                != provider_route_contracts.CAPABILITY_SUPPORTED
+            ),
+            # Routes that have decided history the window cannot see.  A
+            # non-zero count here is exactly the population that used to be
+            # published as never observed.
+            "decided_history_outside_observation_window": sum(
+                1
+                for item in rows
+                if item["route_observation"]["reason"]
+                == repo_policy.ROUTE_OBSERVATION_OUTSIDE_WINDOW
+            ),
             "unattributed_process_rows": len(unattributed),
             "unattributed_missing_model_rows": missing_model,
             "unattributed_unknown_adapter_or_model_rows": len(unattributed) - missing_model,
@@ -1077,6 +1209,14 @@ def build_catalog(
             "economic_routing_is_advisory_only": True,
             "unknown_cost_never_ranks_as_free": True,
             "repository_model_policy_enforced": True,
+            # This surface answers the round-trip question only.  Whether a
+            # route can be STARTED is `build_preflight`'s question and is
+            # quoted verbatim into `availability_reason` when it is the
+            # blocker, so the two surfaces never publish rival words for the
+            # same fact.
+            "route_question": repo_policy.ROUTE_QUESTION_ROUND_TRIP_OBSERVED,
+            "startability_question_answered_by": "repo_policy.build_preflight",
+            "unmeasured_never_reported_as_measured_empty": True,
         },
     }
 
@@ -1264,6 +1404,18 @@ def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *,
             worker_id,
             str(candidate.get("adapter_id") or item.get("effective_adapter_id") or item.get("adapter_id") or ""),
         )
+        # The router can only say `worker_unavailable`; it never saw why.
+        # Carry the catalog's exact reason and its round-trip verdict onto the
+        # candidate so an excluded route is actionable at the point a human or
+        # a router reads the decision, instead of sending them back to the
+        # catalog to find out what "unavailable" meant.
+        if isinstance(item, Mapping):
+            candidate["availability_reason"] = str(
+                item.get("availability_reason") or ""
+            )
+            observation = item.get("route_observation")
+            if isinstance(observation, Mapping):
+                candidate["route_observation"] = dict(observation)
     selected_worker_id = str(decision.get("selected_worker_id") or "")
     selected_runner = ""
     if selected_worker_id:
