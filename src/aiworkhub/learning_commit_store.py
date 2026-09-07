@@ -642,4 +642,249 @@ def commit_learning(
     }
 
 
-__all__ = ["LearningCommitStoreError", "SCHEMA_ID", "commit_learning"]
+__all__ = [
+    "LearningCommitStoreError",
+    "SCHEMA_ID",
+    "commit_learning",
+    "injection_ledger_state",
+    "read_card_outcomes",
+    "read_correction_record",
+]
+
+# ---------------------------------------------------------------------------
+# Read-only correction-record readers (RM-2026-00021 layer two).
+#
+# The learning ledger and the cards it points at are the repository's record of
+# what was corrected and why. ``skill_miner`` mines that record, and reads it
+# exclusively through the three functions below so it never learns this
+# module's schema. All three open the task database READ-ONLY and never write.
+# ---------------------------------------------------------------------------
+
+_MAX_CORRECTION_TEXT = 8000
+
+
+def _readonly(repo: Path) -> sqlite3.Connection:
+    """Open the canonical task database read-only for a bounded scan."""
+    _readiness, db_path = task_store._require_ready(repo)
+    return cast(sqlite3.Connection, task_store._connect(db_path, readonly=True))
+
+
+def _card_of(row: Any) -> dict[str, Any]:
+    try:
+        card = json.loads(str(row["card_json"] or "{}"))
+    except (TypeError, ValueError):
+        return {}
+    return card if isinstance(card, dict) else {}
+
+
+def _card_paths(card: dict[str, Any]) -> list[str]:
+    """The card's own write set -- the instance vocabulary a rule must not use."""
+    writes = card.get("allowed_writes") or card.get("read_first") or []
+    if not isinstance(writes, (list, tuple)):
+        return []
+    return [str(item) for item in writes if isinstance(item, str)][:64]
+
+
+def read_correction_record(
+    repo: str | Path, *, limit: int = 5000
+) -> list[dict[str, Any]]:
+    """Return the repository's correction statements with their provenance.
+
+    Two captured sources, each already bound to the exact judgement it came
+    from:
+
+    * ``learning_commits`` -- the ``invariant_candidate`` and
+      ``lesson_candidate`` a manager wrote when adjudicating one request. These
+      are already rule statements.
+    * ``tasks.card_json.review_feedback.instruction`` -- the manager's exact
+      statement of what was wrong when a card was returned for rework.
+
+    Rows are plain mappings, not typed records, because the consumer's job is
+    to reduce them to vocabulary and this module's job is only to read them
+    truthfully. ``limit`` bounds the scan; an absent or unreadable store
+    yields an empty record rather than an error, so a repository that has
+    never been corrected mines to zero instead of failing.
+    """
+    repo_path = Path(repo)
+    try:
+        conn = _readonly(repo_path)
+    except Exception:  # noqa: BLE001 -- an unreadable store is an empty record
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        conn.row_factory = sqlite3.Row
+        cards: dict[str, dict[str, Any]] = {}
+        runners: dict[str, str] = {}
+        for row in conn.execute(
+            "SELECT task_id, runner, card_json FROM tasks LIMIT ?", (limit,)
+        ):
+            task_id = str(row["task_id"])
+            cards[task_id] = _card_of(row)
+            runners[task_id] = str(row["runner"] or "")
+
+        for row in conn.execute(
+            "SELECT task_id, request_id, repo_area, payload_json, created_at "
+            "FROM learning_commits ORDER BY created_at, task_id LIMIT ?",
+            (limit,),
+        ):
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            task_id = str(row["task_id"])
+            card = cards.get(task_id, {})
+            for field_name in ("invariant_candidate", "lesson_candidate"):
+                text = str(payload.get(field_name) or "").strip()
+                if not text:
+                    continue
+                rows.append(
+                    {
+                        "kind": f"learning_commit.{field_name}",
+                        "task_id": task_id,
+                        "anchor": str(row["request_id"] or ""),
+                        "text": text[:_MAX_CORRECTION_TEXT],
+                        "area": str(row["repo_area"] or ""),
+                        "paths": _card_paths(card),
+                        "actor": runners.get(task_id, ""),
+                        "failure_category": str(payload.get("failure_category") or ""),
+                        "occurred_at": str(row["created_at"] or ""),
+                    }
+                )
+
+        for task_id, card in cards.items():
+            feedback = card.get("review_feedback")
+            if not isinstance(feedback, dict):
+                continue
+            text = str(feedback.get("instruction") or "").strip()
+            if not text:
+                continue
+            rows.append(
+                {
+                    "kind": "review_feedback.instruction",
+                    "task_id": task_id,
+                    "anchor": str(feedback.get("predecessor_request_id") or ""),
+                    "text": text[:_MAX_CORRECTION_TEXT],
+                    "area": "",
+                    "paths": _card_paths(card),
+                    "actor": runners.get(task_id, ""),
+                    "failure_category": "",
+                    "occurred_at": "",
+                }
+            )
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    return rows
+
+
+def read_card_outcomes(repo: str | Path) -> dict[str, dict[str, Any]]:
+    """Return the adjudicated outcome of every card the learning ledger judged.
+
+    Keyed by task id AND by ``task_id:request_id``, because a skill's evidence
+    entry anchors to whichever of the two the manager recorded, and a lookup
+    that only understood one of them would silently report no evidence.
+    """
+    repo_path = Path(repo)
+    try:
+        conn = _readonly(repo_path)
+    except Exception:  # noqa: BLE001 -- unreadable means "no outcomes known"
+        return {}
+    outcomes: dict[str, dict[str, Any]] = {}
+    try:
+        conn.row_factory = sqlite3.Row
+        for row in conn.execute(
+            "SELECT task_id, request_id, outcome, payload_json FROM learning_commits"
+        ):
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except (TypeError, ValueError):
+                payload = {}
+            entry = {
+                "outcome": str(row["outcome"] or ""),
+                "failure_category": str(
+                    (payload or {}).get("failure_category") or ""
+                ),
+                "request_id": str(row["request_id"] or ""),
+            }
+            task_id = str(row["task_id"])
+            outcomes[f"{task_id}:{entry['request_id']}"] = entry
+            # A bare task id maps to its LATEST judgement; rows arrive in
+            # insertion order, so a later adjudication of the same card wins.
+            outcomes[task_id] = entry
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+    return outcomes
+
+
+def injection_ledger_state(repo: str | Path) -> dict[str, Any]:
+    """Report whether skill injection into cards is measurable at all.
+
+    NF-2026-00312 layer six needs "the count of cards a skill was injected
+    into". This function establishes, by measurement rather than assumption,
+    whether that count can be produced -- and on this repository it currently
+    cannot, for two independent reasons that are both reported:
+
+    * no stored card carries a persisted skill packet, because the worker
+      bundle builds the packet at prompt-build time and does not write it back;
+    * no stored card carries the selection vocabulary a packet needs, so
+      replaying selection over history would return zero for every skill
+      whatever its merit.
+
+    Reporting ``state="unavailable"`` with both counts is the honest answer. A
+    rate computed against a zero denominator would read as a measurement and be
+    a fabrication, and the retirement verdict that rested on it would retire
+    good skills and keep bad ones with equal confidence.
+    """
+    from . import skill_registry as _skill_registry
+
+    repo_path = Path(repo)
+    try:
+        conn = _readonly(repo_path)
+    except Exception:  # noqa: BLE001
+        return {
+            "state": "unavailable",
+            "reason": "task_store_unreadable",
+            "cards_scanned": 0,
+            "cards_with_persisted_packet": 0,
+            "cards_with_selection_context": 0,
+            "injected_cards": 0,
+        }
+    scanned = with_packet = with_context = 0
+    try:
+        conn.row_factory = sqlite3.Row
+        for row in conn.execute("SELECT card_json FROM tasks"):
+            card = _card_of(row)
+            scanned += 1
+            context = card.get("project_context")
+            if isinstance(context, dict) and any(
+                "skill" in str(key).lower() for key in context
+            ):
+                with_packet += 1
+            try:
+                if _skill_registry.card_selection_context(card) is not None:
+                    with_context += 1
+            except _skill_registry.SkillRegistryError:
+                continue
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    measurable = with_packet > 0
+    return {
+        "state": "available" if measurable else "unavailable",
+        "reason": (
+            ""
+            if measurable
+            else "no_card_persists_a_skill_packet_and_no_card_declares_selection_vocabulary"
+        ),
+        "cards_scanned": scanned,
+        "cards_with_persisted_packet": with_packet,
+        "cards_with_selection_context": with_context,
+        "injected_cards": with_packet,
+    }
+

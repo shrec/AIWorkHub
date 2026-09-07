@@ -33,6 +33,7 @@ from typing import Any, Callable
 
 from . import core
 from . import skill_registry as sr
+from . import skill_miner
 from . import skill_registry_store as store
 from . import task_store
 
@@ -374,3 +375,85 @@ def activate(*, identity: str, version: str) -> dict[str, Any]:
         return updated
 
     return _invoke_write(operation)
+
+
+def mine(
+    *,
+    threshold: float = skill_miner.DEFAULT_THRESHOLD,
+    min_cards: int = skill_miner.MIN_DISTINCT_CARDS,
+    min_files: int = skill_miner.MIN_DISTINCT_FILES,
+    include_sensitivity: bool = True,
+) -> dict[str, Any]:
+    """MANAGER READ: mine the correction record into gated skill PROPOSALS.
+
+    Read-only in the strongest sense available here: it never opens a store for
+    writing and it never returns a lifecycle transition. What it returns is a
+    set of rule families that recurred across distinct cards and distinct files,
+    each with the exact card ids and request ids where the rule was violated,
+    and each with a proposal draft whose closed-vocabulary selection dimensions
+    are deliberately left blank for the manager to supply.
+
+    The hand-off is a separate, explicit call: a candidate becomes a stored
+    record only when a manager passes a completed draft to :func:`propose`, and
+    becomes ACTIVE only through the registry's unchanged evidence gate. There is
+    no path from this function to an activation.
+    """
+    root, _token, manager = _manager_context()
+    if root is None:
+        return manager
+    try:
+        report = skill_miner.mine(
+            root,
+            threshold=threshold,
+            min_cards=min_cards,
+            min_files=min_files,
+            include_sensitivity=include_sensitivity,
+        )
+    except skill_miner.SkillMinerError as exc:
+        return {
+            "ok": False,
+            "error": str(exc)[:240],
+            "manager": manager,
+            "surface": "manager_mcp",
+        }
+    except (OSError, sqlite3.Error) as exc:
+        return {
+            "ok": False,
+            "error": f"correction_record_unreadable:{type(exc).__name__}",
+            "manager": manager,
+            "surface": "manager_mcp",
+        }
+    return {"ok": True, **report, "manager": manager, "surface": "manager_mcp"}
+
+
+def retirement_report(
+    *, min_anchors: int = skill_miner.MIN_RETIREMENT_ANCHORS
+) -> dict[str, Any]:
+    """MANAGER READ: measure each stored skill against its own failure class.
+
+    Reports what can be measured and states plainly what cannot. The injection
+    denominator NF-2026-00312 layer six asks for is not derivable from this
+    repository's stored cards, and the report says so with both counts rather
+    than substituting a number that would read as a measurement. Every verdict
+    is a recommendation; retirement stays manager-gated, and this never writes.
+    """
+    root, _token, manager = _manager_context()
+    if root is None:
+        return manager
+    try:
+        report = skill_miner.measure_retirement(root, min_anchors=min_anchors)
+    except skill_miner.SkillMinerError as exc:
+        return {
+            "ok": False,
+            "error": str(exc)[:240],
+            "manager": manager,
+            "surface": "manager_mcp",
+        }
+    except (store.SkillStoreError, OSError, sqlite3.Error) as exc:
+        return {
+            "ok": False,
+            "error": f"skill_store_failed:{type(exc).__name__}",
+            "manager": manager,
+            "surface": "manager_mcp",
+        }
+    return {"ok": True, **report, "manager": manager, "surface": "manager_mcp"}

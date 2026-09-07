@@ -477,6 +477,7 @@ from . import manager_recipe_tools
 from . import manager_skill_tools
 from . import process_launcher
 from . import review_summarizer
+from . import skill_miner
 from . import stale_recovery
 from . import task_engine
 from . import task_plan
@@ -1028,6 +1029,54 @@ def aiworkhub_manager_skill_activate(identity: str, version: str) -> dict[str, A
     """
 
     return manager_skill_tools.activate(identity=identity, version=version)
+
+
+@mcp.tool()
+def aiworkhub_manager_skill_mine(
+    threshold: float = skill_miner.DEFAULT_THRESHOLD,
+    min_cards: int = skill_miner.MIN_DISTINCT_CARDS,
+    min_files: int = skill_miner.MIN_DISTINCT_FILES,
+    include_sensitivity: bool = True,
+) -> dict[str, Any]:
+    """MANAGER READ: mine the correction record into gated skill PROPOSALS.
+
+    Clusters every stored rejection instruction and adjudicated invariant by the
+    RULE it asserts -- instance vocabulary (paths, identifiers, ids, digits) is
+    deleted before anything is compared -- then promotes only families that
+    recurred across at least ``min_cards`` distinct cards in ``min_files``
+    distinct files. Each candidate carries the exact card ids and request ids
+    where the rule was violated, plus a proposal draft whose closed-vocabulary
+    selection dimensions are left blank for the manager to fill in.
+
+    Read-only. It produces proposals, never activations: the returned draft
+    reaches the store only if a manager passes it to
+    ``aiworkhub_manager_skill_propose``, and activation remains gated on
+    evidence from two distinct actor identities.
+    """
+
+    return manager_skill_tools.mine(
+        threshold=threshold,
+        min_cards=min_cards,
+        min_files=min_files,
+        include_sensitivity=include_sensitivity,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_skill_retirement_report(
+    min_anchors: int = skill_miner.MIN_RETIREMENT_ANCHORS,
+) -> dict[str, Any]:
+    """MANAGER READ: measure every stored skill against its own failure class.
+
+    Reports, per skill, whether it is injectable at all, the cards its evidence
+    anchors to, and the adjudicated outcome of those cards. It also reports
+    whether the injection denominator exists in this repository -- and when it
+    does not, says so with both counts instead of computing a rate against a
+    zero denominator. Verdicts are recommendations; retirement stays
+    manager-gated and this never writes.
+    """
+
+    return manager_skill_tools.retirement_report(min_anchors=min_anchors)
 
 
 @mcp.tool()
