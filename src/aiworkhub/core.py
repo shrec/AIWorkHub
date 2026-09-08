@@ -2673,9 +2673,21 @@ _TASK_HYGIENE_INFLIGHT: set[str] = set()
 
 
 def _run_off_request_path(target: Any, *, name: str) -> None:
-    """Run ``target`` (a zero-argument callable) on a daemon thread, after the
-    current reply is free to return.  Tests replace this to run inline."""
-    threading.Thread(target=target, name=name, daemon=True).start()
+    """Run ``target`` (a zero-argument callable) now, on this thread.
+
+    This used to start a daemon thread, and that was a measured mistake.
+    ``manager_bootstrap`` is the route gate for every manager tool, so a
+    thread per bootstrap meant a long-lived manager process was almost never
+    single-threaded -- and the validation sandbox's metadata broker forks. A
+    fork from a multi-threaded process is the documented hazard, and it showed
+    as the timestamp broker's child dying on SIGSEGV with no output on all
+    three CI Python versions while passing on a 16-core developer machine.
+
+    The name is kept because it is the seam the tests replace, and the caller's
+    contract is unchanged: the work still happens, and the scheduling decision
+    -- whether it happens at all -- belongs to :func:`_schedule_task_hygiene`.
+    """
+    target()
 
 
 def _prune_stale_callbacks(canonical_root: Path) -> dict[str, Any]:
@@ -2730,12 +2742,26 @@ def _task_hygiene_pass(canonical_root: Path) -> dict[str, Any]:
     return result
 
 
-def _schedule_task_hygiene() -> dict[str, Any]:
-    """Throttled, per-repository, off-request-path hygiene scheduling.
+def _schedule_task_hygiene(*, run_when_due: bool = False) -> dict[str, Any]:
+    """Throttled, per-repository hygiene scheduling.
 
-    Returns the ``task_hygiene`` block: ``state`` is scheduled / running /
+    Returns the ``task_hygiene`` block: ``state`` is ran / owed / running /
     throttled / disabled / skipped, and ``last`` is the most recent completed
     pass for this repository (empty until one has finished).
+
+    ``run_when_due`` is the whole decision. This function is reached from the
+    route gate on every manager tool call and from the bootstrap tool itself,
+    and only the latter asks for the work: measured 2026-09-08, a session made
+    ~470 gate calls against 53 bootstraps, so running the sweep on the gate is
+    where the 2.77s per call went. A due repository that nobody offers to
+    sweep is reported ``owed`` and swept by the reconciler's GC pass, which
+    already owns a durable loop for exactly this kind of periodic work.
+
+    It runs on the CALLER'S thread. The earlier version started a daemon
+    thread per bootstrap, which left a long-lived manager process almost never
+    single-threaded while the validation sandbox's metadata broker forks -- and
+    a fork from a multi-threaded process killed the broker's child on SIGSEGV
+    on every CI Python version.
     """
     if os.environ.get("AIWORKHUB_ALLOW_WRITES") != "1":
         return {"state": "disabled"}
@@ -2750,7 +2776,7 @@ def _schedule_task_hygiene() -> dict[str, Any]:
             due = not inflight and (
                 last_run is None or monotonic_now - last_run >= config["interval_seconds"]
             )
-            if due:
+            if due and run_when_due:
                 # Reserve this repository's interval before running. The
                 # bounded map prevents route changes from suppressing other
                 # repositories or growing process state without limit.
@@ -2761,8 +2787,8 @@ def _schedule_task_hygiene() -> dict[str, Any]:
                     del _TASK_HYGIENE_LAST_RUNS[next(iter(_TASK_HYGIENE_LAST_RUNS))]
                 _TASK_HYGIENE_LAST_RUNS[key] = monotonic_now
                 _TASK_HYGIENE_INFLIGHT.add(key)
-        if due:
-            state = "scheduled"
+        if due and run_when_due:
+            state = "ran"
             try:
                 _run_off_request_path(
                     lambda: _task_hygiene_pass(canonical_root),
@@ -2772,11 +2798,13 @@ def _schedule_task_hygiene() -> dict[str, Any]:
                 with _TASK_HYGIENE_LOCK:
                     _TASK_HYGIENE_INFLIGHT.discard(key)
                 raise
+        elif due:
+            state = "owed"
         else:
             state = "running" if inflight else "throttled"
         with _TASK_HYGIENE_LOCK:
             last = dict(_TASK_HYGIENE_LAST_RESULTS.get(key) or {})
-        return {"state": state, "off_request_path": True, "last": last}
+        return {"state": state, "off_request_path": False, "last": last}
     except Exception as exc:  # noqa: BLE001 -- bootstrap must remain available during hygiene faults
         return {"state": "skipped", "reasons": {type(exc).__name__: 1}}
 
@@ -3129,9 +3157,11 @@ def manager_bootstrap(
     prose, no delivery ledger entry, no dispatcher side effect.
     """
 
-    # Scheduled first so the sweep overlaps the reads below instead of the
-    # request path; the reply reports the last *completed* pass, never this one.
-    hygiene = _schedule_task_hygiene()
+    # Only the bootstrap TOOL offers to sweep. A route-gate call reports what
+    # the last sweep found and marks the repository owed, so the reconciler's
+    # GC pass picks it up: measured ~470 gate calls against 53 bootstraps in a
+    # session, which is where the 2.77s per call was going.
+    hygiene = _schedule_task_hygiene(run_when_due=bootstrap_call)
     identity = _claude_manager_identity() or _codex_manager_identity()
     provider = str((identity or {}).get("provider") or _current_chat_provider())
     root = repo_root()

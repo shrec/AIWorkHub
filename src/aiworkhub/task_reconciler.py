@@ -477,16 +477,27 @@ def run_scan(
     mgr = manager or process_launcher.ProcessManager(repo=repo)
     result = mgr.reconcile(include_gc=include_gc)
     callback_prune: dict[str, Any] = {"state": "skipped", "reason": "gc_not_included"}
+    task_hygiene: dict[str, Any] = {"state": "skipped", "reason": "gc_not_included"}
     if include_gc:
         try:
             callback_prune = core._prune_stale_callbacks(Path(mgr.repo).resolve())
         except Exception as exc:  # noqa: BLE001 -- a scan must never fail on hygiene
             callback_prune = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
+        try:
+            # The durable owner of the archive sweep. Bootstrap offers to run
+            # it only on an explicit tool call, so a repository nobody
+            # bootstraps -- or one whose manager only ever touches the route
+            # gate -- would otherwise never be swept. The throttle is the same
+            # one bootstrap consults, so this cannot double-run it.
+            task_hygiene = core._schedule_task_hygiene(run_when_due=True)
+        except Exception as exc:  # noqa: BLE001 -- see above
+            task_hygiene = {"state": "skipped", "reason": f"{type(exc).__name__}"[:80]}
     return {
         "ok": True,
         "scanned_at": _utcnow(),
         "gc_included": bool(include_gc),
         "callback_prune": callback_prune,
+        "task_hygiene": task_hygiene,
         **result,
     }
 

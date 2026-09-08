@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.7 — 2026-09-08
+
+### Fixed
+
+- Manager startup left a background thread running on every call, which made
+  validation runs that fork unstable on smaller machines. The sweep now runs
+  when someone asks for it, and the reconciler owns it otherwise.
+
 ## 0.11.6 — 2026-09-08
 
 ### Added

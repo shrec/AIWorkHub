@@ -2274,17 +2274,16 @@ def test_manager_bootstrap_hygiene_is_interval_throttled_and_nonfatal(
     monkeypatch.setattr(
         task_retention, "hygiene_config", lambda: {"interval_seconds": 60}
     )
-    # manager_bootstrap schema v2 moves the sweep OFF the request path on
-    # purpose: the reply no longer waits for a pass, it schedules one and
-    # reports the last COMPLETED pass under ``task_hygiene.last``.  Running the
-    # scheduled callable inline -- exactly what ``core._run_off_request_path``
-    # documents for tests -- is how the completed pass is observed here without
-    # a thread race.  The interval reservation, the per-repository bound and
-    # the "a hygiene fault never fails bootstrap" rule below are unchanged from
-    # v1 and are still asserted.
-    monkeypatch.setattr(
-        core, "_run_off_request_path", lambda target, *, name: target()
-    )
+    # Hygiene is throttled per repository and never fatal, as in v1. What v2
+    # changed is WHO offers to run it: the bootstrap TOOL does, the route gate
+    # that every manager tool passes through does not, and the reconciler's GC
+    # pass owns the repositories nobody bootstraps. It runs on the caller's
+    # thread. An earlier v2 draft started a daemon thread per bootstrap, which
+    # left a long-lived manager process almost never single-threaded while the
+    # validation sandbox's metadata broker forks -- and that killed the broker's
+    # child on SIGSEGV, with no output, on all three CI Python versions while
+    # passing on a 16-core developer machine. The thread is gone; this test
+    # pins both halves of the decision so it cannot come back.
     calls: list[Path] = []
 
     def hygiene(repo: Path) -> dict[str, object]:
@@ -2299,11 +2298,17 @@ def test_manager_bootstrap_hygiene_is_interval_throttled_and_nonfatal(
         }
 
     monkeypatch.setattr(task_retention, "run_automatic_hygiene", hygiene)
-    first_a = core.manager_bootstrap()
+
+    # A route-gate call reports the repository as owed and sweeps nothing.
+    gate = core.manager_bootstrap()
+    assert gate["task_hygiene"]["state"] == "owed"
+    assert calls == []
+
+    first_a = core.manager_bootstrap(bootstrap_call=True)
     current_root[0] = root_b
-    first_b = core.manager_bootstrap()
+    first_b = core.manager_bootstrap(bootstrap_call=True)
     current_root[0] = root_a
-    second_a = core.manager_bootstrap()
+    second_a = core.manager_bootstrap(bootstrap_call=True)
 
     assert calls == [root_a.resolve(), root_b.resolve()]
     expected_completed = {
@@ -2315,10 +2320,10 @@ def test_manager_bootstrap_hygiene_is_interval_throttled_and_nonfatal(
         "state": "completed",
     }
     for reply in (first_a, first_b):
-        scheduled = reply["task_hygiene"]
-        assert scheduled["state"] == "scheduled"
-        assert scheduled["off_request_path"] is True
-        last = scheduled["last"]
+        ran = reply["task_hygiene"]
+        assert ran["state"] == "ran"
+        assert ran["off_request_path"] is False
+        last = ran["last"]
         assert {
             field: last[field] for field in expected_completed
         } == expected_completed
@@ -2340,12 +2345,13 @@ def test_manager_bootstrap_hygiene_is_interval_throttled_and_nonfatal(
         "run_automatic_hygiene",
         lambda _repo: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    failed = core.manager_bootstrap()
+    failed = core.manager_bootstrap(bootstrap_call=True)
     assert failed["ok"] is True
     # v1 reported a sweep fault as the bootstrap's own hygiene state because
-    # the sweep ran inline. v2 catches it inside the off-request-path pass, so
-    # the scheduling still succeeds and the fault is reported on the result.
-    assert failed["task_hygiene"]["state"] == "scheduled"
+    # the sweep ran inline. It still runs inline, but the pass catches its own
+    # fault and records it, so the bootstrap reports a completed offer with a
+    # skipped result rather than failing.
+    assert failed["task_hygiene"]["state"] == "ran"
     assert failed["task_hygiene"]["last"]["state"] == "skipped"
     assert failed["task_hygiene"]["last"]["reasons"] == {"RuntimeError": 1}
 
@@ -2358,7 +2364,7 @@ def test_manager_bootstrap_hygiene_is_interval_throttled_and_nonfatal(
         "hygiene_config",
         lambda: (_ for _ in ()).throw(RuntimeError("no config")),
     )
-    unschedulable = core.manager_bootstrap()
+    unschedulable = core.manager_bootstrap(bootstrap_call=True)
     assert unschedulable["ok"] is True
     assert unschedulable["task_hygiene"] == {
         "state": "skipped",

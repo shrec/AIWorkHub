@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.7] - 2026-09-08
+
+### Fixed
+
+- Manager bootstrap started a daemon thread on every call to run task hygiene
+  off the request path. Bootstrap is also the route gate for every manager
+  tool, so a long-lived manager process was almost never single-threaded --
+  and the validation sandbox's metadata broker forks. A fork from a
+  multi-threaded process killed the broker's child on SIGSEGV with no output
+  on all three CI Python versions, while passing on a 16-core developer
+  machine. Hygiene now runs on the caller's thread and only when someone
+  offers: the bootstrap tool does, the route gate does not, and the
+  reconciler's GC pass owns the repositories nobody bootstraps. The measured
+  saving stands, because it was the ~470 gate calls per session and not the 53
+  bootstraps that were paying 2.77s each.
+
 ## [0.11.6] - 2026-09-08
 
 A token-burn audit measured where the models actually spend context, and this
