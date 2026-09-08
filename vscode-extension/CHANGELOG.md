@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.11.8 — 2026-09-08
+
+### Fixed
+
+- The validation sandbox could not install its seccomp filter on a
+  position-independent interpreter, which is what most systems ship. The
+  process died without a message instead, so validation runs failed with no
+  explanation on those machines.
+
 ## 0.11.7 — 2026-09-08
 
 ### Fixed

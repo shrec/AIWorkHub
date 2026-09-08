@@ -6,6 +6,28 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-09-08
+
+### Fixed
+
+- The validation sandbox's seccomp filter could not be installed on any
+  position-independent interpreter, which is every distribution build and every
+  `actions/setup-python` runtime. `seccomp_rule_add` was bound without
+  `argtypes`, so the filter context -- a pointer that `seccomp_init` returns as
+  a Python int -- was converted to a C `int` and silently truncated to its low
+  32 bits. On a non-PIE interpreter the heap sits below 4 GiB and the
+  truncation is invisible, which is why it passed here for months; on a PIE
+  interpreter libseccomp dereferenced a wild pointer and the process died of
+  SIGSEGV with no output, taking the whole metadata filter with it. The
+  boundary never widened: the wrapper crashed rather than allowing anything.
+- The two existing end-to-end broker tests skip when the capability probe
+  reports "unsupported" -- and this defect is what made that probe report
+  unsupported, so they had been silently skipping on every CI run. The
+  timestamp broker test now measures which filter the host actually installed
+  and asserts that path: brokered means the timestamps are applied, a landlock
+  filter without user notification means the syscall is refused with EPERM. It
+  no longer skips.
+
 ## [0.11.7] - 2026-09-08
 
 ### Fixed

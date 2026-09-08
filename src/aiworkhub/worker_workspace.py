@@ -6136,6 +6136,22 @@ def _seccomp_library() -> Any | None:
     library.seccomp_init.restype = ctypes.c_void_p
     library.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
     library.seccomp_syscall_resolve_name.restype = ctypes.c_int
+    # ``scmp_filter_ctx`` is a pointer, and ``seccomp_init`` hands it back here
+    # as a plain Python int.  Without ``argtypes`` ctypes converts that int to a
+    # C ``int``, silently truncating the context to its low 32 bits.  On an
+    # interpreter whose heap lives below 4 GiB (a non-PIE build) the truncation
+    # is invisible; on a PIE interpreter -- every distribution build and every
+    # ``actions/setup-python`` runtime -- libseccomp then dereferences a wild
+    # pointer and the process dies of SIGSEGV with no output at all, taking the
+    # whole metadata filter down with it.  Declare the fixed prototype so the
+    # context is always passed at its real width.  The trailing per-argument
+    # varargs are never used: every call site passes ``arg_cnt == 0``.
+    library.seccomp_rule_add.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
     library.seccomp_rule_add.restype = ctypes.c_int
     library.seccomp_load.argtypes = [ctypes.c_void_p]
     library.seccomp_load.restype = ctypes.c_int

@@ -330,6 +330,18 @@ def test_real_node_and_python_operations_through_validation_broker(
     tmp_path: Path,
 ) -> None:
     assert shutil.which("node") is not None
+    try:
+        backend = worker_workspace.select_sandbox_backend()
+    except worker_workspace.WorkspaceError as exc:  # pragma: no cover - host gap
+        pytest.skip(f"no secure sandbox backend on this host: {exc}")
+    # Measure which filter this host really installs rather than assuming the
+    # brokered one.  ``_landlock_exec`` installs the user-notification broker
+    # only when the capability probe succeeds and otherwise falls back to the
+    # documented deny-only errno filter -- in which case the timestamp syscall
+    # MUST be refused, never silently allowed.  Assert whichever path is
+    # installed so a host without user notification still proves the sandbox
+    # holds instead of skipping the only end-to-end coverage of it.
+    denied = backend == "landlock" and not worker_workspace._seccomp_notify_supported()
     worktree = tmp_path / "worktree"
     home = tmp_path / "home"
     worktree.mkdir()
@@ -340,9 +352,17 @@ def test_real_node_and_python_operations_through_validation_broker(
         "import os\n"
         "p = os.path.join(os.environ['TMPDIR'], 'python')\n"
         "open(p, 'w').close()\n"
-        "os.utime(p, (11, 22))\n"
-        "s = os.stat(p)\n"
-        "assert int(s.st_atime) == 11 and int(s.st_mtime) == 22\n",
+        + (
+            "try:\n"
+            "    os.utime(p, (11, 22))\n"
+            "except PermissionError:\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit('utimensat was allowed with no broker installed')\n"
+            if denied
+            else "os.utime(p, (11, 22))\n"
+            "s = os.stat(p)\n"
+            "assert int(s.st_atime) == 11 and int(s.st_mtime) == 22\n"
+        ),
         encoding="utf-8",
     )
     node_script = worktree / "timestamp_node.js"
@@ -350,9 +370,16 @@ def test_real_node_and_python_operations_through_validation_broker(
         "const fs = require('fs');\n"
         "const p = process.env.TMPDIR + '/node';\n"
         "fs.writeFileSync(p, '');\n"
-        "fs.utimesSync(p, 33, 44);\n"
-        "const s = fs.statSync(p);\n"
-        "if (s.atimeMs !== 33000 || s.mtimeMs !== 44000) process.exit(2);\n",
+        + (
+            "try { fs.utimesSync(p, 33, 44); } catch (e) {\n"
+            "  process.exit(e.code === 'EPERM' ? 0 : 3);\n"
+            "}\n"
+            "process.exit(2);\n"
+            if denied
+            else "fs.utimesSync(p, 33, 44);\n"
+            "const s = fs.statSync(p);\n"
+            "if (s.atimeMs !== 33000 || s.mtimeMs !== 44000) process.exit(2);\n"
+        ),
         encoding="utf-8",
     )
     workspace = worker_workspace.WorkerWorkspace(

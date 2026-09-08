@@ -622,6 +622,140 @@ class TestCapabilityProbe:
     def test_seccomp_notify_supported_is_bool(self) -> None:
         assert isinstance(worker_workspace._seccomp_notify_supported(), bool)
 
+    def test_every_bound_libseccomp_entry_point_declares_its_arguments(self) -> None:
+        """A ctypes call with no ``argtypes`` truncates a pointer to 32 bits.
+
+        ``scmp_filter_ctx`` is the first argument of ``seccomp_rule_add`` and
+        reaches it here as a plain Python int.  Left unprototyped, ctypes
+        converts that int to a C ``int``, so a filter context allocated above
+        4 GiB arrives as a wild pointer and libseccomp dies of SIGSEGV.  A
+        non-PIE interpreter keeps its heap below 4 GiB and hides the defect
+        completely, so the prototype -- not a passing run -- is the only thing
+        that can be asserted portably.
+        """
+        library = worker_workspace._seccomp_library()
+        if library is None:
+            pytest.skip("libseccomp is not installed on this host")
+        for name in (
+            "seccomp_init",
+            "seccomp_syscall_resolve_name",
+            "seccomp_rule_add",
+            "seccomp_load",
+            "seccomp_release",
+        ):
+            assert getattr(library, name).argtypes is not None, (
+                f"{name} is bound without argtypes; a pointer argument would be "
+                "silently truncated to 32 bits"
+            )
+        assert library.seccomp_init.restype is ctypes.c_void_p
+        assert library.seccomp_rule_add.argtypes[0] is ctypes.c_void_p
+
+    def test_filter_context_above_four_gib_survives_rule_add(self) -> None:
+        """Add a rule to a context glibc served from a high mmap'd arena.
+
+        A secondary thread gets its own malloc arena, which glibc mmaps far
+        above 4 GiB even when the main heap is low.  That reproduces here, on
+        any interpreter, exactly what a PIE interpreter does on its very first
+        allocation -- the condition every CI runner is in and this host is not.
+        The probe runs in a child process because the failure mode is SIGSEGV,
+        which no ``pytest.raises`` can observe.
+        """
+        library = worker_workspace._seccomp_library()
+        if library is None:
+            pytest.skip("libseccomp is not installed on this host")
+        syscall_number = library.seccomp_syscall_resolve_name(b"fchmod")
+        if syscall_number < 0:
+            pytest.skip("libseccomp cannot resolve fchmod on this architecture")
+        script = (
+            "import threading\n"
+            "from aiworkhub import worker_workspace\n"
+            "library = worker_workspace._seccomp_library()\n"
+            "outcome = {}\n"
+            "def add_rule():\n"
+            "    context = library.seccomp_init(worker_workspace._SCMP_ACT_ALLOW)\n"
+            "    print('context=' + str(context), flush=True)\n"
+            "    outcome['rc'] = library.seccomp_rule_add(\n"
+            "        context, worker_workspace._SCMP_ACT_ERRNO | 1, "
+            + str(syscall_number)
+            + ", 0\n"
+            "    )\n"
+            "    library.seccomp_release(context)\n"
+            "worker = threading.Thread(target=add_rule)\n"
+            "worker.start()\n"
+            "worker.join()\n"
+            "print('rc=' + repr(outcome.get('rc')), flush=True)\n"
+        )
+        probe = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        reported = [
+            line for line in probe.stdout.splitlines() if line.startswith("context=")
+        ]
+        if not reported:
+            pytest.skip(
+                "could not allocate a filter context in a child process: "
+                f"{probe.stderr[-400:]}"
+            )
+        context = int(reported[0].split("=", 1)[1])
+        if context < 2**32:
+            pytest.skip(
+                "this host serves filter contexts below the 4 GiB boundary, so "
+                "a truncated pointer cannot be distinguished from a correct one"
+            )
+        assert probe.returncode == 0, (
+            f"seccomp_rule_add failed on a context at {context:#x} "
+            f"(returncode={probe.returncode}, stderr={probe.stderr[-400:]})"
+        )
+        assert "rc=0" in probe.stdout, probe.stdout
+
+    def test_declared_notification_structs_match_the_kernel_sizes(self) -> None:
+        """The broker declares the notification structs; the kernel sizes them.
+
+        ``seccomp_notify_alloc`` allocates from ``SECCOMP_GET_NOTIF_SIZES``, so
+        a declared layout wider than the kernel's would have the broker write a
+        response past the end of libseccomp's own allocation.  Pin the two
+        against each other locally instead of discovering the drift as a
+        corrupted child.
+        """
+        library = worker_workspace._seccomp_library()
+        if library is None:
+            pytest.skip("libseccomp is not installed on this host")
+        seccomp_number = library.seccomp_syscall_resolve_name(b"seccomp")
+        if seccomp_number < 0:
+            pytest.skip("libseccomp cannot resolve seccomp(2) on this architecture")
+
+        class _NotifSizes(ctypes.Structure):
+            _fields_ = [
+                ("seccomp_notif", ctypes.c_uint16),
+                ("seccomp_notif_resp", ctypes.c_uint16),
+                ("seccomp_data", ctypes.c_uint16),
+            ]
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        sizes = _NotifSizes()
+        seccomp_get_notif_sizes = 3
+        if (
+            libc.syscall(
+                ctypes.c_long(seccomp_number),
+                ctypes.c_long(seccomp_get_notif_sizes),
+                ctypes.c_long(0),
+                ctypes.byref(sizes),
+            )
+            != 0
+        ):
+            pytest.skip("this kernel does not implement SECCOMP_GET_NOTIF_SIZES")
+        assert ctypes.sizeof(worker_workspace._SeccompData) == sizes.seccomp_data
+        assert ctypes.sizeof(worker_workspace._SeccompNotif) == sizes.seccomp_notif
+        assert (
+            ctypes.sizeof(worker_workspace._SeccompNotifResp)
+            == sizes.seccomp_notif_resp
+        )
+
     @pytest.mark.parametrize("level, expected", [(4, False), (5, True)])
     def test_notify_requires_libseccomp_api_level_five(
         self,

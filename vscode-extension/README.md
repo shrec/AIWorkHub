@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.11.8 — 2026-09-08
+
+- Validation runs work on systems whose Python is a position-independent
+  build, which is most of them. The sandbox filter could not be installed
+  there and the run died without a message.
+
 ## What's new in 0.11.7 — 2026-09-08
 
 - Manager startup no longer leaves a background thread running, which made
