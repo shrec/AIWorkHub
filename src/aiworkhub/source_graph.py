@@ -3454,6 +3454,16 @@ def _looks_like_identifier_query(term: str) -> bool:
     )
 
 
+# A qualified/camelCase identifier query that normalizes to more than this many
+# tokens is over-constrained by the all-tokens AND pass: the extra tokens are
+# namespace/path/owner context that never co-occur in a single FTS row, so the
+# AND returns an authoritative-looking zero while a shorter core of the same
+# query still matches. Above this length the OR broadening is allowed as a
+# fallback so a long focus query cannot silently report zero where its short
+# equivalent returns indexed matches (NF-2026-00641).
+_IDENTIFIER_AND_TOKEN_LIMIT = 5
+
+
 def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[str, Any]]:
     term = (term or "").strip()
     if not term:
@@ -3467,10 +3477,11 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
     if _sgp.is_composed(conn):
         return _sgp.composed_find(conn, term, limit=limit)
     rows = []
+    tokens = _query_tokens(term)
     expressions = [_fts_phrase(term)]
-    if len(_query_tokens(term)) > 1:
+    if len(tokens) > 1:
         expressions.append(_fts_terms(term, operator="AND"))
-        if not _looks_like_identifier_query(term):
+        if not _looks_like_identifier_query(term) or len(tokens) > _IDENTIFIER_AND_TOKEN_LIMIT:
             expressions.append(_fts_terms(term, operator="OR"))
     for expression in expressions:
         try:

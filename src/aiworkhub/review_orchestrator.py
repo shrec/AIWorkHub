@@ -484,6 +484,7 @@ class ReviewOrchestrator:
         # ledger, so evidence can go stale within a pass but never across one.
         reset_routing_catalog_cache()
         instant = now or datetime.now(timezone.utc)
+        review_lifecycle.reconcile_dead_chains(self.db_path, now=instant)
         attempted = completed = failed = pending = 0
         for _ in range(max(0, min(int(max_actions), 12))):
             token = uuid.uuid4().hex

@@ -20,7 +20,8 @@ from typing import Any, Mapping
 SCHEMA_ID = "aiworkhub.review_lifecycle.v1"
 DESCRIPTOR_SCHEMA_ID = "aiworkhub.review_action_descriptor.v1"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-VALID_STATES = {"pending", "reserved", "completed", "failed"}
+VALID_STATES = {"pending", "reserved", "completed", "failed", "retired"}
+RETIRED_REASON = "dependency_retired"
 ACTION_PREIMAGE_COLUMNS: tuple[str, ...] = (
     "chain_id",
     "action_index",
@@ -41,6 +42,7 @@ ACTION_PREIMAGE_COLUMNS: tuple[str, ...] = (
     "receipt_commitment_sha256",
     "completed_at",
     "failure_reason",
+    "retired_due_to_action_id",
     "created_at",
     "updated_at",
 )
@@ -97,6 +99,7 @@ CREATE TABLE IF NOT EXISTS review_action_outbox (
   receipt_commitment_sha256 TEXT NOT NULL DEFAULT '',
   completed_at TEXT NOT NULL DEFAULT '',
   failure_reason TEXT NOT NULL DEFAULT '',
+  retired_due_to_action_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY(chain_id) REFERENCES review_chains(chain_id),
@@ -104,6 +107,18 @@ CREATE TABLE IF NOT EXISTS review_action_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_review_action_outbox_state
   ON review_action_outbox(state, action_id);
+CREATE INDEX IF NOT EXISTS idx_review_action_outbox_state_lease
+  ON review_action_outbox(state, lease_expires_at, action_id);
+
+CREATE TABLE IF NOT EXISTS review_reconciliation_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_failed_action_id INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS review_reservation_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_pending_action_id INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TRIGGER IF NOT EXISTS trg_review_action_completed_no_update
 BEFORE UPDATE ON review_action_outbox
@@ -178,6 +193,30 @@ def ensure_schema(conn: sqlite3.Connection) -> bool:
             "ADD COLUMN receipt_commitment_sha256 TEXT NOT NULL DEFAULT ''"
         )
         changed = True
+    if "retired_due_to_action_id" not in action_columns:
+        conn.execute(
+            "ALTER TABLE review_action_outbox "
+            "ADD COLUMN retired_due_to_action_id TEXT NOT NULL DEFAULT ''"
+        )
+        changed = True
+    reservation_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(review_reservation_state)").fetchall()
+    }
+    if "round_high_watermark" not in reservation_columns:
+        conn.execute(
+            "ALTER TABLE review_reservation_state "
+            "ADD COLUMN round_high_watermark INTEGER NOT NULL DEFAULT 0"
+        )
+        changed = True
+    conn.execute(
+        "INSERT OR IGNORE INTO review_reconciliation_state (id, last_failed_action_id) "
+        "VALUES (1, 0)"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO review_reservation_state (id, last_pending_action_id) "
+        "VALUES (1, 0)"
+    )
     return changed
 
 
@@ -288,6 +327,9 @@ def create_or_replay_chain(
         conn.close()
 
 
+RESERVE_SCAN_LIMIT = 256
+
+
 def reserve_next_action(
     db_path: str | Path,
     *,
@@ -305,63 +347,130 @@ def reserve_next_action(
         ensure_schema(conn)
         conn.commit()
         conn.execute("BEGIN IMMEDIATE")
-        _verify_all_chains(conn)
-        rows = conn.execute(
-            "SELECT * FROM review_action_outbox ORDER BY action_id"
-        ).fetchall()
-        for row in rows:
-            chain_row = conn.execute(
-                "SELECT * FROM review_chains WHERE chain_id=?", (row["chain_id"],)
-            ).fetchone()
-            if chain_row is None:
-                raise ReviewLifecycleError("descriptor_tamper")
-            identity = _verify_chain_row(chain_row)
-            _verify_action_row(row, identity, chain_row["chain_identity_sha256"])
-            state = str(row["state"])
-            if state == "pending":
-                if not _prior_actions_completed(
-                    conn, row, identity, chain_row["chain_identity_sha256"]
-                ):
-                    continue
-            elif state == "reserved":
-                lease_expires_at = _parse_utc(str(row["lease_expires_at"]), "lease_expires_at")
-                if lease_expires_at > now:
-                    continue
-                if not _prior_actions_completed(
-                    conn, row, identity, chain_row["chain_identity_sha256"]
-                ):
-                    continue
-            else:
-                continue
-            cursor = conn.execute(
-                "UPDATE review_action_outbox SET state='reserved', owner=?, "
-                "lease_token=?, lease_expires_at=?, updated_at=? "
-                f"WHERE action_id=? AND {_preimage_where_clause(row)}",
-                (
-                    owner,
-                    lease_token,
-                    expires_text,
-                    now_text,
-                    row["action_id"],
-                    *_preimage_values(row),
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise ReviewLifecycleError("cas_lost")
+        row = _reservable_candidate(conn, now, reserved_only=True)
+        if row is None:
+            row = _reservable_candidate(conn, now, reserved_only=False)
+        if row is None:
             conn.commit()
-            return _action_from_row(
-                conn.execute(
-                    "SELECT * FROM review_action_outbox WHERE action_id=?",
-                    (row["action_id"],),
-                ).fetchone()
-            )
+            return None
+        cursor = conn.execute(
+            "UPDATE review_action_outbox SET state='reserved', owner=?, "
+            "lease_token=?, lease_expires_at=?, updated_at=? "
+            f"WHERE action_id=? AND {_preimage_where_clause(row)}",
+            (
+                owner,
+                lease_token,
+                expires_text,
+                now_text,
+                row["action_id"],
+                *_preimage_values(row),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ReviewLifecycleError("cas_lost")
         conn.commit()
-        return None
+        return _action_from_row(
+            conn.execute(
+                "SELECT * FROM review_action_outbox WHERE action_id=?",
+                (row["action_id"],),
+            ).fetchone()
+        )
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def _reservable_candidate(
+    conn: sqlite3.Connection, now: datetime, *, reserved_only: bool
+) -> sqlite3.Row | None:
+    """Bounded, indexed scan of exactly one state bucket for one candidate.
+
+    Scanning ``reserved`` and ``pending`` through separate indexed queries --
+    instead of one scan ordered by ``action_id`` -- keeps an expired lease
+    reachable no matter how many pending rows precede it in insertion order: a
+    single scan bounded by ``LIMIT`` could fill its whole window with
+    unreservable pending rows and never reach the reserved one.
+
+    The reserved bucket itself never scans in ``action_id`` order either. It
+    queries ``idx_review_action_outbox_state_lease`` directly for rows whose
+    lease has already expired (``lease_expires_at<=now``), ordered by
+    ``lease_expires_at`` -- the same composite key the index stores. Live,
+    unexpired reservations sort after the query's upper bound and are never
+    fetched, no matter how many of them exist or how low their ``action_id``
+    is: more than 256 earlier unexpired reservations cannot fill this
+    window and hide a later expired one, because they are outside the range
+    the index scan ever visits.
+
+    The pending bucket scans one bounded *round* at a time: a persistent
+    keyset cursor (``review_reservation_state.last_pending_action_id``) paired
+    with a persistent high-water mark (``round_high_watermark``) snapshotted
+    once at the start of each round. Every query in a round is clamped to
+    ``action_id <= round_high_watermark``, so rows that arrive mid-round never
+    extend it. Without that upper bound, a cursor that only advances forward
+    and only wraps once a forward scan comes back completely empty is starved
+    by sustained arrivals: a steady stream of ever-newer pending rows keeps
+    the forward scan non-empty forever, so it never notices the round is done
+    and a row `defer_action` reset to a low ``action_id`` is skipped on every
+    call, permanently. Clamping the round means it always completes -- and
+    wraps to a fresh round starting back at ``action_id`` 0, where the reset
+    row sorts first -- within a bounded number of calls set by the backlog
+    size at the round's start, independent of how many new rows keep arriving.
+    """
+    if reserved_only:
+        rows = conn.execute(
+            "SELECT * FROM review_action_outbox WHERE state='reserved' "
+            "AND lease_expires_at<=? ORDER BY lease_expires_at, action_id LIMIT ?",
+            (_format_utc(now), RESERVE_SCAN_LIMIT),
+        ).fetchall()
+    else:
+        cursor, watermark = _reservation_cursor(conn)
+        if watermark == 0:
+            watermark = _pending_high_watermark(conn)
+            cursor = 0
+        rows = (
+            conn.execute(
+                "SELECT * FROM review_action_outbox WHERE state='pending' "
+                "AND action_id > ? AND action_id <= ? ORDER BY action_id LIMIT ?",
+                (cursor, watermark, RESERVE_SCAN_LIMIT),
+            ).fetchall()
+            if watermark
+            else []
+        )
+        if not rows:
+            cursor = 0
+            watermark = _pending_high_watermark(conn)
+            rows = (
+                conn.execute(
+                    "SELECT * FROM review_action_outbox WHERE state='pending' "
+                    "AND action_id > 0 AND action_id <= ? ORDER BY action_id LIMIT ?",
+                    (watermark, RESERVE_SCAN_LIMIT),
+                ).fetchall()
+                if watermark
+                else []
+            )
+        next_cursor = max((int(r["action_id"]) for r in rows), default=cursor)
+        _set_reservation_cursor(conn, next_cursor, watermark)
+    for row in rows:
+        chain_row = conn.execute(
+            "SELECT * FROM review_chains WHERE chain_id=?", (row["chain_id"],)
+        ).fetchone()
+        if chain_row is None:
+            raise ReviewLifecycleError("descriptor_tamper")
+        identity = _verify_chain_row(chain_row)
+        _verify_action_row(conn, row, identity, chain_row["chain_identity_sha256"])
+        state = str(row["state"])
+        if state == "reserved":
+            lease_expires_at = _parse_utc(str(row["lease_expires_at"]), "lease_expires_at")
+            if lease_expires_at > now:
+                continue
+        elif state != "pending":
+            continue
+        if not _prior_actions_completed(conn, row, identity, chain_row["chain_identity_sha256"]):
+            continue
+        return row
+    return None
 
 
 def complete_action(
@@ -397,7 +506,7 @@ def complete_action(
             identity,
             str(chain_row["chain_identity_sha256"]),
         )
-        _verify_action_row(row, identity, chain_row["chain_identity_sha256"])
+        _verify_action_row(conn, row, identity, chain_row["chain_identity_sha256"])
         state = str(row["state"])
         if state == "completed":
             if (
@@ -471,7 +580,7 @@ def fail_action(
             conn, int(chain_row["chain_id"]), identity,
             str(chain_row["chain_identity_sha256"]),
         )
-        _verify_action_row(row, identity, str(chain_row["chain_identity_sha256"]))
+        _verify_action_row(conn, row, identity, str(chain_row["chain_identity_sha256"]))
         if str(row["state"]) == "failed":
             if row["failure_reason"] == failure:
                 conn.commit()
@@ -711,6 +820,7 @@ def _verify_chain_row(row: sqlite3.Row) -> dict[str, str]:
 
 
 def _verify_action_row(
+    conn: sqlite3.Connection,
     row: sqlite3.Row,
     identity: Mapping[str, str],
     identity_sha256: str,
@@ -722,7 +832,7 @@ def _verify_action_row(
     _parse_utc(str(row["updated_at"]), "updated_at")
     if state in {"reserved", "completed", "failed"}:
         _parse_utc(str(row["lease_expires_at"]), "lease_expires_at")
-    if state in {"completed", "failed"}:
+    if state in {"completed", "failed", "retired"}:
         _parse_utc(str(row["completed_at"]), "completed_at")
     if state == "pending":
         if any(
@@ -736,6 +846,7 @@ def _verify_action_row(
                 "receipt_commitment_sha256",
                 "completed_at",
                 "failure_reason",
+                "retired_due_to_action_id",
             )
         ):
             raise ReviewLifecycleError("descriptor_tamper")
@@ -752,6 +863,7 @@ def _verify_action_row(
                     "receipt_commitment_sha256",
                     "completed_at",
                     "failure_reason",
+                    "retired_due_to_action_id",
                 )
             )
         ):
@@ -766,6 +878,7 @@ def _verify_action_row(
             or not str(row["receipt_commitment_sha256"])
             or not str(row["completed_at"])
             or str(row["failure_reason"])
+            or str(row["retired_due_to_action_id"])
         ):
             raise ReviewLifecycleError("descriptor_tamper")
         try:
@@ -788,6 +901,7 @@ def _verify_action_row(
             or not str(row["lease_expires_at"])
             or not str(row["completed_at"])
             or not str(row["failure_reason"])
+            or str(row["retired_due_to_action_id"])
             or any(
                 str(row[column])
                 for column in (
@@ -798,6 +912,24 @@ def _verify_action_row(
             )
         ):
             raise ReviewLifecycleError("descriptor_tamper")
+    elif state == "retired":
+        if (
+            str(row["owner"])
+            or str(row["lease_token"])
+            or str(row["lease_expires_at"])
+            or not str(row["completed_at"])
+            or str(row["failure_reason"]) != RETIRED_REASON
+            or any(
+                str(row[column])
+                for column in (
+                    "receipt_json",
+                    "receipt_sha256",
+                    "receipt_commitment_sha256",
+                )
+            )
+        ):
+            raise ReviewLifecycleError("descriptor_tamper")
+        _verify_retirement_evidence(conn, row)
     action_index = int(row["action_index"])
     if action_index < 0 or action_index >= len(PLAN):
         raise ReviewLifecycleError("descriptor_tamper")
@@ -826,6 +958,29 @@ def _verify_action_row(
     return expected
 
 
+def _verify_retirement_evidence(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+    """Bind a retired row to the exact earlier same-chain failed row it cites.
+
+    Malformed, cross-chain, later, or nonfailed evidence fails closed: a
+    retired action's whole authority to skip execution comes from proving one
+    real, earlier, same-chain failure caused it.
+    """
+    raw = str(row["retired_due_to_action_id"])
+    if not raw.isdigit():
+        raise ReviewLifecycleError("retirement_evidence_invalid")
+    cause = conn.execute(
+        "SELECT chain_id, action_index, state FROM review_action_outbox WHERE action_id=?",
+        (int(raw),),
+    ).fetchone()
+    if (
+        cause is None
+        or int(cause["chain_id"]) != int(row["chain_id"])
+        or int(cause["action_index"]) >= int(row["action_index"])
+        or str(cause["state"]) != "failed"
+    ):
+        raise ReviewLifecycleError("retirement_evidence_invalid")
+
+
 def _verify_chain_actions(
     conn: sqlite3.Connection,
     chain_id: int,
@@ -841,7 +996,7 @@ def _verify_chain_actions(
     if [int(row["action_index"]) for row in rows] != list(range(len(PLAN))):
         raise ReviewLifecycleError("descriptor_tamper")
     for row in rows:
-        _verify_action_row(row, identity, identity_sha256)
+        _verify_action_row(conn, row, identity, identity_sha256)
 
 
 def _verify_all_chains(conn: sqlite3.Connection) -> None:
@@ -873,7 +1028,7 @@ def _prior_actions_completed(
     if len(prior_rows) != action_index:
         raise ReviewLifecycleError("descriptor_tamper")
     for prior in prior_rows:
-        _verify_action_row(prior, identity, identity_sha256)
+        _verify_action_row(conn, prior, identity, identity_sha256)
         if str(prior["state"]) != "completed":
             return False
     return True
@@ -966,3 +1121,157 @@ def rows_for_test(db_path: str | Path) -> list[dict[str, Any]]:
         ]
     finally:
         conn.close()
+
+
+RECONCILE_BATCH_LIMIT = 256
+
+
+def reconcile_dead_chains(
+    db_path: str | Path,
+    *,
+    now: datetime,
+    batch_limit: int = RECONCILE_BATCH_LIMIT,
+) -> dict[str, int]:
+    """Bounded, idempotent pass that retires dead-chain descendants.
+
+    A failed action permanently blocks every later action in its chain --
+    ``_prior_actions_completed`` never sees a failed prior as complete -- so
+    those descendants would stay ``pending`` forever without this. Each call
+    inspects at most ``batch_limit`` failed actions through an indexed keyset
+    cursor that always advances and wraps back to the start once exhausted,
+    so a chain that fails after a busy one is never permanently starved.
+    Retiring an already-retired descendant is a no-op, so repeated calls
+    converge without re-doing work.
+
+    Every failed row and every descendant it retires is authenticated through
+    ``_verify_chain_row``/``_verify_action_row`` before this mutates it, the
+    same way ``reserve_next_action`` and ``complete_action`` authenticate
+    before they act: a row this pass has not verified has no standing to be
+    retired, and a tampered descendant descriptor must fail this whole pass
+    closed rather than being silently marked retired.
+    """
+    limit = max(1, min(int(batch_limit), RECONCILE_BATCH_LIMIT))
+    now_text = _format_utc(now)
+    conn = _connect(db_path)
+    try:
+        ensure_schema(conn)
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = _reconciliation_cursor(conn)
+        failed_rows = conn.execute(
+            "SELECT * FROM review_action_outbox "
+            "WHERE state='failed' AND action_id > ? ORDER BY action_id LIMIT ?",
+            (cursor, limit),
+        ).fetchall()
+        wrapped = False
+        if not failed_rows and cursor != 0:
+            wrapped = True
+            failed_rows = conn.execute(
+                "SELECT * FROM review_action_outbox "
+                "WHERE state='failed' ORDER BY action_id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        retired = 0
+        for failed in failed_rows:
+            chain_id = int(failed["chain_id"])
+            action_index = int(failed["action_index"])
+            action_id = int(failed["action_id"])
+            chain_row = conn.execute(
+                "SELECT * FROM review_chains WHERE chain_id=?", (chain_id,)
+            ).fetchone()
+            if chain_row is None:
+                raise ReviewLifecycleError("descriptor_tamper")
+            identity = _verify_chain_row(chain_row)
+            chain_identity_sha256 = str(chain_row["chain_identity_sha256"])
+            _verify_action_row(conn, failed, identity, chain_identity_sha256)
+            descendants = conn.execute(
+                "SELECT * FROM review_action_outbox WHERE chain_id=? AND action_index>? "
+                "AND state='pending' ORDER BY action_index",
+                (chain_id, action_index),
+            ).fetchall()
+            for descendant in descendants:
+                _verify_action_row(conn, descendant, identity, chain_identity_sha256)
+                updated = conn.execute(
+                    "UPDATE review_action_outbox SET state='retired', "
+                    "retired_due_to_action_id=?, failure_reason=?, completed_at=?, "
+                    "updated_at=? "
+                    f"WHERE action_id=? AND {_preimage_where_clause(descendant)}",
+                    (
+                        str(action_id),
+                        RETIRED_REASON,
+                        now_text,
+                        now_text,
+                        int(descendant["action_id"]),
+                        *_preimage_values(descendant),
+                    ),
+                )
+                if updated.rowcount == 1:
+                    retired += 1
+        next_cursor = max(
+            (int(row["action_id"]) for row in failed_rows),
+            default=0 if wrapped else cursor,
+        )
+        _set_reconciliation_cursor(conn, next_cursor)
+        conn.commit()
+        return {
+            "examined_failed": len(failed_rows),
+            "retired": retired,
+            "wrapped": int(wrapped),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _reconciliation_cursor(conn: sqlite3.Connection) -> int:
+    conn.execute(
+        "INSERT OR IGNORE INTO review_reconciliation_state (id, last_failed_action_id) "
+        "VALUES (1, 0)"
+    )
+    row = conn.execute(
+        "SELECT last_failed_action_id FROM review_reconciliation_state WHERE id=1"
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _set_reconciliation_cursor(conn: sqlite3.Connection, value: int) -> None:
+    conn.execute(
+        "UPDATE review_reconciliation_state SET last_failed_action_id=? WHERE id=1",
+        (int(value),),
+    )
+
+
+def _pending_high_watermark(conn: sqlite3.Connection) -> int:
+    """Snapshot the current maximum pending ``action_id``, or 0 if none.
+
+    Taken fresh at the start of every reservation round so the round's upper
+    bound is fixed to what existed at that moment -- rows that arrive after
+    cannot extend it, which is what keeps a round bounded under sustained
+    arrivals.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(action_id), 0) FROM review_action_outbox WHERE state='pending'"
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _reservation_cursor(conn: sqlite3.Connection) -> tuple[int, int]:
+    conn.execute(
+        "INSERT OR IGNORE INTO review_reservation_state "
+        "(id, last_pending_action_id, round_high_watermark) VALUES (1, 0, 0)"
+    )
+    row = conn.execute(
+        "SELECT last_pending_action_id, round_high_watermark "
+        "FROM review_reservation_state WHERE id=1"
+    ).fetchone()
+    return (int(row[0]), int(row[1])) if row is not None else (0, 0)
+
+
+def _set_reservation_cursor(conn: sqlite3.Connection, cursor: int, watermark: int) -> None:
+    conn.execute(
+        "UPDATE review_reservation_state SET last_pending_action_id=?, "
+        "round_high_watermark=? WHERE id=1",
+        (int(cursor), int(watermark)),
+    )
