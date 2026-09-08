@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.2 — 2026-09-08
+
+### Fixed
+
+- The per-project recipe seeding tests measured the machine that ran them
+  rather than the decision, so the release qualified locally and failed on CI.
+
 ## 0.12.1 — 2026-09-08
 
 ### Fixed

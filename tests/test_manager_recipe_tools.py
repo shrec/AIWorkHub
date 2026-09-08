@@ -1374,9 +1374,54 @@ def _project(root: Path, *, baseline, tests=()):
     return root
 
 
-def test_a_project_without_node_is_not_seeded_the_node_recipe(tmp_path):
-    """The owner's example: pytest + ruff, no Node."""
+def _evidence(
+    *,
+    declared: tuple[str, ...],
+    modules: tuple[str, ...] = (),
+    resolved: tuple[str, ...] = (),
+    missing_modules: tuple[str, ...] = (),
+    missing_executables: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """One measured toolchain, stated rather than sampled from this host.
+
+    The seeding verdict needs BOTH halves -- a project that declares a tool and
+    a host that actually has it -- so a test that declares ruff and then asks
+    the machine whether ruff exists is testing the machine. Measured
+    2026-09-08: that is exactly how v0.12.0 went out green here, where ruff is
+    installed, and red on all three CI Python jobs, which install the package
+    plus pytest and no ruff. Stating the evidence tests the decision.
+    """
+    return {
+        "available": True,
+        "declared": declared,
+        "declares_toolchain": bool(declared),
+        "modules": frozenset(modules),
+        "resolved": frozenset(resolved),
+        "missing_modules": frozenset(missing_modules),
+        "missing_executables": frozenset(missing_executables),
+        "absent_paths": frozenset(),
+        "error": "",
+    }
+
+
+def test_a_project_without_node_is_not_seeded_the_node_recipe(tmp_path, monkeypatch):
+    """The owner's example: pytest + ruff declared and present, no Node.
+
+    Node is withheld for the DECLARATION reason, not for absence on this host:
+    a tool the project never declared is a fact about the machine, and seeding
+    from it is how a Python-only repository ends up owning a Node recipe it
+    will never run.
+    """
     root = _project(tmp_path / "no_node", baseline=("python", "ruff"))
+    monkeypatch.setattr(
+        mrt,
+        "_project_evidence",
+        lambda _root: _evidence(
+            declared=("python", "ruff"),
+            modules=("pytest", "ruff"),
+            resolved=("python", "ruff"),
+        ),
+    )
 
     plan = mrt.seeding_plan(root)
     selected = {recipe.id for recipe in plan["selected"]}
@@ -1384,16 +1429,90 @@ def test_a_project_without_node_is_not_seeded_the_node_recipe(tmp_path):
 
     assert "aiworkhub.validation.node_test" not in selected
     assert "toolchain_not_declared:node" in withheld["aiworkhub.validation.node_test"]
-    # The toolchains it DOES have are seeded.
+    # The toolchains it DOES have -- declared AND present -- are seeded.
     assert "aiworkhub.validation.pytest" in selected
     assert "aiworkhub.validation.ruff_check" in selected
     # And every universal entry, unconditionally.
     assert {recipe.id for recipe in mrt.UNIVERSAL_RECIPES} <= selected
 
 
-def test_a_project_that_declares_node_is_seeded_the_node_recipe(tmp_path):
+def test_a_declared_toolchain_this_host_lacks_is_still_withheld(tmp_path, monkeypatch):
+    """Declaration alone does not seed: the host must actually have the tool.
+
+    This is the half that made the first release red, so it is pinned in its
+    own right rather than left to whichever machine runs the suite. ruff is a
+    MODULE requirement here, matching the recipe's own ``python -m ruff``
+    argv, so its absence reads as ``module_absent`` rather than a missing
+    executable -- the distinction the reason strings exist to keep.
+    """
+    root = _project(tmp_path / "declared_absent", baseline=("python", "ruff"))
+    monkeypatch.setattr(
+        mrt,
+        "_project_evidence",
+        lambda _root: _evidence(
+            declared=("python", "ruff"),
+            modules=("pytest",),
+            resolved=("python",),
+            missing_modules=("ruff",),
+        ),
+    )
+
+    plan = mrt.seeding_plan(root)
+    selected = {recipe.id for recipe in plan["selected"]}
+    withheld = {entry["recipe_id"]: entry["reasons"] for entry in plan["withheld"]}
+
+    assert "aiworkhub.validation.pytest" in selected
+    assert "aiworkhub.validation.ruff_check" not in selected
+    assert "module_absent:ruff" in withheld["aiworkhub.validation.ruff_check"]
+
+def test_an_unmeasurable_toolchain_withholds_every_conditional_recipe(
+    tmp_path, monkeypatch
+):
+    """Fail closed: an unseeded recipe is a missing affordance, a wrongly
+    seeded one is a manifest that lies."""
+    root = _project(tmp_path / "unmeasurable", baseline=("python",))
+    monkeypatch.setattr(
+        mrt,
+        "_project_evidence",
+        lambda _root: {
+            "available": False,
+            "declared": (),
+            "declares_toolchain": False,
+            "modules": frozenset(),
+            "resolved": frozenset(),
+            "missing_modules": frozenset(),
+            "missing_executables": frozenset(),
+            "absent_paths": frozenset(),
+            "error": "OSError: toolchain registry unreadable",
+        },
+    )
+
+    plan = mrt.seeding_plan(root)
+    selected = {recipe.id for recipe in plan["selected"]}
+    withheld = {entry["recipe_id"]: entry["reasons"] for entry in plan["withheld"]}
+
+    assert selected == {recipe.id for recipe in mrt.UNIVERSAL_RECIPES}
+    assert set(withheld) == {
+        requirement.recipe_id for requirement in mrt.CONDITIONAL_REQUIREMENTS
+    }
+    assert all(
+        reasons == ["toolchain_unmeasurable:OSError: toolchain registry unreadable"]
+        for reasons in withheld.values()
+    )
+
+
+def test_a_project_that_declares_node_is_seeded_the_node_recipe(tmp_path, monkeypatch):
     """The same decision in the other direction, so it is not vacuous."""
     root = _project(tmp_path / "with_node", baseline=("python", "ruff", "node"))
+    monkeypatch.setattr(
+        mrt,
+        "_project_evidence",
+        lambda _root: _evidence(
+            declared=("python", "ruff", "node"),
+            modules=("pytest", "ruff"),
+            resolved=("python", "ruff", "node"),
+        ),
+    )
 
     selected = {recipe.id for recipe in mrt.seeding_plan(root)["selected"]}
 

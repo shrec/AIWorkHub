@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-09-08
+
+### Fixed
+
+- The per-project seeding tests asserted the toolchain of the machine that ran
+  them. Seeding requires a project to declare a tool AND the host to have it,
+  so a test that declared ruff and then asked the machine whether ruff exists
+  was testing the machine: it read one answer here, where ruff is installed,
+  and another on the CI Python jobs, which install the package plus pytest and
+  no ruff. The decision is now exercised against stated evidence, and the
+  host-dependent half -- a declared tool this host lacks is still withheld --
+  is pinned in its own test instead of being assumed. Verified in a venv built
+  to match the CI job exactly.
+
 ## [0.12.1] - 2026-09-08
 
 ### Fixed
