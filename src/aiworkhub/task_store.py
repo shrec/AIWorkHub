@@ -4062,6 +4062,17 @@ def recover_blocked_rework(
     authorization once when its predecessor is demonstrably missing.
     """
     _readiness, db_path = _require_ready(root)
+    from .successful_rework_recovery import prepare_blocked_recovery
+
+    # Native callers have already passed the manager/write gate. Retained
+    # filesystem verification and sealing must finish before the writer lease.
+    try:
+        successful_preparation = (
+            None if clean_root_if_predecessor_missing else
+            prepare_blocked_recovery(Path(root), db_path, task_id, feedback_reason)
+        )
+    except (OSError, ValueError):
+        return False, "successful_rework_artifacts_invalid"
     # Serialized on the same lease as the terminal transitions. Its four
     # ``conn.commit()`` calls are MUTUALLY EXCLUSIVE branch exits, not four
     # sequential transactions -- every one is immediately followed by a
@@ -4079,6 +4090,8 @@ def recover_blocked_rework(
         if row is None:
             return False, "task_not_found"
 
+        if successful_preparation and dict(row) != successful_preparation["row"]:
+            return False, "successful_rework_episode_changed"
         current_canonical = canonical_status(dict(row))
 
         try:
@@ -4428,6 +4441,8 @@ def recover_blocked_rework(
         ):
             return False, "live_claim_detected"
 
+        if successful_preparation:
+            card["rework_predecessor"] = successful_preparation["predecessor"]
         retained_predecessor = card.get("rework_predecessor")
         if not isinstance(retained_predecessor, dict):
             retained_predecessor = {}
@@ -4448,7 +4463,10 @@ def recover_blocked_rework(
             "WHERE task_id=? AND event=? ORDER BY rowid DESC",
             (task_id, terminal_event),
         ).fetchall()
-        terminal_row = terminal_rows[0] if terminal_rows else None
+        terminal_row = (
+            successful_preparation["terminal_row"] if successful_preparation
+            else terminal_rows[0] if terminal_rows else None
+        )
 
         # A first failed finalization has no reviewer transport yet. Normal
         # rework may reuse its exact retained candidate, but must not replace
@@ -4461,7 +4479,7 @@ def recover_blocked_rework(
                 (task_id,),
             ).fetchone()
 
-        if validation_only_replay and has_reviewer_transport:
+        if validation_only_replay and has_reviewer_transport and not successful_preparation:
             predecessor_request_id = str(
                 retained_predecessor.get("request_id") or ""
             ).strip()
@@ -5037,6 +5055,10 @@ def recover_blocked_rework(
             "actor": actor[:120],
             "validation_only_replay": bool(validation_only_replay),
         }
+        if successful_preparation:
+            recovery_payload["successful_rework_delta"] = (
+                successful_preparation["predecessor"]["rework_delta"]
+            )
         conn.execute(
             "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
             "VALUES (?, 'blocked_rework_recovery', ?, ?, ?)",

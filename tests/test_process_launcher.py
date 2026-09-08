@@ -2878,6 +2878,7 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
         card["status"] = "processing"
         card["worker_status"] = "claimed"
         card["claimed_by"] = "claude_worker_b1"
+        card["claim_epoch"] = 1
         return card
 
     manager = process_launcher.ProcessManager(
@@ -2904,6 +2905,7 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
     metadata = {
         "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
         "request_id": "req-review-first-1",
+        "claim_epoch": 1,
         "task_id": "TASK_B1",
         "runner": "claude_worker_b1",
         "topic": "task_mcp",
@@ -2983,7 +2985,7 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
 
     assert event["state"] == "review_ready"
     assert event["review_automation"]["state"] == "pending"
-    assert event["review_automation"]["error"].startswith("KeyError:")
+    assert event["review_automation"]["error"] == "RuntimeError:review_lifecycle_store_not_ready"
     assert event["workspace_retained"] is True
     assert event["promoted_paths"] == []
     assert event["finalization_duration_ms"] >= 0
@@ -3016,7 +3018,11 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
     ).hexdigest()
     assert evidence["validation"] == []
     assert evidence["worker_mcp_gate"]["gated"] is False
+    assert evidence["rework_delta"]["sealed"] is True
+    assert evidence["rework_delta"]["claim_epoch"] == 1
     assert evidence["request_identity"] == {
+        "repo": str(repo.resolve()),
+        "claim_epoch": 1,
         "request_id": "req-review-first-1",
         "task_id": "TASK_B1",
         "runner": "claude_worker_b1",

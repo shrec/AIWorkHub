@@ -26,6 +26,7 @@ from typing import Any
 
 from . import runtime_temp
 from .platform_io import process_is_alive
+from .windows_file_structures import FILETIME
 
 
 # Liveness is one function, imported -- never a private copy. A POSIX branch
@@ -89,9 +90,6 @@ def _windows_pid_identity_once(
 ) -> PidIdentityEvidence:
     """Perform one Windows identity probe and capture failure provenance."""
 
-    class _FileTime(ctypes.Structure):
-        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
-
     try:
         kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
@@ -100,10 +98,10 @@ def _windows_pid_identity_once(
         kernel32.CloseHandle.restype = ctypes.c_int
         kernel32.GetProcessTimes.argtypes = [
             ctypes.c_void_p,
-            ctypes.POINTER(_FileTime),
-            ctypes.POINTER(_FileTime),
-            ctypes.POINTER(_FileTime),
-            ctypes.POINTER(_FileTime),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
         ]
         kernel32.GetProcessTimes.restype = ctypes.c_int
         getattr(ctypes, "set_last_error")(0)
@@ -145,10 +143,10 @@ def _windows_pid_identity_once(
             exception="ProcessAbsent" if absent else "OpenProcessFailed",
         )
 
-    creation = _FileTime()
-    exit_time = _FileTime()
-    kernel = _FileTime()
-    user = _FileTime()
+    creation = FILETIME()
+    exit_time = FILETIME()
+    kernel = FILETIME()
+    user = FILETIME()
     try:
         try:
             getattr(ctypes, "set_last_error")(0)

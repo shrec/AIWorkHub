@@ -12,16 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.11.3 — 2026-09-07
+## What's new in 0.11.4 — 2026-09-08
 
-- The system now learns from its own corrections: it reads every rejection it
-  has been given, groups them by the rule that was broken rather than the file
-  it happened in, and proposes a skill only when the same rule was broken on
-  three separate cards.
-- A provider hiccup no longer looks like broken code. A transient failure
-  retries, an expired credential pauses the lane and keeps your finished work,
-  and only a real defect blocks the card.
-- A model your account cannot use is switched off the first time it says so.
-- The dashboard says "loading" while it is loading, instead of reporting that
-  there is nothing there.
-
+- Python and Node validation commands can update timestamps on their permitted
+  scratch files while the sandbox continues to enforce file ownership and paths.
+- Windows process supervision and file handling use shared structure definitions
+  to keep their platform behavior consistent.
+- Rejected successful work retains its verified candidate so corrections can
+  continue from the same attempt.

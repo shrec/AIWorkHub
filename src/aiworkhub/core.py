@@ -4682,11 +4682,11 @@ def _bind_explicit_reject_review_predecessor(
             return None, "predecessor_request_id_missing_hashes"
         seen_paths.add(normalized)
         paths.append(normalized)
-    hash_map: dict[str, str] = {}
+    hash_map: dict[str, str | None] = {}
     for path, digest in hashes.items():
         if type(path) is not str or not path.strip():
             return None, "predecessor_request_id_missing_hashes"
-        if (
+        if digest is not None and (
             type(digest) is not str
             or len(digest) != 64
             or any(char not in "0123456789abcdef" for char in digest)
@@ -4857,6 +4857,24 @@ def reject_review(
     disposition = str(to or "pending").strip().lower()
     if disposition not in ("pending", "blocked", "archived", "superseded"):
         return _lifecycle_error(f"invalid reject-review disposition: {disposition}")
+    actor = _verified_manager_actor()
+    blocked = _canonical_write_gate(
+        "reject-review", runner=CODEX_RUNNER, topic=str(live_topic), coordinator_capability=True
+    )
+    if blocked is not None:
+        return blocked
+    # Keep the exact SQL preimage while artifact I/O happens outside a writer
+    # transaction. A later review episode must never receive this snapshot.
+    snapshot_conn = _canonical_connect(readonly=True)
+    try:
+        review_preimage = snapshot_conn.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+    finally:
+        snapshot_conn.close()
+    if review_preimage is None or task_store._decode_task_card(review_preimage) != card:
+        return _lifecycle_error("reject_review_episode_changed")
+    review_preimage = dict(review_preimage)
     normalized_residuals: list[dict[str, str]] = []
 
     def residual_error(code: str, *, index: int | None = None) -> dict[str, Any]:
@@ -5009,21 +5027,54 @@ def reject_review(
         else:
             raw_delta = evidence.get("rework_delta") if isinstance(evidence, dict) else None
         if raw_delta is None:
-            return None, "predecessor_request_id_missing_delta"
+            # Successful candidates published before the full-payload seal was
+            # introduced can be repaired only from their current, authenticated
+            # artifact bundle and retained bytes.  This is intentionally after
+            # the manager/write gate and before the task-state transaction.
+            from .successful_rework_recovery import (
+                SuccessfulReworkRecoveryError,
+                recover_descriptor,
+            )
+
+            if not isinstance(evidence, dict):
+                return None, "predecessor_request_id_missing_delta"
+            try:
+                raw_delta = recover_descriptor(
+                    repo_root(),
+                    task_id,
+                    str(resolved["request_id"]),
+                    expected_epoch or 0,
+                    evidence,
+                    terminal_episode=terminal_review,
+                )
+            except (OSError, SuccessfulReworkRecoveryError):
+                return None, "predecessor_request_id_missing_delta"
         terminal_delta, delta_error = _validated_rework_delta(
             raw_delta,
             expected_request_id=str(resolved["request_id"]),
             expected_claim_epoch=expected_epoch,
         )
         if delta_error:
+            if (isinstance(terminal_review, dict)
+                    and terminal_review.get("substatus") == "review_ready"
+                    and isinstance(evidence, dict)
+                    and isinstance(evidence.get("attempt_artifact_manifest"), dict)):
+                return None, "successful_rework_invalid_delta:" + delta_error
             return None, delta_error
         resolved = dict(resolved)
         resolved["rework_delta"] = terminal_delta
         return resolved, None
 
     rework_delta_reuse_error: str | None = None
+    selected_predecessor = predecessor_request_id
+    current_terminal = card.get("terminal_review")
+    if (selected_predecessor is None and disposition == "pending"
+            and isinstance(current_terminal, dict)
+            and current_terminal.get("substatus") == "review_ready"
+            and isinstance(current_terminal.get("evidence", {}).get("attempt_artifact_manifest"), dict)):
+        selected_predecessor = str(current_terminal.get("request_id") or "")
     resolved_predecessor, pred_error = _resolve_predecessor(
-        predecessor_request_id, validate_delta=(disposition == "pending")
+        selected_predecessor, validate_delta=(disposition == "pending")
     )
     if (
         disposition == "pending"
@@ -5130,17 +5181,10 @@ def reject_review(
     # the card, so classifying later -- which is when a learning commit runs --
     # can only ever answer "inconclusive". Classify now, pin the answer below.
     terminal_disposition = classify_terminal_disposition(card).value
-    actor = _verified_manager_actor()
     command = [
         "reject-review", task_id, "--runner", actor, "--topic", str(live_topic),
         "--reason", bounded_reason, "--to", disposition,
     ]
-    blocked = _canonical_write_gate(
-        "reject-review", runner=CODEX_RUNNER, topic=str(live_topic), coordinator_capability=True
-    )
-    if blocked is not None:
-        return blocked
-
     # archived / superseded retire the card atomically (archived_at + card_json
     # + task_events) via the shared archive backend. Only a card actually in
     # review may be rejected.
@@ -5358,7 +5402,9 @@ def reject_review(
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     try:
         cur = conn.execute(
-            f"UPDATE tasks SET {set_clause} WHERE task_id=? AND worker_status='review'",
+            f"UPDATE tasks SET {set_clause} WHERE task_id=? AND worker_status='review' "
+            "AND runner=? AND topic=? AND status=? AND claimed_by IS ? "
+            "AND claimed_at IS ? AND card_json=?",
             (
                 json.dumps(
                     task_store.persistable_card_payload(card),
@@ -5367,6 +5413,9 @@ def reject_review(
                 ),
                 now,
                 task_id,
+                review_preimage["runner"], review_preimage["topic"],
+                review_preimage["status"], review_preimage["claimed_by"],
+                review_preimage["claimed_at"], review_preimage["card_json"],
             ),
         )
         if cur.rowcount != 1:

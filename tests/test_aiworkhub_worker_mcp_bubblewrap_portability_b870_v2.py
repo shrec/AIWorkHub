@@ -74,6 +74,7 @@ _PACKAGE_FILES = (
     # at all, which would make this fixture fail for a missing file rather
     # than for the import-root behaviour it exists to prove.
     "platform_io.py",
+    "windows_file_structures.py",
     "_platform_process.py",
     "sqlite_readonly.py",
 )

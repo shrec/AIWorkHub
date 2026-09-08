@@ -18,8 +18,10 @@ from typing import Any, BinaryIO, Callable, cast
 
 try:
     from . import windows_appcontainer
+    from .windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 except ImportError:  # direct-script entrypoint
     import windows_appcontainer  # type: ignore[no-redef]
+    from windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 
 try:
     from .platform_io import atomic_replace, chmod_fd, chmod_path
@@ -80,42 +82,6 @@ MEANINGFUL_PROGRESS_PHASES = {
 }
 
 
-class _IoCounters(ctypes.Structure):
-    _fields_ = [
-        ("read_operations", ctypes.c_uint64),
-        ("write_operations", ctypes.c_uint64),
-        ("other_operations", ctypes.c_uint64),
-        ("read_bytes", ctypes.c_uint64),
-        ("write_bytes", ctypes.c_uint64),
-        ("other_bytes", ctypes.c_uint64),
-    ]
-
-
-class _JobBasicLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("per_process_user_time_limit", ctypes.c_int64),
-        ("per_job_user_time_limit", ctypes.c_int64),
-        ("limit_flags", ctypes.c_uint32),
-        ("minimum_working_set_size", ctypes.c_size_t),
-        ("maximum_working_set_size", ctypes.c_size_t),
-        ("active_process_limit", ctypes.c_uint32),
-        ("affinity", ctypes.c_size_t),
-        ("priority_class", ctypes.c_uint32),
-        ("scheduling_class", ctypes.c_uint32),
-    ]
-
-
-class _JobExtendedLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("basic_limit_information", _JobBasicLimitInformation),
-        ("io_info", _IoCounters),
-        ("process_memory_limit", ctypes.c_size_t),
-        ("job_memory_limit", ctypes.c_size_t),
-        ("peak_process_memory_used", ctypes.c_size_t),
-        ("peak_job_memory_used", ctypes.c_size_t),
-    ]
-
-
 class _WindowsKillOnCloseJob:
     """Own a Windows Job Object that kills the worker tree on supervisor loss."""
 
@@ -134,8 +100,8 @@ class _WindowsKillOnCloseJob:
         handle = kernel32.CreateJobObjectW(None, None)
         if not handle:
             raise ctypes.WinError(ctypes.get_last_error())
-        info = _JobExtendedLimitInformation()
-        info.basic_limit_information.limit_flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if not kernel32.SetInformationJobObject(
             handle, 9, ctypes.byref(info), ctypes.sizeof(info)
         ):

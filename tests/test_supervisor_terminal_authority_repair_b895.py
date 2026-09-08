@@ -102,6 +102,7 @@ def _card(task_id: str = "TASK_B895", runner: str = "claude_worker_b895") -> dic
         "status": "processing",
         "worker_status": "in_progress",
         "claimed_by": runner,
+        "claim_epoch": 1,
         "review_requested_by": "",
         "allowed_writes": ["out/result.txt"],
     }
@@ -175,9 +176,14 @@ def _seed_exited_request(
         "parent_baseline": {},
         "workspace_baseline": {},
     }
+    # Finalization seals real candidate bytes against the persisted exact claim.
+    output = Path(workspace_metadata["path"]) / "out/result.txt"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("worker-result\n", encoding="utf-8")
     worker_workspace.write_json_0600(metadata_path, {
         "request_id": request_id,
         "task_id": card["task_id"],
+        "claim_epoch": card["claim_epoch"],
         "runner": card["runner"],
         "topic": card["topic"],
         "adapter_id": "claude_cli",
@@ -299,7 +305,13 @@ def test_valid_exact_grant_reaches_review_ready_via_task_engine_not_core_mark_re
     assert evidence["changed_paths"] == ["out/result.txt"]
     assert evidence["validation"] == []
     assert evidence["required_outputs"] == []
+    assert evidence["rework_delta"]["sealed"] is True
+    assert evidence["rework_delta"]["task_id"] == card["task_id"]
+    assert evidence["rework_delta"]["request_id"] == request_id
+    assert evidence["rework_delta"]["claim_epoch"] == card["claim_epoch"]
     assert evidence["request_identity"] == {
+        "repo": str(manager.repo),
+        "claim_epoch": card["claim_epoch"],
         "request_id": request_id,
         "task_id": card["task_id"],
         "runner": card["runner"],

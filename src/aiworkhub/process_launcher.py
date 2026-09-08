@@ -3241,8 +3241,10 @@ def _terminal_rework_delta_evidence(
     metadata: Mapping[str, Any],
     request_id: str,
     changed: list[str],
+    *,
+    captured_entries: list[tuple[str, bytes | None]] | None = None,
 ) -> dict[str, Any] | None:
-    """Seal a validation-failed candidate outside its disposable worktree.
+    """Seal a complete terminal candidate outside its disposable worktree.
 
     The returned evidence is intentionally small and identity-bound.  The
     artifact itself contains the exact changed bytes (and deletion markers)
@@ -3259,13 +3261,13 @@ def _terminal_rework_delta_evidence(
             "reason": "rework_delta_identity_invalid",
         }
 
-    entries: list[tuple[str, bytes | None]] = []
     try:
-        for relative in changed:
-            source = workspace.path / relative
-            if source.is_symlink():
-                raise WorkspaceError(f"rework_delta_symlink_forbidden:{relative}")
-            entries.append((relative, source.read_bytes() if source.is_file() else None))
+        from .successful_rework_recovery import capture_candidate_paths
+
+        entries = (
+            captured_entries if captured_entries is not None
+            else capture_candidate_paths(workspace.path, changed)
+        )
         authority_repo = workspace.repo.resolve(strict=False)
         artifact_dir = (
             _worker_workspace.configured_runtime_root(authority_repo)
@@ -10724,13 +10726,21 @@ class ProcessManager:
                         )
                         # Review-first reconcile retains the isolated workspace
                         # and records every check before coordinator acceptance.
-                        changed_path_hashes = _changed_path_hashes(workspace, changed)
+                        # A successful rework publication supersedes its predecessor as
+                        # byte authority.  Seal the complete candidate, including paths
+                        # inherited unchanged from that predecessor, so generation N+1
+                        # never depends on generation N's descriptor remaining present.
+                        from .successful_rework_recovery import successful_candidate_evidence
+
+                        successful_candidate_paths, changed_path_hashes, rework_delta = (
+                            successful_candidate_evidence(workspace, metadata, request_id, changed)
+                        )
                         attempt_artifact_receipt = self._persist_attempt_artifacts(
                             request_id,
                             metadata,
                             workspace,
                             target_state="review_ready",
-                            changed_paths=changed,
+                            changed_paths=successful_candidate_paths,
                             changed_path_hashes=changed_path_hashes,
                             required_outputs=required_output_records,
                             validations=validations,
@@ -10771,8 +10781,9 @@ class ProcessManager:
                             "review_ready",
                             request_id=request_id,
                             evidence={
-                                "changed_paths": changed,
+                                "changed_paths": successful_candidate_paths,
                                 "changed_path_hashes": changed_path_hashes,
+                                "rework_delta": rework_delta,
                                 "required_outputs": required_output_records,
                                 "validation_only_replay": validation_only_replay_records,
                                 "validation": validations,
@@ -10795,6 +10806,8 @@ class ProcessManager:
                                     "task_id": str(metadata["task_id"]),
                                     "runner": str(metadata["runner"]),
                                     "topic": str(metadata["topic"]),
+                                    "repo": str(self.repo.resolve(strict=False)),
+                                    "claim_epoch": metadata.get("claim_epoch"),
                                 },
                             },
                         )

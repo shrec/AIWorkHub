@@ -58,6 +58,11 @@ _platform_process = importlib.import_module(
 )
 _platform_process_backend = cast(_PlatformProcessBackend, _platform_process)
 
+try:
+    from .windows_file_structures import FILE_ID_INFO
+except ImportError:  # direct-file loading used by platform regression tests
+    from windows_file_structures import FILE_ID_INFO  # type: ignore[no-redef]
+
 
 def _normalized_platform(platform_name: str | None = None) -> str:
     """Return the canonical ``windows``, ``linux`` or ``macos`` platform name."""
@@ -592,13 +597,6 @@ class _FileAttributeTagInfo(ctypes.Structure):
     _fields_ = [("FileAttributes", ctypes.c_uint32), ("ReparseTag", ctypes.c_uint32)]
 
 
-class _FileIdInfo(ctypes.Structure):
-    _fields_ = [
-        ("VolumeSerialNumber", ctypes.c_ulonglong),
-        ("FileId", ctypes.c_ubyte * 16),
-    ]
-
-
 class _FileDispositionInfo(ctypes.Structure):
     _fields_ = [("DeleteFile", ctypes.c_ubyte)]
 
@@ -641,6 +639,12 @@ class OwnedWindowsHandle:
     @property
     def closed(self) -> bool:
         return self._value is None
+
+    def detach(self) -> int:
+        """Transfer this HANDLE to another owner without closing it."""
+        value = self.value
+        self._value = None
+        return value
 
     def close(self) -> None:
         value = self._value
@@ -884,7 +888,7 @@ def open_windows_relative_child_directory(
             or tag_info.ReparseTag != 0
         ):
             raise OSError("opened child is not a non-reparse directory")
-        file_id = _FileIdInfo()
+        file_id = FILE_ID_INFO()
         if not get_file_information(
             owned.value,
             _FILE_ID_INFO,
@@ -892,12 +896,46 @@ def open_windows_relative_child_directory(
             ctypes.sizeof(file_id),
         ):
             raise _windows_error(get_last_error())
-        if file_id.VolumeSerialNumber == 0 or not any(file_id.FileId):
+        if file_id.volume_serial_number == 0 or not any(file_id.file_id):
             raise OSError("opened child has no stable volume/file identity")
     except BaseException:
         owned.close()
         raise
     return owned
+
+
+def open_windows_relative_regular_file_descriptor(parent_handle: int, child_name: str) -> int:
+    """Open one non-reparse file beneath a pinned parent; caller owns the FD.
+
+    NtCreateFile resolves exactly one child relative to the borrowed HANDLE.
+    Converting that same HANDLE to a CRT descriptor never reopens its pathname.
+    """
+    owned, information, last_error = _open_windows_relative_child_handle(
+        parent_handle, child_name,
+        0x00100081,  # FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+        0x7,  # share READ | WRITE | DELETE; identity remains pinned by the HANDLE
+        _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_REPARSE_POINT | 0x40,  # NON_DIRECTORY_FILE
+    )
+    try:
+        attributes = _FileAttributeTagInfo()
+        identity = FILE_ID_INFO()
+        for info_class, value in ((_FILE_ATTRIBUTE_TAG_INFO, attributes), (_FILE_ID_INFO, identity)):
+            if not information(owned.value, info_class, ctypes.byref(value), ctypes.sizeof(value)):
+                raise _windows_error(last_error())
+        if (
+            attributes.FileAttributes & (_FILE_ATTRIBUTE_DIRECTORY | _FILE_ATTRIBUTE_DEVICE | 0x400)
+            or attributes.ReparseTag or identity.volume_serial_number == 0
+            or not any(identity.file_id)
+        ):
+            raise OSError("opened child is not an identified non-reparse regular file")
+        import msvcrt
+
+        descriptor = msvcrt.open_osfhandle(owned.value, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        owned.detach()  # the CRT descriptor now owns the original HANDLE
+        return descriptor
+    except BaseException:
+        owned.close()
+        raise
 
 
 def open_windows_relative_child_disposition(
@@ -933,7 +971,7 @@ def open_windows_relative_child_disposition(
         if tag_info.FileAttributes & _FILE_ATTRIBUTE_DEVICE:
             raise OSError("opened child has an unexpected device type")
         is_directory = bool(tag_info.FileAttributes & _FILE_ATTRIBUTE_DIRECTORY)
-        file_id = _FileIdInfo()
+        file_id = FILE_ID_INFO()
         if not get_file_information(
             owned.value,
             _FILE_ID_INFO,
@@ -941,7 +979,7 @@ def open_windows_relative_child_disposition(
             ctypes.sizeof(file_id),
         ):
             raise _windows_error(get_last_error())
-        if file_id.VolumeSerialNumber == 0 or not any(file_id.FileId):
+        if file_id.volume_serial_number == 0 or not any(file_id.file_id):
             raise OSError("opened child has no stable volume/file identity")
     except BaseException:
         owned.close()
@@ -949,8 +987,8 @@ def open_windows_relative_child_disposition(
     return WindowsRelativeChildAuthority(
         owned,
         is_directory=is_directory,
-        volume_serial_number=int(file_id.VolumeSerialNumber),
-        file_id=bytes(file_id.FileId),
+        volume_serial_number=int(file_id.volume_serial_number),
+        file_id=bytes(file_id.file_id),
     )
 
 

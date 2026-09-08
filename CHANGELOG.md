@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-09-08
+
+### Fixed
+
+- Validation commands can update timestamps on their authenticated scratch files
+  through the metadata broker, including Python and Node file-descriptor calls.
+  File ownership and path restrictions remain enforced.
+- Windows job and file metadata structures now share canonical declarations
+  across process supervision, file operations and temporary-file handling.
+- Successful task rework preserves the authenticated candidate across review
+  rejection and verifies retained artifacts before restoring the same attempt.
+
 ## [0.11.3] - 2026-09-07
 
 ### Fixed

@@ -7657,7 +7657,13 @@ def _apply_landlock(
 
 
 _SCMP_ACT_NOTIFY = 0x7FC00000
-_METADATA_BROKER_SYSCALLS = ("chmod", "fchmod", "fchmodat", "fchmodat2")
+_METADATA_BROKER_SYSCALLS = (
+    "chmod",
+    "fchmod",
+    "fchmodat",
+    "fchmodat2",
+    "utimensat",
+)
 _METADATA_BROKER_POLL_MS = 200
 _METADATA_BROKER_HANDSHAKE_SECONDS = 30.0
 _METADATA_BROKER_PATH_LIMIT = 4096
@@ -8200,6 +8206,22 @@ def _read_child_cstring(pid: int, address: int) -> str:
         raise WorkspaceError("metadata_broker_path_not_utf8") from exc
 
 
+def _read_child_bytes(pid: int, address: int, size: int) -> bytes:
+    if address <= 0 or size <= 0 or size > 64:
+        raise WorkspaceError("metadata_broker_invalid_memory_range")
+    try:
+        handle = os.open(f"/proc/{pid}/mem", os.O_RDONLY)
+        try:
+            value = os.pread(handle, size, address)
+        finally:
+            os.close(handle)
+    except OSError as exc:
+        raise WorkspaceError(f"metadata_broker_child_memory_read_failed:{exc}") from exc
+    if len(value) != size:
+        raise WorkspaceError("metadata_broker_child_memory_short_read")
+    return value
+
+
 def _metadata_broker_child_link(pid: int, name: str) -> str:
     try:
         return os.readlink(f"/proc/{pid}/{name}")
@@ -8285,6 +8307,48 @@ def _metadata_broker_check_notification(
         raise WorkspaceError("metadata_broker_notification_stale")
 
 
+def _metadata_broker_open_child_fd(
+    pid: int,
+    raw_fd: int,
+    scratch_specs: "list[tuple[int, PurePosixPath]]",
+    requested_mode: int | None = None,
+) -> "tuple[int, bool]":
+    """Reopen and authenticate the exact descriptor on which the child blocked."""
+    if raw_fd < 0:
+        raise WorkspaceError(f"metadata_broker_bad_fd:{raw_fd}")
+    link = _metadata_broker_child_link(pid, f"fd/{raw_fd}")
+    if link.endswith(" (deleted)"):
+        raise WorkspaceError("metadata_broker_deleted_fd")
+    verified_fd, _verified_mutate = _metadata_broker_verify_target_any(
+        link, scratch_specs, requested_mode
+    )
+    try:
+        verified_info = os.fstat(verified_fd)
+        open_flags = os.O_RDONLY | os.O_NOCTTY
+        if stat.S_ISDIR(verified_info.st_mode):
+            open_flags |= os.O_DIRECTORY
+        try:
+            fd_target = os.open(f"/proc/{pid}/fd/{raw_fd}", open_flags)
+        except OSError as exc:
+            raise WorkspaceError(f"metadata_broker_fd_reopen_failed:{exc}") from exc
+        try:
+            target_info = os.fstat(fd_target)
+            if (target_info.st_dev, target_info.st_ino) != (
+                verified_info.st_dev,
+                verified_info.st_ino,
+            ):
+                raise WorkspaceError("metadata_broker_fd_inode_drift")
+            mutate = _metadata_broker_verify_fd(
+                fd_target, f"/proc/{pid}/fd/{raw_fd}", requested_mode
+            )
+        except BaseException:
+            os.close(fd_target)
+            raise
+    finally:
+        os.close(verified_fd)
+    return fd_target, mutate
+
+
 def _metadata_broker_apply(
     library: Any,
     listener_fd: int,
@@ -8318,56 +8382,64 @@ def _metadata_broker_apply(
         raise WorkspaceError(f"metadata_broker_unsupported_syscall:{request.data.nr}")
     args = request.data.args
 
+    if name == "utimensat":
+        from aiworkhub.validation_metadata_timestamps import (
+            TIMESPEC_PAIR_SIZE,
+            TimestampArgumentError,
+            apply_utimensat_fd,
+            decode_utimensat_timespec,
+        )
+
+        dirfd = ctypes.c_int32(int(args[0]) & 0xFFFFFFFF).value
+        _metadata_broker_verify_flags(int(args[3]))
+        timespec = (
+            None
+            if int(args[2]) == 0
+            else _read_child_bytes(pid, int(args[2]), TIMESPEC_PAIR_SIZE)
+        )
+        try:
+            decode_utimensat_timespec(timespec)
+        except TimestampArgumentError as exc:
+            raise WorkspaceError(str(exc)) from exc
+        _metadata_broker_check_notification(library, listener_fd, request.id)
+        if int(args[1]) == 0:
+            verified_fd, _mutate = _metadata_broker_open_child_fd(
+                pid, dirfd, scratch_specs
+            )
+        else:
+            raw_target = _metadata_broker_abs_path(
+                pid, dirfd, _read_child_cstring(pid, int(args[1]))
+            )
+            verified_fd, _mutate = _metadata_broker_verify_target_any(
+                raw_target, scratch_specs
+            )
+        try:
+            try:
+                # The real syscall receives the validated snapshot unchanged,
+                # preserving atomic NOW/OMIT and both-OMIT no-op semantics.
+                _metadata_broker_check_notification(
+                    library, listener_fd, request.id
+                )
+                apply_utimensat_fd(verified_fd, timespec)
+            except TimestampArgumentError as exc:
+                raise WorkspaceError(str(exc)) from exc
+        finally:
+            os.close(verified_fd)
+        return
+
     if name == "fchmod":
         mode = _metadata_broker_decode_mode_arg(int(args[1]))
         raw_fd = ctypes.c_int32(int(args[0]) & 0xFFFFFFFF).value
-        if raw_fd < 0:
-            raise WorkspaceError(f"metadata_broker_bad_fd:{raw_fd}")
         _metadata_broker_check_notification(library, listener_fd, request.id)
-        link = _metadata_broker_child_link(pid, f"fd/{raw_fd}")
-        if link.endswith(" (deleted)"):
-            raise WorkspaceError("metadata_broker_deleted_fd")
-        verified_fd, _verified_mutate = _metadata_broker_verify_target_any(
-            link, scratch_specs, mode
+        fd_target, mutate = _metadata_broker_open_child_fd(
+            pid, raw_fd, scratch_specs, mode
         )
         try:
-            verified_info = os.fstat(verified_fd)
-            # verified_fd is kernel-resolved via openat2; for directories it
-            # may be an O_PATH descriptor that cannot be fchmod'd directly.
-            # Stat it first so the proc reopen can include O_DIRECTORY for
-            # directory targets -- open() on a directory symlink target
-            # without O_DIRECTORY returns EISDIR.
-            open_flags = os.O_RDONLY | os.O_NOCTTY
-            if stat.S_ISDIR(verified_info.st_mode):
-                open_flags |= os.O_DIRECTORY
-            try:
-                fd_target = os.open(
-                    f"/proc/{pid}/fd/{raw_fd}", open_flags
-                )
-            except OSError as exc:
-                raise WorkspaceError(
-                    f"metadata_broker_fd_reopen_failed:{exc}"
-                ) from exc
-            try:
-                target_info = os.fstat(fd_target)
-                if (target_info.st_dev, target_info.st_ino) != (
-                    verified_info.st_dev,
-                    verified_info.st_ino,
-                ):
-                    raise WorkspaceError("metadata_broker_fd_inode_drift")
-                mutate = _metadata_broker_verify_fd(
-                    fd_target, f"/proc/{pid}/fd/{raw_fd}", mode
-                )
-                _metadata_broker_check_notification(library, listener_fd, request.id)
-                if mutate:
-                    # Mutate the exact descriptor the child blocked on, proven
-                    # by inode identity to be the same beneath-scratch file --
-                    # never a readlink+reopen-by-name that a swap could race.
-                    os.fchmod(fd_target, mode)
-            finally:
-                os.close(fd_target)
+            _metadata_broker_check_notification(library, listener_fd, request.id)
+            if mutate:
+                os.fchmod(fd_target, mode)
         finally:
-            os.close(verified_fd)
+            os.close(fd_target)
         return
 
     if name == "chmod":

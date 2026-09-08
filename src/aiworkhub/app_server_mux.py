@@ -117,6 +117,11 @@ if os.name == "nt":  # pragma: no cover - imported only on Windows hosts
     import ctypes.wintypes as wintypes
 
 try:
+    from .windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+except ImportError:  # direct-script entrypoint
+    from windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+
+try:
     from .platform_io import (
         background_process_launch_kwargs,
         chmod_fd,
@@ -351,38 +356,7 @@ def _bind_child_lifetime_to_this_process(child: subprocess.Popen[Any]) -> int | 
     if os.name != "nt":
         return None
 
-    class _IO_COUNTERS(ctypes.Structure):  # pragma: no cover - Windows only
-        _fields_ = [
-            ("ReadOperationCount", ctypes.c_ulonglong),
-            ("WriteOperationCount", ctypes.c_ulonglong),
-            ("OtherOperationCount", ctypes.c_ulonglong),
-            ("ReadTransferCount", ctypes.c_ulonglong),
-            ("WriteTransferCount", ctypes.c_ulonglong),
-            ("OtherTransferCount", ctypes.c_ulonglong),
-        ]
-
-    class _BASIC_LIMIT(ctypes.Structure):  # pragma: no cover - Windows only
-        _fields_ = [
-            ("PerProcessUserTimeLimit", ctypes.c_longlong),
-            ("PerJobUserTimeLimit", ctypes.c_longlong),
-            ("LimitFlags", wintypes.DWORD),
-            ("MinimumWorkingSetSize", ctypes.c_size_t),
-            ("MaximumWorkingSetSize", ctypes.c_size_t),
-            ("ActiveProcessLimit", wintypes.DWORD),
-            ("Affinity", ctypes.c_size_t),
-            ("PriorityClass", wintypes.DWORD),
-            ("SchedulingClass", wintypes.DWORD),
-        ]
-
-    class _EXTENDED_LIMIT(ctypes.Structure):  # pragma: no cover - Windows only
-        _fields_ = [
-            ("BasicLimitInformation", _BASIC_LIMIT),
-            ("IoInfo", _IO_COUNTERS),
-            ("ProcessMemoryLimit", ctypes.c_size_t),
-            ("JobMemoryLimit", ctypes.c_size_t),
-            ("PeakProcessMemoryUsed", ctypes.c_size_t),
-            ("PeakJobMemoryUsed", ctypes.c_size_t),
-        ]
+    import ctypes.wintypes as wintypes
 
     kernel32 = ctypes.windll.kernel32  # pragma: no cover - Windows only
     kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
@@ -400,7 +374,7 @@ def _bind_child_lifetime_to_this_process(child: subprocess.Popen[Any]) -> int | 
     if not job:
         return None
     job_value = int(job) if isinstance(job, int) else int(job.value)
-    info = _EXTENDED_LIMIT()
+    info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
     info.BasicLimitInformation.LimitFlags = 0x00002000
     if not kernel32.SetInformationJobObject(
         job,

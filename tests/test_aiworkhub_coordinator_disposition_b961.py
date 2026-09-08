@@ -1397,7 +1397,9 @@ def test_reject_explicit_validation_failed_zero_diff_requires_coordinator_capabi
     result = _reject_zero_diff(coord, task_id, request_id)
 
     assert result["ok"] is False
-    assert result["stderr"] == "predecessor_request_id_zero_diff_capability_denied"
+    # The manager gate now refuses before predecessor artifact inspection.
+    assert result["returncode"] == 126
+    assert result["stderr"] == "denied"
     assert scanned == []
     assert _row(coord, task_id)["status"] == "review"
 

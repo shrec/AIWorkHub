@@ -1006,6 +1006,7 @@ def _persisted_request(
     status: dict | None,
 ) -> tuple[process_launcher.ProcessManager, worker_workspace.WorkerWorkspace, str]:
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    card.setdefault("claim_epoch", 1)
     request_id = "persisted-request"
     workspace = worker_workspace.create_workspace(repo, request_id, card, "validation")
     (workspace.path / "out" / "result.txt").write_text("untrusted-worker-output\n", encoding="utf-8")
@@ -1018,6 +1019,7 @@ def _persisted_request(
     worker_workspace.write_json_0600(metadata_path, {
         "request_id": request_id,
         "task_id": card["task_id"],
+        "claim_epoch": card["claim_epoch"],
         "runner": card["runner"],
         "topic": card["topic"],
         "adapter_id": "claude_cli",
@@ -1772,6 +1774,7 @@ def test_required_ignored_output_promoted_in_full_finalize_flow(
         "status": "processing",
         "worker_status": "in_progress",
         "claimed_by": card["runner"],
+        "claim_epoch": 1,
     })
 
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
@@ -1791,6 +1794,7 @@ def test_required_ignored_output_promoted_in_full_finalize_flow(
     worker_workspace.write_json_0600(metadata_path, {
         "request_id": request_id,
         "task_id": card["task_id"],
+        "claim_epoch": card["claim_epoch"],
         "runner": card["runner"],
         "topic": card["topic"],
         "adapter_id": "claude_cli",

@@ -46,8 +46,20 @@ from typing import Any, Callable, Mapping
 # Mirror the supervisor's own pattern rather than assuming package context.
 try:
     from .platform_io import process_is_alive
+    from .windows_file_structures import (
+        FILETIME,
+        FILE_BASIC_INFO,
+        FILE_ID_INFO,
+        FILE_STANDARD_INFO,
+    )
 except ImportError:  # direct-script entrypoint (see worker_supervisor)
     from platform_io import process_is_alive  # type: ignore[no-redef]
+    from windows_file_structures import (  # type: ignore[no-redef]
+        FILETIME,
+        FILE_BASIC_INFO,
+        FILE_ID_INFO,
+        FILE_STANDARD_INFO,
+    )
 
 TEMP_RELATIVE_PATH = Path(".aiworkhub/temp")
 TEMP_ROOT_ENV = "AIWORKHUB_TEMP_ROOT"
@@ -253,19 +265,24 @@ def _darwin_start_ticks(pid: int) -> int | None:
 
 def _windows_start_ticks(pid: int) -> int | None:
     """Windows process creation ``FILETIME`` via ``GetProcessTimes``."""
-    class _FileTime(ctypes.Structure):
-        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
-
     kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
     kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
     kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetProcessTimes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = ctypes.c_int
     handle = kernel32.OpenProcess(0x1000, False, pid)
     if not handle:
         return None
-    creation = _FileTime()
-    exit_time = _FileTime()
-    kernel = _FileTime()
-    user = _FileTime()
+    creation = FILETIME()
+    exit_time = FILETIME()
+    kernel = FILETIME()
+    user = FILETIME()
     try:
         ok = kernel32.GetProcessTimes(
             handle,
@@ -455,24 +472,6 @@ def _valid_windows_metadata(
 
 
 def _windows_handle_metadata(handle: int) -> _WindowsHandleMetadata | None:
-    class _FileBasicInfo(ctypes.Structure):
-        _fields_ = [
-            ("creation_time", ctypes.c_longlong),
-            ("last_access_time", ctypes.c_longlong),
-            ("last_write_time", ctypes.c_longlong),
-            ("change_time", ctypes.c_longlong),
-            ("file_attributes", ctypes.c_uint32),
-        ]
-
-    class _FileStandardInfo(ctypes.Structure):
-        _fields_ = [
-            ("allocation_size", ctypes.c_longlong),
-            ("end_of_file", ctypes.c_longlong),
-            ("number_of_links", ctypes.c_uint32),
-            ("delete_pending", ctypes.c_ubyte),
-            ("directory", ctypes.c_ubyte),
-        ]
-
     file_basic_info = 0
     file_standard_info = 1
 
@@ -484,7 +483,7 @@ def _windows_handle_metadata(handle: int) -> _WindowsHandleMetadata | None:
         ctypes.c_uint32,
     ]
     kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
-    basic = _FileBasicInfo()
+    basic = FILE_BASIC_INFO()
     if not kernel32.GetFileInformationByHandleEx(
         ctypes.c_void_p(handle),
         ctypes.c_int(file_basic_info),
@@ -492,7 +491,7 @@ def _windows_handle_metadata(handle: int) -> _WindowsHandleMetadata | None:
         ctypes.c_uint32(ctypes.sizeof(basic)),
     ):
         return None
-    standard = _FileStandardInfo()
+    standard = FILE_STANDARD_INFO()
     if not kernel32.GetFileInformationByHandleEx(
         ctypes.c_void_p(handle),
         ctypes.c_int(file_standard_info),
@@ -518,12 +517,6 @@ def _windows_handle_metadata(handle: int) -> _WindowsHandleMetadata | None:
 
 
 def _windows_handle_identity(handle: int) -> tuple[int, int] | None:
-    class _FileIdInfo(ctypes.Structure):
-        _fields_ = [
-            ("volume_serial_number", ctypes.c_uint64),
-            ("file_id", ctypes.c_ubyte * 16),
-        ]
-
     file_attribute_reparse_point = 0x400
     file_id_info = 18
     attrs = _windows_handle_attributes(handle)
@@ -538,7 +531,7 @@ def _windows_handle_identity(handle: int) -> tuple[int, int] | None:
         ctypes.c_uint32,
     ]
     kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
-    info = _FileIdInfo()
+    info = FILE_ID_INFO()
     if not kernel32.GetFileInformationByHandleEx(
         ctypes.c_void_p(handle),
         ctypes.c_int(file_id_info),
@@ -1291,24 +1284,6 @@ class WindowsDirectoryAuthority:
 
     @staticmethod
     def _reject_unavailable_non_directory_reparse(handle: int) -> None:
-        class _FileBasicInfo(ctypes.Structure):
-            _fields_ = [
-                ("creation_time", ctypes.c_longlong),
-                ("last_access_time", ctypes.c_longlong),
-                ("last_write_time", ctypes.c_longlong),
-                ("change_time", ctypes.c_longlong),
-                ("file_attributes", ctypes.c_uint32),
-            ]
-
-        class _FileStandardInfo(ctypes.Structure):
-            _fields_ = [
-                ("allocation_size", ctypes.c_longlong),
-                ("end_of_file", ctypes.c_longlong),
-                ("number_of_links", ctypes.c_uint32),
-                ("delete_pending", ctypes.c_ubyte),
-                ("directory", ctypes.c_ubyte),
-            ]
-
         kernel32 = _windows_kernel32()
         kernel32.GetFileInformationByHandleEx.argtypes = [
             ctypes.c_void_p,
@@ -1317,7 +1292,7 @@ class WindowsDirectoryAuthority:
             ctypes.c_uint32,
         ]
         kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
-        basic = _FileBasicInfo()
+        basic = FILE_BASIC_INFO()
         if not kernel32.GetFileInformationByHandleEx(
             ctypes.c_void_p(handle),
             ctypes.c_int(_WINDOWS_FILE_BASIC_INFO),
@@ -1325,7 +1300,7 @@ class WindowsDirectoryAuthority:
             ctypes.c_uint32(ctypes.sizeof(basic)),
         ):
             raise RuntimeTempError("windows directory handle metadata unavailable")
-        standard = _FileStandardInfo()
+        standard = FILE_STANDARD_INFO()
         if not kernel32.GetFileInformationByHandleEx(
             ctypes.c_void_p(handle),
             ctypes.c_int(_WINDOWS_FILE_STANDARD_INFO),
@@ -1340,12 +1315,6 @@ class WindowsDirectoryAuthority:
 
     @staticmethod
     def _file_id_info(handle: int) -> tuple[int, int]:
-        class _FileIdInfo(ctypes.Structure):
-            _fields_ = [
-                ("volume_serial_number", ctypes.c_uint64),
-                ("file_id", ctypes.c_ubyte * 16),
-            ]
-
         kernel32 = _windows_kernel32()
         kernel32.GetFileInformationByHandleEx.argtypes = [
             ctypes.c_void_p,
@@ -1354,7 +1323,7 @@ class WindowsDirectoryAuthority:
             ctypes.c_uint32,
         ]
         kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
-        info = _FileIdInfo()
+        info = FILE_ID_INFO()
         if not kernel32.GetFileInformationByHandleEx(
             ctypes.c_void_p(handle),
             ctypes.c_int(_WINDOWS_FILE_ID_INFO),

@@ -1566,6 +1566,8 @@ def _isolated_finalizer_manager_and_metadata(
         os.umask(previous_umask)
 
     metadata = {
+        "request_id": request_id,
+        "claim_epoch": 1,
         "task_id": task_id,
         "runner": "worker",
         "topic": "truth",
@@ -1598,6 +1600,7 @@ def _isolated_finalizer_manager_and_metadata(
             "runner": "worker",
             "topic": "truth",
             "claimed_by": "worker",
+            "claim_epoch": 1,
             "review_requested_by": "worker",
         },
     )
@@ -2059,6 +2062,9 @@ def test_real_finalizer_derives_fresh_authority_after_worker_candidate_review_tr
         request_id=request_id,
         supervisor_status={"state": "exited", "exit_code": 0, "error": ""},
     )
+    candidate = tmp_path / "repo/worktree/src/app.py"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("VALUE = 1\n", encoding="utf-8")
     manager._append_event(  # noqa: SLF001 - exact finalizer-lineage regression
         {
             "request_id": request_id,

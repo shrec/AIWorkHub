@@ -30,6 +30,11 @@ from ctypes import wintypes
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+try:
+    from .windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+except ImportError:  # direct-script entrypoint
+    from windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+
 __all__ = [
     "AppContainerError",
     "AppContainerLaunch",
@@ -564,41 +569,6 @@ class _PROCESS_INFORMATION(ctypes.Structure):
         ("dwThreadId", wintypes.DWORD),
     ]
 
-
-class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
-        ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
-        ("LimitFlags", wintypes.DWORD),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", wintypes.DWORD),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", wintypes.DWORD),
-        ("SchedulingClass", wintypes.DWORD),
-    ]
-
-
-class _IO_COUNTERS(ctypes.Structure):
-    _fields_ = [
-        ("ReadOperationCount", ctypes.c_ulonglong),
-        ("WriteOperationCount", ctypes.c_ulonglong),
-        ("OtherOperationCount", ctypes.c_ulonglong),
-        ("ReadTransferCount", ctypes.c_ulonglong),
-        ("WriteTransferCount", ctypes.c_ulonglong),
-        ("OtherTransferCount", ctypes.c_ulonglong),
-    ]
-
-
-class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
-        ("IoInfo", _IO_COUNTERS),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1404,7 +1374,7 @@ class _CtypesWin32Api:
         return handle
 
     def configure_job_object(self, job: Any) -> None:
-        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         info.BasicLimitInformation.LimitFlags = (
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         )

@@ -487,6 +487,7 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "_platform_process.py",
         "platform_io.py",
         "runtime_temp.py",
+        "windows_file_structures.py",
         "toolchain_authority.py",
         "validation_runner.py",
         "worker_workspace.py",
@@ -551,6 +552,7 @@ def test_worker_workspace_binds_platform_helpers_after_runtime_temp_closure(
         "_platform_process.py",
         "platform_io.py",
         "runtime_temp.py",
+        "windows_file_structures.py",
         "worker_workspace.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)

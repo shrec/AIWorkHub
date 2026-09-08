@@ -123,6 +123,7 @@ class _FakeWindowsLibraries:
         self.disposition_calls = []
         self.disposition_results = list(disposition_results)
         self.nt_statuses = []
+        self.information_calls = []
 
         def nt_create(*args):
             self.calls.append(args)
@@ -135,6 +136,7 @@ class _FakeWindowsLibraries:
 
         def information(handle, info_class, output, size):
             assert handle == 0x1_0000_1234
+            self.information_calls.append((info_class, type(output._obj), size))
             if info_class == 9:
                 value = output._obj
                 value.FileAttributes = attributes
@@ -142,8 +144,8 @@ class _FakeWindowsLibraries:
             else:
                 assert info_class == 18
                 value = output._obj
-                value.VolumeSerialNumber = volume
-                value.FileId[:] = file_id
+                value.volume_serial_number = volume
+                value.file_id[:] = file_id
             return 1
 
         def set_file_information(handle, info_class, output, size):
@@ -223,6 +225,7 @@ def test_canonical_segment_rejects_ambiguous_windows_names():
     [
         platform_io.open_windows_relative_child_directory,
         platform_io.open_windows_relative_child_disposition,
+        platform_io.open_windows_relative_regular_file_descriptor,
     ],
 )
 def test_relative_child_rejects_invalid_parent_before_native_call(monkeypatch, parent, opener):
@@ -255,6 +258,7 @@ def test_relative_child_rejects_invalid_parent_before_native_call(monkeypatch, p
     [
         platform_io.open_windows_relative_child_directory,
         platform_io.open_windows_relative_child_disposition,
+        platform_io.open_windows_relative_regular_file_descriptor,
     ],
 )
 def test_reserved_superscript_names_no_native_call(monkeypatch, child_name, opener):
@@ -287,6 +291,10 @@ def test_ntcreatefile_directory_child_preserves_exact_abi_and_authority(monkeypa
     assert object_attributes.ObjectName.contents.MaximumLength == 12
     assert args[1:2] == (0x00100081,)
     assert args[5:9] == (0, 0x7, 0x1, 0x200021)
+    assert fake.information_calls == [
+        (9, platform_io._FileAttributeTagInfo, 8),
+        (18, platform_io.FILE_ID_INFO, 24),
+    ]
     owned.close()
     owned.close()
     assert fake.closes == [0x1_0000_1234]
@@ -313,6 +321,10 @@ def test_ntcreatefile_disposition_child_preserves_exact_abi_and_authority(monkey
     assert object_attributes.ObjectName.contents.MaximumLength == 12
     assert args[1:2] == (0x00110080,)
     assert args[5:9] == (0, 0x3, 0x1, 0x200020)
+    assert fake.information_calls == [
+        (9, platform_io._FileAttributeTagInfo, 8),
+        (18, platform_io.FILE_ID_INFO, 24),
+    ]
     authority.close()
     authority.close()
     assert fake.closes == [0x1_0000_1234]
@@ -1807,3 +1819,74 @@ def test_directory_privacy_never_returns_true_for_an_unmeasured_host():
         assert (
             platform_io.directory_is_private_to_current_user(metadata, "linux") is False
         )
+
+
+def _readable_windows_libraries(monkeypatch, **kwargs):
+    fake = _FakeWindowsLibraries(attributes=0x20, **kwargs)
+    monkeypatch.setattr(platform_io.ctypes, "WinDLL", fake.windll, raising=False)
+    monkeypatch.setattr(platform_io.ctypes, "get_last_error", fake.get_last_error, raising=False)
+    return fake
+
+
+def test_windows_relative_regular_file_transfers_exact_read_handle(monkeypatch):
+    fake = _readable_windows_libraries(monkeypatch)
+    conversions = []
+    monkeypatch.setitem(sys.modules, "msvcrt", SimpleNamespace(
+        open_osfhandle=lambda handle, flags: conversions.append((handle, flags)) or 321,
+    ))
+    descriptor = platform_io.open_windows_relative_regular_file_descriptor(0x1_0000_0009, "file.py")
+    assert descriptor == 321
+    args = fake.calls[0]
+    assert args[2]._obj.RootDirectory == 0x1_0000_0009
+    assert args[1] == 0x00100081  # READ_DATA | READ_ATTRIBUTES | SYNCHRONIZE
+    assert args[5:9] == (0, 0x7, 0x1, 0x200060)
+    assert conversions == [(0x1_0000_1234, os.O_RDONLY | getattr(os, "O_BINARY", 0))]
+    assert [entry[0] for entry in fake.information_calls] == [9, 18]
+    assert fake.closes == []  # ownership transferred once; CRT caller closes
+
+
+@pytest.mark.parametrize("failure", ["directory", "device", "reparse", "unknown_reparse", "identity", "attributes", "conversion", "native"])
+def test_windows_relative_read_failure_closes_only_acquired_handle(monkeypatch, failure):
+    kwargs = {"status": -1} if failure == "native" else {}
+    fake = _readable_windows_libraries(monkeypatch, **kwargs)
+    original = fake.kernel32.GetFileInformationByHandleEx.function
+
+    def information(handle, info_class, output, size):
+        result = original(handle, info_class, output, size)
+        if info_class == 9:
+            if failure == "directory":
+                output._obj.FileAttributes = 0x10
+            elif failure == "device":
+                output._obj.FileAttributes = 0x40
+            elif failure == "reparse":
+                output._obj.ReparseTag = 0xA000000C
+            elif failure == "unknown_reparse":
+                output._obj.FileAttributes = 0x400
+            elif failure == "attributes":
+                return 0
+        elif failure == "identity":
+            output._obj.volume_serial_number = 0
+        return result
+
+    fake.kernel32.GetFileInformationByHandleEx.function = information
+    conversions = []
+
+    def convert(handle, flags):
+        conversions.append((handle, flags))
+        raise OSError("CRT conversion failed")
+
+    monkeypatch.setitem(sys.modules, "msvcrt", SimpleNamespace(open_osfhandle=convert))
+    with pytest.raises(OSError):
+        platform_io.open_windows_relative_regular_file_descriptor(0x1_0000_0009, "file.py")
+    assert fake.closes == ([] if failure == "native" else [0x1_0000_1234])
+    assert bool(conversions) is (failure == "conversion")
+
+
+def test_owned_windows_handle_detach_transfers_once():
+    closes = []
+    owned = platform_io.OwnedWindowsHandle(0x1_0000_1234, lambda handle: closes.append(handle.value) or 1, lambda: 5)
+    assert owned.detach() == 0x1_0000_1234
+    owned.close()
+    assert owned.closed and closes == []
+    with pytest.raises(ValueError):
+        owned.detach()
