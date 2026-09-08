@@ -250,6 +250,39 @@ def test_fresh_success_clears_persisted_runtime_failure(tmp_path, monkeypatch) -
     assert not state_path.exists()
 
 
+def test_retry_refresh_bypasses_but_does_not_clear_live_failure(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "runtime" / "claude-auth.json"
+    monkeypatch.setenv("AIWORKHUB_CLAUDE_AUTH_STATE_FILE", str(state_path))
+    claude_auth.invalidate()
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(
+            returncode=0,
+            stdout=b'{"loggedIn":true,"authMethod":"claude.ai"}',
+            stderr=b"",
+        ),
+    )
+    assert claude_auth.record_runtime_auth_failure(
+        sys.executable,
+        http_status=401,
+        error_code="authentication_failed",
+        session_id="session-retry",
+    )
+
+    refreshed = claude_auth.refresh_subscription_session_for_retry(sys.executable)
+    still_blocked = claude_auth.auth_status(sys.executable)
+
+    assert refreshed["launchable"] is True
+    assert still_blocked["launchable"] is False
+    assert still_blocked["blocker_reason"] == (
+        "claude_subscription_session_refresh_required"
+    )
+    assert state_path.exists()
+
+
 def test_compatibility_adapter_readiness_uses_claude_live_auth_truth(
     monkeypatch,
 ) -> None:

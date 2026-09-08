@@ -1313,6 +1313,17 @@ def test_claude_auth_refresh_retry_reuses_request_and_identical_worker_argv(
 
     monkeypatch.setattr(manager, "_popen", fake_popen)
     monkeypatch.setattr(process_launcher, "_pid_start_ticks", lambda _pid: 17)
+    refresh_calls: list[str] = []
+
+    def refresh_host_auth():
+        refresh_calls.append("host")
+        return {"launchable": True}
+
+    monkeypatch.setattr(
+        process_launcher.claude_auth,
+        "refresh_subscription_session_for_retry",
+        refresh_host_auth,
+    )
     monkeypatch.setattr(
         process_launcher,
         "_worker_supervisor_script",
@@ -1343,12 +1354,14 @@ def test_claude_auth_refresh_retry_reuses_request_and_identical_worker_argv(
     assert event is not None
     assert event["request_id"] == request_id
     assert event["state"] == "running"
+    assert refresh_calls == ["host"]
     assert len(popen_calls) == 1
     spec_path = process_dir / f"{request_id}.supervisor-spec.json"
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     assert spec["argv"] == worker_argv
     updated = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert updated["claude_auth_retry_count"] == 1
+    assert updated["claude_auth_retry"]["host_auth_refreshed"] is True
     assert updated["claude_auth_retry"]["session_id_sha256"] != "session-1"
     assert "fresh-host-token" not in json.dumps(updated)
     assert (
@@ -1368,6 +1381,43 @@ def test_claude_auth_refresh_retry_reuses_request_and_identical_worker_argv(
         )
         is None
     )
+
+
+def test_claude_auth_retry_stops_when_host_refresh_is_not_launchable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        process_launcher.claude_auth,
+        "refresh_subscription_session_for_retry",
+        lambda: {"launchable": False},
+    )
+
+    def forbidden_projection(_home):
+        raise AssertionError("stale credentials must not be projected")
+
+    monkeypatch.setattr(
+        worker_workspace,
+        "refresh_claude_credential_projection",
+        forbidden_projection,
+    )
+    manager = object.__new__(process_launcher.ProcessManager)
+
+    assert manager._retry_claude_auth_refresh(
+        request_id="r" * 32,
+        metadata_path=tmp_path / "request.json",
+        metadata={
+            "adapter_id": "claude_cli",
+            "worker_argv": ["claude", "-p", "prompt"],
+            "worker_cwd": str(tmp_path),
+        },
+        workspace=SimpleNamespace(home=tmp_path),
+        provider_launch_failure={
+            "http_status": 401,
+            "error_code": "authentication_failed",
+            "session_id": "session-1",
+        },
+    ) is None
 
 
 def test_success_status_does_not_promote_after_exact_claim_ownership_is_lost(

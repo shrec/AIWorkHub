@@ -197,6 +197,56 @@ def _is_editor_launcher(path: str) -> bool:
     return name in _EDITOR_LAUNCHER_NAMES
 
 
+def _probe_auth_status(path: str) -> dict[str, Any]:
+    """Run Claude's bounded local status probe without changing failure circuits."""
+
+    try:
+        completed = subprocess.run(
+            [path, "auth", "status", "--json"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=STATUS_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "ok": False,
+            "authenticated": False,
+            "launchable": False,
+            "status": "auth_status_unavailable",
+            "blocker_reason": f"claude_auth_status_failed:{type(exc).__name__}",
+            "cache_hit": False,
+        }
+    stdout = bytes(completed.stdout or b"")[:MAX_STATUS_BYTES]
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = {}
+    logged_in = bool(isinstance(payload, dict) and payload.get("loggedIn"))
+    method = (
+        str(payload.get("authMethod") or "")[:80]
+        if isinstance(payload, dict)
+        else ""
+    )
+    subscription = (
+        str(payload.get("subscriptionType") or "")[:80]
+        if isinstance(payload, dict)
+        else ""
+    )
+    launchable = completed.returncode == 0 and logged_in
+    return {
+        "ok": completed.returncode == 0,
+        "authenticated": logged_in,
+        "launchable": launchable,
+        "status": "ready" if launchable else "authentication_required",
+        "auth_method": method,
+        "subscription_type": subscription,
+        "blocker_reason": "" if launchable else "claude_authentication_required",
+        "cache_hit": False,
+    }
+
+
 def auth_status(executable: str | None = None, *, force: bool = False) -> dict[str, Any]:
     resolved = executable or shutil.which("claude") or ""
     if not resolved:
@@ -259,54 +309,52 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
         cached = _cache.get(path)
         if not force and cached and now - cached[0] < CACHE_TTL_SECONDS:
             return {**cached[1], "cache_hit": True}
-    try:
-        completed = subprocess.run(
-            [path, "auth", "status", "--json"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=STATUS_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        result = {
-            "ok": False,
-            "authenticated": False,
-            "launchable": False,
-            "status": "auth_status_unavailable",
-            "blocker_reason": f"claude_auth_status_failed:{type(exc).__name__}",
-            "cache_hit": False,
-        }
-    else:
-        stdout = bytes(completed.stdout or b"")[:MAX_STATUS_BYTES]
-        try:
-            payload = json.loads(stdout.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            payload = {}
-        logged_in = bool(isinstance(payload, dict) and payload.get("loggedIn"))
-        method = str(payload.get("authMethod") or "")[:80] if isinstance(payload, dict) else ""
-        subscription = (
-            str(payload.get("subscriptionType") or "")[:80]
-            if isinstance(payload, dict)
-            else ""
-        )
-        launchable = completed.returncode == 0 and logged_in
-        result = {
-            "ok": completed.returncode == 0,
-            "authenticated": logged_in,
-            "launchable": launchable,
-            "status": "ready" if launchable else "authentication_required",
-            "auth_method": method,
-            "subscription_type": subscription,
-            "blocker_reason": "" if launchable else "claude_authentication_required",
-            "cache_hit": False,
-        }
+    result = _probe_auth_status(path)
     with _lock:
         if result.get("launchable") is True:
             _runtime_failures.pop(path, None)
             _clear_persisted_runtime_failure(path)
         _cache[path] = (now, dict(result))
     return result
+
+
+def refresh_subscription_session_for_retry(
+    executable: str | None = None,
+) -> dict[str, Any]:
+    """Ask the host CLI to refresh OAuth before copying credentials to a worker.
+
+    This deliberately bypasses cached/persisted failure circuits, but it does
+    not clear them. Only a successful retried provider request may do that.
+    """
+
+    resolved = executable or shutil.which("claude") or ""
+    if not resolved:
+        return {
+            "ok": False,
+            "authenticated": False,
+            "launchable": False,
+            "status": "not_installed",
+            "blocker_reason": "claude_executable_not_found",
+        }
+    try:
+        path = str(Path(resolved).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return {
+            "ok": False,
+            "authenticated": False,
+            "launchable": False,
+            "status": "not_installed",
+            "blocker_reason": "claude_executable_invalid",
+        }
+    if _is_editor_launcher(str(resolved)) or _is_editor_launcher(path):
+        return {
+            "ok": False,
+            "authenticated": False,
+            "launchable": False,
+            "status": "not_installed",
+            "blocker_reason": "claude_executable_is_editor_launcher",
+        }
+    return _probe_auth_status(path)
 
 
 def record_runtime_auth_failure(
@@ -376,5 +424,6 @@ __all__ = [
     "classify_runtime_auth_failure",
     "clear_runtime_auth_failure",
     "invalidate",
+    "refresh_subscription_session_for_retry",
     "record_runtime_auth_failure",
 ]

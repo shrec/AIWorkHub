@@ -9028,6 +9028,9 @@ class ProcessManager:
         if not worker_cwd:
             return None
 
+        host_auth = claude_auth.refresh_subscription_session_for_retry()
+        if host_auth.get("launchable") is not True:
+            return None
         projection = _worker_workspace.refresh_claude_credential_projection(
             workspace.home
         )
@@ -9091,6 +9094,7 @@ class ProcessManager:
                 "credential_projection_sha256": str(
                     projection.get("destination_sha256") or ""
                 ),
+                "host_auth_refreshed": True,
             },
         }
         write_json_0600(metadata_path, updated)
