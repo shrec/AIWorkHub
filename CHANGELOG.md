@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-09-08
+
+### Fixed
+
+- Release qualification installed pytest without pytest-xdist while the
+  project's addopts pin `-n auto --dist loadfile`, so every platform job exited
+  in under 25 seconds on `unrecognized arguments: -n --dist` without collecting
+  a test. It had been failing that way on the previous tag too, so no release
+  had actually qualified. The pins now match the CI job.
+- The seed-plan test pinned the exact set of withheld recipes, which pins the
+  runner's own toolchain: it read one set on a machine with ruff installed and
+  another on the CI Python job, which installs pytest but not ruff. Withholding
+  a recipe whose toolchain is absent is the behaviour the feature exists for,
+  so the test now asserts the invariants -- the package gate is withheld for a
+  path reason, every withheld entry names why, and nothing outside the
+  conditional set is ever withheld -- instead of the environment's answer.
+
 ## [0.12.0] - 2026-09-08
 
 A token-burn audit measured where the models actually spend context, and this

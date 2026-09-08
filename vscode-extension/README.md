@@ -12,6 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.12.1 — 2026-09-08
+
+- Release qualification runs again: it was installing pytest without the
+  parallel plugin the project requires, so every platform job failed in under
+  half a minute without running a single test.
+
 ## What's new in 0.12.0 — 2026-09-08
 
 - Tool Recipes now show real usage: which recipes have actually run, who ran

@@ -452,8 +452,30 @@ def test_seed_canonical_installs_what_the_project_has_and_is_idempotent(manager)
     assert len(first["registered"]) == expected
     assert len(store.load_registry(manager)) == expected
     assert expected < len(mrt.CANONICAL_RECIPES)
-    assert {entry["recipe_id"] for entry in first["withheld"]} == {
-        "aiworkhub.validation.package_gate_pytest"
+    # The withheld SET is measured, not fixed, and pinning it here pins the
+    # runner's own toolchain. Measured 2026-09-08: this assertion read
+    # {package_gate_pytest} locally, where ruff is installed, and
+    # {package_gate_pytest, pytest, ruff_check} on the CI Python job, which
+    # installs the package plus pytest and pytest-xdist and no ruff -- so the
+    # release went out green locally and red on all three Python versions.
+    # Withholding ruff_check from a project without ruff is the behaviour this
+    # feature exists for; asserting it away was the defect.
+    #
+    # What IS invariant in any environment: an empty tmp_path repository does
+    # not have this repository's two gate test files, so the package gate is
+    # withheld for a PATH reason and never for a toolchain one; every withheld
+    # entry names why; and nothing outside the conditional set is ever
+    # withheld, which is what would catch a universal recipe being dropped.
+    withheld = {entry["recipe_id"]: list(entry["reasons"]) for entry in first["withheld"]}
+    gate = "aiworkhub.validation.package_gate_pytest"
+    assert gate in withheld
+    assert [reason for reason in withheld[gate] if reason.startswith("path_absent:")]
+    assert all(reasons for reasons in withheld.values())
+    assert set(withheld) <= {
+        requirement.recipe_id for requirement in mrt.CONDITIONAL_REQUIREMENTS
+    }
+    assert set(withheld) == {
+        entry["recipe_id"] for entry in plan["withheld"]
     }
 
     second = mrt.seed_canonical()

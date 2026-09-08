@@ -1,5 +1,15 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.12.1 — 2026-09-08
+
+### Fixed
+
+- Release qualification could not run at all: it installed pytest without the
+  parallel plugin the project requires, so every platform job failed in under
+  half a minute without running a test.
+- A seeding test asserted the exact recipes withheld on the machine that ran
+  it, which made it pass locally and fail on CI.
+
 ## 0.12.0 — 2026-09-08
 
 ### Added
