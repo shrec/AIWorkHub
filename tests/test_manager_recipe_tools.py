@@ -1519,8 +1519,18 @@ def test_a_project_that_declares_node_is_seeded_the_node_recipe(tmp_path, monkey
     assert "aiworkhub.validation.node_test" in selected
 
 
-def test_the_package_gate_is_withheld_when_the_tests_it_names_are_absent(tmp_path):
-    """Its argv names THIS repository's two gate files as literals."""
+def test_the_package_gate_is_withheld_when_the_tests_it_names_are_absent(
+    tmp_path, monkeypatch
+):
+    """Its argv names THIS repository's two gate files as literals.
+
+    The evidence is stated rather than sampled, for the same reason as the
+    tests above: this recipe needs a module AND two paths, so asking the host
+    about the module would make a path assertion fail wherever that module
+    resolves differently. Measured 2026-09-08: the exact-list form read two
+    path reasons here and three reasons on the CI Python jobs, where the probe
+    left pytest unresolved. What this test is about is the PATHS.
+    """
     absent = _project(tmp_path / "absent", baseline=("python",))
     present = _project(
         tmp_path / "present",
@@ -1528,6 +1538,13 @@ def test_the_package_gate_is_withheld_when_the_tests_it_names_are_absent(tmp_pat
         tests=(
             "tests/test_module_size_ratchet.py",
             "tests/test_declared_invariants.py",
+        ),
+    )
+    monkeypatch.setattr(
+        mrt,
+        "_project_evidence",
+        lambda _root: _evidence(
+            declared=("python",), modules=("pytest",), resolved=("python",)
         ),
     )
 
@@ -1544,6 +1561,11 @@ def test_the_package_gate_is_withheld_when_the_tests_it_names_are_absent(tmp_pat
     assert "aiworkhub.validation.package_gate_pytest" in {
         recipe.id for recipe in present_plan["selected"]
     }
+    # The paths are the whole difference between the two projects: same stated
+    # toolchain, one seeds the gate and the other does not.
+    assert {recipe.id for recipe in present_plan["selected"]} - {
+        recipe.id for recipe in absent_plan["selected"]
+    } == {"aiworkhub.validation.package_gate_pytest"}
 
 
 def test_the_universal_half_of_the_catalogue_is_git_and_package_only(tmp_path):

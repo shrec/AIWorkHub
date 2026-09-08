@@ -1,23 +1,6 @@
 # AIWorkHub for VS Code — Changelog
 
-## 0.12.2 — 2026-09-08
-
-### Fixed
-
-- The per-project recipe seeding tests measured the machine that ran them
-  rather than the decision, so the release qualified locally and failed on CI.
-
-## 0.12.1 — 2026-09-08
-
-### Fixed
-
-- Release qualification could not run at all: it installed pytest without the
-  parallel plugin the project requires, so every platform job failed in under
-  half a minute without running a test.
-- A seeding test asserted the exact recipes withheld on the machine that ran
-  it, which made it pass locally and fail on CI.
-
-## 0.12.0 — 2026-09-08
+## 0.11.6 — 2026-09-08
 
 ### Added
 
@@ -51,6 +34,14 @@
   reporting a third of all work as unknown.
 - The operator recipe scripts are shipped with the package; they were never
   committed and could not run outside a developer's own working copy.
+
+### Fixed (release plumbing)
+
+- Release qualification could not run at all: it installed pytest without the
+  parallel plugin the project requires, so every platform job failed in under
+  half a minute without running a test.
+- Two seeding tests measured the toolchain of the machine that ran them, so
+  the release qualified locally and failed on CI.
 
 ## 0.11.5 — 2026-09-08
 
