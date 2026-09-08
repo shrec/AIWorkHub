@@ -21,6 +21,7 @@ from . import (
     eval_artifact_gate,
     evidence_levels,
     known_bug_scanner,
+    platform_io,
     quality_review,
     quality_reviewer,
 )
@@ -2140,10 +2141,14 @@ def _run_command_array(
     module = declared_argv[2] if len(declared_argv) >= 3 else ""
     pytest_entrypoint = None
     if module == "pytest" and toolchain_root is not None:
-        relative = Path(".venv/Scripts/pytest.exe" if os.name == "nt" else ".venv/bin/pytest")
+        relative = Path(
+            ".venv/Scripts/pytest.exe"
+            if platform_io.is_windows()
+            else ".venv/bin/pytest"
+        )
         candidate = toolchain_root / relative
         if candidate.is_file() and (
-            os.name == "nt" or candidate.stat().st_mode & stat.S_IXUSR
+            platform_io.is_windows() or candidate.stat().st_mode & stat.S_IXUSR
         ):
             pytest_entrypoint = str(candidate)
     if pytest_entrypoint is not None:
